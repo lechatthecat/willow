@@ -139,10 +139,7 @@ impl TypeChecker {
                         }
                     };
                     let result_ty = if cancel_aware {
-                        Type::Generic(
-                            "Result".to_string(),
-                            vec![output_ty, Type::Named("Cancelled".to_string())],
-                        )
+                        B::Result.apply(vec![output_ty, Type::Named("Cancelled".to_string())])
                     } else {
                         output_ty
                     };
@@ -333,9 +330,11 @@ impl TypeChecker {
         call: &MethodCallExpr,
     ) -> Type {
         // (expected arg type, return type) per method.
-        let sig: Option<(Option<Type>, Type)> = match (lock, call.method.as_str()) {
-            ("BlockingCell", "get") | ("BlockingRwCell", "read") => Some((None, elem.clone())),
-            ("BlockingCell", "set") | ("BlockingRwCell", "write") => {
+        let sig: Option<(Option<Type>, Type)> = match (B::from_name(lock), call.method.as_str()) {
+            (Some(B::BlockingCell), "get") | (Some(B::BlockingRwCell), "read") => {
+                Some((None, elem.clone()))
+            }
+            (Some(B::BlockingCell), "set") | (Some(B::BlockingRwCell), "write") => {
                 Some((Some(elem.clone()), Type::Void))
             }
             _ => None,
@@ -348,18 +347,18 @@ impl TypeChecker {
                 format!("`{lock}<T>` has no method `{}`", call.method),
             )
             .with_label(Label::primary(call.span, "unknown lock method"));
-            diagnostic = if matches!(lock, "Mutex" | "RwLock") {
+            diagnostic = if matches!(B::from_name(lock), Some(B::Mutex | B::RwLock)) {
                 // The removed `get`/`set` are the likely reach, so name the
                 // replacement rather than an empty method list.
                 diagnostic.with_help(
-                    if lock == "Mutex" {
+                    if B::from_name(lock) == Some(B::Mutex) {
                         "`Mutex<T>` has no accessor methods: a get/set read-modify-write can lose updates. Use `lock <mutex> as [mut] value { .. }` inside an `async fn`, or `BlockingCell<T>` for native-blocking compatibility"
                     } else {
                         "`RwLock<T>` has no accessor methods: separate read/write calls can lose a read-modify-write update. Use `lock read <rwlock> as value { .. }` or `lock write <rwlock> as [mut] value { .. }` inside an `async fn`, or `BlockingRwCell<T>` for native-blocking compatibility"
                     },
                 )
             } else {
-                let methods = if lock == "BlockingCell" {
+                let methods = if B::from_name(lock) == Some(B::BlockingCell) {
                     "get/set"
                 } else {
                     "read/write"
@@ -394,7 +393,7 @@ impl TypeChecker {
     /// Type-check a method on `AtomicI64` / `AtomicBool` (willow-dgwo.3).
     /// `compare_exchange(T, T) -> bool`, `load() -> T`, `store(T)`, `add(T)/sub(T) -> T` (i64 only), `swap(T) -> T`.
     pub(super) fn check_atomic_method_call(&mut self, atomic: &str, call: &MethodCallExpr) -> Type {
-        let elem = if atomic == "AtomicI64" {
+        let elem = if B::from_name(atomic) == Some(B::AtomicI64) {
             Type::I64
         } else {
             Type::Bool
@@ -405,7 +404,9 @@ impl TypeChecker {
             "store" => Some((1, Some(elem.clone()), Type::Void)),
             "compare_exchange" => Some((2, Some(elem.clone()), Type::Bool)),
             "swap" => Some((1, Some(elem.clone()), elem.clone())),
-            "add" | "sub" if atomic == "AtomicI64" => Some((1, Some(Type::I64), Type::I64)),
+            "add" | "sub" if B::from_name(atomic) == Some(B::AtomicI64) => {
+                Some((1, Some(Type::I64), Type::I64))
+            }
             _ => None,
         };
         let Some((argc, arg_ty, ret)) = sig else {
@@ -570,8 +571,8 @@ impl TypeChecker {
         // named BlockingCell/BlockingRwCell.
         if let Type::Generic(n, args) = obj_ty
             && matches!(
-                n.as_str(),
-                "Mutex" | "RwLock" | "BlockingCell" | "BlockingRwCell"
+                B::from_name(n.as_str()),
+                Some(B::Mutex | B::RwLock | B::BlockingCell | B::BlockingRwCell)
             )
             && args.len() == 1
         {

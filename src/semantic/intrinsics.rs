@@ -564,18 +564,18 @@ fn symbol_effects(name: &str) -> RuntimeEffects {
 /// (`emit_lir_static_call_values_inner`). The caller rules out user classes of
 /// the same name first: a declared static method always wins.
 pub(crate) fn builtin_static_constructor(class: &str, method: &str) -> Option<&'static str> {
-    Some(match (class, method) {
-        ("Map", "new") => "willow_map_new",
-        ("Channel", "new") => "willow_channel_new",
-        ("Channel", "with_capacity") => "willow_channel_new_bounded",
-        ("CancellationToken", "new") => "willow_cancellation_token_new",
-        ("TaskScope", "new") => "willow_task_scope_new",
-        ("AtomicI64", "new") => "willow_atomic_i64_new",
-        ("AtomicBool", "new") => "willow_atomic_bool_new",
-        ("BlockingCell", "new") => "willow_blocking_cell_new",
-        ("BlockingRwCell", "new") => "willow_blocking_rw_cell_new",
-        ("Mutex", "new") => "willow_async_mutex_new",
-        ("RwLock", "new") => "willow_async_rwlock_new",
+    Some(match (B::from_name(class), method) {
+        (Some(B::Map), "new") => "willow_map_new",
+        (Some(B::Channel), "new") => "willow_channel_new",
+        (Some(B::Channel), "with_capacity") => "willow_channel_new_bounded",
+        (Some(B::CancellationToken), "new") => "willow_cancellation_token_new",
+        (Some(B::TaskScope), "new") => "willow_task_scope_new",
+        (Some(B::AtomicI64), "new") => "willow_atomic_i64_new",
+        (Some(B::AtomicBool), "new") => "willow_atomic_bool_new",
+        (Some(B::BlockingCell), "new") => "willow_blocking_cell_new",
+        (Some(B::BlockingRwCell), "new") => "willow_blocking_rw_cell_new",
+        (Some(B::Mutex), "new") => "willow_async_mutex_new",
+        (Some(B::RwLock), "new") => "willow_async_rwlock_new",
         _ => return None,
     })
 }
@@ -595,7 +595,7 @@ pub(crate) fn builtin_static_effects(
     let method = method.as_ref();
     // Array construction has its own typed lowering, but the same runtime
     // preemption/effect contract as its allocation ABI entry.
-    if (owner, method) == ("Array", "new") {
+    if (B::from_name(owner), method) == (Some(B::Array), "new") {
         return Some(symbol_effects("willow_array_new_literal"));
     }
     if let Some(runtime) = builtin_static_constructor(owner, method) {
@@ -603,8 +603,8 @@ pub(crate) fn builtin_static_effects(
     }
     // Variant construction boxes the payload on the GC heap.
     if matches!(
-        (owner, method),
-        ("Option", "Some" | "None") | ("Result", "Ok" | "Err")
+        (B::from_name(owner), method),
+        (Some(B::Option), "Some" | "None") | (Some(B::Result), "Ok" | "Err")
     ) {
         return Some(RuntimeEffects::MAY_ALLOCATE);
     }

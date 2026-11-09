@@ -467,7 +467,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         object_ty: &Type,
     ) -> Value {
         let object = self.emit_lir_operand(function, object);
-        if matches!(object_ty, Type::Generic(name, args) if *name == TypeId::local("Range") && args == &[Type::I64])
+        if matches!(object_ty, Type::Generic(name, args) if crate::semantic::builtin_types::resolve_name(name) == Some(crate::semantic::builtin_types::BuiltinTypeId::Range) && args == &[Type::I64])
         {
             return self.builder.ins().load(
                 types::I64,

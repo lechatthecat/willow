@@ -38,12 +38,10 @@ pub(super) fn lir_collection(ty: &Type) -> Option<(LirCollection, Vec<Type>)> {
 /// object `[start, end]`, both `i64`, with no reference slots
 ///.
 ///
-/// Recognised by name: `Range` is not a [`BuiltinTypeId`]. Eligibility and
-/// field emission share this predicate to agree on the two-word layout.
-///
-/// [`BuiltinTypeId`]: crate::semantic::builtin_types::BuiltinTypeId
+/// Eligibility and field emission share the builtin identity and payload
+/// check to agree on the two-word layout.
 pub(super) fn range_i64(ty: &Type) -> bool {
-    matches!(ty, Type::Generic(name, args) if name == &TypeId::local("Range") && args.as_slice() == [Type::I64])
+    matches!(ty, Type::Generic(name, args) if crate::semantic::builtin_types::resolve_name(name) == Some(crate::semantic::builtin_types::BuiltinTypeId::Range) && args.as_slice() == [Type::I64])
 }
 
 /// The builtin namespace call `class::method` names, or `None` if it is not one.
@@ -107,7 +105,7 @@ fn empty_map_type(ty: &Type) -> bool {
 #[cfg(test)]
 pub(super) fn is_fresh_empty_map(e: &HirExpr) -> bool {
     matches!(&e.kind, HirExprKind::StaticCall { class, method, args }
-        if class == &TypeId::local("Map") && method == "new" && args.is_empty())
+        if crate::semantic::builtin_types::resolve_name(class) == Some(crate::semantic::builtin_types::BuiltinTypeId::Map) && method == "new" && args.is_empty())
         && empty_map_type(&e.ty)
 }
 

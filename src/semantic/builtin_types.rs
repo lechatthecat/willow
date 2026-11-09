@@ -46,6 +46,9 @@ pub enum BuiltinTypeId {
     TaskScope,
     Cancelled,
     IoError,
+    Mutex,
+    RwLock,
+    Range,
 }
 
 impl BuiltinTypeId {
@@ -70,6 +73,9 @@ impl BuiltinTypeId {
             Self::TaskScope => "TaskScope",
             Self::Cancelled => "Cancelled",
             Self::IoError => "IoError",
+            Self::Mutex => "Mutex",
+            Self::RwLock => "RwLock",
+            Self::Range => "Range",
         }
     }
 
@@ -94,6 +100,9 @@ impl BuiltinTypeId {
             "TaskScope" => Self::TaskScope,
             "Cancelled" => Self::Cancelled,
             "IoError" => Self::IoError,
+            "Mutex" => Self::Mutex,
+            "RwLock" => Self::RwLock,
+            "Range" => Self::Range,
             _ => return None,
         })
     }
@@ -123,6 +132,11 @@ pub struct BuiltinTypeRef<'a, N = String> {
     pub args: &'a [Type<N>],
 }
 
+/// Classify a resolved nominal head without discarding its namespace.
+pub fn resolve_name<N: TypeName>(name: &N) -> Option<BuiltinTypeId> {
+    BuiltinTypeId::from_name(name.builtin_name()?.as_ref())
+}
+
 pub fn resolve<N: TypeName>(ty: &Type<N>) -> Option<BuiltinTypeRef<'_, N>> {
     match ty {
         Type::Array(element) => Some(BuiltinTypeRef {
@@ -130,11 +144,11 @@ pub fn resolve<N: TypeName>(ty: &Type<N>) -> Option<BuiltinTypeRef<'_, N>> {
             args: std::slice::from_ref(element.as_ref()),
         }),
         Type::Generic(name, args) => Some(BuiltinTypeRef {
-            id: BuiltinTypeId::from_name(name.builtin_name()?.as_ref())?,
+            id: resolve_name(name)?,
             args,
         }),
         Type::Named(name) => Some(BuiltinTypeRef {
-            id: BuiltinTypeId::from_name(name.builtin_name()?.as_ref())?,
+            id: resolve_name(name)?,
             args: &[],
         }),
         _ => None,
@@ -223,6 +237,110 @@ mod tests {
             (BuiltinTypeId::CancellationToken, vec![]),
         ] {
             assert_eq!(resolve(&id.apply(args)).unwrap().id, id);
+        }
+    }
+
+    #[test]
+    fn builtin_name_boundaries_preserve_qualification_and_case() {
+        use crate::semantic::ids::TypeId;
+        for id in [
+            BuiltinTypeId::Option,
+            BuiltinTypeId::Result,
+            BuiltinTypeId::Array,
+            BuiltinTypeId::Map,
+            BuiltinTypeId::Mutex,
+            BuiltinTypeId::RwLock,
+            BuiltinTypeId::Range,
+            BuiltinTypeId::Channel,
+            BuiltinTypeId::Future,
+            BuiltinTypeId::FrozenArray,
+            BuiltinTypeId::FrozenMap,
+        ] {
+            let name = id.source_name();
+            assert_eq!(BuiltinTypeId::from_name(name), Some(id));
+            assert_eq!(resolve_name(&TypeId::local(name)), Some(id));
+            for other in [
+                format!("user::{name}"),
+                format!("{name}Like"),
+                name.to_lowercase(),
+            ] {
+                assert_eq!(BuiltinTypeId::from_name(&other), None);
+                assert_eq!(resolve_name(&TypeId::from(other.as_str())), None);
+            }
+            for args in [vec![], vec![Type::I64], vec![Type::I64, Type::String]] {
+                let ty = Type::Generic(name.into(), args.clone());
+                let resolved = resolve(&ty).unwrap();
+                assert_eq!(resolved.id, id);
+                assert_eq!(resolved.args, args);
+                assert_eq!(unary_arg(&ty, id).is_some(), args.len() == 1);
+                assert_eq!(binary_args(&ty, id).is_some(), args.len() == 2);
+            }
+        }
+    }
+
+    #[test]
+    fn bridge_builtin_ids_preserve_shapes_and_opaque_precedence() {
+        use crate::rust_bridge_ir::Scalar;
+        let array = BuiltinTypeId::Array.apply(vec![Type::I64]);
+        assert_eq!(Scalar::from_type(&array), Some(Scalar::Bytes));
+        assert_eq!(
+            Scalar::from_type(&Type::Array(Box::new(Type::I64))),
+            Some(Scalar::Bytes)
+        );
+        let result = BuiltinTypeId::Result.apply(vec![array, Type::String]);
+        assert_eq!(
+            Scalar::from_type(&result),
+            Some(Scalar::Result(
+                Box::new(Scalar::Bytes),
+                Box::new(Scalar::String)
+            ))
+        );
+        for (id, args) in [
+            (BuiltinTypeId::Array, vec![Type::Bool]),
+            (BuiltinTypeId::Option, vec![]),
+            (BuiltinTypeId::Option, vec![Type::I64, Type::I64]),
+            (BuiltinTypeId::Result, vec![Type::I64]),
+            (BuiltinTypeId::Mutex, vec![Type::I64]),
+        ] {
+            assert_eq!(Scalar::from_type(&id.apply(args)), None);
+        }
+        assert_eq!(
+            Scalar::from_type(&Type::Generic("user::Option".into(), vec![Type::I64])),
+            None
+        );
+        let names = std::collections::HashSet::from(["Option".to_owned()]);
+        assert_eq!(
+            Scalar::from_type_with_opaque(&Type::Named("Option".into()), &names),
+            Some(Scalar::Opaque("Option".into()))
+        );
+    }
+
+    #[test]
+    fn builtin_head_resolution_does_not_visit_payloads() {
+        use std::cell::Cell;
+        struct Counted<'a>(&'a Cell<usize>);
+        impl TypeName for Counted<'_> {
+            fn builtin_name(&self) -> Option<impl AsRef<str>> {
+                self.0.set(self.0.get() + 1);
+                Some("Option")
+            }
+        }
+        for width in [1, 16, 256] {
+            let visits = Cell::new(0);
+            let ty = crate::parser::ast::Type::Generic(
+                Counted(&visits),
+                (0..width)
+                    .map(|_| crate::parser::ast::Type::Named(Counted(&visits)))
+                    .collect(),
+            );
+            for _ in 0..width {
+                assert_eq!(resolve(&ty).unwrap().id, BuiltinTypeId::Option);
+            }
+            assert_eq!(visits.get(), width);
+            println!(
+                "calls={width} payloads={width} head_visits={}",
+                visits.get()
+            );
         }
     }
 }

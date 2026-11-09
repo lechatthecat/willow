@@ -1,5 +1,6 @@
 use super::emit_interface::collection_elem_kind;
 use super::*;
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use cranelift_codegen::ir::{InstBuilder, types};
 
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -70,7 +71,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let ptr_ty = reference_type(self.module.target_config());
-        let option = Type::Generic("Option".into(), vec![value_ty.clone()]);
+        let option = Builtin::Option.apply(vec![value_ty.clone()]);
         if super::option_repr::is_scalar_pair(&option) {
             return self.emit_pair(tag, payload);
         }

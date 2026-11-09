@@ -1,6 +1,7 @@
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
 use crate::qualified_name::QualifiedName;
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 
 use super::*;
 
@@ -636,7 +637,7 @@ fn is_option_none_expr(checker: &TypeChecker, expr: &Expr) -> bool {
     checker.is_unshadowed_bare_none(expr)
         || matches!(expr,
             Expr::StaticCall(call)
-                if call.class == "Option" && call.method == "None" && call.args.is_empty())
+                if Builtin::from_name(&call.class) == Some(Builtin::Option) && call.method == "None" && call.args.is_empty())
 }
 
 /// The span of a syntactically negative exponent literal (`x ** -3`), if that

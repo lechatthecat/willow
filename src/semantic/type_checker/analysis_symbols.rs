@@ -1,6 +1,7 @@
 use super::*;
 use crate::qualified_name::QualifiedName;
 use crate::semantic::analysis_symbols::Declaration;
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 
 impl TypeChecker {
     pub(super) fn record_annotation_uses(&mut self, program: &Program) {
@@ -142,8 +143,10 @@ impl TypeChecker {
             if *declaration != Some(span) && !self.analysis_symbols.used_imports.contains(first) {
                 self.analysis_symbols.used_imports.insert(first.to_string());
             }
-        } else if matches!(first, "Array" | "Map")
-            && self.imported_std_modules.contains_key("collections")
+        } else if matches!(
+            Builtin::from_name(first),
+            Some(Builtin::Array | Builtin::Map)
+        ) && self.imported_std_modules.contains_key("collections")
             && !self.analysis_symbols.used_imports.contains("collections")
         {
             // The unaliased collections module also exposes its bare type names.

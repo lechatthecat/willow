@@ -2494,7 +2494,9 @@ fn array_element_type(ty: &Type) -> Type {
                 .clone()
         }
         Type::Generic(name, args)
-            if name == &TypeId::local("Range") && args.as_slice() == [Type::I64] =>
+            if crate::semantic::builtin_types::resolve_name(name)
+                == Some(crate::semantic::builtin_types::BuiltinTypeId::Range)
+                && args.as_slice() == [Type::I64] =>
         {
             Type::I64
         }

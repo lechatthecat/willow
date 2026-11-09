@@ -18,7 +18,10 @@ fn builtin_case(id: B) -> (Vec<Type>, SlotKind) {
         | B::FrozenArray
         | B::Channel
         | B::BlockingCell
-        | B::BlockingRwCell => (vec![Type::String], SlotKind::GcRef),
+        | B::BlockingRwCell
+        | B::Mutex
+        | B::RwLock
+        | B::Range => (vec![Type::String], SlotKind::GcRef),
         B::Map | B::FrozenMap => (vec![Type::String, Type::I64], SlotKind::GcRef),
         B::AtomicI64
         | B::AtomicBool
@@ -100,6 +103,9 @@ fn representation_matrix_all_types_and_builtins() {
         B::TaskScope,
         B::Cancelled,
         B::IoError,
+        B::Mutex,
+        B::RwLock,
+        B::Range,
     ] {
         let (args, slot) = builtin_case(id);
         let clif = if slot == SlotKind::ScalarPair {
@@ -117,7 +123,7 @@ fn representation_matrix_all_types_and_builtins() {
     ] {
         cases.push((B::Option.apply(vec![inner]), types::I64, SlotKind::GcRef));
     }
-    assert_eq!(cases.len(), 36);
+    assert_eq!(cases.len(), 39);
     for (ty, clif, slot) in &cases {
         assert_eq!(clif_type(types::I64, ty), *clif, "{ty:?}");
         assert_eq!(value_slot_kind(ty, &enums), *slot, "{ty:?}");

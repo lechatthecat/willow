@@ -568,7 +568,7 @@ impl<'a> WalkState<'a> {
             return;
         };
         if let Some(name) = binding
-            && matches!(root, Expr::StaticCall(c) if c.class == "TaskScope" && c.method == "new" && c.args.is_empty())
+            && matches!(root, Expr::StaticCall(c) if BuiltinTypeId::from_name(&c.class) == Some(BuiltinTypeId::TaskScope) && c.method == "new" && c.args.is_empty())
         {
             let scope = self.task_scopes.len();
             self.task_scopes.push(TaskScopeState {

@@ -3,6 +3,7 @@
 //! `register_*` entry points stay `pub`; the rest are `pub(super)`.
 
 use crate::qualified_name::QualifiedName;
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
@@ -193,10 +194,7 @@ impl TypeChecker {
                 foreign: false,
                 params: Vec::new(),
                 param_infos: Vec::new(),
-                return_type: Type::Generic(
-                    "Option".to_string(),
-                    vec![Type::Named("PanicInfo".to_string())],
-                ),
+                return_type: Builtin::Option.apply(vec![Type::Named("PanicInfo".to_string())]),
                 public: true,
                 is_async: false,
                 declaration_span: Span::dummy(),
@@ -1019,15 +1017,23 @@ impl TypeChecker {
                                 span: import.span,
                             },
                         );
-                        self.imported_collection_types.insert("Array".to_string());
-                        self.imported_collection_types.insert("Map".to_string());
+                        self.imported_collection_types
+                            .insert(Builtin::Array.source_name().to_string());
+                        self.imported_collection_types
+                            .insert(Builtin::Map.source_name().to_string());
                     }
                 }
-                [
-                    "std",
-                    "collections",
-                    item @ ("Array" | "Map" | "FrozenArray" | "FrozenMap"),
-                ] => {
+                ["std", "collections", item]
+                    if matches!(
+                        Builtin::from_name(item),
+                        Some(
+                            Builtin::Array
+                                | Builtin::Map
+                                | Builtin::FrozenArray
+                                | Builtin::FrozenMap
+                        )
+                    ) =>
+                {
                     let local = import.alias.as_deref().unwrap_or(item);
                     self.imported_names
                         .insert(local.to_string(), Some(import.span));
@@ -2008,7 +2014,7 @@ impl TypeChecker {
                 self.check_call_args_against_param_infos(&mi.param_infos, args);
                 let retains = mi.is_async
                     || (virtual_dispatch
-                        && matches!(&mi.return_type, Type::Generic(name, _) if name == "Task")
+                        && matches!(&mi.return_type, Type::Generic(name, _) if Builtin::from_name(name) == Some(Builtin::Task))
                         && self
                             .symbols
                             .dispatch_may_start_task(&class_name, method_name));
@@ -2117,7 +2123,7 @@ impl TypeChecker {
         // Two `&mut` arguments naming the same place alias through the call,
         // exactly as they would on a direct call.
         self.check_mut_reference_aliases(&m.param_infos, args);
-        let retains = matches!(&m.return_type, Type::Generic(name, _) if name == "Task")
+        let retains = matches!(&m.return_type, Type::Generic(name, _) if Builtin::from_name(name) == Some(Builtin::Task))
             && self
                 .symbols
                 .dispatch_may_start_task(&iface.name, method_name);
@@ -2222,10 +2228,11 @@ impl TypeChecker {
             ..*call
         };
 
+        let builtin_class = Builtin::from_name(class_name);
         // Built-in `Map<K, V>` constructor. The type parameters are resolved
         // from the binding's annotation (Map<Void, Void> is a placeholder, like
         // an empty array literal).
-        if class_name == "Map" && method_name == "new" {
+        if builtin_class == Some(Builtin::Map) && method_name == "new" {
             return self.resolve_map_new(&call);
         }
 
@@ -2239,21 +2246,30 @@ impl TypeChecker {
         }
 
         if method_name == "new" {
-            match class_name {
-                "Mutex" | "RwLock" | "BlockingCell" | "BlockingRwCell" => {
+            match builtin_class {
+                Some(
+                    Builtin::Mutex
+                    | Builtin::RwLock
+                    | Builtin::BlockingCell
+                    | Builtin::BlockingRwCell,
+                ) => {
                     return self.resolve_lock_new(&call);
                 }
-                "AtomicI64" | "AtomicBool" => return self.resolve_atomic_new(&call),
-                "CancellationToken" | "TaskScope" => return self.resolve_no_arg_new(&call),
+                Some(Builtin::AtomicI64 | Builtin::AtomicBool) => {
+                    return self.resolve_atomic_new(&call);
+                }
+                Some(Builtin::CancellationToken | Builtin::TaskScope) => {
+                    return self.resolve_no_arg_new(&call);
+                }
                 _ => {}
             }
         }
 
-        if class_name == "Channel" && method_name == "with_capacity" {
+        if builtin_class == Some(Builtin::Channel) && method_name == "with_capacity" {
             return self.resolve_channel_with_capacity(&call);
         }
 
-        if class_name == "Channel" && method_name == "new" {
+        if builtin_class == Some(Builtin::Channel) && method_name == "new" {
             return self.resolve_channel_new(&call);
         }
 
@@ -2287,17 +2303,17 @@ impl TypeChecker {
             span,
             ..
         } = *call;
-        self.check_collection_type_imported("Map", span);
+        self.check_collection_type_imported(Builtin::Map.source_name(), span);
         self.check_builtin_arity(
-            constructor_arity("Map", "new"),
-            "Map",
+            constructor_arity(Builtin::Map.source_name(), "new"),
+            Builtin::Map.source_name(),
             "new",
             args.len(),
             span,
         );
         match type_args {
-            [] => Type::Generic("Map".to_string(), vec![Type::Void, Type::Void]),
-            [key, value] => Type::Generic("Map".to_string(), vec![key.clone(), value.clone()]),
+            [] => Builtin::Map.apply(vec![Type::Void, Type::Void]),
+            [key, value] => Builtin::Map.apply(vec![key.clone(), value.clone()]),
             _ => {
                 self.push_error(
                     ErrorCode::E0201,
@@ -2308,7 +2324,7 @@ impl TypeChecker {
                     span,
                     "wrong number of type arguments",
                 );
-                Type::Generic("Map".to_string(), vec![Type::Void, Type::Void])
+                Builtin::Map.apply(vec![Type::Void, Type::Void])
             }
         }
     }
@@ -2549,7 +2565,7 @@ impl TypeChecker {
             ..
         } = *call;
         self.reject_reference_args(&QualifiedName::join(class_name, "new"), args);
-        let expected = if class_name == "AtomicI64" {
+        let expected = if Builtin::from_name(class_name) == Some(Builtin::AtomicI64) {
             Type::I64
         } else {
             Type::Bool
@@ -2728,17 +2744,11 @@ impl TypeChecker {
             ("f64", "to_string") => (Type::F64, Type::String),
             ("f64", "parse") => (
                 Type::String,
-                Type::Generic(
-                    "Result".to_string(),
-                    vec![Type::F64, Type::Named("ParseFloatError".to_string())],
-                ),
+                Builtin::Result.apply(vec![Type::F64, Type::Named("ParseFloatError".to_string())]),
             ),
             ("i64", "parse") => (
                 Type::String,
-                Type::Generic(
-                    "Result".to_string(),
-                    vec![Type::I64, Type::Named("ParseIntError".to_string())],
-                ),
+                Builtin::Result.apply(vec![Type::I64, Type::Named("ParseIntError".to_string())]),
             ),
             _ => return None,
         };

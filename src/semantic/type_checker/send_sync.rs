@@ -25,6 +25,7 @@
 //! - plain function pointers: Send + Sync (no environment)
 //! - closure values: conservatively neither (captures unknown)
 
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use std::collections::HashSet;
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
@@ -482,14 +483,16 @@ impl TypeChecker {
             Type::Fn(_, _) => true,
             Type::Closure(_, _) => false,
 
-            Type::Generic(name, args) => match name.as_str() {
+            Type::Generic(name, args) => match Builtin::from_name(name) {
                 // Immutable: Send iff args Send, Sync iff args Sync (the frozen
                 // collections that may be shared across tasks — willow-dgwo.7).
-                "Option" | "Result" | "FrozenArray" | "FrozenMap" => args
+                Some(
+                    Builtin::Option | Builtin::Result | Builtin::FrozenArray | Builtin::FrozenMap,
+                ) => args
                     .iter()
                     .all(|a| self.marker_holds_with_reason(a, marker, visiting, reasons)),
                 // Send if K/V Send; never Sync (mutable).
-                "Map" => {
+                Some(Builtin::Map) => {
                     send && args
                         .iter()
                         .all(|a| self.marker_holds_with_reason(a, Marker::Send, visiting, reasons))
@@ -497,11 +500,13 @@ impl TypeChecker {
                 // Channel<T>/Mutex<T>/BlockingCell<T>: Send + Sync iff T: Send.
                 // Each hands out the value only under exclusive access, so T
                 // never needs to be Sync.
-                "Channel" | "Mutex" | "BlockingCell" => args.first().is_none_or(|t| {
-                    self.marker_holds_with_reason(t, Marker::Send, visiting, reasons)
-                }),
+                Some(Builtin::Channel | Builtin::Mutex | Builtin::BlockingCell) => {
+                    args.first().is_none_or(|t| {
+                        self.marker_holds_with_reason(t, Marker::Send, visiting, reasons)
+                    })
+                }
                 // RwLock<T>: Send + Sync iff T: Send + Sync (concurrent readers).
-                "RwLock" | "BlockingRwCell" => args.first().is_none_or(|t| {
+                Some(Builtin::RwLock | Builtin::BlockingRwCell) => args.first().is_none_or(|t| {
                     self.marker_holds_with_reason(t, Marker::Send, visiting, reasons)
                         && self.marker_holds_with_reason(t, Marker::Sync, visiting, reasons)
                 }),
@@ -509,19 +514,26 @@ impl TypeChecker {
                 // itself Sync (share results, not the task).
                 // `TaskResult<T>` is a view of the same frame, so it carries the
                 // same markers as the task it came from (willow-qrj9).
-                "Task" | "JoinHandle" | "Future" | "TaskResult" => {
+                Some(
+                    Builtin::Task | Builtin::JoinHandle | Builtin::Future | Builtin::TaskResult,
+                ) => {
                     send && args.first().is_none_or(|t| {
                         self.marker_holds_with_reason(t, Marker::Send, visiting, reasons)
                     })
                 }
                 // Range<i64> is a scalar pair.
-                "Range" => true,
+                Some(Builtin::Range) => true,
                 _ => self.named_marker_holds(name, args, marker, visiting, reasons),
             },
 
-            Type::Named(name) => match name.as_str() {
-                "AtomicI64" | "AtomicBool" | "TcpListener" | "TcpStream" | "CancellationToken"
-                | "TaskScope" => true,
+            Type::Named(name) => match Builtin::from_name(name) {
+                Some(
+                    Builtin::AtomicI64
+                    | Builtin::AtomicBool
+                    | Builtin::CancellationToken
+                    | Builtin::TaskScope,
+                ) => true,
+                _ if matches!(name.as_str(), "TcpListener" | "TcpStream") => true,
                 _ => self.named_marker_holds(name, &[], marker, visiting, reasons),
             },
         };
@@ -529,7 +541,12 @@ impl TypeChecker {
             // Reuse the reason traversal: select advice at the failing leaf,
             // with reader-sharing wrappers explaining their stronger contract.
             let help = match ty {
-                Type::Generic(name, _) if matches!(name.as_str(), "RwLock" | "BlockingRwCell") => {
+                Type::Generic(name, _)
+                    if matches!(
+                        Builtin::from_name(name.as_str()),
+                        Some(Builtin::RwLock | Builtin::BlockingRwCell)
+                    ) =>
+                {
                     Some(
                         "RwLock<T> and BlockingRwCell<T> require T: Send + Sync because readers share it; use Mutex<T> when T is Send, or freeze mutable data so it is Sync; for class updates, replace the whole value through the write binding (w = new C(...)) and keep all fields free of post-construction writes, or use Mutex<T> for field mutation",
                     )
@@ -537,9 +554,13 @@ impl TypeChecker {
                 Type::Array(_) if !send => Some(
                     "mutable Array values are never Sync; use FrozenArray via .freeze(), or Mutex<Array<T>> when the elements are Send",
                 ),
-                Type::Generic(name, _) if name == "Map" && !send => Some(
-                    "mutable Map values are never Sync; use FrozenMap via .freeze(), or Mutex<Map<K, V>> when keys and values are Send",
-                ),
+                Type::Generic(name, _)
+                    if Builtin::from_name(name) == Some(Builtin::Map) && !send =>
+                {
+                    Some(
+                        "mutable Map values are never Sync; use FrozenMap via .freeze(), or Mutex<Map<K, V>> when keys and values are Send",
+                    )
+                }
                 Type::Named(name) if self.symbols.lookup_interface(name).is_some() => {
                     Some(if send {
                         "interface values need a declared `extends Send` (or `extends Sync`) contract if every implementation satisfies it"

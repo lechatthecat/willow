@@ -1616,7 +1616,11 @@ impl TypeChecker {
     ) -> Option<Type> {
         let required = mode.lock_type_name();
         if let Type::Generic(name, args) = target_ty
-            && name == required
+            && match B::from_name(required) {
+                Some(id) => B::from_name(name) == Some(id),
+                // Group is a syntax sentinel, not a nominal builtin family.
+                None => name == required,
+            }
             && args.len() == 1
         {
             return Some(args[0].clone());
@@ -1646,9 +1650,9 @@ impl TypeChecker {
         if let Type::Generic(name, args) = target_ty
             && args.len() == 1
         {
-            if name == "Mutex" {
+            if B::from_name(name) == Some(B::Mutex) {
                 diagnostic = diagnostic.with_help("`Mutex<T>` uses `lock <mutex> as [mut] value`");
-            } else if name == "RwLock" {
+            } else if B::from_name(name) == Some(B::RwLock) {
                 diagnostic = diagnostic.with_help(
                     "`RwLock<T>` uses `lock read <rwlock> as value` or `lock write <rwlock> as [mut] value`",
                 );
@@ -1723,7 +1727,7 @@ impl TypeChecker {
             // Builtin constructor holes are finalized by check_expr,
             // including recovery from malformed payloads. Keep the
             // existing binding check for user-defined generic enums.
-            if !matches!(&inferred, Type::Generic(name, _) if name == "Option" || name == "Result")
+            if !matches!(&inferred, Type::Generic(name, _) if matches!(B::from_name(name), Some(B::Option | B::Result)))
                 && let Some(diag) = self.unresolved_generic_enum_diagnostic(
                     &s.init,
                     &inferred,
@@ -2045,7 +2049,9 @@ impl TypeChecker {
                     .unwrap()
                     .clone()
             }
-            Type::Generic(name, args) if name == "Range" && args.as_slice() == [Type::I64] => {
+            Type::Generic(name, args)
+                if B::from_name(name) == Some(B::Range) && args.as_slice() == [Type::I64] =>
+            {
                 Type::I64
             }
             Type::Void => Type::Void,
@@ -2320,7 +2326,7 @@ impl TypeChecker {
                 builtin_types::binary_args(&self.local.current_return_type, B::Result)
                     .is_some_and(|(ok, _)| *ok == Type::Void);
             if returns_result_void
-                && sc.class == "Result"
+                && B::from_name(&sc.class) == Some(B::Result)
                 && sc.method == "Ok"
                 && sc.args.is_empty()
             {
@@ -2410,7 +2416,11 @@ impl TypeChecker {
     ) -> Type {
         // Constructor syntax supplies a class argument from the expected array
         // when omitted, then uses the declaration's ordinary static dispatch.
-        if self.resolve_static_call_class_quiet(&s.class).as_deref() == Some("Array")
+        if self
+            .resolve_static_call_class_quiet(&s.class)
+            .as_deref()
+            .and_then(B::from_name)
+            == Some(B::Array)
             && self
                 .generics
                 .classes
@@ -2422,7 +2432,7 @@ impl TypeChecker {
             {
                 return Self::error_type();
             }
-            self.check_collection_type_imported("Array", s.span);
+            self.check_collection_type_imported(B::Array.source_name(), s.span);
             let inferred;
             let mut checked_argument = None;
             let arguments = if s.type_args.is_empty() {
@@ -2575,7 +2585,7 @@ impl TypeChecker {
         let generation = self.error_generation;
         let mut ty = self.check_expr_inner(expr);
         if self.error_generation == generation
-            && matches!(&ty, Type::Generic(name, _) if name == "Option" || name == "Result")
+            && matches!(&ty, Type::Generic(name, _) if matches!(B::from_name(name), Some(B::Option | B::Result)))
             && self.report_constructor_holes(expr, &ty)
         {
             ty = Self::error_type();
@@ -3300,7 +3310,7 @@ impl TypeChecker {
                 // Prelude constructors can infer their payload without an outer
                 // annotation, just like the qualified Result::Ok/Err forms.
                 let inferred_enum = match c.callee.as_str() {
-                    "Ok" | "Err" => Some("Result"),
+                    "Ok" | "Err" => Some(B::Result.source_name()),
                     _ => None,
                 };
                 if let Some(name) = inferred_enum

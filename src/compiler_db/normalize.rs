@@ -2,6 +2,7 @@
 //! aliased collection references and builtin module aliases before lowering.
 
 use crate::qualified_name::QualifiedName;
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use std::collections::{HashMap, HashSet};
 
 use crate::module::std_registry;
@@ -203,7 +204,11 @@ pub(crate) fn std_collection_imports(program: &Program) -> StdCollectionImports 
                 }
             }
             Ok(std_registry::StdImport::Item { module, item })
-                if module == "collections" && matches!(item.as_str(), "Array" | "Map") =>
+                if module == "collections"
+                    && matches!(
+                        Builtin::from_name(item.as_str()),
+                        Some(Builtin::Array | Builtin::Map)
+                    ) =>
             {
                 aliases.insert(import.alias.clone().unwrap_or_else(|| item.clone()), item);
             }
@@ -581,19 +586,19 @@ pub(crate) fn normalize_std_collection_type(ty: &mut Type, imports: &StdCollecti
             for arg in args.iter_mut() {
                 normalize_std_collection_type(arg, imports);
             }
-            match std_collection_item_name(name, imports) {
-                Some("Array") if args.len() == 1 => {
+            match std_collection_item_name(name, imports).and_then(Builtin::from_name) {
+                Some(Builtin::Array) if args.len() == 1 => {
                     let element = args.remove(0);
                     *ty = Type::Array(Box::new(element));
                 }
-                Some("Map") => {
-                    *name = "Map".to_string();
+                Some(Builtin::Map) => {
+                    *name = Builtin::Map.source_name().to_string();
                 }
-                Some("Option") => {
-                    *name = "Option".to_string();
+                Some(Builtin::Option) => {
+                    *name = Builtin::Option.source_name().to_string();
                 }
-                Some("Result") => {
-                    *name = "Result".to_string();
+                Some(Builtin::Result) => {
+                    *name = Builtin::Result.source_name().to_string();
                 }
                 _ => {}
             }

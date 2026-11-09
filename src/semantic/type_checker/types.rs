@@ -158,11 +158,11 @@ pub(super) fn type_name_with<'a, N: std::fmt::Display>(
 }
 
 pub(crate) fn range_type() -> Type {
-    Type::Generic("Range".to_string(), vec![Type::I64])
+    B::Range.apply(vec![Type::I64])
 }
 
 pub(crate) fn is_i64_range_type<N: TypeName>(ty: &Type<N>) -> bool {
-    matches!(ty, Type::Generic(name, args) if name.builtin_name().is_some_and(|n| n.as_ref() == "Range") && matches!(args.as_slice(), [Type::I64]))
+    matches!(ty, Type::Generic(name, args) if name.builtin_name().is_some_and(|n| B::from_name(n.as_ref()) == Some(B::Range)) && matches!(args.as_slice(), [Type::I64]))
 }
 
 pub(crate) fn function_call_return_type(info: &FuncInfo) -> Type {

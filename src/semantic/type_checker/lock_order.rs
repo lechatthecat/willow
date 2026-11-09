@@ -10,6 +10,7 @@
 //! before it is ordered before each of them, and each of them is ordered before
 //! anything taken under it. Nesting two such locks of one type is then a cycle,
 //! while a parent reached before its differently typed child is ordered.
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
@@ -261,7 +262,10 @@ impl Analysis<'_> {
                 .cloned()
                 .unwrap_or_default(),
             Expr::StaticCall(call)
-                if matches!(call.class.as_str(), "Mutex" | "RwLock") && call.method == "new" =>
+                if matches!(
+                    Builtin::from_name(call.class.as_str()),
+                    Some(Builtin::Mutex | Builtin::RwLock)
+                ) && call.method == "new" =>
             {
                 Identity {
                     class: Some(Class::Allocation(expr.id())),
@@ -330,7 +334,10 @@ impl Analysis<'_> {
             Expr::Call(call) if locals.contains_key(&call.callee) => Some(self.opaque),
             Expr::Call(call) => self.target_node(FunctionId::free_from_source_name(&call.callee)),
             Expr::StaticCall(call)
-                if matches!(call.class.as_str(), "Mutex" | "RwLock") && call.method == "new" =>
+                if matches!(
+                    Builtin::from_name(call.class.as_str()),
+                    Some(Builtin::Mutex | Builtin::RwLock)
+                ) && call.method == "new" =>
             {
                 None
             }
@@ -567,7 +574,7 @@ pub(crate) fn collect(
             )),
             Item::Class(class) => {
                 for field in &class.fields {
-                    if field.is_static && !field.is_mut && field.initializer.as_ref().is_some_and(|expr| matches!(expr, Expr::StaticCall(call) if matches!(call.class.as_str(), "Mutex" | "RwLock") && call.method == "new")) {
+                    if field.is_static && !field.is_mut && field.initializer.as_ref().is_some_and(|expr| matches!(expr, Expr::StaticCall(call) if matches!(Builtin::from_name(call.class.as_str()), Some(Builtin::Mutex | Builtin::RwLock)) && call.method == "new")) {
                         analysis.globals.insert((class.name.clone(), field.name.clone()), Identity {
                             class: Some(Class::Global(field.span)), same: Some(field.span),
                         });

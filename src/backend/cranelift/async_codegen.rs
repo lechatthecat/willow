@@ -6,6 +6,7 @@
 
 use crate::ir::lowered::{LirDeferId, LirFunction, LirInst, LirLocalId};
 use crate::qualified_name::QualifiedName;
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use anyhow::Result;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
 use cranelift_module::Module;
@@ -419,10 +420,7 @@ impl UnitCodegenContext<'_> {
                 mask,
                 bitmap: layout.gc_payload_bitmap.clone(),
                 first_param_slot: if main_result_err_ty.as_ref().is_some_and(|err| {
-                    self.is_inline_pair(&Type::Generic(
-                        "Result".into(),
-                        vec![Type::Void, err.clone()],
-                    ))
+                    self.is_inline_pair(&Builtin::Result.apply(vec![Type::Void, err.clone()]))
                 }) {
                     3
                 } else {
@@ -1152,7 +1150,7 @@ impl UnitCodegenContext<'_> {
         builder.ins().call(run_ref, &[main_task_id]);
 
         if let Some((result_offset, err_ty)) = frame_layout.main_result {
-            let result_ty = Type::Generic("Result".into(), vec![Type::Void, err_ty.clone()]);
+            let result_ty = Builtin::Result.apply(vec![Type::Void, err_ty.clone()]);
             let result = if self.is_inline_pair(&result_ty) {
                 let tag =
                     builder

@@ -8298,3 +8298,39 @@ fn nonnegative_induction_rejects_async_capture_and_unrolled_definitions() {
         !super::super::nonnegative::analyze(&f).contains(&crate::ir::lowered::LirOperand::Local(i))
     );
 }
+
+#[test]
+fn builtin_identity_preserves_task_stack_call_boundaries() {
+    use crate::ir::lowered::LirRvalue;
+    for (name, boundary) in [
+        ("Option", false),
+        ("Result", false),
+        ("Map", false),
+        ("Channel", false),
+        ("Mutex", true),
+        ("RwLock", true),
+        ("Range", true),
+        ("User", true),
+        ("user::Map", true),
+    ] {
+        for callback in [false, true] {
+            let call = LirRvalue::StaticCall {
+                class: name.into(),
+                method: "new".into(),
+                is_async: false,
+                args: vec![],
+                arg_types: if callback {
+                    vec![Type::Fn(vec![], Box::new(Type::Void))]
+                } else {
+                    vec![]
+                },
+                result: Type::Void,
+            };
+            assert_eq!(
+                task_stack_boundary(&call),
+                boundary || callback,
+                "{name}, callback={callback}"
+            );
+        }
+    }
+}

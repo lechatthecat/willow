@@ -635,36 +635,37 @@ fn flat_static_call_supported(
     ctx: &LirTypeCtx<'_>,
 ) -> bool {
     let class = ctx.resolved_class(class);
+    let builtin_class = B::from_name(class);
     if !ctx.supported_type(result) || args.iter().any(|ty| !ctx.supported_type(ty)) {
         return false;
     }
-    if class == "Map" && method == "new" && args.is_empty() {
+    if builtin_class == Some(B::Map) && method == "new" && args.is_empty() {
         return matches!(lir_collection(result), Some((LirCollection::Map, _)));
     }
-    if class == "Channel" && builtin_types::unary_arg(result, B::Channel).is_some() {
+    if builtin_class == Some(B::Channel) && builtin_types::unary_arg(result, B::Channel).is_some() {
         return (method == "new" && args.is_empty())
             || (method == "with_capacity" && args == [Type::I64]);
     }
     if let Some(cell) = atomic_cell(result)
-        && class == cell.class_name()
+        && builtin_class == Some(cell.type_id())
         && method == "new"
     {
         return args == [cell.word()];
     }
     if let Some((kind, elem)) = blocking_cell(result)
-        && class == kind.class_name()
+        && builtin_class == Some(kind.type_id())
         && method == "new"
     {
         return args.len() == 1 && ctx.same_repr(elem, &args[0]);
     }
     if let Some((_, elem)) = scheduler_lock(result)
-        && matches!(class, "Mutex" | "RwLock")
+        && matches!(builtin_class, Some(B::Mutex | B::RwLock))
         && method == "new"
     {
         return args.len() == 1 && ctx.same_repr(elem, &args[0]);
     }
     if let Some(handle) = cancellation_handle(result)
-        && class == handle.class_name()
+        && builtin_class == Some(handle.type_id())
         && method == "new"
     {
         return args.is_empty();

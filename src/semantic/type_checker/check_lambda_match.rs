@@ -1095,7 +1095,7 @@ impl TypeChecker {
             | Pattern::EnumVariantTuple {
                 enum_name, variant, ..
             } => {
-                (enum_name == "Option" || enum_name.is_empty())
+                (B::from_name(enum_name) == Some(B::Option) || enum_name.is_empty())
                     && matches!(variant.as_str(), "Some" | "None")
             }
             _ => false,

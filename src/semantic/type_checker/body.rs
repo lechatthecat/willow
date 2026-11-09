@@ -1,4 +1,5 @@
 use super::*;
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 
 /// Ephemeral callable state. A root body starts empty; nested lambda checking
 /// keeps this same lexical/inference state until independent lambda inputs exist.
@@ -332,7 +333,7 @@ impl TypeChecker {
         body.missing_collection_imports_reported = self.missing_collection_imports_reported.clone();
         // Array annotations in a body normalize through the bundled template,
         // which is a declaration like any other the body reads.
-        for name in ["$std::collections::Array", "Array"] {
+        for name in ["$std::collections::Array", Builtin::Array.source_name()] {
             if let Some(template) = self.generics.classes.get(name)
                 && template.abi_storage.is_some()
             {

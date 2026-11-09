@@ -1,5 +1,6 @@
 use super::LirPlace;
 use super::*;
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 
 #[derive(Default)]
 struct Callables {
@@ -74,32 +75,51 @@ fn static_call(
         return false;
     }
     let class_name = class.to_string();
-    match (class_name.as_str(), method, args) {
+    match (Builtin::from_name(&class_name), method, args) {
         (
-            "Map" | "Channel" | "CancelToken" | "CancelSource" | "CancellationToken" | "TaskScope",
+            Some(Builtin::Map | Builtin::Channel | Builtin::CancellationToken | Builtin::TaskScope),
             "new",
             [],
         ) => true,
-        ("Channel", "with_capacity", [arg]) => arg.ty == Type::I64,
-        (
-            "AtomicI64" | "AtomicBool" | "CellI64" | "CellBool" | "Mutex" | "RwLock"
-            | "BlockingCell" | "BlockingRwCell",
-            "new",
-            [arg],
-        ) => {
+        (Some(Builtin::Channel), "with_capacity", [arg]) => arg.ty == Type::I64,
+        (id, "new", [arg])
+            if matches!(
+                id,
+                Some(
+                    Builtin::AtomicI64
+                        | Builtin::AtomicBool
+                        | Builtin::Mutex
+                        | Builtin::RwLock
+                        | Builtin::BlockingCell
+                        | Builtin::BlockingRwCell
+                )
+            ) || matches!(class_name.as_str(), "CellI64" | "CellBool") =>
+        {
             use crate::semantic::builtin_types;
             matches!(result, Type::Generic(name, payloads) if name == class && matches!(payloads.as_slice(), [ty] if argument_coercible(ty, arg, &callables.resolution)))
-                || builtin_types::resolve(result).is_some_and(|resolved| {
-                    resolved
-                        .args
-                        .first()
-                        .is_some_and(|ty| argument_coercible(ty, arg, &callables.resolution))
-                })
+                || builtin_types::resolve(result)
+                    .filter(|resolved| {
+                        !matches!(
+                            resolved.id,
+                            Builtin::Mutex | Builtin::RwLock | Builtin::Range
+                        )
+                    })
+                    .is_some_and(|resolved| {
+                        resolved
+                            .args
+                            .first()
+                            .is_some_and(|ty| argument_coercible(ty, arg, &callables.resolution))
+                    })
+                || matches!(
+                    (id, &arg.ty),
+                    (Some(Builtin::AtomicI64), Type::I64) | (Some(Builtin::AtomicBool), Type::Bool)
+                )
                 || matches!(
                     (class_name.as_str(), &arg.ty),
-                    ("AtomicI64" | "CellI64", Type::I64) | ("AtomicBool" | "CellBool", Type::Bool)
+                    ("CellI64", Type::I64) | ("CellBool", Type::Bool)
                 )
         }
+        (None, "new", []) if matches!(class_name.as_str(), "CancelToken" | "CancelSource") => true,
         _ => false,
     }
 }
@@ -190,12 +210,12 @@ fn builtin_call(callee: &FunctionId, args: &[HirExpr], result: &Type) -> bool {
     if name == "sleep" {
         return matches!(args, [arg] if arg.ty == Type::I64)
             && (*result == Type::Void
-                || *result == Type::Generic(TypeId::local("Future"), vec![Type::Void]));
+                || matches!(result, Type::Generic(name, payloads) if crate::semantic::builtin_types::resolve_name(name) == Some(Builtin::Future) && payloads == &[Type::Void]));
     }
     if name == "yield" {
         return args.is_empty()
             && (*result == Type::Void
-                || *result == Type::Generic(TypeId::local("Future"), vec![Type::Void]));
+                || matches!(result, Type::Generic(name, payloads) if crate::semantic::builtin_types::resolve_name(name) == Some(Builtin::Future) && payloads == &[Type::Void]));
     }
     crate::semantic::intrinsics::builtin_call_runtime_name(name).is_some()
         && args.is_empty()
@@ -317,8 +337,13 @@ fn argument_types(
             }
             if method == "new"
                 && matches!(
-                    class.name().as_ref(),
-                    "Mutex" | "RwLock" | "BlockingCell" | "BlockingRwCell"
+                    Builtin::from_name(class.name().as_ref()),
+                    Some(
+                        Builtin::Mutex
+                            | Builtin::RwLock
+                            | Builtin::BlockingCell
+                            | Builtin::BlockingRwCell
+                    )
                 )
                 && let Type::Generic(_, params) = &node.ty
             {
@@ -583,7 +608,7 @@ pub(in crate::ir::lowered) fn lower_calls(
                         method,
                         &mut method_effects,
                     ) || (super_class.is_none()
-                        && matches!(result, Type::Generic(name, _) if *name == TypeId::local("Task"))
+                        && matches!(result, Type::Generic(name, _) if crate::semantic::builtin_types::resolve_name(name) == Some(crate::semantic::builtin_types::BuiltinTypeId::Task))
                         && matches!(receiver, Type::Named(class) | Type::Generic(class, _)
                         if super::super::dispatch_may_start_task(
                             resolution, &children, *class, method.as_str(), &mut dispatch_effects, &mut method_effects,
@@ -787,7 +812,7 @@ fn lower_blocks_with(
             }
             match &mut inst {
                 SourceInst::Let { value, ty, .. } => {
-                    if matches!(&value.kind, HirExprKind::StaticCall { class, method, args } if *class == TypeId::local("Map") && method == "new" && args.is_empty())
+                    if matches!(&value.kind, HirExprKind::StaticCall { class, method, args } if crate::semantic::builtin_types::resolve_name(class) == Some(crate::semantic::builtin_types::BuiltinTypeId::Map) && method == "new" && args.is_empty())
                     {
                         value.ty = ty.clone();
                     }
@@ -841,6 +866,77 @@ fn lower_blocks_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_scheduler_builtin_results(callee: &str, args: &[HirExpr]) {
+        for (result, expected) in [
+            (Type::Void, true),
+            (Builtin::Future.apply(vec![Type::Void]), true),
+            (Type::Named(TypeId::local("Future")), false),
+            (Builtin::Future.apply(vec![]), false),
+            (Builtin::Future.apply(vec![Type::Void, Type::Void]), false),
+            (Builtin::Future.apply(vec![Type::I64]), false),
+            (
+                Type::Generic(TypeId::from("user::Future"), vec![Type::Void]),
+                false,
+            ),
+            (
+                Type::Generic(TypeId::local("FutureLike"), vec![Type::Void]),
+                false,
+            ),
+            (Builtin::Task.apply(vec![Type::Void]), false),
+            (Type::Array(Box::new(Type::Void)), false),
+        ] {
+            assert_eq!(
+                builtin_call(&FunctionId::free_from_source_name(callee), args, &result),
+                expected,
+                "{callee}: {result:?}"
+            );
+        }
+        assert!(!builtin_call(
+            &FunctionId::free_from_source_name(&format!("user::{callee}")),
+            args,
+            &Type::Void
+        ));
+    }
+
+    #[test]
+    fn scheduler_builtin_sleep_requires_exact_future_void_and_duration() {
+        let duration = HirExpr {
+            kind: HirExprKind::Var("duration".into()),
+            ty: Type::I64,
+            span: Span::dummy(),
+        };
+        check_scheduler_builtin_results("sleep", std::slice::from_ref(&duration));
+        let callee = FunctionId::free_from_source_name("sleep");
+        for result in [Type::Void, Builtin::Future.apply(vec![Type::Void])] {
+            assert!(!builtin_call(&callee, &[], &result));
+            assert!(!builtin_call(
+                &callee,
+                &[duration.clone(), duration.clone()],
+                &result
+            ));
+            let mut wrong = duration.clone();
+            wrong.ty = Type::Bool;
+            assert!(!builtin_call(&callee, &[wrong], &result));
+        }
+    }
+
+    #[test]
+    fn scheduler_builtin_yield_requires_exact_future_void_and_no_arguments() {
+        check_scheduler_builtin_results("yield", &[]);
+        let argument = HirExpr {
+            kind: HirExprKind::Var("argument".into()),
+            ty: Type::I64,
+            span: Span::dummy(),
+        };
+        for result in [Type::Void, Builtin::Future.apply(vec![Type::Void])] {
+            assert!(!builtin_call(
+                &FunctionId::free_from_source_name("yield"),
+                std::slice::from_ref(&argument),
+                &result
+            ));
+        }
+    }
 
     fn program(source: &str) -> super::super::super::SourceProgram {
         let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();

@@ -694,10 +694,7 @@ fn lower_env(program: &Program, tables: &PartialCheckerTables) -> LowerEnv {
         ("panic".to_string(), Type::Never),
         (
             "recover".to_string(),
-            Type::Generic(
-                "Option".to_string(),
-                vec![Type::Named("PanicInfo".to_string())],
-            ),
+            B::Option.apply(vec![Type::Named("PanicInfo".to_string())]),
         ),
         ("format".to_string(), Type::String),
         (
@@ -1684,7 +1681,8 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
                 }
                 // An i64 range yields i64 elements.
                 Type::Generic(name, args)
-                    if name.name().as_ref() == "Range" && args.first() == Some(&Type::I64) =>
+                    if B::from_name(name.name().as_ref()) == Some(B::Range)
+                        && args.first() == Some(&Type::I64) =>
                 {
                     Type::I64
                 }

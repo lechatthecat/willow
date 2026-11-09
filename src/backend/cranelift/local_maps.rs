@@ -61,7 +61,8 @@ pub(super) fn confined_scalar_maps(f: &LirFunction) -> bool {
                                 args,
                                 ..
                             } => {
-                                *class == crate::semantic::ids::TypeId::local("Map")
+                                crate::semantic::builtin_types::resolve_name(class)
+                                    == Some(crate::semantic::builtin_types::BuiltinTypeId::Map)
                                     && method == "new"
                                     && args.is_empty()
                             }

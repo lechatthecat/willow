@@ -437,8 +437,9 @@ impl TypeChecker {
             && name == expected_name
             && args.len() == expected_args.len()
             && args.iter().all(|arg| *arg == Type::Void)
-            && ((name == "Map" && call.method == "new")
-                || (name == "Channel" && matches!(call.method.as_str(), "new" | "with_capacity")))
+            && ((B::from_name(name) == Some(B::Map) && call.method == "new")
+                || (B::from_name(name) == Some(B::Channel)
+                    && matches!(call.method.as_str(), "new" | "with_capacity")))
         {
             return expected.clone();
         }
@@ -447,8 +448,8 @@ impl TypeChecker {
 
     pub(super) fn report_contextless_variant(&mut self, name: &str, span: Span) -> bool {
         let enum_name = match name {
-            "Some" | "None" => "Option",
-            "Ok" | "Err" => "Result",
+            "Some" | "None" => B::Option.source_name(),
+            "Ok" | "Err" => B::Result.source_name(),
             _ => return false,
         };
         if !self.prelude_variant_name_is_unshadowed(name) {

@@ -1,6 +1,7 @@
 //! Immutable canonical class layout queries with parent-first evaluation.
 //! Composition is iterative; backend symbol allocation is deliberately separate.
 use super::query::QueryTable;
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use crate::semantic::{ids::TypeId, method_slots::MethodSlots};
 use anyhow::Result;
 use std::{
@@ -101,7 +102,7 @@ pub(crate) fn is_gc_managed(ty: &Type, named: impl FnOnce(TypeId) -> bool) -> bo
     match ty {
         Type::Named(name) => named(*name),
         Type::FixedArray(_, _) | Type::Array(_) | Type::String | Type::Closure(_, _) => true,
-        Type::Generic(name, _) => name.name().as_ref() != "Future",
+        Type::Generic(name, _) => Builtin::from_name(name.name().as_ref()) != Some(Builtin::Future),
         Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never | Type::Fn(_, _) => false,
     }
 }

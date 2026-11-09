@@ -4,6 +4,7 @@
 use super::*;
 use crate::compiler_db::checks::{CheckInput, CheckKind, CheckRecord, CheckValue, SignatureState};
 use crate::qualified_name::QualifiedName;
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use crate::semantic::symbols::{FuncInfo, SymbolReadCapture};
 use serde_json::{Value, json};
 
@@ -42,11 +43,14 @@ impl TypeChecker {
                 .insert(input.clone(), value.clone());
             value
         });
-        if matches!(input, CheckInput::SignatureType(n, _) if n == "Array") {
+        if matches!(input, CheckInput::SignatureType(n, _) if Builtin::from_name(n) == Some(Builtin::Array))
+        {
             let (qualified, missing) = self.signature_array_before.unwrap_or_else(|| {
                 (
-                    self.fully_qualified_collection_types.contains("Array"),
-                    self.missing_collection_imports_reported.contains("Array"),
+                    self.fully_qualified_collection_types
+                        .contains(Builtin::Array.source_name()),
+                    self.missing_collection_imports_reported
+                        .contains(Builtin::Array.source_name()),
                 )
             });
             json!([value, qualified, missing])
@@ -66,7 +70,7 @@ impl TypeChecker {
                 let std_module = QualifiedName::new(name)
                     .split_first()
                     .and_then(|(module, _)| self.imported_std_modules.get(module));
-                let collection = (name == "Array").then(|| {
+                let collection = (Builtin::from_name(name) == Some(Builtin::Array)).then(|| {
                     json!([
                         self.array_abi_files.contains(file),
                         self.provider_template_files.contains(file),
@@ -175,8 +179,10 @@ impl TypeChecker {
             q.signature_checks.set(q.signature_checks.get() + 1);
             self.signature_reads = Some(HashMap::new());
             self.signature_array_before = Some((
-                self.fully_qualified_collection_types.contains("Array"),
-                self.missing_collection_imports_reported.contains("Array"),
+                self.fully_qualified_collection_types
+                    .contains(Builtin::Array.source_name()),
+                self.missing_collection_imports_reported
+                    .contains(Builtin::Array.source_name()),
             ));
             self.signature_qualified.clear();
             self.signature_normalized.clear();

@@ -590,8 +590,8 @@ impl TypeChecker {
             && let Some(template) = self.generics.classes.get(name).cloned()
             && let Some(storage) = &template.abi_storage
         {
-            if name == "Array" {
-                self.check_collection_type_imported("Array", span);
+            if B::from_name(name) == Some(B::Array) {
+                self.check_collection_type_imported(B::Array.source_name(), span);
             }
             if let Some((module, item)) = self.resolve_fully_qualified_std_item(name, span)
                 && module == "collections"
@@ -677,9 +677,15 @@ impl TypeChecker {
                     .iter()
                     .map(|arg| self.normalize_type(arg, span))
                     .collect::<Vec<_>>();
-                if name == "Array" {
-                    self.check_collection_type_imported("Array", span);
-                    return self.normalize_std_type_item(name, "collections", "Array", args, span);
+                if B::from_name(name) == Some(B::Array) {
+                    self.check_collection_type_imported(B::Array.source_name(), span);
+                    return self.normalize_std_type_item(
+                        name,
+                        "collections",
+                        B::Array.source_name(),
+                        args,
+                        span,
+                    );
                 }
                 if let Some(item) = self.imported_collection_aliases.get(name).cloned() {
                     return self.normalize_std_type_item(name, "collections", &item, args, span);
@@ -799,7 +805,7 @@ impl TypeChecker {
 
         if expected == 0 {
             Type::Named(builtin_name.to_string())
-        } else if builtin_name == "Array" {
+        } else if B::from_name(builtin_name) == Some(B::Array) {
             Type::Array(Box::new(
                 args.into_iter().next().expect("validated Array arity"),
             ))
@@ -1470,13 +1476,13 @@ impl TypeChecker {
         // A fixed built-in vocabulary keeps typo recovery independent of the
         // number of declarations; exact missing-import hints above take priority.
         let builtins = [
-            "Array",
-            "Map",
+            B::Array.source_name(),
+            B::Map.source_name(),
             "FrozenArray",
             "Channel",
             "String",
-            "Option",
-            "Result",
+            B::Option.source_name(),
+            B::Result.source_name(),
             "Task",
         ];
         if let Some(suggestion) = suggest_similar_name(
@@ -1497,7 +1503,7 @@ impl TypeChecker {
             Type::Array(element) => self.validate_type(element, span),
             Type::Generic(name, args) => {
                 if builtin_types::is(ty, B::Map) {
-                    self.check_collection_type_imported("Map", span);
+                    self.check_collection_type_imported(B::Map.source_name(), span);
                 }
                 self.check_type_argument_count(name, args.len(), span);
                 // A private generic is as private as a private plain type:
@@ -1516,15 +1522,15 @@ impl TypeChecker {
             Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Void | Type::Never => {}
             Type::Named(name)
                 if matches!(
-                    name.as_str(),
-                    "AtomicI64"
-                        | "AtomicBool"
-                        | "TcpListener"
-                        | "TcpStream"
-                        | "CancellationToken"
-                        | "TaskScope"
-                        | "Cancelled"
-                ) =>
+                    B::from_name(name),
+                    Some(
+                        B::AtomicI64
+                            | B::AtomicBool
+                            | B::CancellationToken
+                            | B::TaskScope
+                            | B::Cancelled
+                    )
+                ) || matches!(name.as_str(), "TcpListener" | "TcpStream") =>
             {
                 // Compiler-known runtime primitives. TCP handles are opaque,
                 // GC-managed objects constructed only by `std::net`.
@@ -1699,8 +1705,7 @@ impl TypeChecker {
             && call.args.is_empty()
             && call.type_args.is_empty()
             && let Type::Generic(name, args) = ty
-            && name != "Option"
-            && name != "Result"
+            && !matches!(B::from_name(name), Some(B::Option | B::Result))
             && args.contains(&Type::Void)
             && let Some(info) = self.symbols.lookup_enum(name)
             && info
@@ -1729,9 +1734,9 @@ impl TypeChecker {
                     && self
                         .enum_variant_resolutions
                         .get(&call.id)
-                        .is_some_and(|name| name == "Result") =>
+                        .is_some_and(|name| B::from_name(name) == Some(B::Result)) =>
             {
-                ("Result", call.callee.as_str())
+                (B::Result.source_name(), call.callee.as_str())
             }
             _ => return None,
         };
@@ -1744,14 +1749,14 @@ impl TypeChecker {
         #[cfg(test)]
         CONSTRUCTOR_INFERENCE_CHECKS.with(|checks| checks.set(checks.get() + 1));
         let var_label = if var == "_" { "x" } else { var };
-        let (code, message, label, hint) = match (name, variant, args.as_slice()) {
-            ("Option", "None", [Type::Void]) => (
+        let (code, message, label, hint) = match (B::from_name(name), variant, args.as_slice()) {
+            (Some(B::Option), "None", [Type::Void]) => (
                 ErrorCode::E1801,
                 "cannot infer type parameter `T` for `Option::None`".to_string(),
                 "type annotation required",
                 format!("add a type annotation, e.g. `let {var_label}: Option<i64> = ...;`"),
             ),
-            ("Result", "Ok", [_, Type::Void]) => (
+            (Some(B::Result), "Ok", [_, Type::Void]) => (
                 ErrorCode::E1803,
                 "cannot infer error type `E` for `Result::Ok`".to_string(),
                 "error type is unknown",
@@ -1759,7 +1764,7 @@ impl TypeChecker {
                     "add a type annotation, e.g. `let {var_label}: Result<i64, String> = ...;`"
                 ),
             ),
-            ("Result", "Err", [Type::Void, _]) => (
+            (Some(B::Result), "Err", [Type::Void, _]) => (
                 ErrorCode::E1803,
                 "cannot infer success type `T` for `Result::Err`".to_string(),
                 "success type is unknown",
@@ -2306,19 +2311,31 @@ fn imported_class_info_from_decl(
 }
 
 fn missing_builtin_type_arguments(name: &str) -> Option<&'static str> {
-    match name {
-        "Task" => Some("()"),
-        "Map" | "FrozenMap" => Some("K, V"),
-        "Result" => Some("T, E"),
-        "Option" | "TaskResult" | "Future" | "JoinHandle" | "Array" | "FrozenArray" | "Channel"
-        | "BlockingCell" | "BlockingRwCell" | "Mutex" | "RwLock" | "Range" => Some("T"),
+    match B::from_name(name) {
+        Some(B::Task) => Some("()"),
+        Some(B::Map | B::FrozenMap) => Some("K, V"),
+        Some(B::Result) => Some("T, E"),
+        Some(
+            B::Option
+            | B::TaskResult
+            | B::Future
+            | B::JoinHandle
+            | B::Array
+            | B::FrozenArray
+            | B::Channel
+            | B::BlockingCell
+            | B::BlockingRwCell
+            | B::Mutex
+            | B::RwLock
+            | B::Range,
+        ) => Some("T"),
         _ => None,
     }
 }
 
 /// Whether a generic head is compiler-known without a symbol table entry.
 fn compiler_known_generic_head(name: &str) -> bool {
-    B::from_name(name).is_some() || matches!(name, "Mutex" | "RwLock" | "Range")
+    B::from_name(name).is_some()
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 //! `Scalar` retains its R2 public name for API compatibility.
 use crate::parser::ast::Type;
 use crate::qualified_name::QualifiedName;
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
@@ -50,16 +51,25 @@ impl Scalar {
             Type::Array(inner) if **inner == Type::I64 => Self::Bytes,
             // `Array` is a source-defined class, so the parser keeps
             // `Array<i64>` as a plain generic application.
-            Type::Generic(name, args) if name == "Array" && args.as_slice() == [Type::I64] => {
+            Type::Generic(name, args)
+                if Builtin::from_name(name) == Some(Builtin::Array)
+                    && args.as_slice() == [Type::I64] =>
+            {
                 Self::Bytes
             }
-            Type::Generic(name, args) if name == "Option" && args.len() == 1 => {
+            Type::Generic(name, args)
+                if Builtin::from_name(name) == Some(Builtin::Option) && args.len() == 1 =>
+            {
                 Self::Option(Box::new(Self::from_type_with_opaque(&args[0], names)?))
             }
-            Type::Generic(name, args) if name == "Result" && args.len() == 2 => Self::Result(
-                Box::new(Self::from_type_with_opaque(&args[0], names)?),
-                Box::new(Self::from_type_with_opaque(&args[1], names)?),
-            ),
+            Type::Generic(name, args)
+                if Builtin::from_name(name) == Some(Builtin::Result) && args.len() == 2 =>
+            {
+                Self::Result(
+                    Box::new(Self::from_type_with_opaque(&args[0], names)?),
+                    Box::new(Self::from_type_with_opaque(&args[1], names)?),
+                )
+            }
             _ => return None,
         })
     }

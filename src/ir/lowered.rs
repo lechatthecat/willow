@@ -2198,7 +2198,7 @@ impl Builder {
         let failure_value = if is_option {
             self.push_compute(
                 LirRvalue::EnumAlloc {
-                    class: TypeId::local("Option"),
+                    class: TypeId::local(B::Option.source_name()),
                     variant: "None".into(),
                     enum_ty: return_type.clone(),
                 },
@@ -2235,7 +2235,7 @@ impl Builder {
                 );
                 let result = self.push_compute(
                     LirRvalue::EnumAlloc {
-                        class: TypeId::local("Result"),
+                        class: TypeId::local(B::Result.source_name()),
                         variant: "Err".into(),
                         enum_ty: return_type.clone(),
                     },
@@ -2247,7 +2247,7 @@ impl Builder {
                     local: result,
                     value: LirRvalue::EnumPayloadStore {
                         object: LirOperand::Local(result),
-                        class: TypeId::local("Result"),
+                        class: TypeId::local(B::Result.source_name()),
                         variant: "Err".into(),
                         index: 0,
                         value: LirOperand::Local(converted),
@@ -4250,7 +4250,7 @@ impl Builder {
             // position from running twice.
             (_, Type::Generic(g, args))
                 if g.namespace().is_none()
-                    && g.name().as_ref() == "Range"
+                    && B::from_name(g.name().as_ref()) == Some(B::Range)
                     && args.first() == Some(&Type::I64) =>
             {
                 let range_name = format!("__for{n}_range");

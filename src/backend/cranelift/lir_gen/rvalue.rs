@@ -1065,12 +1065,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let resolved_class = self.static_call_class_name(class);
         let class = resolved_class.as_str();
-        if class == "Map" && method == "new" {
+        let builtin_class = B::from_name(class);
+        if builtin_class == Some(B::Map) && method == "new" {
             let (key, value) = builtin_types::binary_args(ret_ty, B::Map)
                 .expect("map constructor must carry checked type arguments");
             return self.emit_map_new(key, value);
         }
-        if class == "Channel"
+        if builtin_class == Some(B::Channel)
             && let Type::Generic(_, type_args) = ret_ty
             && let Some(element_ty) = type_args.first()
         {
@@ -1094,14 +1095,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         if let Some(handle) = cancellation_handle(ret_ty)
             && method == "new"
-            && class == handle.class_name()
+            && builtin_class == Some(handle.type_id())
         {
             let runtime = format!("{}_new", handle.prefix());
             return self.emit_value_runtime_call(&runtime, &[]);
         }
         if let Some(cell) = atomic_cell(ret_ty)
             && method == "new"
-            && class == cell.class_name()
+            && builtin_class == Some(cell.type_id())
         {
             let initial = args[0];
             let runtime = format!("willow_atomic_{}_new", cell.suffix());
@@ -1109,7 +1110,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         if let Some((kind, elem)) = blocking_cell(ret_ty)
             && method == "new"
-            && class == kind.class_name()
+            && builtin_class == Some(kind.type_id())
         {
             // The runtime allocates the cell on the GC heap  and
             // roots a reference word itself across that allocation, so no
@@ -1127,7 +1128,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         if let Some((prefix, protected)) = scheduler_lock(ret_ty)
             && method == "new"
-            && matches!(class, "Mutex" | "RwLock")
+            && matches!(builtin_class, Some(B::Mutex | B::RwLock))
         {
             let protected = protected.clone();
             let mut initial = self.emit_to_storage_word(args[0], &protected);

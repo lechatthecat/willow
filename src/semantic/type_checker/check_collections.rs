@@ -159,7 +159,7 @@ impl TypeChecker {
             .or_else(|| {
                 self.generics
                     .classes
-                    .get("Array")
+                    .get(B::Array.source_name())
                     .filter(|c| c.abi_storage.is_some())
                     .cloned()
             });
@@ -270,7 +270,7 @@ impl TypeChecker {
                 {
                     "$std::collections::Array"
                 } else {
-                    "Array"
+                    B::Array.source_name()
                 };
                 if let Some(receiver) =
                     self.instantiate_class(access, &[elem.as_ref().clone()], m.span)
@@ -420,13 +420,19 @@ impl TypeChecker {
         }
 
         if let Some((arity, key, value)) = super::builtin_methods::map_method(&m.method)
-            && self.check_builtin_arity(arity, "Map", &m.method, m.args.len(), m.span)
+            && self.check_builtin_arity(
+                arity,
+                B::Map.source_name(),
+                &m.method,
+                m.args.len(),
+                m.span,
+            )
         {
             if key {
                 let got = self.check_expr(&m.args[0].expr);
                 self.check_builtin_argument(
                     BuiltinArgument::MapKey,
-                    "Map",
+                    B::Map.source_name(),
                     &m.method,
                     &key_ty,
                     &got,
@@ -437,7 +443,7 @@ impl TypeChecker {
                 let got = self.check_expr_expecting(&m.args[1].expr, &val_ty);
                 self.check_builtin_argument(
                     BuiltinArgument::MapValue,
-                    "Map",
+                    B::Map.source_name(),
                     &m.method,
                     &val_ty,
                     &got,

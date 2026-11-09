@@ -1265,6 +1265,8 @@ pub(super) fn task_stack_boundary(value: &crate::ir::lowered::LirRvalue) -> bool
     {
         return true;
     }
+    // Locks and ranges retain ordinary call boundaries even though their
+    // nominal heads now have builtin identities.
     match value {
         R::DirectCall { .. }
         | R::IndirectCall { .. }
@@ -1272,10 +1274,12 @@ pub(super) fn task_stack_boundary(value: &crate::ir::lowered::LirRvalue) -> bool
         | R::Print { .. }
         | R::AwaitFuture { .. } => true,
         R::StaticCall { class, .. } | R::ConstructorCall { class, .. } => {
-            crate::semantic::builtin_types::resolve(&Type::Named(*class)).is_none()
+            crate::semantic::builtin_types::resolve(&Type::Named(*class))
+                .is_none_or(|ty| matches!(ty.id, B::Mutex | B::RwLock | B::Range))
         }
         R::MethodCall { receiver_ty, .. } | R::EnumMethod { receiver_ty, .. } => {
-            crate::semantic::builtin_types::resolve(receiver_ty).is_none()
+            crate::semantic::builtin_types::resolve(receiver_ty)
+                .is_none_or(|ty| matches!(ty.id, B::Mutex | B::RwLock | B::Range))
         }
         _ => false,
     }

@@ -2,6 +2,7 @@ use crate::compiler_db::checks::{CheckInput, CheckKind, CheckRecord, CheckValue}
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use crate::semantic::ids::{FunctionId, TypeId};
 use std::collections::{HashMap, HashSet};
 
@@ -492,7 +493,7 @@ impl ConcurrencyAnalyzer {
                         | Type::Array(_)
                         | Type::FixedArray(..)
                 ) || matches!(&param.ty, Type::Named(name) if self.reference_class(name))
-                    || matches!(&param.ty, Type::Generic(name, _) if name == "Array" || self.reference_class(name))
+                    || matches!(&param.ty, Type::Generic(name, _) if Builtin::from_name(name) == Some(Builtin::Array) || self.reference_class(name))
                 {
                     continue;
                 }

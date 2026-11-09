@@ -1,6 +1,7 @@
 //! Builtin call contracts. Keep legacy diagnostic spelling and evaluation
 //! policy separate: an arity error must not change which expressions are checked.
 use super::*;
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 
 #[cfg(test)]
 thread_local! {
@@ -163,28 +164,39 @@ pub(super) fn option_method(owner: B, method: &str) -> Option<(BuiltinArity, Opt
 
 pub(super) fn method_arity(owner: &str, method: &str) -> BuiltinArity {
     use ArityText::*;
-    match (owner, method) {
-        ("Map", _) => map_method(method).expect("known Map method").0,
-        ("Channel", "send") => BuiltinArity::new(1, Plain),
-        ("Channel", "recv" | "recv_opt" | "close")
-        | ("Task", "result" | "cancel" | "is_cancelled") => BuiltinArity::new(0, Plain),
-        ("CancellationToken" | "TaskScope", "attach" | "add") => BuiltinArity::new(1, Method("")),
-        ("CancellationToken" | "TaskScope", "cancel" | "is_cancelled" | "child" | "finish") => {
-            BuiltinArity::new(0, QualifiedCount)
+    match (Builtin::from_name(owner), method) {
+        (Some(Builtin::Map), _) => map_method(method).expect("known Map method").0,
+        (Some(Builtin::Channel), "send") => BuiltinArity::new(1, Plain),
+        (Some(Builtin::Channel), "recv" | "recv_opt" | "close")
+        | (Some(Builtin::Task), "result" | "cancel" | "is_cancelled") => {
+            BuiltinArity::new(0, Plain)
         }
-        ("primitive", "toString") => BuiltinArity::new(0, Display).label("unexpected arguments"),
+        (Some(Builtin::CancellationToken | Builtin::TaskScope), "attach" | "add") => {
+            BuiltinArity::new(1, Method(""))
+        }
+        (
+            Some(Builtin::CancellationToken | Builtin::TaskScope),
+            "cancel" | "is_cancelled" | "child" | "finish",
+        ) => BuiltinArity::new(0, QualifiedCount),
+        (None, "toString") if owner == "primitive" => {
+            BuiltinArity::new(0, Display).label("unexpected arguments")
+        }
         _ => unreachable!("missing builtin arity: {owner}::{method}"),
     }
 }
 
 pub(super) fn constructor_arity(owner: &str, method: &str) -> BuiltinArity {
-    if owner == "Map" {
+    let owner_id = Builtin::from_name(owner);
+    if owner_id == Some(Builtin::Map) {
         return BuiltinArity::new(0, ArityText::Method("")).label("unexpected arguments");
     }
-    if matches!(owner, "CancellationToken" | "TaskScope") {
+    if matches!(
+        owner_id,
+        Some(Builtin::CancellationToken | Builtin::TaskScope)
+    ) {
         return BuiltinArity::new(0, ArityText::Constructor).label("wrong constructor arguments");
     }
-    if owner == "Channel" && method == "new" {
+    if owner_id == Some(Builtin::Channel) && method == "new" {
         let mut arity = BuiltinArity::new(0, ArityText::Function);
         arity.help = Some("use `Channel::with_capacity(n)` to create a bounded channel");
         return arity;

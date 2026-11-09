@@ -1,3 +1,4 @@
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
 use cranelift_module::Module;
 
@@ -24,7 +25,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr: cranelift_codegen::ir::Value,
         inner_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let option_ty = Type::Generic("Option".to_string().into(), vec![inner_ty.clone()]);
+        let option_ty = Builtin::Option.apply(vec![inner_ty.clone()]);
         if self.option_repr(&option_ty) == Some(OptionRepr::NullableGcPointer) {
             return self.builder.ins().icmp_imm_u(IntCC::NotEqual, ptr, 0);
         }
@@ -38,7 +39,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr: cranelift_codegen::ir::Value,
         inner_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let option_ty = Type::Generic("Option".to_string().into(), vec![inner_ty.clone()]);
+        let option_ty = Builtin::Option.apply(vec![inner_ty.clone()]);
         let raw = if self.option_repr(&option_ty) == Some(OptionRepr::NullableGcPointer) {
             ptr
         } else {
@@ -236,7 +237,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let output_ty = Type::Generic("Option".to_string().into(), vec![ret_ty.clone()]);
+        let output_ty = Builtin::Option.apply(vec![ret_ty.clone()]);
         let result_var = self.builder.declare_var(self.clif_type(&output_ty));
         let is_some = self.emit_option_is_some(ptr, inner_ty);
 
@@ -318,7 +319,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let output_ty = Type::Generic("Option".to_string().into(), vec![inner_ty.clone()]);
+        let output_ty = Builtin::Option.apply(vec![inner_ty.clone()]);
         let result_var = self.builder.declare_var(self.clif_type(&output_ty));
         let is_some = self.emit_option_is_some(ptr, inner_ty);
 
@@ -363,7 +364,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             ResultSide::Ok => vec![ret_ty.clone(), err_ty.clone()],
             ResultSide::Err => vec![ok_ty.clone(), ret_ty.clone()],
         };
-        let output_ty = Type::Generic("Result".to_string().into(), type_args);
+        let output_ty = Builtin::Result.apply(type_args);
         self.emit_result_arms(ptr, &output_ty, |this, arm| {
             let arm_ty = arm.payload_ty(ok_ty, err_ty);
             let payload = this.emit_result_arm_payload(ptr, arm_ty);
@@ -524,7 +525,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         payload_ty: &Type,
         payload_val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        let option_ty = Type::Generic("Option".to_string().into(), vec![payload_ty.clone()]);
+        let option_ty = Builtin::Option.apply(vec![payload_ty.clone()]);
         if self.option_repr(&option_ty) == Some(OptionRepr::NullableGcPointer) {
             payload_val
         } else if super::option_repr::is_scalar_pair(&option_ty) {
@@ -541,7 +542,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         payload_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let option_ty = Type::Generic("Option".to_string().into(), vec![payload_ty.clone()]);
+        let option_ty = Builtin::Option.apply(vec![payload_ty.clone()]);
         if self.option_repr(&option_ty) == Some(OptionRepr::NullableGcPointer) {
             self.builder
                 .ins()

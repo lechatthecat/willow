@@ -1,3 +1,4 @@
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use cranelift_codegen::ir::{
     InstBuilder, MemFlagsData, StackSlot, StackSlotData, StackSlotKind, Value, condcodes::IntCC,
     types,
@@ -327,7 +328,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .store(MemFlagsData::new(), zero64, frame, phase_offset);
         let handle_ty = Type::Generic(
             match mode {
-                LockMode::Mutex => "Mutex",
+                LockMode::Mutex => Builtin::Mutex.source_name(),
                 LockMode::Read | LockMode::Write => "RwLock",
                 LockMode::Group => unreachable!("group cleanup dispatched separately"),
             }
@@ -460,7 +461,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for member in members {
             let handle_ty = Type::Generic(
                 match member.mode {
-                    LockMode::Mutex => "Mutex",
+                    LockMode::Mutex => Builtin::Mutex.source_name(),
                     LockMode::Read | LockMode::Write => "RwLock",
                     LockMode::Group => unreachable!("nested group member"),
                 }

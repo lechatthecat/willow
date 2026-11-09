@@ -703,12 +703,12 @@ impl AtomicCell {
         if self.is_i64 { "i64" } else { "bool" }
     }
 
-    /// The prelude name this cell is constructed through.
-    pub(super) fn class_name(self) -> &'static str {
+    /// The builtin identity this cell is constructed through.
+    pub(super) fn type_id(self) -> B {
         if self.is_i64 {
-            "AtomicI64"
+            B::AtomicI64
         } else {
-            "AtomicBool"
+            B::AtomicBool
         }
     }
 }
@@ -772,12 +772,12 @@ impl CancelHandle {
         }
     }
 
-    /// The prelude name this handle is constructed through.
-    pub(super) fn class_name(self) -> &'static str {
+    /// The builtin identity this handle is constructed through.
+    pub(super) fn type_id(self) -> B {
         if self.is_token {
-            "CancellationToken"
+            B::CancellationToken
         } else {
-            "TaskScope"
+            B::TaskScope
         }
     }
 }
@@ -822,12 +822,12 @@ impl BlockingCellKind {
         }
     }
 
-    /// The prelude name this cell is constructed through.
-    pub(super) fn class_name(self) -> &'static str {
+    /// The builtin identity this cell is constructed through.
+    pub(super) fn type_id(self) -> B {
         if self.is_rw {
-            "BlockingRwCell"
+            B::BlockingRwCell
         } else {
-            "BlockingCell"
+            B::BlockingCell
         }
     }
 }
@@ -854,9 +854,7 @@ pub(super) fn blocking_cell(ty: &Type) -> Option<(BlockingCellKind, &Type)> {
 /// Whether `ty` is a scheduler-aware lock, and over which protected type
 ///.
 ///
-/// Matched by NAME rather than through [`builtin_types`], because these two are
-/// not builtin type ids: the checker keys `lock`/`read`/`write` on exactly these
-/// two spellings too ([`crate::parser::ast::LockMode::lock_type_name`]).
+/// The resolved head keeps the existing terminal-name matching policy.
 ///
 /// The `&'static str` is the runtime symbol PREFIX, which is what distinguishes
 /// the two state machines: `Mutex<T>` has one owner, `RwLock<T>` has readers and
@@ -868,9 +866,9 @@ pub(super) fn scheduler_lock(ty: &Type) -> Option<(&'static str, &Type)> {
     let [protected] = args.as_slice() else {
         return None;
     };
-    match name.name().as_ref() {
-        "Mutex" => Some(("willow_async_mutex", protected)),
-        "RwLock" => Some(("willow_async_rwlock", protected)),
+    match B::from_name(name.name().as_ref()) {
+        Some(B::Mutex) => Some(("willow_async_mutex", protected)),
+        Some(B::RwLock) => Some(("willow_async_rwlock", protected)),
         _ => None,
     }
 }
@@ -948,8 +946,8 @@ pub(super) fn option_result_method(recv: &Type, method: &str, args: &[Type]) -> 
         }
     };
     let non_void = |t: Type| (!matches!(t, Type::Void)).then_some(t);
-    let option_of = |t: Type| Type::Generic("Option".to_string().into(), vec![t]);
-    let result_of = |ok: Type, err: Type| Type::Generic("Result".to_string().into(), vec![ok, err]);
+    let option_of = |t: Type| B::Option.apply(vec![t]);
+    let result_of = |ok: Type, err: Type| B::Result.apply(vec![ok, err]);
     match resolved.id {
         B::Option => match method {
             "is_some" | "is_none" => no_args(Type::Bool),
@@ -2172,16 +2170,17 @@ fn supported_expr_node<'n>(
             // symbol they mangle — sees the one name.
             let class_spelling = class.to_string();
             let class = ctx.resolved_class(&class_spelling);
+            let builtin_class = B::from_name(class);
             // `Map::new` is the one builtin constructor in the subset. The
             // result type decides, not the spelling, so a user class called
             // `Map` cannot reach `willow_map_new`: it would have a `Named` type
             // and fall through to the class path below. The empty map is either
             // already instantiated (and then vetted by `supported_type` above)
             // or carries the untyped `Map<Void, Void>` the checker gives it.
-            if class == "Map" && method == "new" && args.is_empty() {
+            if builtin_class == Some(B::Map) && method == "new" && args.is_empty() {
                 return matches!(lir_collection(&e.ty), Some((LirCollection::Map, _)));
             }
-            if class == "Channel"
+            if builtin_class == Some(B::Channel)
                 && matches!(method.as_str(), "new" | "with_capacity")
                 && builtin_types::unary_arg(&e.ty, B::Channel).is_some()
                 && ctx.supported_type(&e.ty)
@@ -2203,7 +2202,7 @@ fn supported_expr_node<'n>(
             // step.
             if let Some(cell) = atomic_cell(&e.ty)
                 && method == "new"
-                && class == cell.class_name()
+                && builtin_class == Some(cell.type_id())
             {
                 return matches!(args.as_slice(), [a] if a.ty == cell.word())
                     && child_supported(&args[0]);
@@ -2216,7 +2215,7 @@ fn supported_expr_node<'n>(
             // `assignable_repr` rather than `storable`.
             if let Some((kind, elem)) = blocking_cell(&e.ty)
                 && method == "new"
-                && class == kind.class_name()
+                && builtin_class == Some(kind.type_id())
             {
                 return matches!(args.as_slice(), [a] if ctx.same_repr(elem, &a.ty))
                     && child_supported(&args[0]);
@@ -2227,7 +2226,7 @@ fn supported_expr_node<'n>(
             // way, on the class as well as the result type.
             if let Some((_, protected)) = scheduler_lock(&e.ty)
                 && method == "new"
-                && matches!(class, "Mutex" | "RwLock")
+                && matches!(builtin_class, Some(B::Mutex | B::RwLock))
             {
                 return matches!(args.as_slice(), [a] if ctx.same_repr(protected, &a.ty))
                     && child_supported(&args[0]);
@@ -2237,7 +2236,7 @@ fn supported_expr_node<'n>(
             // type, for the same reason the cell constructor above is.
             if let Some(handle) = cancellation_handle(&e.ty)
                 && method == "new"
-                && class == handle.class_name()
+                && builtin_class == Some(handle.type_id())
             {
                 return args.is_empty();
             }

@@ -4,6 +4,7 @@ use super::{LirLocal, LirLocalId, SourceBlock, SourceInst, SourceTerminator};
 use crate::diagnostics::Span;
 use crate::ir::typed_ast::{HirExpr, HirExprKind};
 use crate::parser::ast::{BinOp, ExprId, UnaryOp};
+use crate::semantic::builtin_types::{self, BuiltinTypeId as Builtin};
 use crate::semantic::ids::{FunctionId, SemanticType as Type, TypeId};
 use std::collections::HashMap;
 
@@ -394,20 +395,20 @@ impl LirRvalue {
             Self::CaptureArrayOwner { .. } => false,
             Self::ReferenceDebug { argument, .. } => destination.ty == Type::Void && matches!(argument, LirOperand::Reference { .. }) && ty(argument).is_some(),
             Self::Use(operand) => ty(operand).as_ref() == Some(&destination.ty),
-            Self::StartTask { args, params, output, .. } => destination.ty == Type::Generic(TypeId::local("Task"), vec![output.clone()]) && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| ty(arg).as_ref() == Some(param)),
-            Self::AwaitFuture { future, result } => destination.ty == *result && ty(future) == Some(Type::Generic(TypeId::local("Future"), vec![result.clone()])),
+            Self::StartTask { args, params, output, .. } => matches!(&destination.ty, Type::Generic(name, payloads) if builtin_types::resolve_name(name) == Some(Builtin::Task) && payloads == std::slice::from_ref(output)) && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| ty(arg).as_ref() == Some(param)),
+            Self::AwaitFuture { future, result } => destination.ty == *result && matches!(ty(future).as_ref(), Some(Type::Generic(name, payloads)) if builtin_types::resolve_name(name) == Some(Builtin::Future) && payloads == std::slice::from_ref(result)),
             Self::SelectIdleWait { deadlines } => destination.ty == Type::Void && deadlines.iter().all(|operand| ty(operand) == Some(Type::I64)),
             Self::Coerce { value, source, target } => ty(value).as_ref() == Some(source) && destination.ty == *target,
             Self::ArrayAlloc { element, .. } => destination.ty == Type::Array(Box::new(element.clone())),
             Self::ArrayStore { array, index, value, element } => ty(array) == Some(Type::Array(Box::new(element.clone()))) && ty(index) == Some(Type::I64) && ty(value).is_some() && destination.ty == Type::Void,
-            Self::Index { array, index, element } => ty(index) == Some(Type::I64) && destination.ty == *element && ty(array).is_some_and(|array| match &array { Type::Array(inner) => **inner == *element, Type::Generic(name, args) => *name == TypeId::local("FrozenArray") && args == std::slice::from_ref(element), _ => false }),
+            Self::Index { array, index, element } => ty(index) == Some(Type::I64) && destination.ty == *element && ty(array).is_some_and(|array| match &array { Type::Array(inner) => **inner == *element, Type::Generic(name, args) => crate::semantic::builtin_types::resolve_name(name) == Some(crate::semantic::builtin_types::BuiltinTypeId::FrozenArray) && args == std::slice::from_ref(element), _ => false }),
             Self::ObjectAlloc { class } => destination.ty == Type::Named(*class),
             Self::FieldLoad { object, object_ty, result, .. } => ty(object).as_ref() == Some(object_ty) && destination.ty == *result,
             Self::FieldStore { object, object_ty, value, .. } => ty(object).as_ref() == Some(object_ty) && ty(value).is_some() && destination.ty == Type::Void,
             Self::StaticField { result, .. } => destination.ty == *result,
             Self::StaticStore { value, .. } => ty(value).is_some() && destination.ty == Type::Void,
             Self::ConstructorCall { object, class, args, arg_types } => ty(object) == Some(Type::Named(*class)) && destination.ty == Type::Void && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| ty(arg).as_ref() == Some(expected)),
-            Self::Range { start, end } => ty(start) == Some(Type::I64) && ty(end) == Some(Type::I64) && destination.ty == Type::Generic(TypeId::local("Range"), vec![Type::I64]),
+            Self::Range { start, end } => ty(start) == Some(Type::I64) && ty(end) == Some(Type::I64) && matches!(&destination.ty, Type::Generic(name, payloads) if builtin_types::resolve_name(name) == Some(Builtin::Range) && payloads == &[Type::I64]),
             Self::EnumMethod { receiver, receiver_ty, args, arg_types, result, .. } => ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| ty(arg).as_ref() == Some(expected)),
             Self::BuiltinCall { args, params, result, .. } => destination.ty == *result && args.len() == params.len() && args.iter().zip(params).all(|(arg, expected)| ty(arg).as_ref() == Some(expected)),
             Self::StaticCall { args, arg_types, result, .. } => destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| ty(arg).as_ref() == Some(expected)),
@@ -415,7 +416,7 @@ impl LirRvalue {
             Self::EnumPayloadStore { object, value, source, enum_ty, .. } => ty(object).as_ref() == Some(enum_ty) && ty(value).as_ref() == Some(source) && destination.ty == *enum_ty,
             Self::FormatScalar { value, ty: expected, format } => ty(value).as_ref() == Some(expected) && destination.ty == Type::String && if format.is_some() { *expected == Type::F64 } else { matches!(expected, Type::I64 | Type::F64 | Type::Bool | Type::String) },
             Self::Panic { message } => ty(message) == Some(Type::String) && destination.ty == Type::Never,
-            Self::Recover => destination.ty == Type::Generic(TypeId::local("Option"), vec![Type::Named(TypeId::local("PanicInfo"))]),
+            Self::Recover => destination.ty == Type::Generic(TypeId::local(Builtin::Option.source_name()), vec![Type::Named(TypeId::local("PanicInfo"))]),
             Self::RebindResultError { value, source, target } | Self::IntoError { value, source, target } => ty(value).as_ref() == Some(source) && destination.ty == *target,
             Self::PrepareMethod { receiver, receiver_ty, .. } => ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *receiver_ty,
             Self::MethodCall { receiver, receiver_ty, args, arg_types, result, .. } => ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| ty(arg).as_ref() == Some(expected)),
@@ -574,6 +575,117 @@ mod tests {
     }
 
     use super::*;
+
+    fn value_local(id: u32, ty: Type) -> LirLocal {
+        LirLocal {
+            storage_kind: super::super::LirStorageKind::Value,
+            id: LirLocalId(id),
+            name: format!("v{id}"),
+            ty,
+            source_span: None,
+            synthetic: true,
+            parameter: false,
+        }
+    }
+
+    fn nominal_shapes(id: Builtin) -> Vec<(Type, bool)> {
+        let name = id.source_name();
+        vec![
+            (id.apply(vec![Type::I64]), true),
+            (Type::Named(TypeId::local(name)), false),
+            (id.apply(vec![]), false),
+            (id.apply(vec![Type::I64, Type::I64]), false),
+            (id.apply(vec![Type::Bool]), false),
+            (
+                Type::Generic(TypeId::from(format!("user::{name}")), vec![Type::I64]),
+                false,
+            ),
+            (
+                Type::Generic(TypeId::local(format!("{name}Like")), vec![Type::I64]),
+                false,
+            ),
+            (Type::Array(Box::new(Type::I64)), false),
+        ]
+    }
+
+    #[test]
+    fn builtin_verifier_start_task_preserves_nominal_shape_and_arguments() {
+        let task = LirRvalue::StartTask {
+            callee: FunctionId::free_from_source_name("work"),
+            args: vec![LirOperand::Int(1)],
+            params: vec![Type::I64],
+            output: Type::I64,
+        };
+        for (ty, expected) in nominal_shapes(Builtin::Task) {
+            assert_eq!(
+                task.is_well_typed(&[value_local(0, ty.clone())], LirLocalId(0)),
+                expected,
+                "{ty:?}"
+            );
+        }
+        let locals = [value_local(0, Builtin::Task.apply(vec![Type::I64]))];
+        for (args, params) in [
+            (vec![], vec![Type::I64]),
+            (vec![LirOperand::Int(1)], vec![]),
+            (vec![LirOperand::Bool(true)], vec![Type::I64]),
+            (vec![LirOperand::Local(LirLocalId(9))], vec![Type::I64]),
+        ] {
+            let bad = LirRvalue::StartTask {
+                callee: FunctionId::free_from_source_name("work"),
+                args,
+                params,
+                output: Type::I64,
+            };
+            assert!(!bad.is_well_typed(&locals, LirLocalId(0)));
+        }
+    }
+
+    #[test]
+    fn builtin_verifier_await_future_preserves_nominal_shape_and_result() {
+        let awaiter = LirRvalue::AwaitFuture {
+            future: LirOperand::Local(LirLocalId(1)),
+            result: Type::I64,
+        };
+        for (ty, expected) in nominal_shapes(Builtin::Future) {
+            let locals = [value_local(0, Type::I64), value_local(1, ty.clone())];
+            assert_eq!(
+                awaiter.is_well_typed(&locals, LirLocalId(0)),
+                expected,
+                "{ty:?}"
+            );
+        }
+        assert!(!awaiter.is_well_typed(&[value_local(0, Type::I64)], LirLocalId(0)));
+        assert!(!awaiter.is_well_typed(
+            &[
+                value_local(0, Type::Bool),
+                value_local(1, Builtin::Future.apply(vec![Type::I64]))
+            ],
+            LirLocalId(0)
+        ));
+    }
+
+    #[test]
+    fn builtin_verifier_range_preserves_nominal_shape_and_bounds() {
+        let range = LirRvalue::Range {
+            start: LirOperand::Int(0),
+            end: LirOperand::Int(3),
+        };
+        for (ty, expected) in nominal_shapes(Builtin::Range) {
+            assert_eq!(
+                range.is_well_typed(&[value_local(0, ty.clone())], LirLocalId(0)),
+                expected,
+                "{ty:?}"
+            );
+        }
+        let locals = [value_local(0, Builtin::Range.apply(vec![Type::I64]))];
+        for (start, end) in [
+            (LirOperand::Bool(false), LirOperand::Int(3)),
+            (LirOperand::Int(0), LirOperand::Bool(true)),
+            (LirOperand::Local(LirLocalId(9)), LirOperand::Int(3)),
+        ] {
+            assert!(!LirRvalue::Range { start, end }.is_well_typed(&locals, LirLocalId(0)));
+        }
+    }
 
     #[test]
     fn scalar_operators_become_flat_local_operands() {

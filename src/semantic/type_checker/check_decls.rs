@@ -1,6 +1,7 @@
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
 use crate::qualified_name::QualifiedName;
+use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use crate::semantic::symbols::*;
 use std::collections::HashSet;
 
@@ -217,7 +218,8 @@ impl TypeChecker {
     }
 
     pub(super) fn check_collection_type_imported(&mut self, name: &str, span: Span) {
-        if (name == "Array" && self.array_abi_files.contains(&span.file_id))
+        if (Builtin::from_name(name) == Some(Builtin::Array)
+            && self.array_abi_files.contains(&span.file_id))
             || self.provider_template_files.contains(&span.file_id)
             || self.imported_collection_types.contains(name)
             || self.fully_qualified_collection_types.contains(name)
@@ -231,9 +233,9 @@ impl TypeChecker {
         {
             return;
         }
-        let (code, help) = match name {
-            "Array" => (ErrorCode::E2001, "add `import std::collections::Array;`"),
-            "Map" => (ErrorCode::E2002, "add `import std::collections::Map;`"),
+        let (code, help) = match Builtin::from_name(name) {
+            Some(Builtin::Array) => (ErrorCode::E2001, "add `import std::collections::Array;`"),
+            Some(Builtin::Map) => (ErrorCode::E2002, "add `import std::collections::Map;`"),
             _ => return,
         };
         self.push(
