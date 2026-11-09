@@ -41,9 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
-      - name: Select native toolchain
-        run: rustup override set 1.96.0-${{ matrix.target }}
+        run: rustup show active-toolchain
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

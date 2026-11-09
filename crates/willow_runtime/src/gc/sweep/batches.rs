@@ -190,7 +190,13 @@ pub(super) fn execute(mut plan: SweepPlan) -> usize {
     }
     if std::env::var("WILLOW_GC_LOG").is_ok() {
         eprintln!(
-            "[gc] sweep background_limits=256/1048576/1000000 assist_limits=32/65536/100000 {:?}",
+            "[gc] sweep background_limits={}/{}/{} assist_limits={}/{}/{} {:?}",
+            BACKGROUND.objects,
+            BACKGROUND.bytes,
+            BACKGROUND.ns,
+            ALLOCATION.objects,
+            ALLOCATION.bytes,
+            ALLOCATION.ns,
             cursor.report
         );
     }

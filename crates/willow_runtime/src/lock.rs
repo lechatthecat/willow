@@ -225,37 +225,47 @@ fn alloc_cell_payload(type_id: u32, payload_size: usize, value: &mut i64, is_ref
     payload
 }
 
-#[unsafe(no_mangle)]
-#[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_blocking_cell_new(value: i64, is_ref: i64) -> *mut c_void {
+/// Allocate and initialize a cell before publishing its initial GC edge.
+fn new_blocking_cell<T>(
+    mut value: i64,
+    is_ref: i64,
+    type_id: u32,
+    destination: GcStoreDestination,
+    init: impl FnOnce(i64, bool) -> T,
+) -> *mut c_void {
     let is_ref = is_ref != 0;
-    let mut value = value;
-    let payload = alloc_cell_payload(
-        BLOCKING_CELL_TYPE_ID,
-        std::mem::size_of::<WillowBlockingCell>(),
-        &mut value,
-        is_ref,
-    );
+    let payload = alloc_cell_payload(type_id, std::mem::size_of::<T>(), &mut value, is_ref);
     if payload.is_null() {
         return std::ptr::null_mut();
     }
-    // Placement-init into GC memory; `drop_blocking_cell` runs the destructor
-    // during sweep.
+    // Placement-init into GC memory; the registered hook drops T during sweep.
     unsafe {
-        (payload as *mut WillowBlockingCell).write(WillowBlockingCell {
-            value: StdMutex::new(value),
-            is_ref,
-        });
+        payload.cast::<T>().write(init(value, is_ref));
     }
     if is_ref {
         crate::gc::willow_gc_write_barrier(
             payload,
             std::ptr::null_mut(),
             value as *mut u8,
-            GcStoreDestination::BlockingCell as i64,
+            destination as i64,
         );
     }
-    payload as *mut c_void
+    payload.cast()
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_blocking_cell_new(value: i64, is_ref: i64) -> *mut c_void {
+    new_blocking_cell(
+        value,
+        is_ref,
+        BLOCKING_CELL_TYPE_ID,
+        GcStoreDestination::BlockingCell,
+        |value, is_ref| WillowBlockingCell {
+            value: StdMutex::new(value),
+            is_ref,
+        },
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -286,32 +296,16 @@ pub extern "C" fn willow_blocking_cell_set(raw: *mut c_void, value: i64) {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_rw_cell_new(value: i64, is_ref: i64) -> *mut c_void {
-    let is_ref = is_ref != 0;
-    let mut value = value;
-    let payload = alloc_cell_payload(
-        BLOCKING_RW_CELL_TYPE_ID,
-        std::mem::size_of::<WillowBlockingRwCell>(),
-        &mut value,
+    new_blocking_cell(
+        value,
         is_ref,
-    );
-    if payload.is_null() {
-        return std::ptr::null_mut();
-    }
-    unsafe {
-        (payload as *mut WillowBlockingRwCell).write(WillowBlockingRwCell {
+        BLOCKING_RW_CELL_TYPE_ID,
+        GcStoreDestination::BlockingRwCell,
+        |value, is_ref| WillowBlockingRwCell {
             value: StdRwLock::new(value),
             is_ref,
-        });
-    }
-    if is_ref {
-        crate::gc::willow_gc_write_barrier(
-            payload,
-            std::ptr::null_mut(),
-            value as *mut u8,
-            GcStoreDestination::BlockingRwCell as i64,
-        );
-    }
-    payload as *mut c_void
+        },
+    )
 }
 
 #[unsafe(no_mangle)]

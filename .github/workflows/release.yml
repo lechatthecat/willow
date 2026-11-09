@@ -44,9 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        run: rustup toolchain install 1.96.0 --profile minimal
-      - name: Select native toolchain
-        run: rustup override set 1.96.0-${{ matrix.target }}
+        run: rustup show active-toolchain
       - name: Build
         run: cargo build --locked --release --features willow/packaged -p willow -p willow_runtime
       # Relocatable layout: bin/willow finds ../lib/<runtime> without Cargo.
