@@ -599,7 +599,7 @@ pub(super) fn record_stop(reason: u32, start: u64, work_end: u64, unlocked: u64)
         coordination_hold_ns: unlocked.saturating_sub(start),
         budget: (reason == 2).then(|| LAST_BUDGET.get()),
     };
-    if std::env::var_os("WILLOW_GC_LOG").is_some() {
+    if crate::diagnostic_settings::GC_LOG.os {
         if reason == 2 {
             let budget = diagnostic.budget.expect("remark owns its budget");
             eprintln!(
@@ -663,7 +663,7 @@ pub(super) fn record_preparation(
         index_entries,
         heap_hold_ns,
     };
-    if std::env::var_os("WILLOW_GC_LOG").is_some() {
+    if crate::diagnostic_settings::GC_LOG.os {
         eprintln!(
             "[gc] concurrent_prepare regions={} index_entries={} bitmap_words={} bitmap_bytes={} heap_hold_ns={}",
             diagnostic.regions,

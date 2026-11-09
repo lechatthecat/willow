@@ -128,7 +128,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     fn patch_root_reservation(&mut self, reservation: RootReservation, peak: usize) {
         let count = peak.saturating_sub(reservation.base);
-        if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
+        if *crate::diagnostic_settings::PANIC_DEPTH_LOAD_LOG {
             eprintln!("[root-reservation:{count}]");
         }
         if let cranelift_codegen::ir::InstructionData::UnaryImm { imm, .. } =
@@ -229,7 +229,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 context,
                 willow_abi::generated_context::ROOT_TOP_OFFSET,
             );
-            if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
+            if *crate::diagnostic_settings::PANIC_DEPTH_LOAD_LOG {
                 eprintln!("[inline-root-push]");
             }
             self.roots.root_peak_count =

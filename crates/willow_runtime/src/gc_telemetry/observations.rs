@@ -185,7 +185,7 @@ impl State {
 // under the observation lock.
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
     let history = super::observation_history();
-    let configured = super::env_capacity("WILLOW_GC_TRACE_CAPACITY", CAPACITY, MAX_CAPACITY);
+    let configured = *crate::diagnostic_settings::GC_TRACE_CAPACITY;
     let capacity = configured.unwrap_or(CAPACITY);
     Mutex::new(State {
         stats: Stats {
@@ -223,11 +223,7 @@ thread_local! {
     static PENDING_PROGRESS: Cell<u64> = const { Cell::new(0) };
 }
 pub fn enabled() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("WILLOW_GC_MEASURE").as_deref() == Ok("1")
-            || std::env::var("WILLOW_GC_TRACE_VERSION").as_deref() == Ok("4")
-    });
-    *ON
+    *crate::diagnostic_settings::GC_OBSERVATIONS
 }
 fn thread() -> u64 {
     ID.with(|id| {

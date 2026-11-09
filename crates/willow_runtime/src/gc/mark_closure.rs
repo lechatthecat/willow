@@ -11,7 +11,7 @@ pub(super) fn finish(
     started: std::time::Instant,
 ) -> Option<(crate::gc_telemetry::MarkWork, sweep::SweepPlan)> {
     #[cfg(feature = "gc-notification-prototype")]
-    if std::env::var_os("WILLOW_GC_NOTIFY").as_deref() == Some(std::ffi::OsStr::new("1")) {
+    if *crate::diagnostic_settings::GC_NOTIFY {
         return finish_with_policy(cycle, started, std::thread::sleep, || {}, true);
     }
     finish_with_wait(cycle, started, std::thread::sleep)

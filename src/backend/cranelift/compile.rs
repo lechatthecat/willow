@@ -1893,7 +1893,7 @@ impl UnitCodegenContext<'_> {
         // Async functions still use the cooperative constructor/poll ABI, with
         // the same mandatory lowered body.
         if f.is_async {
-            if std::env::var("WILLOW_LIR_LOG").is_ok() {
+            if *crate::diagnostic_settings::LIR_LOG {
                 eprintln!("[lir] compiling async `{name}` from lowered IR");
             }
             return if is_main {
@@ -2028,7 +2028,7 @@ impl UnitCodegenContext<'_> {
             }
         }
 
-        if std::env::var("WILLOW_LIR_LOG").is_ok() {
+        if *crate::diagnostic_settings::LIR_LOG {
             eprintln!("[lir] compiling `{name}` from lowered IR");
         }
         fg.emit_lir_function(&lir_fn);
@@ -2063,7 +2063,7 @@ impl UnitCodegenContext<'_> {
             .module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
-                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                if *crate::diagnostic_settings::VERIFY_DEBUG {
                     eprintln!("[verify] {e:?}");
                 }
                 e
@@ -2356,7 +2356,7 @@ impl UnitCodegenContext<'_> {
             .module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
-                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                if *crate::diagnostic_settings::VERIFY_DEBUG {
                     eprintln!("[verify] {e:?}");
                 }
                 e
@@ -2790,7 +2790,7 @@ impl UnitCodegenContext<'_> {
             anyhow::bail!("method `{lir_name}` has invalid lowered IR: {reason}");
         }
         if m.is_async {
-            if std::env::var("WILLOW_LIR_LOG").is_ok() {
+            if *crate::diagnostic_settings::LIR_LOG {
                 let display = crate::diagnostics::diagnostic::source_names(
                     lir_name.to_string(),
                     &Default::default(),
@@ -2892,7 +2892,7 @@ impl UnitCodegenContext<'_> {
             fg.bind_param(&p.name, &ty, &p.mode, val);
         }
 
-        if std::env::var("WILLOW_LIR_LOG").is_ok() {
+        if *crate::diagnostic_settings::LIR_LOG {
             let display = crate::diagnostics::diagnostic::source_names(
                 lir_name.to_string(),
                 &Default::default(),
@@ -2929,7 +2929,7 @@ impl UnitCodegenContext<'_> {
             .module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
-                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                if *crate::diagnostic_settings::VERIFY_DEBUG {
                     eprintln!("[verify] {e:?}");
                 }
                 e

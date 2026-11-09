@@ -646,7 +646,7 @@ fn finish(state: &mut GcState, dead_chunks: &[bool]) {
     state.sweeping = None;
     state.pending_sweep_chunks = 0..0;
     publish_collection_busy(state);
-    if std::env::var("WILLOW_GC_VERIFY_REGIONS").is_ok()
+    if *crate::diagnostic_settings::GC_VERIFY_REGIONS
         && let Err(message) = verify_old_region_metadata(state)
     {
         panic!("willow gc: region verification failed after major collection: {message}");

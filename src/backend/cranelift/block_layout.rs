@@ -56,7 +56,7 @@ pub(super) fn sink_cold_regions(func: &mut Function) {
     for block in cold {
         func.layout.set_cold(block);
     }
-    if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
+    if *crate::diagnostic_settings::PANIC_DEPTH_LOAD_LOG {
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
                 if let cranelift_codegen::ir::InstructionData::Load { offset, .. } =

@@ -8,6 +8,7 @@ pub mod backend;
 pub mod compiler_db;
 pub(crate) mod compiler_stack;
 pub mod desugar;
+mod diagnostic_settings;
 pub mod diagnostics;
 pub mod errors;
 mod hex;

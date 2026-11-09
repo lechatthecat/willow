@@ -84,7 +84,7 @@ impl AnalysisRevision {
         use anyhow::Context;
         let prepare_start = std::time::Instant::now();
         let _symbols = self.symbols.enter();
-        let verify = std::env::var_os("WILLOW_INCREMENTAL_VERIFY").is_some_and(|v| v == "1");
+        let verify = *crate::diagnostic_settings::INCREMENTAL_VERIFY;
         let cold_session = verify.then(|| {
             CompilerSession::new(
                 session.src,

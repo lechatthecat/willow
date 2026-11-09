@@ -753,7 +753,7 @@ impl UnitArtifacts {
 impl Drop for UnitArtifacts {
     fn drop(&mut self) {
         crate::query_stats::peaks(self.metrics.borrow().peak);
-        if std::env::var_os("WILLOW_UNIT_MEMORY_LOG").is_some_and(|value| value != "0") {
+        if *crate::diagnostic_settings::UNIT_MEMORY_LOG {
             let peak = self.metrics.borrow().peak;
             eprintln!(
                 "[unit-memory] peak_ast={} peak_checker={} peak_declared={} peak_lir={}",

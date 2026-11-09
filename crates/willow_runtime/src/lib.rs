@@ -54,6 +54,7 @@ pub mod blocking;
 mod borrow_migration_probe;
 pub mod cancellation;
 pub mod channel;
+mod diagnostic_settings;
 pub(crate) mod exit;
 pub(crate) mod failure;
 pub mod frame_lifetime;

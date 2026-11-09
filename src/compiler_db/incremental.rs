@@ -1160,7 +1160,7 @@ impl SyntaxQueries {
     }
     pub(crate) fn retained_query_bytes(&self) -> usize {
         #[cfg(test)]
-        if std::env::var_os("WILLOW_RETAIN_PROFILE").is_some_and(|v| v == "1") {
+        if *crate::diagnostic_settings::RETAIN_PROFILE {
             eprintln!(
                 "retained_payloads={:?} auxiliary_prepared={} auxiliary_derived={} auxiliary_effects={} auxiliary_symbols={} table={}",
                 self.table.retention_profile(),

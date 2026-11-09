@@ -2084,9 +2084,6 @@ pub extern "C" fn willow_gc_minor_collect() {
 /// times, and `std::env::var` costs a `getenv` scan plus, on Windows, a heap
 /// allocation for the key on each call.
 pub(crate) fn gc_stress_enabled(kind: &str) -> bool {
-    static MODES: LazyLock<Vec<String>> = LazyLock::new(|| {
-        parse_gc_stress_modes(&std::env::var("WILLOW_GC_STRESS").unwrap_or_default())
-    });
     #[cfg(test)]
     if let Some(modes) = &*gc_stress_override()
         .lock()
@@ -2094,17 +2091,13 @@ pub(crate) fn gc_stress_enabled(kind: &str) -> bool {
     {
         return modes.iter().any(|mode| mode == "all" || mode == kind);
     }
-    MODES.iter().any(|mode| mode == "all" || mode == kind)
+    crate::diagnostic_settings::GC_STRESS_MODES
+        .iter()
+        .any(|mode| mode == "all" || mode == kind)
 }
 
-fn parse_gc_stress_modes(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|mode| !mode.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
+#[cfg(test)]
+use crate::diagnostic_settings::parse_gc_stress_modes;
 
 /// Process-wide stress-mode override for tests that cannot restart the process
 /// with a different `WILLOW_GC_STRESS`. `None` restores the environment value.
@@ -2297,7 +2290,7 @@ fn try_collect_internal() -> CollectionAttempt {
         progress::record_skip(GcSkipReason::ForeignOwner);
         return CollectionAttempt::ForeignOwner;
     }
-    let gc_log = std::env::var("WILLOW_GC_LOG").is_ok();
+    let gc_log = crate::diagnostic_settings::GC_LOG.unicode;
 
     let cycle = crate::gc_telemetry::Cycle::begin(crate::gc_telemetry::CycleKind::Major);
 

@@ -7,19 +7,13 @@ use std::collections::VecDeque;
 use std::sync::{LazyLock, Mutex};
 
 pub const STOP_KINDS: usize = 4;
-const EVENT_CAPACITY: usize = 64;
-const MAX_EVENT_CAPACITY: usize = 16384;
+pub(crate) const EVENT_CAPACITY: usize = 64;
+pub(crate) const MAX_EVENT_CAPACITY: usize = 16384;
 #[cfg(test)]
 fn configured_capacity(value: Option<&str>) -> Option<usize> {
     super::bounded_capacity(value, EVENT_CAPACITY, MAX_EVENT_CAPACITY)
 }
-static CONFIGURED_CAPACITY: LazyLock<Option<usize>> = LazyLock::new(|| {
-    super::env_capacity(
-        "WILLOW_GC_STOP_TRACE_CAPACITY",
-        EVENT_CAPACITY,
-        MAX_EVENT_CAPACITY,
-    )
-});
+use crate::diagnostic_settings::GC_STOP_TRACE_CAPACITY as CONFIGURED_CAPACITY;
 pub const STOP_COUNTERS_VALID: u64 = 1;
 pub const STOP_EVENTS_LOST: u64 = 2;
 pub const STOP_COUNTERS_SATURATED: u64 = 4;

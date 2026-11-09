@@ -1326,15 +1326,11 @@ impl PinSource {
 /// other than `0`. Read once; consulted only when a young object is about to
 /// be pinned.
 fn verify_no_pin() -> bool {
-    static VERIFY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        verify_no_pin_enabled(std::env::var_os("WILLOW_GC_VERIFY_NO_PIN").as_deref())
-    });
-    *VERIFY
+    *crate::diagnostic_settings::GC_VERIFY_NO_PIN
 }
 
-fn verify_no_pin_enabled(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some_and(|value| !value.is_empty() && value != "0")
-}
+#[cfg(test)]
+use crate::diagnostic_settings::verify_no_pin_enabled;
 
 /// Run one minor collection over `roots`, or return `None` to defer it.
 ///
@@ -1402,7 +1398,7 @@ fn minor_collect_with_roots(
     state.minor_deferral_budget_bytes = 0;
     state.survivor_stats.minor_blockers = 0;
     state.minor_retry_bytes = 0;
-    if std::env::var("WILLOW_GC_VERIFY_BARRIER").is_ok()
+    if crate::diagnostic_settings::GC_VERIFY_BARRIER.unicode
         && let Err(message) = verify_remembered_set(&state, &registry.trace)
     {
         crate::gc_telemetry::failure_record::emit("invariant", &message);
@@ -1445,7 +1441,7 @@ fn minor_collect_with_roots(
         allocators,
         state.memory_limit_bytes,
     );
-    if std::env::var("WILLOW_GC_VERIFY_REGIONS").is_ok()
+    if *crate::diagnostic_settings::GC_VERIFY_REGIONS
         && let Err(message) = verify_old_region_metadata(&state)
     {
         panic!("willow gc: region verification failed after minor collection: {message}");

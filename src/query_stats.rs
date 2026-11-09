@@ -97,14 +97,9 @@ pub(crate) struct Session {
 
 impl Session {
     pub(crate) fn enter() -> Self {
-        let session = Self::start(
-            std::env::var_os("WILLOW_QUERY_STATS").is_some_and(|v| v == "1"),
-            true,
-        );
-        LOG.with(|log| log.set(std::env::var_os("WILLOW_QUERY_LOG").is_some_and(|v| v == "1")));
-        TRACE.with(|trace| {
-            trace.set(std::env::var_os("WILLOW_QUERY_TRACE").is_some_and(|v| v == "1"))
-        });
+        let session = Self::start(*crate::diagnostic_settings::QUERY_STATS, true);
+        LOG.with(|log| log.set(*crate::diagnostic_settings::QUERY_LOG));
+        TRACE.with(|trace| trace.set(*crate::diagnostic_settings::QUERY_TRACE));
         session
     }
 
@@ -176,7 +171,7 @@ pub(crate) fn peaks(peaks: [usize; 4]) {
 /// Persistent query-cache reports are opt-in through `WILLOW_QUERY_CACHE_STATS=1`;
 /// printing lives here so compiler queries stay free of output.
 pub(crate) fn query_cache(message: impl FnOnce() -> String) {
-    if std::env::var_os("WILLOW_QUERY_CACHE_STATS").is_some_and(|v| v == "1") {
+    if *crate::diagnostic_settings::QUERY_CACHE_STATS {
         eprintln!("willow-query-cache {}", message());
     }
 }
@@ -269,7 +264,7 @@ fn trace(message: std::fmt::Arguments<'_>) {
 
 /// Separate verification reporting work from compiler cache/front-end work.
 pub(crate) fn verification_phase(phase: &str, start: std::time::Instant) {
-    if std::env::var_os("WILLOW_QUERY_CACHE_STATS").is_some_and(|v| v == "1") {
+    if *crate::diagnostic_settings::QUERY_CACHE_STATS {
         eprintln!(
             "willow-verification-phase {}",
             serde_json::json!({"phase": phase, "elapsed_us": start.elapsed().as_micros()})

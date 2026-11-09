@@ -188,7 +188,7 @@ pub(super) fn execute(mut plan: SweepPlan) -> usize {
     {
         *LAST.lock().unwrap() = Some(cursor.report.clone());
     }
-    if std::env::var("WILLOW_GC_LOG").is_ok() {
+    if crate::diagnostic_settings::GC_LOG.unicode {
         eprintln!(
             "[gc] sweep background_limits={}/{}/{} assist_limits={}/{}/{} {:?}",
             BACKGROUND.objects,
@@ -232,7 +232,7 @@ impl Cursor {
             timed_holds: cfg!(test)
                 || crate::gc_telemetry::collector_profile::enabled()
                 || crate::gc_telemetry::profiling()
-                || std::env::var_os("WILLOW_GC_LOG").is_some(),
+                || crate::diagnostic_settings::GC_LOG.os,
             deadline_due: false,
             ahead: Vec::with_capacity(DEADLINE_STRIDE as usize),
             epoch_region_hint: None,

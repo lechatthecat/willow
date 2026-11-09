@@ -672,7 +672,7 @@ impl UnitCodegenContext<'_> {
             .module
             .define_function(ctor_fid, &mut ctx)
             .map_err(|e| {
-                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                if *crate::diagnostic_settings::VERIFY_DEBUG {
                     eprintln!("[verify] {e:?}");
                 }
                 e
@@ -962,7 +962,7 @@ impl UnitCodegenContext<'_> {
             .module
             .define_function(ctor_fid, &mut ctx)
             .map_err(|e| {
-                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                if *crate::diagnostic_settings::VERIFY_DEBUG {
                     eprintln!("[verify] {e:?}");
                 }
                 e
@@ -1199,7 +1199,7 @@ impl UnitCodegenContext<'_> {
             .module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
-                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                if *crate::diagnostic_settings::VERIFY_DEBUG {
                     eprintln!("[verify] {e:?}");
                 }
                 e
@@ -1538,7 +1538,7 @@ impl UnitCodegenContext<'_> {
             .module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
-                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                if *crate::diagnostic_settings::VERIFY_DEBUG {
                     eprintln!("[verify] {e:?}");
                 }
                 e
@@ -1679,7 +1679,7 @@ impl UnitCodegenContext<'_> {
             .module
             .define_function(cancel_fid, &mut ctx)
             .map_err(|e| {
-                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                if *crate::diagnostic_settings::VERIFY_DEBUG {
                     eprintln!("[verify] {e:?}");
                 }
                 e

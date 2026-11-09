@@ -2,13 +2,11 @@ use super::*;
 
 static DESTINATIONS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 static DELETIONS: AtomicU64 = AtomicU64::new(0);
-static VERIFY_COUNTS: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("WILLOW_GC_VERIFY_BARRIER").is_some());
 pub fn barrier_variant_counts() -> ([u64; 13], u64, bool) {
     (
         std::array::from_fn(|i| DESTINATIONS[i].load(Ordering::Relaxed)),
         DELETIONS.load(Ordering::Relaxed),
-        cfg!(test) || *VERIFY_COUNTS,
+        cfg!(test) || crate::diagnostic_settings::GC_VERIFY_BARRIER.os,
     )
 }
 pub(super) fn reset_barrier_variant_counts() {
@@ -224,7 +222,10 @@ fn publish_marking_unlocked(old: *mut u8, value: *mut u8, phase: u8) -> bool {
 /// reach a safepoint or trace payloads, so callers may hold a container lock.
 pub(crate) fn satb_delete(old: *mut u8) {
     let phase = GC_MARK_PHASE.load(Ordering::Acquire);
-    if !old.is_null() && phase != 0 && (cfg!(test) || *VERIFY_COUNTS) {
+    if !old.is_null()
+        && phase != 0
+        && (cfg!(test) || crate::diagnostic_settings::GC_VERIFY_BARRIER.os)
+    {
         count(&DELETIONS);
     }
     if !old.is_null() && phase != 0 && !publish_marking_unlocked(old, std::ptr::null_mut(), phase) {
@@ -367,7 +368,7 @@ fn write_barrier(
     if value.is_null() && (old_value.is_null() || !marking_active) {
         return;
     }
-    if (cfg!(test) || *VERIFY_COUNTS)
+    if (cfg!(test) || crate::diagnostic_settings::GC_VERIFY_BARRIER.os)
         && let Some(counter) = destination_kind
             .checked_sub(1)
             .and_then(|i| usize::try_from(i).ok())

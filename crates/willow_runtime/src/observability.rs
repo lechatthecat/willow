@@ -5,6 +5,7 @@
 //! timer, netpoll, and channel locks. A hook must still be fast and must not
 //! panic across the C ABI.
 
+use crate::diagnostic_settings::{SCHED_TRACE, TASK_TRACE};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
@@ -205,10 +206,6 @@ struct HookState {
 }
 
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-static SCHED_TRACE: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("WILLOW_SCHED_TRACE").is_some());
-static TASK_TRACE: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("WILLOW_TASK_TRACE").is_some());
 static HOOK_ENABLED: AtomicBool = AtomicBool::new(false);
 static HOOK_STATE: LazyLock<Mutex<HookState>> = LazyLock::new(|| Mutex::new(HookState::default()));
 

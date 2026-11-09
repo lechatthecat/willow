@@ -351,10 +351,6 @@ impl Drop for NativeGcScope {
     }
 }
 
-/// How long a collector waits for registered mutators to acknowledge a
-/// handshake or park before treating the wait as wedged.
-const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 120;
-
 /// The configured bound, or `None` to wait indefinitely.
 ///
 /// An acknowledgement that never arrives means a registered thread stopped
@@ -367,17 +363,7 @@ const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 120;
 ///
 /// Read once: `std::env::var` allocates for the key on Windows.
 fn handshake_timeout() -> Option<std::time::Duration> {
-    static TIMEOUT: LazyLock<Option<std::time::Duration>> = LazyLock::new(|| {
-        let seconds = match std::env::var("WILLOW_GC_HANDSHAKE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-        {
-            Some(seconds) => seconds,
-            None => DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-        };
-        (seconds != 0).then(|| std::time::Duration::from_secs(seconds))
-    });
-    *TIMEOUT
+    *crate::diagnostic_settings::GC_HANDSHAKE_TIMEOUT
 }
 
 /// Wait on the coordination condvar until `ready` holds.

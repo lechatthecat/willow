@@ -39,7 +39,7 @@ fn publish(state: &mut super::GcState, goal: u64, trigger: u64, reason: &str) {
     if state.threshold_bytes == goal && state.pacer_trigger == trigger {
         return;
     }
-    if std::env::var("WILLOW_GC_LOG").is_ok() {
+    if crate::diagnostic_settings::GC_LOG.unicode {
         eprintln!(
             "[gc] threshold goal={} trigger={} previous_goal={} previous_trigger={} reason={}",
             goal, trigger, state.threshold_bytes, state.pacer_trigger, reason

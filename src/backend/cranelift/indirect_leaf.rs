@@ -160,7 +160,7 @@ impl FuncGen<'_, '_> {
             return self.emit_lir_indirect_call(signature, target, args, name, span, None);
         }
         self.reuse.indirect_leaf_promoted = true;
-        if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
+        if *crate::diagnostic_settings::PANIC_DEPTH_LOAD_LOG {
             eprintln!("[indirect-leaf-expand]");
         }
         let addr = self

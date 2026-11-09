@@ -100,7 +100,7 @@ pub(crate) fn backend_unit_imports(
 /// errors themselves — the error is raised where the body is wanted, by
 /// `compile_function_named`.
 fn log_hir_gaps(gaps: &[diagnostics::Diagnostic]) {
-    if gaps.is_empty() || std::env::var("WILLOW_LIR_LOG").is_err() {
+    if gaps.is_empty() || !*crate::diagnostic_settings::LIR_LOG {
         return;
     }
     for gap in gaps {
@@ -1442,7 +1442,7 @@ fn link_output(
     // on what the backend actually emitted — the imported-symbol list of the
     // object is the only place a runtime call is visible, since the linked
     // binary also contains everything the runtime staticlib defines.
-    let keep_object = std::env::var_os("WILLOW_KEEP_OBJECT").is_some_and(|value| value != "0");
+    let keep_object = *crate::diagnostic_settings::KEEP_OBJECT;
     let discard_object = |path: &Path| {
         if !keep_object {
             let _ = std::fs::remove_file(path);

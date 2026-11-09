@@ -1059,7 +1059,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         args: &[cranelift_codegen::ir::Value],
     ) {
         if name == rt::willow_pop_roots && self.roots.root_reservation.is_some() {
-            if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
+            if *crate::diagnostic_settings::PANIC_DEPTH_LOAD_LOG {
                 eprintln!("[inline-root-pop]");
             }
             let ty = reference_type(self.module.target_config());
@@ -1094,7 +1094,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         args: &[cranelift_codegen::ir::Value],
     ) -> cranelift_codegen::ir::Value {
         if name == rt::willow_root_depth && self.roots.root_reservation.is_some() {
-            if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
+            if *crate::diagnostic_settings::PANIC_DEPTH_LOAD_LOG {
                 eprintln!("[inline-root-depth]");
             }
             let ty = reference_type(self.module.target_config());

@@ -311,9 +311,7 @@ pub(crate) struct MarkWork {
 }
 
 pub(crate) fn profiling() -> bool {
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("WILLOW_GC_PROFILE").is_some());
-    *ENABLED
+    crate::diagnostic_settings::GC_PROFILE.os
 }
 
 impl MarkWork {
@@ -716,7 +714,7 @@ struct TraceSink {
 }
 impl TraceSink {
     fn from_env() -> Self {
-        let Some(path) = std::env::var_os("WILLOW_GC_TRACE").filter(|p| !p.is_empty()) else {
+        let Some(path) = crate::diagnostic_settings::gc_trace_path() else {
             return Self { writer: None };
         };
         if path == "stderr" {
@@ -871,39 +869,9 @@ static TRACE: LazyLock<Option<Mutex<TraceSink>>> = LazyLock::new(|| {
     sink.writer.as_ref()?;
     Some(Mutex::new(sink))
 });
-static TRACE_STOPS: LazyLock<bool> = LazyLock::new(|| {
-    matches!(
-        std::env::var("WILLOW_GC_TRACE_VERSION").as_deref(),
-        Ok("2" | "3" | "4")
-    )
-});
-static TRACE_MILESTONES: LazyLock<bool> = LazyLock::new(|| {
-    matches!(
-        std::env::var("WILLOW_GC_TRACE_VERSION").as_deref(),
-        Ok("3" | "4")
-    )
-});
-/// V4 observation lines go only to version-4 streams; V1-V3 consumers never
-/// see them even when `WILLOW_GC_MEASURE=1` enables the aggregate snapshot.
-static TRACE_OBSERVATIONS: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("WILLOW_GC_TRACE_VERSION").as_deref() == Ok("4"));
-/// Opt-in bounded history size: absent selects `default`; unparsable or
-/// outside `1..=max` yields None, which callers report instead of hiding.
-fn bounded_capacity(value: Option<&str>, default: usize, max: usize) -> Option<usize> {
-    match value {
-        None => Some(default),
-        Some(text) => text.parse::<usize>().ok().filter(|n| (1..=max).contains(n)),
-    }
-}
-
-/// Reads `var` for [`bounded_capacity`]; a non-Unicode value is invalid.
-fn env_capacity(var: &str, default: usize, max: usize) -> Option<usize> {
-    match std::env::var(var) {
-        Ok(value) => bounded_capacity(Some(&value), default, max),
-        Err(std::env::VarError::NotPresent) => bounded_capacity(None, default, max),
-        Err(std::env::VarError::NotUnicode(_)) => None,
-    }
-}
+#[cfg(test)]
+use crate::diagnostic_settings::bounded_capacity;
+use crate::diagnostic_settings::{TRACE_MILESTONES, TRACE_OBSERVATIONS, TRACE_STOPS};
 
 /// Whether a V4 sink exists to drain per-event observation history.
 fn observation_history() -> bool {

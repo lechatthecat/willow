@@ -62,11 +62,9 @@ pub struct Snapshot {
     pub intervals: [Histogram; KINDS],
     pub collisions: [u64; KINDS],
 }
-static ON: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("WILLOW_GC_PROFILE").as_deref() == Ok("1"));
 static STATS: LazyLock<Mutex<Snapshot>> = LazyLock::new(|| Mutex::new(Snapshot::default()));
 pub fn enabled() -> bool {
-    *ON
+    crate::diagnostic_settings::GC_PROFILE.one
 }
 pub fn snapshot() -> Snapshot {
     *STATS.lock().unwrap_or_else(|e| e.into_inner())

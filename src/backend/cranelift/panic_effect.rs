@@ -275,7 +275,7 @@ impl UnitCodegenContext<'_> {
         ordered.sort_by(|left, right| left.0.cmp(&right.0));
         *self.dispatch_cache.get_mut() = Default::default();
         self.output.interface_slot_summaries.get_mut().clear();
-        let log = std::env::var_os("WILLOW_PANIC_EFFECTS_LOG").is_some();
+        let log = *crate::diagnostic_settings::PANIC_EFFECTS_LOG;
         for (name, may_panic) in ordered {
             if log {
                 eprintln!(
