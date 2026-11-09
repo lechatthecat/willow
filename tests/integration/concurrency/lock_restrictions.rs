@@ -1036,7 +1036,10 @@ async fn hold(r: RwLock<Node>, started: AtomicI64) {
         node = new Node(node.value + 1);
     }
 }
-async fn wait_read(r: RwLock<Node>) -> i64 {
+async fn wait_read(r: RwLock<Node>, started: AtomicI64) -> i64 {
+    // Spawn order does not guarantee acquisition order. Wait until the writer
+    // owns the lock so this read must observe its update after release.
+    while started.load() == 0 { await yield(); }
     lock read r as node { return node.value; }
 }
 async fn collect_when_held(started: AtomicI64) {
@@ -1047,7 +1050,7 @@ async fn main() {
     let r = RwLock::new(new Node(10));
     let started = AtomicI64::new(0);
     let owner = hold(r, started);
-    let waiter = wait_read(r);
+    let waiter = wait_read(r, started);
     let collector = collect_when_held(started);
     await owner;
     await collector;
