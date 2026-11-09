@@ -25,12 +25,12 @@ use std::{
     rc::Rc,
 };
 
-// Version 2 records include source-reference facts for read-only AI consumers.
-const FORMAT: u32 = 2;
+// Version 4 prefixes payloads with compact input-admission metadata.
+const FORMAT: u32 = 4;
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
 type ModuleIdentity = (UnitId, PathBuf, Option<SymbolModule>);
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CacheKey {
     format: u32,
     compiler: String,
@@ -64,7 +64,15 @@ impl CacheKey {
 }
 
 #[derive(Serialize, Deserialize)]
+struct Admission {
+    key: CacheKey,
+    sources: Vec<super::incremental::admission::SourceAdmission>,
+}
+
+#[derive(Serialize, Deserialize)]
 struct Snapshot {
+    // Must remain first: admission reads this field before loading any payload.
+    admission: Admission,
     prechecks: Vec<(String, crate::semantic::type_checker::precheck::Record)>,
     key: CacheKey,
     id_ends: [u64; 2],
@@ -107,12 +115,99 @@ fn cache_path(root: &Path, entry: &Path) -> PathBuf {
         ))
 }
 
+#[derive(Default, Serialize)]
+struct RestoreWork {
+    admission_bytes: u64,
+    validated_sources: usize,
+    validated_owners: usize,
+    current_source_bytes: usize,
+    payload_bytes: u64,
+    payload_loads: usize,
+}
+
+fn load_admitted(
+    path: &Path,
+    key: &CacheKey,
+    source: &str,
+    work: &mut RestoreWork,
+) -> Result<(DiskRevision, SyntaxQueries)> {
+    use std::io::{BufReader, Read, Seek, SeekFrom};
+    // Bound speculative metadata reads independently of the semantic payload.
+    // A rejected header is only a miss. Accepted files still undergo full
+    // checksum, compiler-key and record validation in load().
+    struct Counted<R> {
+        reader: R,
+        bytes: u64,
+    }
+    impl<R: Read> Read for Counted<R> {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.reader.read(bytes)?;
+            self.bytes += count as u64;
+            Ok(count)
+        }
+    }
+    let file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    anyhow::ensure!(length <= MAX_BYTES, "invalid cache size");
+    let mut reader = BufReader::new(Counted {
+        reader: file.take(16 * 1024 * 1024),
+        bytes: 0,
+    });
+    let mut prefix = [0; 78];
+    reader.read_exact(&mut prefix)?;
+    anyhow::ensure!(
+        &prefix[64..] == b"\n{\"admission\":",
+        "missing admission metadata"
+    );
+    let admission = Admission::deserialize(&mut serde_json::Deserializer::from_reader(&mut reader));
+    work.admission_bytes = reader.get_ref().bytes;
+    let admission = admission?;
+    anyhow::ensure!(admission.key == *key, "incompatible admission metadata");
+    let mut density = super::incremental::admission::ReuseDensity::default();
+    for input in admission.sources {
+        work.validated_sources += 1;
+        work.validated_owners += input.owners();
+        if input.path.starts_with("<std>") {
+            continue;
+        }
+        let current = if input.file == FileId::ENTRY {
+            std::borrow::Cow::Borrowed(source)
+        } else {
+            std::borrow::Cow::Owned(super::captured::FileInput::read(input.path.clone())?.source)
+        };
+        work.current_source_bytes += current.len();
+        let matched = input
+            .density(&current)?
+            .context("changed cache declarations")?;
+        density.owners += matched.owners;
+        density.matched += matched.matched;
+        density.bytes += matched.bytes;
+        density.matched_bytes += matched.matched_bytes;
+    }
+    // Aggregate real source modules, not bundled declarations: editing one
+    // small imported module must preserve reuse of the rest of the project.
+    anyhow::ensure!(
+        density.matched * 2 >= density.owners && density.matched_bytes * 2 >= density.bytes,
+        "insufficient reusable cache payload"
+    );
+    work.payload_bytes = length.saturating_sub(65);
+    work.payload_loads = 1;
+    // Keep the opened inode across admission and restore. An atomic writer may
+    // replace path meanwhile; reopening it would bypass this admission decision.
+    let mut file = reader.into_inner().reader.into_inner();
+    file.seek(SeekFrom::Start(0))?;
+    load_file(file, key)
+}
+
+#[cfg(test)]
 fn load(path: &Path, key: &CacheKey) -> Result<(DiskRevision, SyntaxQueries)> {
+    load_file(std::fs::File::open(path)?, key)
+}
+
+fn load_file(file: std::fs::File, key: &CacheKey) -> Result<(DiskRevision, SyntaxQueries)> {
     use std::io::Read;
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take(MAX_BYTES + 1)
-        .read_to_end(&mut bytes)?;
+    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
     anyhow::ensure!(
         bytes.len() as u64 <= MAX_BYTES && bytes.len() >= 65,
         "invalid cache size"
@@ -123,6 +218,7 @@ fn load(path: &Path, key: &CacheKey) -> Result<(DiskRevision, SyntaxQueries)> {
         "cache checksum mismatch"
     );
     let snapshot: Snapshot = serde_json::from_slice(payload)?;
+    drop(bytes);
     anyhow::ensure!(snapshot.key == *key, "incompatible compiler cache");
     let mut units = std::collections::HashSet::new();
     for (unit, _, _) in &snapshot.modules {
@@ -192,6 +288,10 @@ fn save(path: &Path, key: CacheKey, frontend: &Frontend, syntax: &SyntaxQueries)
             .map(|(id, key)| (key, id))
             .collect();
     let snapshot = Snapshot {
+        admission: Admission {
+            key: key.clone(),
+            sources: syntax.disk_admission()?,
+        },
         prechecks: frontend.db.prechecks.snapshot(),
         key,
         id_ends: crate::parser::ast::cached_id_ends(),
@@ -213,14 +313,13 @@ fn save(path: &Path, key: CacheKey, frontend: &Frontend, syntax: &SyntaxQueries)
         effects: frontend.db.effects.disk_snapshot(),
         definitions,
     };
-    let payload = serde_json::to_vec(&snapshot)?;
-    anyhow::ensure!(
-        payload.len() as u64 + 65 <= MAX_BYTES,
-        "compiler cache size limit"
-    );
-    let mut bytes = digest(&payload).into_bytes();
-    bytes.push(b'\n');
-    bytes.extend(payload);
+    let mut bytes = vec![b' '; 65];
+    serde_json::to_writer(&mut bytes, &snapshot)?;
+    drop(snapshot);
+    anyhow::ensure!(bytes.len() as u64 <= MAX_BYTES, "compiler cache size limit");
+    let checksum = digest(&bytes[65..]);
+    bytes[..64].copy_from_slice(checksum.as_bytes());
+    bytes[64] = b'\n';
     std::fs::create_dir_all(path.parent().context("cache parent")?)?;
     crate::project::init::atomic_replace(path, &bytes)
 }
@@ -229,12 +328,24 @@ pub(crate) fn run(
     source: &str,
     root: &Path,
     map: &SourceMap,
+    inputs: CompilerInputs,
+    emitter: &mut dyn DiagnosticEmitter,
+) -> Result<Frontend> {
+    // Persistence is experimental: its restore/save cost can exceed a clean
+    // check. Neither a cache directory nor statistics implicitly enables it.
+    if std::env::var_os("WILLOW_QUERY_CACHE").is_none_or(|v| v != "1") {
+        return crate::run_frontend_revision(source, root, map, inputs, emitter, None, None);
+    }
+    run_enabled(source, root, map, inputs, emitter)
+}
+
+fn run_enabled(
+    source: &str,
+    root: &Path,
+    map: &SourceMap,
     mut inputs: CompilerInputs,
     emitter: &mut dyn DiagnosticEmitter,
 ) -> Result<Frontend> {
-    if std::env::var_os("WILLOW_QUERY_CACHE").is_some_and(|v| v == "0") {
-        return crate::run_frontend_revision(source, root, map, inputs, emitter, None, None);
-    }
     // Analysis may reuse validated build/check records, but must never publish
     // caches, including when analyzing isolated edit candidates or a cache miss.
     let read_only = inputs.capture_analysis || inputs.verification;
@@ -247,7 +358,8 @@ pub(crate) fn run(
     };
     let path = cache_path(inputs.query_cache_root.as_deref().unwrap_or(root), entry);
     let restore_start = std::time::Instant::now();
-    let loaded = load(&path, &key).ok();
+    let mut restore_work = RestoreWork::default();
+    let loaded = load_admitted(&path, &key, source, &mut restore_work).ok();
     let hit = loaded.is_some();
     let (previous, syntax) = match loaded {
         Some((previous, syntax)) => (Some(previous), syntax),
@@ -272,7 +384,7 @@ pub(crate) fn run(
     let frontend_us = frontend_start.elapsed().as_micros();
     let stats = syntax.borrow().stats();
     crate::query_stats::query_cache(|| {
-        serde_json::json!({"loaded": hit, "cache_restore_us": restore_us, "frontend_us": frontend_us, "effects_scanned": frontend.db.effects.work().0, "effects_recomputed": frontend.db.effects.work().1, "precheck_replay_us": frontend.db.prechecks.replay_us.get(), "precheck_semantic_us": frontend.db.prechecks.semantic_us.get(), "declaration_validations": frontend.db.prechecks.validations.get(), "precheck_declarations": frontend.db.prechecks.declarations.get(), "precheck_bodies": frontend.db.prechecks.bodies.get(), "precheck_signatures": frontend.db.prechecks.signatures.get(), "precheck_instances": frontend.db.prechecks.instances.get(), "precheck_templates": frontend.db.prechecks.templates.get(), "signature_checks": frontend.db.typed_bodies.signature_checks.get(), "concurrency_checks": frontend.db.typed_bodies.concurrency_checks.get(), "async_borrow_checks": frontend.db.typed_bodies.async_borrow_checks.get(), "typechecks": frontend.db.typed_bodies.typechecks(), "reused_bodies": frontend.db.typed_bodies.reused(), "queries_recomputed": stats.recomputed, "queries_validated": stats.validated, "dependency_edges_visited": stats.dependency_edges_visited}).to_string()
+        serde_json::json!({"loaded": hit, "restore_work": restore_work, "cache_restore_us": restore_us, "frontend_us": frontend_us, "effects_scanned": frontend.db.effects.work().0, "effects_recomputed": frontend.db.effects.work().1, "precheck_replay_us": frontend.db.prechecks.replay_us.get(), "precheck_semantic_us": frontend.db.prechecks.semantic_us.get(), "declaration_validations": frontend.db.prechecks.validations.get(), "precheck_declarations": frontend.db.prechecks.declarations.get(), "precheck_bodies": frontend.db.prechecks.bodies.get(), "precheck_signatures": frontend.db.prechecks.signatures.get(), "precheck_instances": frontend.db.prechecks.instances.get(), "precheck_templates": frontend.db.prechecks.templates.get(), "signature_checks": frontend.db.typed_bodies.signature_checks.get(), "concurrency_checks": frontend.db.typed_bodies.concurrency_checks.get(), "async_borrow_checks": frontend.db.typed_bodies.async_borrow_checks.get(), "typechecks": frontend.db.typed_bodies.typechecks(), "reused_bodies": frontend.db.typed_bodies.reused(), "queries_recomputed": stats.recomputed, "queries_validated": stats.validated, "dependency_edges_visited": stats.dependency_edges_visited}).to_string()
     });
     // Cache failures never change successful compilation into a failure.
     if !read_only && let Err(error) = save(&path, key, &frontend, &syntax.borrow()) {

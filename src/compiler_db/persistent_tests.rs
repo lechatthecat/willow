@@ -1,4 +1,6 @@
 use super::*;
+// Exercise persistence explicitly without mutating process-global environment.
+use super::run_enabled as run;
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -70,6 +72,169 @@ impl DiagnosticEmitter for Diagnostics {
     }
 }
 const SOURCE: &str = "fn first() -> i64 { return 1; } fn second() -> i64 { return first(); } fn main() { let value = second(); }";
+
+#[test]
+fn persistent_cache_storage_and_restore_counts_follow_live_bodies() {
+    let mut previous_counts: Option<(usize, usize, usize, usize)> = None;
+    let mut small_counts = None;
+    for count in [16, 64, 256] {
+        let fixture = Fixture::new();
+        let mut source = String::from(SOURCE);
+        // Repeated dependencies (fan-out) must not duplicate their transitive
+        // closure. Every added function is actually reused on the warm check.
+        for i in 0..count {
+            source.push_str(&format!(" fn caller{i}() -> i64 {{ return first(); }}"));
+        }
+        let path = fixture.0.join("analysis.cache");
+        let (cold, syntax) = fixture.compile(&source, None, SyntaxQueries::default());
+        save(&path, fixture.key(), &cold, &syntax.borrow()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(&bytes[65..]).unwrap();
+        let table = &snapshot["syntax"]["table"];
+        let memos = table["memos"].as_array().unwrap();
+        let inputs = table["inputs"].as_array().unwrap().len();
+        let edges: usize = memos
+            .iter()
+            .map(|m| m["dependencies"].as_array().unwrap().len())
+            .sum();
+        assert_eq!(
+            snapshot["bodies"]["typed"].as_array().unwrap().len(),
+            count + 3
+        );
+        let counts = (bytes.len(), memos.len(), inputs, edges);
+        if let Some(old) = previous_counts {
+            for (new, old) in [
+                (counts.0, old.0),
+                (counts.1, old.1),
+                (counts.2, old.2),
+                (counts.3, old.3),
+            ] {
+                assert!(
+                    new > old && new <= 5 * old,
+                    "nonlinear growth: {old} -> {new}"
+                );
+            }
+        }
+        previous_counts = Some(counts);
+        let (previous, syntax) = load(&path, &fixture.key()).unwrap();
+        let (warm, _) = fixture.compile(&source, Some(&previous), syntax);
+        assert_eq!(warm.db.typed_bodies.typechecks(), 0);
+        assert_eq!(warm.db.typed_bodies.reused(), count + 3);
+        println!(
+            "cache_live bodies={} bytes={} restored_memos={} restored_inputs={} restored_edges={}",
+            count + 3,
+            counts.0,
+            counts.1,
+            counts.2,
+            counts.3
+        );
+
+        // Shrinking the source must evict dead records rather than carrying an
+        // ever-growing history into subsequent restores.
+        let (previous, syntax) = load(&path, &fixture.key()).unwrap();
+        let (small, syntax) = fixture.compile(SOURCE, Some(&previous), syntax);
+        save(&path, fixture.key(), &small, &syntax.borrow()).unwrap();
+        let small_bytes = std::fs::read(&path).unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(&small_bytes[65..]).unwrap();
+        assert_eq!(snapshot["bodies"]["typed"].as_array().unwrap().len(), 3);
+        assert!(small_bytes.len() < bytes.len());
+        let table = &snapshot["syntax"]["table"];
+        let counts = (
+            table["memos"].as_array().unwrap().len(),
+            table["inputs"].as_array().unwrap().len(),
+        );
+        if let Some(expected) = small_counts {
+            assert_eq!(
+                counts, expected,
+                "dead query history survived source shrink"
+            );
+        }
+        small_counts = Some(counts);
+        let (previous, syntax) = load(&path, &fixture.key()).unwrap();
+        let (warm, _) = fixture.compile(SOURCE, Some(&previous), syntax);
+        assert_eq!(warm.db.typed_bodies.typechecks(), 0);
+        assert_eq!(warm.db.typed_bodies.reused(), 3);
+    }
+}
+
+#[test]
+fn persistent_cache_first_edited_check_skips_obsolete_payloads() {
+    for count in [16, 64, 256] {
+        for replace in [false, true] {
+            let fixture = Fixture::new();
+            let mut source = String::from(SOURCE);
+            for i in 0..count {
+                source.push_str(&format!(" fn caller{i}() -> i64 {{ return first(); }}"));
+            }
+            let entry = fixture.0.join("main.wi");
+            let path = cache_path(&fixture.0, &entry);
+            let (cold, syntax) = fixture.compile(&source, None, SyntaxQueries::default());
+            save(&path, fixture.key(), &cold, &syntax.borrow()).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let edited = if replace {
+                // Same declarations and size class, but almost no matching bodies.
+                source.replace("return first();", "return 99999;")
+            } else {
+                SOURCE.to_owned()
+            };
+            std::fs::write(&entry, &edited).unwrap();
+            let mut work = RestoreWork::default();
+            assert!(load_admitted(&path, &fixture.key(), &edited, &mut work).is_err());
+            assert!(work.validated_owners >= count);
+            assert!(work.admission_bytes < before.len() as u64 / 2);
+            assert_eq!(work.payload_bytes, 0);
+            assert_eq!(work.payload_loads, 0);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            let mut diagnostics = Diagnostics::default();
+            let first = run(
+                &edited,
+                &fixture.0,
+                &SourceMap::new(entry.to_str().unwrap(), &edited),
+                fixture.inputs(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert!(diagnostics.0.is_empty());
+            assert_eq!(first.db.typed_bodies.reused(), 0);
+            assert_eq!(
+                first.db.typed_bodies.typechecks(),
+                if replace { count + 3 } else { 3 }
+            );
+            println!(
+                "first_edit old_bodies={} replace={replace} validation_owners={} admission_bytes={} payload_loads={} payload_bytes={} reused={} typechecks={}",
+                count + 3,
+                work.validated_owners,
+                work.admission_bytes,
+                work.payload_loads,
+                work.payload_bytes,
+                first.db.typed_bodies.reused(),
+                first.db.typed_bodies.typechecks()
+            );
+        }
+    }
+}
+
+#[test]
+fn persistent_cache_admission_weights_large_changed_bodies() {
+    let fixture = Fixture::new();
+    let mut source = String::from("fn large() { let mut n = 0;");
+    for _ in 0..256 {
+        source.push_str("n = n + 1;");
+    }
+    source.push_str("} fn main() {}");
+    for i in 0..32 {
+        source.push_str(&format!(" fn tiny{i}() {{}}"));
+    }
+    let (cold, syntax) = fixture.compile(&source, None, SyntaxQueries::default());
+    let path = fixture.0.join("analysis.cache");
+    save(&path, fixture.key(), &cold, &syntax.borrow()).unwrap();
+    let edited = source.replace("n = n + 1;", "n = n + 2;");
+    let mut work = RestoreWork::default();
+    assert!(load_admitted(&path, &fixture.key(), &edited, &mut work).is_err());
+    assert_eq!(work.payload_loads, 0);
+    assert_eq!(work.payload_bytes, 0);
+}
+
 fn envelope(payload: &[u8]) -> Vec<u8> {
     let mut bytes = digest(payload).into_bytes();
     bytes.push(b'\n');

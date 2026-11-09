@@ -133,6 +133,102 @@ fn tree(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
 const SOURCE: &str = "fn first() -> i64 { return 1; } fn second() -> i64 { return first(); } fn main() { println(second()); }";
 
 #[test]
+fn first_check_after_shrink_or_replacement_does_not_restore_old_payloads() {
+    for count in [16, 64, 256] {
+        let mut source = String::from(SOURCE);
+        for i in 0..count {
+            source.push_str(&format!(" fn extra{i}() -> i64 {{ return 1; }}"));
+        }
+        let fixture = Fixture::new(&source);
+        for edited in [
+            SOURCE.to_owned(),
+            source.replace("return 1;", "return 999;"),
+        ] {
+            fixture.write(&source);
+            fixture.warm();
+            let old_bytes = fs::metadata(fixture.cache()).unwrap().len();
+            fixture.write(&edited);
+            let first = fixture.run(&["check", "main.wi"], false);
+            let clean = fixture.run(&["check", "main.wi"], true);
+            assert!(first.status.success(), "{}", stderr(&first));
+            assert_eq!(first.status.code(), clean.status.code());
+            assert_eq!(first.stdout, clean.stdout);
+            let diagnostics = stderr(&first)
+                .lines()
+                .filter(|line| !line.starts_with("willow-query-cache "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(diagnostics, stderr(&clean).trim_end());
+            let observed = stats(&first);
+            assert_eq!(observed["loaded"], false);
+            assert_eq!(observed["reused_bodies"], 0);
+            assert_eq!(observed["restore_work"]["payload_loads"], 0);
+            assert_eq!(observed["restore_work"]["payload_bytes"], 0);
+            assert!(
+                observed["restore_work"]["admission_bytes"]
+                    .as_u64()
+                    .unwrap()
+                    < old_bytes / 2
+            );
+            println!(
+                "first_check old_bodies={} restore_work={}",
+                count + 3,
+                observed["restore_work"]
+            );
+        }
+    }
+}
+
+#[test]
+fn persistent_cache_requires_explicit_opt_in_and_preserves_diagnostics() {
+    let fixture = Fixture::new(SOURCE);
+    // Even an existing warm cache and a configured cache directory/statistics
+    // must not opt users into persistence.
+    fixture.warm();
+    for source in [
+        SOURCE.to_owned(),
+        format!("// comment\n{SOURCE}"),
+        SOURCE.replace("return 1;", "return 9;"),
+        SOURCE.replace("return 1;", "return missing;"),
+        SOURCE.replace("return 1;", "return true;"),
+        SOURCE.replace("return 1;", "return @;"),
+        format!("import std::collections::Array;\n{SOURCE}"),
+    ] {
+        fixture.write(&source);
+        let before = tree(&fixture.0);
+        let baseline = fixture.run(&["check", "main.wi", "--warnings"], true);
+        for setting in [None, Some(""), Some("0"), Some("true"), Some("2")] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
+            command
+                .current_dir(&fixture.0)
+                .args(["check", "main.wi", "--warnings"])
+                .env_remove("WILLOW_QUERY_CACHE")
+                .env("WILLOW_QUERY_CACHE_DIR", fixture.0.join("cache"))
+                .env("WILLOW_QUERY_CACHE_STATS", "1");
+            if let Some(value) = setting {
+                command.env("WILLOW_QUERY_CACHE", value);
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), baseline.status.code(), "{setting:?}");
+            assert_eq!(output.stdout, baseline.stdout, "{setting:?}");
+            assert_eq!(output.stderr, baseline.stderr, "{setting:?}");
+            assert_eq!(tree(&fixture.0), before, "{setting:?}");
+        }
+    }
+    fs::remove_dir_all(fixture.0.join("cache")).unwrap();
+    fixture.write(SOURCE);
+    let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .current_dir(&fixture.0)
+        .args(["check", "main.wi"])
+        .env_remove("WILLOW_QUERY_CACHE")
+        .env("WILLOW_QUERY_CACHE_DIR", fixture.0.join("cache"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!fixture.0.join("cache").exists());
+}
+
+#[test]
 fn readonly_queries_reuse_check_bodies_and_match_cold_in_separate_processes() {
     let fixture = Fixture::new(SOURCE);
     fixture.warm();

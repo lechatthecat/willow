@@ -11,6 +11,8 @@ use crate::{
     semantic::ids::FunctionId,
 };
 use anyhow::Result;
+#[path = "persistent_admission.rs"]
+pub(crate) mod admission;
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -1340,7 +1342,9 @@ const DERIVED_WIRE_VERSION: u8 = 3;
 struct DerivedValue {
     // Preparation and the memo share immutable buffers; publication is O(1)
     // beyond the single encoding/canonicalization pass.
+    #[serde(with = "json_buffer")]
     wire: Rc<Vec<u8>>,
+    #[serde(with = "json_buffer")]
     canonical: Rc<Vec<u8>>,
     #[serde(default)]
     epoch: u64,
@@ -1362,8 +1366,11 @@ impl Eq for DerivedValue {}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ParsedValue {
+    #[serde(with = "json_buffer")]
     wire: Vec<u8>,
+    #[serde(with = "json_buffer")]
     canonical: Vec<u8>,
+    #[serde(with = "json_buffer")]
     tokens: Vec<u8>,
     declarations: CompactJson,
     imports: CompactJson,
@@ -1436,7 +1443,26 @@ struct SyntaxProvider<'a> {
 /// Encoding happens once; equality and fingerprints compare the same bytes.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CompactJson {
+    #[serde(with = "json_buffer")]
     bytes: std::sync::Arc<[u8]>,
+}
+
+// These buffers are produced by serde_json, hence UTF-8. A JSON string keeps
+// their exact bytes (and equality/fingerprint semantics) without expanding each
+// byte into a numeric JSON value during persistence.
+mod json_buffer {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        let text = std::str::from_utf8(bytes).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(text)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>, T: From<Vec<u8>>>(
+        deserializer: D,
+    ) -> Result<T, D::Error> {
+        Ok(String::deserialize(deserializer)?.into_bytes().into())
+    }
 }
 impl CompactJson {
     fn new(value: &Value) -> Result<Self> {
@@ -2934,7 +2960,9 @@ impl SyntaxQueries {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct DiskValue {
     kind: DiskKind,
-    payload: serde_json::Value,
+    // Decode directly into the known type; never allocate a second generic
+    // JSON tree for the entire query closure.
+    payload: Box<serde_json::value::RawValue>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum DiskKind {
@@ -2983,11 +3011,13 @@ impl DiskValue {
         })
     }
     fn encode(kind: DiskKind, value: &QueryValue) -> Result<Self> {
-        fn encode_as<T: serde::Serialize + 'static>(value: &QueryValue) -> Result<Value> {
+        fn encode_as<T: serde::Serialize + 'static>(
+            value: &QueryValue,
+        ) -> Result<Box<serde_json::value::RawValue>> {
             let value = value
                 .downcast::<T>()
                 .ok_or_else(|| anyhow::anyhow!("disk payload type mismatch"))?;
-            Ok(serde_json::to_value(value)?)
+            Ok(serde_json::value::to_raw_value(value)?)
         }
         let payload = match kind {
             DiskKind::Source => encode_as::<Source>(value)?,
@@ -3031,25 +3061,25 @@ impl DiskValue {
     }
     fn decode(self, fingerprint: ResultFingerprint) -> Result<QueryValue> {
         fn decode_as<T: serde::de::DeserializeOwned + Eq + Retained + 'static>(
-            payload: Value,
+            payload: &str,
             fingerprint: ResultFingerprint,
         ) -> Result<QueryValue> {
             Ok(QueryValue::new(
-                serde_json::from_value::<T>(payload)?,
+                serde_json::from_str::<T>(payload)?,
                 fingerprint,
             ))
         }
         match self.kind {
-            DiskKind::Source => decode_as::<Source>(self.payload, fingerprint),
-            DiskKind::Parsed => decode_as::<ParsedValue>(self.payload, fingerprint),
-            DiskKind::Compact => decode_as::<CompactJson>(self.payload, fingerprint),
-            DiskKind::Typed => decode_as::<TypedBodyValue>(self.payload, fingerprint),
+            DiskKind::Source => decode_as::<Source>(self.payload.get(), fingerprint),
+            DiskKind::Parsed => decode_as::<ParsedValue>(self.payload.get(), fingerprint),
+            DiskKind::Compact => decode_as::<CompactJson>(self.payload.get(), fingerprint),
+            DiskKind::Typed => decode_as::<TypedBodyValue>(self.payload.get(), fingerprint),
             DiskKind::Dispatch => {
-                decode_as::<super::dispatch::DispatchDeclaration>(self.payload, fingerprint)
+                decode_as::<super::dispatch::DispatchDeclaration>(self.payload.get(), fingerprint)
             }
-            DiskKind::Children => decode_as::<Vec<String>>(self.payload, fingerprint),
-            DiskKind::Derived => decode_as::<DerivedValue>(self.payload, fingerprint),
-            DiskKind::Dependencies => decode_as::<Vec<QueryNode>>(self.payload, fingerprint),
+            DiskKind::Children => decode_as::<Vec<String>>(self.payload.get(), fingerprint),
+            DiskKind::Derived => decode_as::<DerivedValue>(self.payload.get(), fingerprint),
+            DiskKind::Dependencies => decode_as::<Vec<QueryNode>>(self.payload.get(), fingerprint),
         }
     }
 }
@@ -3057,6 +3087,27 @@ impl DiskValue {
 #[cfg(test)]
 mod disk_snapshot_tests {
     use super::*;
+
+    #[test]
+    fn disk_json_buffers_preserve_exact_bytes_without_numeric_arrays() {
+        for text in [
+            "null",
+            "\"日本語 🦀\"",
+            " {\"escaped\":\"\\n\\\"\\\\\",\"x\":[1,2]} ",
+        ] {
+            let original = CompactJson::from_bytes(text.as_bytes().to_vec());
+            let encoded = serde_json::to_vec(&original).unwrap();
+            let shape: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(shape["bytes"].as_str(), Some(text));
+            let decoded: CompactJson = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded.bytes, original.bytes);
+            assert_eq!(
+                ResultFingerprint::bytes(&decoded.bytes),
+                ResultFingerprint::bytes(&original.bytes)
+            );
+        }
+        assert!(serde_json::from_str::<CompactJson>(r#"{"bytes":[0,255]}"#).is_err());
+    }
 
     fn fixture() -> (SyntaxQueries, BodyId) {
         let mut queries = SyntaxQueries::default().candidate().unwrap();
