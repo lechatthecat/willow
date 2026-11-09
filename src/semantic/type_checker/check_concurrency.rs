@@ -200,605 +200,123 @@ impl TypeChecker {
         obj_ty: &Type,
         call: &MethodCallExpr,
     ) -> Option<Type> {
+        use super::builtin_methods::{OptionAction, TransformResult, option_method};
         let builtin = builtin_types::resolve(obj_ty)?;
-        match builtin.id {
-            B::Option => {
-                let args = builtin.args;
-                let inner = args.first().cloned().unwrap_or(Type::Void);
-                match call.method.as_str() {
-                    "is_some" | "is_none" => {
-                        if !call.args.is_empty() {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!("`Option::{}` takes no arguments", call.method),
-                                )
-                                .with_label(Label::primary(call.span, "unexpected arguments")),
-                            );
-                        }
-                        Some(Type::Bool)
-                    }
-                    "unwrap" => {
-                        if !call.args.is_empty() {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    "`Option::unwrap` takes no arguments",
-                                )
-                                .with_label(Label::primary(call.span, "unexpected arguments")),
-                            );
-                        }
-                        Some(inner)
-                    }
-                    "expect" => {
-                        if call.args.len() != 1 {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "`Option::expect` expects 1 argument (message), got {}",
-                                        call.args.len()
-                                    ),
-                                )
-                                .with_label(Label::primary(call.span, "wrong number of arguments")),
-                            );
-                        } else {
-                            let msg_ty = self.check_expr(&call.args[0].expr);
-                            if msg_ty != Type::String && !Self::contains_error_type(&msg_ty) {
-                                self.push(
-                                    Diagnostic::new(
-                                        Severity::Error,
-                                        ErrorCode::E0201,
-                                        format!(
-                                            "expect message must be `String`, found `{}`",
-                                            self.diagnostic_type_name(&msg_ty)
-                                        ),
-                                    )
-                                    .with_label(
-                                        Label::primary(
-                                            call.args[0].expr.span(),
-                                            "expected `String`",
-                                        ),
-                                    ),
-                                );
-                            }
-                        }
-                        Some(inner)
-                    }
-                    "unwrap_or" => {
-                        if call.args.len() != 1 {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "`Option::unwrap_or` expects 1 argument, got {}",
-                                        call.args.len()
-                                    ),
-                                )
-                                .with_label(Label::primary(call.span, "wrong number of arguments")),
-                            );
-                        } else {
-                            let default_ty = self.check_expr(&call.args[0].expr);
-                            if !self.types_compatible(&inner, &default_ty) {
-                                self.push(
-                                    Diagnostic::new(
-                                        Severity::Error,
-                                        ErrorCode::E0201,
-                                        format!(
-                                            "mismatched types: expected `{}`, found `{}`",
-                                            self.diagnostic_type_name(&inner),
-                                            self.diagnostic_type_name(&default_ty)
-                                        ),
-                                    )
-                                    .with_label(
-                                        Label::primary(
-                                            call.args[0].expr.span(),
-                                            format!(
-                                                "expected `{}`",
-                                                self.diagnostic_type_name(&inner)
-                                            ),
-                                        ),
-                                    ),
-                                );
-                            }
-                        }
-                        Some(inner)
-                    }
-                    "map" => {
-                        if call.args.len() != 1 {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "`Option::map` expects 1 argument (fn), got {}",
-                                        call.args.len()
-                                    ),
-                                )
-                                .with_label(Label::primary(call.span, "wrong number of arguments")),
-                            );
-                            Some(obj_ty.clone())
-                        } else {
-                            let f_ty = self.check_fn_arg_with_param_context(
-                                &call.args[0].expr,
-                                std::slice::from_ref(&inner),
-                                false,
-                            );
-                            match f_ty {
-                                Type::Fn(ref params, ref ret) if params.len() == 1 => {
-                                    if !self.types_compatible(&inner, &params[0]) {
-                                        self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
-                                            format!("`Option::map` closure argument type mismatch: expected `{}`, found `{}`",
-                                                self.diagnostic_type_name(&inner), self.diagnostic_type_name(&params[0])))
-                                            .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
-                                    }
-                                    Some(B::Option.apply(vec![*ret.clone()]))
-                                }
-                                _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
-                                    && Self::contains_error_type(&f_ty) =>
-                                {
-                                    Some(Self::error_type())
-                                }
-                                _ => {
-                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
-                                        format!("`Option::map` expects a function `fn({}) -> U`, found `{}`",
-                                            self.diagnostic_type_name(&inner), self.diagnostic_type_name(&f_ty)))
-                                        .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
-                                    Some(obj_ty.clone())
-                                }
-                            }
-                        }
-                    }
-                    "and_then" => {
-                        if call.args.len() != 1 {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "`Option::and_then` expects 1 argument (fn), got {}",
-                                        call.args.len()
-                                    ),
-                                )
-                                .with_label(Label::primary(call.span, "wrong number of arguments")),
-                            );
-                            Some(obj_ty.clone())
-                        } else {
-                            let f_ty = self.check_fn_arg_with_param_context(
-                                &call.args[0].expr,
-                                std::slice::from_ref(&inner),
-                                false,
-                            );
-                            match f_ty {
-                                Type::Fn(ref params, ref ret) if params.len() == 1 => {
-                                    if !self.types_compatible(&inner, &params[0]) {
-                                        self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
-                                            format!("`Option::and_then` closure argument type mismatch: expected `{}`, found `{}`",
-                                                self.diagnostic_type_name(&inner), self.diagnostic_type_name(&params[0])))
-                                            .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
-                                    }
-                                    Some(*ret.clone())
-                                }
-                                _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
-                                    && Self::contains_error_type(&f_ty) =>
-                                {
-                                    Some(Self::error_type())
-                                }
-                                _ => {
-                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
-                                        format!("`Option::and_then` expects a function `fn({}) -> Option<U>`, found `{}`",
-                                            self.diagnostic_type_name(&inner), self.diagnostic_type_name(&f_ty)))
-                                        .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
-                                    Some(obj_ty.clone())
-                                }
-                            }
-                        }
-                    }
-                    "or_else" => {
-                        if call.args.len() != 1 {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "`Option::or_else` expects 1 argument (fn), got {}",
-                                        call.args.len()
-                                    ),
-                                )
-                                .with_label(Label::primary(call.span, "wrong number of arguments")),
-                            );
-                            Some(obj_ty.clone())
-                        } else {
-                            let f_ty = self.check_fn_arg_with_param_context(
-                                &call.args[0].expr,
-                                &[],
-                                false,
-                            );
-                            match f_ty {
-                                Type::Fn(ref params, ref ret) if params.is_empty() => {
-                                    Some(*ret.clone())
-                                }
-                                _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
-                                    && Self::contains_error_type(&f_ty) =>
-                                {
-                                    Some(Self::error_type())
-                                }
-                                _ => {
-                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
-                                        format!("`Option::or_else` expects a function `fn() -> Option<{}>`, found `{}`",
-                                            self.diagnostic_type_name(&inner), self.diagnostic_type_name(&f_ty)))
-                                        .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
-                                    Some(obj_ty.clone())
-                                }
-                            }
-                        }
-                    }
-                    _ => None,
-                }
-            }
-            B::Result => {
-                let args = builtin.args;
-                let ok_ty = args.first().cloned().unwrap_or(Type::Void);
-                let err_ty = args.get(1).cloned().unwrap_or(Type::Void);
-                match call.method.as_str() {
-                    "is_ok" | "is_err" => {
-                        if !call.args.is_empty() {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!("`Result::{}` takes no arguments", call.method),
-                                )
-                                .with_label(Label::primary(call.span, "unexpected arguments")),
-                            );
-                        }
-                        Some(Type::Bool)
-                    }
-                    "unwrap" => {
-                        if !call.args.is_empty() {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    "`Result::unwrap` takes no arguments",
-                                )
-                                .with_label(Label::primary(call.span, "unexpected arguments")),
-                            );
-                        }
-                        Some(ok_ty)
-                    }
-                    "expect" => {
-                        if call.args.len() != 1 {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "`Result::expect` expects 1 argument (message), got {}",
-                                        call.args.len()
-                                    ),
-                                )
-                                .with_label(Label::primary(call.span, "wrong number of arguments")),
-                            );
-                        } else {
-                            let msg_ty = self.check_expr(&call.args[0].expr);
-                            if msg_ty != Type::String && !Self::contains_error_type(&msg_ty) {
-                                self.push(
-                                    Diagnostic::new(
-                                        Severity::Error,
-                                        ErrorCode::E0201,
-                                        format!(
-                                            "expect message must be `String`, found `{}`",
-                                            self.diagnostic_type_name(&msg_ty)
-                                        ),
-                                    )
-                                    .with_label(
-                                        Label::primary(
-                                            call.args[0].expr.span(),
-                                            "expected `String`",
-                                        ),
-                                    ),
-                                );
-                            }
-                        }
-                        Some(ok_ty)
-                    }
-                    "unwrap_or" => {
-                        if call.args.len() != 1 {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "`Result::unwrap_or` expects 1 argument, got {}",
-                                        call.args.len()
-                                    ),
-                                )
-                                .with_label(Label::primary(call.span, "wrong number of arguments")),
-                            );
-                        } else {
-                            let default_ty = self.check_expr(&call.args[0].expr);
-                            if !self.types_compatible(&ok_ty, &default_ty) {
-                                self.push(
-                                    Diagnostic::new(
-                                        Severity::Error,
-                                        ErrorCode::E0201,
-                                        format!(
-                                            "mismatched types: expected `{}`, found `{}`",
-                                            self.diagnostic_type_name(&ok_ty),
-                                            self.diagnostic_type_name(&default_ty)
-                                        ),
-                                    )
-                                    .with_label(
-                                        Label::primary(
-                                            call.args[0].expr.span(),
-                                            format!(
-                                                "expected `{}`",
-                                                self.diagnostic_type_name(&ok_ty)
-                                            ),
-                                        ),
-                                    ),
-                                );
-                            }
-                        }
-                        Some(ok_ty)
-                    }
-                    "unwrap_err" => {
-                        if !call.args.is_empty() {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    "`Result::unwrap_err` takes no arguments",
-                                )
-                                .with_label(Label::primary(call.span, "unexpected arguments")),
-                            );
-                        }
-                        Some(err_ty)
-                    }
-                    "map" => {
-                        if call.args.len() != 1 {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "`Result::map` expects 1 argument (fn), got {}",
-                                        call.args.len()
-                                    ),
-                                )
-                                .with_label(Label::primary(call.span, "wrong number of arguments")),
-                            );
-                            Some(obj_ty.clone())
-                        } else {
-                            let f_ty = self.check_fn_arg_with_param_context(
-                                &call.args[0].expr,
-                                std::slice::from_ref(&ok_ty),
-                                false,
-                            );
-                            match f_ty {
-                                Type::Fn(ref params, ref ret) if params.len() == 1 => {
-                                    if !self.types_compatible(&ok_ty, &params[0]) {
-                                        self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
-                                            format!("`Result::map` closure argument type mismatch: expected `{}`, found `{}`",
-                                                self.diagnostic_type_name(&ok_ty), self.diagnostic_type_name(&params[0])))
-                                            .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
-                                    }
-                                    Some(Type::Generic(
-                                        "Result".to_string(),
-                                        vec![*ret.clone(), err_ty],
-                                    ))
-                                }
-                                _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
-                                    && Self::contains_error_type(&f_ty) =>
-                                {
-                                    Some(Self::error_type())
-                                }
-                                _ => {
-                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
-                                        format!("`Result::map` expects a function `fn({}) -> U`, found `{}`",
-                                            self.diagnostic_type_name(&ok_ty), self.diagnostic_type_name(&f_ty)))
-                                        .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
-                                    Some(obj_ty.clone())
-                                }
-                            }
-                        }
-                    }
-                    "map_err" => {
-                        if call.args.len() != 1 {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "`Result::map_err` expects 1 argument (fn), got {}",
-                                        call.args.len()
-                                    ),
-                                )
-                                .with_label(Label::primary(call.span, "wrong number of arguments")),
-                            );
-                            Some(obj_ty.clone())
-                        } else {
-                            let f_ty = self.check_fn_arg_with_param_context(
-                                &call.args[0].expr,
-                                std::slice::from_ref(&err_ty),
-                                false,
-                            );
-                            match f_ty {
-                                Type::Fn(ref params, ref ret) if params.len() == 1 => {
-                                    if !self.types_compatible(&err_ty, &params[0]) {
-                                        self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
-                                            format!("`Result::map_err` closure argument type mismatch: expected `{}`, found `{}`",
-                                                self.diagnostic_type_name(&err_ty), self.diagnostic_type_name(&params[0])))
-                                            .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
-                                    }
-                                    Some(Type::Generic(
-                                        "Result".to_string(),
-                                        vec![ok_ty, *ret.clone()],
-                                    ))
-                                }
-                                _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
-                                    && Self::contains_error_type(&f_ty) =>
-                                {
-                                    Some(Self::error_type())
-                                }
-                                _ => {
-                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
-                                        format!("`Result::map_err` expects a function `fn({}) -> F`, found `{}`",
-                                            self.diagnostic_type_name(&err_ty), self.diagnostic_type_name(&f_ty)))
-                                        .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
-                                    Some(obj_ty.clone())
-                                }
-                            }
-                        }
-                    }
-                    "and_then" => {
-                        if call.args.len() != 1 {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "`Result::and_then` expects 1 argument (fn), got {}",
-                                        call.args.len()
-                                    ),
-                                )
-                                .with_label(Label::primary(call.span, "wrong number of arguments")),
-                            );
-                            Some(obj_ty.clone())
-                        } else {
-                            let f_ty = self.check_fn_arg_with_param_context(
-                                &call.args[0].expr,
-                                std::slice::from_ref(&ok_ty),
-                                false,
-                            );
-                            match f_ty {
-                                Type::Fn(ref params, ref ret) if params.len() == 1 => {
-                                    if !self.types_compatible(&ok_ty, &params[0]) {
-                                        self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
-                                            format!("`Result::and_then` closure argument type mismatch: expected `{}`, found `{}`",
-                                                self.diagnostic_type_name(&ok_ty), self.diagnostic_type_name(&params[0])))
-                                            .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
-                                    }
-                                    Some(*ret.clone())
-                                }
-                                _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
-                                    && Self::contains_error_type(&f_ty) =>
-                                {
-                                    Some(Self::error_type())
-                                }
-                                _ => {
-                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
-                                        format!("`Result::and_then` expects a function `fn({}) -> Result<U, E>`, found `{}`",
-                                            self.diagnostic_type_name(&ok_ty), self.diagnostic_type_name(&f_ty)))
-                                        .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
-                                    Some(obj_ty.clone())
-                                }
-                            }
-                        }
-                    }
-                    "or_else" => {
-                        if call.args.len() != 1 {
-                            for arg in &call.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "`Result::or_else` expects 1 argument (fn), got {}",
-                                        call.args.len()
-                                    ),
-                                )
-                                .with_label(Label::primary(call.span, "wrong number of arguments")),
-                            );
-                            Some(obj_ty.clone())
-                        } else {
-                            let f_ty = self.check_fn_arg_with_param_context(
-                                &call.args[0].expr,
-                                std::slice::from_ref(&err_ty),
-                                false,
-                            );
-                            match f_ty {
-                                Type::Fn(ref params, ref ret) if params.len() == 1 => {
-                                    if !self.types_compatible(&err_ty, &params[0]) {
-                                        self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
-                                            format!("`Result::or_else` closure argument type mismatch: expected `{}`, found `{}`",
-                                                self.diagnostic_type_name(&err_ty), self.diagnostic_type_name(&params[0])))
-                                            .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
-                                    }
-                                    Some(*ret.clone())
-                                }
-                                _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
-                                    && Self::contains_error_type(&f_ty) =>
-                                {
-                                    Some(Self::error_type())
-                                }
-                                _ => {
-                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
-                                        format!("`Result::or_else` expects a function `fn({}) -> Result<T, F>`, found `{}`",
-                                            self.diagnostic_type_name(&err_ty), self.diagnostic_type_name(&f_ty)))
-                                        .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
-                                    Some(obj_ty.clone())
-                                }
-                            }
-                        }
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
+        let (arity, action) = option_method(builtin.id, &call.method)?;
+        let owner = builtin.id.source_name();
+        let inner = builtin.args.first().cloned().unwrap_or(Type::Void);
+        let error = builtin.args.get(1).cloned().unwrap_or(Type::Void);
+        if call.args.len() != arity.count {
+            self.check_discarded_builtin_args(&call.args);
+            self.check_builtin_arity(arity, owner, &call.method, call.args.len(), call.span);
+            return Some(match action {
+                OptionAction::Bool => Type::Bool,
+                OptionAction::ErrorPayload => error,
+                OptionAction::Transform { .. } => obj_ty.clone(),
+                _ => inner,
+            });
         }
+        Some(match action {
+            OptionAction::Bool => Type::Bool,
+            OptionAction::Payload => inner,
+            OptionAction::ErrorPayload => error,
+            OptionAction::Message | OptionAction::Default => {
+                let got = self.check_expr(&call.args[0].expr);
+                let rule = if matches!(action, OptionAction::Message) {
+                    BuiltinArgument::Message
+                } else {
+                    BuiltinArgument::Default
+                };
+                self.check_builtin_argument(
+                    rule,
+                    owner,
+                    &call.method,
+                    &inner,
+                    &got,
+                    call.args[0].expr.span(),
+                );
+                inner
+            }
+            OptionAction::Transform {
+                error_input,
+                no_input,
+                result,
+            } => {
+                let input = if error_input { &error } else { &inner };
+                let params = if no_input {
+                    &[][..]
+                } else {
+                    std::slice::from_ref(input)
+                };
+                let f_ty = self.check_fn_arg_with_param_context(&call.args[0].expr, params, false);
+                match f_ty {
+                    Type::Fn(ref parameters, ref ret) if parameters.len() == params.len() => {
+                        if !no_input {
+                            self.check_builtin_argument(
+                                BuiltinArgument::Closure,
+                                owner,
+                                &call.method,
+                                input,
+                                &parameters[0],
+                                call.args[0].expr.span(),
+                            );
+                        }
+                        match result {
+                            TransformResult::Option => B::Option.apply(vec![*ret.clone()]),
+                            TransformResult::ResultOk => B::Result.apply(vec![*ret.clone(), error]),
+                            TransformResult::ResultErr => {
+                                B::Result.apply(vec![inner, *ret.clone()])
+                            }
+                            TransformResult::Direct => *ret.clone(),
+                        }
+                    }
+                    _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
+                        && Self::contains_error_type(&f_ty) =>
+                    {
+                        Self::error_type()
+                    }
+                    _ => {
+                        let signature = match (builtin.id, call.method.as_str()) {
+                            (_, "map") => {
+                                format!("fn({}) -> U", self.diagnostic_type_name(input))
+                            }
+                            (B::Result, "map_err") => {
+                                format!("fn({}) -> F", self.diagnostic_type_name(input))
+                            }
+                            (B::Option, "and_then") => {
+                                format!("fn({}) -> Option<U>", self.diagnostic_type_name(input))
+                            }
+                            (B::Option, "or_else") => {
+                                format!("fn() -> Option<{}>", self.diagnostic_type_name(input))
+                            }
+                            (B::Result, "and_then") => {
+                                format!("fn({}) -> Result<U, E>", self.diagnostic_type_name(input))
+                            }
+                            (B::Result, "or_else") => {
+                                format!("fn({}) -> Result<T, F>", self.diagnostic_type_name(input))
+                            }
+                            _ => unreachable!(),
+                        };
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!(
+                                    "`{owner}::{}` expects a function `{signature}`, found `{}`",
+                                    call.method,
+                                    self.diagnostic_type_name(&f_ty)
+                                ),
+                            )
+                            .with_label(Label::primary(
+                                call.args[0].expr.span(),
+                                "expected function",
+                            )),
+                        );
+                        obj_ty.clone()
+                    }
+                }
+            }
+        })
     }
 
     /// Type-check a method on the explicitly native-blocking compatibility
@@ -823,9 +341,7 @@ impl TypeChecker {
             _ => None,
         };
         let Some((arg_ty, ret)) = sig else {
-            for arg in &call.args {
-                self.check_expr(&arg.expr);
-            }
+            self.check_discarded_builtin_args(&call.args);
             let mut diagnostic = Diagnostic::new(
                 Severity::Error,
                 ErrorCode::E0806,
@@ -854,40 +370,23 @@ impl TypeChecker {
             return Type::Void;
         };
         let expected_argc = usize::from(arg_ty.is_some());
-        if call.args.len() != expected_argc {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0201,
-                    format!(
-                        "`{lock}::{}` expects {expected_argc} argument(s), got {}",
-                        call.method,
-                        call.args.len()
-                    ),
-                )
-                .with_label(Label::primary(call.span, "wrong number of arguments")),
-            );
-        }
+        self.check_builtin_arity(
+            BuiltinArity::new(expected_argc, ArityText::ArgumentS),
+            lock,
+            &call.method,
+            call.args.len(),
+            call.span,
+        );
         if let (Some(expected), Some(arg)) = (arg_ty, call.args.first()) {
             let got = self.check_expr(&arg.expr);
-            if got != expected
-                && got != Type::Never
-                && !self.recovery_types_compatible(&expected, &got)
-            {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "`{lock}::{}` expects `{}`, got `{}`",
-                            call.method,
-                            self.diagnostic_type_name(&expected),
-                            self.diagnostic_type_name(&got)
-                        ),
-                    )
-                    .with_label(Label::primary(arg.expr.span(), "wrong argument type")),
-                );
-            }
+            self.check_builtin_argument(
+                BuiltinArgument::Cell,
+                lock,
+                &call.method,
+                &expected,
+                &got,
+                arg.expr.span(),
+            );
         }
         ret
     }
@@ -910,9 +409,7 @@ impl TypeChecker {
             _ => None,
         };
         let Some((argc, arg_ty, ret)) = sig else {
-            for arg in &call.args {
-                self.check_expr(&arg.expr);
-            }
+            self.check_discarded_builtin_args(&call.args);
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -924,44 +421,27 @@ impl TypeChecker {
             );
             return Type::Void;
         };
-        if call.args.len() != argc {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0201,
-                    format!(
-                        "`{atomic}::{}` expects {argc} argument(s), got {}",
-                        call.method,
-                        call.args.len()
-                    ),
-                )
-                .with_label(Label::primary(call.span, "wrong number of arguments")),
-            );
-        }
+        self.check_builtin_arity(
+            BuiltinArity::new(argc, ArityText::ArgumentS),
+            atomic,
+            &call.method,
+            call.args.len(),
+            call.span,
+        );
         for arg in &call.args {
             let Some(expected) = arg_ty.as_ref() else {
                 self.check_expr(&arg.expr);
                 continue;
             };
             let got = self.check_expr(&arg.expr);
-            if &got != expected
-                && got != Type::Never
-                && !self.recovery_types_compatible(expected, &got)
-            {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "`{atomic}::{}` expects `{}`, got `{}`",
-                            call.method,
-                            self.diagnostic_type_name(expected),
-                            self.diagnostic_type_name(&got)
-                        ),
-                    )
-                    .with_label(Label::primary(arg.expr.span(), "wrong argument type")),
-                );
-            }
+            self.check_builtin_argument(
+                BuiltinArgument::Cell,
+                atomic,
+                &call.method,
+                expected,
+                &got,
+                arg.expr.span(),
+            );
         }
         ret
     }
@@ -998,21 +478,14 @@ impl TypeChecker {
             }
             return Some(match call.method.as_str() {
                 "cancel" | "is_cancelled" | "child" | "finish" => {
-                    if !call.args.is_empty() {
-                        for arg in &call.args {
-                            self.check_expr(&arg.expr);
-                        }
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!(
-                                    "`{kind}::{}` expects 0 arguments, got {}",
-                                    call.method,
-                                    call.args.len()
-                                ),
-                            )
-                            .with_label(Label::primary(call.span, "wrong number of arguments")),
+                    if call.args.len() != method_arity(kind, &call.method).count {
+                        self.check_discarded_builtin_args(&call.args);
+                        self.check_builtin_arity(
+                            method_arity(kind, &call.method),
+                            kind,
+                            &call.method,
+                            call.args.len(),
+                            call.span,
                         );
                     }
                     match call.method.as_str() {
@@ -1040,9 +513,7 @@ impl TypeChecker {
                     let valid_name = (kind_id == B::CancellationToken && call.method == "attach")
                         || (kind_id == B::TaskScope && call.method == "add");
                     if !valid_name {
-                        for arg in &call.args {
-                            self.check_expr(&arg.expr);
-                        }
+                        self.check_discarded_builtin_args(&call.args);
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,
@@ -1052,43 +523,28 @@ impl TypeChecker {
                             .with_label(Label::primary(call.span, "unknown method")),
                         );
                         Type::Void
-                    } else if call.args.len() != 1 {
-                        for arg in &call.args {
-                            self.check_expr(&arg.expr);
-                        }
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!(
-                                    "`{kind}::{}` expects 1 argument, got {}",
-                                    call.method,
-                                    call.args.len()
-                                ),
-                            )
-                            .with_label(Label::primary(call.span, "wrong number of arguments")),
+                    } else if call.args.len() != method_arity(kind, &call.method).count {
+                        self.check_discarded_builtin_args(&call.args);
+                        self.check_builtin_arity(
+                            method_arity(kind, &call.method),
+                            kind,
+                            &call.method,
+                            call.args.len(),
+                            call.span,
                         );
                         Type::Void
                     } else {
                         let task_ty = self.check_expr(&call.args[0].expr);
                         if !is_task_handle_type(&task_ty) && Self::contains_error_type(&task_ty) {
                             Self::error_type()
-                        } else if !is_task_handle_type(&task_ty) {
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "`{kind}::{}` expects `Task<T>`, found `{}`",
-                                        call.method,
-                                        self.diagnostic_type_name(&task_ty)
-                                    ),
-                                )
-                                .with_label(Label::primary(
-                                    call.args[0].expr.span(),
-                                    "not a Task handle",
-                                )),
-                            );
+                        } else if !self.check_builtin_argument(
+                            BuiltinArgument::Task,
+                            kind,
+                            &call.method,
+                            &Type::Void,
+                            &task_ty,
+                            call.args[0].expr.span(),
+                        ) {
                             Type::Void
                         } else {
                             task_ty
@@ -1096,9 +552,7 @@ impl TypeChecker {
                     }
                 }
                 _ => {
-                    for arg in &call.args {
-                        self.check_expr(&arg.expr);
-                    }
+                    self.check_discarded_builtin_args(&call.args);
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -1130,34 +584,24 @@ impl TypeChecker {
             // returned `TaskResult<T>` waits, and it maps a cancelled task to
             // `Err(Cancelled)` instead of panicking.
             "result" if join_handle_result_type(obj_ty).is_some() => {
-                if !call.args.is_empty() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!("result expects 0 arguments, got {}", call.args.len()),
-                        )
-                        .with_label(Label::primary(call.span, "wrong number of arguments")),
-                    );
-                }
+                self.check_builtin_arity(
+                    method_arity("Task", &call.method),
+                    "Task",
+                    &call.method,
+                    call.args.len(),
+                    call.span,
+                );
                 Some(B::TaskResult.apply(vec![join_handle_result_type(obj_ty).unwrap()]))
             }
             // Cooperative cancellation (willow-0a6k.7).
             "cancel" | "is_cancelled" if join_handle_result_type(obj_ty).is_some() => {
-                if !call.args.is_empty() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "{} expects 0 arguments, got {}",
-                                call.method,
-                                call.args.len()
-                            ),
-                        )
-                        .with_label(Label::primary(call.span, "wrong number of arguments")),
-                    );
-                }
+                self.check_builtin_arity(
+                    method_arity("Task", &call.method),
+                    "Task",
+                    &call.method,
+                    call.args.len(),
+                    call.span,
+                );
                 Some(if call.method == "cancel" {
                     Type::Void
                 } else {
@@ -1170,9 +614,7 @@ impl TypeChecker {
             // rather than an unrelated "unknown method" error. Unrelated user
             // classes may still define methods with either name.
             "join" | "try_join" if !self.class_defines_method(obj_ty, &call.method) => {
-                for arg in &call.args {
-                    self.check_expr(&arg.expr);
-                }
+                self.check_discarded_builtin_args(&call.args);
                 if !is_task_handle_type(obj_ty) {
                     return None;
                 }
@@ -1212,9 +654,7 @@ impl TypeChecker {
             "send" if !self.class_defines_method(obj_ty, "send") => {
                 let channel_type = channel_element_type(obj_ty);
                 if channel_type.is_none() {
-                    for arg in &call.args {
-                        self.check_expr(&arg.expr);
-                    }
+                    self.check_discarded_builtin_args(&call.args);
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -1250,16 +690,13 @@ impl TypeChecker {
                         .with_help("send Send values (scalars, String, frozen/Sync types) through channels"),
                     );
                 }
-                if call.args.len() != 1 {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!("send expects 1 argument, got {}", call.args.len()),
-                        )
-                        .with_label(Label::primary(call.span, "wrong number of arguments")),
-                    );
-                }
+                self.check_builtin_arity(
+                    method_arity("Channel", &call.method),
+                    "Channel",
+                    &call.method,
+                    call.args.len(),
+                    call.span,
+                );
                 if let Some(arg) = call.args.first() {
                     let arg_ty = self.check_expr_expecting(&arg.expr, &element_ty);
                     // Record each suspended value independently: a
@@ -1290,41 +727,27 @@ impl TypeChecker {
                                 ),
                             )),
                         );
-                    } else if !self.types_compatible(&element_ty, &arg_ty) {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0802,
-                                format!(
-                                    "cannot send `{}` into `Channel<{}>`",
-                                    self.diagnostic_type_name(&arg_ty),
-                                    self.diagnostic_type_name(&element_ty)
-                                ),
-                            )
-                            .with_label(Label::primary(
-                                arg.expr.span(),
-                                format!(
-                                    "expected `{}`, found `{}`",
-                                    self.diagnostic_type_name(&element_ty),
-                                    self.diagnostic_type_name(&arg_ty)
-                                ),
-                            )),
+                    } else {
+                        self.check_builtin_argument(
+                            BuiltinArgument::Channel,
+                            "Channel",
+                            &call.method,
+                            &element_ty,
+                            &arg_ty,
+                            arg.expr.span(),
                         );
                     }
                 }
                 Some(Type::Void)
             }
             method @ ("recv" | "recv_opt") if !self.class_defines_method(obj_ty, method) => {
-                if !call.args.is_empty() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!("{method} expects 0 arguments, got {}", call.args.len()),
-                        )
-                        .with_label(Label::primary(call.span, "wrong number of arguments")),
-                    );
-                }
+                self.check_builtin_arity(
+                    method_arity("Channel", &call.method),
+                    "Channel",
+                    &call.method,
+                    call.args.len(),
+                    call.span,
+                );
                 match channel_element_type(obj_ty) {
                     // `recv_opt` answers `None` once the channel is closed and
                     // drained instead of raising (willow-jz15.44).
@@ -1333,9 +756,7 @@ impl TypeChecker {
                     }
                     Some(element_ty) => Some(element_ty),
                     None => {
-                        for arg in &call.args {
-                            self.check_expr(&arg.expr);
-                        }
+                        self.check_discarded_builtin_args(&call.args);
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,
@@ -1352,20 +773,15 @@ impl TypeChecker {
                 }
             }
             "close" if !self.class_defines_method(obj_ty, "close") => {
-                if !call.args.is_empty() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!("close expects 0 arguments, got {}", call.args.len()),
-                        )
-                        .with_label(Label::primary(call.span, "wrong number of arguments")),
-                    );
-                }
+                self.check_builtin_arity(
+                    method_arity("Channel", &call.method),
+                    "Channel",
+                    &call.method,
+                    call.args.len(),
+                    call.span,
+                );
                 if channel_element_type(obj_ty).is_none() {
-                    for arg in &call.args {
-                        self.check_expr(&arg.expr);
-                    }
+                    self.check_discarded_builtin_args(&call.args);
                     self.push(
                         Diagnostic::new(
                             Severity::Error,

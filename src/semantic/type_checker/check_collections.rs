@@ -148,9 +148,7 @@ impl TypeChecker {
                 )
                 .with_label(Label::primary(m.span, "resizing a fixed array")),
             );
-            for arg in &m.args {
-                self.check_expr(&arg.expr);
-            }
+            self.check_discarded_builtin_args(&m.args);
             return Some(Self::error_type());
         }
         let template = self
@@ -204,9 +202,7 @@ impl TypeChecker {
                     .with_help(format!("available methods: {methods}"));
                     self.label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
                     self.push(diagnostic);
-                    for arg in &m.args {
-                        self.check_expr(&arg.expr);
-                    }
+                    self.check_discarded_builtin_args(&m.args);
                     return Some(Self::error_type());
                 }
                 if **elem == Type::Void {
@@ -264,9 +260,7 @@ impl TypeChecker {
                         )
                         .with_label(Label::primary(m.span, "method constraint is not satisfied")),
                     );
-                    for arg in &m.args {
-                        self.check_expr(&arg.expr);
-                    }
+                    self.check_discarded_builtin_args(&m.args);
                     return Some(Self::error_type());
                 }
                 let access = if self
@@ -425,66 +419,36 @@ impl TypeChecker {
             );
         }
 
-        let check_key = async |checker: &mut Self, arg: &CallArg| {
-            let k = checker.check_expr(&arg.expr);
-            if key_ty != Type::Void && !checker.types_compatible(&key_ty, &k) {
-                checker.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "map key type mismatch: expected `{}`, found `{}`",
-                            checker.diagnostic_type_name(&key_ty),
-                            checker.diagnostic_type_name(&k)
-                        ),
-                    )
-                    .with_label(Label::primary(arg.expr.span(), "wrong key type")),
+        if let Some((arity, key, value)) = super::builtin_methods::map_method(&m.method)
+            && self.check_builtin_arity(arity, "Map", &m.method, m.args.len(), m.span)
+        {
+            if key {
+                let got = self.check_expr(&m.args[0].expr);
+                self.check_builtin_argument(
+                    BuiltinArgument::MapKey,
+                    "Map",
+                    &m.method,
+                    &key_ty,
+                    &got,
+                    m.args[0].expr.span(),
                 );
             }
-        };
+            if value {
+                let got = self.check_expr_expecting(&m.args[1].expr, &val_ty);
+                self.check_builtin_argument(
+                    BuiltinArgument::MapValue,
+                    "Map",
+                    &m.method,
+                    &val_ty,
+                    &got,
+                    m.args[1].expr.span(),
+                );
+            }
+        }
 
         match m.method.as_str() {
-            "insert" => {
-                if m.args.len() != 2 {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!("`Map::insert` expects 2 arguments, got {}", m.args.len()),
-                        )
-                        .with_label(Label::primary(m.span, "expected `insert(key, value)`")),
-                    );
-                } else {
-                    check_key(self, &m.args[0]).await;
-                    let v = self.check_expr_expecting(&m.args[1].expr, &val_ty);
-                    if val_ty != Type::Void && !self.types_compatible(&val_ty, &v) {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!(
-                                    "map value type mismatch: expected `{}`, found `{}`",
-                                    self.diagnostic_type_name(&val_ty),
-                                    self.diagnostic_type_name(&v)
-                                ),
-                            )
-                            .with_label(Label::primary(m.args[1].expr.span(), "wrong value type")),
-                        );
-                    }
-                }
-                Some(Type::Void)
-            }
+            "insert" => Some(Type::Void),
             "keys" | "values" | "entries" => {
-                if !m.args.is_empty() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!("`Map::{}` takes no arguments", m.method),
-                        )
-                        .with_label(Label::primary(m.span, "unexpected arguments")),
-                    );
-                }
                 let element = match m.method.as_str() {
                     "keys" => key_ty,
                     "values" => val_ty,
@@ -492,69 +456,12 @@ impl TypeChecker {
                 };
                 Some(Type::Array(Box::new(element)))
             }
-            "get" | "remove" => {
-                if m.args.len() != 1 {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "`Map::{}` expects 1 argument, got {}",
-                                m.method,
-                                m.args.len()
-                            ),
-                        )
-                        .with_label(Label::primary(
-                            m.span,
-                            format!("expected `{}(key)`", m.method),
-                        )),
-                    );
-                } else {
-                    check_key(self, &m.args[0]).await;
-                }
-                Some(B::Option.apply(vec![val_ty]))
-            }
-            "contains" => {
-                if m.args.len() != 1 {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!("`Map::contains` expects 1 argument, got {}", m.args.len()),
-                        )
-                        .with_label(Label::primary(m.span, "expected `contains(key)`")),
-                    );
-                } else {
-                    check_key(self, &m.args[0]).await;
-                }
-                Some(Type::Bool)
-            }
-            "len" => {
-                if !m.args.is_empty() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            "`Map::len` takes no arguments",
-                        )
-                        .with_label(Label::primary(m.span, "unexpected arguments")),
-                    );
-                }
-                Some(Type::I64)
-            }
+            "get" | "remove" => Some(B::Option.apply(vec![val_ty])),
+            "contains" => Some(Type::Bool),
+            "len" => Some(Type::I64),
             // `.freeze()` -> an immutable `FrozenMap<K,V>` copy, Sync when K,V are
             // Sync, so it can be shared across tasks (willow-dgwo.10).
             "toString" => {
-                if !m.args.is_empty() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            "`Map::toString` takes no arguments",
-                        )
-                        .with_label(Label::primary(m.span, "unexpected arguments")),
-                    );
-                }
                 if !matches!(val_ty, Type::I64 | Type::F64 | Type::Bool | Type::String) {
                     self.push(
                         Diagnostic::new(
@@ -574,16 +481,6 @@ impl TypeChecker {
                 Some(Type::String)
             }
             "freeze" => {
-                if !m.args.is_empty() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            "`Map::freeze` takes no arguments",
-                        )
-                        .with_label(Label::primary(m.span, "unexpected arguments")),
-                    );
-                }
                 if key_ty == Type::Void || val_ty == Type::Void {
                     return Some(Self::error_type());
                 }

@@ -1,0 +1,57 @@
+// Builtin method contracts: contextual closures, collections and concurrency.
+import std::collections::{Array, Map};
+
+async fn value() -> i64 {
+    return 7;
+}
+
+async fn main() {
+    let some: Option<i64> = Some(4);
+    let none: Option<i64> = None;
+    println(some.is_some());
+    println(none.is_none());
+    println(some.expect("some"));
+    println(none.unwrap_or(9));
+    println(some.map(|n| n + 1).unwrap());
+    println(none.or_else(|| Option::Some(3)).unwrap());
+    println(some.and_then(|n| Option::Some(n + 2)).unwrap());
+    let ok: Result<i64, String> = Ok(8);
+    let err: Result<i64, String> = Err("bad");
+    println(ok.is_ok());
+    println(err.is_err());
+    println(ok.map(|n| n * 2).unwrap());
+    println(err.map_err(|e| e + "!").unwrap_err());
+    println(err.or_else(|e| Result::Ok(e.len())).unwrap());
+    let map = Map<String, i64>::new();
+    map.insert("a", 5);
+    println(map.get("a").unwrap());
+    println(map.contains("a"));
+    println(map.keys().len());
+    println(map.remove("a").unwrap());
+    let array: Array<i64> = [1];
+    array.push(2);
+    println(array.len());
+    println(array.pop());
+    let atomic = AtomicI64::new(10);
+    println(atomic.add(2));
+    println(atomic.compare_exchange(12, 15));
+    println(atomic.load());
+    let cell = BlockingCell<i64>::new(1);
+    cell.set(6);
+    println(cell.get());
+    let channel = Channel<i64>::with_capacity(1);
+    channel.send(11);
+    println(channel.recv());
+    channel.close();
+    println(channel.recv_opt().is_none());
+    let token = CancellationToken::new();
+    let task = token.attach(value());
+    println((await task.result()).unwrap());
+    token.cancel();
+    println(token.is_cancelled());
+    let scope = TaskScope::new();
+    let scoped = scope.add(value());
+    println(await scoped);
+    let finished = await scope.finish();
+    println(finished.is_ok());
+}

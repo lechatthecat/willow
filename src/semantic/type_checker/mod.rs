@@ -11,10 +11,12 @@ use crate::qualified_name::QualifiedName;
 use crate::semantic::async_borrows::ReferenceArgMode;
 pub(crate) mod analysis;
 pub(crate) mod body;
+mod builtin_methods;
 mod check;
 mod check_calls;
 mod check_collections;
 mod check_concurrency;
+use builtin_methods::{ArityText, BuiltinArgument, BuiltinArity, constructor_arity, method_arity};
 mod check_decls;
 mod check_lambda_match;
 pub(crate) mod generics;
@@ -23,6 +25,8 @@ pub(crate) mod precheck_journal;
 mod signature;
 pub use check_lambda_match::LambdaCapture;
 mod async_retention;
+#[cfg(test)]
+mod builtin_contract_tests;
 #[cfg(test)]
 mod builtin_method_diagnostic_tests;
 mod check_ops;

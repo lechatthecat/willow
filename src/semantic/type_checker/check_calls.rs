@@ -24,19 +24,13 @@ impl TypeChecker {
         supplied: usize,
         span: Span,
     ) {
-        if expected != supplied {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0201,
-                    format!(
-                        "{} takes {} argument(s) but {} were supplied",
-                        callee, expected, supplied
-                    ),
-                )
-                .with_label(Label::primary(span, "wrong number of arguments")),
-            );
-        }
+        self.check_builtin_arity(
+            BuiltinArity::new(expected, ArityText::ValueCall),
+            "",
+            callee,
+            supplied,
+            span,
+        );
     }
 
     /// Reject `&arg` on a builtin whose parameters are all by value. Builtin

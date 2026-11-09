@@ -1705,16 +1705,13 @@ impl TypeChecker {
         if method_name == "toString"
             && matches!(obj_ty, Type::I64 | Type::F64 | Type::Bool | Type::String)
         {
-            if !args.is_empty() {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        "`toString()` takes no arguments",
-                    )
-                    .with_label(Label::primary(span, "unexpected arguments")),
-                );
-            }
+            self.check_builtin_arity(
+                method_arity("primitive", method_name),
+                "primitive",
+                method_name,
+                args.len(),
+                span,
+            );
             return Type::String;
         }
         if let Some(inner) = crate::semantic::builtin_types::unary_arg(
@@ -2291,14 +2288,13 @@ impl TypeChecker {
             ..
         } = *call;
         self.check_collection_type_imported("Map", span);
-        if !args.is_empty() {
-            self.push_error(
-                ErrorCode::E0201,
-                "`Map::new` takes no arguments",
-                span,
-                "unexpected arguments",
-            );
-        }
+        self.check_builtin_arity(
+            constructor_arity("Map", "new"),
+            "Map",
+            "new",
+            args.len(),
+            span,
+        );
         match type_args {
             [] => Type::Generic("Map".to_string(), vec![Type::Void, Type::Void]),
             [key, value] => Type::Generic("Map".to_string(), vec![key.clone(), value.clone()]),
@@ -2494,15 +2490,13 @@ impl TypeChecker {
             ..
         } = *call;
         self.reject_reference_args(&QualifiedName::join(class_name, "new"), args);
-        if args.len() != 1 {
-            self.push_wrong_argument_count(
-                ErrorCode::E0201,
-                format!(
-                    "function `{class_name}::new` expects 1 argument, got {}",
-                    args.len()
-                ),
-                span,
-            );
+        if !self.check_builtin_arity(
+            constructor_arity(class_name, "new"),
+            class_name,
+            "new",
+            args.len(),
+            span,
+        ) {
             return Type::Generic(class_name.to_string(), vec![Type::Void]);
         }
         // The written type argument, else the expected lock's element, is
@@ -2522,19 +2516,14 @@ impl TypeChecker {
         let elem = match type_args {
             [] => arg_ty.clone(),
             [t] => {
-                if arg_ty != *t && arg_ty != Type::Never {
-                    self.push_error(
-                        ErrorCode::E0201,
-                        format!(
-                            "`{class_name}<{}>::new` expects `{}`, got `{}`",
-                            self.diagnostic_type_name(t),
-                            self.diagnostic_type_name(t),
-                            self.diagnostic_type_name(&arg_ty)
-                        ),
-                        args[0].expr.span(),
-                        "wrong argument type",
-                    );
-                }
+                self.check_builtin_argument(
+                    BuiltinArgument::LockConstructor,
+                    class_name,
+                    "new",
+                    t,
+                    &arg_ty,
+                    args[0].expr.span(),
+                );
                 t.clone()
             }
             _ => {
@@ -2565,29 +2554,22 @@ impl TypeChecker {
         } else {
             Type::Bool
         };
-        if args.len() != 1 {
-            self.push_wrong_argument_count(
-                ErrorCode::E0201,
-                format!(
-                    "function `{class_name}::new` expects 1 argument, got {}",
-                    args.len()
-                ),
-                span,
-            );
-        } else {
+        if self.check_builtin_arity(
+            constructor_arity(class_name, "new"),
+            class_name,
+            "new",
+            args.len(),
+            span,
+        ) {
             let arg_ty = self.check_expr(&args[0].expr);
-            if arg_ty != expected && arg_ty != Type::Never {
-                self.push_error(
-                    ErrorCode::E0201,
-                    format!(
-                        "`{class_name}::new` expects `{}`, got `{}`",
-                        self.diagnostic_type_name(&expected),
-                        self.diagnostic_type_name(&arg_ty)
-                    ),
-                    args[0].expr.span(),
-                    "wrong argument type",
-                );
-            }
+            self.check_builtin_argument(
+                BuiltinArgument::Constructor,
+                class_name,
+                "new",
+                &expected,
+                &arg_ty,
+                args[0].expr.span(),
+            );
         }
         Type::Named(class_name.to_string())
     }
@@ -2603,15 +2585,13 @@ impl TypeChecker {
         } = *call;
         self.reject_reference_args(&QualifiedName::join(class_name, "new"), args);
         if !type_args.is_empty() || !args.is_empty() {
-            for arg in args {
-                self.check_expr(&arg.expr);
-            }
-            self.push_error(
-                ErrorCode::E0201,
-                format!("function `{class_name}::new` expects no arguments"),
+            self.check_discarded_builtin_args(args);
+            self.push(constructor_arity(class_name, "new").diagnostic(
+                class_name,
+                "new",
+                args.len(),
                 span,
-                "wrong constructor arguments",
-            );
+            ));
         }
         Type::Named(class_name.to_string())
     }
@@ -2625,28 +2605,22 @@ impl TypeChecker {
             ..
         } = *call;
         self.reject_reference_args("Channel::with_capacity", args);
-        if args.len() != 1 {
-            self.push_wrong_argument_count(
-                ErrorCode::E0201,
-                format!(
-                    "function `Channel::with_capacity` expects 1 argument, got {}",
-                    args.len()
-                ),
-                span,
-            );
-        } else {
+        if self.check_builtin_arity(
+            constructor_arity("Channel", "with_capacity"),
+            "Channel",
+            "with_capacity",
+            args.len(),
+            span,
+        ) {
             let cap_ty = self.check_expr(&args[0].expr);
-            if cap_ty != Type::I64 {
-                self.push_error(
-                    ErrorCode::E0201,
-                    format!(
-                        "channel capacity must be `i64`, found `{}`",
-                        self.diagnostic_type_name(&cap_ty)
-                    ),
-                    args[0].expr.span(),
-                    "expected `i64`",
-                );
-            }
+            self.check_builtin_argument(
+                BuiltinArgument::Capacity,
+                "Channel",
+                "with_capacity",
+                &Type::I64,
+                &cap_ty,
+                args[0].expr.span(),
+            );
         }
         match type_args {
             [] => Type::Generic("Channel".to_string(), vec![Type::Void]),
@@ -2673,20 +2647,13 @@ impl TypeChecker {
             span,
             ..
         } = *call;
-        if !args.is_empty() {
-            self.push(
-                Self::error_at(
-                    ErrorCode::E0201,
-                    format!(
-                        "function `Channel::new` expects 0 arguments, got {}",
-                        args.len()
-                    ),
-                    span,
-                    "wrong number of arguments",
-                )
-                .with_help("use `Channel::with_capacity(n)` to create a bounded channel"),
-            );
-        }
+        self.check_builtin_arity(
+            constructor_arity("Channel", "new"),
+            "Channel",
+            "new",
+            args.len(),
+            span,
+        );
         match type_args {
             [] => Type::Generic("Channel".to_string(), vec![Type::Void]),
             [element_ty] => Type::Generic("Channel".to_string(), vec![element_ty.clone()]),
@@ -2733,17 +2700,13 @@ impl TypeChecker {
             ..
         } = *call;
         self.reject_static_call_type_args(call);
-        if args.len() != entry.params.len() {
-            self.push_wrong_argument_count(
-                ErrorCode::E0201,
-                format!(
-                    "function `{class_name}::{method_name}` expects {} arguments, got {}",
-                    entry.params.len(),
-                    args.len()
-                ),
-                span,
-            );
-        }
+        self.check_builtin_arity(
+            BuiltinArity::new(entry.params.len(), ArityText::FunctionPlural),
+            class_name,
+            method_name,
+            args.len(),
+            span,
+        );
         let params: Vec<_> = entry.params.iter().map(|ty| ty.to_source()).collect();
         self.check_value_call_args(&params, args);
         entry.ret.to_source()
@@ -2783,16 +2746,13 @@ impl TypeChecker {
         if matches!(method_name, "from_i64" | "trunc_to_i64") {
             self.reject_static_call_type_args(call);
         }
-        if args.len() != 1 {
-            self.push_wrong_argument_count(
-                ErrorCode::E0201,
-                format!(
-                    "function `{class_name}::{method_name}` expects 1 argument, got {}",
-                    args.len()
-                ),
-                span,
-            );
-        }
+        self.check_builtin_arity(
+            constructor_arity(class_name, method_name),
+            class_name,
+            method_name,
+            args.len(),
+            span,
+        );
         self.check_value_call_args(&[param], args);
         Some(ret)
     }
