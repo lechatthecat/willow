@@ -769,7 +769,7 @@ async fn main() {
     let expected = (171..=180)
         .map(|id| format!("prm-{id}:cleanup-{id}\n"))
         .collect::<String>();
-    // willow-ikoh: a panic used to bypass cancellation cleanup's root pops,
+    // a panic used to bypass cancellation cleanup's root pops,
     // leaving native stack slots registered after the cleanup function returned.
     // The handshake ensures both defers are registered before cancellation.
     for workers in ["1", "4"] {

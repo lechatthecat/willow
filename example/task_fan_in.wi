@@ -1,4 +1,4 @@
-// task_fan_in.wi — one task waiting on many tasks (willow-ezs.2).
+// task_fan_in.wi — one task waiting on many tasks.
 //
 // Every `await` of an unfinished task registers the waiting task on the
 // awaited task's waiter list and parks it; finishing wakes each registered

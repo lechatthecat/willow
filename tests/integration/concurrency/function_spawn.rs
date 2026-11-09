@@ -198,7 +198,7 @@ fn main() {
 }
 "#,
         // `JoinHandle<T>` is a legacy SPELLING of `Task<T>`, not a second type,
-        // so diagnostics name the canonical one (willow-qrj9).
+        // so diagnostics name the canonical one.
         &[
             "error[E0201]",
             "mismatched types: expected `Task<i64>`, found `i64`",

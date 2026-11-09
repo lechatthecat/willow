@@ -1,4 +1,4 @@
-// Mutable static properties (willow-qsqf, Stage 3).
+// Mutable static properties (static member support, Stage 3).
 //
 // `static mut name: T = expr;` is shared, class-level state that CAN be
 // reassigned with `ClassName::name = value`. A plain `static` (no `mut`) is

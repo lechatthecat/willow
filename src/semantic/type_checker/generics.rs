@@ -40,7 +40,7 @@ pub(crate) struct TemplateRegistry {
     // speculative instances still use a separate registry.
     classes: Rc<Map<(crate::diagnostics::FileId, String), Rc<ClassDecl>>>,
     /// Generic interfaces with default bodies, by declaring file and name: a
-    /// class in another unit receives their defaults (willow-s71l).
+    /// class in another unit receives their defaults.
     interfaces: Map<(crate::diagnostics::FileId, String), Rc<InterfaceDecl>>,
     /// Each concrete instantiation of such an interface, checked once in its
     /// declaring unit and shared by every receiving class.
@@ -199,7 +199,7 @@ pub(crate) struct Generics {
     /// Interface defaults this checker's classes received from a generic
     /// interface another unit declares, by (class, method): each is replaced
     /// by the default at that method index of the instance checked in that
-    /// unit (willow-s71l).
+    /// unit.
     pub default_copies: Map<String, HashMap<String, (Rc<InterfaceDecl>, usize)>>,
 }
 impl Default for Generics {
@@ -478,7 +478,7 @@ mod template_registry_tests {
     fn nested_deferred_lambdas_check_each_generic_call_once() {
         // Each level's lambda is typed after its sibling argument and holds the
         // next generic call, so re-checking a deferred lambda would grow the
-        // count exponentially with depth (willow-jz15.64).
+        // count exponentially with depth.
         for depth in [1, 4, 8, 16, 32] {
             let mut expression = format!("x{} + 1", depth - 1);
             for level in (0..depth).rev() {
@@ -507,7 +507,7 @@ mod template_registry_tests {
     #[test]
     fn generic_caller_chains_check_each_generic_call_once() {
         // Every link is a generic function that calls `fold` and the previous
-        // link with unannotated lambdas typed from its own `T` (willow-jz15.97).
+        // link with unannotated lambdas typed from its own `T`.
         for depth in [1, 4, 16, 64] {
             let mut source = "import std::collections::Array; fn fold<T, A>(xs: Array<T>, init: A, f: closure(A, T) -> A) -> A { let mut acc = init; for x in xs { acc = f(acc, x); } return acc; }".to_string();
             for link in 0..depth {
@@ -815,7 +815,7 @@ mod template_registry_tests {
     }
 
     #[test]
-    fn iflh_default_body_visits_are_not_added_by_import_collection() {
+    fn import_usage_default_body_visits_are_not_added_by_import_collection() {
         use super::super::check_decls::DEFAULT_BODY_CHECKS;
         use crate::parser::import_usage::DEFAULT_BODY_PARSES;
         for width in [1, 8, 32] {
@@ -879,7 +879,7 @@ mod template_registry_tests {
                     assert_eq!(total, 2 * checks);
                     assert_eq!(DEFAULT_BODY_PARSES.with(|v| v.get()), templates);
                     println!(
-                        "iflh defaults={templates} width={width} instantiated={instantiated} parses={templates} generic_body_checks={checks} total_body_checks={total}"
+                        "import_usage defaults={templates} width={width} instantiated={instantiated} parses={templates} generic_body_checks={checks} total_body_checks={total}"
                     );
                 }
             }
@@ -889,7 +889,7 @@ mod template_registry_tests {
     #[test]
     fn foreign_default_receivers_share_one_interface_instance() {
         // Every receiver of one instantiation reuses the provider's single
-        // checked instance; only a new type argument adds one (willow-s71l).
+        // checked instance; only a new type argument adds one.
         for width in [1, 16, 256] {
             let provider = parse(&format!(
                 "pub interface Get<T> {{ fn raw(self) -> T; fn get(self) -> i64 {{ {} return 1; }} }}",
@@ -1372,7 +1372,7 @@ impl TypeChecker {
     }
 
     /// An argument of a generic call inside an interface default, as
-    /// inference sees it (willow-dnia). The receiver is unknown there, so no
+    /// inference sees it. The receiver is unknown there, so no
     /// instantiation may be keyed by `Self`: a whole `self` is inferred as
     /// the interface it converts to, and `Self` inside another type, which no
     /// conversion reaches, is reported (`None`).
@@ -1752,8 +1752,8 @@ impl TypeChecker {
                 let substituted = fully_explicit
                     .then(|| ty.substitute_names(|name| explicit_bindings.get(name).cloned()));
                 // The test runs on the formal: an explicit argument may spell
-                // the caller's own parameter under a callee parameter's name
-                // (willow-jz15.97).
+                // the caller's own parameter under a callee parameter's name.
+                //
                 let expected = substituted.as_ref().unwrap_or(ty);
                 (fully_explicit || !uses_parameters(ty, &parameter_names))
                     .then(|| self.normalize_type(expected, span))
@@ -1761,7 +1761,7 @@ impl TypeChecker {
             .collect();
         // The expected result type, matched against the declared return type,
         // gives a parameter-mentioning formal a context for contextual forms
-        // (`let h: Box<Array<i64>> = wrap([])`, willow-jz15.96). It is only a
+        // (`let h: Box<Array<i64>> = wrap([])`, contextual generic arguments). It is only a
         // checking context: inference still binds from the checked arguments,
         // so an ordinary value keeps its own type.
         let hinted_params = match expected {
@@ -1869,7 +1869,7 @@ impl TypeChecker {
         let mut failure_argument = None;
         // An argument whose type already carries the recovery marker has been
         // reported; matching it would only add a derived mismatch, and every
-        // later call fed this call's result would add another (willow-jz15.64).
+        // later call fed this call's result would add another.
         let mut poisoned = false;
         for (i, ty) in actual.iter().enumerate() {
             let Some(ty) = ty else { continue };
@@ -1931,8 +1931,8 @@ impl TypeChecker {
             // the caller's own type parameter, whose name can coincide with
             // one of the callee's (`fold` called from `count_where<T>` binds
             // the callee's `T` to the caller's `T`), so the substituted type
-            // says nothing about which callee parameters are still unbound
-            // (willow-jz15.97).
+            // says nothing about which callee parameters are still unbound.
+            //
             let known = |ty: &Type| {
                 if mentions(ty, |name| {
                     parameter_names.contains(name)
@@ -2670,12 +2670,12 @@ impl TypeChecker {
     }
 
     /// Request, from the unit that declares each generic interface `c`
-    /// implements, the concrete instance whose defaults `c`'s copies reuse
-    /// (willow-s71l). A copy of another unit's generic default must name that
+    /// implements, the concrete instance whose defaults `c`'s copies reuse. A copy of another
+    /// unit's generic default must name that
     /// unit's items, so it is checked there, once per distinct interface
     /// instantiation, as a non-generic interface; the class's copy is then
     /// rebound to that body when generics are expanded and lowered in that
-    /// unit's scope like any other foreign default (willow-rvpp). Returns the
+    /// unit's scope like any other foreign default. Returns the
     /// copies handled this way, which `c` must not check itself.
     pub(super) fn instantiate_foreign_defaults<'c>(
         &mut self,

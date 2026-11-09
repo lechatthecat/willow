@@ -1,4 +1,4 @@
-// Recoverable panics around a request loop (willow-s9ej).
+// Recoverable panics around a request loop.
 //
 // A Willow panic is NOT the error-handling mechanism — `Result` still is. A
 // panic abandons ordinary execution, unwinds lexical scopes, and runs every

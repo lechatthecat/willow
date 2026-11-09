@@ -1,5 +1,5 @@
 //! One structural traversal of the AST, shared by every read-only whole-program
-//! analysis (willow-uqzx.1.1, catalog item 3).
+//! analysis (shared AST walking, catalog item 3).
 //!
 //! Before this module the compiler carried nine hand-written whole-body
 //! traversals, each with its own exhaustive `match` over [`Stmt`] and [`Expr`]:

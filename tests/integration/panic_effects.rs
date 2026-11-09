@@ -1,4 +1,4 @@
-//! willow-s9ej.8 — conservative may-panic analysis and fast-path coverage.
+//! Panic-effect analysis — conservative may-panic analysis and fast-path coverage.
 
 use super::support::{
     TestProject, compile_and_collect_panic_events, compile_and_collect_panic_events_all,
@@ -53,8 +53,8 @@ fn panic_snapshots_reduce_three_surviving_straight_line_reads() {
 
 #[test]
 fn panic_snapshots_do_not_add_reads_to_pure_calls() {
-    // Pure only in release: debug overflow checks make `fib` may-panic
-    // (willow-jz15.14).
+    // Pure only in release: debug overflow checks make `fib` may-panic.
+    //
     let targets = compile_and_collect_panic_events_mode(PURE_RECURSION, &[], true);
     assert!(!has_target(&targets, "inline_panic_depth"));
     let targets = compile_and_collect_panic_events_mode(PURE_RECURSION, &[], false);
@@ -246,7 +246,7 @@ fn pe_01_pure_recursive_function_is_reported_no_panic() {
         compile_release_with_compiler_env(PURE_RECURSION, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     assert!(ok, "{stderr}");
     assert!(stderr.contains("[panic-effects] fib: no-panic"), "{stderr}");
-    // Debug: checked `+`/`-` can raise an overflow panic (willow-jz15.14).
+    // Debug: checked `+`/`-` can raise an overflow panic.
     let (ok, stderr) =
         compile_with_compiler_env(PURE_RECURSION, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     assert!(ok, "{stderr}");
@@ -636,7 +636,7 @@ fn pe_17_cross_module_panicking_summary_propagates_to_entry_wrapper() {
     );
 }
 
-// willow-s9ej.11 perspectives 18-24: the integration layer pins the logged
+// virtual-dispatch effect analysis perspectives 18-24: the integration layer pins the logged
 // summary, emitted checks, runtime recovery, optimizer on/off parity,
 // AST/LIR selection parity, grandchild propagation, and debug/release parity.
 #[test]
@@ -738,7 +738,7 @@ fn pe_24_virtual_self_call_agrees_in_release() {
     assert_eq!(debug, release);
 }
 
-// --- Shared structural AST walk (willow-uqzx.1.1) ---
+// --- Shared structural AST walk ---
 //
 // The effect summary reads the shared walk in `parser::visit` rather than its
 // own traversal. A child slot the walk never reaches makes a hazardous
@@ -1048,8 +1048,8 @@ fn main() { println(new A().value() + new B().value()); }
     assert_eq!(run.stdout, b"2\n");
 }
 
-// An injected default copy is checked and lowered in its provider's scope
-// (willow-rvpp), so its free call binds to the provider's `pure`, not to the
+// An injected default copy is checked and lowered in its provider's scope, so its free call
+// binds to the provider's `pure`, not to the
 // destination's panicking function of the same name.
 #[test]
 fn pe_33_cross_unit_default_copy_binds_free_calls_in_the_provider_scope() {
@@ -1291,7 +1291,7 @@ fn inline_panic_snapshots_have_zero_runtime_relocations() {
     }
 }
 
-// willow-8hq4.30: literals have allocation effects, without recoverable panic.
+// literals have allocation effects, without recoverable panic.
 #[test]
 fn array_literal_allocation_only_calls_and_effects() {
     let count =
@@ -1374,7 +1374,7 @@ fn array_literal_allocation_example_preserves_roots_and_active_panic() {
     }
 }
 
-/// willow-25da.29.66: `f64 **` lowers to a guard-free float power, while
+/// `f64 **` lowers to a guard-free float power, while
 /// `i64 **` keeps the runtime negative-exponent guard and, for a literal
 /// exponent, only the debug multiplication overflow checks.
 #[test]

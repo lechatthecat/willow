@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Happens-before guarantees + Channel item Send (willow-dgwo.6) ────────────
+// ── Happens-before guarantees + Channel item Send ────────────
 // Perspectives: 1 channel send->recv value visible; 2 channel order preserved;
 // 3 Mutex counter no lost updates; 4 AtomicI64 counter no lost updates; 5 await
 // makes a task's result visible; 6 Channel<Fn> send rejected under the check

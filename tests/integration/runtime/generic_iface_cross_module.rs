@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Cross-module generic interface with a class type argument (willow-jz15.45) ──
+// ── Cross-module generic interface with a class type argument ──
 //
 // `class Big implements Pred<Item>` in one module and `let q: Pred<Item> = new
 // Big()` in another spell `Item` differently (bare item import vs. the

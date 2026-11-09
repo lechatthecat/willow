@@ -1,4 +1,4 @@
-// Cross-module generic interface with a class type argument (willow-jz15.45).
+// Cross-module generic interface with a class type argument.
 // `Big` implements `Pred<Item>` in module `preds`; the entry spells the same
 // instantiation through its own item imports. Interface identity AND each type
 // argument are compared by declaration, not by spelling, so the class converts.

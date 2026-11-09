@@ -1,4 +1,4 @@
-// Leaf closures (willow-8hq4.28).
+// Leaf closures.
 //
 // A lambda body that only reads its captures and parameters, compares and
 // does arithmetic — no call, allocation, loop or possible panic — is a

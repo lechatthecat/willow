@@ -1,6 +1,6 @@
 // Leaf methods (no panic, allocation, call or loop) skip the receiver root,
 // the safepoint poll and the caller's panic bracket, and so does an
-// interface call whose every implementer is such a leaf (willow-8hq4.14).
+// interface call whose every implementer is such a leaf.
 // Expected output: 385, 1210, 7
 import std::collections::Array;
 interface Shape { fn area(self) -> i64; }

@@ -1,6 +1,6 @@
-//! Inline reference field stores (willow-8hq4.22): object, enum-payload and
+//! Inline reference field stores: object, enum-payload and
 //! interface-box stores reuse the header-flag barrier filter of reference
-//! array stores (willow-8hq4.15); globals keep the unconditional call.
+//! array stores; globals keep the unconditional call.
 
 use super::support::*;
 use std::time::Duration;
@@ -262,7 +262,7 @@ fn object_field_store_sites_add_one_cold_barrier_and_phase_load_each() {
 
 #[test]
 fn old_string_and_array_owner_stores_keep_heap_consistent() {
-    // willow-jz15.53: String values and opaque array-element owners are
+    // String values and opaque array-element owners are
     // headered GC payloads, so their stores into old fields and async frame
     // slots read the value's generation and skip the barrier call for old
     // values outside marking. Young values must still remember the owner, and

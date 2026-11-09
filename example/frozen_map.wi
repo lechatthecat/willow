@@ -1,4 +1,4 @@
-// frozen_map.wi — immutable, shareable FrozenMap<K,V> (willow-dgwo.10).
+// frozen_map.wi — immutable, shareable FrozenMap<K,V>.
 //
 // `map.freeze()` returns a FrozenMap<K,V>: an independent immutable copy with
 // read-only `.get(k)` / `.contains(k)` / `.len()` (no insert/remove). It is Sync

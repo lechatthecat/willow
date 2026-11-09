@@ -83,7 +83,7 @@ impl<'a> ClassView<'a> {
     }
 
     /// [`Self::base`] of a DECLARATION identity, ignoring whatever aliases
-    /// this unit has installed over it (willow-kd1v): for build-wide walks
+    /// this unit has installed over it: for build-wide walks
     /// over names the tables themselves recorded.
     pub(super) fn base_canonical(&self, id: &TypeId) -> Option<TypeId> {
         self.layouts.base(*id)

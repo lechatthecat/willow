@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Collection debug display: .toString() (willow-vwn6) ─────────────────────
+// ── Collection debug display: .toString() ─────────────────────
 // 20 perspectives: 1 i64 array, 2 String array (quoted), 3 f64 array
 // (shortest repr), 4 bool array, 5 empty array, 6 single element, 7 f64
 // specials inside (Infinity/NaN), 8 negative numbers, 9 map sorted by key,

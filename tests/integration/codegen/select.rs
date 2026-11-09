@@ -58,7 +58,7 @@ async fn main() {
 }
 
 // ----------------------------------------------------------------------------
-// select (willow-7aj): wait on multiple channel ops. A recv case is ready when
+// select: wait on multiple channel ops. A recv case is ready when
 // its channel has a value or is closed; a send case (unbounded) is always
 // ready; the first ready case runs; `default` runs when nothing is ready.
 // ----------------------------------------------------------------------------
@@ -194,7 +194,7 @@ async fn main() {
     );
 }
 
-// willow-lpn.7: a task parked on a TIMER keeps its async-frame GC roots alive
+// a task parked on a TIMER keeps its async-frame GC roots alive
 // while a CONCURRENT task triggers collection. The sleeper's frame is a runtime
 // root while parked, so its live String survives.
 #[test]
@@ -226,7 +226,7 @@ async fn main() {
     assert_eq!(out, "kept-across-timer-park\n");
 }
 
-// ── willow-7aj: cooperative-suspend `select` (a select INSIDE a task PARKS on
+// ── cooperative-suspend `select` (a select INSIDE a task PARKS on
 // its channels instead of block-driving). 20 test perspectives:
 //  1. single recv parks when empty, woken by a later send -> receives value
 //  2. repeated select in a while loop (park/wake each iteration)
@@ -499,7 +499,7 @@ async fn main() {
 
 #[test]
 fn coop_select_10_fair_pick_among_ready() {
-    // Perspectives 13, 15 (revised, willow-0a6k.6): when several recv cases
+    // Perspectives 13, 15 (revised, fair select): when several recv cases
     // are ready the pick is PSEUDO-RANDOMIZED (mixed global counter) rather
     // than always favoring source order — across many one-shot selects BOTH
     // cases must win at least once. This checks absence of systematic

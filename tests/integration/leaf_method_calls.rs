@@ -1,4 +1,4 @@
-//! Safepoint-free leaf methods and proven interface slots (willow-8hq4.14).
+//! Safepoint-free leaf methods and proven interface slots.
 //!
 //! A method whose body cannot panic, allocate, call or loop neither roots
 //! `self` nor polls the safepoint, and an interface call whose every slot
@@ -8,7 +8,7 @@
 //! Perspectives:
 //!   01 a field getter adds no root and no poll per method
 //!   02 arithmetic and comparisons stay leaves in release; debug overflow
-//!      checks (willow-jz15.14) add a panic path, so debug keeps the root/poll
+//!      checks add a panic path, so debug keeps the root/poll
 //!   03 a literal divisor other than 0/-1 stays a leaf and keeps no guard
 //!   04 a parameter divisor keeps the guard and the entry root
 //!   05 a literal 0 divisor still panics
@@ -158,7 +158,7 @@ fn field_getter_adds_no_root_or_poll() {
 fn arithmetic_and_comparison_stay_leaves() {
     let body = "(self, k: i64) -> bool { return (self.n * k + 3 - k) > (self.n * 2); }";
     // `[debug, release]`: checked debug arithmetic can panic, so the method
-    // is not a leaf there (willow-jz15.14); release wraps and stays a leaf.
+    // is not a leaf there; release wraps and stays a leaf.
     for symbol in [ROOT, POLL] {
         let [debug, release] = method_delta("fn", body, symbol);
         assert_eq!(release, 0, "{symbol}");
@@ -281,7 +281,7 @@ fn direct_leaf_calls_have_no_panic_bracket() {
 
 /// `calls` interface calls of `Shape.area` with the given implementers. The
 /// caller sums with `wrapping_add` and the leaves avoid `+ - *`, so debug
-/// overflow checks (willow-jz15.14) do not change either side.
+/// overflow checks do not change either side.
 fn interface_source(implementers: &str, calls: usize) -> String {
     let body = "total = total.wrapping_add(s.area());".repeat(calls);
     format!(
@@ -545,7 +545,7 @@ fn leaf_method_and_call_counts_scale_without_runtime_overhead() {
         let names = relocations(&source, &[], true);
         let counts = [ROOT, POLL, PANIC_DEPTH]
             .map(|symbol| names.iter().filter(|name| name.as_str() == symbol).count());
-        // Call-site roots share reused entry slots (willow-jz15.50), so the
+        // Call-site roots share reused entry slots, so the
         // root count does not grow with the number of calls.
         assert_eq!(counts, [3, 1, 0], "methods/calls={n}");
     }

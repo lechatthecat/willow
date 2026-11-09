@@ -1,6 +1,6 @@
 use super::*;
 
-// ── willow-oewp.6: GC-safety of remaining expression forms + temporaries ──────
+// ── GC-safety of remaining expression forms + temporaries ──────
 // Each test runs under WILLOW_GC_STRESS=alloc (collect on every allocation), so
 // any live GC value that is not reachable from the root graph during an
 // allocation is freed and the program corrupts/segfaults. The 24 perspectives

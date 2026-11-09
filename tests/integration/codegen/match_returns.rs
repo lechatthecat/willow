@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Statement-position match + return arms (willow-zvkv) ────────────────────
+// ── Statement-position match + return arms ────────────────────
 // 20 perspectives: 1 return-arm sugar, 2 block arm with trailing return,
 // 3 statement match at fn end satisfies the missing-return path, 4 mixed
 // value + return arms in expression position (Never unifies), 5 bare

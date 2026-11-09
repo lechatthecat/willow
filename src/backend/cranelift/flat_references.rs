@@ -16,7 +16,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Pass every reference argument as a pointer to a caller-owned
-    /// [`REFERENCE_CELL_BYTES`] cell `{base, offset}` (willow-9tls.9).
+    /// [`REFERENCE_CELL_BYTES`] cell `{base, offset}`.
     ///
     /// `base` is the managed allocation that owns the referenced storage, or
     /// null for a native stack slot; `offset` is the byte offset of the storage

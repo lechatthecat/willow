@@ -1,5 +1,5 @@
 //! A value `match`/ternary whose arms are distinct classes takes the type it
-//! flows into when every arm converts to it (willow-jz15.47).
+//! flows into when every arm converts to it.
 use super::*;
 use crate::{lexer::Lexer, parser::Parser};
 

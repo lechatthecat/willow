@@ -15,10 +15,10 @@ use super::*;
 /// directly-imported interface alias (`import mod::Iface` -> bare `Iface`)
 /// names the box site with the local alias, so canonicalize before the lookup;
 /// otherwise the box silently falls back to the raw object and dispatch
-/// crashes (willow-64gs.1).
+/// crashes.
 ///
 /// A free function rather than a `FuncGen` method so LIR eligibility can ask
-/// the same question before emission (willow-j260): the walker may only admit
+/// the same question before emission: the walker may only admit
 /// a class → interface coercion that [`FuncGen::emit_interface_box`] can
 /// actually build, and the two must use the same scoped type identities.
 pub(super) fn resolve_vtable_id(

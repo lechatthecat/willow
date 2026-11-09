@@ -1,4 +1,4 @@
-// Direct type imports (willow-64gs.1): a directly-imported interface
+// Direct type imports: a directly-imported interface
 // (`import shapes::Drawable`) dispatches correctly from the entry, and a module
 // function may use its OWN enum internally even though the entry never imports
 // that enum.

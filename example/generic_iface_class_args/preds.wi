@@ -1,5 +1,5 @@
 // A generic interface whose implementations take CLASS type arguments
-// imported from another module (willow-jz15.45).
+// imported from another module.
 import items::Item;
 import items::Tag;
 

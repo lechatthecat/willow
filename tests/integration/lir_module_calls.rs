@@ -1,4 +1,4 @@
-//! Calls into an imported user module, compiled from Lowered IR (willow-7nc6).
+//! Calls into an imported user module, compiled from Lowered IR.
 //!
 //! `math::add(1, 2)` reaches the backend as a static call whose "class" is the
 //! module's ACCESS name, the same node `Class::method(..)` lowers to. The two
@@ -36,7 +36,7 @@
 //!  13 a module class argument        26 a user module beats a builtin one
 //!
 //! Plus two more: a `&mut` argument crosses the module edge as a pointer to the
-//! caller's place (willow-0g8j.2.17); and an unrecovered panic raised inside the
+//! caller's place; and an unrecovered panic raised inside the
 //! module must name the module frame and the caller frame under it.
 
 use super::support::{

@@ -1,5 +1,5 @@
-//! Caller impact through function values and generic instantiations
-//! (willow-25da.29.57): a closure reaches the calls of its type key inside its
+//! Caller impact through function values and generic instantiations: a closure reaches the
+//! calls of its type key inside its
 //! own instantiation, never the callers of unrelated instantiations.
 use std::{collections::BTreeSet, fs, path::PathBuf};
 use willow_compiler::{

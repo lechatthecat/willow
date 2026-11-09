@@ -1,4 +1,4 @@
-// Bounded channels (willow-o038): `Channel<T>::with_capacity(n)` builds a
+// Bounded channels: `Channel<T>::with_capacity(n)` builds a
 // channel whose buffer holds at most `n` values. A `send` into a full buffer
 // PARKS the producer (it does not spin and does not block the worker); a `recv`
 // that frees a slot wakes it. This is what gives a producer/consumer pipeline

@@ -1,5 +1,5 @@
-//! `std::fs`, `std::net` and the prelude's error enums compiled from Lowered IR
-//! (willow-0g8j.2.13).
+//! `std::fs`, `std::net` and the prelude's error enums compiled from Lowered IR.
+//!
 //!
 //! Four pieces land together here, because a real I/O function needs all four
 //! at once:

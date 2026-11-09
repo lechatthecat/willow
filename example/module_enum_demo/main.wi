@@ -1,5 +1,5 @@
 // Using a module's enum via its module-qualified name `palette::Color`
-// (construction and match patterns), willow-64gs.
+// (construction and match patterns), module enum support.
 import palette;
 
 fn code(c: palette::Color) -> i64 {

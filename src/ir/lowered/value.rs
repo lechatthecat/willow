@@ -314,7 +314,7 @@ pub enum LirRvalue {
         operand_ty: Type,
     },
     /// Concatenation of `parts` in order, built by one size-summed runtime
-    /// allocation (willow-8hq4.29). `part_types[i]` is `String`, or `I64` for
+    /// allocation. `part_types[i]` is `String`, or `I64` for
     /// a value written in decimal as by `i64.toString()`.
     StringConcat {
         parts: Vec<LirOperand>,
@@ -322,10 +322,10 @@ pub enum LirRvalue {
     },
 }
 
-/// Integer operators that debug builds check for signed overflow
-/// (willow-jz15.14). Release builds wrap them; `**` additionally keeps its
+/// Integer operators that debug builds check for signed overflow. Release builds wrap them;
+/// `**` additionally keeps its
 /// negative-exponent guard in both modes. A shift checks its amount against
-/// `0..64` (willow-jz15.8), so a literal amount in range needs no check;
+/// `0..64`, so a literal amount in range needs no check;
 /// release builds mask the amount to its low six bits.
 pub fn is_overflow_checked_binary(op: &BinOp, rhs: &LirOperand, operand_ty: &Type) -> bool {
     *operand_ty == Type::I64

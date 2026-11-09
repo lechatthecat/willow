@@ -1,6 +1,6 @@
 use super::support::*;
 
-// Review follow-ups for the panic/recover epic (willow-s9ej.7 review):
+// Review follow-ups for the panic/recover epic:
 //
 //   1. a normal-exit defer — in any frame — must not be able to consume a
 //      panic that is unwinding some OTHER scope,

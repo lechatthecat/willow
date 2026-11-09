@@ -961,7 +961,7 @@ pub extern "C" fn willow_map_snapshot(map: *mut u8, mode: i64, value_pair: i64) 
 }
 
 /// Allocate an independent copy of `map` (same entries + value ref-ness). Backs
-/// `Map<K,V>::freeze()` -> `FrozenMap<K,V>` (willow-dgwo.10): the copy shares no
+/// `Map<K,V>::freeze()` -> `FrozenMap<K,V>`: the copy shares no
 /// `MapData` with the original, so it is safe to treat as immutable / Sync.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
@@ -970,8 +970,8 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
         return willow_map_new(0, 0, 0);
     }
     let layout = unsafe { storage(map) }.layout;
-    // Allocate the destination BEFORE reading any value word out of the source
-    // (willow-9tls.8). `willow_map_new` can collect, and a moving minor
+    // Allocate the destination BEFORE reading any value word out of the source.
+    // `willow_map_new` can collect, and a moving minor
     // collection evacuates young values reachable only through the rooted
     // source map, rewriting the source's slots through `trace_map`. A native
     // snapshot taken before that allocation would still hold the pre-move
@@ -1084,8 +1084,8 @@ fn alloc_none() -> *mut u8 {
 /// Debug display of a whole map: `{a: 1, b: 2}` — entries sorted by rendered key
 /// for deterministic output (HashMap iteration order is not stable). Kinds follow
 /// `willow_array_to_string` (0=i64, 1=f64, 2=bool, 3=String); string KEYS are
-/// printed bare (they are identifiers-like), string VALUES are quoted
-/// (willow-vwn6). `key_kind` is what tells a word key apart from the `f64` and
+/// printed bare (they are identifiers-like), string VALUES are quoted. `key_kind` is what
+/// tells a word key apart from the `f64` and
 /// `bool` that share its representation, so `Map<f64, V>` prints `1.5` and not
 /// the bit pattern. Returns a newly allocated WillowString.
 #[unsafe(no_mangle)]
@@ -1875,7 +1875,7 @@ mod tests {
         }
     }
 
-    /// willow-9tls.8: `freeze()` copies the value words a moving collection
+    /// `freeze()` copies the value words a moving collection
     /// leaves in the source, not the ones it read before that collection.
     ///
     /// The scenario is a worker that freezes a map while another thread stops
@@ -2033,7 +2033,7 @@ mod tests {
         willow_pop_roots(1);
     }
 
-    /// willow-ssl7.7: a read-only lookup must not copy the key. Counted per
+    /// a read-only lookup must not copy the key. Counted per
     /// thread through the test binary's counting global allocator, after all
     /// setup allocations, so the numbers are this loop's own Rust allocation
     /// traffic and nothing else's.

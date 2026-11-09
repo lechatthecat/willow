@@ -8,7 +8,7 @@ use crate::parser::ast::Type;
 
 /// A type used in a standard-library function signature.
 ///
-/// Recursive on purpose (willow-uqzx, catalog item 11). This enum used to carry
+/// Recursive on purpose (shared compiler infrastructure, catalog item 11). This enum used to carry
 /// one variant per concrete *combination* the table happened to need —
 /// `OptionString`, `StringArray`, `StringIoResult`, `VoidIoResult`,
 /// `TaskStringIoResult`, `TaskVoidIoResult`, `TaskBool`, `TcpListenerIoResult`,
@@ -342,7 +342,7 @@ mod tests {
 
 #[cfg(test)]
 mod recursive_schema_tests {
-    //! Perspectives 1-22 for the recursive [`StdType`] (willow-uqzx, catalog
+    //! Perspectives 1-22 for the recursive [`StdType`] (shared compiler infrastructure, catalog
     //! item 11).
     //!
     //! The refactor that made `StdType` recursive was meant to change no

@@ -1,6 +1,6 @@
-//! Async frame reference stores (willow-jz15.51): frames are old-region
+//! Async frame reference stores: frames are old-region
 //! objects addressed by payload start, so stores into their slots reuse the
-//! inline header-flag barrier filter of object field stores (willow-8hq4.22)
+//! inline header-flag barrier filter of object field stores
 //! instead of calling `willow_gc_write_barrier`, whose heap lock serialized
 //! parallel async workers, for every store.
 //!
@@ -115,7 +115,7 @@ fn async_frame_store_sites_add_one_cold_barrier_and_phase_load_each() {
         }
         // Every frame reference store site (the assignment, plus the slot
         // re-store around each await) is filtered: one cold barrier call and
-        // one mark-phase load each. Before willow-jz15.51 these sites called
+        // one mark-phase load each. Before GC barrier inlining these sites called
         // the barrier unconditionally and loaded no mark phase.
         let barriers = per_site(&reference, 3);
         assert!(barriers >= added, "{scalar:?} {reference:?}");

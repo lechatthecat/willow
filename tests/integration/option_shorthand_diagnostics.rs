@@ -1,7 +1,7 @@
 use super::support::*;
 
 // Contextual Some/None shorthand and Option-only absence diagnostics —
-// willow-glaj.5. The shorthand is deliberately not a first-class constructor.
+// Option shorthand. The shorthand is deliberately not a first-class constructor.
 
 fn run(source: &str) -> String {
     let (out, ok) = compile_and_run(source);

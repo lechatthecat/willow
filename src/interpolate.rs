@@ -1,4 +1,4 @@
-//! Format-string interpolation spec parsing (willow-csax), shared by the type
+//! Format-string interpolation spec parsing, shared by the type
 //! checker (placeholder counting + argument type validation) and the Cranelift
 //! backend (message assembly), so the two can never drift.
 //!

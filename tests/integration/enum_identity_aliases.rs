@@ -1,5 +1,5 @@
-//! An enum has ONE identity build-wide, however a unit spells it
-//! (willow-0g8j.3, over willow-itcw / willow-64gs).
+//! An enum has ONE identity build-wide, however a unit spells it.
+//!
 //!
 //! `import signal::Level as Rank;` binds a local name to a declaration that
 //! lives in `signal`. The checker registers the declaration under BOTH the
@@ -20,7 +20,7 @@
 //!   * and a lambda parameter annotation was used verbatim, so `|g: Rank|`
 //!     disagreed with the function it called.
 //!
-//! Since willow-0g8j.3 every body compiles from lowered IR, so each of those
+//! Since the lowered-IR cutover every body compiles from lowered IR, so each of those
 //! was a hard `E0800` refusal rather than a second emitter's answer — except
 //! the first, which the checker resolved to a catch-all binding and answered
 //! WRONG. These perspectives pin down both halves: the values are right, and

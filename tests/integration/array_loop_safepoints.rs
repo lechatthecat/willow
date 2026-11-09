@@ -1,4 +1,4 @@
-//! Array loops after willow-nzsg: per-trip reuse of the owner, length and
+//! Array-loop access reuse: per-trip reuse of the owner, length and
 //! bounds facts, cold fault paths that reload their operands, and the
 //! frame's spare poll countdown outside task stacks.
 

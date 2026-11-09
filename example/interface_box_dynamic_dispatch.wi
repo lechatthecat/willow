@@ -1,6 +1,6 @@
 // Widening a value to an interface must keep the RUNTIME class's overrides,
-// even when the expression being widened is typed on a base class
-// (willow-tygf).
+// even when the expression being widened is typed on a base class.
+//
 //
 // A `(class, interface)` vtable is chosen from the STATIC type at the boxing
 // site, so a `Parcel`-typed parameter holding a `Sub` used to box with

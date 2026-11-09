@@ -1,4 +1,4 @@
-//! Bitwise and shift operators on `i64` (willow-jz15.8).
+//! Bitwise and shift operators on `i64`.
 //!
 //! Precedence, loosest to tightest: `||`, `&&`, comparisons, `|`, `^`, `&`,
 //! `<<`/`>>`, `+`/`-`, `*`/`/`/`%`, prefix `-`/`!`, `**`. `!` on `i64` is the

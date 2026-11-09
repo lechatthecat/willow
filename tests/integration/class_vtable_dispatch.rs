@@ -1,4 +1,4 @@
-//! Class virtual dispatch through a per-class VTABLE (willow-fm7t).
+//! Class virtual dispatch through a per-class VTABLE.
 //!
 //! Word 0 of every class object points at that class's DESCRIPTOR — a static
 //! table holding the class's runtime `type_id` at offset 0, followed by one
@@ -52,7 +52,7 @@
 //!  27. the runnable example prints what it documents
 //!
 //! Every behavioral perspective runs the program and asserts what it prints.
-//! Since willow-0g8j.2.4 the LIR walker compiles these hierarchies, deciding
+//! Since lowered-IR inheritance support the LIR walker compiles these hierarchies, deciding
 //! each call's slot through `plan_virtual_call`, so a slot-index bug shows up
 //! as a wrong ANSWER rather than as a refused body. The walker-specific
 //! eligibility coverage lives in `lir_class_inheritance.rs`.
@@ -65,7 +65,7 @@ use super::support::{
 /// No extra compiler environment: the ordinary build.
 const PLAIN: [(&str, &str); 0] = [];
 
-/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// The build runs and prints `expected`. Since the lowered-IR cutover every body is
 /// compiled from lowered IR, so a body the walker cannot take is a compile
 /// error here rather than a second emitter's answer.
 #[track_caller]
@@ -791,8 +791,8 @@ fn main() {
 /// bodies. The bound sits clear of both.
 ///
 /// The per-class comparison chain this bound was written against lived in the
-/// AST emitter willow-0g8j.3 retired, and the walker compiles inherited classes
-/// itself since willow-0g8j.13. The measurement stays as a code-size regression
+/// AST emitter the lowered-IR cutover retired, and the walker compiles inherited classes
+/// itself since module inheritance lowering. The measurement stays as a code-size regression
 /// guard on vtable dispatch.
 #[test]
 fn vtable_24_a_deep_hierarchy_costs_constant_code_per_call_site() {

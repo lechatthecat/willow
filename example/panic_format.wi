@@ -1,4 +1,4 @@
-// Formatted panic + generalized format (willow-csax).
+// Formatted panic + generalized format.
 //
 // `format(spec, args...)` interpolates `{}` placeholders by argument type
 // (i64, f64, bool, String); `{:.17g}` / `{:.16f}` / `{:.6f}` keep their fixed

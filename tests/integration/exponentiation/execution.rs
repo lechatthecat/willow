@@ -175,7 +175,7 @@ fn main() {
 "#;
 
     // `pow(2, 64)` wraps to 0 only in release; debug builds panic on the
-    // overflow (willow-jz15.14).
+    // overflow.
     let (out, ok) = compile_and_run_release(SOURCE);
     assert!(ok, "{out}");
     assert_eq!(out, "1024\n243\n243\n0\n-8\n512\n-32\n1\n");

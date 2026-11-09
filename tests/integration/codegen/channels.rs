@@ -1,7 +1,7 @@
 use super::*;
 
 // ----------------------------------------------------------------------------
-// Cooperative channels (willow-dsw): channel `recv` is a cooperative suspend
+// Cooperative channels: channel `recv` is a cooperative suspend
 // point — an empty `recv` parks the consuming task as a channel waiter, and
 // `send`/`close` wake it. This makes a recv-consumer a real cooperative task
 // (task await works) and lets producer/consumer tasks interleave correctly.
@@ -115,7 +115,7 @@ async fn consume_first(ch: Channel<i64>) -> i64 {
 }
 
 // Channel<GC-type> buffers are GC-traced: computed (non-literal) string values
-// queued in a channel survive collection until received (willow-dsw GC tracing).
+// queued in a channel survive collection until received (channel payload GC tracing).
 #[test]
 fn coop_chan_04_gc_element_channel_traced() {
     let (out, ok) = compile_and_run_gc_stress(
@@ -482,7 +482,7 @@ class Box {
     pub fn copy(self) -> Box { return new Box(self.v); }
     pub static fn new(v: i64) -> Box { return new Box(v); }
 }
-// Shared objects are never written after construction (Sync, willow-jz15.78);
+// Shared objects are never written after construction (Sync, immutable shared fields);
 // mutable state crosses tasks only inside a Mutex.
 class Acc {
     pub total: i64;

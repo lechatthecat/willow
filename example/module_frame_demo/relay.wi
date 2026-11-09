@@ -1,4 +1,4 @@
-// relay.wi — a module that calls ANOTHER module (willow-0g8j.2.20).
+// relay.wi — a module that calls ANOTHER module.
 //
 // The frame this file's call pushes is named `trace::deep` and located in
 // `relay.wi`: a frame always names the callee as the source spells it, and

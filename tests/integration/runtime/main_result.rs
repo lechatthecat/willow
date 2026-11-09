@@ -1,6 +1,6 @@
 use super::*;
 
-// ── fn main() -> Result<void, E> (willow-exg) ────────────────────────────────
+// ── fn main() -> Result<void, E> ────────────────────────────────
 
 #[test]
 fn main_result_01_err_prints_and_exits_nonzero() {

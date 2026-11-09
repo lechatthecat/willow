@@ -4,7 +4,7 @@ module depot;
 // plus functions typed on the interfaces. Every call below boxes its argument
 // into `[object | vtable]`, so each concrete class reaching one of them needs a
 // `(class, interface)` vtable of its own -- including classes declared in the
-// program that IMPORTS this module (willow-himv).
+// program that IMPORTS this module.
 
 pub interface Named {
     fn tag(self) -> String;

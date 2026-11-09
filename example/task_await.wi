@@ -1,6 +1,6 @@
 import std::collections::Array;
 
-// task_await.wi — one way to wait for a task: `await` (willow-qrj9).
+// task_await.wi — one way to wait for a task: `await`.
 //
 // `Task.join()` and `Task.try_join()` no longer exist. The complete surface for
 // finishing a task is:

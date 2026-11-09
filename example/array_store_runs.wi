@@ -1,5 +1,5 @@
 // Scalar element stores share the owner, length and buffer facts of the
-// surrounding GC-free run (willow-ijui.10), next to stores whose value
+// surrounding GC-free run, next to stores whose value
 // allocates, calls, grows the array or runs on a task.
 import std::collections::Array;
 

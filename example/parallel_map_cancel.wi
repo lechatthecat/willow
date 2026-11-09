@@ -10,7 +10,7 @@
 // pool decides it has finished by snapshotting every source of runnable work.
 // A snapshot that misses a task another worker has in hand ends the drive with
 // the awaiting task still runnable, and the program then falls off the end of
-// `main` having printed nothing and exiting 0 (willow-6wd6). Each section
+// `main` having printed nothing and exiting 0. Each section
 // below ends in a `println`, so a run that prints fewer than five lines is
 // that failure, not a different result.
 

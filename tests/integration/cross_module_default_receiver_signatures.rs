@@ -1,6 +1,6 @@
 //! Interface defaults copied into an entry-file class whose name a provider
-//! INTERFACE also uses, while the class's own methods are typed with its name
-//! (willow-kptd).
+//! INTERFACE also uses, while the class's own methods are typed with its name.
+//!
 //!
 //! The provider spells its own interfaces bare, so in its scope the entry
 //! class's declared signatures (`fn me(self) -> A`) would name the provider's

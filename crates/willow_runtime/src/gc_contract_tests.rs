@@ -1,11 +1,11 @@
-//! Premises of the concurrent-mark contract (willow-6fv.5.8.1).
+//! Premises of the concurrent-mark contract.
 //!
 //! `requirements/willow_apex_gc_concurrent_mark_contract.md` fixes the first old
 //! cycle as **non-moving SATB mark-sweep**, and several of its decisions are only
 //! sound because of properties the collector already has today. Those properties
 //! are prose in the contract and code here: if one of them regresses, a decision
 //! in the contract silently becomes wrong, and the SATB implementation built on
-//! top of it (willow-6fv.5.6.2 and later) inherits the hole.
+//! top of it (concurrent collection and later) inherits the hole.
 //!
 //! Each test names the contract clause it pins (`C1`..`C7` of §13). These are
 //! *premises*, not the concurrent collector — nothing here marks concurrently.

@@ -1,4 +1,4 @@
-//! `AtomicI64` / `AtomicBool` compiled from Lowered IR (willow-0g8j.2.13).
+//! `AtomicI64` / `AtomicBool` compiled from Lowered IR.
 //!
 //! Both cells are GC-allocated words accessed with inline SeqCst instructions.
 //! Admitting them to the walker is three pieces: the type itself, the
@@ -31,7 +31,7 @@ const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
 #[test]
 fn lir_atomics_24_temporary_receivers_survive_allocating_operands() {
-    // willow-p8ud: the former AST emitter left a temporary receiver unrooted
+    // the former AST emitter left a temporary receiver unrooted
     // while evaluating its operand. Exercise both call-result and constructor
     // receivers, including void-returning stores, with collection at allocation.
     assert_atomics(

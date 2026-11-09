@@ -1,10 +1,10 @@
 use super::*;
 
-// ── Many waiters on one channel (willow-ezs.1.2) ─────────────────────────────
+// ── Many waiters on one channel ─────────────────────────────
 //
 // End-to-end coverage the unit tests cannot give: real generated code parking
 // hundreds of tasks on a single channel, cancelling some of them, and mixing
-// recv and send waiters. Perspectives 29-32 of willow-ezs.1.2 (1-15 cover
+// recv and send waiters. Perspectives 29-32 of wait-queue scaling (1-15 cover
 // `WaiterQueue`, 16-28 the scheduler's blocked-syscall counter).
 
 /// 29. hundreds of consumers park on ONE channel and every value is taken

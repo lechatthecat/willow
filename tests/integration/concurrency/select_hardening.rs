@@ -1,7 +1,7 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
-// select hardening (willow-o038 review). Perspectives covered here:
+// select hardening. Perspectives covered here:
 //   1. `t.join(x)` inside select is an arity error, not a silently dropped arg
 //   2. same for the `let v = t.join(x)` form
 //   3. `ch.recv(x)` inside select is an error

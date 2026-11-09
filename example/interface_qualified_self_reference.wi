@@ -1,6 +1,6 @@
 // A class implementing an imported interface may name that interface by its
 // qualified path in the methods it implements and overrides; conformance
-// compares interface identities, not spellings (willow-k6n9).
+// compares interface identities, not spellings.
 import interface_qualified_self_reference_support::shapes;
 
 class Square implements shapes::Shape {

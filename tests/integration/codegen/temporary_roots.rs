@@ -1,6 +1,6 @@
 use super::*;
 
-// ── GC-managed temporary rooting (willow-5mb) ────────────────────────────────
+// ── GC-managed temporary rooting ────────────────────────────────
 
 // Chain of string concatenations: intermediate r1 = (a + b) must survive
 // the GC that runs during the second concat allocation.

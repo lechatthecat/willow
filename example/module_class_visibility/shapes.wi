@@ -2,7 +2,7 @@ module shapes;
 
 // One of TWO modules in this project that declare a class named `Point`. The
 // entry file imports this one and never mentions `grid`, so a bare `Point` in
-// the entry means this class (willow-vtlr).
+// the entry means this class.
 pub class Point {
     pub x: i64;
     pub y: i64;

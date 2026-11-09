@@ -1,4 +1,4 @@
-//! Reproducible derived-wire boundary cost evidence for willow-r52c.12.
+//! Reproducible derived-wire boundary cost evidence for derived-wire boundary costs.
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 

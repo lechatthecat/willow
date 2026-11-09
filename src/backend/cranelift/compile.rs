@@ -14,7 +14,7 @@ use super::*;
 use anyhow::Context;
 
 /// The name of a lifted closure's hidden leading parameter — the environment
-/// object it was called through (willow-0g8j.2.12).
+/// object it was called through.
 ///
 /// `$` cannot appear in a source identifier, so this can never collide with a
 /// parameter, a capture, or a local the program wrote.
@@ -22,7 +22,7 @@ pub(super) const CLOSURE_ENV_PARAM: &str = "$closure_env";
 
 /// The hidden environment parameter a `closure`-typed lambda's lifted body
 /// takes, or `None` for a `fn`-typed one, which is called through a bare code
-/// address and has no environment at all (willow-0g8j.2.12).
+/// address and has no environment at all.
 ///
 /// Its declared type is the closure type itself: that is what the value IS, so
 /// the parameter is rooted and traced like any other GC reference.
@@ -44,8 +44,8 @@ fn closure_env_param(lambda_type: Option<&Type>, span: Span) -> Option<Param> {
 ///
 /// Built by [`Codegen::module_body_plan`] / [`Codegen::program_body_plan`] and
 /// emitted one at a time by [`UnitCodegenContext::compile_body`], so no whole-unit IR map
-/// or name re-keying sits between a unit's lowering and its emission
-/// (willow-afb5.18).
+/// or name re-keying sits between a unit's lowering and its emission.
+///
 pub struct UnitBody<'a> {
     /// `None` only on the standalone path, which has no session body index.
     body: Option<crate::parser::ast::BodyId>,
@@ -97,7 +97,7 @@ enum BodyTarget<'a> {
 
 impl<'a> UnitBody<'a> {
     /// A lifted lambda declared as `name`, with semantic body `body`: one
-    /// nested in an interface default another unit copied (willow-rvpp).
+    /// nested in an interface default another unit copied.
     pub(crate) fn lambda(
         body: crate::parser::ast::BodyId,
         name: &'a str,
@@ -160,7 +160,7 @@ impl BodyTarget<'_> {
 /// lowered — carrying the per-unit inputs [`Codegen::declare_module`] derived so
 /// [`Codegen::with_module_bodies`] can construct a fresh context later.
 ///
-/// Declaration and body lowering are separate driver phases (willow-4zt8):
+/// Declaration and body lowering are separate driver phases:
 /// EVERY unit — each imported module plus the entry program — is declared
 /// before any body is lowered, so `virtual_dispatch_candidates` sees the whole
 /// program's class hierarchy. Compiling each module completely in turn made a
@@ -180,24 +180,24 @@ pub struct DeclaredModule {
     module_prefix: String,
     module_classes: Vec<(String, ClassDecl)>,
     /// Lambdas collected and declared by this module's declaration phase, under
-    /// module-qualified symbols (willow-9yhi). The body phase compiles these
+    /// module-qualified symbols. The body phase compiles these
     /// same symbols; the collector numbers from zero per unit, so the names
     /// cannot be re-derived later without renumbering.
     lambdas: Vec<(String, LambdaExpr)>,
     /// The semantic body of each entry in `lambdas`, same order, walked once by
-    /// the declaration phase (willow-afb5.18). Empty on the standalone path.
+    /// the declaration phase. Empty on the standalone path.
     lambda_bodies: Vec<crate::parser::ast::BodyId>,
     source_file: String,
     builtin_module_aliases: HashMap<String, String>,
     /// The module access names this unit's own `import`s name, plus the module
-    /// itself (willow-vtlr), carried into this unit's fresh emission context.
+    /// itself, carried into this unit's fresh emission context.
     visible_modules: HashSet<String>,
-    /// This module's own single-item imports (willow-28h8). They bind a LOCAL
+    /// This module's own single-item imports. They bind a LOCAL
     /// name to another module's symbol, and two units can bind the same local
     /// name to different modules, so they are rebound before these bodies.
     item_imports: Vec<ItemBinding>,
-    /// The module prefixes this unit writes that the tables are not keyed by
-    /// (willow-kd1v), resolved only in this unit's emission context.
+    /// The module prefixes this unit writes that the tables are not keyed by, resolved only in
+    /// this unit's emission context.
     module_spellings: Vec<ModuleSpelling>,
     enum_aliases: Vec<(String, EnumInfo)>,
 }
@@ -214,18 +214,18 @@ pub struct DeclaredProgram {
     /// compiles these same symbols, so they are not re-collected (the collector
     /// numbers them by traversal order).
     lambdas: Vec<(String, LambdaExpr)>,
-    /// The semantic body of each entry in `lambdas`, same order (willow-afb5.18).
+    /// The semantic body of each entry in `lambdas`, same order.
     lambda_bodies: Vec<crate::parser::ast::BodyId>,
     source_file: String,
     builtin_module_aliases: HashMap<String, String>,
-    /// The module access names the entry file imports (willow-vtlr).
+    /// The module access names the entry file imports.
     visible_modules: HashSet<String>,
-    /// The entry file's own single-item imports (willow-28h8), rebound before
+    /// The entry file's own single-item imports, rebound before
     /// its bodies because a module's body phase runs in between and may have
     /// bound the same local name to its own module's symbol.
     item_imports: Vec<ItemBinding>,
     /// The module prefixes the entry file writes that the tables are not keyed
-    /// by (willow-kd1v) — it aliased a module some other file had already
+    /// by — it aliased a module some other file had already
     /// registered under a different spelling.
     module_spellings: Vec<ModuleSpelling>,
     enum_aliases: Vec<(String, EnumInfo)>,
@@ -266,7 +266,7 @@ pub use crate::compiler_db::scope::{ItemBinding, ModuleSpelling, UnitImports};
 /// This is a macro rather than a method because every field is a reference to a
 /// closure temporary: returning the struct from a function would drop those
 /// closures at the return. Expanded in place, they live as long as the `let`
-/// that binds the context (willow-0g8j.2.18).
+/// that binds the context.
 macro_rules! lir_type_ctx {
     ($me:expr, $return_type:expr) => {
         super::lir_gen::LirTypeCtx {
@@ -286,8 +286,8 @@ macro_rules! lir_type_ctx {
             },
             // The same `enum_infos` table `enum_variant_tag` and
             // `enum_is_gc_object_type` answer from, so the tags and the
-            // representation eligibility vets are the ones emission uses
-            // (willow-0g8j.8).
+            // representation eligibility vets are the ones emission uses.
+            //
             enum_def: &|n| {
                 let info = $me.enum_infos.get(n)?;
                 Some(super::lir_gen::LirEnumDef {
@@ -352,8 +352,8 @@ macro_rules! lir_type_ctx {
             fn_types: &$me.fn_types,
             func_param_modes: &$me.func_param_modes,
             known_modules: &$me.known_modules,
-            // The same set emission resolves a bare module class name from
-            // (willow-vtlr), so eligibility and emission cannot disagree about
+            // The same set emission resolves a bare module class name from, so eligibility and
+            // emission cannot disagree about
             // which module a name means.
             visible_modules: &$me.visible_modules,
             builtin_module_aliases: &$me.builtin_module_aliases,
@@ -361,11 +361,11 @@ macro_rules! lir_type_ctx {
             return_type: $return_type,
             // Per-FUNCTION, like `return_type`: `lir_rejection_reason` sets it
             // from the function it is vetting, so nothing here can get it
-            // wrong (willow-0g8j.13).
+            // wrong.
             self_class: None,
             // The same table emission reads for a lambda's address, so the
             // symbol eligibility vets is the symbol emission takes the address
-            // of (willow-0g8j.2.2).
+            // of.
             lambda_symbol: &|id| $me.lambda_names.get(&id).cloned(),
             cooperative_leaves: &$me.cooperative_leaves,
         }
@@ -376,7 +376,7 @@ macro_rules! lir_type_ctx {
 pub(super) struct BodyPlanner(pub bool);
 impl BodyPlanner {
     /// The ordered emission targets of a module's body phase, each paired with
-    /// the semantic body its lowered IR is stored under (willow-afb5.18).
+    /// the semantic body its lowered IR is stored under.
     ///
     /// Built once per unit, in the order the bodies are emitted: the lifted
     /// lambdas this module declared, its free functions, then each declared
@@ -460,8 +460,8 @@ impl BodyPlanner {
                 },
             });
         }
-        // Each constructor is emitted as its synthesized `init` method
-        // (willow-scq2); the synthesized shell clones the constructor block, so
+        // Each constructor is emitted as its synthesized `init` method; the synthesized shell
+        // clones the constructor block, so
         // it carries the constructor's own body identity.
         for ctor in &class.constructors {
             plan.push(UnitBody {
@@ -503,11 +503,11 @@ impl UnitCodegenContext<'_> {
     ) -> Result<DeclaredModule> {
         let init_unit = self.module_init_plan.ensure_module(canonical_path);
         // Recorded from the RAW program, because the normalization on the next
-        // line is what erases the aliases from it (willow-nswv).
+        // line is what erases the aliases from it.
         self.builtin_module_aliases = builtin_module_aliases(program);
         // The imports the resolver classified for THIS file. A module sees what
         // it imports, plus itself: its own classes are keyed
-        // `{mod_name}::{Class}` by the tables below (willow-vtlr).
+        // `{mod_name}::{Class}` by the tables below.
         let crate::compiler_db::scope::UnitScope {
             imports: unit_imports,
             enum_aliases,
@@ -518,7 +518,7 @@ impl UnitCodegenContext<'_> {
         // declared, but a direct TYPE import aliases whole compiled tables and
         // doing that per module changes what the classes declared after it are
         // compiled against. Only the function half is rebound, before this
-        // unit's bodies (willow-28h8).
+        // unit's bodies.
         let item_imports = unit_imports.item_imports;
         let module_spellings = unit_imports.module_spellings;
         // The one type table that does have to answer under this unit's own
@@ -527,7 +527,7 @@ impl UnitCodegenContext<'_> {
         // interface this unit IMPORTED (`import proto::Describable;`) is keyed
         // there by its canonical `proto::Describable` alone. The lookup missed,
         // the vtable was silently skipped, and every later boxing site fell back
-        // to the raw object (willow-0g8j.3). Bound only in this declaration context, so
+        // to the raw object. Bound only in this declaration context, so
         // nothing declared after this unit sees it.
         self.bind_unit_enum_aliases(&enum_aliases);
         self.bind_unit_instantiation_types(program);
@@ -545,15 +545,15 @@ impl UnitCodegenContext<'_> {
         self.known_modules
             .register(module_id, canonical_path, mod_name);
         // ...and the module prefixes THIS unit writes for modules the graph
-        // registered under some other spelling (willow-kd1v). Every module this
+        // registered under some other spelling. Every module this
         // one imports is already declared — dependencies are declared before
         // their dependents — so the tables the aliases point at exist.
         self.alias_unit_module_spellings(&module_spellings);
         self.declare_runtime()?;
         self.declare_string_literals(program)?;
         // The source path backs `PanicInfo.file` for every panic, so it is a
-        // release-mode literal too: V1 records message AND source location
-        // (willow-s9ej.7).
+        // release-mode literal too: V1 records message AND source location.
+        //
         self.declare_string_literal(source_file)?;
         if self.build_mode == BuildMode::Debug {
             for name in collect_nil_check_names(program) {
@@ -578,7 +578,7 @@ impl UnitCodegenContext<'_> {
         // CANONICAL path rather than the name this unit reaches it by: an enum
         // has one identity build-wide, and the type checker qualifies module
         // signatures the same way, so what the walker reads off a cross-module
-        // call has to be the same name (willow-itcw).
+        // call has to be the same name.
         let local_enum_names: std::collections::HashSet<String> = program
             .items
             .iter()
@@ -590,7 +590,7 @@ impl UnitCodegenContext<'_> {
 
         // CLASS names declared in this module, used to qualify a module-local
         // `extends Base` so the subclass's class_base / layout / inherited-method
-        // resolution all key off `module::Base` (willow-2egr).
+        // resolution all key off `module::Base`.
         let local_class_names: std::collections::HashSet<String> = program
             .items
             .iter()
@@ -604,7 +604,7 @@ impl UnitCodegenContext<'_> {
         // `one::make() -> Point` and `two::make() -> Point` collapse to the same
         // bare type even though their layouts have different identities. A
         // directly imported short name still compares equal through the shared
-        // class type id (willow-0g8j.3).
+        // class type id.
         let mut local_signature_type_names = local_type_names.clone();
         local_signature_type_names.extend(local_class_names.iter().cloned());
 
@@ -615,7 +615,7 @@ impl UnitCodegenContext<'_> {
         // itself imported (`import proto::Grade;`), or a builtin -- is left
         // exactly as written, so it still resolves to the one table that answers
         // to it. Prefixing wholesale renamed such a type into `lib::Grade`, which
-        // nothing declares (willow-sxcp).
+        // nothing declares.
         // ...and a name that is neither is resolved through the aliases this
         // unit's own item imports installed above, so what leaves the module is
         // the identity the build's tables answer to (`Sized` -> `proto::Sized`).
@@ -685,17 +685,17 @@ impl UnitCodegenContext<'_> {
                 // A module-local `implements` name (generic included --
                 // `implements Box<i64>` -> `boxmod2::Box<i64>`) is qualified so
                 // its vtable is declared and keyed by the same name the entry
-                // boxes against (willow-1js.5), while an interface this module
+                // boxes against, while an interface this module
                 // merely IMPORTED keeps the spelling it was written with:
                 // renaming `import proto::Describable;` into `impls::Describable`
                 // made the vtable lookup below silently find no interface, so the
                 // class got NO vtable and every later box site fell back to the
-                // raw object (willow-0g8j.3).
+                // raw object.
                 let mut qualified = qualify_module_class_decl(c, mod_name, &qualify_class_type);
                 // Qualify a module-local base class so `name()` yields the
                 // module-qualified base (TypePath::name() returns only the last
                 // segment, so the qualified name must live in a single Local
-                // string) (willow-2egr).
+                // string).
                 let module_local_base = match &qualified.base_class {
                     Some(TypePath::Local(name)) if local_class_names.contains(name) => {
                         Some(name.clone())
@@ -717,11 +717,11 @@ impl UnitCodegenContext<'_> {
         // methods; the inherited ones are prepended afterwards by
         // `finalize_class_layouts`, which evaluates the `extends` chain
         // root-down. A cross-module hierarchy can arrive subclass-first too,
-        // and no declaration order may change a layout (willow-59gx). The
+        // and no declaration order may change a layout. The
         // same evaluation settles each class's virtual slot ORDER, which the
         // vtables below need: an `open` method's vtable slot holds a thunk
         // that dispatches through virtual slot N of the receiver's
-        // descriptor (willow-tygf).
+        // descriptor.
         for (_, c) in &module_classes {
             self.register_class_layout(c)?;
         }
@@ -746,8 +746,8 @@ impl UnitCodegenContext<'_> {
                         qualify_module_fn_signature(&qualified, canonical_path, &local_enum_names);
                     // Same translation the classes above get: a type this module
                     // reached through its own item import is exported under the
-                    // identity the tables hold, not the bare local spelling
-                    // (willow-sxcp).
+                    // identity the tables hold, not the bare local spelling.
+                    //
                     for param in &mut qualified.params {
                         param.ty = self
                             .canonical_declared_type(&resolve_instantiation(&param.ty))
@@ -777,13 +777,13 @@ impl UnitCodegenContext<'_> {
         self.declare_vtables_for_classes(&qualified_classes)?;
 
         // Emit one descriptor per module class: word 0 of every object of that
-        // class, holding its `type_id` and its virtual method slots
-        // (willow-fm7t). Must follow the method declarations above, since every
+        // class, holding its `type_id` and its virtual method slots. Must follow the method
+        // declarations above, since every
         // slot is filled by function address.
         self.declare_class_descriptors_for(&qualified_classes)?;
 
         // Collect and declare this module's lambdas, exactly as
-        // `declare_program` does for the entry file (willow-9yhi). Lifting a
+        // `declare_program` does for the entry file. Lifting a
         // lambda is a DECLARATION-phase job: `lambda_names` is what both
         // emitters read to find the lifted symbol for a lambda expression, so
         // without this pass a module body's lambda reaches codegen with no name
@@ -943,13 +943,13 @@ impl UnitCodegenContext<'_> {
     }
 
     /// Emit bodies another unit received from `unit`'s interfaces under
-    /// `unit`'s alias scope (willow-rvpp): a default body names the items of
+    /// `unit`'s alias scope: a default body names the items of
     /// the module that declared the interface, whichever class it was copied
     /// into. The static initializers stay with [`Self::emit_module`].
     ///
     /// `bare` holds the receiving units' bare type identities the bodies
-    /// spell under [`FOREIGN_RECEIVER_PREFIX`](crate::semantic::ids::FOREIGN_RECEIVER_PREFIX)
-    /// (willow-nvi6): each respelling resolves to its identity in any scope,
+    /// spell under [`FOREIGN_RECEIVER_PREFIX`](crate::semantic::ids::FOREIGN_RECEIVER_PREFIX):
+    /// each respelling resolves to its identity in any scope,
     /// and a local
     /// name of `unit` equal to one is unbound, so neither the receiver's type
     /// nor its `Class.method` symbols resolve to `unit`'s own declaration.
@@ -958,7 +958,7 @@ impl UnitCodegenContext<'_> {
     /// `methods` lists the receiving classes' methods the bodies can call,
     /// as (class, method) pairs: their declared signatures spell the entry
     /// types bare, which here could mean `unit`'s own interface of that
-    /// name, so this scope reads them respelled too (willow-kptd).
+    /// name, so this scope reads them respelled too.
     pub(super) fn emit_foreign_bodies(
         &mut self,
         unit: &DeclaredModule,
@@ -976,7 +976,7 @@ impl UnitCodegenContext<'_> {
 
     /// Overlay the signatures of `methods` in this scope with every identity
     /// in `bare` spelled under the receiver prefix, which names the entry's
-    /// type in any unit (willow-kptd). Work is bounded by those signatures.
+    /// type in any unit. Work is bounded by those signatures.
     fn respell_receiver_signatures(
         &mut self,
         bare: &std::collections::BTreeSet<TypeId>,
@@ -1051,8 +1051,8 @@ impl UnitCodegenContext<'_> {
             }
             self.install_function_scope(scope);
         }
-        // `unit` spells its own interfaces bare in bodies and signatures alike
-        // (willow-64gs.1), so such a name keeps `unit`'s meaning; the bodies
+        // `unit` spells its own interfaces bare in bodies and signatures alike, so such a name
+        // keeps `unit`'s meaning; the bodies
         // reach the receiver through the respelling.
         let interfaces: std::collections::HashSet<&str> = (unit.program.items.iter())
             .filter_map(|item| match item {
@@ -1085,13 +1085,13 @@ impl UnitCodegenContext<'_> {
         self.bind_unit_instantiation_types(program);
         self.rebind_item_import_functions(&unit.item_imports);
         // Bind the types this unit imported by single-item import under the
-        // local names it spells them by (willow-0g8j.3), then the module's own
+        // local names it spells them by, then the module's own
         // enums/interfaces under their unqualified names so the module body
-        // resolves its own types internally (willow-64gs.1). Own declarations
+        // resolves its own types internally. Own declarations
         // are installed second, so they win.
         self.alias_item_import_types(&unit.item_imports);
         // Before the unit's own names, so a module reached under two spellings
-        // still loses to a type this module declares itself (willow-kd1v).
+        // still loses to a type this module declares itself.
         self.alias_unit_module_spellings(&unit.module_spellings);
         self.alias_module_local_types(program, &unit.mod_name);
         for item in &program.items {
@@ -1123,9 +1123,9 @@ impl UnitCodegenContext<'_> {
         scope: crate::compiler_db::scope::UnitScope,
     ) -> Result<DeclaredProgram> {
         // Recorded from the RAW program, because the normalization on the next
-        // line is what erases the aliases from it (willow-nswv).
+        // line is what erases the aliases from it.
         self.builtin_module_aliases = builtin_module_aliases(program);
-        // The entry file's own classified imports (willow-vtlr, willow-28h8).
+        // The entry file's own classified imports.
         // Every module is declared by now, so the entry's single-item imports
         // bind here, function and directly imported type alike — the entry is
         // the last unit declared, so nothing is compiled against these tables
@@ -1141,7 +1141,7 @@ impl UnitCodegenContext<'_> {
             self.register_item_import(&item.local, &item.module, &item.item);
         }
         // The entry's own spellings for modules another file registered under a
-        // different name (willow-kd1v). These bindings belong only to this
+        // different name. These bindings belong only to this
         // context; each later body context resolves its own spellings.
         self.bind_unit_enum_aliases(&enum_aliases);
         self.bind_unit_instantiation_types(program);
@@ -1155,8 +1155,8 @@ impl UnitCodegenContext<'_> {
         self.declare_runtime()?;
         self.declare_string_literals(program)?;
         // The source path backs `PanicInfo.file` for every panic, so it is a
-        // release-mode literal too: V1 records message AND source location
-        // (willow-s9ej.7).
+        // release-mode literal too: V1 records message AND source location.
+        //
         self.declare_string_literal(source_file)?;
         if self.build_mode == BuildMode::Debug {
             for name in collect_nil_check_names(program) {
@@ -1168,7 +1168,7 @@ impl UnitCodegenContext<'_> {
         // Pass 1: record every class's OWN fields, base and type_id. No
         // inherited field is resolved here, because a subclass may be declared
         // before its base and reading a base mid-walk sees whatever has been
-        // registered so far (willow-59gx).
+        // registered so far.
         for item in &program.items {
             if let Item::Class(c) = item {
                 self.register_class_layout(c)?;
@@ -1179,7 +1179,7 @@ impl UnitCodegenContext<'_> {
         // The same pass settles every class's virtual slot ORDER, which the
         // vtables below need: an `open` method's vtable slot holds a thunk
         // that dispatches through virtual slot N of the receiver's
-        // descriptor (willow-tygf).
+        // descriptor.
         self.finalize_class_layouts()?;
         // Pass 3: forward-declare methods and static storage, now that every
         // layout is final -- a constructor's parameter order IS the layout.
@@ -1207,7 +1207,7 @@ impl UnitCodegenContext<'_> {
         // them by function address.
         self.declare_interface_vtables(program)?;
 
-        // Emit one descriptor per class (willow-fm7t). Unlike interface
+        // Emit one descriptor per class. Unlike interface
         // vtables this covers EVERY class, since word 0 of every object points
         // at its descriptor whether or not the class implements an interface.
         self.declare_class_descriptors(program)?;
@@ -1232,7 +1232,7 @@ impl UnitCodegenContext<'_> {
             expr_types,
         )?;
 
-        // Always declare `__willow_static_init` (willow-qsqf §13.5). The runtime
+        // Always declare `__willow_static_init` (static member support §13.5). The runtime
         // calls it after `gc_init` and before `willow_user_main`; it checks the ABI
         // even when the program has no static properties. Declaring it unconditionally
         // keeps the runtime call path uniform regardless of the `main` lowering.
@@ -1283,7 +1283,7 @@ impl UnitCodegenContext<'_> {
     }
 
     /// Declare the `__willow_static_init` symbol (no params, no returns). Exported
-    /// so the runtime entry can call it before `main` (willow-qsqf §13.5).
+    /// so the runtime entry can call it before `main` (static member support §13.5).
     pub(super) fn declare_static_init(&mut self) -> Result<()> {
         if self.func_ids.contains_key(STATIC_INIT_SYMBOL) {
             return Ok(());
@@ -1310,7 +1310,7 @@ impl UnitCodegenContext<'_> {
         // Imported generic calls can leave specialization-private nominal
         // aliases in contextual lambda signatures. Only the owning checker
         // knows those aliases; resolve them as HIR lowering does before using
-        // the backend's declaration scope (willow-jz15.87).
+        // the backend's declaration scope.
         let checked_type = self.checked.and_then(|checked| {
             checked
                 .expr_types
@@ -1331,7 +1331,7 @@ impl UnitCodegenContext<'_> {
             ),
         };
         // A closure's lifted body takes its environment object as a hidden
-        // LEADING argument (willow-0g8j.2.12). It is declared here, in the
+        // LEADING argument. It is declared here, in the
         // signature and in every per-parameter table, so the index a caller
         // counts from and the index the body binds from stay the same one.
         let env_param = closure_env_param(lambda_type.as_ref(), l.span);
@@ -1417,7 +1417,7 @@ impl UnitCodegenContext<'_> {
             ),
         };
         // Same leading environment parameter `declare_lambda` put in the
-        // signature (willow-0g8j.2.12); the two are built from the same
+        // signature; the two are built from the same
         // checker type, so they cannot disagree.
         let params: Vec<Param> = closure_env_param(lambda_type.as_ref(), l.span)
             .into_iter()
@@ -1438,7 +1438,7 @@ impl UnitCodegenContext<'_> {
             LambdaBody::Block(b) => b.clone(),
             // A `void` body is a STATEMENT, not a returned value: synthesising
             // `return println(x);` would emit a `return` with an operand
-            // against a signature that has no result slot (willow-0g8j.2.2).
+            // against a signature that has no result slot.
             LambdaBody::Expr(e) if return_type == Type::Void => Block {
                 id: crate::parser::ast::BodyId::fresh(),
                 stmts: vec![Stmt::Expr(ExprStmt {
@@ -1607,7 +1607,7 @@ impl UnitCodegenContext<'_> {
         }
         let call_return_type = self.canonical_enum_type(&function_call_return_type(f));
         // A `Result<void, E>` main lowers to a VOID `willow_user_main` (it
-        // inspects its result and exits in the body; willow-exg). Keep this in
+        // inspects its result and exits in the body; value-producing control flow). Keep this in
         // sync with compile_function_named.
         let force_void_main = symbol_name == USER_MAIN_SYMBOL && main_result_err_type(f).is_some();
         if let Some(bridge) = &f.rust_bridge {
@@ -1856,19 +1856,19 @@ impl UnitCodegenContext<'_> {
                     .push(AbiParam::new(param_abi_type(param, ptr_ty, self.classes())));
             }
         }
-        // Stage 5 function-body cutover (willow-0g8j.3): every checked function
-        // compiles from lowered IR, and since willow-t0uy.3 there is no AST
+        // Stage 5 function-body cutover: every checked function
+        // compiles from lowered IR, and since the lowered-IR cutover there is no AST
         // emitter left to fall back to — a missing or rejected LIR body is an
         // internal compile error, never a backend selection decision.
         // `main` is eligible in its `void` forms, with or without the declared
-        // `args: Array<String>` (willow-0g8j.2.10): `willow_user_main` takes no
+        // `args: Array<String>`: `willow_user_main` takes no
         // arguments either way, and a declared `args` is bound from the process
         // arguments below, BEFORE the body is emitted, so the walker sees an
-        // ordinary local. `fn main() -> Result<void, E>` is eligible too
-        // (willow-0g8j.2.14): it also lowers to a void `willow_user_main`.
+        // ordinary local. `fn main() -> Result<void, E>` is eligible too: it also lowers to a
+        // void `willow_user_main`.
         // Synchronous exits are shaped in the walker; an async poll publishes
         // the Result into its frame and the generated main driver applies the
-        // same `emit_main_result_exit` shaping after joining it (willow-4ylu).
+        // same `emit_main_result_exit` shaping after joining it.
         // Any other `main` return type is rejected here.
         let supported_main = is_main
             && (f.return_type == (Type::Void).to_source() || main_result_err_type(f).is_some());
@@ -1912,7 +1912,7 @@ impl UnitCodegenContext<'_> {
             None
         };
         // A `Result<void, E>` main lowers to a VOID `willow_user_main` — it
-        // inspects its result inside the body and exits accordingly (willow-exg),
+        // inspects its result inside the body and exits accordingly,
         // so the runtime keeps calling `willow_user_main()` uniformly. Other
         // mains (incl. async, whose body returns a Future) keep their signature.
         let force_void_main = main_result_err_ty.is_some();
@@ -1942,7 +1942,7 @@ impl UnitCodegenContext<'_> {
         fg.diagnostics.diagnostic_function = diagnostic_function;
         fg.locals.address_taken = super::lir_address_taken_locals(&lir_fn);
         // A safepoint-free leaf neither roots its GC parameters nor reaches
-        // the panic-return block (willow-8hq4.14).
+        // the panic-return block.
         let unrooted = !is_main
             && super::root_effect::is_safepoint_free_leaf(
                 &lir_fn,
@@ -2001,7 +2001,7 @@ impl UnitCodegenContext<'_> {
         }
 
         // Unpack the closure environment into ordinary locals, BEFORE the body
-        // runs (willow-0g8j.2.12). Each capture keeps its own declared type, so
+        // runs. Each capture keeps its own declared type, so
         // a GC-managed one is rooted here by exactly the machinery that roots a
         // parameter, and the body cannot tell a capture from a parameter.
         if !lir_fn.captures.is_empty() {
@@ -2041,7 +2041,7 @@ impl UnitCodegenContext<'_> {
             }
             if call_return_type != Type::Void && !force_void_main {
                 // A value-returning fn can END with a statement whose arms all
-                // return (e.g. a statement-position match, willow-zvkv); this
+                // return (e.g. a statement-position match, statement-position matching); this
                 // fall-through is then unreachable but must still satisfy the
                 // signature.
                 let zero = match fg.clif_type(&call_return_type) {
@@ -2075,7 +2075,7 @@ impl UnitCodegenContext<'_> {
     pub(super) fn declare_class_methods(&mut self, c: &ClassDecl) -> Result<()> {
         *self.dispatch_cache.get_mut() = Default::default();
         // Constructors lower to an ordinary `init` method (self receiver, void
-        // return) so they reuse the method machinery (willow-scq2).
+        // return) so they reuse the method machinery.
         let mut all_methods: Vec<MethodDecl> = c.methods.clone();
         for ctor in &c.constructors {
             all_methods.push(constructor_to_method(ctor));
@@ -2129,7 +2129,7 @@ impl UnitCodegenContext<'_> {
     }
 
     /// Declare global storage for each `static [mut] name: T = expr` property and
-    /// record its initializer for `__willow_static_init` (willow-qsqf §13.3/§11).
+    /// record its initializer for `__willow_static_init` (static member support §13.3/§11).
     /// `class_key` is the registered (possibly module-qualified) class name.
     pub(super) fn declare_static_storage_for_class(
         &mut self,
@@ -2163,7 +2163,7 @@ impl UnitCodegenContext<'_> {
                 .declare_data(&sym, Linkage::Local, true, false)?;
             let mut data = DataDescription::new();
             // Zero-initialized: GC-managed slots start null so a collection during
-            // static init sees a safe (null) slot (willow-qsqf §12.3). The slot
+            // static init sees a safe (null) slot (static member support §12.3). The slot
             // holds a pointer and is registered as a GC root, so it must be
             // 8-aligned — the collector dereferences the root slot.
             let storage_bytes = willow_abi::storage_word_bytes(
@@ -2393,7 +2393,7 @@ impl UnitCodegenContext<'_> {
                 // points to a monomorphic class method (default-method bodies are
                 // injected once as class methods too), so all instantiations yield
                 // a byte-identical vtable and correctly share this single name-keyed
-                // entry — `declare_one_vtable` dedups them (willow-1js.6).
+                // entry — `declare_one_vtable` dedups them.
                 let iface_name = match iface_ty {
                     crate::parser::ast::Type::Named(n)
                     | crate::parser::ast::Type::Generic(n, _) => n.clone(),
@@ -2490,7 +2490,7 @@ impl UnitCodegenContext<'_> {
             // An `open`/`override` method must not be nailed to the body THIS
             // class would inherit: the box may have been built from a
             // base-typed expression whose object is really a subclass, and the
-            // subclass's override has to win (willow-tygf). Its slot therefore
+            // subclass's override has to win. Its slot therefore
             // holds a thunk that re-dispatches through the receiver's own class
             // descriptor. A method with no virtual slot is neither `open` nor
             // an `override`, so no subclass can replace it and the direct
@@ -2561,7 +2561,7 @@ impl UnitCodegenContext<'_> {
     }
 
     /// Emit (once per `(class, method)` pair) the virtual-dispatch thunk a
-    /// vtable slot points at instead of a method body (willow-tygf).
+    /// vtable slot points at instead of a method body.
     ///
     /// The thunk takes the target method's own signature, loads the receiver's
     /// class descriptor from word 0 of the object, reads virtual slot `vslot`
@@ -2603,7 +2603,7 @@ impl UnitCodegenContext<'_> {
         }
         let symbol = vtable_thunk_symbol(class_name, method_name);
         // Shares the one linker namespace with every other symbol the backend
-        // hands out, so it is claimed like the rest (willow-uqzx, item 8).
+        // hands out, so it is claimed like the rest (shared compiler infrastructure, item 8).
         self.claim_symbol(
             &symbol,
             format!("virtual dispatch thunk for `{class_name}::{method_name}`"),
@@ -2654,7 +2654,7 @@ impl UnitCodegenContext<'_> {
     ///
     /// Must run AFTER `declare_class_methods`, because every slot is filled by
     /// `resolve_class_method_func_id`, which reads `func_ids`.
-    /// Emit a descriptor for every class in `program` (willow-fm7t).
+    /// Emit a descriptor for every class in `program`.
     pub(super) fn declare_class_descriptors(&mut self, program: &Program) -> Result<()> {
         let classes: Vec<ClassDecl> = program
             .items
@@ -2679,8 +2679,8 @@ impl UnitCodegenContext<'_> {
     ///
     /// Every class gets one, INCLUDING a class with no virtual methods at all —
     /// otherwise word 0 of an object would sometimes be a descriptor address
-    /// and sometimes a bare type_id, and no reader could tell which
-    /// (willow-fm7t.1).
+    /// and sometimes a bare type_id, and no reader could tell which.
+    ///
     pub(super) fn declare_one_class_descriptor(
         &mut self,
         class_name: &str,
@@ -2696,7 +2696,7 @@ impl UnitCodegenContext<'_> {
         let slots: &[String] = slots.as_ref().map_or(&[], |slots| slots.as_slice());
         let symbol = class_descriptor_symbol(class_name);
         // Shares the one linker namespace with every other symbol the backend
-        // hands out, so it is claimed like the rest (willow-uqzx, item 8).
+        // hands out, so it is claimed like the rest (shared compiler infrastructure, item 8).
         self.claim_symbol(&symbol, format!("class `{class_name}`"), span)?;
         let data_id = self
             .output
@@ -2749,7 +2749,7 @@ impl UnitCodegenContext<'_> {
     }
 
     /// Emit an interface default that `class_name` received from another
-    /// unit's interface (willow-rvpp). The caller installs the declaring
+    /// unit's interface. The caller installs the declaring
     /// unit's alias scope, so `class_name` is the class identity rather than
     /// a spelling of the unit that declared the class.
     pub(crate) fn compile_foreign_method(
@@ -2770,7 +2770,7 @@ impl UnitCodegenContext<'_> {
         let diagnostic_function = self.runtime_name(&QualifiedName::join(class_name, &m.name));
         self.declare_string_literal(&diagnostic_function)?;
         let mangled = self.class_method_symbol(class_name, &m.name);
-        // LIR-walking path for a method body (willow-0g8j.2.18). `lower_program`
+        // LIR-walking path for a method body. `lower_program`
         // lowers every method under `Class::method` -- the key
         // `register_lir_functions` stored it under, which is not the mangled
         // symbol -- and puts the `self` receiver first in the lowered parameter
@@ -2835,7 +2835,7 @@ impl UnitCodegenContext<'_> {
         fg.diagnostics.diagnostic_function = diagnostic_function;
         fg.locals.address_taken = super::lir_address_taken_locals(&lir_fn);
         // Instance methods bind a rooted `self`, even for scalar bodies, unless
-        // the body can never reach a safepoint (willow-8hq4.14).
+        // the body can never reach a safepoint.
         let unrooted = super::root_effect::is_safepoint_free_leaf(
             &lir_fn,
             fg.diagnostics.build_mode == BuildMode::Debug,
@@ -2856,7 +2856,7 @@ impl UnitCodegenContext<'_> {
         // methods (static `::` calls pass a dummy null there), so user params
         // always start at block_params[1]. A static method simply does not bind
         // `self`: there is no receiver, and the body cannot reference it
-        // (rejected by the type checker, willow-qsqf §9.2).
+        // (rejected by the type checker, static member support §9.2).
         //
         // The receiver is a GC-managed class object; it must be stored in a
         // stack slot and rooted so that allocations inside the method body
@@ -2908,7 +2908,7 @@ impl UnitCodegenContext<'_> {
             }
             if call_return_type != Type::Void {
                 // Unreachable fall-through after a body that ends with an
-                // all-returning statement match (willow-zvkv): satisfy the
+                // all-returning statement match: satisfy the
                 // signature with a typed zero.
                 let zero = match fg.clif_type(&call_return_type) {
                     types::F64 => fg.builder.ins().f64const(0.0),

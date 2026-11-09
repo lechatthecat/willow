@@ -1,4 +1,4 @@
-//! Cooperative cancellation tokens and structured task scopes (willow-2s3.3).
+//! Cooperative cancellation tokens and structured task scopes.
 //!
 //! `CancellationToken` is a fan-out cancellation source. `attach(task)` is an
 //! identity operation on the Task handle that records its task id; cancelling

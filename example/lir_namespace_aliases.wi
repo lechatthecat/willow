@@ -1,5 +1,5 @@
 // lir_namespace_aliases.wi — builtin namespaces reached through an `import`
-// alias, compiled from Lowered IR (willow-nswv).
+// alias, compiled from Lowered IR.
 //
 // `import std::fs as files;` makes `files::exists(..)` the SAME call as
 // `fs::exists(..)`. The AST emitter never sees the alias: a normalization pass
@@ -16,7 +16,7 @@
 // and `parallel` are aliased, so both dispatch paths meet in the same program.
 //
 // Every function declared here is compiled by the walker — since
-// willow-0g8j.3 there is nothing else to compile it. Run under
+// the lowered-IR cutover there is nothing else to compile it. Run under
 // `WILLOW_LIR_LOG=1` to watch each one being claimed.
 
 import std::collections::Array;

@@ -1,5 +1,5 @@
 //! One module, several spellings: what each unit calls a module has to reach
-//! the same registered tables (willow-kd1v).
+//! the same registered tables.
 //!
 //! The back end declares a module once, under the name the module GRAPH gave
 //! it — the first importer's spelling. Every other unit is free to reach it by
@@ -24,7 +24,7 @@
 //! its own fields alone. Declared names are therefore canonicalized at
 //! registration, while the alias is still installed.
 //!
-//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! Since the lowered-IR cutover a body outside the walker's subset is a compile error,
 //! so a run that prints the right answer is proof the walker produced it.
 //!
 //! 24 perspectives:

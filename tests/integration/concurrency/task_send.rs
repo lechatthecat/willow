@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Task<T> Send: interface-value capture diagnostics (willow-dgwo.5) ────────
+// ── Task<T> Send: interface-value capture diagnostics ────────
 // An interface value passed to an async fn follows the interface contract, so a
 // plain interface (neither Send nor Sync) → E2404; an interface that is Send but
 // not Sync → E2405; an interface that `extends Sync` is accepted. Gated by the

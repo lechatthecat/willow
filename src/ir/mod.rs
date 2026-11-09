@@ -2,7 +2,7 @@
 //!
 //! [`typed_ast`] is the typed high-level IR (HIR): every expression carries its
 //! resolved type. [`lower`] builds HIR from the type-checked AST, and
-//! [`lowered`] produces the LIR consumed by backend emission (willow-mb5).
+//! [`lowered`] produces the LIR consumed by backend emission.
 
 pub mod dump;
 pub mod lower;

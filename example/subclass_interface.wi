@@ -1,4 +1,4 @@
-// A subclass is usable as an interface its BASE class implements (willow-2s4i).
+// A subclass is usable as an interface its BASE class implements.
 //
 // `Dog implements Animal`; `Puppy extends Dog` does not re-declare `implements
 // Animal`, yet a `Puppy` is an `Animal` (Liskov) — it gets its own

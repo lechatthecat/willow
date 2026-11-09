@@ -176,7 +176,7 @@ pub fn binary_args<N: TypeName>(ty: &Type<N>, id: BuiltinTypeId) -> Option<(&Typ
 /// the runtime is the only thing that constructs one. Each of those used to
 /// carry its own transcription of this list, and HIR lowering carried none at
 /// all -- so `info.line` found no field on its receiver and the whole function
-/// historically used the now-retired AST emitter (willow-0g8j.3). One list,
+/// historically used the now-retired AST emitter. One list,
 /// read by all of them.
 pub fn panic_info_fields() -> [(&'static str, Type); 4] {
     [

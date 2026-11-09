@@ -1,4 +1,4 @@
-//! A module body dispatches virtually against the WHOLE program (willow-4zt8).
+//! A module body dispatches virtually against the WHOLE program.
 //!
 //! `plan_virtual_call` devirtualizes a call whose receiver has exactly one
 //! implementation in the class hierarchy — and the hierarchy it consulted was

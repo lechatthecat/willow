@@ -27,7 +27,7 @@ pub extern "C" fn willow_nil_deref(file: *const u8, line: i32, col: i32, context
     crate::panic_context::raise_language_message_at(&message, file, line.into(), col.into());
 }
 
-/// Print the active async chain (willow-9lw) if a task is currently running, so
+/// Print the active async chain if a task is currently running, so
 /// panics inside async fns show the suspended future chain, not just the OS call
 /// stack (which the cooperative scheduler flattens).
 fn print_async_chain() {
@@ -39,7 +39,7 @@ fn print_async_chain() {
 
 /// Called by the Willow `panic(message)` builtin.  `message` is a WillowString pointer.
 ///
-/// TOP-LEVEL PANIC POLICY (preemption spec §18, willow-0a6k.7): Willow has no
+/// TOP-LEVEL PANIC POLICY (preemption spec §18, panic and cancellation policy): Willow has no
 /// `recover`, so a panic anywhere — any task, any worker thread, any depth —
 /// prints the located `runtime panic:` message, the call stack, and the async
 /// chain (task id + spawn site), then ABORTS THE WHOLE PROGRAM. The
@@ -57,7 +57,7 @@ pub extern "C" fn willow_panic(message: *const u8) {
 }
 
 /// Called when `fn main() -> Result<void, E>` returns `Err`. Prints a clean
-/// top-level error report to stderr and exits with a non-zero status (willow-exg).
+/// top-level error report to stderr and exits with a non-zero status.
 /// `message` is a WillowString pointer for `E = String`, or null for other error
 /// types (a generic report is printed).
 #[unsafe(no_mangle)]
@@ -71,13 +71,13 @@ pub extern "C" fn willow_main_fail(message: *const u8) {
     }
     crate::gc_telemetry::flush_observations();
     // Reached with the runtime's threads still running, so it exits the same
-    // way a successful `main` does (willow-ihr5).
+    // way a successful `main` does.
     crate::exit::terminate_without_teardown(1);
 }
 
 /// Like [`willow_panic`] but with the source location of the `panic(...)` call
 /// site (debug builds). Prints `runtime panic: <msg> at <file>:<line>:<col>`
-/// then aborts (willow-4j6).
+/// then aborts.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_panic_at(message: *const u8, file: *const u8, line: i32, col: i32) {
@@ -90,7 +90,7 @@ pub extern "C" fn willow_panic_at(message: *const u8, file: *const u8, line: i32
     std::process::abort();
 }
 
-/// Debug-build integer division guard failure (willow-l9lx). `kind`:
+/// Debug-build integer division guard failure. `kind`:
 /// 0 = division by zero, 1 = `i64::MIN / -1` overflow, 2 = remainder by zero,
 /// 3 = `i64::MIN % -1` overflow. `file` is a WillowString pointer.
 #[unsafe(no_mangle)]
@@ -105,9 +105,9 @@ pub extern "C" fn willow_int_div_panic(kind: i64, file: *const u8, line: i32, co
     crate::panic_context::raise_language_message_at(what, file, line.into(), col.into());
 }
 
-/// Debug-build signed overflow check failure (willow-jz15.14). `kind`:
+/// Debug-build signed overflow check failure. `kind`:
 /// 0 = `+`, 1 = `-`, 2 = `*`, 3 = unary `-`, 4 = `**`, 5 = `<<` and 6 = `>>`
-/// with an amount outside `0..64` (willow-jz15.8). Release builds wrap
+/// with an amount outside `0..64`. Release builds wrap
 /// and never call this. `file` is a WillowString pointer.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]

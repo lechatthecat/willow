@@ -1,4 +1,4 @@
-//! Conservative induction proof (willow-ijui.12).
+//! Conservative induction proof.
 //!
 //! A local is nonnegative at every read when every definition is a nonnegative
 //! literal or a positive increment protected by a strict signed upper bound.

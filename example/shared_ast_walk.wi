@@ -1,4 +1,4 @@
-// One structural AST walk, three analyses (willow-uqzx.1.1).
+// One structural AST walk, three analyses.
 //
 // The recoverable-panic summary, the async checker's helper call graph, and its
 // loop detector used to be three separately hand-written traversals of the same

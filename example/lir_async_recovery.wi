@@ -1,5 +1,5 @@
 // lir_async_recovery.wi — a recovery-capable `defer` inside an async function,
-// compiled by the LIR walker (willow-0g8j.2.11).
+// compiled by the LIR walker.
 //
 // `defer match recover() { .. }` ends a panic instead of only cleaning up after
 // one, so the scope it guards has a SECOND way out: the statement after the

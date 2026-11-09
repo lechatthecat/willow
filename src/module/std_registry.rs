@@ -4,7 +4,7 @@
 //! packages. Unlike local imports (which map to source files), `std` imports
 //! are validated against this fixed registry of public modules and items.
 //!
-//! Stage 2 (willow-4bv.2) establishes the namespace and the item-import
+//! Stage 2 establishes the namespace and the item-import
 //! resolver. The concrete types/functions behind some items (notably
 //! `collections.Array` / `collections.Map`) are wired into the type system in
 //! later stages; here an import of a known item simply resolves without error.

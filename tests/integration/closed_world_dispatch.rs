@@ -1,4 +1,4 @@
-//! Closed-build interface dispatch (willow-8hq4.34).
+//! Closed-build interface dispatch.
 use super::support::{TestProject, compile_and_run_release};
 
 #[test]

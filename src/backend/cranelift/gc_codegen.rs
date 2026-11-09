@@ -257,7 +257,7 @@ pub(super) fn emit_gc_heap_store_raw(
 /// all header writes and before the payload escapes. Only the owner writes an
 /// active chunk's start words, and other threads read them only after
 /// synchronizing with the owner, so a plain read-modify-write suffices: no
-/// fence and no locked RMW (willow-8hq4.16).
+/// fence and no locked RMW.
 fn emit_tlab_start_publication(
     builder: &mut FunctionBuilder<'_>,
     tlab: Value,
@@ -644,7 +644,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// Class instances and strings are always GC heap payloads with a header;
     /// such a value word is never a tag, box-free pair, or foreign pointer
-    /// (string literals are permanently rooted heap strings, willow-jz15.53).
+    /// (string literals are permanently rooted heap strings, GC allocation fast paths).
     fn is_header_pointer(&self, ty: &Type) -> bool {
         matches!(ty, Type::String)
             || matches!(ty, Type::Named(n) | Type::Generic(n, _) if self.classes.is_class(n))
@@ -665,7 +665,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// Store an opaque GC-owner word (a managed allocation base, never a tag
     /// or interior pointer) into an async frame slot. Old values skip the
-    /// barrier call outside marking, as for class-typed stores (willow-jz15.53).
+    /// barrier call outside marking, as for class-typed stores.
     pub(super) fn emit_gc_owner_frame_store(&mut self, frame: Value, offset: i32, value: Value) {
         self.emit_gc_heap_store_inner(
             frame,
@@ -729,7 +729,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Store a reference `word` into `slot` inside the GC object whose payload
-    /// starts at `owner` (willow-8hq4.15, 8hq4.22). The fused
+    /// starts at `owner`. The fused
     /// `willow_gc_write_barrier` call is skipped when it is a no-op: no SATB
     /// epoch is active and the word is null, the owner is not old, or the
     /// owner is already remembered (a header flag the runtime keeps equal to
@@ -994,7 +994,7 @@ pub(super) enum BarrierRefinement {
 
 /// Destinations whose owner is always the payload start of a GC heap object,
 /// so its header bytes can be read inline. Async frames are old-region objects
-/// from `willow_async_frame_alloc`, addressed by payload start (willow-jz15.51).
+/// from `willow_async_frame_alloc`, addressed by payload start.
 /// Globals have no header and `IndirectReference` owners are interior slots;
 /// both, like runtime-owned cells, keep the unconditional barrier call.
 fn owner_is_object_payload(destination: GcStoreDestination) -> bool {
@@ -1504,8 +1504,8 @@ mod destination_abi_tests {
     /// Perspective 5: `destination_kind` reaches `willow_gc_write_barrier` as a
     /// bare integer, so the compiler's enum and the runtime's must agree
     /// discriminant for discriminant. The lock-cell destinations were added on
-    /// both sides in willow-38w.1.4/.1.5 and the blocking-cell ones in
-    /// willow-9tls.5; the rest are pinned so a renumbering shows up here
+    /// both sides in mutex and read/write lock lowering and the blocking-cell ones in
+    /// blocking-cell root handling; the rest are pinned so a renumbering shows up here
     /// rather than as a mis-classified barrier at runtime.
     #[test]
     fn store_destinations_are_the_shared_runtime_type() {

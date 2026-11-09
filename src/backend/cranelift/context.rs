@@ -214,8 +214,8 @@ impl Codegen {
         context.checked = Some(checked);
         context.emit_module(unit, emit)
     }
-    /// Emit the interface defaults another unit received from `unit`
-    /// (willow-rvpp), checked and scoped as `unit`'s own bodies are.
+    /// Emit the interface defaults another unit received from `unit`, checked and scoped as
+    /// `unit`'s own bodies are.
     pub fn with_foreign_bodies<'a>(
         &'a mut self,
         unit: &DeclaredModule,

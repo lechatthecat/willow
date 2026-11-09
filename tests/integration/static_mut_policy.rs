@@ -1,4 +1,4 @@
-//! willow-9tls.23: runtime worker count, static initialization, and ABI emission.
+//! runtime worker count, static initialization, and ABI emission.
 use super::support::*;
 
 const SLOT: &str = "class S { pub static mut n: i64 = 0; }";

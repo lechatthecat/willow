@@ -1,4 +1,4 @@
-//! Function-owned panic locations across modules (willow-jz15.67).
+//! Function-owned panic locations across modules.
 //! Callers retain their call sites; frame zero uses the panic site. Names come
 //! from declarations, so import aliases do not rename an executing function.
 //! Coverage includes cleanup, recovery, references, async tasks and GC stress.

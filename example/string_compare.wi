@@ -1,4 +1,4 @@
-// String equality is CONTENT equality (willow-rpxh): a runtime-built string
+// String equality is CONTENT equality: a runtime-built string
 // equals a literal with the same bytes. Optional strings test presence with
 // is_none()/is_some(); Option does not define structural equality.
 

@@ -1,4 +1,4 @@
-//! Inline reference-element array stores (willow-8hq4.15): bounds check,
+//! Inline reference-element array stores: bounds check,
 //! header-flag barrier filter, and no per-store root or panic bracket.
 
 use super::support::*;
@@ -259,9 +259,9 @@ fn array_reference_store_sites_match_scalar_store_runtime_calls() {
     // of the i64 store (its cold `willow_array_set` slow path) plus one cold
     // barrier call and one mark-phase load: no extra root pair and no hot
     // panic-depth bracket. The loaded array temporaries of successive sites
-    // share one reused entry root slot (willow-jz15.50), so roots stay flat.
+    // share one reused entry root slot, so roots stay flat.
     // Scalar stores form one GC-free run, so their array temporaries need no
-    // root at all (willow-ijui.10).
+    // root at all.
     const TRACKED: [&str; 6] = [
         "root_push",
         "root_pop",

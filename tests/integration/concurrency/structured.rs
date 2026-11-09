@@ -1,6 +1,6 @@
 use crate::support::*;
 
-// ── CancellationToken + TaskScope (willow-2s3.3) ────────────────────────────
+// ── CancellationToken + TaskScope ────────────────────────────
 // Token attachment and scope addition are identity adapters over an existing
 // eager Task. Waiting remains `await task` / `await task.result()`; scope exit
 // is the explicit `await scope.finish()` operation.

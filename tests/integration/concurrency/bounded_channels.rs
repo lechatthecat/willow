@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Bounded channels: `Channel<T>::with_capacity(n)` (willow-o038) ───────────
+// ── Bounded channels: `Channel<T>::with_capacity(n)` ───────────
 //
 // A bounded channel's buffer holds at most `n` values. A send into a full
 // buffer PARKS the producer (registering it as a send waiter) instead of

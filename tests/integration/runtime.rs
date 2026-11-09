@@ -3,7 +3,7 @@ use super::support::*;
 #[path = "runtime/gc_allocation.rs"]
 mod gc_allocation;
 
-// ── Interface dispatch (willow-xds, spec 14) ───────────────────────────────
+// ── Interface dispatch (interface dispatch, spec 14) ───────────────────────────────
 
 const IFACE_ANIMALS: &str = r#"
 interface Animal {
@@ -19,12 +19,12 @@ class Cat implements Animal {
 
 // ---------------------------------------------------------------------------
 // A MODULE that reaches ANOTHER module's enum through a plain (unrenamed) item
-// import (willow-favj). The aliased form of this lives in
+// import. The aliased form of this lives in
 // `enum_identity_aliases::METER`; the plain one had no coverage, and its
 // failure mode was silent: every construction behaved like variant 0.
 // ---------------------------------------------------------------------------
 
-const FAVJ_ALPHA: &str = r#"
+const IMPORTED_ENUM_ALPHA: &str = r#"
 module alpha;
 pub enum Color { A, B, C }
 pub enum Tag { Plain, Payload(i64) }
@@ -37,7 +37,7 @@ pub fn own_code(c: Color) -> i64 {
 }
 "#;
 
-const FAVJ_BETA: &str = r#"
+const IMPORTED_ENUM_BETA: &str = r#"
 module beta;
 import alpha::Color;
 import alpha::Tag;

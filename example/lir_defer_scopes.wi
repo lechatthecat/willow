@@ -1,4 +1,4 @@
-// Synchronous `defer` scopes that cross LIR blocks (willow-0g8j.2.15).
+// Synchronous `defer` scopes that cross LIR blocks.
 //
 // A `defer` scope is left by more than fallthrough: an explicit `return`, a
 // `break`, a `continue`, or a `?` that propagates all leave early, and each of
@@ -14,7 +14,7 @@
 // graph. An `if/else` lowers as then -> merge -> else, so the merge block has a
 // LOWER index than the `else` arm that is its only live predecessor, and an
 // emitter walking indices would reach it before anything had told it which
-// scopes are open (willow-fvt4).
+// scopes are open.
 
 fn doubled(n: i64) -> i64 {
     defer println("leave doubled");

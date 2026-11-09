@@ -1,4 +1,4 @@
-// Many lightweight tasks on the cooperative scheduler (willow-gyaa.4).
+// Many lightweight tasks on the cooperative scheduler.
 //
 // Tasks are cheap: creating a batch and awaiting them is the basic concurrency
 // pattern. The scheduler uses per-worker run queues with work stealing; the

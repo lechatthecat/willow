@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Top-level panic policy (willow-0a6k.7, spec §18) ────────────────────────
+// ── Top-level panic policy (panic and cancellation policy, spec §18) ────────────────────────
 // Willow has no recover: the FINAL policy is abort-the-program. A panic
 // anywhere — any task, any worker thread, any depth — prints the located
 // `runtime panic:` message, the call stack, and the async chain (task id +

@@ -1,4 +1,4 @@
-//! Lowering: type-checked AST → typed HIR ([`super::typed_ast`]) — willow-mb5.
+//! Lowering: type-checked AST → typed HIR ([`super::typed_ast`]) — typed HIR lowering.
 //!
 //! Coverage so far: the MVP-core constructs (literals, variables, arithmetic/
 //! comparison/logical/unary operators, free-function calls, `print`, and
@@ -163,10 +163,10 @@ pub struct PartialCheckerTables<'a> {
     /// `import shapes::Kind;`). The lowering's own sweep only sees THIS unit's
     /// `enum` items, so without this table a `match` on any enum that came
     /// from another file decides its scrutinee is not an enum at all
-    /// (willow-28h8 case B).
+    /// (imported enum matching case B).
     pub enums: Option<&'a HashMap<crate::semantic::ids::TypeId, symbols::EnumInfo>>,
     /// What the checker made of each type ANNOTATION it normalized, keyed by
-    /// the written spelling (willow-0g8j.3). Lowering reads annotations off the
+    /// the written spelling. Lowering reads annotations off the
     /// AST, where `Arr<i64>` (an aliased import), `std::result::Result<i64, E>`
     /// (a fully qualified std path) and a module's own `Level` (an enum whose
     /// identity is `signal::Level`) are still the words the source used; every
@@ -177,8 +177,8 @@ pub struct PartialCheckerTables<'a> {
     /// unchanged spellings. Absence is an error on the production path.
     pub static_call_classes: Option<&'a HashMap<ExprId, crate::semantic::ids::TypeId>>,
     /// What each lambda captures from its enclosing function, keyed by the
-    /// lambda's node ID and ordered as the closure environment lays its slots out
-    /// (willow-0g8j.2.12). Only the checker knows this: capture is decided by
+    /// lambda's node ID and ordered as the closure environment lays its slots out. Only the
+    /// checker knows this: capture is decided by
     /// name resolution, which the AST does not record.
     pub lambda_captures: Option<&'a HashMap<ExprId, Vec<LambdaCapture>>>,
 }
@@ -279,7 +279,7 @@ impl<'a> PartialCheckerTables<'a> {
     /// How this scope must spell the type `name` is an alias of, when that
     /// is the entry file's bare identity and this scope's own types shadow
     /// it: a generic instance's argument can be the entry's `Me` in a unit
-    /// that declares its own (willow-nvi6). `None` leaves `name` to the
+    /// that declares its own. `None` leaves `name` to the
     /// ordinary normalization.
     fn receiver_spelling(&self, name: &str) -> Option<String> {
         // The kind too: a receiver class and the scope's own interface can
@@ -330,7 +330,7 @@ impl<'a> PartialCheckerTables<'a> {
     /// payloads in that unit's own spelling — `Box2` under `import bx::Bx as
     /// Box2;`, `Shape` for an item-imported interface — which no other unit
     /// can resolve, so an importer that met the enum through this metadata
-    /// turned every function taking it down (willow-jz15.38). Only an enum in
+    /// turned every function taking it down. Only an enum in
     /// `declared` (see [`Self::declared_enum_identities`]) is rewritten: an
     /// imported one is already canonical, and this unit's spellings say
     /// nothing about another module's names.
@@ -371,7 +371,7 @@ impl<'a> PartialCheckerTables<'a> {
     }
 
     /// The value of the module-level `const` a bare name resolves to in this
-    /// unit (its own, or one an item import bound), willow-jz15.10.
+    /// unit (its own, or one an item import bound), constant resolution.
     fn constant(&self, name: &str) -> Option<&crate::parser::ast::ConstValue> {
         self.symbols?.lookup_func(name)?.constant.as_ref()
     }
@@ -405,7 +405,7 @@ impl<'a> PartialCheckerTables<'a> {
     /// The checker's enums, re-keyed by the name they are WRITTEN with —
     /// `TypeId`'s own rendering, so `palette::Color` stays qualified and a
     /// direct type import's local `Kind` stays bare. Those are exactly the
-    /// names a scrutinee's `Type::Named` carries (willow-28h8 case B).
+    /// names a scrutinee's `Type::Named` carries (imported enum matching case B).
     fn declared_enums(&self) -> impl Iterator<Item = (String, EnumInfo)> + '_ {
         self.enums.into_iter().flatten().map(|(id, info)| {
             (
@@ -449,7 +449,7 @@ pub fn lower_program_with_partial(
 
 /// [`lower_program_with_partial`], leaving out the class methods `foreign` selects:
 /// interface defaults another unit declared, which [`lower_foreign_methods_partial`]
-/// lowers in that unit's scope instead (willow-rvpp).
+/// lowers in that unit's scope instead.
 fn lower_program_except_partial(
     program: &Program,
     tables: &PartialCheckerTables,
@@ -533,7 +533,7 @@ fn lower_program_except_partial(
 }
 
 /// Lower the interface defaults that classes of other units received from
-/// `scope`'s interfaces (willow-rvpp) in that unit's scope: `scope` and
+/// `scope`'s interfaces in that unit's scope: `scope` and
 /// `scope_tables` are the declaring unit's program and checked tables, whose
 /// typed record of each default is what the copies reuse. The scope's
 /// signatures and resolution are built once for all `receivers`; `classes`
@@ -604,7 +604,7 @@ fn lower_foreign_methods_partial(
     let mut resolution = lower_resolution_partial(scope, scope_tables);
     // The receivers' class chains are their implementing units' declarations;
     // module class identities are qualified, and a bare one the scope's own
-    // names shadow arrives under `FOREIGN_RECEIVER_PREFIX` (willow-nvi6), so
+    // names shadow arrives under `FOREIGN_RECEIVER_PREFIX`, so
     // none collides with the scope's.
     for (id, info) in classes {
         resolution
@@ -623,11 +623,11 @@ fn lower_foreign_methods_partial(
 }
 
 /// A class that copied interface defaults from another unit, with each copy's
-/// body identity and the declaration it instantiates (willow-rvpp).
+/// body identity and the declaration it instantiates.
 pub struct ForeignClass<'a> {
     /// The receiver's class identity, as its own unit's tables normalize it,
     /// or under `FOREIGN_RECEIVER_PREFIX` when that is a bare name the scope's
-    /// own items shadow (willow-nvi6).
+    /// own items shadow.
     pub key: &'a str,
     pub span: Span,
     pub methods: Vec<(crate::parser::ast::BodyId, &'a MethodDecl)>,
@@ -711,7 +711,7 @@ fn lower_env(program: &Program, tables: &PartialCheckerTables) -> LowerEnv {
     let mut classes = Classes::with_runtime_types();
     let mut enums = Enums::with_prelude();
     // Before this unit's own items, so a locally declared enum still shadows
-    // an imported one of the same name below (willow-28h8 case B).
+    // an imported one of the same name below (imported enum matching case B).
     for (name, info) in tables.declared_enums() {
         enums.map.insert(name, info);
     }
@@ -726,8 +726,8 @@ fn lower_env(program: &Program, tables: &PartialCheckerTables) -> LowerEnv {
             Item::Class(c) => {
                 // The base keeps its module qualifier: a local `Sized extends
                 // shapes::Sized` must not read as `Sized extends Sized`, which
-                // sent `Classes::resolve` around a one-class loop forever
-                // (willow-ejg5). A qualified base is not in this map (it holds
+                // sent `Classes::resolve` around a one-class loop forever. A qualified base is
+                // not in this map (it holds
                 // only the unit's own classes), so the walk stops there and the
                 // member type comes from the checker tables instead.
                 let mut info = ClassInfo {
@@ -760,8 +760,8 @@ fn lower_env(program: &Program, tables: &PartialCheckerTables) -> LowerEnv {
             // `import bx::Bx;`) must bind as `bx::Bx`, the type every member
             // access on the binding resolves against. The checker keeps this
             // unit's spelling, so its entry under the enum's identity — the
-            // name a module's own scrutinee carries — is replaced as well
-            // (willow-jz15.38). Imported enums are already canonical.
+            // name a module's own scrutinee carries — is replaced as well. Imported enums are
+            // already canonical.
             Item::Enum(e) => {
                 let mut info = enum_info(e);
                 for payload in info.variants.values_mut() {
@@ -814,7 +814,7 @@ struct Enums {
 
 /// The prelude's enums, read from [`crate::prelude::PRELUDE_SOURCE`] itself.
 ///
-/// Parsed rather than transcribed (willow-0g8j.2.13): the list used to be a
+/// Parsed rather than transcribed: the list used to be a
 /// hand-written `Option` + `Result` pair, so `IoError`, `ParseFloatError` and
 /// `Cancelled` had no entry here. An unqualified pattern on one of them —
 /// `Failed(msg)` on an `IoError` — then missed the variant lookup in
@@ -887,7 +887,7 @@ impl Classes {
     /// checker defines it, the runtime is the only thing that builds one, and a
     /// `recover()` handler reads its fields like any other object's. Without it
     /// here, `info.line` found no field on its receiver and the enclosing
-    /// function historically used the now-retired AST emitter (willow-0g8j.3).
+    /// function historically used the now-retired AST emitter.
     fn with_runtime_types() -> Self {
         let panic_info = ClassInfo {
             fields: builtin_types::panic_info_fields()
@@ -902,7 +902,7 @@ impl Classes {
     }
 
     /// The key a class's `extends` target has in this table: a local name as
-    /// written, a qualified path with its module kept (willow-ejg5).
+    /// written, a qualified path with its module kept.
     fn base_key(base: &TypePath) -> String {
         base.spelling()
     }
@@ -911,7 +911,7 @@ impl Classes {
     /// `pick` finds. Stops if a base class is not in the program (e.g. external)
     /// or if the chain revisits a class: the checker rejects an `extends` cycle
     /// (E0426), so lowering never sees one, but this walk must still terminate
-    /// on any table it is handed (willow-ejg5).
+    /// on any table it is handed.
     fn resolve<F: Fn(&ClassInfo) -> Option<Type>>(&self, class: &str, pick: F) -> Option<Type> {
         let mut current = Some(class);
         let mut seen = HashSet::new();
@@ -1105,8 +1105,8 @@ struct Binding {
     cell: bool,
     ty: Type,
     /// The HIR name. This is the source name for the first binding of that
-    /// name in a function, and `name$n` for every later one
-    /// (willow-0g8j.2.10). LIR has a single flat namespace per function, so
+    /// name in a function, and `name$n` for every later one. LIR has a single flat namespace
+    /// per function, so
     /// two source bindings that shadow each other — sibling `for x` loops, a
     /// `let` over a parameter, a `match` arm binding over an outer `let` —
     /// must not arrive there under one name.
@@ -1157,7 +1157,7 @@ struct LowerCtx<'a> {
     next_defer_id: u32,
     current_class: Option<String>,
     /// The receiver class an interface default's copy lowers the opaque
-    /// `Self` its shared check typed the body with as (willow-dnia).
+    /// `Self` its shared check typed the body with as.
     receiver: Option<Type>,
     fn_returns: &'a HashMap<String, Type>,
     classes: &'a Classes,
@@ -1187,7 +1187,7 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-    /// The checker's type for a written annotation (willow-0g8j.3).
+    /// The checker's type for a written annotation.
     fn normalize(&self, ty: &Type) -> Type {
         self.receiver_self(self.tables.normalize(ty))
     }
@@ -1526,7 +1526,7 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         }
         Stmt::Break(span) => Ok(HirStmt::Break { span: *span }),
         Stmt::Continue(span) => Ok(HirStmt::Continue { span: *span }),
-        // Every source form of `defer` has a HIR shape (willow-0g8j.2.3). The
+        // Every source form of `defer` has a HIR shape. The
         // body is lowered where it was written, so a deferred `match
         // recover()` sees the same bindings the registering scope did; a block
         // body gets its own scope, exactly as `lower_block` gives any block.
@@ -1547,7 +1547,7 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
             })
         }
         // HIR needs explicit acquire/cleanup edges for a critical section, which
-        // arrive with the backend lowering (willow-38w.1.3). Until then the
+        // arrive with the backend lowering. Until then the
         // statement has no HIR shape at all — the type checker rejects it with
         // E2502, so this is unreachable in practice and only keeps the lowering
         // gap explicit.
@@ -1862,7 +1862,7 @@ fn required_expr_type(id: ExprId, span: Span, ctx: &LowerCtx) -> Result<Option<T
     Ok(ty)
 }
 
-/// The literal one use of a module-level `const` stands for (willow-jz15.10).
+/// The literal one use of a module-level `const` stands for.
 fn const_literal(value: &crate::parser::ast::ConstValue, span: Span) -> HirExpr {
     use crate::parser::ast::ConstValue;
     let kind = match value {
@@ -1878,7 +1878,7 @@ fn const_literal(value: &crate::parser::ast::ConstValue, span: Span) -> HirExpr 
 /// nested expression costs one SMALL frame per level instead of one frame
 /// holding every arm's locals at once: a debug build gives the match's frame
 /// room for all of them, which cost ~63KB per level and overflowed a 2MiB
-/// thread at around 30 levels of nesting (willow-t0uy.1). `inline(never)` keeps
+/// thread at around 30 levels of nesting. `inline(never)` keeps
 /// that true in release builds, where the arms would otherwise be folded back
 /// into one frame.
 #[inline(never)]
@@ -1914,19 +1914,19 @@ fn lower_var_expr(
             span,
         });
     }
-    // A module-level `const` (willow-jz15.10): inline its literal. Locals
+    // A module-level `const`: inline its literal. Locals
     // were resolved above, so a binding of the same name still shadows it,
     // exactly as in the checker.
     if let Some(value) = ctx.tables.constant(name) {
         return Ok(const_literal(value, span));
     }
     // A named top-level function used as a value (`apply(10, double)`,
-    // willow-0g8j.2.2). The checker types the bare identifier as the
+    // function value lowering). The checker types the bare identifier as the
     // function's `fn(...) -> ...`; taking that from the checker rather
     // than rebuilding it keeps the parameter modes and the return type
     // exactly what the call site was checked against. A function bound by an
     // item import is not in `fn_returns`; the back end binds its local name
-    // to the imported symbol, as for a direct call (willow-yf49).
+    // to the imported symbol, as for a direct call.
     if (ctx.fn_returns.contains_key(name)
         || ctx
             .tables
@@ -2091,7 +2091,7 @@ fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
     }
     // An unqualified enum-variant construction (`Ok(42)` in an
     // expected-enum position) parses as a call; the checker records
-    // which enum it resolved to (willow-60o.1).
+    // which enum it resolved to.
     if let Some(enum_name) = ctx.tables.enum_variant_resolution(&c.id) {
         // Prefer the checker's recorded type (it carries generic type
         // arguments, e.g. `Result<i64, String>` for `Ok(42)`).
@@ -2111,7 +2111,7 @@ fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
     }
     // A local fn-typed variable shadows a free function; its call is an
     // indirect call typed by the variable's `fn(..) -> R`, and it is
-    // named by the binding's HIR name (willow-0g8j.2.10).
+    // named by the binding's HIR name.
     let indirect = ctx.lookup(&c.callee).and_then(|b| match &b.ty {
         Type::Fn(_, ret) | Type::Closure(_, ret) => Some((b.hir_name.clone(), (**ret).clone())),
         _ => None,
@@ -2133,13 +2133,13 @@ fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
         .or_else(|| ctx.fn_returns.get(&c.callee).cloned())
         // A function bound by an ITEM import (`import calc::add;`) is a
         // plain unqualified call in this file, but it is not one of the
-        // program's own items, so `fn_returns` has never heard of it
-        // (willow-28h8). The checker did resolve the import and typed
+        // program's own items, so `fn_returns` has never heard of it. The checker did resolve
+        // the import and typed
         // the call, so its type is what makes the call lowerable at
         // all. The back end binds this same local name to the mangled
         // symbol of the module THIS unit imported, rebinding it before
         // each unit's bodies, so the call the type came from is the
-        // call that gets emitted (willow-28h8).
+        // call that gets emitted.
         .or_else(|| ctx.expr_type(&c.id))
         .ok_or_else(|| {
             internal(
@@ -2294,7 +2294,7 @@ fn lower_index_expr(
     let index = lower_expr(index, ctx)?;
     // A `FrozenArray<T>` is the same runtime handle as the `Array<T>` it
     // was frozen from, and `arr[i]` reads it the same way, so both lower
-    // to one `Index` node (willow-0g8j.7). `Range<i64>` also spells a
+    // to one `Index` node. `Range<i64>` also spells a
     // read this way but is not a handle at all, so it stays unsupported.
     let element = match &array.ty {
         Type::Array(element) => (**element).clone(),
@@ -2346,7 +2346,7 @@ fn lower_ternary_expr(t: &TernaryExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Di
     // A diverging arm contributes no value to the result. If both diverge,
     // the result remains Never. Otherwise the checker's type is
     // authoritative: branches of distinct classes flowing into an interface
-    // take that interface (willow-jz15.47).
+    // take that interface.
     let ty = if then_expr.ty == Type::Never {
         else_expr.ty.clone()
     } else {
@@ -2608,7 +2608,7 @@ fn lower_object_literal_expr(
 
 #[inline(never)]
 fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
-    // `config::LIMIT` names a module's `const` before any class (willow-jz15.10),
+    // `config::LIMIT` names a module's `const` before any class,
     // matching the checker's precedence.
     if let Some(value) = ctx.tables.module_constant(&s.class, &s.field) {
         return Ok(const_literal(value, s.span));
@@ -2626,7 +2626,7 @@ fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<Hi
         // Checker authority, exactly as the static-CALL arm below uses
         // it: `Self::prop` inside a class body names a class the
         // registry has no entry for, and the checker has already
-        // resolved and typed the read (willow-0g8j.13).
+        // resolved and typed the read.
         .or_else(|| ctx.expr_type(&s.id))
         .ok_or_else(|| unsupported(s.span, "static property not found"))?;
     Ok(HirExpr {
@@ -2666,8 +2666,8 @@ fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<Hi
 )]
 fn lower_static_call_expr(s: &StaticCallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     // `config::LIMIT`: an uppercase bare member parses like a fieldless
-    // variant; a module's `const` takes precedence, as in the checker
-    // (willow-jz15.10).
+    // variant; a module's `const` takes precedence, as in the checker.
+    //
     if s.is_bare_member()
         && let Some(value) = ctx.tables.module_constant(&s.class, &s.method)
     {
@@ -3014,7 +3014,7 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
     };
     let is_closure = matches!(ctx.tables.lambda_fn_type(&l.id), Some(Type::Closure(..)));
     // Resolve every capture in the ENCLOSING namespace first: after the
-    // scope below, `n` means the lambda's own copy (willow-0g8j.2.12).
+    // scope below, `n` means the lambda's own copy.
     let capture_sources: Vec<(String, String, Type, bool)> = ctx
         .tables
         .lambda_captures(&l.id)
@@ -3033,7 +3033,7 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
     ctx.push_scope();
     // A lambda body is lifted into a LirFunction of its own, so its
     // flat namespace is its own too and the shadow suffixes restart
-    // here (willow-0g8j.2.10). Without this a lambda parameter could
+    // here. Without this a lambda parameter could
     // arrive renamed after an unrelated binding of the same name in the
     // enclosing function — and the backend, which binds the lifted
     // parameters by their source names, would never bind it.
@@ -3096,8 +3096,8 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
             let span = value.span;
             // A `void` body has no value to return: `|s| println(s)` is
             // a statement, and returning its non-existent value would
-            // build a `return` against a signature with no result slot
-            // (willow-0g8j.2.2).
+            // build a `return` against a signature with no result slot.
+            //
             let body = if matches!(ret, Type::Void) {
                 vec![HirStmt::Expr(value), HirStmt::Return { value: None, span }]
             } else {
@@ -3384,8 +3384,8 @@ fn lower_match(
 
     // `Never` arms (panic) coerce to the others; an all-diverging match stays
     // Never. Otherwise the checker's unified type is authoritative: arms of
-    // distinct classes flowing into an interface take that interface
-    // (willow-jz15.47).
+    // distinct classes flowing into an interface take that interface.
+    //
     let ty = arms
         .iter()
         .map(|a| &a.ty)
@@ -3446,7 +3446,7 @@ fn bind_variant_tuple(
 
 /// Lower call/constructor arguments. A reference argument retains its place as
 /// a marker expression so eligibility can verify it against the callee mode and
-/// codegen can pass its address rather than its value (willow-0g8j.2.7).
+/// codegen can pass its address rather than its value.
 #[willow_continuations::function(
     lower_array_literal_expr,
     lower_await_expr,
@@ -3580,7 +3580,7 @@ fn unsupported(span: Span, what: &str) -> Diagnostic {
     Diagnostic::new(
         Severity::Error,
         ErrorCode::E0800,
-        format!("HIR lowering does not yet support {what} (willow-mb5 slice 1)"),
+        format!("HIR lowering does not yet support {what}"),
     )
     .with_label(crate::diagnostics::Label::primary(span, "here"))
 }
@@ -4150,7 +4150,7 @@ mod tests {
     /// stack. Lowering is recursive, so the cost that matters is the size of
     /// ONE level: the arms of `lower_expr_inner` live in their own functions
     /// precisely so a level pays for the arm it takes instead of for every arm
-    /// at once (willow-t0uy.1). With them inline, a debug build spent ~63KB per
+    /// at once. With them inline, a debug build spent ~63KB per
     /// level and 256 levels needed 16MiB; a level now costs ~6KB, so this fits
     /// several times over.
     #[test]
@@ -4911,7 +4911,7 @@ mod tests {
         );
         assert!(diags.is_empty(), "{diags:?}");
         // A class with a static initializer contributes its own `$static_init`
-        // function ahead of the user's, so pick `f` by name (willow-t0uy.3).
+        // function ahead of the user's, so pick `f` by name.
         let body = &hir
             .functions
             .iter()
@@ -5176,7 +5176,7 @@ mod tests {
             ),
             Type::I64
         );
-        // `Mutex<T>` lost its accessors in willow-38w.1.4; the blocking cell
+        // `Mutex<T>` lost its accessors in mutex lowering; the blocking cell
         // and the RwLock keep theirs, and both must still lower.
         assert_eq!(
             return_ty("fn f(c: BlockingCell<i64>) -> i64 { return c.get(); }"),
@@ -5312,7 +5312,7 @@ mod tests {
     //     the checker table. The checker special-cases the zero-argument form
     //     and used to return before recording anything, so lowering could not
     //     type the call and reported a gap -- which dropped the WHOLE function
-    //     from the HIR, and with it from the LIR (willow-0g8j.2.14).
+    //     from the HIR, and with it from the LIR.
     #[test]
     fn p82_zero_arg_result_ok_types_via_checker_tables() {
         let src = "fn f() -> Result<void, String> { return Result::Ok(); }";
@@ -5381,7 +5381,7 @@ mod tests {
         assert!(!diags.is_empty(), "unresolved construction must report");
     }
 
-    // willow-ejg5: the unit-local class table records a module-qualified base
+    // the unit-local class table records a module-qualified base
     // by its full path, and `Classes::resolve` stops at a repeated class.
 
     /// `(class, base, fields)` rows for a hand-built class table.
@@ -5408,7 +5408,7 @@ mod tests {
     // A qualified base is keyed as `shapes::Sized`, not `Sized`, so a
     // same-named local class does not become its own base.
     #[test]
-    fn ejg5_qualified_base_keeps_its_module_in_the_class_table() {
+    fn class_table_qualified_base_keeps_its_module_in_the_class_table() {
         let tokens = Lexer::new(
             "class Sized extends shapes::Sized { depth: i64; }\n\
              class Block extends Sized { tag: i64; }",
@@ -5434,7 +5434,7 @@ mod tests {
     // A base outside the table ends the walk with `None` (the checker tables
     // take over), instead of looping.
     #[test]
-    fn ejg5_resolve_stops_at_a_base_missing_from_the_table() {
+    fn class_table_resolve_stops_at_a_base_missing_from_the_table() {
         let classes = table(&[
             ("Sized", Some("shapes::Sized"), &[("depth", Type::I64)]),
             ("Block", Some("Sized"), &[]),
@@ -5448,7 +5448,7 @@ mod tests {
     // The shape the bug produced: a class that is its own base. The walk
     // must return, not spin.
     #[test]
-    fn ejg5_resolve_terminates_on_a_self_ring() {
+    fn class_table_resolve_terminates_on_a_self_ring() {
         let classes = table(&[("Sized", Some("Sized"), &[("depth", Type::I64)])]);
         assert_eq!(classes.field_type("Sized", "depth"), Some(Type::I64));
         assert_eq!(classes.field_type("Sized", "width"), None);
@@ -5458,7 +5458,7 @@ mod tests {
     // A two-class ring terminates too, and a member found on the ring is
     // still returned.
     #[test]
-    fn ejg5_resolve_terminates_on_a_two_class_ring() {
+    fn class_table_resolve_terminates_on_a_two_class_ring() {
         let classes = table(&[
             ("A", Some("B"), &[("a", Type::I64)]),
             ("B", Some("A"), &[("b", Type::Bool)]),

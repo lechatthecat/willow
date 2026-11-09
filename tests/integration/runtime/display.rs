@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Explicit toString() + String-only concatenation (willow-fvfc) ────────────
+// ── Explicit toString() + String-only concatenation ────────────
 
 #[test]
 fn tostring_01_primitives_and_class() {

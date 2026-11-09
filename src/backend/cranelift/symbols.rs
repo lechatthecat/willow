@@ -3,7 +3,7 @@
 //! qualify module-local types/classes; constructor->method desugaring lives here
 //! too as a naming/shape transform.
 //!
-//! # The mangling scheme (willow-uqzx, catalog item 8 phase 2)
+//! # The mangling scheme (shared compiler infrastructure, catalog item 8 phase 2)
 //!
 //! Every backend symbol is built here and nowhere else. The scheme is
 //! **injective**: two different declarations can never produce one symbol.
@@ -77,8 +77,8 @@ fn with_role(base: &str, role: &str) -> String {
 /// The symbol path for a `::`-qualified module path (`a::b` -> `a.b`).
 pub(crate) fn module_symbol_prefix(module_path: &str) -> String {
     // Standalone module identity is internal; preserve its public linker
-    // spelling. A foreign default's respelled receiver names its own class
-    // (willow-nvi6).
+    // spelling. A foreign default's respelled receiver names its own class.
+    //
     let name = QualifiedName::new(module_path);
     let module_path = (name.strip_qualifier(crate::semantic::ids::LOCAL_NAMESPACE))
         .or_else(|| name.strip_qualifier(crate::semantic::ids::FOREIGN_RECEIVER_NAMESPACE))
@@ -147,7 +147,7 @@ pub(crate) fn vtable_symbol(class_name: &str, iface_name: &str) -> String {
 
 /// `{class}.{method}$virtual_thunk` — the stub a vtable slot holds for an
 /// `open`/`override` method, dispatching through the receiver's class
-/// descriptor instead of naming one body (willow-tygf).
+/// descriptor instead of naming one body.
 ///
 /// The method symbol plus a role, so it cannot collide with the method body it
 /// forwards to: a role separator cannot appear in a source name.
@@ -159,7 +159,7 @@ pub(crate) fn vtable_thunk_symbol(class_name: &str, method_name: &str) -> String
 }
 
 /// The descriptor data symbol for `class_name` — word 0 of every object of that
-/// class (willow-fm7t). Offset 0 holds the class's `type_id`; the virtual
+/// class. Offset 0 holds the class's `type_id`; the virtual
 /// method slots follow.
 pub(crate) fn class_descriptor_symbol(class_name: &str) -> String {
     with_role(&backend_symbol_component(class_name), "descriptor")
@@ -191,7 +191,7 @@ pub(crate) fn lambda_symbol(index: usize) -> String {
 }
 
 /// `{module_prefix}.$lambda.{n}` — the lifted function for a lambda in an
-/// imported module's body (willow-9yhi).
+/// imported module's body.
 ///
 /// The module prefix is what keeps two modules apart: `collect_lambdas_in_program`
 /// numbers from zero for every unit it is handed, so a bare `$lambda.0` would
@@ -201,7 +201,7 @@ pub(crate) fn module_lambda_symbol(module_prefix: &str, index: usize) -> String 
     module_item_symbol(module_prefix, &lambda_symbol(index))
 }
 
-/// Synthesize the `init` method that a constructor lowers to (willow-scq2): a
+/// Synthesize the `init` method that a constructor lowers to: a
 /// non-static instance method with a hidden `self` receiver and void return.
 pub(crate) fn constructor_to_method(ctor: &ConstructorDecl) -> MethodDecl {
     MethodDecl {
@@ -253,7 +253,7 @@ pub(crate) fn class_method_symbol_name(
 /// bare name with the module's own spelling renamed a type the module obtained
 /// through its OWN item import (`import proto::Grade;`) into `lib::Grade` -- a
 /// type nothing declares -- so the field's enum lookup missed and the class fell
-/// out of the walker's subset (willow-sxcp).
+/// out of the walker's subset.
 pub(crate) fn qualify_module_class_decl(
     class: &ClassDecl,
     module_name: &str,
@@ -307,8 +307,8 @@ pub(crate) fn qualify_module_class_decl(
 /// `module::Type`, including a GENERIC head name (`Box<i64>` ->
 /// `module::Box<i64>`), while leaving builtin generics (Array/Map/Result/...)
 /// untouched. Used to qualify a module function's signature so the importing
-/// file boxes interface arguments against the right (class, interface) vtable
-/// (willow-1js.5).
+/// file boxes interface arguments against the right (class, interface) vtable.
+///
 pub(crate) fn qualify_module_local_type(
     ty: &Type,
     module_name: &str,
@@ -331,7 +331,7 @@ pub(crate) fn qualify_module_local_type(
 
 /// Clone a module function declaration with its SIGNATURE (parameter and return
 /// types) qualified to module-local names. The body is left untouched (it is
-/// compiled under the module's local-name aliases) (willow-1js.5).
+/// compiled under the module's local-name aliases).
 pub(crate) fn qualify_module_fn_signature(
     f: &FunctionDecl,
     module_name: &str,
@@ -364,7 +364,7 @@ pub(crate) fn user_function_symbol(name: &str) -> String {
 
 #[cfg(test)]
 mod mangling_tests {
-    //! Perspectives 33-50 for the injective mangling scheme (willow-uqzx,
+    //! Perspectives 33-50 for the injective mangling scheme (shared compiler infrastructure,
     //! catalog item 8 phase 2).
     //!
     //! Phase 1 could only *report* symbol collisions, because
@@ -662,7 +662,7 @@ mod mangling_tests {
     }
 
     /// Perspective 51: a vtable thunk is the method's own symbol plus a role,
-    /// so it can never land on the body it forwards to (willow-tygf).
+    /// so it can never land on the body it forwards to.
     #[test]
     fn unit_mangle_51_vtable_thunk_is_distinct_from_its_method() {
         let known = ModuleSymbols::default();

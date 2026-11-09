@@ -122,8 +122,8 @@ pub(crate) fn collect_string_literals_in_program(program: &Program) -> Vec<Strin
                 for ctor in &c.constructors {
                     collect_string_literals_in_block(&ctor.body, &mut out);
                 }
-                // Static-property initializers are emitted in __willow_static_init
-                // (willow-qsqf), so their string literals must be declared too.
+                // Static-property initializers are emitted in __willow_static_init, so their
+                // string literals must be declared too.
                 for field in &c.fields {
                     if let Some(init) = &field.initializer {
                         collect_string_literals_in_expr(init, &mut out);

@@ -90,7 +90,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let source_ty = Self::flat_operand_type(function, value);
         // A frame-backed local is only an interior edge of the rooted frame.
         // Inline pairs, whose storage word allocates a box, returned above.
-        // Neither the coercion (an inline interface pair, willow-9tls.12) nor
+        // Neither the coercion (an inline interface pair, inline interface pairs) nor
         // a non-pair storage word reaches a GC point, so `array` stays valid.
         let index = self.emit_lir_operand(function, index);
         let value = self.emit_lir_operand(function, value);
@@ -100,8 +100,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().iconst(types::I64, 0)
     }
 
-    /// Inline bounds-checked store of a non-scalar element word
-    /// (willow-8hq4.15). Like `willow_array_set`, the buffer's `H_IS_REF`
+    /// Inline bounds-checked store of a non-scalar element word. Like `willow_array_set`, the
+    /// buffer's `H_IS_REF`
     /// word selects the barrier, which the shared header-flag filter of
     /// `emit_filtered_reference_store` skips when it is a no-op. Invalid
     /// accesses take the panicking runtime store.
@@ -200,7 +200,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// them, so it never rejoins the fast path. The fast path therefore
     /// dominates the code after the access, and a read or scalar store
     /// records the header it validated for the rest of the current GC-free
-    /// run (willow-nzsg, willow-ijui.10). The slow path takes its operands as
+    /// run. The slow path takes its operands as
     /// block parameters and spills them to a frame slot the function's fault
     /// paths share; it reloads them only after the panic-depth snapshot call.
     /// Operands live across that call would otherwise make the register
@@ -213,7 +213,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> Value {
         use willow_abi::array_layout as layout;
         // A scalar store leaves the header alone, so reads and stores share
-        // the facts of the current GC-free run (willow-ijui.10).
+        // the facts of the current GC-free run.
         let known = self
             .reuse
             .lir_reuse
@@ -500,9 +500,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let (offset, target_ty) = layout.field(field).expect("checked field");
         let object = self.emit_lir_operand(function, object);
         let source_ty = Self::flat_operand_type(function, value);
-        // Neither the coercion (an inline interface pair, willow-9tls.12) nor
+        // Neither the coercion (an inline interface pair, inline interface pairs) nor
         // the store and its barrier reach a safepoint, so `object` stays
-        // valid without a root (willow-8hq4.16).
+        // valid without a root.
         let value = self.emit_lir_operand(function, value);
         let value = self.coerce_to_target(value, &source_ty, target_ty);
         self.emit_gc_heap_store(
@@ -575,7 +575,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let ptr = self.emit_lir_operand(function, object);
         // Only the `init` call below consumes `ptr`. Operand evaluation and
         // coercions in between reach no GC point: `coerce_to_target` builds
-        // inline interface pairs without allocating (willow-9tls.12).
+        // inline interface pairs without allocating.
         self.emit_push_call_root(ptr);
         let mangled = class_method_symbol_name(self.known_modules, &class.to_string(), "init");
         let init_fid = self

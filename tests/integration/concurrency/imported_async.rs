@@ -1,7 +1,7 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Cross-module async fn call types as `Task<T>` at the call site (willow-887c).
+// Cross-module async fn call types as `Task<T>` at the call site.
 // A module-qualified call to an async fn must yield a task so `await`
 // type-checks, exactly like a local async call.
 // ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ async fn main() {
 
 // ---------------------------------------------------------------------------
 // Awaiting a NON-leaf (item-imported) async fn from a cooperative poll fn must
-// suspend cooperatively, not block-drive the scheduler (willow-0a6k.6). Output
+// suspend cooperatively, not block-drive the scheduler. Output
 // correctness here also guards the frame-slot reload on resume: without a
 // reserved callee-frame slot the resume path would re-run the call.
 // ---------------------------------------------------------------------------

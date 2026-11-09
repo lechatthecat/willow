@@ -480,7 +480,7 @@ fn collect_debug_reference_calls(
 }
 
 /// Records every `await` in a function body, in source order, on the shared
-/// structural walk (willow-uqzx.1.1).
+/// structural walk.
 ///
 /// Two skips are carried over from the hand-written traversal this replaced:
 /// a `defer` body belongs to the deferred callable, and a `select` case's
@@ -835,7 +835,7 @@ mod tests {
             .collect()
     }
 
-    // --- Shared structural AST walk (willow-uqzx.1.1) ---
+    // --- Shared structural AST walk ---
     //
     // Await points and by-reference call sites are collected on the shared
     // walk in `parser::visit`. A slot the walk misses drops a suspension point

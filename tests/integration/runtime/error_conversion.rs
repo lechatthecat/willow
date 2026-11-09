@@ -1,6 +1,6 @@
 use super::*;
 
-// ── `?` automatic error conversion via Into<E> (willow-1ow) ─────────────────
+// ── `?` automatic error conversion via Into<E> ─────────────────
 
 #[test]
 fn try_convert_01_err_path_converts() {

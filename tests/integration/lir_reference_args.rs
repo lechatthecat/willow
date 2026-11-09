@@ -1,4 +1,4 @@
-//! `&place` arguments compiled from Lowered IR (willow-0g8j.2.17).
+//! `&place` arguments compiled from Lowered IR.
 //!
 //! The walker could already lower a reference argument — it just refused to in
 //! debug builds, because a debug build also emits the reference-call hook that
@@ -22,14 +22,14 @@
 //! now stack-backed from their declaration. Perspectives 16, 17, 22, 24, 26, 27
 //! and 28 are that fix.
 //!
-//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! Since the lowered-IR cutover a body outside the walker's subset is a compile error,
 //! so a run that prints the right answer is proof the walker produced it.
 //!
 //! An indirect call had the same half-record for longer still: interface
 //! dispatch wrote the reference-call context and never cleared it, on BOTH
 //! emitters, so a panic anywhere later in the same function was reported under
 //! a place the callee had already given back. Perspectives 30, 31 and 32 are
-//! that fix (willow-0g8j.11).
+//! that fix.
 //!
 //! 34 perspectives:
 //!   1 `&mut i64` writes back            17 a reference call in one arm
@@ -697,7 +697,7 @@ fn reference_args_30_a_panic_under_interface_dispatch_reports_the_reference() {
     );
 }
 
-// 31. The half of perspective 30 that nothing used to do (willow-0g8j.11):
+// 31. The half of perspective 30 that nothing used to do:
 //     interface dispatch recorded the reference call and never cleared it, so a
 //     later, unrelated panic in the SAME function was reported as if it had
 //     happened inside the callee, under a place the callee had already given

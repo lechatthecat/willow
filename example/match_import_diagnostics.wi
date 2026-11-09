@@ -1,4 +1,4 @@
-// Supported spellings corresponding to willow-jz15.69 diagnostics.
+// Supported spellings corresponding to diagnostic recovery diagnostics.
 import std::collections::{Map, FrozenArray, FrozenMap};
 
 fn show(values: FrozenArray<i64>, snapshot: FrozenMap<String, i64>) {

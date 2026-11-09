@@ -1,4 +1,4 @@
-//! Deterministic allocation evidence for willow-9tls.42.1.
+//! Deterministic allocation evidence for syntax ownership.
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use willow_compiler::diagnostics::Span;

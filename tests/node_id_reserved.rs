@@ -1,4 +1,4 @@
-//! willow-9tls.1: the very first syntax identity a process allocates must not
+//! the very first syntax identity a process allocates must not
 //! be `ExprId::placeholder()`.
 //!
 //! This lives in its own test binary on purpose: the range allocator behind

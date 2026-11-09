@@ -184,7 +184,7 @@ pub(super) fn record_satb_locked(state: &mut GcState, old: *mut u8) {
 }
 
 /// Publish a concurrent-mark deletion (`old`) and new edge (`value`) into the
-/// cached cycle's shard buffers without the heap lock (willow-jz15.53).
+/// cached cycle's shard buffers without the heap lock.
 /// Returns false when the caller must use the heap-locked path instead: no
 /// concurrent phase, a stale cache, or shards sealed by closure/remark. The
 /// validity checks run under the shard lock, and so does every queue
@@ -450,7 +450,7 @@ fn write_barrier(
 /// is the payload start of a GC object. While marking is inactive, only a
 /// non-null young value stored into an old, unremembered owner needs the
 /// locked barrier; skipping the rest keeps runtime container stores off the
-/// heap lock (willow-jz15.51). Like the generated filter, the phase load and
+/// heap lock. Like the generated filter, the phase load and
 /// the caller's store contain no safepoint, and a stale unremembered byte
 /// only takes the conservative locked path.
 pub(crate) fn write_barrier_object_owner(

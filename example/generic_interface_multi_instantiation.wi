@@ -1,4 +1,4 @@
-// Multiple instantiations of one generic interface (willow-1js.6).
+// Multiple instantiations of one generic interface.
 //
 // A class may implement several instantiations of the same generic interface
 // (`Capability<Read>`, `Capability<Write>`) WHEN one method body can satisfy

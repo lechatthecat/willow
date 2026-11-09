@@ -187,7 +187,7 @@ fn channel_unit_14_abi_recv_closed_empty_raises_and_returns_neutral_word() {
     crate::panic_context::replace_current_context(previous);
 }
 
-// willow-jz15.44: `recv_opt` drains buffered values after close, then
+// `recv_opt` drains buffered values after close, then
 // answers `None` without raising.
 #[test]
 fn channel_unit_15_abi_recv_opt_drains_then_reports_closed() {
@@ -231,7 +231,7 @@ fn channel_unit_16_abi_recv_opt_bool_payload_is_a_full_word() {
     assert_eq!(willow_channel_recv_bool(ch), 1);
 }
 
-// willow-vynv.1: send wakes EVERY parked waiter (a cancelled head waiter
+// send wakes EVERY parked waiter (a cancelled head waiter
 // must not swallow the single wake and starve live consumers).
 #[test]
 fn send_reserves_one_value_and_wakes_one_receiver() {
@@ -268,7 +268,7 @@ fn send_reserves_one_value_and_wakes_one_receiver() {
     );
 }
 
-// willow-p4er: channels are GC-managed — unreachable ones are reclaimed,
+// channels are GC-managed — unreachable ones are reclaimed,
 // rooted ones survive collection with their queued values intact.
 #[test]
 fn unreachable_channels_are_reclaimed() {
@@ -496,7 +496,7 @@ fn rooted_channel_survives_collection_with_values() {
 fn cancelled_task_is_purged_from_all_waiter_queues() {
     let _guard = crate::gc::runtime_test_guard();
     crate::scheduler::reset_global_scheduler_for_test();
-    // Purge now walks the task-side REVERSE references (willow-p4er), so
+    // Purge now walks the task-side REVERSE references, so
     // the fixture must register the way recv_ready does: waiter queue
     // entry + record_channel_wait on the task. Task 7 must exist.
     let (t7, t9) = crate::scheduler::with_global_for_test(|sched| {
@@ -587,7 +587,7 @@ fn normal_waiter_removal_clears_task_reverse_references() {
     crate::gc::willow_gc_collect();
 }
 
-// ── Bounded channels (willow-o038) ───────────────────────────────────────
+// ── Bounded channels ───────────────────────────────────────
 
 fn capacity_of(raw: *mut c_void) -> Option<usize> {
     unsafe { channel_from_raw(raw) }
@@ -820,7 +820,7 @@ fn bounded_unit_10_cancelled_handoff_wakes_the_next_producer() {
     // The drive below must reap `first` and nothing else. Cancelling `first`
     // compensates the handoff and leaves `second` READY, and a worker pool
     // would race to claim and complete that placeholder before the run loop
-    // notices its target is done (willow-tcrg).
+    // notices its target is done.
     let _single_worker = crate::scheduler::single_worker_for_test();
     crate::gc::reset_internal_for_test();
     crate::scheduler::reset_global_scheduler_for_test();
@@ -1005,12 +1005,12 @@ fn bounded_unit_16_stale_head_does_not_swallow_the_single_wake() {
     );
 }
 
-// ── O(1) waiter membership (willow-ezs.1.2) ──────────────────────────────
+// ── O(1) waiter membership ──────────────────────────────
 //
 // Registration used `VecDeque::contains`, so parking 10,000 tasks on ONE
 // channel cost O(n^2) and every select loser's unregister was another O(n)
 // scan. `WaiterQueue` keeps a membership set beside the FIFO order.
-// Perspectives 1-15 of willow-ezs.1.2 (16-28 cover the scheduler's
+// Perspectives 1-15 of wait-queue scaling (16-28 cover the scheduler's
 // blocked-syscall counter, in `scheduler.rs`):
 //
 //  1. a first registration is accepted, a duplicate is rejected

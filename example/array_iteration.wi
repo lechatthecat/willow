@@ -1,4 +1,4 @@
-// Array for-loop iteration semantics (willow-pcoy): the loop re-reads the
+// Array for-loop iteration semantics: the loop re-reads the
 // array's length and buffer every iteration, so mutating the array from the
 // body is observed immediately — pushes extend the walk, pops shrink it, and
 // buffer reallocation on growth is transparent (the handle is stable).

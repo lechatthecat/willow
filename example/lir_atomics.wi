@@ -1,5 +1,5 @@
-// lir_atomics.wi — AtomicI64 / AtomicBool compiled from Lowered IR
-// (willow-0g8j.2.13).
+// lir_atomics.wi — AtomicI64 / AtomicBool compiled from Lowered IR.
+//
 //
 // Every function declared here is compiled by the LIR walker, in a synchronous
 // function and inside a poll function alike. `example/atomics.wi` introduces

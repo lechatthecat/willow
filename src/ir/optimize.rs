@@ -3,7 +3,7 @@
 //! Only pure scalar subtrees are replaced. Faulting arithmetic stays in the IR
 //! so runtime panic/recovery behavior and source locations remain intact. An
 //! overflowing `+ - * **` or negation is such a fault in debug builds and
-//! wraps in release builds (willow-jz15.14); folding is build-mode
+//! wraps in release builds; folding is build-mode
 //! independent, so it leaves both for the backend.
 mod recursive_inline;
 mod string_concat;
@@ -258,8 +258,8 @@ pub(crate) fn eliminate_dead_values(
         .iter()
         .map(|local| (local.name.as_str(), local.id))
         .collect();
-    // Debug builds check integer `+ - * **` and negation for overflow
-    // (willow-jz15.14), so a dead one still reports its fault. Release keeps a
+    // Debug builds check integer `+ - * **` and negation for overflow, so a dead one still
+    // reports its fault. Release keeps a
     // dead wrapping op only until Cranelift's own dead-code elimination.
     let pure = |value: &LirRvalue| match value {
         _ if value.has_overflow_check() => false,
@@ -699,7 +699,7 @@ pub(crate) fn unroll_scalar_loops(function: &mut super::lowered::SourceFunction)
 /// faults, loops, references, or cleanup can cross this transformation.
 /// Keeping the expansion budget small also bounds work between safepoints.
 /// With `overflow_checks` (debug builds), checked integer arithmetic is such a
-/// fault: its call stack must name the callee (willow-jz15.14).
+/// fault: its call stack must name the callee.
 pub(crate) fn inline_scalar_leaves(
     functions: &mut [super::lowered::SourceFunction],
     overflow_checks: bool,
@@ -1170,7 +1170,7 @@ fn mid(a: i64, x: f64) -> f64 { println(d(a, a)); return f(x, x); }
     #[test]
     fn tail_recursion_removes_only_safe_tail_calls() {
         use super::super::lowered::LirRvalue;
-        // Release: debug overflow checks keep `fib` out of line (willow-jz15.14).
+        // Release: debug overflow checks keep `fib` out of line.
         let program = lowered_with(
             r#"
 fn sum(n: i64, acc: i64) -> i64 { if n == 0 { return acc; } return sum(n - 1, acc + n); }
@@ -1202,8 +1202,8 @@ fn managed(n: i64, s: String) -> String { if n == 0 { return s; } return managed
     #[test]
     fn recursive_inlining_is_bounded_and_excludes_effects_faults_and_large_bodies() {
         use super::super::lowered::LirRvalue;
-        // Release: debug overflow checks make `small` a faulting body
-        // (willow-jz15.14), covered by `debug_overflow_checks_keep_faulting_leaves_out_of_line`.
+        // Release: debug overflow checks make `small` a faulting body, covered by
+        // `debug_overflow_checks_keep_faulting_leaves_out_of_line`.
         let program = lowered_with(
             r#"
 fn small(n: i64) -> i64 { if n < 2 { return n; } return small(n-1) + small(n-2); }
@@ -1495,7 +1495,7 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
     fn inlines_small_scalar_leaves_but_preserves_faulting_calls() {
         use super::super::lowered::LirRvalue;
         let source = "fn twice(x: i64) -> i64 { return x * 2; } fn divide(x: i64, y: i64) -> i64 { return x / y; } fn f(x: i64, y: i64) -> i64 { return twice(x) + divide(x, y); }";
-        // Debug overflow checks make `twice` faulting too (willow-jz15.14).
+        // Debug overflow checks make `twice` faulting too.
         for (overflow_checks, expected) in [(false, &["divide"][..]), (true, &["twice", "divide"])]
         {
             let program = lowered_with(source, overflow_checks);
@@ -1528,7 +1528,7 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
     fn dce_removes_dead_scalar_dependency_chains() {
         // DCE runs per function before the build mode is known, so a checked
         // `i64` chain stays in both modes: debug must still report its
-        // overflow (willow-jz15.14) and release leaves the dead wrapping op to
+        // overflow and release leaves the dead wrapping op to
         // Cranelift's own dead-code elimination.
         for (source, kept) in [
             (
@@ -1661,7 +1661,7 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
     #[test]
     fn preserves_arithmetic_faults_and_overflow_and_folds_successful_operations() {
         // Overflow is left to the backend, which checks or wraps per build
-        // mode (willow-jz15.14).
+        // mode.
         for (op, a, b) in [
             (BinOp::Add, i64::MAX, 1),
             (BinOp::Sub, i64::MIN, 1),

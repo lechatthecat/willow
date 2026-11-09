@@ -1,4 +1,4 @@
-// Function values inside a critical section (willow-h4t7).
+// Function values inside a critical section.
 //
 // A call through a `fn` or closure value has no static target, so the compiler
 // rejects a lock-held indirect call (E2604) when any function value with the

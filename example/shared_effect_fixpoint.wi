@@ -1,5 +1,5 @@
-// shared_effect_fixpoint.wi — one effect lattice, one fixpoint
-// (willow-uqzx.1.3).
+// shared_effect_fixpoint.wi — one effect lattice, one fixpoint.
+//
 //
 // Three analyses ask the call graph the same shape of question:
 //

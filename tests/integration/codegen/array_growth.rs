@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Array dynamic growth: push/pop (willow-5a4) ────────────────────────────
+// ── Array dynamic growth: push/pop ────────────────────────────
 
 // push grows an empty array; len and indexing reflect the appended elements.
 #[test]
@@ -195,7 +195,7 @@ fn main() {
     );
 }
 
-// ── Arrays are GC roots (regression for is_gc_managed(Array), willow-a7j-adjacent) ──
+// ── Arrays are GC roots (regression for is_gc_managed(Array), array GC roots-adjacent) ──
 
 // An array local must survive gc_collect AND subsequent allocations that would
 // reuse its freed memory if it were not rooted. (The plain survive-gc tests can

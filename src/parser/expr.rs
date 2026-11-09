@@ -268,7 +268,7 @@ impl Parser {
     /// `|`, `^`, `&`, `<<` and `>>`, all left-associative. They bind tighter
     /// than comparisons and looser than arithmetic, from loosest to tightest
     /// `|`, `^`, `&`, then the shifts (Rust's order), so `x & mask == 0` is
-    /// `(x & mask) == 0` and `1 << n - 1` is `1 << (n - 1)` (willow-jz15.8).
+    /// `(x & mask) == 0` and `1 << n - 1` is `1 << (n - 1)`.
     ///
     /// One operator-precedence loop covers all four levels: a function per
     /// level would add three continuations to every expression parse.
@@ -1234,8 +1234,8 @@ impl Parser {
         }))
     }
 
-    /// Build the task-completion case behind `await <expr>` inside a `select`
-    /// (willow-qrj9). Keep the expression intact: cancellation-awareness is a
+    /// Build the task-completion case behind `await <expr>` inside a `select`. Keep the
+    /// expression intact: cancellation-awareness is a
     /// property of its checked type, not of whether the parser happens to see
     /// an inline method named `result`.
     fn select_await_case(binding: String, awaited: Expr) -> SelectCaseKind {
@@ -1269,7 +1269,7 @@ impl Parser {
     }
 
     /// The two removed Task-waiting shapes, reported with their own migration
-    /// text (willow-qrj9).
+    /// text.
     fn select_removed_wait_error(&self, expr: &Expr) -> Option<Diagnostic> {
         let Expr::MethodCall(m) = expr else {
             return None;
@@ -1368,7 +1368,7 @@ impl Parser {
             let pattern = self.parse_pattern()?;
             let scope = self.default_import_usage.scope();
             self.default_import_usage.bind_pattern(&pattern);
-            // `pattern if guard => body` (willow-jz15.6).
+            // `pattern if guard => body`.
             let guard = if self.eat(TokenKind::If) {
                 Some(self.parse_expr()?)
             } else {
@@ -1383,7 +1383,7 @@ impl Parser {
             } else if matches!(self.peek_kind(), TokenKind::Return) {
                 // `Pattern => return [expr]` — sugar for a single-statement
                 // block arm, so match works in statement position with early
-                // returns (willow-zvkv). No trailing `;` inside an arm.
+                // returns. No trailing `;` inside an arm.
                 let ret_span = self.current_span();
                 self.advance(); // consume `return`
                 let value = if matches!(self.peek_kind(), TokenKind::Comma | TokenKind::RBrace) {

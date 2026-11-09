@@ -1,5 +1,5 @@
-// frozen_map_gc.wi — `freeze()` and a collection that moves the values
-// (willow-9tls.8).
+// frozen_map_gc.wi — `freeze()` and a collection that moves the values.
+//
 //
 // A `Map<K, V>` whose values are GC objects keeps them alive through its own
 // trace hook. Class instances made by compiled code start in the nursery, and

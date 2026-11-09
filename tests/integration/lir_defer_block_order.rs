@@ -1,4 +1,4 @@
-//! LIR block emission order for synchronous `defer` scopes (willow-fvt4).
+//! LIR block emission order for synchronous `defer` scopes.
 //!
 //! The synchronous emitter does not rebuild a `defer` scope at every exit the
 //! way the cooperative path does. It keeps the open scopes on the Rust side and
@@ -23,7 +23,7 @@
 //! are all created before the walk and nothing is sealed inside it, so the order
 //! is free.
 //!
-//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! Since the lowered-IR cutover a body outside the walker's subset is a compile error,
 //! so a run that prints the right answer is proof the walker produced it. Each
 //! program also runs under `WILLOW_GC_STRESS=alloc`, because reordering
 //! emission also reorders the GC root bookkeeping.

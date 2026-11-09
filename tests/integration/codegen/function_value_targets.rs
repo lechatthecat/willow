@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Which functions are function values (willow-yf49) ───────────────────────
+// ── Which functions are function values ───────────────────────
 //
 // A named function used as a value compiles to the address of its symbol. An
 // item-imported function has one too, under the name its import binds; an

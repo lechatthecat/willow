@@ -4,10 +4,10 @@
 //! point, and each ended in an abort rather than a diagnostic:
 //!
 //! * a `match` arm body now becomes explicit LIR CFG, so its lock acquisition
-//!   owns a frame-backed resume edge (willow-0g8j.3);
+//!   owns a frame-backed resume edge;
 //! * a lambda body -- the type checker inherited the enclosing `async fn`'s
 //!   context across a boundary the backend treats as a separate lifted
-//!   function, so E2603 and E0801 both waved the body through (willow-3kty).
+//!   function, so E2603 and E0801 both waved the body through.
 //!
 //! The unit tests in `src/semantic/type_checker/mod.rs` cover which diagnostic
 //! each shape gets. These run the real `willow` binary, because the property

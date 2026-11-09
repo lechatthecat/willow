@@ -1,4 +1,4 @@
-//! willow-jz15.103: bare uppercase class members are property reads.
+//! bare uppercase class members are property reads.
 //! Perspectives: (1) scalar, (2) frozen array index, (3) for head, (4) if head,
 //! (5) while head, (6) match head, (7) Self, (8) initializer dependency,
 //! (9) mutable store/read, (10) String root, (11) module path, (12) module alias,

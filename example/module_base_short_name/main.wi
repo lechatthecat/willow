@@ -1,5 +1,5 @@
-// module_base_short_name -- a module-qualified base keeps its module
-// (willow-ejg5).
+// module_base_short_name -- a module-qualified base keeps its module.
+//
 //
 // `class Sized extends shapes::Sized` names two different classes: the local
 // `Sized` being declared and the module's `shapes::Sized` it extends. Lowering

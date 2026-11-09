@@ -1,5 +1,5 @@
-// lir_scope_roots.wi — a lexical scope's GC roots end where the scope does
-// (willow-0g8j.3.3).
+// lir_scope_roots.wi — a lexical scope's GC roots end where the scope does.
+//
 //
 // The LIR back end gives every GC-managed local ONE stack slot, allocated and
 // rooted once at function entry: the lowered IR is a flat basic-block graph, so

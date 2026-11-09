@@ -1,4 +1,4 @@
-//! Idle-stop and drive-completion viewpoints for the worker pool (willow-6wd6).
+//! Idle-stop and drive-completion viewpoints for the worker pool.
 //!
 //! A parallel drive ends when worker 0 decides the run is globally idle and
 //! publishes `ParallelRunState::stop`. That decision is a snapshot of several
@@ -34,7 +34,7 @@
 //! 20. a three-deep await chain resolves end to end in one `run_until`
 //! 21. a nested drive keeps its paused outer poll visible to the snapshot
 //!
-//! Gate-free claims (willow-8hq4.19): a claim takes `claim_gate` only while a
+//! Gate-free claims: a claim takes `claim_gate` only while a
 //! stop decision has raised `stop_intent`.
 //!
 //! 22. a quiescent decision publishes the stop and lowers the intent
@@ -391,7 +391,7 @@ fn idle_13_the_declared_read_order_is_the_one_the_argument_needs() {
             .unwrap_or_else(|| panic!("{source:?} must be one of the checked work sources"))
     };
     // A poll publishes its requeue BEFORE it leaves `active_polls`, so the
-    // poll counters must be read before the queue (willow-8hq4.19).
+    // poll counters must be read before the queue.
     assert!(
         position(WorkSource::Poll) < position(WorkSource::RunQueue),
         "the poll counters must be read before the run queue: {IDLE_READ_ORDER:?}"
@@ -399,7 +399,7 @@ fn idle_13_the_declared_read_order_is_the_one_the_argument_needs() {
     // A claim publishes its in-flight marker BEFORE it pops, so an empty-queue
     // observation that missed the popped task is always followed by a marker
     // observation that sees the claim. Reading the marker first leaves a window
-    // in which the claim is invisible to both reads (willow-6wd6).
+    // in which the claim is invisible to both reads.
     assert!(
         position(WorkSource::RunQueue) < position(WorkSource::Claim),
         "the run queue must be read before the claim marker: {IDLE_READ_ORDER:?}"

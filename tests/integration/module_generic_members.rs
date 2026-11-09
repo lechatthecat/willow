@@ -1,4 +1,4 @@
-//! Cross-module specialization-origin regression coverage (willow-jz15.63).
+//! Cross-module specialization-origin regression coverage.
 use super::support::TestProject;
 
 const BOXES: &str = r#"

@@ -1,7 +1,7 @@
 module depot;
 
 // A module whose exported signature is written in names it obtained through its
-// OWN item imports (willow-sxcp).
+// OWN item imports.
 //
 // Every `Parcel`, `Weighed` and `Grade` below used to be exported as
 // `depot::Parcel`, `depot::Weighed` and `depot::Grade` -- types nothing

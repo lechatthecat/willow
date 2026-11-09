@@ -1,4 +1,4 @@
-//! E2604 through function values (willow-h4t7): a call through a `fn` or
+//! E2604 through function values: a call through a `fn` or
 //! `closure` value has no static target, so a lock-held indirect call is
 //! rejected when any function value with the same parameter count may wait.
 use super::*;
@@ -145,7 +145,7 @@ fn indirect_lock_08_waiting_lambda_local_call() {
 
 /// Perspective 9: calling a lambda that calls an async function only creates
 /// a Task, so it never waits in the critical section. (An async function
-/// itself is not a function value: E1012, willow-yf49.)
+/// itself is not a function value: E1012, lock method validation.)
 #[test]
 fn indirect_lock_09_async_call_lambda_accepted() {
     accepted(

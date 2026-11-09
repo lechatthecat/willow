@@ -1,4 +1,4 @@
-// Statement-position `match` with `return` and block arms (willow-zvkv).
+// Statement-position `match` with `return` and block arms.
 
 pub enum Result {
     Ok(i64),

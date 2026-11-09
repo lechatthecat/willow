@@ -396,7 +396,7 @@ impl<'a> Lexer<'a> {
         Err(self.err_unterminated_string_at(start, line, col))
     }
 
-    /// Lexes a numeric literal. Rules (willow-jz15.55):
+    /// Lexes a numeric literal. Rules:
     ///
     /// - `0x` (hex), `0o` (octal) and `0b` (binary) prefixes introduce an
     ///   integer literal; hex digits may be either case, the prefix must be
@@ -408,7 +408,7 @@ impl<'a> Lexer<'a> {
     /// - An integer literal must fit `i64` whatever its radix, so
     ///   `0xFFFF_FFFF_FFFF_FFFF` is out of range rather than `-1` (as in Rust).
     /// - A decimal literal with a fraction or an exponent (`1e3`, `2.5E-4`) is
-    ///   an `f64` (willow-jz15.121). Its value is the runtime `f64::parse` of
+    ///   an `f64`. Its value is the runtime `f64::parse` of
     ///   the text without separators; a value that rounds to infinity is E0055.
     fn lex_number(&mut self) -> Result<TokenKind, Diagnostic> {
         let start = self.pos;
@@ -864,7 +864,7 @@ impl<'a> Lexer<'a> {
     }
 }
 
-/// Why a float literal is malformed beyond its digit runs (willow-jz15.121).
+/// Why a float literal is malformed beyond its digit runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FloatError {
     /// `1e`, `1e+`, `1e_`: an exponent marker without digits.
@@ -1127,7 +1127,7 @@ mod tests {
 
     // ── Integer literals: invalid ────────────────────────────────────────────
 
-    // Bitwise operators (willow-jz15.8): `<`/`>` stay single tokens so the
+    // Bitwise operators: `<`/`>` stay single tokens so the
     // parser can tell `>>` from two generic closers.
     #[test]
     fn bitwise_operator_tokens() {
@@ -1211,7 +1211,7 @@ mod tests {
         );
     }
 
-    // ── Exponentiation `**` tokenization (willow-n5yv.2) ─────────────────────
+    // ── Exponentiation `**` tokenization ─────────────────────
     //
     // `**` is lexed with maximal munch out of the same `*` arm that produces
     // multiplication, so the perspectives below pin both the new token and the
@@ -1433,7 +1433,7 @@ mod tests {
         );
     }
 
-    // ── Radix prefixes and digit separators (willow-jz15.55) ─────────────────
+    // ── Radix prefixes and digit separators ─────────────────
 
     fn ints(src: &str) -> Vec<i64> {
         kinds(src)
@@ -1657,7 +1657,7 @@ mod tests {
         assert_eq!(kinds("0.5").unwrap(), vec![TokenKind::Float(0.5)]);
     }
 
-    // ── Float exponents (willow-jz15.121) ───────────────────────────────────
+    // ── Float exponents ───────────────────────────────────
 
     fn floats(src: &str) -> Vec<f64> {
         kinds(src)

@@ -1,4 +1,4 @@
-//! `parallel::map` compiled from Lowered IR (willow-0g8j.2.13).
+//! `parallel::map` compiled from Lowered IR.
 //!
 //! `parallel` is a NAMESPACE, not a class: it has no layout, no methods and no
 //! symbols of its own, so `parallel::map(frozen, f)` is one direct runtime

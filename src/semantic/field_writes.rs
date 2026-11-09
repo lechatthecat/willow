@@ -1,4 +1,4 @@
-//! Instance-field reassignment summary (willow-jz15.78).
+//! Instance-field reassignment summary.
 //!
 //! Willow fields have no `readonly` spelling: every instance field can be
 //! assigned wherever it is visible. A class value shared by several tasks is
@@ -1033,7 +1033,7 @@ mod tests {
     #[test]
     fn deep_nesting_collects_on_a_small_stack() {
         // Collector and escape scan both use an explicit work stack, so the
-        // native stack does not grow with nesting depth (willow-xcrf).
+        // native stack does not grow with nesting depth.
         for depth in [64, 1024, 4096] {
             let source = format!(
                 "class A {{ pub n: i64; pub m: i64; pub init(self) {{ {open} self.m = 1; keep(self); {close} self.n = 2; }} }} \

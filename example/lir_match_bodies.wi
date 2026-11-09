@@ -1,5 +1,5 @@
 // lir_match_bodies.wi — statements inside `match` arm bodies, compiled from
-// Lowered IR (willow-0g8j.2.13).
+// Lowered IR.
 //
 // A `match` used as a STATEMENT is how Willow spells a multi-way store, and
 // until now the LIR walker only admitted arms whose body was a single

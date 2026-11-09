@@ -1,4 +1,4 @@
-// std::fs and std::net compiled from Lowered IR (willow-0g8j.2.13).
+// std::fs and std::net compiled from Lowered IR.
 //
 // The two namespaces reach the walker as plain runtime calls whose signatures
 // come from the stdlib schema, and the two socket handles are opaque words the
@@ -28,7 +28,7 @@ fn read_missing(path: String) -> Result<String, IoError> {
 }
 
 // The prelude's `IoError`, matched by its unqualified variant pattern. Before
-// willow-0g8j.2.13 this lowered as an interface downcast onto a class named
+// lowered-IR runtime call support this lowered as an interface downcast onto a class named
 // `Failed` and took the whole function back to the AST emitter.
 fn is_failure(error: IoError) -> bool {
     return match error {

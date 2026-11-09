@@ -464,7 +464,7 @@ fn sweep_chunk(
         return (0, false);
     }
     // A chunk retired after the remark stop is validated before its start
-    // bits are rebuilt from the live objects alone (willow-8hq4.21).
+    // bits are rebuilt from the live objects alone.
     let indexed = index_retired_chunk(&mut state.tlab_chunks[chunk_index]) as u64;
     stop_work.metadata_objects += indexed;
     stop_work.metadata_bytes += indexed * GC_HEADER_SIZE as u64;

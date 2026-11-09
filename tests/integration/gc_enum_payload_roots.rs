@@ -1,5 +1,5 @@
-//! Enum variant payloads must be rooted across their own allocation
-//! (willow-vz5f).
+//! Enum variant payloads must be rooted across their own allocation.
+//!
 //!
 //! Building an enum value with a payload is two allocations in sequence: the
 //! payload, then the `[tag | payload…]` GC object that will hold it. Between

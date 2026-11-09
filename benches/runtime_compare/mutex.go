@@ -1,4 +1,4 @@
-// Newly reconstructed for willow-8hq4.42; not recovered historical source.
+// Newly reconstructed for the lock-contention comparison; not recovered historical source.
 package main
 
 import (

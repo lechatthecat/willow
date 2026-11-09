@@ -51,7 +51,7 @@ impl RuntimeSymbol {
 /// COLLECTION can happen inside the call, so a GC value the caller is holding
 /// in an unrooted place does not survive it. A helper that only does
 /// `Box::into_raw` onto the native heap therefore stays `NONE` — no
-/// safepoint, nothing to root against (willow-8hk7).
+/// safepoint, nothing to root against.
 ///
 /// Over-declaring is safe and under-declaring is not: the effects are read to
 /// decide what generated code may keep across a call, so an omission is a
@@ -236,7 +236,7 @@ runtime_abi_schema! {
     NONE; willow_gc_old_region_reuses => ([] -> Some(I64));
     NONE; willow_gc_old_regions_released => ([] -> Some(I64));
     NONE; willow_gc_major_collections => ([] -> Some(I64));
-    // --- multi-mutator coordination (willow-6fv.5.6) ---
+    // --- multi-mutator coordination ---
     NONE; willow_gc_register_mutator => ([] -> None);
     NONE; willow_gc_unregister_mutator => ([] -> None);
     NONE; willow_gc_stop_flag => ([] -> Some(Ptr));
@@ -263,7 +263,7 @@ runtime_abi_schema! {
     ALLOC; willow_map_new_local => ([I64, I64, I64] -> Some(Ptr));
     ALLOC; willow_map_copy => ([Ptr] -> Some(Ptr));
     // (map, key_word, key_is_ref, val_word, val_is_ref): each generic payload
-    // word is followed by its own is-reference flag (willow-9tls.7).
+    // word is followed by its own is-reference flag.
     PANIC_ALLOC; willow_map_insert => ([Ptr, Word, I64, Word, I64] -> None);
     PANIC_ALLOC; willow_map_get => ([Ptr, Word, I64, I64] -> Some(Ptr));
     PANIC_ALLOC; willow_map_snapshot => ([Ptr, I64, I64] -> Some(Ptr));
@@ -304,7 +304,7 @@ runtime_abi_schema! {
     NONE; willow_future_release_f64 => ([Ptr] -> None);
     NONE; willow_future_release_ptr => ([Ptr] -> None);
     // --- channels ---
-    // Atomic primitives (willow-dgwo.3). Handles are native pointers;
+    // Atomic primitives. Handles are native pointers;
     // AtomicBool values use the dedicated I8 representation.
     ALLOC; willow_atomic_i64_new => ([I64] -> Some(Ptr));
     NONE; willow_atomic_i64_load => ([Ptr] -> Some(I64));
@@ -319,7 +319,7 @@ runtime_abi_schema! {
     NONE; willow_atomic_bool_store => ([Ptr, I8] -> None);
     NONE; willow_atomic_bool_swap => ([Ptr, I8] -> Some(I8));
     // Blocking cells hold a generic Willow word plus an is-reference flag.
-    // The cells are GC-managed payloads (willow-9tls.5): `new` allocates the
+    // The cells are GC-managed payloads: `new` allocates the
     // handle on the GC heap and roots a reference word across that allocation.
     ALLOC; willow_blocking_cell_new => ([Word, I64] -> Some(Ptr));
     BLOCK; willow_blocking_cell_get => ([Ptr] -> Some(Word));
@@ -327,7 +327,7 @@ runtime_abi_schema! {
     ALLOC; willow_blocking_rw_cell_new => ([Word, I64] -> Some(Ptr));
     BLOCK; willow_blocking_rw_cell_read => ([Ptr] -> Some(Word));
     BLOCK; willow_blocking_rw_cell_write => ([Ptr, Word] -> None);
-    // Scheduler-aware Mutex<T> (willow-38w.1.3): acquire/poll return a status
+    // Scheduler-aware Mutex<T>: acquire/poll return a status
     // code (1 acquired, 0 pending, -1 recursive, -2 lost, -3 cancelled) and publish the
     // registration token through the out-parameter, so a parked acquire can
     // re-identify its own generation after a wake.
@@ -352,7 +352,7 @@ runtime_abi_schema! {
     NONE; willow_async_mutex_cancel => ([] -> Some(I32));
     PANIC_ALLOC; willow_async_mutex_recursive_panic => ([Ptr, I32, I32] -> None);
     NONE; willow_async_mutex_invalid_status => ([I32, I32] -> None);
-    // Scheduler-aware RwLock<T> (willow-38w.1.5). Mode is 1=read, 2=write;
+    // Scheduler-aware RwLock<T>. Mode is 1=read, 2=write;
     // handoff wakes either one writer or the contiguous reader prefix.
     ALLOC; willow_async_rwlock_new => ([Word, I64] -> Some(Ptr));
     SUSPEND; willow_async_rwlock_acquire => ([Ptr, I32, Ptr] -> Some(I32));
@@ -410,7 +410,7 @@ runtime_abi_schema! {
     NONE; willow_panic_recover => ([] -> Some(Ptr));
     NONE; willow_panic_release_recovered => ([Ptr] -> None);
     NONE; willow_panic_finish_unhandled => ([] -> None);
-    // --- debug call-chain stack (willow-992h) ---
+    // --- debug call-chain stack ---
     NONE; willow_callstack_push => ([Ptr, I64, Ptr, I64, I32, I32] -> None);
     NONE; willow_callstack_push_pending => ([Ptr, I64, Ptr, I64, I32, I32] -> None);
     NONE; willow_callstack_activate => ([] -> None);
@@ -426,7 +426,7 @@ runtime_abi_schema! {
     NONE; willow_debug_reference_call_scope_push => ([] -> None);
     NONE; willow_debug_reference_call => ([Ptr, I32, I32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr] -> None);
     NONE; willow_debug_reference_call_clear => ([] -> None);
-    // Async frame allocator + cooperative scheduler (willow-lpn.5 / willow-fqg.1).
+    // Async frame allocator + cooperative scheduler.
     // Imported so the async state-machine lowering can emit frame allocation and
     // cooperative spawn/poll/wake calls.
     ALLOC; willow_async_frame_alloc => ([I64, I64] -> Some(Ptr));
@@ -479,7 +479,7 @@ runtime_abi_schema! {
     PANIC_ALLOC; willow_parallel_map_i64 => ([Ptr, Ptr] -> Some(Ptr));
     NONE; willow_blocking_active_jobs => ([] -> Some(I64));
     NONE; willow_blocking_completed_jobs => ([] -> Some(I64));
-    // Bounded blocking-pool queue gauges (willow-9tls.6).
+    // Bounded blocking-pool queue gauges.
     NONE; willow_blocking_queued_jobs => ([] -> Some(I64));
     NONE; willow_blocking_slot_waiters => ([] -> Some(I64));
     NONE; willow_blocking_queue_capacity => ([] -> Some(I64));
@@ -502,14 +502,14 @@ runtime_abi_schema! {
     NONE; willow_rust_bridge_payload => ([I64, I32, Ptr] -> None);
     ALLOC; willow_rust_bridge_enum => ([Ptr, I64, Ptr, I32, I32] -> Some(I64));
     NONE; willow_sched_current_task => ([] -> Some(I64));
-    // Tag the running task with its async fn name for async stack traces
-    // (willow-9lw): (name_ptr, name_len).
+    // Tag the running task with its async fn name for async stack traces: (name_ptr, name_len).
+    //
     NONE; willow_sched_tag_current_task => ([Ptr, I64] -> None);
     SUSPEND; willow_sched_sleep => ([I64] -> None);
     NONE; willow_sched_yield => ([] -> None);
     SUSPEND; willow_sched_await => ([I64] -> Some(I32));
     NONE; willow_sched_task_state => ([I64] -> Some(I32));
-    // --- frame-backed task status (willow-ezs.1.3). Terminal status lives in
+    // --- frame-backed task status. Terminal status lives in
     // the async frame HEADER, so a holder of the task handle answers
     // await/result/is_cancelled with one Acquire load instead of a
     // scheduler-table lookup under the global lock. ---
@@ -517,8 +517,8 @@ runtime_abi_schema! {
     NONE; willow_frame_is_cancelled => ([Ptr] -> Some(I64));
     SUSPEND; willow_frame_await => ([Ptr, I64] -> Some(I32));
     PANIC_ALLOC; willow_frame_await_check => ([Ptr, I64] -> None);
-    // --- preemption (willow-0a6k.1, spec §7-9,22-23). Flags are native pointers.
-    // Emitted by compiler-inserted safepoints in willow-0a6k.2; declared here so
+    // --- preemption (preemption primitives, spec §7-9,22-23). Flags are native pointers.
+    // Emitted by compiler-inserted safepoints in preemption support; declared here so
     // the runtime ABI surface + symbol-export tests cover them from stage 1. ---
     NONE; willow_preempt_task_budget => ([] -> Some(I64));
     NONE; willow_preempt_time_quantum_ms => ([] -> Some(I64));

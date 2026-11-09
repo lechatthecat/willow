@@ -3,14 +3,14 @@
 // `gc_allocated_bytes()` and its twenty-one siblings are zero-argument reads of
 // a runtime counter: `() -> i64`, no panic path, no preemption point. The void
 // pair beside them, `gc_collect()` and `gc_minor_collect()`, was already inside
-// the walker's subset; these are (willow-0g8j.3.1).
+// the walker's subset; these are.
 //
 // Every counter's VALUE depends on the allocator's schedule, so this program
 // prints only what holds on every platform and under every collection schedule:
 // a counter is never negative, a cumulative counter never goes backwards, and
 // two reads with nothing between them agree. Building under
 // WILLOW_GC_STRESS=alloc and under WILLOW_GC_STRESS=minor must print exactly
-// the same thing as building without either. Since willow-0g8j.3 a body
+// the same thing as building without either. Since the lowered-IR cutover a body
 // outside the walker's subset is a compile error, so the build succeeding is
 // the proof that the walker compiled every function below.
 

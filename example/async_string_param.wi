@@ -2,7 +2,7 @@
 //
 // The compiler spills such GC-managed values into a heap async frame
 // (willow_async_frame_alloc) that is GC-rooted while the task is live, so the
-// value survives collection even across suspension points (willow-lpn.5a).
+// value survives collection even across suspension points (async frame roots).
 
 async fn greet(name: String) -> String {
     await sleep(1);

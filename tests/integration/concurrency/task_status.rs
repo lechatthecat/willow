@@ -1,7 +1,7 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Frame-backed task status, end to end (willow-ezs.1.3).
+// Frame-backed task status, end to end.
 //
 // The runtime unit tests cover the status word itself; these cover what the
 // compiled language actually does with it, which unit tests cannot reach:

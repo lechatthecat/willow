@@ -1,5 +1,5 @@
-// locks.wi — the shared-state cells: Mutex<T>, RwLock<T>, BlockingCell<T>
-// (willow-dgwo.3, willow-38w.1.4).
+// locks.wi — the shared-state cells: Mutex<T>, RwLock<T>, BlockingCell<T>.
+//
 //
 // All three are compiler-known, always-in-scope cells. They are Send + Sync
 // (when their contents are), so the same cell can be handed to several tasks.

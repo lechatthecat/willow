@@ -1,4 +1,4 @@
-//! An imported module's bodies compile from lowered IR (willow-0g8j.16).
+//! An imported module's bodies compile from lowered IR.
 //!
 //! `compile_program_with_modules` used to lower exactly one program: the entry
 //! file. `register_lir_functions` was called once, with the entry program's
@@ -11,8 +11,8 @@
 //!
 //! Three things had to line up for a module to be lowered:
 //!
-//! 1. Its OWN checker's tables. A module is type-checked in its own scope
-//!    (willow-3eo1): the prelude plus what IT imports, under the names IT uses.
+//! 1. Its OWN checker's tables. A module is type-checked in its own scope: the prelude plus
+//!    what IT imports, under the names IT uses.
 //!    Lowering it with the entry file's tables would resolve names the module
 //!    never imported and miss the ones it did. `typecheck_modules` now keeps
 //!    each checker instead of dropping it.
@@ -20,8 +20,8 @@
 //!    function is `module_item_symbol(prefix, name)` (`shapes.area`), and a
 //!    method belongs to the QUALIFIED class decl (`shapes::Rect::area`), while
 //!    `lower_function` names it with the module's own bare class name
-//!    (`Rect::area`). Emission addresses each body by its `BodyId`
-//!    (willow-afb5.18), so the symbol a body is compiled under is chosen at the
+//!    (`Rect::area`). Emission addresses each body by its `BodyId`, so the symbol a body is
+//!    compiled under is chosen at the
 //!    emission site and no name re-keying pass is needed.
 //! 3. Eligibility that survives a class with two spellings. A module class's
 //!    declared field types are qualified (`inner: shapes::Rect`) while the

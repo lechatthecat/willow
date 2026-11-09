@@ -14,7 +14,7 @@ pub struct ConcurrencyReport {
     pub select_expressions: usize,
     pub channel_operations: usize,
     /// Cancellation-aware await adapters (`task.result()`). Task waiting is
-    /// counted by `await_expressions` (willow-qrj9).
+    /// counted by `await_expressions`.
     pub task_result_queries: usize,
 }
 
@@ -152,7 +152,7 @@ impl ConcurrencyAnalyzer {
     /// helpers of an imported module, keyed by their module-qualified names
     /// (`module::fn`, `module::Class::method`). This lets the entry program's
     /// task-aware check flag a direct cross-module call such as `await`-free
-    /// `worker::heavy()` from an async fn (willow-0a6k.2). Call before
+    /// `worker::heavy()` from an async fn. Call before
     /// `check_program`.
     pub fn with_module_helpers(self, module_name: &str, program: &Program) -> Self {
         self.with_module_helper_index(module_name, &compute_nonpreemptible_helpers(program))
@@ -182,7 +182,7 @@ impl ConcurrencyAnalyzer {
     /// `module_display` names the source module for the diagnostic note. Re-keys
     /// the module's non-preemptible helpers from the item's name to the local
     /// name so a free-fn import (`heavy` → `heavy()`) and a class import
-    /// (`Work` → `Work::method()`) both resolve (willow-0a6k.2).
+    /// (`Work` → `Work::method()`) both resolve.
     pub fn with_item_helper(
         self,
         local: &str,
@@ -769,8 +769,8 @@ fn main() {
     }
 
     /// A select task case is an `await` and must be reported as one; an inline
-    /// `.result()` in a case is also reported as a task-result query
-    /// (willow-qrj9).
+    /// `.result()` in a case is also reported as a task-result query.
+    ///
     #[test]
     fn report_counts_select_task_cases_as_awaits() {
         let analyzer = analyze(
@@ -796,7 +796,7 @@ async fn run() {
     }
 
     /// The `await` inside a sync select's task case is still an await, so it is
-    /// counted AND flagged as occurring outside an async fn (willow-qrj9).
+    /// counted AND flagged as occurring outside an async fn.
     #[test]
     fn report_flags_select_task_case_await_outside_async() {
         let analyzer = analyze(
@@ -1443,7 +1443,7 @@ async fn run() -> i64 {
     }
 
     // ------------------------------------------------------------------
-    // Stage A-prime: recursion is unbounded work too (willow-38w.2.1).
+    // Stage A-prime: recursion is unbounded work too.
     //
     // Before Stage A-prime the analysis seeded only from `contains a loop`,
     // so a loop-free recursive helper — `fib(n-1) + fib(n-2)` — was admitted
@@ -2150,7 +2150,7 @@ fn add_one(n: i64) -> i64 {
 }
 "#;
 
-    // --- Shared structural AST walk (willow-uqzx.1.1) ---
+    // --- Shared structural AST walk ---
     //
     // The loop detector and the helper call graph both read the shared walk in
     // `parser::visit` instead of carrying their own hand-written traversals.

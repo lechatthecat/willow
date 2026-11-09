@@ -17,7 +17,7 @@ use crate::task::{
 use crate::task_state::{BoundaryOutcome, CancelOutcome, ClaimOutcome, TaskLifecycle, WakeOutcome};
 use crate::timer_queue::{TimerQueue, TimerWake};
 
-/// A terminal task's frame awaiting the end of its grace period (willow-vjaf).
+/// A terminal task's frame awaiting the end of its grace period.
 #[derive(Debug, Clone, Copy)]
 struct RetiredFrame {
     frame: usize,
@@ -35,7 +35,7 @@ static FRAME_RELEASE_DUE: AtomicBool = AtomicBool::new(false);
 
 /// Lock-free half of terminal task cleanup. The task record is already gone
 /// when this runs, so channel addresses and the exact lock reverse link must be
-/// captured before removal (willow-ezs.1.4, willow-38w.1.6).
+/// captured before removal.
 #[derive(Debug)]
 struct TerminalCleanup {
     task_id: RuntimeTaskId,
@@ -89,7 +89,7 @@ fn classify_poll_result(result: i32) -> PollOutcome {
 }
 
 /// The frame-header status code for a terminal task state, or `None` while the
-/// task can still run (willow-ezs.1.3).
+/// task can still run.
 fn terminal_frame_status(state: RuntimeTaskState) -> Option<i64> {
     match state {
         RuntimeTaskState::Completed => Some(crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED),
@@ -137,8 +137,8 @@ impl RuntimeWorkerConfig {
 /// publication, relationship detach and root release to happen before the
 /// abort, and that publication wakes the panicked task's awaiters — so the
 /// claim path must stop handing out work first, or a sibling worker runs
-/// ordinary code past `await <panicked task>` in the window before the abort
-/// (willow-s9ej.7).
+/// ordinary code past `await <panicked task>` in the window before the abort.
+///
 static FATAL_PANIC_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Close the claim gate. Only the fatal path calls this, and that path always
@@ -175,7 +175,7 @@ static TEST_WORKER_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 /// worker can claim a task that the drive itself woke — a terminal purge
 /// compensating a cancelled channel handoff, say — and complete it before the
 /// run loop observes that its target is already done, so the drive returns a
-/// completion count the test never asked for (willow-tcrg).
+/// completion count the test never asked for.
 ///
 /// Hold this alongside `crate::gc::runtime_test_guard()`, and install it before
 /// `reset_global_scheduler_for_test()` so the fresh run queues are sized for one
@@ -215,7 +215,7 @@ pub fn runtime_worker_config() -> RuntimeWorkerConfig {
     )
 }
 
-/// Worker-owned FIFO deques with concurrent inbound queues (willow-9tls.38).
+/// Worker-owned FIFO deques with concurrent inbound queues.
 /// Foreign or off-drive publishers write to a worker's inbox. The active owner
 /// transfers a bounded batch into its deque; thieves may steal from either
 /// source. The global injection queue accepts concurrent foreign publishers.
@@ -651,7 +651,7 @@ impl RunQueues {
     }
 
     /// Return a pinned task to its owner and wake only that owner: an idle
-    /// thief would just steal it and reroute it again (willow-jz15.120).
+    /// thief would just steal it and reroute it again.
     fn push_rerouted(&self, owner: usize, id: RuntimeTaskId) {
         match self.locals.get(owner) {
             Some(queue) => {
@@ -995,20 +995,20 @@ impl RunQueues {
 /// Every poll locks its task's shard several times (claim, affinity, poll
 /// boundary), so workers polling distinct tasks collide on a shard with
 /// probability about workers / shards per lock. At 32 shards, 8 workers of
-/// `yield_switch` spent 2-3% of their samples in contended shard locks
-/// (willow-8hq4.19). Whole-table walks (`len`, `for_each`, `drain`) are
+/// `yield_switch` spent 2-3% of their samples in contended shard locks. Whole-table walks
+/// (`len`, `for_each`, `drain`) are
 /// diagnostic or teardown paths; a wake batch groups by sort below this
 /// count, so no per-operation path scales with it.
 const TASK_TABLE_SHARDS: usize = 256;
 
-/// Hasher for task-id keys (willow-8hq4.18). Ids in one shard share
+/// Hasher for task-id keys. Ids in one shard share
 /// `id % TASK_TABLE_SHARDS` (the low eight bits), so the hash must spread the
 /// high id bits to both ends; the shared folded multiply does.
 use crate::id_hash::IdHasher as TaskIdHasher;
 
 type TaskShard = HashMap<RuntimeTaskId, RuntimeTask, BuildHasherDefault<TaskIdHasher>>;
 
-/// Task records partitioned by task id (willow-6qtv).
+/// Task records partitioned by task id.
 ///
 /// A one-task operation takes one shard. A relationship transaction takes the
 /// two participating shards in ascending index order; same-shard transactions
@@ -1024,8 +1024,8 @@ struct ShardedTaskTable {
     /// published while the same task shard is locked. Readers use it without
     /// taking the scheduler metadata mutex.
     blocked_syscall: AtomicUsize,
-    /// Advances after every `Terminal` transition and every record removal
-    /// (willow-8hq4.19).
+    /// Advances after every `Terminal` transition and every record removal.
+    ///
     ///
     /// A drive whose target is still live keeps the epoch it read BEFORE its
     /// last look at the target and looks again only once the epoch moves, so
@@ -1274,7 +1274,7 @@ pub(crate) use wake_batch::{WakeBatchScratch, wake_channel_owners};
 /// metadata mutex involved.
 ///
 /// The state transition, the blocked-syscall accounting and the queue
-/// publication all complete while the task's shard is held (willow-6qtv/8agm),
+/// publication all complete while the task's shard is held,
 /// and the queue entry is published *before* the blocked count drops so an idle
 /// observer always sees at least one reason to stay alive.
 ///
@@ -1340,7 +1340,7 @@ fn wake_task_in(tasks: &ShardedTaskTable, run_queues: &RunQueues, id: RuntimeTas
 /// terminal record is observable here: `finish_terminal` publishes Terminal under
 /// the task's shard, releases it, and only then re-takes the shard to remove the
 /// record. A promoting thread that looks in that gap must treat the entry as
-/// stale — the same answer it gets once the record is gone (willow-0a6k.7).
+/// stale — the same answer it gets once the record is gone.
 fn timer_entry_is_current(tasks: &ShardedTaskTable, wake: TimerWake) -> bool {
     tasks
         .with(wake.task_id, |task| timer_matches_task(task, wake.deadline))
@@ -1358,7 +1358,7 @@ fn timer_matches_task(task: &RuntimeTask, deadline: Instant) -> bool {
 ///
 /// The shard guard is released by `with_mut` before the timer heap is touched:
 /// the lock order is timer heap -> task shard, so taking the heap while holding
-/// a shard would invert it (willow-9ha4).
+/// a shard would invert it.
 fn set_wake_after_millis_in(tasks: &ShardedTaskTable, timers: &TimerQueue, millis: i64) {
     let deadline = Instant::now() + Duration::from_millis(millis.max(0) as u64);
     let Some(id) = current_task_id() else { return };
@@ -1373,11 +1373,11 @@ fn set_wake_after_millis_in(tasks: &ShardedTaskTable, timers: &TimerQueue, milli
 #[derive(Debug)]
 pub struct RuntimeScheduler {
     /// Next never-reused task id, shared with [`SchedulerComponents`] so global
-    /// spawns reserve ids without `GLOBAL_SCHEDULER` (willow-9bvc).
+    /// spawns reserve ids without `GLOBAL_SCHEDULER`.
     next_task_id: Arc<AtomicU64>,
     tasks: Arc<ShardedTaskTable>,
-    /// Per-worker local run queues + a shared global queue, with work stealing
-    /// (willow-gyaa.4). New/woken tasks go to the global queue; an idle worker
+    /// Per-worker local run queues + a shared global queue, with work stealing. New/woken
+    /// tasks go to the global queue; an idle worker
     /// drains its local queue, then the global queue, then steals from the back
     /// of another worker's local queue.
     run_queues: Arc<RunQueues>,
@@ -1387,10 +1387,10 @@ pub struct RuntimeScheduler {
     /// Total frame roots currently owned by the scheduler: active task frames
     /// plus terminal frames still inside their grace period. Atomic and shared
     /// with [`SchedulerComponents`] because global spawns publish without
-    /// `GLOBAL_SCHEDULER` (willow-9bvc); retirement still decrements under it.
+    /// `GLOBAL_SCHEDULER`; retirement still decrements under it.
     frame_roots: Arc<AtomicUsize>,
     /// Wake-deadlines, behind their own lock rather than this scheduler's
-    /// metadata mutex (willow-9ha4). The run loop promotes expired timers once
+    /// metadata mutex. The run loop promotes expired timers once
     /// per iteration, so keeping them here cost one global-mutex acquisition
     /// per poll on every worker even when nothing had ever slept.
     timers: Arc<TimerQueue>,
@@ -1458,7 +1458,7 @@ impl RuntimeScheduler {
         self.run_queues.worker_count()
     }
 
-    /// The one place a task id enters a run queue (willow-ezs.1.1).
+    /// The one place a task id enters a run queue.
     ///
     /// The atomic `queued` bit means exactly one runnable claim is outstanding,
     /// so enqueue never scans the queues. Returns whether the caller won the
@@ -1495,11 +1495,11 @@ impl RuntimeScheduler {
     /// Pop the next runnable task for `worker`: its own local queue first (FIFO),
     /// then the global queue, then steal from the back of another worker's local
     /// queue (LIFO steal, which tends to take the coldest work). Returns `None`
-    /// when no worker has runnable tasks (willow-gyaa.4).
+    /// when no worker has runnable tasks.
     pub fn pop_for_worker(&mut self, worker: usize) -> Option<RuntimeTaskId> {
         // Physical pop deliberately leaves `queued` set. `claim_for_poll`
         // consumes the queue right together with Ready -> Running/Cancelling,
-        // closing the pop/wake lost-wake window (willow-ezs.4 review).
+        // closing the pop/wake lost-wake window.
         self.pop_queue_entry(worker)
     }
 
@@ -1550,7 +1550,7 @@ impl RuntimeScheduler {
             ClaimOutcome::Cancel => {}
         }
 
-        // Cooperative cancellation boundary (willow-0a6k.7): the atomic claim
+        // Cooperative cancellation boundary: the atomic claim
         // moved the task to Cancelling and consumed the request.
         if has_cleanup {
             set_current_task_context(id, panic_context);
@@ -1569,7 +1569,7 @@ impl RuntimeScheduler {
     }
 
     /// The cleanup entry + frame for a task the claim just moved to
-    /// Cancelling (willow-vynv.3). Consumes the entry so it runs once.
+    /// Cancelling. Consumes the entry so it runs once.
     pub fn take_cancel_work(
         &mut self,
         id: RuntimeTaskId,
@@ -1606,10 +1606,10 @@ impl RuntimeScheduler {
 
     /// True while any task is parked in `BlockedSyscall` — a blocking-pool
     /// job will wake it, so the scheduler must NOT declare idle/stop on the
-    /// strength of empty queues alone (willow-0a6k.5 review fix).
+    /// strength of empty queues alone.
     ///
     /// O(1): the idle path asks this on every park cycle, so it reads the
-    /// maintained counter instead of scanning the task table (willow-ezs.1.2).
+    /// maintained counter instead of scanning the task table.
     fn has_blocked_syscall_tasks(&self) -> bool {
         self.blocked_syscall_count() > 0
     }
@@ -1629,8 +1629,8 @@ impl RuntimeScheduler {
         self.blocked_syscall_count() == blocked
     }
 
-    /// The single terminal transition for Completed/Cancelled/Panicked
-    /// (willow-ezs.1.4).
+    /// The single terminal transition for Completed/Cancelled/Panicked.
+    ///
     ///
     /// Under the scheduler lock this publishes the frame status, detaches both
     /// directions of await relationships, wakes awaiters, captures external
@@ -1708,7 +1708,7 @@ impl RuntimeScheduler {
     }
 
     /// True if `id` is queued anywhere (any local queue or the global queue).
-    /// O(1): the flag is the invariant, not a scan (willow-ezs.1.1).
+    /// O(1): the flag is the invariant, not a scan.
     pub fn is_queued(&self, id: RuntimeTaskId) -> bool {
         self.tasks
             .with(id, |task| task.state.load().is_queued())
@@ -1753,7 +1753,7 @@ impl RuntimeScheduler {
     }
 
     /// Test-only: run `f` against one task record under its shard lock, for
-    /// fixtures that must drive the state word directly (willow-38w.1.2).
+    /// fixtures that must drive the state word directly.
     #[cfg(test)]
     pub fn with_task_for_test<R>(
         &self,
@@ -1854,7 +1854,7 @@ impl RuntimeScheduler {
 
     /// Clear the "currently running" marker once a poll returns. Guards
     /// `willow_sched_sleep` / `willow_sched_await` against attaching a deadline
-    /// or waiter to a STALE task when called outside of a poll (willow-lpn.5.3).
+    /// or waiter to a STALE task when called outside of a poll.
     pub fn clear_running(&mut self) {
         set_current_task(None);
     }
@@ -1867,7 +1867,7 @@ impl RuntimeScheduler {
     }
 
     /// The parked task with the earliest wake-deadline, if any. Backed by a
-    /// min-heap so idle scheduling does not scan every parked task (willow-gyaa.3).
+    /// min-heap so idle scheduling does not scan every parked task.
     fn next_timer_deadline(&self) -> Option<(RuntimeTaskId, Instant)> {
         let tasks = &*self.tasks;
         self.timers
@@ -1903,7 +1903,7 @@ impl RuntimeScheduler {
     pub fn register_waiter(&mut self, awaitee: RuntimeTaskId, waiter: RuntimeTaskId) {
         // `register` answers "already a waiter?" from its membership map, so a
         // 10,000-task fan-in costs expected O(1) per registration instead of a
-        // linear scan of the waiter list (willow-ezs.2).
+        // linear scan of the waiter list.
         let _ = register_waiter_sharded(&self.tasks, awaitee, waiter);
     }
 
@@ -2048,21 +2048,21 @@ impl RuntimeScheduler {
     }
 }
 
-// The scheduler exposes no `GcTrace` impl (willow-ezs.3). Task-owned GC values
+// The scheduler exposes no `GcTrace` impl. Task-owned GC values
 // live in the async frame, which stays reachable through the runtime root
 // registry while `frame_rooted` holds; collection scans that registry, never
 // the task table. The previous impl walked a per-task root set that nothing
 // ever populated.
 
-// ─── Process-global cooperative scheduler (willow-fqg.1 / willow-gyaa.4) ─────
+// ─── Process-global cooperative scheduler ─────
 //
 // A shared run queue that drives compiler-generated cooperative tasks. Each task
 // owns a heap async frame; the frame is registered as a GC runtime root while
 // the task is pending/running, so a parked/ready task's live values survive
 // collection even though no native stack frame holds them (spec §8.2 / §9).
 
-/// The run queues, task table and timers every scheduler entry point shares
-/// (willow-8hq4.18).
+/// The run queues, task table and timers every scheduler entry point shares.
+///
 ///
 /// Only test reset replaces them. The hot path runs once per task poll on every
 /// worker, so reaching the components must not write a shared cache line: a
@@ -2123,7 +2123,7 @@ impl SchedulerComponents {
 /// The scheduler state a spawn touches. Every field is internally
 /// synchronized, so global spawns reserve and publish without
 /// `GLOBAL_SCHEDULER`; that lock serialized every spawning worker twice per
-/// spawn (willow-9bvc).
+/// spawn.
 struct SpawnTarget<'a> {
     next_task_id: &'a AtomicU64,
     tasks: &'a ShardedTaskTable,
@@ -2251,7 +2251,7 @@ fn global_task_table() -> &'static Arc<ShardedTaskTable> {
 /// idle and stops the pool; the claiming worker then observes the stop, pushes
 /// the id back and returns — leaving a runnable task stranded and the drive
 /// reporting quiescence. That is the lost-wakeup behind an `await` returning
-/// early and a `select` giving up (willow-atth).
+/// early and a `select` giving up.
 ///
 /// Counted globally rather than per `ParallelRunState` so a nested drive and a
 /// foreign driver thread observe each other's claims too.
@@ -2260,7 +2260,7 @@ fn global_task_table() -> &'static Arc<ShardedTaskTable> {
 /// bits are an epoch advanced by popped claims and active/paused transfers. A
 /// stop decision reads every word before and after its snapshot and accepts
 /// only unchanged words with zero counts, so no claim can pop, resolve and
-/// republish work between its reads unseen (willow-8hq4.19). All claim-word
+/// republish work between its reads unseen. All claim-word
 /// accesses are `SeqCst`: they form one half of the store/load handshake with
 /// [`ParallelRunState::stop_intent`] that lets claims skip `claim_gate`.
 ///
@@ -2378,7 +2378,7 @@ fn claims_changed_or_in_flight(before: &[u64; ACCOUNTING_SHARDS]) -> bool {
 }
 
 /// Wake-deadlines, shared with the scheduler instance the same way the run
-/// queues and the task table are (willow-9ha4). Timer work reaches this through
+/// queues and the task table are. Timer work reaches this through
 /// its own lock, so the run loop's per-iteration timer promotion no longer
 /// serializes every worker on `GLOBAL_SCHEDULER`.
 fn global_timers() -> &'static Arc<TimerQueue> {
@@ -2397,7 +2397,7 @@ fn with_global<R>(f: impl FnOnce(&mut RuntimeScheduler) -> R) -> R {
 }
 
 /// Hot wake path: state, blocked-syscall accounting, and queue publication are
-/// completed while one task shard is locked (willow-6qtv/8agm).
+/// completed while one task shard is locked.
 fn wake_global_task(id: RuntimeTaskId) -> bool {
     wake_task_in(global_task_table(), global_run_queues(), id)
 }
@@ -2407,7 +2407,7 @@ fn wake_global_task_outcome(id: RuntimeTaskId) -> WakeOutcome {
 }
 
 /// Register the running task's sleep deadline without the scheduler metadata
-/// mutex (willow-9ha4).
+/// mutex.
 fn set_global_wake_after_millis(millis: i64) {
     set_wake_after_millis_in(global_task_table(), global_timers(), millis);
 }
@@ -2425,7 +2425,7 @@ fn global_next_timer_deadline() -> Option<(RuntimeTaskId, Instant)> {
 /// The lock-free hint short-circuits the overwhelmingly common case — no task
 /// has a deadline, or the earliest one is still in the future — so the run
 /// loop's per-iteration timer check costs one atomic load instead of a
-/// process-global mutex acquisition (willow-9ha4). Missing a just-pushed timer
+/// process-global mutex acquisition. Missing a just-pushed timer
 /// here is harmless: the idle path re-reads the heap under its lock before it
 /// can conclude that the scheduler has nothing to do.
 fn wake_global_due_timers_now() -> usize {
@@ -2472,7 +2472,7 @@ enum GlobalPollBoundary {
 /// Return frame ownership after a poll without taking the scheduler metadata
 /// mutex. Only the blocked-syscall aggregate needs reconciliation afterwards;
 /// ordinary Pending/yield/preempt transitions are task-shard + run-queue
-/// operations (willow-8agm/6qtv).
+/// operations.
 fn finish_global_poll_boundary(id: RuntimeTaskId, boundary: GlobalPollBoundary) {
     let tasks = global_task_table();
     let run_queues = global_run_queues();
@@ -2573,8 +2573,8 @@ fn current_task_id() -> Option<RuntimeTaskId> {
 
 /// Every poll boundary drops the published fault location: release synchronous
 /// code publishes none, so a site left by the previous task (or by an async
-/// poll that returned to synchronous code) must not label its faults
-/// (willow-9686).
+/// poll that returned to synchronous code) must not label its faults.
+///
 fn set_current_task(id: Option<RuntimeTaskId>) {
     crate::panic_context::willow_fault_site_clear();
     CURRENT_TASK.with(|current| current.set(id));
@@ -2633,10 +2633,10 @@ fn spawn_global_task_initialized_inner(
     cooperative_poll: bool,
 ) -> u64 {
     // The caller holds `frame` unrooted once the task is published and may
-    // finish on another worker (willow-vjaf).
+    // finish on another worker.
     let _unit = crate::frame_reclaim::ExecutionUnit::enter();
     // Reserve and publish through the internally synchronized components;
-    // `GLOBAL_SCHEDULER` is not taken (willow-9bvc). The frame is rooted before
+    // `GLOBAL_SCHEDULER` is not taken. The frame is rooted before
     // the callback because native initialization may allocate or explicitly
     // collect. A panic leaves an id gap but the guard rolls the unpublished
     // runtime root back.
@@ -2747,8 +2747,8 @@ pub(crate) fn wake_channel_owner(id: u64) -> bool {
 
 /// The id of the currently-running task (0 if none). Used by blocking runtime
 /// primitives (e.g. cooperative channel `recv`) to register the running task as
-/// a waiter before it suspends (willow-dsw).
-/// Request cooperative cancellation of `id` (willow-0a6k.7). A parked task is
+/// a waiter before it suspends.
+/// Request cooperative cancellation of `id`. A parked task is
 /// re-queued so the cancellation is observed promptly; the task is finalized
 /// (state Cancelled, never polled again) at the next scheduler claim.
 #[unsafe(no_mangle)]
@@ -2763,7 +2763,7 @@ pub extern "C" fn willow_sched_cancel(id: u64) {
             let outcome = task.state.request_cancel();
             if outcome != CancelOutcome::NoChange {
                 // Mirror the request into the frame header so
-                // `Task::is_cancelled()` is a plain load (willow-ezs.1.3).
+                // `Task::is_cancelled()` is a plain load.
                 crate::async_frame::frame_request_cancel(task.frame);
             }
             if outcome == CancelOutcome::Enqueue {
@@ -2785,8 +2785,8 @@ pub extern "C" fn willow_sched_cancel(id: u64) {
 }
 
 /// Record the source location of the call that spawned task `id` (file is a
-/// WillowString; copied out of the GC heap). Shown in panic/debug traces
-/// (willow-0a6k.7).
+/// WillowString; copied out of the GC heap). Shown in panic/debug traces.
+///
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_set_spawn_site(id: u64, file: *const u8, line: i64) {
@@ -2844,7 +2844,7 @@ pub(crate) fn take_channel_waits(task_id: u64) -> Vec<ChannelOwnershipToken> {
         .unwrap_or_default()
 }
 
-// ── Lock waiter reverse links (willow-38w.1.2) ──────────────────────────────
+// ── Lock waiter reverse links ──────────────────────────────
 //
 // The task-shard half of the `LockState -> TaskShard` protocol in
 // `lock_wait.rs`. Each of these takes exactly one shard lock and releases it
@@ -2998,13 +2998,13 @@ pub extern "C" fn willow_sched_is_cancelled(id: u64) -> i64 {
         .unwrap_or(false) as i64
 }
 
-/// Post-await fallback for a null frame (willow-0a6k.7): a CANCELLED task has
+/// Post-await fallback for a null frame: a CANCELLED task has
 /// no result to read, so it is a located runtime panic.
 fn sched_await_check(id: u64) {
     // The lifecycle collapses every terminal outcome into `Terminal`, so the
     // id-only path cannot tell Panicked from Completed. The gate answers the
     // question that matters: an unhandled panic is being published, and no
-    // awaiter may resume before the abort (willow-s9ej.7).
+    // awaiter may resume before the abort.
     if fatal_panic_pending() {
         park_until_fatal_abort();
     }
@@ -3045,8 +3045,8 @@ fn report_poll_failure(id: u64, invalid_result: Option<i32>, async_chain: &str) 
     std::process::abort();
 }
 
-/// Attach the compiler-generated cancellation cleanup entry to a task
-/// (willow-vynv.3). Called by the async-fn constructor right after spawn.
+/// Attach the compiler-generated cancellation cleanup entry to a task. Called by the async-fn
+/// constructor right after spawn.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_set_cancel_fn(id: u64, cancel: RuntimeCancelFn) {
@@ -3078,8 +3078,8 @@ pub extern "C" fn willow_sched_current_task() -> u64 {
 
 /// Tag the currently-running task with its async fn name (raw static UTF-8 bytes
 /// plus length, which must remain valid for the process lifetime). Emitted at
-/// the top of each async poll fn so a panic can render the async chain
-/// (willow-9lw). No-op when no task is running.
+/// the top of each async poll fn so a panic can render the async chain. No-op when no task is
+/// running.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) {
@@ -3127,7 +3127,7 @@ pub(crate) fn lock_spinning_allowed(task: RuntimeTaskId) -> bool {
     current_task_id() == Some(task) && global_run_queues().worker_count() > 1
 }
 
-/// Render the active async chain for panic diagnostics (willow-9lw).
+/// Render the active async chain for panic diagnostics.
 pub fn async_chain_text() -> String {
     let current = current_task_id();
     let Some(mut id) = current else {
@@ -3201,7 +3201,7 @@ pub extern "C" fn willow_sched_active_workers() -> u64 {
 }
 
 /// Deterministic scheduler ownership counters for diagnostics and plateau
-/// tests (willow-ezs.1.5). They intentionally do not claim to measure RSS.
+/// tests. They intentionally do not claim to measure RSS.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_heavy_task_count() -> u64 {
@@ -3228,7 +3228,7 @@ pub extern "C" fn willow_sched_frame_root_count() -> u64 {
 
 /// Register a wake-deadline on the currently-running task: after the poll fn
 /// returns Pending, the timer-aware run loop wakes it once `millis` elapse.
-/// Called by a cooperative poll fn that is awaiting a sleep (willow-lpn.5.3).
+/// Called by a cooperative poll fn that is awaiting a sleep.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_sleep(millis: i64) {
@@ -3250,7 +3250,7 @@ pub extern "C" fn willow_sched_yield() {
 /// Await another task's completion (for `await <task>`): returns 1 if `awaitee`
 /// has already completed (the caller may read its result and continue), else
 /// registers the currently-running task as a waiter and returns 0 — the caller
-/// then returns Pending and is woken when `awaitee` completes (willow-lpn.5.3).
+/// then returns Pending and is woken when `awaitee` completes.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_await(awaitee: u64) -> i32 {
@@ -3264,7 +3264,7 @@ pub extern "C" fn willow_sched_await(awaitee: u64) -> i32 {
     ready
 }
 
-/// Frame-backed `await <task>` (willow-ezs.1.3).
+/// Frame-backed `await <task>`.
 ///
 /// Same contract as [`willow_sched_await`], but the terminal check is an
 /// `Acquire` load of the awaitee's frame-header status instead of a scheduler
@@ -3288,7 +3288,7 @@ pub extern "C" fn willow_frame_await(frame: *mut c_void, awaitee: u64) -> i32 {
     willow_sched_await(awaitee)
 }
 
-/// Frame-backed post-await check (willow-ezs.1.3): the cancelled test is a
+/// Frame-backed post-await check: the cancelled test is a
 /// header load, and the id is carried only for the diagnostic message.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
@@ -3301,8 +3301,8 @@ pub extern "C" fn willow_frame_await_check(frame: *mut c_void, id: u64) {
         // Awaiting a task whose panic escaped is not recoverable and has no
         // result to read: the process is aborting, so this task stops here
         // instead of running its continuation. The gate closes before the
-        // PANICKED status is published, so a woken awaiter always observes it
-        // (willow-s9ej.7). Frame status alone is NOT the trigger: a PANICKED
+        // PANICKED status is published, so a woken awaiter always observes it. Frame status
+        // alone is NOT the trigger: a PANICKED
         // frame with no abort in flight (a recovered panic republished by a
         // test harness) must still return normally.
         park_until_fatal_abort();
@@ -3315,7 +3315,7 @@ pub extern "C" fn willow_frame_await_check(frame: *mut c_void, id: u64) {
 
 /// Milliseconds since process start (monotonic), for select timeout cases:
 /// the deadline is fixed once at select entry and re-checked on every
-/// (re-)probe (willow-soro).
+/// (re-)probe.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_monotonic_millis() -> i64 {
@@ -3324,7 +3324,7 @@ pub extern "C" fn willow_monotonic_millis() -> i64 {
 }
 
 /// Sleep the CALLING OS THREAD until the monotonic deadline (sync select's
-/// timeout wait when nothing else can progress; willow-soro). No-op if the
+/// timeout wait when nothing else can progress; select deadline handling). No-op if the
 /// deadline already passed.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
@@ -3339,7 +3339,7 @@ pub extern "C" fn willow_sleep_until_monotonic(deadline_ms: i64) {
 
 /// Remove the currently-running task from `awaitee`'s waiter list — a select
 /// that registered on a task-completion case must unregister when another
-/// case wins, exactly like channel waiters (willow-soro).
+/// case wins, exactly like channel waiters.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_unregister_task_waiter(awaitee: u64) {
@@ -3355,8 +3355,8 @@ pub extern "C" fn willow_sched_unregister_task_waiter(awaitee: u64) {
 ///
 /// This is the ID-ONLY query, and it is answered from the scheduler's task
 /// table. It is therefore a DIAGNOSTIC: once a finished task is reaped the
-/// record is gone and this returns -1 (Unknown), with no tombstone kept
-/// (willow-ezs.1.3). Language-visible questions about a task that the caller
+/// record is gone and this returns -1 (Unknown), with no tombstone kept. Language-visible
+/// questions about a task that the caller
 /// holds a handle to must use the frame-backed queries — `willow_frame_status`,
 /// `willow_frame_await`, `willow_frame_await_check`, `willow_frame_is_cancelled`
 /// — whose answer is stored in the frame the handle already points at and so
@@ -3386,7 +3386,7 @@ pub extern "C" fn willow_sched_task_state(id: u64) -> i32 {
 thread_local! {
     /// Re-entrancy depth of `willow_sched_run` on this thread. `await` block-runs
     /// the scheduler recursively, so the driver registers as a GC mutator on the
-    /// OUTERMOST entry and unregisters on the matching exit (willow-6fv.5.6).
+    /// OUTERMOST entry and unregisters on the matching exit.
     static SCHED_RUN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -3398,7 +3398,7 @@ pub extern "C" fn willow_sched_run() -> i64 {
 
 /// Drive the scheduler only until `target` completes (or the scheduler goes
 /// genuinely idle), then return — the `await` of a concrete task
-/// handle (willow-bsqy). Reuses the mutator-registration wrapper so GC
+/// handle. Reuses the mutator-registration wrapper so GC
 /// coordination is identical to `willow_sched_run`.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
@@ -3413,7 +3413,7 @@ pub extern "C" fn willow_sched_run_until(target: u64) -> i64 {
     // strands exactly this way, so treat an early return as a signal to drive
     // again rather than as an answer. `scheduler_has_wake_source` is false once
     // the target is genuinely blocked forever, so this cannot spin: a real
-    // deadlock still returns and the awaiter reports it (willow-6wd6).
+    // deadlock still returns and the awaiter reports it.
     while !target_is_done(Some(target)) && scheduler_has_wake_source() {
         completed += sched_run_with_mutator(Some(target), None);
     }
@@ -3427,7 +3427,7 @@ pub extern "C" fn willow_sched_run_until(target: u64) -> i64 {
 /// task, so an unbounded `willow_sched_run()` could sit inside a five-second
 /// task before ever re-checking a thirty-millisecond timeout. This variant
 /// stops the run loop once the deadline passes and clamps every idle wait to
-/// it, so the caller always gets its turn back in time (willow-o038 review).
+/// it, so the caller always gets its turn back in time.
 ///
 /// Like `willow_sched_run`, it returns as soon as the scheduler has nothing
 /// left to do — the caller then decides whether to wait out the deadline.
@@ -3447,7 +3447,7 @@ pub extern "C" fn willow_sched_run_until_deadline(deadline_ms: i64) -> i64 {
 /// A drive returning "no task completed" is NOT the same as "nothing can ever
 /// happen": the drive may simply have raced a claim, or stopped on its own
 /// deadline. Callers that turn quiescence into a blocking-forever diagnostic
-/// must consult this first (willow-atth).
+/// must consult this first.
 pub(crate) fn scheduler_has_wake_source() -> bool {
     // Read producers before their destination queues, then claims and polls,
     // just as the parallel idle snapshot does. A deadline-limited nested drive
@@ -3484,7 +3484,7 @@ pub(crate) fn wait_for_any_wake_briefly() {
 /// and returns, so the caller re-probes. When nothing can make a case ready the
 /// select would block forever, so it raises a language panic instead of
 /// spinning — the same policy sync channel `recv`/`send` use for a blocking
-/// operation with no counterpart (willow-atth).
+/// operation with no counterpart.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_select_idle_wait() {
@@ -3578,7 +3578,7 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
     // Register the driver thread as a GC mutator while it drives tasks so a
     // future parallel collector can stop it at a safepoint. Single-mutator runs
     // have exactly one registered thread, so `multi_mutator_active()` stays false
-    // and GC behavior is unchanged (willow-6fv.5.6).
+    // and GC behavior is unchanged.
     let drive = SchedulerDriveGuard::new();
     #[cfg(test)]
     DRIVE_ENTRY_HOOK.with(|hook| {
@@ -3610,8 +3610,8 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
 }
 
 /// Purge captured external registrations of terminal tasks. Runs on every
-/// run-loop iteration, so the empty case must not take `GLOBAL_SCHEDULER`
-/// (willow-8hq4.19): the flag is set under the mutex after the push, and a
+/// run-loop iteration, so the empty case must not take `GLOBAL_SCHEDULER`: the flag is set
+/// under the mutex after the push, and a
 /// push seen by no drain yet keeps it raised until some drain takes the list,
 /// at the latest the drive-end drain, which runs after the workers have joined.
 ///
@@ -3641,12 +3641,12 @@ fn drain_terminal_cleanups() {
         // A task that dies while queued on (or holding a reservation for) a
         // scheduler-aware lock must not strand it: phase-driven cleanup removes
         // a `Waiting` entry, and re-hands ownership that was already reserved
-        // for this task (willow-38w.1.3, spec §12.3).
+        // for this task (scheduler-aware mutex support, spec §12.3).
         crate::async_mutex::purge_captured_task_lock_wait(cleanup.task_id, cleanup.lock_wait);
     }
 }
 
-/// Unroot the retired frames whose grace period has ended (willow-vjaf).
+/// Unroot the retired frames whose grace period has ended.
 /// Unless `force`d, runs only once a retirement raised [`FRAME_RELEASE_DUE`],
 /// so the run loop's empty case takes no lock. The run loop calls outside its
 /// execution unit. Explicit GC may call inside a unit: that conservatively
@@ -3679,7 +3679,7 @@ struct ParallelRunState {
     stop: AtomicBool,
     /// Serializes stop decisions. A claim takes it only while
     /// `stop_intent` is raised, so the claim hot path writes no shared lock
-    /// word (willow-8hq4.19).
+    /// word.
     claim_gate: Mutex<()>,
     /// Raised by a stop decision, under `claim_gate`, for the whole snapshot.
     /// With [`CLAIM_WORD`] it forms a store/load handshake: a claim increments
@@ -3698,8 +3698,8 @@ struct ParallelRunState {
     completed: AtomicI64,
 }
 
-/// One look at the drive target per terminal epoch for the whole pool
-/// (willow-8hq4.19). Every completion advances the epoch, and without this
+/// One look at the drive target per terminal epoch for the whole pool. Every completion
+/// advances the epoch, and without this
 /// every worker would lock the target's shard after every completion.
 #[derive(Debug, Default)]
 struct SharedTargetCheck {
@@ -3726,8 +3726,8 @@ impl ParallelRunState {
     /// and resolved while `quiescent` was evaluated. A claim that entered
     /// before the intent was raised is in the word; one that entered after it
     /// reads the intent and queues on `claim_gate` behind this decision, then
-    /// observes the stop. The stop is published only once it is final
-    /// (willow-6wd6), and before the intent is lowered, so a claim that reads
+    /// observes the stop. The stop is published only once it is final, and before the intent
+    /// is lowered, so a claim that reads
     /// the lowered intent also reads the stop.
     fn publish_stop_if(&self, quiescent: impl FnOnce(&Self) -> bool) -> bool {
         let _gate = self
@@ -3987,7 +3987,7 @@ fn run_parallel_worker(
     crate::stack_overflow::protect_current_thread();
     SCHED_RUN_DEPTH.with(|depth| depth.set(1));
     // An unwind out of the run loop must still unregister: a worker that dies
-    // registered blocks every later collection forever (willow-utqy).
+    // registered blocks every later collection forever.
     let mutator = crate::gc::MutatorRegistration::new();
     let worker_state = Arc::clone(&state);
     with_parallel_context(worker, worker_state, || {
@@ -4029,7 +4029,7 @@ fn target_is_done(target: Option<RuntimeTaskId>) -> bool {
 }
 
 /// Per-loop view of `target_is_done` that locks the target's shard only after
-/// the task table's terminal epoch moves (willow-8hq4.19).
+/// the task table's terminal epoch moves.
 ///
 /// Every worker of a drive asks on every iteration. Before, each question
 /// locked the one shard holding the target, so the workers contended on it.
@@ -4150,7 +4150,7 @@ pub extern "C" fn willow_sync_poll_cancel_cleanup() {
 }
 
 /// Pop/steal without the scheduler metadata mutex, then take only the task
-/// shard needed for atomic state validation and task-work lookup (willow-8agm).
+/// shard needed for atomic state validation and task-work lookup.
 fn claim_global_ready_for_worker(
     worker: usize,
     shared: Option<&ParallelRunState>,
@@ -4168,12 +4168,12 @@ fn claim_global_ready_for_worker(
     loop {
         // Publish the claim BEFORE the pop removes the id from every queue, and
         // keep it published until the claim has resolved into an active poll or
-        // a requeue (willow-atth).
+        // a requeue.
         let mut in_flight = ClaimInFlight::enter();
         let id = queues.pop_for_worker(worker)?;
         in_flight.popped();
-        // Only a stop decision in progress sends the claim through the gate
-        // (willow-8hq4.19). Outside one, the in-flight word already makes the
+        // Only a stop decision in progress sends the claim through the gate. Outside one, the
+        // in-flight word already makes the
         // whole resolution, including a foreign-affinity reroute or a
         // requeue, visible to any later decision: resolving advances the
         // epoch, so a snapshot that read an empty queue before the requeue
@@ -4323,7 +4323,7 @@ fn claim_global_ready_for_worker(
 /// (native stack or quantum affinity). A worker that still has queued local
 /// work would time-slice the new task with that work while another worker sits
 /// idle, so it hands an unpinned Ready task back to the shared queue and wakes
-/// an idle worker instead (willow-jz15.120). Idleness is "not running a poll",
+/// an idle worker instead. Idleness is "not running a poll",
 /// not "registered to park": a worker between parks, or one just woken for
 /// this very task, is not registered either, and treating it as busy pinned
 /// two tasks to one worker. Each hop is paired with a local pop by the busy
@@ -4332,7 +4332,7 @@ fn claim_global_ready_for_worker(
 /// already holds a task for every idle peer gains nothing from one more:
 /// requeueing then only churns the shared queue and wakes peers that find
 /// other work anyway, as when batch pops spread a spawn burst over every
-/// local queue (willow-xere).
+/// local queue.
 fn task_should_spread(
     task: &RuntimeTask,
     worker: usize,
@@ -4435,8 +4435,8 @@ fn scheduler_idle_step(
     // observation: using a value captured earlier can falsely declare global
     // idle while the other worker is still publishing a timer/netpoll waiter.
     // A claim that has popped its task but not yet reached `active_polls` is
-    // equally in-flight work, and is invisible in every other check
-    // (willow-atth).
+    // equally in-flight work, and is invisible in every other check.
+    //
     if claims_in_flight() {
         // Empty claims publish no event when they finish. Reprobe this short
         // transition instead of waiting indefinitely for a nonexistent poll.
@@ -4584,19 +4584,19 @@ enum WorkSource {
 ///   [`WorkSource::Poll`] is read BEFORE [`WorkSource::RunQueue`]. Reading
 ///   the poll counters only after the queue permits: `idle: queue empty` /
 ///   `worker: yield pushes the task, poll ends` / `idle: no active poll ->
-///   stop` (willow-8hq4.19).
+///   stop`.
 /// * A claim publishes its in-flight marker BEFORE it pops, so
 ///   [`WorkSource::Claim`] is read AFTER [`WorkSource::RunQueue`]. Reversing
 ///   that permits: `idle: no claims` / `worker: enter claim, pop the last
 ///   task, block on claim_gate` / `idle: queue empty -> stop`, after which the
 ///   worker sees the stop, requeues the task it is holding and leaves —
 ///   stranding a runnable task and returning from the drive with its target
-///   still alive (willow-6wd6). `claim_gate` alone does not cover this: it
-///   excludes claims that have not popped yet, not the pop itself
-///   (willow-atth).
+///   still alive. `claim_gate` alone does not cover this: it
+///   excludes claims that have not popped yet, not the pop itself.
+///
 ///
 /// None of these independently synchronized structures requires
-/// `GLOBAL_SCHEDULER` (willow-9ha4).
+/// `GLOBAL_SCHEDULER`.
 const IDLE_READ_ORDER: [WorkSource; 6] = [
     WorkSource::Poll,
     WorkSource::Timer,
@@ -4660,15 +4660,15 @@ fn scheduler_run_loop(
         }
         // A drive deadline belongs to the CALLER (sync `select` with a
         // `sleep(ms)` case), not to any task: give the caller its turn back on
-        // time instead of running unrelated tasks to quiescence first
-        // (willow-o038 review).
+        // time instead of running unrelated tasks to quiescence first.
+        //
         if deadline.is_some_and(|d| Instant::now() >= d) {
             break;
         }
         // Stop as soon as the TARGET task (an `await` of a concrete
         // handle) is done, instead of draining the whole scheduler to quiescence
         // — so awaiting one task does not run unrelated tasks to completion and
-        // cannot hang on an unrelated non-terminating task (willow-bsqy). A
+        // cannot hang on an unrelated non-terminating task. A
         // completed task may have been pruned (state None); treat that as done
         // too — the awaiter reads the result from the frame, not the task.
         if target_watch.is_done() {
@@ -4701,15 +4701,15 @@ fn scheduler_run_loop(
             break;
         }
         // Cooperative GC safepoint: cheap (one atomic load) when no collection is
-        // pending; lets a parallel collector stop this driver between task polls
-        // (willow-6fv.5.6).
+        // pending; lets a parallel collector stop this driver between task polls.
+        //
         crate::gc::relocatable_safepoint();
         // A runnable CPU task can keep the ready queue non-empty forever.
         // Promote expired timers before selecting work so those tasks still get
         // a turn without waiting for the scheduler to become idle. This runs on
         // every worker on every iteration, so it must stay cheap when no timer
         // exists: `wake_global_due_timers` answers that case with one atomic
-        // load and takes no lock at all (willow-9ha4).
+        // load and takes no lock at all.
         let woken_timers = wake_global_due_timers_now();
         let next = if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
             None
@@ -4733,8 +4733,8 @@ fn scheduler_run_loop(
             // sleeping), block until the earliest one and wake it, then keep
             // running. If netpoll has parked I/O waiters, wait for readiness
             // first (bounded by the nearest timer deadline) and wake matching
-            // tasks. Otherwise there is genuinely nothing left to do
-            // (willow-lpn.5.3 / willow-lcw).
+            // tasks. Otherwise there is genuinely nothing left to do.
+            //
             // Only worker 0 decides that a parallel run is globally idle.
             // Letting any worker stop the pool races with another worker that
             // is publishing a timer/netpoll waiter as its poll returns Pending.
@@ -4764,7 +4764,7 @@ fn scheduler_run_loop(
                 // when a later check failed; any worker that read the flag
                 // inside that rollback window left the pool for good, and any
                 // claim that read it requeued the task it was holding and went
-                // idle (willow-6wd6).
+                // idle.
                 if !state.publish_stop_if(parallel_run_is_idle_locked) {
                     continue;
                 }
@@ -4778,12 +4778,12 @@ fn scheduler_run_loop(
             park_until_fatal_abort();
         }
         // Poll, cleanup and their post-poll boundaries form one unit: frames
-        // retired while it runs keep their roots until it ends (willow-vjaf).
+        // retired while it runs keep their roots until it ends.
         // Idle waits stay outside it so a parked worker never delays release.
         let _unit = crate::frame_reclaim::ExecutionUnit::enter();
         // A task the claim moved to Cancelling: run its cleanup entry WITHOUT
-        // the scheduler lock (poll-like), then finalize as Cancelled
-        // (willow-vynv.3). The frame stays rooted until finalization.
+        // the scheduler lock (poll-like), then finalize as Cancelled. The frame stays rooted
+        // until finalization.
         let cancel_work = work.cancel;
         let frame_identity = cancel_work
             .as_ref()
@@ -5029,7 +5029,7 @@ fn scheduler_run_loop(
                 // releasing task roots before the abort, but that publication
                 // wakes this task's awaiters — without the gate another worker
                 // claims one and runs ordinary code past `await <panicked
-                // task>` in the window before the abort lands (willow-s9ej.7).
+                // task>` in the window before the abort lands.
                 begin_fatal_panic();
                 with_global(|sched| sched.finalize_panicked(id));
             }
@@ -5263,7 +5263,7 @@ pub extern "C" fn willow_task_stack_leave() {
     }
 }
 
-/// Idle-stop / drive-completion viewpoints (willow-6wd6).
+/// Idle-stop / drive-completion viewpoints.
 #[cfg(test)]
 #[path = "scheduler_idle_stop_tests.rs"]
 mod idle_stop_tests;
@@ -5291,7 +5291,7 @@ mod idle_backoff_tests;
 mod native_affinity_tests;
 
 /// Opt-in scaling and footprint measurements, kept out of the deterministic
-/// gate (willow-ezs.2/.3). See the module's own documentation for how to run
+/// gate. See the module's own documentation for how to run
 /// them and how to read the table.
 #[cfg(test)]
 #[path = "scheduler_scaling_tests.rs"]

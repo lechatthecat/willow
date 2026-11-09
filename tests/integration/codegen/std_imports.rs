@@ -1,6 +1,6 @@
 use super::*;
 
-// ── std namespace and basic item imports (willow-4bv.2, Stage 2) ───────────
+// ── std namespace and basic item imports (basic imports, Stage 2) ───────────
 // The reserved `std` namespace is resolved against the built-in registry, not
 // the filesystem. Single-item imports use `::` paths: `import std::mod::item;`.
 // Stage 2 establishes namespace + resolver; concrete collection *types* arrive
@@ -334,7 +334,7 @@ fn test_std_import_diagnostic_codes_are_distinct() {
     );
 }
 
-// ── std::collections type imports (willow-4bv.3, Stage 3) ───────────────────
+// ── std::collections type imports (type imports, Stage 3) ───────────────────
 
 #[test]
 fn test_std_collections_array_import_enables_annotations() {
@@ -517,7 +517,7 @@ fn main() {}
     );
 }
 
-// ── std::collections module imports (willow-4bv.4, Stage 4) ─────────────────
+// ── std::collections module imports (module imports, Stage 4) ─────────────────
 
 #[test]
 fn test_std_collections_module_import_enables_qualified_types_and_constructor() {
@@ -627,7 +627,7 @@ fn main() {}
     );
 }
 
-// ── std::collections alias imports (willow-4bv.5, Stage 5) ──────────────────
+// ── std::collections alias imports (alias imports, Stage 5) ──────────────────
 
 #[test]
 fn test_std_collection_array_alias_enables_type_positions() {
@@ -741,7 +741,7 @@ fn main() {}
     );
 }
 
-// ── fully qualified std paths (willow-4bv.6, Stage 6) ──────────────────────
+// ── fully qualified std paths (qualified paths, Stage 6) ──────────────────────
 
 #[test]
 fn test_fully_qualified_std_collection_array_type() {
@@ -815,7 +815,7 @@ fn main() {
     );
 }
 
-// ── grouped imports (willow-4bv.7, Stage 7) ────────────────────────────────
+// ── grouped imports (grouped imports, Stage 7) ────────────────────────────────
 
 #[test]
 fn test_grouped_std_collection_imports_are_usable() {

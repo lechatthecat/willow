@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Option/Result runtime behaviour (willow-0g8j.2.1) ───────────────────────
+// ── Option/Result runtime behaviour ───────────────────────
 //
 // The eligibility boundary is pinned by the `p*` unit tests in
 // `src/backend/cranelift/lir_gen.rs`. These pin the OUTPUT: for each shape the
@@ -171,7 +171,7 @@ fn main() {
 
 #[test]
 fn lir_diff_51_try_propagate_converts_the_error() {
-    // willow-1ow: when the operand's `E1` differs from the function's `E2` the
+    // when the operand's `E1` differs from the function's `E2` the
     // failure path calls `into()` and re-wraps. Forwarding the operand pointer
     // unchanged here would hand back a `PortError` where a `ConfigError` is
     // expected, and the field read would be off by whatever the layouts differ.

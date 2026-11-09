@@ -1,9 +1,9 @@
-//! `i64 ** i64` lowering (willow-n5yv.3).
+//! `i64 ** i64` lowering.
 //!
 //! Integer exponentiation is a compiler primitive, not a runtime call: a
 //! non-negative *literal* exponent unrolls into a multiplication chain and
 //! everything else becomes a bounded exponentiation-by-squaring loop. Overflow
-//! follows an ordinary Willow `*` (willow-jz15.14): release builds wrap modulo
+//! follows an ordinary Willow `*`: release builds wrap modulo
 //! 2^64 and debug builds raise a recoverable `integer overflow: `**`` panic.
 //!
 //! The debug check is exact. The schedule squares the accumulator only while

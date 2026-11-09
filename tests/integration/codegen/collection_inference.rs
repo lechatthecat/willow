@@ -102,7 +102,7 @@ fn main() {
     assert_eq!(out, "3\n");
 }
 
-// willow-ssl7.36: empty literal arguments must retain their parameter type.
+// empty literal arguments must retain their parameter type.
 #[test]
 fn contextual_empty_array_arguments() {
     let source = r#"
@@ -239,7 +239,7 @@ async fn main() {
     }
 }
 
-// willow-8hq4.33: the maximum inline buffer and the first old-generation
+// the maximum inline buffer and the first old-generation
 // buffer must preserve contents/roots in both optimization modes.
 #[test]
 fn array_literal_tlab_size_boundary_preserves_elements() {

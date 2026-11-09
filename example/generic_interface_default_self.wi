@@ -1,6 +1,6 @@
 // `self` in another module's generic interface default has the written
 // interface type, so it converts to `Gauge<i64>` and to the super-interface
-// `Labeled` there (willow-rktm).
+// `Labeled` there.
 import generic_interface_default_self_support::meters;
 
 class Tank implements meters::Meter<i64>, meters::Gauge<i64> {

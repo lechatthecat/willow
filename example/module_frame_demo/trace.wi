@@ -1,4 +1,4 @@
-// trace.wi — the module whose bodies panic (willow-0g8j.2.20).
+// trace.wi — the module whose bodies panic.
 //
 // Nothing here is aware of call frames. What matters is that these bodies live
 // in a DIFFERENT file from the caller: when one of them panics, the report can

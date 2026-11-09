@@ -1,4 +1,4 @@
-//! Scheduler-aware reader/writer lock runtime (willow-38w.1.5).
+//! Scheduler-aware reader/writer lock runtime.
 //!
 //! Readers and writers use the same `(LockId, RegistrationToken)` reverse-link
 //! protocol as [`crate::async_mutex`].  The native state admits readers while

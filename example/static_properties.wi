@@ -1,4 +1,4 @@
-// Immutable static properties (willow-qsqf, Stage 2).
+// Immutable static properties (static member support, Stage 2).
 //
 // A `static name: T = expr;` property is class-level, immutable, and initialized
 // once before `main` runs. Read it as `ClassName::property`. GC-managed values

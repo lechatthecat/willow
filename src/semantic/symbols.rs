@@ -164,7 +164,7 @@ pub struct FuncInfo {
     pub is_async: bool,
     pub declaration_span: Span,
     pub module_path: Option<String>,
-    /// The value of a module-level `const` (willow-jz15.10); `None` for every
+    /// The value of a module-level `const`; `None` for every
     /// callable function. A constant's name is a value of `return_type`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constant: Option<crate::parser::ast::ConstValue>,
@@ -184,14 +184,14 @@ pub struct FieldInfo {
     pub public: bool,
     pub protected: bool,
     pub declaration_span: Span,
-    /// Written somewhere after construction (willow-jz15.78). Part of the
+    /// Written somewhere after construction. Part of the
     /// declaration value, so a new write elsewhere invalidates reused bodies
     /// whose Send/Sync verdicts read this class.
     #[serde(default)]
     pub reassigned: bool,
 }
 
-/// An `init(...)` constructor's resolved signature (willow-scq2). MVP allows at
+/// An `init(...)` constructor's resolved signature. MVP allows at
 /// most one constructor per class.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ConstructorInfo {
@@ -202,7 +202,7 @@ pub struct ConstructorInfo {
     pub declaration_span: Span,
 }
 
-/// A `static [mut] name: T = expr` class property (willow-qsqf). Lives in global
+/// A `static [mut] name: T = expr` class property. Lives in global
 /// storage, not instance layout.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StaticPropInfo {
@@ -211,8 +211,8 @@ pub struct StaticPropInfo {
     pub public: bool,
     pub protected: bool,
     /// Declaration index within the class, for init order / forward-reference
-    /// checks (willow-qsqf §10.4). Populated now; read once §10.4 lands
-    /// (tracked: willow-pz6q.9).
+    /// checks (static member support §10.4). Populated now; read once §10.4 lands
+    /// (tracked: static property initialization checks).
     #[allow(dead_code)]
     pub decl_index: usize,
     #[allow(dead_code)]
@@ -228,7 +228,7 @@ pub struct MethodInfo {
     pub params: Vec<Type>,
     pub param_infos: Vec<ParamInfo>,
     /// `static fn` — class-level method with no receiver, called as
-    /// `Type::method(...)` (willow-qsqf). Drives `::` vs `.` resolution.
+    /// `Type::method(...)`. Drives `::` vs `.` resolution.
     pub is_static: bool,
     pub is_async: bool,
     pub return_type: Type,
@@ -253,13 +253,13 @@ pub struct ClassInfo {
     pub declaration_span: Span,
     pub fields: HashMap<String, FieldInfo>,
     pub methods: HashMap<String, MethodInfo>,
-    /// `static [mut] name: T = expr` properties (willow-qsqf), keyed by name.
+    /// `static [mut] name: T = expr` properties, keyed by name.
     pub static_props: HashMap<String, StaticPropInfo>,
     /// Instance fields in declaration order — drives the implicit memberwise
-    /// constructor and definite-assignment checking (willow-scq2).
+    /// constructor and definite-assignment checking.
     pub instance_field_order: Vec<(String, Type)>,
-    /// The explicit `init(...)` constructor, if the class declares one
-    /// (willow-scq2). `None` means the implicit memberwise constructor applies.
+    /// The explicit `init(...)` constructor, if the class declares one. `None` means the
+    /// implicit memberwise constructor applies.
     pub constructor: Option<ConstructorInfo>,
 }
 
@@ -299,8 +299,8 @@ pub struct InterfaceMethodInfo<N = String> {
     /// [`MethodInfo::param_infos`]. A `&`/`&mut` parameter is passed as a
     /// POINTER (`param_abi_type`), so the mode is part of the dispatch ABI:
     /// conformance, call checking and interface codegen all need it, and
-    /// `params` alone cannot distinguish `value: i64` from `value: &mut i64`
-    /// (willow-0g8j.9).
+    /// `params` alone cannot distinguish `value: i64` from `value: &mut i64`.
+    ///
     pub param_infos: Vec<ParamInfo<N>>,
     pub is_static: bool,
     pub return_type: Type<N>,
@@ -311,20 +311,20 @@ pub struct InterfaceMethodInfo<N = String> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InterfaceInfo<N = String> {
     pub name: N,
-    // `public`/`module_path` drive import visibility (willow-k6g); `declaration_span`
+    // `public`/`module_path` drive import visibility; `declaration_span`
     // feeds future diagnostics. Not read until those stages.
     #[allow(dead_code)]
     pub public: bool,
     pub methods: HashMap<String, InterfaceMethodInfo<N>>,
     /// Method names in declaration order — the deterministic vtable slot order
-    /// used by interface dispatch codegen (willow-xds).
+    /// used by interface dispatch codegen.
     pub method_order: super::method_slots::MethodSlots,
     /// Generic type parameter names in declaration order (`interface Foo<T>`),
-    /// empty for non-generic interfaces (willow-1js.1).
+    /// empty for non-generic interfaces.
     #[allow(dead_code)]
     pub type_params: Vec<N>,
-    /// Direct super-interfaces (`interface B extends A`), module-qualified
-    /// (willow-1js.2). Drives interface-to-interface subtyping; the inherited
+    /// Direct super-interfaces (`interface B extends A`), module-qualified. Drives
+    /// interface-to-interface subtyping; the inherited
     /// methods themselves are composed into `method_order` during desugaring.
     pub extends: Vec<N>,
     #[allow(dead_code)]

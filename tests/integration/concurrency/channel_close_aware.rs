@@ -1,7 +1,7 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Close-aware channel receive (willow-jz15.44): `Channel<T>::recv_opt()`
+// Close-aware channel receive: `Channel<T>::recv_opt()`
 // returns `Option<T>` — `Some(v)` while values remain, `None` once the channel
 // is closed AND drained — and `let v = ch.recv_opt() =>` is the select form.
 // Perspectives covered here:

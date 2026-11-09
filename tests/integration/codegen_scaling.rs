@@ -1,4 +1,4 @@
-//! Structural scaling of emitted code and data (epic willow-ssl7).
+//! Structural scaling of emitted code and data (epic compiler scaling).
 //!
 //! These tests do not time anything. Each one compiles a program whose SIZE is
 //! parameterized, keeps the intermediate object, and counts symbols or
@@ -8,18 +8,18 @@
 //!
 //! Three emitters are covered.
 //!
-//! * Normal-exit defer cleanup (willow-xgfk). A function with `D` defers and
+//! * Normal-exit defer cleanup. A function with `D` defers and
 //!   `E` early exits used to emit one full flush per exit, i.e. `D * E`
 //!   actions. The flush is now emitted once per distinct registration set and
 //!   entered with a continuation selector, so the action count is `D` and the
 //!   exits only contribute a jump each.
-//! * `?` error conversion through `Into` (willow-76bf). The conversion site
+//! * `?` error conversion through `Into`. The conversion site
 //!   used to switch over every subclass of the static error class and call each
 //!   one's `into` directly, so `S` conversion sites over `K` subclasses emitted
 //!   `S * K` calls. It now goes through ordinary virtual dispatch: one indirect
 //!   call per site, and the only per-class references left are the ones the
 //!   class descriptors own anyway.
-//! * Interface vtables (willow-ssl7.5). A vtable used to embed each super's
+//! * Interface vtables. A vtable used to embed each super's
 //!   table verbatim, so a diamond stored one copy of a shared ancestor per
 //!   inheritance PATH — doubling per level in the hierarchy below. It now
 //!   stores composed method pointers once followed by one pointer per direct
@@ -81,7 +81,7 @@ fn count_of(names: &[String], predicate: impl Fn(&str) -> bool) -> usize {
     names.iter().filter(|name| predicate(name)).count()
 }
 
-// ── willow-xgfk: one normal-exit flush per registration set ──────────────────
+// ── one normal-exit flush per registration set ──────────────────
 
 /// `D` defers, each printing a distinct number, and `E` early returns.
 fn defers_and_exits(defers: usize, exits: usize) -> String {
@@ -327,7 +327,7 @@ async fn main() {
     assert_eq!(out, "normal cleanup\ncancel cleanup\ntrue\n");
 }
 
-// ── willow-76bf: one virtual conversion per `?` site ─────────────────────────
+// ── one virtual conversion per `?` site ─────────────────────────
 
 /// `K` subclasses overriding `into`, and `S` functions that propagate the base
 /// error type with `?`.
@@ -492,7 +492,7 @@ fn main() { match run() { Result::Ok(v) => println(v), Result::Err(e) => println
     assert_eq!(out, "5\n");
 }
 
-// ── willow-ssl7.5: shared super tables instead of embedded copies ────────────
+// ── shared super tables instead of embedded copies ────────────
 
 /// A hierarchy whose inheritance PATH count doubles per level: every level has
 /// two interfaces, each extending both interfaces of the level below, so there
@@ -603,7 +603,7 @@ fn scaling_22_the_widening_example_survives_gc_stress() {
     assert_eq!(out, "700\n7\n70\ncard\n7\n7\ncard\n");
 }
 
-// ── willow-76bf: instructions and table slots counted apart ──────────────────
+// ── instructions and table slots counted apart ──────────────────
 
 #[test]
 fn scaling_23_call_instructions_are_counted_apart_from_table_slots() {
@@ -629,7 +629,7 @@ fn scaling_23_call_instructions_are_counted_apart_from_table_slots() {
     assert_eq!(data, 2 * 17);
 }
 
-// willow-ssl7.30: runtime-call cancellation edges share a terminal flush.
+// runtime-call cancellation edges share a terminal flush.
 fn cancellation_sites(defers: usize, sites: usize, branches: bool) -> String {
     let mut source =
         String::from("import std::collections::Array;\nfn work(xs: Array<i64>, i: i64) -> i64 {\n");

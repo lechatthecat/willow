@@ -1,4 +1,4 @@
-//! Bottom-type compatibility across value-consuming contexts (willow-9tls.53).
+//! Bottom-type compatibility across value-consuming contexts.
 use super::{ErrorCode, check_source};
 
 #[test]

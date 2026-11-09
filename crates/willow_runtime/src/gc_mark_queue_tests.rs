@@ -1,4 +1,4 @@
-//! Perspectives on the concurrent-mark work queue (willow-6fv.5.6.1).
+//! Perspectives on the concurrent-mark work queue.
 //!
 //! The queue is pure transport, so every test here is about *delivery* and
 //! *accounting*, never about what marking does with an item. Item addresses are

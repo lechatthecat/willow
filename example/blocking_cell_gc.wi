@@ -1,5 +1,5 @@
-// blocking_cell_gc.wi — BlockingCell<T> and BlockingRwCell<T> are GC objects
-// (willow-9tls.5).
+// blocking_cell_gc.wi — BlockingCell<T> and BlockingRwCell<T> are GC objects.
+//
 //
 // A blocking cell used to be a raw runtime pointer that lived until the
 // process exited, and every cell holding a reference was also recorded in a

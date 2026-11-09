@@ -12,7 +12,7 @@
 //   word 0 : state (i64)      — 0 = initial, N = after await N, i64::MAX = done
 //   word 1 : slot_count (i64) — number of data slots following the header
 //   word 2 : status (i64)     — terminal status + cancel-requested bit; see
-//                               the status constants below (willow-ezs.1.3)
+//                               the status constants below
 //   word 3 : slot 0           — first data slot (GC pointer or scalar)
 //   word 4 : slot 1
 //   …
@@ -58,14 +58,14 @@ pub const ASYNC_FRAME_SLOT_COUNT_OFFSET: usize = willow_abi::async_frame::header
     std::mem::size_of::<usize>() as u32,
 ) as usize;
 
-/// Byte offset of the `status` field within the payload (willow-ezs.1.3).
+/// Byte offset of the `status` field within the payload.
 pub const ASYNC_FRAME_STATUS_OFFSET: usize = willow_abi::async_frame::header_word_offset(
     willow_abi::async_frame::STATUS_WORD,
     std::mem::size_of::<usize>() as u32,
 ) as usize;
 
 // ---------------------------------------------------------------------------
-// Frame status word (willow-ezs.1.3)
+// Frame status word
 // ---------------------------------------------------------------------------
 //
 // Bits 0-2 hold the TERMINAL code; bit 8 is the cancel-requested flag. The
@@ -164,7 +164,7 @@ pub fn frame_request_cancel(frame: *mut c_void) {
 // ---------------------------------------------------------------------------
 
 /// Raw status word of a task frame — the compiler emits this wherever it has
-/// the awaitee's frame pointer (willow-ezs.1.3).
+/// the awaitee's frame pointer.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_frame_status(frame: *mut c_void) -> i64 {
@@ -516,7 +516,7 @@ mod tests {
     // -------------------------------------------------------------------------
     // F13: a STRING reference stored in a frame GC slot survives collection
     // while the frame is rooted (matches the compiler mask bit for a String
-    // frame field — willow-lpn.4).
+    // frame field — async frame storage).
     // -------------------------------------------------------------------------
     #[test]
     fn frame_f13_string_ref_slot_survives() {
@@ -600,7 +600,7 @@ mod tests {
     // -------------------------------------------------------------------------
     // F15: an ARRAY reference stored in a frame GC slot survives collection
     // while the frame is rooted (matches the compiler mask bit for an Array
-    // frame field — willow-lpn.4).
+    // frame field — async frame storage).
     // -------------------------------------------------------------------------
     #[test]
     fn frame_f15_array_ref_slot_survives() {
@@ -635,7 +635,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Frame status word (willow-ezs.1.3).
+    // Frame status word.
     //
     // Terminal status lives in the fixed header so that `await task`,
     // `await task.result()` and `is_cancelled` can answer from the frame the

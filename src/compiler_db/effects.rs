@@ -289,12 +289,12 @@ pub(crate) struct EffectQueries {
     roots: std::cell::RefCell<HashMap<UnitId, Vec<BodyId>>>,
     names: HashMap<String, UnitId>,
     dependencies: Option<std::rc::Rc<super::dependencies::ModuleDependencies>>,
-    /// Debug builds check `+ - * **` and unary `-` on `i64` for overflow
-    /// (willow-jz15.14), which makes those operators recoverable faults.
+    /// Debug builds check `+ - * **` and unary `-` on `i64` for overflow, which makes those
+    /// operators recoverable faults.
     /// Release builds wrap. Sessions without a mode stay conservative.
     overflow_checks: bool,
     /// Function-value facts of the units checked so far in this session, for
-    /// E2604 through indirect calls (willow-h4t7).
+    /// E2604 through indirect calls.
     pub(crate) indirect_lock: std::cell::RefCell<IndirectLockSession>,
 }
 impl Default for EffectQueries {
@@ -1123,7 +1123,7 @@ impl EffectQueries {
     /// Resolve a declared callable before reading its asyncness or evidence.
     /// Source dependencies also invalidate asyncness and witness-only edits.
     /// Arity mask of the function values `target`, a callable of an earlier
-    /// checked unit, can call indirectly before returning (willow-h4t7).
+    /// checked unit, can call indirectly before returning.
     pub(crate) fn indirect_reach(
         &self,
         consumer: UnitId,
@@ -3577,7 +3577,7 @@ impl<N> HazardVisitor<'_, N> {
             // Every call form is an edge in the shared graph, classified by
             // `classify_edge` rather than here. A field access lowers to a
             // plain load of a checked layout offset with no language-level
-            // guard (willow-8hq4.14); its receiver is visited on its own.
+            // guard; its receiver is visited on its own.
             Expr::FieldAccess(..)
             | Expr::Call(_)
             | Expr::MethodCall(_)
@@ -3675,8 +3675,8 @@ pub(crate) struct LockTarget {
 }
 
 impl LockEffectKind {
-    /// The lattice bits this wait contributes to the shared effect fixpoint
-    /// (willow-uqzx.1.3).
+    /// The lattice bits this wait contributes to the shared effect fixpoint.
+    ///
     pub(crate) fn effects(self) -> RuntimeEffects {
         match self {
             Self::Suspend => RuntimeEffects::MAY_SUSPEND,
@@ -3728,7 +3728,7 @@ impl Ord for LockEffectWitness {
 }
 
 /// Session aggregate of function values and indirect lock-held calls, keyed
-/// by arity bit (`1 << min(arity, 63)`) (willow-h4t7). Units add their facts
+/// by arity bit (`1 << min(arity, 63)`). Units add their facts
 /// when they finish, so each cross-unit pair is checked by the later unit.
 #[derive(Default)]
 pub(crate) struct IndirectLockSession {

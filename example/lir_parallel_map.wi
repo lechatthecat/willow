@@ -1,5 +1,5 @@
-// lir_parallel_map.wi — `parallel::map` compiled from Lowered IR
-// (willow-0g8j.2.13).
+// lir_parallel_map.wi — `parallel::map` compiled from Lowered IR.
+//
 //
 // `parallel::map` is a NAMESPACE call: `parallel` has no layout and no methods,
 // so `parallel::map(frozen, f)` becomes one direct runtime call and the runtime
@@ -16,7 +16,7 @@
 // with nothing for the collector to trace.
 //
 // Every function declared here is compiled by the walker — since
-// willow-0g8j.3 there is nothing else to compile it. Run under
+// the lowered-IR cutover there is nothing else to compile it. Run under
 // `WILLOW_LIR_LOG=1` to watch each one being claimed.
 
 import std::collections::Array;

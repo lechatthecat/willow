@@ -1,6 +1,6 @@
 use super::super::support::*;
 
-// ── E180x type-inference and `?` diagnostics (willow-aff.3) ────────────────
+// ── E180x type-inference and `?` diagnostics ────────────────
 // Acceptance criteria from requirements/requirements_option_result.md:
 //   E1801 — cannot infer `T` for `Option::None`
 //   E1803 — cannot infer `E` for `Result::Ok` / cannot infer `T` for `Result::Err`

@@ -15,7 +15,7 @@ use super::{
 };
 
 /// Collector-private address keys use the shared folded multiply; SipHash
-/// dominated minor collection time (willow-8hq4.16).
+/// dominated minor collection time.
 pub(super) use crate::id_hash::IdHasher as AddressHasher;
 type AddressMap<V> = HashMap<usize, V, BuildHasherDefault<AddressHasher>>;
 type AddressSet = HashSet<usize, BuildHasherDefault<AddressHasher>>;
@@ -565,7 +565,7 @@ impl<'a> MinorCollector<'a> {
         }
     }
 
-    /// Evacuate a root slot's young referent and rewrite the slot (willow-9tls.9).
+    /// Evacuate a root slot's young referent and rewrite the slot.
     /// The slot is the holder's only copy across this collection, so the
     /// referent need not stay in place. A slot already rewritten earlier in
     /// this cycle (an aliased registration) names a destination and is left
@@ -955,7 +955,7 @@ impl<'a> MinorCollector<'a> {
                 // A destination of this cycle holds only the young copies
                 // `allocate_survivor` indexed and marked: its offsets, start
                 // bits and live bytes are already exact. Re-walking it would
-                // revisit every survivor once more (willow-jz15.120).
+                // revisit every survivor once more.
                 let chunk = &self.state.tlab_chunks[chunk_index];
                 debug_assert_eq!(chunk.kind, RegionKind::Survivor);
                 debug_assert_eq!(chunk.live_bytes, chunk.used);
@@ -1339,7 +1339,7 @@ fn verify_no_pin_enabled(value: Option<&std::ffi::OsStr>) -> bool {
 /// Run one minor collection over `roots`, or return `None` to defer it.
 ///
 /// Value roots come from threads parked inside runtime code, whose Rust frames
-/// may keep raw copies of a young referent (willow-9tls.9). Such a park is
+/// may keep raw copies of a young referent. Such a park is
 /// normally transient: the frame resumes after this stop and a later
 /// allocation slow path retries, one TLAB chunk later (`minor_retry_bytes`).
 /// Deferring instead of pinning keeps every nursery object movable. The
@@ -1535,7 +1535,7 @@ pub(crate) fn deferred_minor_collections_for_test() -> u64 {
 /// Run a minor collection that promotes young referents of runtime-held value
 /// roots in place, as under a hard memory budget, instead of deferring. Unit
 /// fixtures use it to drive the remaining pinned-region paths without a
-/// budget (willow-9tls.9). The flag is thread-local so concurrently running
+/// budget. The flag is thread-local so concurrently running
 /// tests that expect deferral are unaffected.
 #[cfg(test)]
 pub(crate) fn minor_collect_pinning_for_test() {
@@ -1636,7 +1636,7 @@ pub(crate) fn minor_collect_internal() {
     let _reserve = SurvivorAdmission::new();
     // Stop the world and scan every registered mutator, for the reason spelled
     // out over the major cycle's mark phase: a registration that races a
-    // single-mutator scan leaves the newcomer's objects unmarked (willow-v6k0).
+    // single-mutator scan leaves the newcomer's objects unmarked.
     let collected = with_stw(
         crate::gc_telemetry::stops::StopReason::Minor,
         |coord, stop_work| {

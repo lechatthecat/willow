@@ -1,4 +1,4 @@
-// async_concurrent.wi — many concurrent async tasks (willow-9lw / willow-h2vf).
+// async_concurrent.wi — many concurrent async tasks.
 //
 // Each `async fn` lowers to a pollable state machine: `await sleep(n)` suspends
 // and yields to the cooperative single-threaded executor (it does NOT block a

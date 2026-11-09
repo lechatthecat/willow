@@ -25,7 +25,7 @@ pub open class Parcel implements Measured {
 
 // Inherits `implements Measured` from `Parcel`, so it gets its own copy of the
 // `label` default. Neither copy is something this file wrote, so neither needs
-// an `override` keyword (willow-3eo1).
+// an `override` keyword.
 pub class BigParcel extends Parcel {
     pub static fn make(side: i64) -> BigParcel {
         return new BigParcel(side);

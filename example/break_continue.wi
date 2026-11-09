@@ -1,4 +1,4 @@
-// break / continue (willow-kzka): exit or skip within the innermost loop.
+// break / continue: exit or skip within the innermost loop.
 // `continue` in a for-loop still advances the induction variable; break in
 // nested loops exits only the inner one. Outside a loop both are E0904.
 

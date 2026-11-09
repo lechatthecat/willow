@@ -1,5 +1,5 @@
 // type_argument_arity -- a written type must carry exactly the type arguments
-// its declaration takes (willow-rlq9).
+// its declaration takes.
 //
 // The checker validates every annotation position -- parameters, return
 // types, `let` annotations, class fields, lambda parameters, and the

@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Virtual dispatch for overridden methods (willow-ftk) ─────────────────────
+// ── Virtual dispatch for overridden methods ─────────────────────
 
 #[test]
 fn virtual_dispatch_01_override_via_base_ref() {
@@ -37,7 +37,7 @@ fn main() { println(new Dog().describe()); }
 #[test]
 fn virtual_dispatch_03_inherited_non_override_dispatches_to_base() {
     // A subclass that does NOT override must dispatch to the inherited base
-    // implementation (regression for the fall-through bug, willow-ftk).
+    // implementation (regression for the fall-through bug, virtual dispatch).
     let (out, ok) = compile_and_run(
         r#"
 open class Animal { pub open fn sound(self) -> String { return "base"; } }

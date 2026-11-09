@@ -472,7 +472,7 @@ fn package_loader_feeds_consumer_dependency_index_and_backend_classification() {
 
 #[test]
 fn item_imports_bind_one_module_spelling_per_written_prefix() {
-    // willow-jz15.43: a project module is registered under its package-qualified
+    // a project module is registered under its package-qualified
     // name, so the prefix an item import writes needs one spelling, however
     // many items the unit imports from it.
     for count in [1, 8, 64] {
@@ -501,7 +501,7 @@ fn item_imports_bind_one_module_spelling_per_written_prefix() {
         assert_eq!(spelling.access, "util");
         assert_ne!(spelling.graph_name, "util");
         assert_eq!(spelling.types.len(), count);
-        // Item imports keep the module's bare names unbound (willow-vtlr).
+        // Item imports keep the module's bare names unbound.
         assert!(!imports.visible_modules.contains("util"));
     }
 }

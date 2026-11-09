@@ -1,4 +1,4 @@
-//! willow-s9ej.12 — a terminating deferred action must terminate its current
+//! Deferred termination — a terminating deferred action must terminate its current
 //! Cranelift block; no cleanup/return/jump may be appended afterwards.
 //!
 //! Perspectives:
@@ -231,7 +231,7 @@ fn main() {
 /// A synchronous scope that is left by `return` has no fallthrough
 /// `LeaveDeferScope` in LIR. Recovery still has to resume at the lexical
 /// continuation, not at a backend-invented block after the function body has
-/// already been emitted (willow-0g8j.2.15).
+/// already been emitted.
 #[test]
 fn defer_term_24_lir_early_return_recovery_uses_the_lexical_continuation() {
     let (out, ok) = compile_and_run_with_env(RECOVERED_PATHS, &[]);

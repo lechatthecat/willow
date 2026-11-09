@@ -1,6 +1,6 @@
 use super::support::*;
 
-// Permanent T? -> Option<T> parser normalization — willow-glaj.4/.10.
+// Permanent T? -> Option<T> parser normalization — Option normalization.
 
 fn run(source: &str) -> String {
     let (out, ok) = compile_and_run(source);

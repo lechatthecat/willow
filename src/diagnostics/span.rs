@@ -49,7 +49,7 @@ impl Span {
     /// Merging two token spans with [`Span::new`] would stamp the merged span
     /// with [`FileId::ENTRY`], so every construct whose span spans more than one
     /// token — a class, a method, a match arm — would report against the entry
-    /// file even when it was parsed from an imported module (willow-3eo1).
+    /// file even when it was parsed from an imported module.
     pub fn to(self, end: Span) -> Span {
         Self {
             file_id: self.file_id,

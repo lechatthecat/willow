@@ -1,11 +1,11 @@
 use super::*;
 
-// ── ? error conversion: virtual Into dispatch on subclassed errors (bpk6) ────
+// ── ? error conversion: virtual Into dispatch on subclassed errors ────
 
 #[test]
 fn try_convert_11_subclassed_error_uses_override() {
     // A Result<_, BaseErr> holding a SpecificErr (override of into) must convert
-    // via the override when propagated with `?` (willow-bpk6).
+    // via the override when propagated with `?`.
     let (out, ok) = compile_and_run(
         r#"
 class AppErr { pub code: i64; }
@@ -64,7 +64,7 @@ fn main() {
 fn try_convert_13_scalar_into_override_returns_by_value() {
     // The virtual `into` call takes its signature from the target's declared
     // return type: an `Into<f64>`/`Into<bool>` override returns a scalar, not a
-    // pointer, and must not ICE the Cranelift verifier (review of willow-ssl7).
+    // pointer, and must not ICE the Cranelift verifier (review of compiler scaling).
     let (out, ok) = compile_and_run(
         r#"
 open class BaseErr implements Into<f64> {

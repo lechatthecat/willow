@@ -1,4 +1,4 @@
-//! willow-ijui.12: execute the proof and its invalidation paths in both modes.
+//! execute the proof and its invalidation paths in both modes.
 use super::support::*;
 use std::time::Duration;
 

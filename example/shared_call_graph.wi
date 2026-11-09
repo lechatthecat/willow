@@ -1,5 +1,5 @@
-// shared_call_graph.wi — one call graph, one virtual-dispatch rule
-// (willow-uqzx.1.2).
+// shared_call_graph.wi — one call graph, one virtual-dispatch rule.
+//
 //
 // Two separate analyses ask a method call the same question: "which bodies can
 // this actually run?"

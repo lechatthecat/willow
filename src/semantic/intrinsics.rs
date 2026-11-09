@@ -1,4 +1,4 @@
-//! Resolved identity for Willow's builtin methods (willow-uqzx, catalog item 7).
+//! Resolved identity for Willow's builtin methods (shared compiler infrastructure, catalog item 7).
 //!
 //! A call like `ch.recv()` or `arr.toString()` is not a user method call: it is
 //! a compiler intrinsic that lowers to a specific runtime symbol. Deciding
@@ -60,8 +60,8 @@ pub enum Intrinsic {
     F64ToString,
     /// `bool.toString()` → `willow_bool_to_string`.
     BoolToString,
-    /// `i64.wrapping_add(i64)`: two's-complement `+` in every build mode
-    /// (willow-jz15.14). Inline, like the other explicit overflow operations.
+    /// `i64.wrapping_add(i64)`: two's-complement `+` in every build mode. Inline, like the
+    /// other explicit overflow operations.
     I64WrappingAdd,
     /// `i64.wrapping_sub(i64)`.
     I64WrappingSub,
@@ -154,7 +154,7 @@ pub enum Intrinsic {
     /// `Channel<T>::recv()` — a suspension point on an empty channel.
     ChannelRecv,
     /// `Channel<T>::recv_opt()` → `Option<T>`: `recv` that answers `None`
-    /// once the channel is closed and drained (willow-jz15.44).
+    /// once the channel is closed and drained.
     ChannelRecvOpt,
     /// `Channel<T>::close()`.
     ChannelClose,
@@ -502,8 +502,8 @@ pub(crate) fn adt_callback(ty: &Type, method: &str) -> bool {
 
 /// The builtin free functions code generation defines as ordinary
 /// Willow-ABI functions, so they can be used as `fn` values. Every other
-/// builtin is lowered inline at each call site and has no address
-/// (willow-yf49).
+/// builtin is lowered inline at each call site and has no address.
+///
 pub(crate) const ADDRESSABLE_BUILTINS: [&str; 2] = ["pow", "powf"];
 
 /// Full runtime effects of a call target that has no Willow body: a builtin
@@ -653,8 +653,8 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
             return Some(ResolvedMethod::fixed(intrinsic, ty));
         }
     }
-    // Explicit overflow behavior, independent of the build mode
-    // (willow-jz15.14).
+    // Explicit overflow behavior, independent of the build mode.
+    //
     if matches!(recv, Type::I64) {
         let option = || B::Option.apply(vec![Type::I64]);
         let entry = match (method, arity) {
@@ -672,7 +672,7 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
             return Some(ResolvedMethod::fixed(intrinsic, ty));
         }
     }
-    // Scalar `toString` conversions (willow-fvfc).
+    // Scalar `toString` conversions.
     if method == "toString" && arity == 0 {
         match recv {
             Type::I64 => return Some(ResolvedMethod::fixed(Intrinsic::I64ToString, Type::String)),
@@ -1940,7 +1940,7 @@ async fn f() {
     }
 
     /// Perspective 37b: the explicit `i64` overflow methods. `wrapping_*`
-    /// return `i64`; `checked_*` return `Option<i64>` (willow-jz15.14).
+    /// return `i64`; `checked_*` return `Option<i64>`.
     #[test]
     fn p37b_integer_overflow_methods_agree() {
         assert_agrees(INTEGERS, 8);
@@ -2176,7 +2176,7 @@ fn f() {
 
 /// The zero-argument runtime statistic builtins: `() -> i64` reads of a runtime
 /// counter. Their ABI entries are all `NONE; ([] -> Some(I64))`, so LIR
-/// emission needs only the runtime call (willow-0g8j.3.1).
+/// emission needs only the runtime call.
 ///
 /// Derived from `builtin_call_runtime_name` rather than repeating its list:
 /// Collection and task-frame diagnostic calls return void, and
@@ -2350,7 +2350,7 @@ pub(crate) fn namespace_builtin(class: &str, method: &str) -> Option<NamespaceBu
         ("fs", "exists_async") => rt::willow_fs_exists_async,
         ("fs", "remove_file_async") => rt::willow_fs_remove_file_async,
 
-        // `parallel::map(frozen, f)` (willow-0g8j.2.13). Its two arguments are
+        // `parallel::map(frozen, f)`. Its two arguments are
         // the only ones in this table that are not scalars or strings: a
         // `FrozenArray<i64>`, which is rooted like any other heap handle, and a
         // FUNCTION VALUE, which is a bare code address and so is deliberately

@@ -1,4 +1,4 @@
-// Reconstructed for willow-8hq4.41; not the unavailable historical probe.
+// Reconstructed for the scheduler/GC comparison; not the unavailable historical probe.
 async fn main() {
     let n = 4000000;
     let mut i = 0;

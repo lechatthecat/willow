@@ -189,7 +189,7 @@ pub(super) fn retire_tlab_locked(state: &mut GcState, address: usize) {
         );
         // Header indexing is deferred to the first walk that needs it
         // (`index_retired_chunk`), so a nursery chunk that dies entirely in
-        // the next minor collection is never walked (willow-8hq4.21). Every
+        // the next minor collection is never walked. Every
         // start bit but the slow-path first object came from the fast path.
         record.retired_fast_allocations = record
             .retired_fast_allocations
@@ -205,7 +205,7 @@ pub(super) fn retire_tlab_locked(state: &mut GcState, address: usize) {
 /// for collector liveness/generation fields. Header addresses come from the
 /// published start bits rather than from chasing `offset += size`: each header
 /// load is then independent of the previous one, and the size chain is only
-/// compared, never used as an address (willow-8hq4.16). An unpublished header
+/// compared, never used as an address. An unpublished header
 /// shows up as a gap and an extra bit as an overlap.
 pub(super) fn index_retired_chunk(chunk: &mut BumpChunk) -> usize {
     if !chunk.needs_index() {
@@ -363,8 +363,8 @@ pub(super) fn retire_tlabs_for_thread(owner: ThreadId) {
 
 /// Zeroed storage and start bitmaps for one TLAB chunk, prepared before the
 /// refill takes the heap lock. Zeroing 32 KiB and allocating both bitmaps
-/// inside the critical section serialized every concurrent refill
-/// (willow-jz15.120). Dropping an uninstalled value releases the storage.
+/// inside the critical section serialized every concurrent refill. Dropping an uninstalled
+/// value releases the storage.
 pub(super) struct ChunkStorage {
     block: StorageBlock,
     mark_bitmap: RegionMarkBitmap,

@@ -1,4 +1,4 @@
-// Fused String concatenation chains (willow-8hq4.29).
+// Fused String concatenation chains.
 //
 // A left-nested `+` chain whose intermediates are compiler temporaries is
 // lowered to one `willow_string_concat_n` call that sizes the result once and

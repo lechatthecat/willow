@@ -1,4 +1,4 @@
-//! Type-argument arity of written types (willow-rlq9).
+//! Type-argument arity of written types.
 //!
 //! `validate_type` used to accept any head-plus-arguments shape as long as the
 //! head named something. A bare generic (`Option`, `Wrap`, `Conv`) passed as an

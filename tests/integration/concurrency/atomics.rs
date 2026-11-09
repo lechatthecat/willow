@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Atomic primitives AtomicI64 / AtomicBool (willow-dgwo.3) ──────────────────
+// ── Atomic primitives AtomicI64 / AtomicBool ──────────────────
 //
 // 20 test perspectives:
 //  1. AtomicI64::new + load reads the initial value.

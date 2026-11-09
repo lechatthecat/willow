@@ -1,4 +1,4 @@
-// Typed HIR demo (willow-mb5).
+// Typed HIR demo.
 //
 // Build normally, or inspect the typed high-level IR with:
 //
@@ -8,7 +8,7 @@
 // with every expression annotated by its resolved type (`<expr>: <type>`);
 // `--emit-lir` prints the basic-block Lowered IR. This program is in the
 // scalar subset, so `fib` is COMPILED from the Lowered IR (the AST -> Typed
-// HIR -> Lowered IR -> Cranelift pipeline, willow-0g8j) — set WILLOW_LIR_LOG=1
+// HIR -> Lowered IR -> Cranelift pipeline, the lowered-IR pipeline) — set WILLOW_LIR_LOG=1
 // to see it happen.
 
 fn fib(n: i64) -> i64 {

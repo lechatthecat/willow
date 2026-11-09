@@ -1,4 +1,4 @@
-//! Machine-code block placement policy (willow-nzsg).
+//! Machine-code block placement policy.
 //!
 //! Cranelift lowers blocks in the reverse postorder of a successor DFS and
 //! sinks only blocks marked cold (or ending in a trap) to the end of the
@@ -17,8 +17,8 @@
 //!
 //! Both only change placement; no instruction executes differently.
 //!
-//! Orientation is limited to loops that call no compiled function
-//! (willow-3za7). It also changes the dominator-tree visiting order of
+//! Orientation is limited to loops that call no compiled function. It also changes the
+//! dominator-tree visiting order of
 //! Cranelift's egraph elaboration: once a loop's body is visited before its
 //! exit, Cranelift hoists argument-free values such as the `func_addr` targets
 //! of guarded interface dispatch out of the loop. Across the loop's calls each
@@ -578,7 +578,7 @@ mod tests {
         shapes
     }
 
-    // The array_read_sum_only phase (willow-nzsg): inline len/index slow paths
+    // The array_read_sum_only phase: inline len/index slow paths
     // and the safepoint runtime calls must all sit outside the hot loop. Per
     // trip the read loop loads the GC stop flag, the countdown, the owner
     // from its root slot, the length, the buffer and the element, and stores
@@ -604,7 +604,7 @@ mod tests {
         assert_eq!((read.hot_loads, read.hot_stores), (6, 1));
     }
 
-    // The array_write_only phase (willow-ijui.10): the store's receiver copy
+    // The array_write_only phase: the store's receiver copy
     // needs no root, and the store reuses the owner, length and buffer the
     // condition validated. Per trip: the GC stop flag, the countdown, the
     // owner, the length and the buffer are loaded; the countdown and the

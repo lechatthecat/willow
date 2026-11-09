@@ -1,7 +1,7 @@
-//! A default interface method is injected ONCE per `extends` chain (willow-3eo1).
+//! A default interface method is injected ONCE per `extends` chain.
 //!
 //! `implements` is propagated down an `extends` chain so every subclass gets its
-//! own (class, interface) vtable (willow-2s4i). Default-method injection then ran
+//! own (class, interface) vtable. Default-method injection then ran
 //! for every one of those classes, so `Base`, `Mid` and `Leaf` each received a
 //! private copy of the same interface default body. Two consequences, both
 //! wrong:
@@ -541,7 +541,7 @@ fn main() {
 }
 
 // 18. The chain inside an imported MODULE — the case that surfaced this, since
-//     module bodies were not checked before willow-3eo1.
+//     module bodies were not checked before module body checking.
 #[test]
 fn default_inheritance_18_a_module_chain_compiles_and_runs() {
     let lib = "

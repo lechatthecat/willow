@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Return-position channel recv is a real suspend point (willow-0a6k.6) ────
+// ── Return-position channel recv is a real suspend point ────
 // `return ch.recv();` used to fall into the SYNC recv path: it block-drove
 // the scheduler from inside its own poll (nested run), could not park, could
 // not be cancelled, and aborted 'recv would block' at idle. Now it suspends
@@ -198,7 +198,7 @@ fn rrecv_20_two_channels() {
     assert_eq!(out, "1\n2\n");
 }
 
-// Review fixes on the recv suspend arms (willow-0a6k.6): is_channel_recv
+// Review fixes on the recv suspend arms: is_channel_recv
 // matched by NAME only, so a user-defined `recv()` method was hijacked into
 // the channel runtime (with an i64 element-type fallback). The arms are now
 // gated on the receiver actually typing as Channel<T>. 21 user recv() in

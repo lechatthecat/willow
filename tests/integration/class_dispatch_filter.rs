@@ -1,4 +1,4 @@
-//! Class-method dispatch chain filtering (willow-au5k).
+//! Class-method dispatch chain filtering.
 //!
 //! A class-method call whose receiver's runtime type is not known statically
 //! compiles to a chain of `type_id` comparisons. The chain used to include
@@ -498,7 +498,7 @@ fn main() {
 /// clear of both, so it fails on a regression without tracking codegen noise.
 ///
 /// The 33-way chain this bound was written against lived in the AST emitter
-/// willow-0g8j.3 retired. The LIR walker emits a direct call for a class shape
+/// the lowered-IR cutover retired. The LIR walker emits a direct call for a class shape
 /// like this one, so the bound is slack today and stands as a plain code-size
 /// regression guard rather than as a test of the filter itself.
 #[test]

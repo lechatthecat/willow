@@ -438,7 +438,7 @@ fn constructor_flow_recovery_exits_require_initialization() {
     }
 }
 
-/// willow-ssl7.19: calls and cleanups consult checker-owned panic facts, and
+/// calls and cleanups consult checker-owned panic facts, and
 /// only a direct `recover()` creates a recovery exit.
 #[test]
 fn constructor_flow_effect_refinement_perspectives() {
@@ -575,7 +575,7 @@ interface Probe { fn ok(self) -> bool; }
     );
 }
 
-/// willow-ssl7.19 scaling: helper chains, recursive SCCs, fan-out and repeated
+/// Constructor-flow analysis scaling: helper chains, recursive SCCs, fan-out and repeated
 /// calls. The checker accepts each shape through solved facts, and one flow
 /// run asks the call oracle exactly once per call expression.
 #[test]

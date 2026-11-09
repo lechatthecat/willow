@@ -1,4 +1,4 @@
-//! Native `f64 ** f64` lowering (willow-n5yv.4-.10).
+//! Native `f64 ** f64` lowering (floating-point exponentiation).
 //!
 //! The general-exponent numerical kernel is a Cranelift translation of the
 //! binary64 `pow` algorithm shipped by rust-lang/libm 0.2.16, which preserves
@@ -21,7 +21,7 @@
 //! intermediate. Negative literals share the dispatcher; nonnegative literals
 //! unroll the same multiplication order. There is no uniform small-ULP accuracy
 //! guarantee for the integral path: squaring amplifies earlier rounding errors.
-//! The sampled maximum in willow-zeow's grid/near-one corpus is 27,174,730,217
+//! The sampled maximum in the floating-point accuracy audit's grid/near-one corpus is 27,174,730,217
 //! ULP, not a global error bound. See
 //! docs/f64_power_contract.md and its reproducible numerical audit.
 

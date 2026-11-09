@@ -16,7 +16,7 @@ use std::sync::Mutex as TestMutex;
 use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::time::Instant;
 
-// Test perspectives for the Stage 3 Mutex state machine (willow-38w.1.3).
+// Test perspectives for the Stage 3 Mutex state machine.
 // Each maps to at least one test below.
 //
 //  1. A fresh mutex is unowned, has no waiters, and is reclaimable.

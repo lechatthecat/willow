@@ -52,7 +52,7 @@ im = { version = "15.1.0", features = ["serde"] }
 # The runtime's hot FFI entry points (willow_sync_poll_counter, safepoint and
 # barrier fast paths) are called from every generated function. With the
 # default 16 codegen units, thread_local! accessor shims can be partitioned
-# away from their callers and stop being inlined (willow-vos2).
+# away from their callers and stop being inlined.
 [profile.release.package.willow_runtime]
 codegen-units = 1
 

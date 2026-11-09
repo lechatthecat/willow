@@ -1,8 +1,8 @@
-// Diverging code, formatted strings and scalar `toString` on the LIR backend
-// (willow-0g8j.2.5).
+// Diverging code, formatted strings and scalar `toString` on the LIR backend.
+//
 //
 // Every function here stays inside the LIR walker's subset, which since
-// willow-0g8j.3 is the only way a function body gets compiled at all:
+// the lowered-IR cutover is the only way a function body gets compiled at all:
 //
 //     WILLOW_LIR_LOG=1 willow build example/lir_divergence.wi
 //

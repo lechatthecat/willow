@@ -1,4 +1,4 @@
-// Interface methods that take `&` / `&mut` parameters (willow-0g8j.9).
+// Interface methods that take `&` / `&mut` parameters.
 //
 // A reference parameter is passed as a POINTER to the caller's place, not as a
 // copy of its value. That is true for a virtual call too: dispatching through

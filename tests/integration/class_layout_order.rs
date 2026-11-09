@@ -1,4 +1,4 @@
-//! Class field layout is independent of DECLARATION ORDER (willow-59gx).
+//! Class field layout is independent of DECLARATION ORDER.
 //!
 //! A class's layout is its base's layout followed by the fields it declares
 //! itself. That rule is what makes an inherited field sit at the same offset
@@ -44,7 +44,7 @@
 //!  23. the runnable example prints what it documents
 //!
 //! Every behavioral perspective runs the program and asserts what it prints:
-//! since willow-0g8j.3 a body outside the walker's subset does not compile, so
+//! since the lowered-IR cutover a body outside the walker's subset does not compile, so
 //! a layout bug shows up as a wrong ANSWER rather than as a refusal.
 
 use super::support::{TestProject, compile_and_run_gc_stress, compile_with_env_and_run};
@@ -52,7 +52,7 @@ use super::support::{TestProject, compile_and_run_gc_stress, compile_with_env_an
 /// No extra compiler environment: the ordinary build.
 const PLAIN: [(&str, &str); 0] = [];
 
-/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// The build runs and prints `expected`. Since the lowered-IR cutover every body is
 /// compiled from lowered IR, so a body the walker cannot take is a compile
 /// error here rather than a second emitter's answer.
 #[track_caller]
@@ -473,7 +473,7 @@ fn main() {
 }
 
 /// Perspective 16. Layout and virtual dispatch are separate tables built by
-/// separate passes (willow-fm7t). Reverse declaration must leave both correct,
+/// separate passes. Reverse declaration must leave both correct,
 /// not just whichever one is being tested.
 #[test]
 fn layout_16_virtual_dispatch_is_unaffected_by_declaration_order() {

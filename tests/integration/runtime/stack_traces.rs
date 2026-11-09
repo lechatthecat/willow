@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Debug call-chain stack traces on panic (willow-992h) ─────────────────────
+// ── Debug call-chain stack traces on panic ─────────────────────
 
 #[test]
 fn callchain_01_nested_panic_prints_ordered_chain() {
@@ -126,8 +126,8 @@ fn main() { a(); }
 
 #[test]
 fn callchain_05_method_call_in_chain() {
-    // A panic inside a class method shows the method frame above its caller
-    // (willow-phx3).
+    // A panic inside a class method shows the method frame above its caller.
+    //
     let (out, ok) = compile_and_run_check_exit(
         r#"
 class Worker {
@@ -159,7 +159,7 @@ fn main() {
 fn async_frame_shadowed_locals_get_distinct_slots() {
     // An outer GC-managed local and a nested shadowed local of the SAME name,
     // both live across awaits, must occupy distinct async-frame slots — the
-    // inner write must not clobber the outer (willow-lpn.11). Run under GC
+    // inner write must not clobber the outer. Run under GC
     // stress so a mis-traced/aliased slot is caught.
     let src = r#"
 async fn work() -> String {
@@ -189,8 +189,8 @@ async fn main() {
 
 #[test]
 fn generic_interface_neg_08_two_instantiations_unsatisfiable_rejected() {
-    // A class MAY implement two instantiations of the same generic interface
-    // (willow-1js.6), but only when one method body can satisfy every
+    // A class MAY implement two instantiations of the same generic interface, but only when
+    // one method body can satisfy every
     // instantiation. Here `get(self) -> T` cannot return both `i64` and
     // `String`, so conformance rejects it (E0417), not the duplicate check.
     assert!(expect_compile_error(
@@ -208,7 +208,7 @@ fn main() {}
 fn generic_interface_09_phantom_two_instantiations_allowed() {
     // When the interface's type parameter appears in no method signature
     // (a phantom/marker parameter), a class can implement several
-    // instantiations at once; they share one identical vtable (willow-1js.6).
+    // instantiations at once; they share one identical vtable.
     let (out, ok) = compile_and_run(
         r#"
 interface Tagged<T> { fn tag_name(self) -> String; }

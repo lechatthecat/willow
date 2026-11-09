@@ -1,4 +1,4 @@
-//! Typed high-level IR (HIR) — willow-mb5.
+//! Typed high-level IR (HIR) — typed HIR lowering.
 //!
 //! Checked source functions lower through this typed tree into LIR and then
 //! Cranelift. Every expression carries its resolved type; backend consumers
@@ -155,12 +155,12 @@ pub struct HirParam {
 }
 
 /// One value a lambda body reads from the enclosing function, lifted into the
-/// closure environment (willow-0g8j.2.12).
+/// closure environment.
 ///
 /// The two names are the SAME source variable seen from the two sides of the
 /// lift: `source` is what the enclosing function calls it, `name` is what the
 /// lifted body calls it. They differ whenever shadowing renamed one of them,
-/// because the lifted body restarts the flat namespace (willow-0g8j.2.10).
+/// because the lifted body restarts the flat namespace.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirCapture {
     /// The binding's name inside the lifted lambda body.
@@ -171,7 +171,7 @@ pub struct HirCapture {
     pub ty: Type,
 }
 
-/// What a `defer` runs when its scope exits (willow-0g8j.2.3).
+/// What a `defer` runs when its scope exits.
 ///
 /// The two arms mirror the source forms and differ in SCOPE, not just shape: a
 /// block body owns its own bindings, while an expression body is evaluated in
@@ -201,7 +201,7 @@ pub enum HirStmt {
     /// with: the annotation when written, otherwise the initialiser's inferred
     /// type. The two differ whenever the annotation is a supertype of the
     /// initialiser (`let a: Animal = new Dog();`), so a consumer that stores or
-    /// reloads the variable must use `ty`, not `value.ty` (willow-0g8j.5).
+    /// reloads the variable must use `ty`, not `value.ty`.
     Let {
         name: String,
         mutable: bool,
@@ -230,7 +230,7 @@ pub enum HirStmt {
     },
     /// `return [value];`
     Return { value: Option<HirExpr>, span: Span },
-    /// `break;` — exit the innermost loop (willow-kzka).
+    /// `break;` — exit the innermost loop.
     Break { span: Span },
     /// `continue;` — next iteration of the innermost loop.
     Continue { span: Span },
@@ -538,7 +538,7 @@ pub enum HirExprKind {
     /// A variable read; its [`HirExpr::ty`] is the type it was bound with.
     Var(String),
     /// A named top-level function used as a VALUE rather than called —
-    /// `apply(10, double)` (willow-0g8j.2.2). Spelled as a bare identifier in
+    /// `apply(10, double)`. Spelled as a bare identifier in
     /// source, so it is only distinguishable from [`HirExprKind::Var`] by what
     /// the name resolves to; `ty` is the function's `fn(...) -> ...` type.
     FnRef(FunctionId),
@@ -599,7 +599,7 @@ pub enum HirExprKind {
         args: Vec<HirExpr>,
         /// `Some(base)` for `super.method(args)`: `object` is `self`, and the
         /// call targets the implementation `base` resolves `method` to —
-        /// directly, never through `self`'s vtable (willow-jz15.48).
+        /// directly, never through `self`'s vtable.
         super_class: Option<TypeId>,
     },
     /// `Class { field: value, ... }` object literal; `ty` is the class type.
@@ -644,7 +644,7 @@ pub enum HirExprKind {
         id: ExprId,
         params: Vec<HirParam>,
         /// What the body reads from the enclosing function, in environment-slot
-        /// order (willow-0g8j.2.12). Empty for a `fn`-typed lambda.
+        /// order. Empty for a `fn`-typed lambda.
         captures: Vec<HirCapture>,
         body: Vec<HirStmt>,
     },
@@ -667,7 +667,7 @@ pub struct HirSelectCase {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirSelectCaseKind {
-    /// `closed_aware`: `ch.recv_opt()` binds `Option<T>` (willow-jz15.44).
+    /// `closed_aware`: `ch.recv_opt()` binds `Option<T>`.
     Recv {
         binding: String,
         channel: HirExpr,
@@ -693,7 +693,7 @@ pub enum HirSelectCaseKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirMatchArm {
     pub pattern: HirPattern,
-    /// `pattern if guard` (willow-jz15.6): a `bool` evaluated with the
+    /// `pattern if guard`: a `bool` evaluated with the
     /// pattern's bindings in scope. False falls through to the next arm.
     pub guard: Option<HirExpr>,
     pub body: Vec<HirStmt>,

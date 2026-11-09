@@ -65,10 +65,10 @@ pub enum RuntimeTaskState {
     Completed,
     Panicked,
     /// Cancel-requested task whose cleanup entry (`cancel_fn`) is currently
-    /// being run by a worker (willow-vynv.3). In-flight: not claimable, not
+    /// being run by a worker. In-flight: not claimable, not
     /// done for awaiters.
     Cancelling,
-    /// Cooperatively cancelled (willow-0a6k.7): the task was cancel-requested
+    /// Cooperatively cancelled: the task was cancel-requested
     /// and reached a scheduler boundary without being polled again. Awaiting a
     /// cancelled task is a runtime panic.
     Cancelled,
@@ -82,7 +82,7 @@ pub enum RuntimeTaskState {
 /// across the call.
 pub type RuntimePollFn = unsafe extern "C" fn(frame: *mut c_void) -> i32;
 
-/// Compiler-generated cancellation cleanup entry (willow-vynv.3): runs the
+/// Compiler-generated cancellation cleanup entry: runs the
 /// task's still-pending `defer`s (reverse lexical order) against its frame.
 /// Called by a worker WITHOUT the scheduler lock held, exactly like `poll`.
 pub type RuntimeCancelFn = unsafe extern "C" fn(frame: *mut c_void);
@@ -90,11 +90,11 @@ pub type RuntimeCancelFn = unsafe extern "C" fn(frame: *mut c_void);
 /// Poll result codes returned by a [`RuntimePollFn`] (preemption spec §7).
 ///
 /// `Pending`/`Ready` are the cooperative-async base codes; `Yield`/`Preempted`/
-/// `Panicked` are the preemptible-task extension (willow-0a6k.1). `Yield` and
+/// `Panicked` are the preemptible-task extension. `Yield` and
 /// `Preempted` are both *runnable* outcomes (the scheduler requeues the task)
 /// and differ only diagnostically: `Yield` is voluntary, `Preempted` is forced
 /// by the runtime at a safepoint. They are emitted once compiler-inserted
-/// safepoints land (willow-0a6k.2); the scheduler already honors them.
+/// safepoints land; the scheduler already honors them.
 pub const RUNTIME_POLL_PENDING: i32 = willow_abi::RuntimePollResult::Pending as i32;
 pub const RUNTIME_POLL_READY: i32 = willow_abi::RuntimePollResult::Ready as i32;
 pub const RUNTIME_POLL_YIELD: i32 = willow_abi::RuntimePollResult::Yield as i32;
@@ -104,7 +104,7 @@ pub const RUNTIME_POLL_PANICKED: i32 = willow_abi::RuntimePollResult::Panicked a
 pub const RUNTIME_POLL_BLOCKED_SYSCALL: i32 = willow_abi::RuntimePollResult::BlockedSyscall as i32;
 
 /// Wait relationships a task only owns while it is actually waiting on
-/// something (willow-ezs.3). The overwhelmingly common case — a ready or
+/// something. The overwhelmingly common case — a ready or
 /// running task — has none of them, so they live behind one lazy allocation
 /// instead of costing 160 inline bytes in every scheduler slot. The box is
 /// released again as soon as the last relationship goes away, so a workload
@@ -113,21 +113,21 @@ pub const RUNTIME_POLL_BLOCKED_SYSCALL: i32 = willow_abi::RuntimePollResult::Blo
 pub(crate) struct TaskWaitLinks {
     /// Tasks parked awaiting THIS task's completion; woken in registration
     /// order when it completes (dependency wake for `await <task>`,
-    /// willow-lpn.5.3). A `WaitQueue` rather than a `Vec` so 10,000 tasks
+    /// cooperative suspension). A `WaitQueue` rather than a `Vec` so 10,000 tasks
     /// awaiting one task register in expected O(1) each instead of O(n²)
-    /// total, and so a cancelled waiter is removed without a scan
-    /// (willow-ezs.2).
+    /// total, and so a cancelled waiter is removed without a scan.
+    ///
     waiters: WaitQueue<RuntimeTaskId>,
     /// Tasks THIS task is registered on as a completion waiter — the reverse of
     /// `waiters`, mirroring `wait_channels`. Cancellation walks it to remove
     /// this task from those waiter lists in O(registered); without it a
-    /// cancelled select task waiter lingers until its awaitee finishes
-    /// (willow-o038 review). A set, not a queue: nothing depends on the order
-    /// in which one task's awaitees are visited (willow-ezs.2).
+    /// cancelled select task waiter lingers until its awaitee finishes. A set, not a queue: nothing depends on the order
+    /// in which one task's awaitees are visited.
+    ///
     awaiting: IdSet<RuntimeTaskId>,
     /// Channels this task is registered on as a recv/select waiter — reverse
     /// references so cancellation deregisters in O(registered) instead of
-    /// scanning every channel (willow-p4er). Addresses stay live while the
+    /// scanning every channel. Addresses stay live while the
     /// task does (the handles sit in its rooted frame).
     // Cancellation groups these by channel; registration order is immaterial.
     wait_channels: Vec<ChannelOwnershipToken>,
@@ -135,8 +135,8 @@ pub(crate) struct TaskWaitLinks {
     // inline HashMap metadata. Once promoted, retain the index until drained.
     #[allow(clippy::box_collection)] // Saves inline map metadata on every small wait.
     channel_ownership_index: Option<Box<HashMap<ChannelOwnershipKey, usize>>>,
-    /// The lock this task is queued on, or holds a reserved handoff for
-    /// (willow-38w.1.2). At most one: a critical section may not nest and may
+    /// The lock this task is queued on, or holds a reserved handoff for. At most one: a
+    /// critical section may not nest and may
     /// not suspend, so a task waits on one lock at a time. Cancellation takes
     /// this link under the task shard and reconciles at the lock afterwards,
     /// which is why the link carries the lock's identity and not just its
@@ -218,11 +218,11 @@ fn recycle_wait_links(mut links: Box<TaskWaitLinks>) {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TaskDebugInfo {
     /// Source name of the async fn this task runs, tagged at poll-fn entry.
-    /// Used to render async stack traces from the suspended future chain
-    /// (willow-9lw).
+    /// Used to render async stack traces from the suspended future chain.
+    ///
     name: Option<std::borrow::Cow<'static, str>>,
     /// Source location of the call that spawned this task (file, line), for
-    /// panic/debug traces (willow-0a6k.7).
+    /// panic/debug traces.
     spawn_site: Option<(String, u32)>,
     execution_site: Option<crate::stack_trace::ExecutionSite>,
 }
@@ -247,7 +247,7 @@ pub struct RuntimeTask {
     pub id: RuntimeTaskId,
     /// Atomic lifecycle and run-queue ownership. This is the only source of
     /// truth for Ready/Running/Parked/BlockedSyscall/Cancelling and replaces
-    /// the former state + wake/cancel/in-queue fields (willow-x3te).
+    /// the former state + wake/cancel/in-queue fields.
     pub(crate) state: AtomicTaskState,
     /// Cooperative resume entry, or `None` for a bookkeeping-only placeholder.
     pub poll: Option<RuntimePollFn>,
@@ -257,7 +257,7 @@ pub struct RuntimeTask {
     /// Retained until a source suspension or terminal cleanup.
     pub(crate) worker_affinity: Option<crate::worker_affinity::WorkerAffinity<'static>>,
     /// Cancellation cleanup entry running the frame's pending defers, or
-    /// `None` when the async fn has no defer sites (willow-vynv.3).
+    /// `None` when the async fn has no defer sites.
     pub cancel: Option<RuntimeCancelFn>,
     /// Cancellation may call synchronous helpers requiring a native stack.
     pub(crate) native_cancel_cleanup: bool,
@@ -270,30 +270,30 @@ pub struct RuntimeTask {
     pub frame_rooted: bool,
     /// When `Some`, this (parked) task should be woken once the instant passes —
     /// set by `willow_sched_sleep` from a poll fn before it returns Pending, and
-    /// honored by the timer-aware run loop (willow-lpn.5.3).
+    /// honored by the timer-aware run loop.
     pub wake_deadline: Option<std::time::Instant>,
     /// `await yield()` requested a cooperative requeue while the task was still
     /// Running. The scheduler publishes that requeue only after the poll returns
     /// Pending, avoiding a second worker polling the same frame concurrently.
     pub yield_requested: bool,
     /// How often the scheduler handed this unpinned task back to the shared
-    /// queue to start it on an idle worker (willow-jz15.120).
+    /// queue to start it on an idle worker.
     pub(crate) spread_hops: u16,
     /// Set by the first claim for a poll. Only a task that never ran may
     /// spread: a later Ready claim resumes an unpinned task that thieves can
-    /// already take (willow-xere).
+    /// already take.
     pub(crate) started: bool,
     /// Set by the first netpoll registration; its terminal cleanup must purge.
     pub(crate) netpoll_registered: bool,
     /// Wait relationships, allocated on the first registration and released
-    /// with the last (willow-ezs.3). Private so every mutation goes through the
+    /// with the last. Private so every mutation goes through the
     /// accessors that maintain that invariant.
     wait: Option<Box<TaskWaitLinks>>,
-    /// Debug name and spawn site, allocated on the first tag (willow-ezs.3).
+    /// Debug name and spawn site, allocated on the first tag.
     debug: Option<Box<TaskDebugInfo>>,
     /// Recoverable language-panic state belongs to the task, never to the OS
-    /// worker that happens to poll it (willow-s9ej.2). The same allocation
-    /// carries the task's stable preemption request flag (willow-lk92).
+    /// worker that happens to poll it. The same allocation
+    /// carries the task's stable preemption request flag.
     panic_context: Arc<crate::panic_context::PanicContext>,
 }
 
@@ -343,7 +343,7 @@ impl RuntimeTask {
         Arc::clone(&self.panic_context)
     }
 
-    // ── Lazy wait relationships (willow-ezs.3) ──────────────────────────────
+    // ── Lazy wait relationships ──────────────────────────────
     //
     // Every mutator goes through `wait_mut` (which allocates on demand) and
     // ends with `release_wait_if_vacant` (which frees again), so a task that
@@ -472,7 +472,7 @@ impl RuntimeTask {
         } else if wait.wait_channels.is_empty() {
             // Size the first growth for the common one/two-channel wait: the
             // default (four tokens) costs every idle parked task 48 bytes it
-            // never uses (willow-lk92). A wider select grows normally later.
+            // never uses. A wider select grows normally later.
             wait.wait_channels.reserve_exact(2);
         }
         wait.wait_channels.push(token);
@@ -552,7 +552,7 @@ impl RuntimeTask {
         }
     }
 
-    // ── Lock wait link (willow-38w.1.2) ─────────────────────────────────────
+    // ── Lock wait link ─────────────────────────────────────
     //
     // Every mutator here runs with the owning lock's state locked (registration
     // and handoff) or with nothing else locked at all (cancellation): the fixed
@@ -616,12 +616,12 @@ impl RuntimeTask {
     }
 
     /// Whether this task currently owns a wait-relationship allocation. Used by
-    /// the footprint measurements and the plateau tests (willow-ezs.3).
+    /// the footprint measurements and the plateau tests.
     pub fn owns_wait_links(&self) -> bool {
         self.wait.is_some()
     }
 
-    // ── Lazy debug metadata (willow-ezs.3) ──────────────────────────────────
+    // ── Lazy debug metadata ──────────────────────────────────
 
     pub fn name(&self) -> Option<&str> {
         self.debug.as_ref().and_then(|debug| debug.name.as_deref())
@@ -694,7 +694,7 @@ impl RuntimeTask {
     }
 }
 
-// A task owns no GC roots of its own (willow-ezs.3). Its one reachable
+// A task owns no GC roots of its own. Its one reachable
 // GC-managed value is the async `frame`, which is kept alive through the
 // runtime root registry (`willow_gc_add_runtime_root`) while `frame_rooted` is
 // set — not through a per-task root set. The former `RuntimeTask::roots` field
@@ -751,7 +751,7 @@ mod tests {
     }
 }
 
-/// Footprint and lazy-metadata tests for willow-ezs.3.
+/// Footprint and lazy-metadata tests for compact task metadata.
 ///
 /// Test perspectives (F1–F25):
 ///
@@ -793,7 +793,7 @@ mod footprint {
 
     use super::*;
 
-    /// Inline size budget for one scheduler task slot. Before willow-ezs.3 the
+    /// Inline size budget for one scheduler task slot. Before compact task metadata the
     /// struct was 264 bytes: a dead `GcRootSet` (24), a dead `spawned_from`
     /// (24) and a dead `stack_trace` (24), plus 72 bytes of wait relationships
     /// and 56 bytes of debug metadata carried by every task whether or not it

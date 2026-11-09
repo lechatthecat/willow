@@ -356,7 +356,7 @@ fn argument_types(
 }
 
 /// The one type both sides of a class/interface `==` or `!=` are compared
-/// at (willow-zvnt): the supertype side's, so the subtype side is coerced to
+/// at: the supertype side's, so the subtype side is coerced to
 /// it first. Reference identity is then the object word on either side.
 fn identity_operand_type(
     lhs: &HirExpr,
@@ -1156,7 +1156,7 @@ mod tests {
             r#"fn f() -> String { return format("{}:{}", gc_allocated_bytes(), gc_allocated_bytes()); }"#,
         );
         // Every operand and literal segment is evaluated in source order.
-        // String-concat fusion (willow-8hq4.29) then formats the `{i64}`
+        // String-concat fusion then formats the `{i64}`
         // segments straight into one sized result instead of allocating each
         // piece, so only the final concatenation follows the operands.
         let mut kinds = Vec::new();

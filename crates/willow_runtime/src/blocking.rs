@@ -1,7 +1,7 @@
 //! Bounded blocking-work pool used to isolate file I/O and conservative foreign
-//! calls from scheduler workers (willow-0a6k.5).
+//! calls from scheduler workers.
 //!
-//! The pool is bounded in BOTH dimensions (willow-9tls.6):
+//! The pool is bounded in BOTH dimensions:
 //!
 //! * threads: `WILLOW_BLOCKING_THREADS` (default [`DEFAULT_BLOCKING_THREADS`]);
 //! * queued-but-not-started jobs: `WILLOW_BLOCKING_QUEUE` (default

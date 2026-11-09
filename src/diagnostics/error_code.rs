@@ -44,13 +44,13 @@ error_codes! {
     E0106,
     E0107,
     E0108,
-    E0109, // `const` initializer is not a literal (willow-jz15.10)
+    E0109, // `const` initializer is not a literal
     E0110, // `const` type is unsupported or does not match its literal
     // Type checker E02xx
     E0201,
     E0202,
     E0203,
-    E0204, // negative exponent literal in an integer `**` (willow-n5yv.3)
+    E0204, // negative exponent literal in an integer `**`
     E0205, // control reaches the end of a body that owes its caller a value
     // Mutability E030x
     E0301,
@@ -118,7 +118,7 @@ error_codes! {
     E0813, // `Task.try_join()` has been removed — use `await`
     W0801, // async frame exceeds the large-frame warning threshold
     W0802, // discarded task/future expression statement
-    // Static members / implicit self E083x (willow-qsqf)
+    // Static members / implicit self E083x
     E0830, // static property requires an initializer
     E0831, // `self` not available in static method (or explicit self on static)
     E0832, // cannot assign to immutable static property
@@ -129,7 +129,7 @@ error_codes! {
     E0837, // `self` not available in static property initializer
     E0838, // cyclic or unresolved static initialization dependency
     E0839, // static member hides inherited static member
-    // Constructors / `new` / `init` E084x (willow-scq2)
+    // Constructors / `new` / `init` E084x
     E0840, // constructor `init` must not declare a return type
     E0841, // constructor `init` cannot return a value
     E0842, // field not initialized by constructor
@@ -154,7 +154,7 @@ error_codes! {
     E1001,
     E1002,
     // E1009: assignment to an immutable outer capture. Mutable outer bindings
-    // assigned by a lambda share GC-managed cells (willow-bv9.2).
+    // assigned by a lambda share GC-managed cells.
     // E1011: a capturing lambda where a plain function pointer is required.
     // E1012: an async or builtin function named as a function value.
     E1009,
@@ -213,10 +213,10 @@ error_codes! {
     E2012, // invalid manifest
     E2013, // invalid dependency alias
     E2014, // unsupported manifest version
-    // Rust dependency / bridge manifest configuration (willow-u2tk.1)
+    // Rust dependency / bridge manifest configuration
     E2015, // invalid `[rust-dependencies]` entry or `[rust]` bridge path
     E2016, // declared `[rust]` bridge file does not exist
-    // Send / Sync marker interfaces & data-race policy E24xx (willow-dgwo)
+    // Send / Sync marker interfaces & data-race policy E24xx
     E2401, // `Send`/`Sync` are compiler-known markers and cannot be implemented manually
     E2402, // cannot pass a non-Sync GC reference (or non-Send value) to an async call
     E2403, // channel item type must be Send (it crosses task/worker boundaries)
@@ -228,10 +228,10 @@ error_codes! {
     W2002, // duplicate import
     W2003, // unused import
     // Staged language features that parse and type-check but have no code
-    // generation yet E25xx (willow-n5yv)
-    E2501, // retired exponentiation staging gate (reserved; willow-n5yv)
-    E2502, // the `lock` statement has no backend lowering yet (willow-38w.1.3)
-    // Scheduler-aware `lock` statement E26xx (willow-38w.1)
+    // generation yet E25xx
+    E2501, // retired exponentiation staging gate (reserved; exponentiation)
+    E2502, // the `lock` statement has no backend lowering yet
+    // Scheduler-aware `lock` statement E26xx
     E2601, // malformed `lock` statement (e.g. a `mut` binding on `lock read`)
     E2602, // `lock` target is not the lock type the statement's mode requires
     E2603, // scheduler-aware `lock` is only allowed inside an `async fn`

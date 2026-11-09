@@ -1,8 +1,8 @@
-// Reference field stores (willow-8hq4.22).
+// Reference field stores.
 //
 // `object.field = value` on a GC reference field compiles to an inline
 // header-flag write-barrier filter and a plain store, the same filter that
-// reference array stores use (willow-8hq4.15). Only stores that may create
+// reference array stores use. Only stores that may create
 // an unremembered old-to-young edge, or that run while a marking epoch is
 // active, call the runtime barrier. Owners are tenured here first, so the
 // young values stored into them exercise the generational remembered set.

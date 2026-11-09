@@ -1,5 +1,5 @@
-//! Per-thread old-generation allocation buffers for runtime-side objects
-//! (willow-jz15.53). A thread carves a span of up to `OLD_LAB_BYTES` from an
+//! Per-thread old-generation allocation buffers for runtime-side objects. A thread carves a
+//! span of up to `OLD_LAB_BYTES` from an
 //! old region under the heap mutex, then bump-allocates small objects in it
 //! holding only its own uncontended buffer mutex. Each object is published
 //! exactly as `OldRegion::allocate_object` publishes one: zeroed span,
@@ -30,7 +30,7 @@ use super::*;
 
 /// Carve size: four generated TLAB chunks (half an old region). Runtime-heavy
 /// pipelines refill while the sweeper holds the heap mutex region by region,
-/// so a quarter of the refill rate measurably cuts blocking (willow-jz15.53
+/// so a quarter of the refill rate measurably cuts blocking (GC allocation fast paths
 /// audit); an idle buffer pins at most this much per thread until retirement.
 pub(super) const OLD_LAB_BYTES: usize = 4 * GC_TLAB_CHUNK_SIZE;
 /// Smallest carve preferred from an existing region. Smaller holes stay for

@@ -1,4 +1,4 @@
-// select timeout + task-completion cases (willow-soro):
+// select timeout + task-completion cases:
 //   sleep(ms) =>       ready once ms elapsed (deadline fixed at select entry)
 //   let v = await t => ready when the task completes (panics if cancelled;
 //                      use `let r = await t.result() =>` for `Result<T, Cancelled>`)

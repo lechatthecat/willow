@@ -1,6 +1,6 @@
 use super::*;
 
-// ── `void` is a writable type (foundation for willow-exg) ──────────────────
+// ── `void` is a writable type (foundation for value-producing control flow) ──────────────────
 
 // An explicit `-> void` return annotation is accepted and behaves like an
 // omitted return type.

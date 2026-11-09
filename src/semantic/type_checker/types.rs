@@ -9,7 +9,7 @@ use crate::semantic::builtin_types::{self, BuiltinTypeId as B, TypeName};
 use crate::semantic::symbols::*;
 
 /// True for the task-handle generic family produced by spawning/awaiting:
-/// `Task<T>` / `Future<T>` / `JoinHandle<T>` (willow-h2vf case A).
+/// `Task<T>` / `Future<T>` / `JoinHandle<T>` (async task unification case A).
 pub(crate) fn is_task_handle_type<N: TypeName + Clone>(ty: &Type<N>) -> bool {
     builtin_types::resolve(ty).is_some_and(|resolved| {
         resolved.args.len() == 1 && matches!(resolved.id, B::Task | B::Future | B::JoinHandle)
@@ -18,7 +18,7 @@ pub(crate) fn is_task_handle_type<N: TypeName + Clone>(ty: &Type<N>) -> bool {
 
 /// The task's own result type `T` behind a panic-on-cancel handle:
 /// `Task<T>` (an async call's eager task) or `JoinHandle<T>`. The frame's slot 0
-/// holds the result (willow-h2vf).
+/// holds the result.
 pub(crate) fn join_handle_result_type<N: TypeName + Clone>(ty: &Type<N>) -> Option<Type<N>> {
     let resolved = builtin_types::resolve(ty)?;
     (resolved.args.len() == 1 && matches!(resolved.id, B::JoinHandle | B::Task))
@@ -26,7 +26,7 @@ pub(crate) fn join_handle_result_type<N: TypeName + Clone>(ty: &Type<N>) -> Opti
 }
 
 /// `TaskResult<T>` — the cancellation-aware awaitable returned by
-/// `Task<T>.result()` (willow-qrj9). Returns the task's own result type `T`;
+/// `Task<T>.result()`. Returns the task's own result type `T`;
 /// awaiting it produces `Result<T, Cancelled>`.
 pub(crate) fn task_result_output_type<N: TypeName + Clone>(ty: &Type<N>) -> Option<Type<N>> {
     builtin_types::unary_arg(ty, B::TaskResult).cloned()
@@ -38,7 +38,7 @@ pub(crate) fn task_result_output_type<N: TypeName + Clone>(ty: &Type<N>) -> Opti
 ///
 /// Cancellation-awareness is a property of the awaited TYPE, not of how the
 /// await was spelled: `await t.result()` and `let v = t.result(); await v` must
-/// behave identically (willow-qrj9). This one definition is shared by the type
+/// behave identically. This one definition is shared by the type
 /// checker and the Cranelift backend so the two can never disagree about which
 /// handles are awaitable.
 pub(crate) fn awaitable_task_type<N: TypeName + Clone>(ty: &Type<N>) -> Option<(Type<N>, bool)> {
@@ -214,7 +214,7 @@ pub(crate) fn param_modes_match(a: &ParamMode, b: &ParamMode) -> bool {
 
 /// Render a parameter the way it is written in source, including its `&`/`&mut`
 /// mode. The mode is part of the signature a class must match, because a
-/// reference parameter is passed as a pointer (willow-0g8j.9).
+/// reference parameter is passed as a pointer.
 pub(crate) fn param_info_name(p: &ParamInfo, type_name: impl Fn(&Type) -> String) -> String {
     match &p.mode {
         ParamMode::Reference { mutable: true, .. } => format!("&mut {}", type_name(&p.ty)),

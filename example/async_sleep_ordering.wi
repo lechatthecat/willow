@@ -1,5 +1,5 @@
 // async_sleep_ordering.wi — timers fire in DEADLINE order, and cancelling a
-// sleeper drops its pending wake (willow-9ha4).
+// sleeper drops its pending wake.
 //
 // In the runtime, wake-deadlines live in their own timer queue behind their own
 // lock, separate from the scheduler's metadata mutex. Registering a sleep,

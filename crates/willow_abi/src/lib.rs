@@ -265,7 +265,7 @@ pub enum GcObjectKind {
     AtomicCell = 11,
     LockHandle = 12,
     /// A closure value: payload word 0 is the lifted function's code address
-    /// and words 1..N are the captured environment (willow-0g8j.2.12).
+    /// and words 1..N are the captured environment.
     Closure = 13,
 }
 
@@ -284,9 +284,9 @@ pub enum GcStoreDestination {
     ContainerInternal = 9,
     AsyncMutexCell = 10,
     AsyncRwLockCell = 11,
-    /// The protected word of a `BlockingCell<T>` (willow-9tls.5).
+    /// The protected word of a `BlockingCell<T>`.
     BlockingCell = 12,
-    /// The protected word of a `BlockingRwCell<T>` (willow-9tls.5).
+    /// The protected word of a `BlockingRwCell<T>`.
     BlockingRwCell = 13,
 }
 
@@ -427,7 +427,7 @@ pub mod tlab {
     /// synchronizing with the owner (stop handshake or a published reference).
     /// Generated code therefore uses plain loads/stores, and allocation counts
     /// are derived by the runtime from the cursor and start words instead of
-    /// per-object counters (willow-8hq4.16).
+    /// per-object counters.
     pub const fn start_bits_offset(pointer_bytes: u32) -> u32 {
         2 * pointer_bytes
     }

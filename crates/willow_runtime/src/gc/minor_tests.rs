@@ -569,7 +569,7 @@ fn tenure_budget_failure_retains_survivor_chunk_as_pinned() {
     reset_internal();
 }
 
-/// Membership comes from the chunk index and start bitmap (willow-8hq4.16):
+/// Membership comes from the chunk index and start bitmap:
 /// only exact payload starts of young objects in pre-cycle chunks qualify.
 #[test]
 fn young_source_accepts_only_exact_pre_cycle_young_payloads() {
@@ -655,7 +655,7 @@ fn remembered_header_flag_mirrors_remembered_set_membership() {
 
 #[test]
 fn runtime_object_owner_filter_calls_barrier_only_for_new_young_edges() {
-    // willow-jz15.51: runtime container stores skip the locked barrier
+    // runtime container stores skip the locked barrier
     // exactly when the generated inline filter would.
     use crate::gc::*;
     let _guard = runtime_test_guard();
@@ -859,7 +859,7 @@ fn sparse_unindexed_source_keeps_relocation_poisoning() {
     reset_internal();
 }
 
-/// willow-8hq4.21: a nursery chunk without survivors or droppable objects is
+/// a nursery chunk without survivors or droppable objects is
 /// released without visiting a header, so minor metadata work is independent
 /// of its object count; debug builds index and poison reachable sources.
 #[test]

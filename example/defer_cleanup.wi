@@ -1,4 +1,4 @@
-// `defer` (willow-vynv.2): scope-exit cleanup for a language with no
+// `defer`: scope-exit cleanup for a language with no
 // destructors and no exceptions. LIFO within a scope; receiver and arguments
 // are evaluated AT REGISTRATION; runs on scope fallthrough, return, `?`
 // propagation, break, and continue — never on panic (panic aborts).

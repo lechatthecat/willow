@@ -1,5 +1,5 @@
-// Constructor field initialization uses the checker's panic facts
-// (willow-ssl7.19). Only a defer that calls `recover()` itself can end a
+// Constructor field initialization uses the checker's panic facts. Only a defer that calls
+// `recover()` itself can end a
 // panic, so cleanup-only defers never let a constructor return early, and a
 // call proven panic-free cannot reach a recovery exit.
 fn clamp(n: i64) -> i64 {

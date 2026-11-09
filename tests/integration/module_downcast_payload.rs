@@ -1,4 +1,4 @@
-//! Project-mode downcast payload identity (willow-jz15.79).
+//! Project-mode downcast payload identity.
 use super::support::*;
 
 const SHAPES: &str = r#"

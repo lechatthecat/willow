@@ -1,5 +1,5 @@
-// scheduler_aware_rwlock.wi — task-parking `lock read` / `lock write`
-// (willow-38w.1.5).
+// scheduler_aware_rwlock.wi — task-parking `lock read` / `lock write`.
+//
 //
 // RwLock admits concurrent readers, excludes writers, and stops admitting new
 // readers as soon as a waiter queues. Handoff wakes one writer or the

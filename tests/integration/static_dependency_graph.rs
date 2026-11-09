@@ -1,4 +1,4 @@
-//! willow-9tls.32: dependency ordering and cycle witnesses, including helper calls.
+//! dependency ordering and cycle witnesses, including helper calls.
 use super::support::*;
 
 fn output(source: &str, expected: &str) {

@@ -1,4 +1,4 @@
-// GC-safety of temporary GC values across allocations (willow-oewp.6).
+// GC-safety of temporary GC values across allocations.
 //
 // Invariant: if a GC-managed value may be used after an allocation, it must be
 // reachable from the GC root graph during that allocation. This example
@@ -12,7 +12,7 @@
 // The enum cases are the same invariant seen from the other side: building
 // `Note::Text(s)` allocates the `[tag | payload]` object AFTER `s` exists, and
 // `map`/`map_err` rewrap a value that lives only in a register, so the payload
-// has to be rooted across that allocation (willow-vz5f).
+// has to be rooted across that allocation.
 
 import std::collections::Map;
 

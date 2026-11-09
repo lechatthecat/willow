@@ -223,7 +223,7 @@ fn main() {
 
 // 30. A reference call through an interface, in a debug build, where the
 // reference diagnostic hook and its post-call clear are emitted. The walker
-// compiles it (willow-0g8j.2.17), and the by-value sibling stays independently
+// compiles it, and the by-value sibling stays independently
 // eligible.
 #[test]
 fn refmode_30_reference_call_is_walker_owned() {

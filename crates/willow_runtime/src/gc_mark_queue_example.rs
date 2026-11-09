@@ -1,10 +1,10 @@
-//! Runnable walkthrough of the concurrent-mark work queue (willow-6fv.5.6.1).
+//! Runnable walkthrough of the concurrent-mark work queue.
 //!
 //! ```text
 //! cargo test -p willow_runtime --lib gc_mark_queue_walkthrough -- --nocapture
 //! ```
 //!
-//! This stands in for the marking engine (willow-6fv.5.6.3): a root job injects
+//! This stands in for the marking engine: a root job injects
 //! shards, background workers consume them and discover more work, a mutator
 //! assists, and the cycle ends only once the counters agree that nothing is left
 //! anywhere.
@@ -104,7 +104,7 @@ fn gc_mark_queue_walkthrough() {
             });
         }
 
-        // Stand-in for termination detection (willow-6fv.5.6.5): force every
+        // Stand-in for termination detection: force every
         // private segment into the open so a worker that stalls cannot sit on
         // work its peers could be doing, then read the one counter that knows
         // about every item everywhere — queued or in a consumer's hand.

@@ -1,5 +1,5 @@
 //! Timer deadlines with their own lock, off the scheduler metadata mutex
-//! (willow-9ha4, stage 4 of `requirements/willow_scheduler_lock_decomposition.md`).
+//! (timer-lock decomposition, stage 4 of `requirements/willow_scheduler_lock_decomposition.md`).
 //!
 //! # Why this is its own lock
 //!

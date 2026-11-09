@@ -1,5 +1,5 @@
 // channel_element_inference.wi — where a channel's element type comes from,
-// and why it matters to the collector (willow-nk3g).
+// and why it matters to the collector.
 //
 // A channel can be spelled two ways:
 //

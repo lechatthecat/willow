@@ -1,4 +1,4 @@
-//! Class `extends` cycles are a language error (willow-jlky → E0426).
+//! Class `extends` cycles are a language error (class cycle detection → E0426).
 //!
 //! `open class A extends B {}` with `open class B extends A {}` used to pass
 //! the checker: every hierarchy walker guards against repeats, so nothing

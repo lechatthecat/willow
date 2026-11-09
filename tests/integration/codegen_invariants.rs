@@ -1,5 +1,5 @@
 //! Guards for the backend's `compiler invariant violated` panics
-//! (willow-uqzx, catalog item 14).
+//! (shared compiler infrastructure, catalog item 14).
 //!
 //! The Cranelift backend used to answer impossible states — a method the type
 //! checker never approved, a field with no layout slot, a call through a value

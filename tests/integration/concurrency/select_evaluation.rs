@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Select channel expressions evaluate exactly once (willow-0a6k.6) ────────
+// ── Select channel expressions evaluate exactly once ────────
 // The channel expr used to be re-evaluated at probe, unregister, recv, AND
 // on every wakeup re-probe — a side-effecting expression could register one
 // channel and receive from another. Now: coop selects stash the pointer in a

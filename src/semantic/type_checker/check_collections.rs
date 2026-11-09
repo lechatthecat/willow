@@ -101,7 +101,7 @@ impl TypeChecker {
         }
         match &arr_ty {
             Type::Array(elem) | Type::FixedArray(elem, _) => (**elem).clone(),
-            // Read-only indexing of an immutable `FrozenArray<T>` (willow-dgwo.7).
+            // Read-only indexing of an immutable `FrozenArray<T>`.
             Type::Generic(_, _)
                 if let Some(elem) = builtin_types::unary_arg(&arr_ty, B::FrozenArray) =>
             {
@@ -466,7 +466,7 @@ impl TypeChecker {
             "contains" => Some(Type::Bool),
             "len" => Some(Type::I64),
             // `.freeze()` -> an immutable `FrozenMap<K,V>` copy, Sync when K,V are
-            // Sync, so it can be shared across tasks (willow-dgwo.10).
+            // Sync, so it can be shared across tasks.
             "toString" => {
                 if !matches!(val_ty, Type::I64 | Type::F64 | Type::Bool | Type::String) {
                     self.push(
@@ -514,7 +514,7 @@ impl TypeChecker {
         }
     }
 
-    /// Builtin methods on the immutable `FrozenMap<K, V>` (willow-dgwo.10):
+    /// Builtin methods on the immutable `FrozenMap<K, V>`:
     /// read-only `.get(k) -> Option<V>`, `.contains(k) -> bool`, `.len() -> i64`;
     /// `insert`/`remove` are rejected.
     pub(super) fn check_frozen_map_method_call(

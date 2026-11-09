@@ -154,7 +154,7 @@ fn main() {
 // Channel/Future locals are opaque RUNTIME pointers with no GC header, so
 // is_gc_managed must NOT root them on the shadow stack — otherwise the collector
 // reads a bogus header at payload_to_header and crashes once a collection scans
-// the root (willow-lpn.9). Task/JoinHandle are GC async frames in the cooperative
+// the root. Task/JoinHandle are GC async frames in the cooperative
 // scheduler path, so it is safe and necessary to trace them.
 
 // A void task awaited while collections fire on every allocation.

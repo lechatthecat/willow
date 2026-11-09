@@ -1,6 +1,6 @@
-// Release synchronous code publishes no fault site (willow-9686).
+// Release synchronous code publishes no fault site.
 //
-// Release synchronous runtime faults are location-free (willow-s9ej.7), so
+// Release synchronous runtime faults are location-free, so
 // generated synchronous code must not call `willow_trace_site_set` before every
 // raising operation: the call cost a hot map loop ~2x and spilled loop-invariant
 // registers in array loops. Async code still publishes its own site, and a site

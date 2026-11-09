@@ -1,7 +1,7 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
-// `new` object creation + `init` constructors — willow-scq2 Stage 1.
+// `new` object creation + `init` constructors — constructor support Stage 1.
 //
 //  1. explicit constructor + method call
 //  2. implicit memberwise constructor (no init)

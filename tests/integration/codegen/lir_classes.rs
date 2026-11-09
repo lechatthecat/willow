@@ -1,10 +1,10 @@
 use super::*;
 
-// ── Class objects in the LIR walker (willow-0g8j.5) ─────────────────────────
+// ── Class objects in the LIR walker ─────────────────────────
 // The walker claims functions that create, read, mutate and pass "simple"
 // class objects: no base class, not itself a base, no interface or enum field.
 // Class METHOD bodies compile through `compile_class_method_inner`, which walks
-// lowered IR of its own (willow-0g8j.3); the programs below exercise the object
+// lowered IR of its own; the programs below exercise the object
 // code paths from free functions and `main`.
 //
 // Perspectives 27-46 (1-26 are the eligibility unit tests in `lir_gen.rs`):

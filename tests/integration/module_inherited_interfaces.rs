@@ -1,8 +1,8 @@
 //! An ENTRY-file subclass of a module class is usable as the interfaces that
-//! module class implements (willow-himv).
+//! module class implements.
 //!
 //! `implements` is propagated down an `extends` chain by
-//! `resolve_interface_inheritance` (willow-2s4i), and that pass built its class
+//! `resolve_interface_inheritance`, and that pass built its class
 //! map out of `program.items` alone. Every ancestor that lived in an imported
 //! module was therefore invisible: `class EntryParcel extends lib::Parcel`
 //! inherited nothing, no `(EntryParcel, lib::Measured)` vtable was ever
@@ -330,7 +330,7 @@ fn main() {
 
 /// A module whose interface inherits another: `Measured extends Named`, so a
 /// `Parcel` is usable as either and `Measured`'s vtable carries a pointer to
-/// the one shared `Named` table (willow-ssl7.5).
+/// the one shared `Named` table.
 const LIB_SUPER: &str = r#"
 module lib;
 
@@ -1044,7 +1044,7 @@ fn mi_24_the_runnable_example_program() {
 
 #[test]
 fn mi_25_an_imported_sub_interface_widens_to_its_imported_super() {
-    // willow-ssl7.5: widening reads the super's table out of the sub-interface's
+    // widening reads the super's table out of the sub-interface's
     // own table. Both interfaces live in the module, so the table the entry
     // file's widening lands on has to be the same one the module's own
     // `lib::name` dispatches through, in the entry file and across the boundary.

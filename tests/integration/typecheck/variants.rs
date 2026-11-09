@@ -3,7 +3,7 @@ use super::super::support::*;
 // ───────────────────────────────────────────────────────────────────────────
 // Unqualified enum-variant CONSTRUCTION (`Ok(42)` vs `Result::Ok(42)`) resolved
 // by expected type, slice 1: payload variants in let-annotation and call-arg
-// positions (willow-60o.1). Fieldless variants, return position, and patterns
+// positions. Fieldless variants, return position, and patterns
 // are follow-up slices.
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -369,7 +369,7 @@ fn main() {
     );
 }
 
-// ── Unqualified enum-variant PATTERNS in `match` (willow-60o.1) ──────────────
+// ── Unqualified enum-variant PATTERNS in `match` ──────────────
 
 #[test]
 fn test_unqualified_pattern_non_generic_payload_and_fieldless() {

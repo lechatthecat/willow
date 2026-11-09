@@ -1,12 +1,12 @@
-//! Send / Sync type classification (willow-dgwo.2).
+//! Send / Sync type classification.
 //!
 //! `Send`  = a value may be transferred across worker/task boundaries.
 //! `Sync`  = a value may be shared by multiple workers/tasks concurrently.
 //!
 //! The compiler INFERS these structurally (users may not implement them — see
-//! willow-dgwo.1 / E2401). These predicates are the foundation for spawn/async
-//! capture checking (dgwo.4), `Task<T>` Send analysis (dgwo.5), and frozen
-//! collections (dgwo.7).
+//! Send/Sync checking / E2401). These predicates are the foundation for spawn/async
+//! capture checking, `Task<T>` Send analysis, and frozen
+//! collections.
 //!
 //! Summary of the rules (spec §5–§7):
 //! - primitives (`i64`/`f64`/`bool`), immutable `String`: Send + Sync
@@ -19,7 +19,7 @@
 //! - `Channel<T>`: Send + Sync iff T: Send
 //! - `Task<T>`/`JoinHandle<T>`: Send iff T: Send; not Sync
 //! - class: Send iff all fields Send; Sync iff all fields Sync and no field is
-//!   reassigned after construction (willow-jz15.78, see `field_writes`)
+//!   reassigned after construction (immutable shared fields, see `field_writes`)
 //! - interface: Send iff it `extends Send` or `extends Sync`; Sync iff it
 //!   `extends Sync`
 //! - plain function pointers: Send + Sync (no environment)
@@ -62,11 +62,11 @@ impl TypeChecker {
 
     /// Check the arguments passed to an async fn call: each value is captured
     /// into a `Task` that may run on another worker, so a GC-reference argument
-    /// must be `Sync` and a scalar/value argument must be `Send` (willow-dgwo.4,
+    /// must be `Sync` and a scalar/value argument must be `Send` (spawn argument checking,
     /// spec §8). Reports E2402 per offending argument.
     ///
     /// Only enforced when `enforce_send_sync` is set. Normal compilation sets
-    /// it because Willow runs at least five workers (willow-dgwo.9).
+    /// it because Willow runs at least five workers.
     pub(super) fn check_async_capture(&mut self, params: &[ParamInfo], args: &[CallArg]) {
         if !self.enforce_send_sync {
             return;
@@ -84,7 +84,7 @@ impl TypeChecker {
                 continue;
             }
             // An interface value follows the interface contract, so give the
-            // interface-specific diagnostic (willow-dgwo.5, spec §14): E2404 if it
+            // interface-specific diagnostic (task Send checking, spec §14): E2404 if it
             // is not even Send, else E2405 (Send but not Sync).
             if self.is_interface_type(ty) {
                 let (code, kind) = if !self.is_send(ty) {
@@ -171,10 +171,10 @@ impl TypeChecker {
         self.local.async_local_types.push(ty);
     }
 
-    /// The `Task<T>` Send rule (willow-dgwo.5, spec §9): a task produced by an
+    /// The `Task<T>` Send rule (task Send checking, spec §9): a task produced by an
     /// async fn may be moved between workers only if its worker-movable frame —
     /// the return value, parameters, and locals live across `await` — is entirely
-    /// `Send`. Consumed by the multi-worker capstone (willow-dgwo.9) to reject
+    /// `Send`. Consumed by the multi-worker capstone to reject
     /// stealing a non-`Send` task.
     pub(super) fn check_async_task_send(
         &mut self,
@@ -485,7 +485,7 @@ impl TypeChecker {
 
             Type::Generic(name, args) => match Builtin::from_name(name) {
                 // Immutable: Send iff args Send, Sync iff args Sync (the frozen
-                // collections that may be shared across tasks — willow-dgwo.7).
+                // collections that may be shared across tasks — shared collection tracing).
                 Some(
                     Builtin::Option | Builtin::Result | Builtin::FrozenArray | Builtin::FrozenMap,
                 ) => args
@@ -513,7 +513,7 @@ impl TypeChecker {
                 // Task/JoinHandle/Future: Send iff T: Send; a task handle is not
                 // itself Sync (share results, not the task).
                 // `TaskResult<T>` is a view of the same frame, so it carries the
-                // same markers as the task it came from (willow-qrj9).
+                // same markers as the task it came from.
                 Some(
                     Builtin::Task | Builtin::JoinHandle | Builtin::Future | Builtin::TaskResult,
                 ) => {
@@ -632,8 +632,8 @@ impl TypeChecker {
                 && class.instance_field_order.iter().all(|(name, _)| {
                     let f = &class.fields[name];
                     // A field written after construction races when the
-                    // object is shared, whatever the field's type
-                    // (willow-jz15.78). Moving the object (Send) is fine.
+                    // object is shared, whatever the field's type. Moving the object (Send) is fine.
+                    //
                     if f.reassigned && matches!(marker, Marker::Sync) {
                         if let Some(reasons) = reasons {
                             reasons.field_span.get_or_insert(f.declaration_span);

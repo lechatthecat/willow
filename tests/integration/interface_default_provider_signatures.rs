@@ -1,4 +1,4 @@
-//! Provider-owned types in injected default signatures (willow-srv6).
+//! Provider-owned types in injected default signatures.
 use super::support::*;
 
 fn runs(provider: &str, main: &str, expected: &str) {

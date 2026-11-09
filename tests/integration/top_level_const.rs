@@ -1,4 +1,4 @@
-//! Module-level `const` declarations (willow-jz15.10).
+//! Module-level `const` declarations.
 //!
 //! `const NAME: T = literal;` declares a named scalar or `String` value at
 //! module level. It is registered like a zero-parameter function, so it shares
@@ -436,7 +436,7 @@ fn main() {
 
 // The array literal is a literal, but not one supported by module constants.
 // The help points at a frozen class static property, built once, instead of a
-// function that would allocate the array on every call (willow-jz15.93).
+// function that would allocate the array on every call.
 #[test]
 fn c28_array_const_diagnostic_and_frozen_static_alternative() {
     let stderr =
@@ -465,7 +465,7 @@ fn c28_array_const_diagnostic_and_frozen_static_alternative() {
 }
 
 // 29. Every rejected const is reported: four consecutive const arrays yield
-//     four diagnostics, not every other one (willow-jz15.93).
+//     four diagnostics, not every other one.
 #[test]
 fn c29_every_rejected_const_array_is_reported() {
     let stderr = compile_error_stderr(

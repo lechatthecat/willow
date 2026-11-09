@@ -1432,7 +1432,7 @@ fn retired_tlab_header_index_bounds_lookup_work_and_rejects_dead_headers() {
     }
 }
 
-/// willow-8hq4.21: a chunk retired without its header index answers lookups
+/// a chunk retired without its header index answers lookups
 /// from its start bits, never from the index, and is indexed once later.
 #[test]
 fn unindexed_retired_tlab_lookups_use_start_bits() {

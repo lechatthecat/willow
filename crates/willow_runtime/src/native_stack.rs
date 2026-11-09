@@ -45,7 +45,7 @@ pub(crate) struct NativeStack {
     cancelled: bool,
     /// Cancel-request epoch at this stack's last task-state look; 0 forces a
     /// look. `cancelled()` re-reads the shared task table only when the epoch
-    /// has moved, so per-call checks stay thread-local (willow-jz15.120).
+    /// has moved, so per-call checks stay thread-local.
     cancel_epoch: u64,
     cleanup_depth: u32,
     /// Countdown that generated synchronous safepoints decrement inline; they
@@ -869,7 +869,7 @@ mod tests {
         assert_eq!(output, 5151);
     }
 
-    /// Models generated synchronous safepoints (willow-jz15.40): decrement
+    /// Models generated synchronous safepoints: decrement
     /// the inline countdown, enter the runtime only once it runs out.
     struct CountedLoop {
         safepoints: u64,

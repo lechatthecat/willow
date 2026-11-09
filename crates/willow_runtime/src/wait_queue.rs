@@ -1,4 +1,4 @@
-//! FIFO wait queue with expected O(1) membership (willow-ezs.2).
+//! FIFO wait queue with expected O(1) membership.
 //!
 //! Both channels and task-completion waits need the same structure: a queue
 //! that wakes waiters in registration order, answers "is this waiter already
@@ -196,7 +196,7 @@ impl<T: Copy + Eq + Hash> WaitQueue<T> {
 mod tests {
     use super::*;
 
-    // Perspectives for the shared queue itself (willow-ezs.2). The scheduler
+    // Perspectives for the shared queue itself. The scheduler
     // and channel modules test their own use of it on top of these.
     //   WQ1  a fresh queue is empty
     //   WQ2  registration reports newly-registered

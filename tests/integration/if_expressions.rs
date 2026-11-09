@@ -1,4 +1,4 @@
-//! Expression-form if/else (willow-jz15.5). Cases exercise the shared
+//! Expression-form if/else. Cases exercise the shared
 //! ternary checker/lowering, including contextual types and lazy execution.
 use crate::support::*;
 

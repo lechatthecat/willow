@@ -1,6 +1,6 @@
 use super::support::*;
 
-// Central Option representation — willow-glaj.3.
+// Central Option representation — Option representation.
 //
 // A GC-reference payload uses zero as None and the payload pointer itself as
 // Some. Scalars and nested Options retain the boxed tagged

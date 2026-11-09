@@ -18,7 +18,7 @@ pub struct ItemBinding {
 }
 
 /// One module spelling this unit writes that the build's tables are NOT keyed
-/// by (willow-kd1v).
+/// by.
 ///
 /// A module is registered once, under the name the module graph gave it — the
 /// FIRST importer's spelling — while every other unit is free to reach it by
@@ -33,7 +33,7 @@ pub struct ModuleSpelling {
     /// The prefix the build's tables are keyed by.
     pub graph_name: String,
     /// The module's canonical identity, which is what its ENUMS are keyed by
-    /// (willow-itcw) even when its classes carry the graph name.
+    /// even when its classes carry the graph name.
     pub canonical_path: String,
     /// The class/enum/interface names the module declares, i.e. the suffixes
     /// worth binding. Taken from the module's own program rather than scanned
@@ -49,7 +49,7 @@ pub struct ModuleSpelling {
 /// when `a::b` is a module file and an item import of `a` otherwise, and only
 /// the resolver knows which files it loaded. Guessing from the path shape marks
 /// the parent of an item import visible, which is a module this file cannot
-/// name at all (willow-vtlr).
+/// name at all.
 ///
 /// Recorded on the unit's [`UnitScope`] by its declaration phase and
 /// reinstalled from there before its bodies: another unit's declaration phase
@@ -62,8 +62,8 @@ pub struct UnitImports {
     pub visible_modules: HashSet<String>,
     /// The single items this file bound, in import order.
     pub item_imports: Vec<ItemBinding>,
-    /// The module prefixes this file writes that are not themselves table keys
-    /// (willow-kd1v).
+    /// The module prefixes this file writes that are not themselves table keys.
+    ///
     pub module_spellings: Vec<ModuleSpelling>,
 }
 

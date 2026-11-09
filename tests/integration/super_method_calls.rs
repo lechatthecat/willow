@@ -1,4 +1,4 @@
-//! `super.method(args)` outside `init` (willow-jz15.48).
+//! `super.method(args)` outside `init`.
 //!
 //! A super call targets the implementation the CURRENT class's base resolves
 //! the method to. The call is direct and never goes through `self`'s vtable,

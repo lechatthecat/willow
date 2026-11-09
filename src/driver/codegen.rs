@@ -883,7 +883,7 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
     }
     let mut text = ir::dump::format_program(&hir);
     if !lowering_diagnostics.is_empty() {
-        text.push_str("\n// constructs not yet lowered to HIR (willow-mb5):\n");
+        text.push_str("\n// constructs not yet lowered to HIR:\n");
         for diagnostic in &lowering_diagnostics {
             text.push_str(&format!("//   {}\n", diagnostic.message));
         }
@@ -976,7 +976,7 @@ pub fn emit_lir_text(src: &str) -> Result<String> {
     }
     let mut text = ir::lowered::format_program(&lir);
     if !gaps.is_empty() {
-        text.push_str("\n// constructs not yet lowered to HIR (willow-mb5):\n");
+        text.push_str("\n// constructs not yet lowered to HIR:\n");
         for diagnostic in gaps.iter() {
             text.push_str(&format!("//   {}\n", diagnostic.message));
         }

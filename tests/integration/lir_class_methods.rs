@@ -1,4 +1,4 @@
-//! Class METHOD bodies on the LIR-walking backend (willow-0g8j.2.18).
+//! Class METHOD bodies on the LIR-walking backend.
 //!
 //! The walker was a free-function backend by accident. Eligibility could vet a
 //! method, lowering already produced one under `Class::method`, and the emitter
@@ -23,7 +23,7 @@
 //!     self-calls and reference parameters are the same constructs inside a
 //!     method as outside one.
 //!
-//! Since willow-0g8j.3 there is no second emitter to compare against: a method
+//! Since the lowered-IR cutover there is no second emitter to compare against: a method
 //! body the walker cannot take is a compile error, so a run that prints the
 //! right answer is proof the walker produced it. Where the point of a
 //! perspective is WHICH body was walked, the test reads `WILLOW_LIR_LOG=1`
@@ -67,7 +67,7 @@ use super::support::{
 const PLAIN: [(&str, &str); 0] = [];
 const LIR_LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 
-/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// The build runs and prints `expected`. Since the lowered-IR cutover every body is
 /// compiled from lowered IR, so a body the walker cannot take is a compile
 /// error here rather than a second emitter's answer.
 #[track_caller]

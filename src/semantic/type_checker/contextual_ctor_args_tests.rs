@@ -1,6 +1,6 @@
 //! The expected result type reaches the arguments of lock constructors and
 //! generic calls, so an empty collection argument takes the annotated element
-//! types instead of `void` placeholders (willow-jz15.96).
+//! types instead of `void` placeholders.
 use super::*;
 use crate::{lexer::Lexer, parser::Parser};
 

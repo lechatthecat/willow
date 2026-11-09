@@ -1,5 +1,5 @@
-//! E0205: a body that owes its caller a value must not run off the end
-//! (willow-x8sj).
+//! E0205: a body that owes its caller a value must not run off the end.
+//!
 //!
 //! Willow has no implicit tail expression — a body produces its value only
 //! through `return` — and nothing used to check that one was reached. A
@@ -45,8 +45,8 @@
 //! The `main` exemption is the one place the rule steps aside, and it belongs to
 //! the ENTRY POINT, not to a name. Perspectives 30-31 pin both halves: the real
 //! entry point keeps the latitude, and an imported module's `main` — an ordinary
-//! function called as `foo::main()` and mangled like any other — does not
-//! (willow-ltkj).
+//! function called as `foo::main()` and mangled like any other — does not.
+//!
 //!
 //!  30 the entry point keeps the exemption in a multi-file project
 //!  31 an imported module's `main` does not inherit it
@@ -495,7 +495,7 @@ async fn main() {
 
 // 24. The entry point is the one body where running off the end means
 //     something: `fn main() -> Result<void, E>` exits 0 on the implicit end
-//     exactly as it does on `return Ok()` (willow-exg). A plain function with
+//     exactly as it does on `return Ok()`. A plain function with
 //     the same return type gets no such latitude.
 #[test]
 fn missing_return_24_a_result_void_main_may_end_implicitly() {
@@ -642,7 +642,7 @@ fn main() -> Result<void, String> {
 // 31. The other half. A module's `main` is not an entry point — it is called as
 //     `foo::main()` and the backend mangles it like any other function — so a
 //     fall-through hands the caller the zero of a `Result<void, E>`, which then
-//     has a tag read out of it. Exempting it by NAME was the bug (willow-ltkj).
+//     has a tag read out of it. Exempting it by NAME was the bug.
 #[test]
 fn missing_return_31_a_module_main_does_not_inherit_the_exemption() {
     let stderr = compile_temp_project_error_stderr(

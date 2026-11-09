@@ -1,4 +1,4 @@
-// Float literals in scientific notation (willow-jz15.121).
+// Float literals in scientific notation.
 // A decimal literal with an exponent is an `f64`, even without a point.
 
 const AVOGADRO: f64 = 6.022_140_76e23;

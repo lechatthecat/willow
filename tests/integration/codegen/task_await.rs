@@ -122,7 +122,7 @@ async fn main() {
 }
 
 // Slice 5: awaits inside if/else and while are lowered by the CFG-based
-// cooperative state machine (willow-lpn.5.3 / willow-8fh3 regression).
+// cooperative state machine.
 #[test]
 fn coop_async_09_await_in_if_else_both_return() {
     let (out, ok) = compile_and_run_gc_stress(

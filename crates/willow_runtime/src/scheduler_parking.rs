@@ -8,7 +8,7 @@ struct WaitList {
     free: Vec<usize>,
     head: Option<usize>,
     /// Latest linked slot registered under each worker index, so a targeted
-    /// wake finds its owner in O(1) (willow-jz15.120).
+    /// wake finds its owner in O(1).
     by_worker: Vec<Option<usize>>,
 }
 

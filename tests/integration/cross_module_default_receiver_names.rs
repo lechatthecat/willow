@@ -1,5 +1,5 @@
 //! Interface defaults copied into a class whose name a provider-local item
-//! also uses (willow-nvi6).
+//! also uses.
 //!
 //! The entry file's type identities are bare (`A`), so in the scope of the
 //! module that declares the interface the bare name would mean that module's
@@ -12,7 +12,7 @@
 //!  1. ticket repro: provider-private class `A` with a method `two`
 //!  2. runnable example program
 //!  3. Self-returning abstract method implemented by the receiver
-//!  4. generic interface (willow-s71l) with the same collision
+//!  4. generic interface with the same collision
 //!  5. generic interface + Self-returning abstract method
 //!  6. generic argument is an entry class named like a provider class
 //!  7. receiver's base class named like a provider-local class

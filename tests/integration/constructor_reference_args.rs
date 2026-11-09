@@ -1,5 +1,5 @@
-//! Reference arguments to `new` and `super.init(...)` (willow-0g8j.10,
-//! willow-dssc).
+//! Reference arguments to `new` and `super.init(...)` (constructor reference arguments,
+//! constructor GC roots).
 //!
 //! A constructor parameter can be `&`/`&mut` like any other parameter, and
 //! `init` has no other spelling: `new C(&place)` and `super.init(&place)` are
@@ -19,9 +19,9 @@
 //! memberwise constructor reached the LIR emitter as a node it has no case for
 //! and panicked the compiler.
 //!
-//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! Since the lowered-IR cutover a body outside the walker's subset is a compile error,
 //! so a run that prints the right answer is proof the walker produced it —
-//! `init` bodies included, which the walker took over in willow-0g8j.2.18.
+//! `init` bodies included, which the walker took over in constructor body lowering.
 //!
 //! 34 perspectives:
 //!   1 `&mut i64` writes back            18 a memberwise ctor takes values
@@ -520,7 +520,7 @@ fn ctor_refs_21_a_panic_inside_init_names_the_place() {
 }
 
 // 22. The record is cleared when the constructor returns: a later, unrelated
-//     panic in the same function must not be attributed to it (willow-0g8j.11).
+//     panic in the same function must not be attributed to it.
 #[test]
 fn ctor_refs_22_a_panic_after_new_returned_is_not_a_reference_call() {
     assert_panic_report(

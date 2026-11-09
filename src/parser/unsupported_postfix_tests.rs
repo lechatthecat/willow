@@ -156,7 +156,7 @@ fn generic_functions_accept_parameters_and_recover_malformed_lists() {
 }
 
 #[test]
-fn ticket_42_call_result_help_and_nested_recovery() {
+fn call_result_help_and_nested_recovery() {
     for expression in ["choose(1)(2)", "object.choose()(2)", "Factory::choose()(2)"] {
         for statement in [
             format!("{expression};"),
@@ -177,7 +177,7 @@ fn ticket_42_call_result_help_and_nested_recovery() {
 }
 
 #[test]
-fn ticket_42_recovery_reads_scale_linearly() {
+fn recovery_reads_scale_linearly() {
     for nested in [false, true] {
         let mut samples = Vec::new();
         for count in [8, 16, 32, 64] {
@@ -256,7 +256,7 @@ fn generic_classes_accept_parameters_and_recover_malformed_lists() {
 }
 
 #[test]
-fn ticket_60_supported_interfaces_and_classes() {
+fn supported_interfaces_and_classes() {
     for source in [
         "interface Get<T> { fn get(self) -> T; }",
         "pub interface Pair<T, U> { fn get(self) -> T; fn other(self) -> U; }",
@@ -307,7 +307,7 @@ fn generic_class_token_reads_scale_linearly() {
 }
 
 #[test]
-fn ticket_60_following_item_boundaries() {
+fn following_item_boundaries() {
     for following in [
         "open class Following {}",
         "pub open class Following {}",

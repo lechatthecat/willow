@@ -1,5 +1,5 @@
-//! One enum declaration, one identity, one back end (willow-nm0g,
-//! willow-itcw, willow-0g8j.3.2).
+//! One enum declaration, one identity, one back end (module enum table merging,
+//! enum canonicalization, canonical enum identities).
 //!
 //! Each unit of a build spells a module's enum differently: the declaring
 //! module writes `Level`, every importer writes `signal::Level`, and the
@@ -18,12 +18,12 @@
 //!     under `WILLOW_GC_STRESS`.
 //!   * the walker asks the same table what a type is, so every body naming one
 //!     of those enums dropped out of it -- at the time to the AST emitter, which
-//!     willow-0g8j.3 has since retired -- and where the table DID know both
+//!     the lowered-IR cutover has since retired -- and where the table DID know both
 //!     names, `same_repr` still compared the two strings and said no.
 //!
 //! An enum now has an IDENTITY, `module::Enum`, which is the name it is
 //! registered under build-wide however many units can see it and whatever each
-//! of them calls it (willow-itcw). Before that the identity was the spelling,
+//! of them calls it. Before that the identity was the spelling,
 //! so two modules that each declared `enum Level` were one entry in the table:
 //! the checker let one pass for the other (a tag matched against the wrong
 //! variant list), and the back end, unable to tell which was meant, registered
@@ -290,7 +290,7 @@ fn borrowed<'a>(files: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a s
     files.iter().map(|(n, s)| (*n, s.as_str())).collect()
 }
 
-/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// The build runs and prints `expected`. Since the lowered-IR cutover every body is
 /// compiled from lowered IR, so a body the walker cannot take is a compile
 /// error here rather than a second emitter's answer.
 #[track_caller]
@@ -318,7 +318,7 @@ fn assert_survives_gc_stress(entry: &str, expected: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// The enum table has to answer to the name each unit spells (willow-nm0g).
+// The enum table has to answer to the name each unit spells.
 // ---------------------------------------------------------------------------
 
 // 1. A fieldless module enum, held in ANOTHER module's frame across an
@@ -557,7 +557,7 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// The two spellings are one representation (willow-0g8j.3.2).
+// The two spellings are one representation.
 // ---------------------------------------------------------------------------
 
 // 13. A module calling a method of its OWN class with its OWN enum: the
@@ -720,7 +720,7 @@ fn main() {
 // 21. Where two modules answer to one bare name, each is still ITS OWN enum:
 //     both bodies lower, and each answers with its own variant. `Level` is not
 //     a name the back end resolves at all any more -- an enum is registered
-//     under `module::Enum`, the one name it has build-wide (willow-itcw), and
+//     under `module::Enum`, the one name it has build-wide, and
 //     the bare spelling each unit uses for it is installed for that unit alone.
 //     Before that, the two bare `Level`s were one table entry, so the alias was
 //     dropped and neither body could be lowered.
@@ -1045,7 +1045,7 @@ fn p26_the_module_enum_tables_example_survives_gc_stress() {
 }
 
 /// The second example: two modules that each declare `enum Level`, both in
-/// scope at once (willow-itcw).
+/// scope at once.
 const IDENTITY_EXAMPLE: &[(&str, &str)] = &[
     (
         "signal.wi",
@@ -1098,7 +1098,7 @@ fn p34_the_module_enum_identity_example_survives_gc_stress() {
 //     `signal::Level`, but knowing an enum's identity is not permission to write
 //     its variants bare. Only a unit that can name the ENUM bare -- the module
 //     that declares it, or an importer that took it by item -- may leave the
-//     name off its variants (willow-itcw).
+//     name off its variants.
 #[test]
 fn p35_an_importer_may_not_construct_a_modules_variant_bare() {
     let files = project(
@@ -1150,7 +1150,7 @@ fn main() {
 }
 
 // 37. ... and taking the enum by item is what grants both bare forms: the item
-//     import binds `Level` unqualified (willow-64gs), so the unit can name the
+//     import binds `Level` unqualified, so the unit can name the
 //     enum bare and therefore its variants too.
 #[test]
 fn p37_an_item_import_grants_the_bare_forms() {

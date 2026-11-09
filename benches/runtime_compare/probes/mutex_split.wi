@@ -1,4 +1,4 @@
-// Newly reconstructed for willow-8hq4.42; same increment and lock body as contention.
+// Newly reconstructed for the lock-contention comparison; same increment and lock body as contention.
 async fn work(shared: Mutex<i64>, n: i64) {
     let mut i = 0;
     while i < n { lock shared as mut value { value = value + 1; } i = i + 1; }

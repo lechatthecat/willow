@@ -1,5 +1,5 @@
 // An annotated type reaches the arguments of lock constructors and generic
-// calls (willow-jz15.96). An empty collection argument takes the annotated
+// calls. An empty collection argument takes the annotated
 // element types; it no longer becomes `Map<void, void>` or `Array<void>`.
 import std::collections::Array;
 import std::collections::Map;

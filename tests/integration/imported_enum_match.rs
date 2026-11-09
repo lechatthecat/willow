@@ -1,4 +1,4 @@
-//! Matching an enum that was declared in ANOTHER file (willow-28h8 case B).
+//! Matching an enum that was declared in ANOTHER file (imported enum matching case B).
 //!
 //! HIR lowering built its enum table from the unit it was lowering — the
 //! `enum` items of that one file — so any enum reached through an import was
@@ -108,7 +108,7 @@ fn borrowed<'a>(files: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a s
     files.iter().map(|(n, s)| (*n, s.as_str())).collect()
 }
 
-/// The project builds and prints `expected`. Since willow-0g8j.3 every body is
+/// The project builds and prints `expected`. Since the lowered-IR cutover every body is
 /// compiled from lowered IR, so a match the walker cannot take is a compile
 /// error here rather than a second emitter's answer.
 #[track_caller]

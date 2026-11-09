@@ -266,9 +266,9 @@ fn a7_adt_fallback_does_not_hide_an_unknown_callback() {
 }
 
 #[test]
-fn jz15_80_imported_generic_task_repro() {
+fn task_preemption_imported_generic_task_repro() {
     let project = TestProject::new(
-        "jz15_80",
+        "imported_generic_task",
         &[
             ("boxes.wi", "pub fn id<T>(x:T)->T{return x;}"),
             (
@@ -297,7 +297,7 @@ fn jz15_80_imported_generic_task_repro() {
 // Twenty explicit combinations: item/module imports and aliases, each with
 // inferred scalar/String/bool, explicit type arguments, and repeated instances.
 #[test]
-fn jz15_80_imported_generic_task_matrix() {
+fn task_preemption_imported_generic_task_matrix() {
     for (import, callee) in [
         ("import boxes::id;", "id"),
         ("import boxes::id as identity;", "identity"),
@@ -316,7 +316,7 @@ fn jz15_80_imported_generic_task_matrix() {
         ] {
             let source = format!("{import} async fn main(){{{body}}}");
             let project = TestProject::new(
-                "jz15_80_matrix",
+                "imported_task_matrix",
                 &[
                     ("boxes.wi", "pub fn id<T>(x:T)->T{return x;}"),
                     ("main.wi", &source),
@@ -342,9 +342,9 @@ fn jz15_80_imported_generic_task_matrix() {
 }
 
 #[test]
-fn jz15_80_generic_unknown_has_source_name_and_call_span() {
+fn task_preemption_generic_unknown_has_source_name_and_call_span() {
     let project = TestProject::new(
-        "jz15_80_diagnostic",
+        "generic_task_diagnostic",
         &[
             (
                 "boxes.wi",
@@ -366,9 +366,9 @@ fn jz15_80_generic_unknown_has_source_name_and_call_span() {
 }
 
 #[test]
-fn jz15_80_proven_indirect_call_does_not_hide_failing_generic() {
+fn task_preemption_proven_indirect_call_does_not_hide_failing_generic() {
     let project = TestProject::new(
-        "jz15_80_safe_indirect",
+        "proven_indirect_task",
         &[
             (
                 "boxes.wi",
@@ -391,7 +391,7 @@ fn jz15_80_proven_indirect_call_does_not_hide_failing_generic() {
 }
 
 #[test]
-fn jz15_80_virtual_spans_follow_build_wide_dispatch() {
+fn task_preemption_virtual_spans_follow_build_wide_dispatch() {
     for api in [
         "pub interface I extends Sync { fn get(self)->i64; }",
         "pub interface I extends Sync { fn get(self)->i64{return 1;} }",
@@ -409,7 +409,7 @@ fn jz15_80_virtual_spans_follow_build_wide_dispatch() {
             ),
         ] {
             let project = TestProject::new(
-                "jz15_80_virtual",
+                "virtual_task_spans",
                 &[
                     ("api.wi", api),
                     (
@@ -440,9 +440,9 @@ fn jz15_80_virtual_spans_follow_build_wide_dispatch() {
 }
 
 #[test]
-fn jz15_80_virtual_override_hazard_uses_union_span() {
+fn task_preemption_virtual_override_hazard_uses_union_span() {
     let project = TestProject::new(
-        "jz15_80_override",
+        "virtual_override_hazard",
         &[
             (
                 "api.wi",

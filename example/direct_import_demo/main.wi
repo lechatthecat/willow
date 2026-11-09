@@ -1,4 +1,4 @@
-// `import mod::Type` binds the unqualified type name (willow-64gs).
+// `import mod::Type` binds the unqualified type name.
 import shapes::Point;
 import shapes::Kind;
 

@@ -55,7 +55,7 @@ pub(crate) struct LirQueries {
     store: Rc<ArtifactStore>,
     units: QueryTable<UnitId, LirUnit>,
     bodies: QueryTable<BodyId, usize>,
-    /// Debug builds check integer overflow (willow-jz15.14).
+    /// Debug builds check integer overflow.
     overflow_checks: bool,
 }
 
@@ -128,7 +128,7 @@ impl LirQueries {
     }
 
     /// Lower one unit and store every body it produces, returning the
-    /// constructs HIR lowering could not express (willow-mb5).
+    /// constructs HIR lowering could not express.
     ///
     /// The unit evaluator runs once and owns the lowering itself: call lowering
     /// and scalar-leaf inlining require all of a unit's functions together, so
@@ -296,7 +296,7 @@ impl LirQueries {
     }
 
     /// Lower and store the interface defaults that classes of other units
-    /// copied from `scope`'s interfaces (willow-rvpp), in that declaring unit's
+    /// copied from `scope`'s interfaces, in that declaring unit's
     /// scope: `scope` and `scope_tables` are its program and checked tables,
     /// and `classes` holds each receiver's class chain from its own unit. These
     /// bodies are left out of [`Self::lower_unit`], so each is lowered exactly
@@ -385,7 +385,7 @@ impl LirQueries {
 
 /// The lambdas nested in `block`, the body of the copy `copy`, with the
 /// contextual body identity each has in that copy, innermost first: the
-/// order lowering lifts them in (willow-rvpp).
+/// order lowering lifts them in.
 pub(crate) fn copied_lambdas<'b>(
     index: &BodyIndex,
     copy: BodyId,

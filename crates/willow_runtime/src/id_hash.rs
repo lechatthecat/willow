@@ -2,8 +2,8 @@
 //!
 //! Task ids, wait tickets and heap addresses are produced by the runtime, not
 //! by program input, so SipHash's flooding resistance buys nothing and costs a
-//! keyed multi-round hash per lookup on scheduler and collector hot paths
-//! (willow-8hq4.16, willow-8hq4.18, willow-lk92).
+//! keyed multi-round hash per lookup on scheduler and collector hot paths.
+//!
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};

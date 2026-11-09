@@ -1,4 +1,4 @@
-// Interface inheritance (willow-1js.2): an interface may `extends` another,
+// Interface inheritance: an interface may `extends` another,
 // inheriting its required (and default) methods. A class that implements the
 // sub-interface must satisfy the whole chain, and is usable wherever any
 // super-interface is expected. A sub-interface value is also usable as a

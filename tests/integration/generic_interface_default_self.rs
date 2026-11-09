@@ -1,8 +1,8 @@
-//! `self` in a GENERIC interface default (willow-rktm).
+//! `self` in a GENERIC interface default.
 //!
 //! A class implementing another module's `Get<A>` receives its defaults
-//! through one non-generic instance checked in the provider (willow-s71l).
-//! `self` there is the opaque `Self` (willow-dnia), converting to the written
+//! through one non-generic instance checked in the provider.
+//! `self` there is the opaque `Self`, converting to the written
 //! type `Get<A>` wherever the receiver's declared interface would, and no
 //! diagnostic names the instance.
 //! A generic interface value also converts to the non-generic interfaces its

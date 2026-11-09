@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Reassigned fields break `Sync` (willow-jz15.78) ──────────────────────────
+// ── Reassigned fields break `Sync` ──────────────────────────
 //
 // Willow fields have no readonly spelling, so a class is `Sync` only when all
 // of its fields are `Sync` AND no field is written after construction.
@@ -72,7 +72,7 @@ fn assert_accepted(source: &str) {
 const REASSIGNED: &str = "is reassigned after construction";
 
 #[test]
-fn test_jz15_78_repro_rejected() {
+fn test_field_write_sync_repro_rejected() {
     assert_not_sync(
         REPRO,
         &[
@@ -84,7 +84,7 @@ fn test_jz15_78_repro_rejected() {
 }
 
 #[test]
-fn test_jz15_78_diagnostic_points_at_field_and_names_remedies() {
+fn test_field_write_sync_diagnostic_points_at_field_and_names_remedies() {
     assert_not_sync(
         REPRO,
         &[
@@ -97,7 +97,7 @@ fn test_jz15_78_diagnostic_points_at_field_and_names_remedies() {
 }
 
 #[test]
-fn test_jz15_78_init_only_writes_stay_sync() {
+fn test_field_write_sync_init_only_writes_stay_sync() {
     assert_accepted(
         r#"
 class Config {
@@ -112,7 +112,7 @@ async fn main() { let c = new Config(3); println(await read(c)); }
 }
 
 #[test]
-fn test_jz15_78_method_compound_write_rejected() {
+fn test_field_write_sync_method_compound_write_rejected() {
     assert_not_sync(
         r#"
 class C { pub n: i64; pub fn bump(self) { self.n += 1; } }
@@ -124,7 +124,7 @@ async fn main() { let c = new C(3); println(await read(c)); }
 }
 
 #[test]
-fn test_jz15_78_write_through_immutable_binding_rejected() {
+fn test_field_write_sync_write_through_immutable_binding_rejected() {
     assert_not_sync(
         r#"
 class C { pub n: i64; }
@@ -137,7 +137,7 @@ async fn main() { let c = new C(3); reset(c); println(await read(c)); }
 }
 
 #[test]
-fn test_jz15_78_subclass_write_to_inherited_field_rejected() {
+fn test_field_write_sync_subclass_write_to_inherited_field_rejected() {
     assert_not_sync(
         r#"
 open class Base { pub n: i64; }
@@ -150,7 +150,7 @@ async fn main() { let b = new Base(3); println(await read(b)); }
 }
 
 #[test]
-fn test_jz15_78_reference_argument_counts_as_write() {
+fn test_field_write_sync_reference_argument_counts_as_write() {
     assert_not_sync(
         r#"
 class C { pub n: i64; }
@@ -163,7 +163,7 @@ async fn main() { let c = new C(1); inc(&c.n); println(await read(c)); }
 }
 
 #[test]
-fn test_jz15_78_nested_write_breaks_inner_and_outer() {
+fn test_field_write_sync_nested_write_breaks_inner_and_outer() {
     let decls = r#"
 class Inner { pub v: i64; }
 class Outer { pub inner: Inner; }
@@ -187,7 +187,7 @@ fn poke(o: Outer) { o.inner.v = 2; }
 }
 
 #[test]
-fn test_jz15_78_init_lambda_write_through_alias_counts() {
+fn test_field_write_sync_init_lambda_write_through_alias_counts() {
     assert_not_sync(
         r#"
 class C {
@@ -207,7 +207,7 @@ async fn main() { println(await read(new C())); }
 }
 
 #[test]
-fn test_jz15_78_init_write_after_self_escapes_rejected() {
+fn test_field_write_sync_init_write_after_self_escapes_rejected() {
     assert_not_sync(
         r#"
 class C {
@@ -232,7 +232,7 @@ async fn main() { println(new C().n); }
 }
 
 #[test]
-fn test_jz15_78_write_after_escaping_super_init_rejected() {
+fn test_field_write_sync_write_after_escaping_super_init_rejected() {
     let base = r#"
 open class P {
     pub x: i64;
@@ -257,7 +257,7 @@ async fn main() { println(await read(new C())); }
 }
 
 #[test]
-fn test_jz15_78_init_lambda_without_writes_stays_sync() {
+fn test_field_write_sync_init_lambda_without_writes_stays_sync() {
     assert_accepted(
         r#"
 class C {
@@ -271,7 +271,7 @@ async fn main() { println(await read(new C())); }
 }
 
 #[test]
-fn test_jz15_78_atomic_lock_and_frozen_fields_stay_sync_and_run() {
+fn test_field_write_sync_atomic_lock_and_frozen_fields_stay_sync_and_run() {
     let (out, ok) = compile_and_run(
         r#"
 import std::collections::Array;
@@ -305,7 +305,7 @@ async fn main() {
 }
 
 #[test]
-fn test_jz15_78_reassigned_mutex_field_rejected() {
+fn test_field_write_sync_reassigned_mutex_field_rejected() {
     assert_not_sync(
         r#"
 class Shared { pub m: Mutex<i64>; pub fn reset(self) { self.m = Mutex::new(0); } }
@@ -317,7 +317,7 @@ async fn main() { await work(new Shared(Mutex::new(0))); }
 }
 
 #[test]
-fn test_jz15_78_rwlock_of_mutable_class_rejected() {
+fn test_field_write_sync_rwlock_of_mutable_class_rejected() {
     assert_not_sync(
         r#"
 class C { pub n: i64; pub fn bump(self) { self.n += 1; } }
@@ -329,7 +329,7 @@ async fn main() { println(await r(RwLock::new(new C(1)))); }
 }
 
 #[test]
-fn test_jz15_78_mutex_of_mutable_class_accepted() {
+fn test_field_write_sync_mutex_of_mutable_class_accepted() {
     assert_accepted(
         r#"
 class C { pub n: i64; pub fn bump(self) { self.n += 1; } }
@@ -340,7 +340,7 @@ async fn main() { println(await r(Mutex::new(new C(1)))); }
 }
 
 #[test]
-fn test_jz15_78_sync_interface_contract_rejects_reassigned_field() {
+fn test_field_write_sync_sync_interface_contract_rejects_reassigned_field() {
     assert_not_sync(
         r#"
 interface Shareable extends Sync {}
@@ -359,7 +359,7 @@ fn main() { println(new C(1).n); }
 }
 
 #[test]
-fn test_jz15_78_generic_class_setter_rejected() {
+fn test_field_write_sync_generic_class_setter_rejected() {
     assert_not_sync(
         r#"
 class Box<T> { pub v: T; pub fn set(self, v: T) { self.v = v; } }
@@ -371,7 +371,7 @@ async fn main() { println(await read(new Box<i64>(1))); }
 }
 
 #[test]
-fn test_jz15_78_static_field_writes_do_not_affect_instances() {
+fn test_field_write_sync_static_field_writes_do_not_affect_instances() {
     let (ok, stderr) = compile_with_data_race_check(
         r#"
 class C { pub static mut total: i64 = 0; pub n: i64; }
@@ -384,7 +384,7 @@ async fn main() { C::total = 5; println(await read(new C(1))); }
 }
 
 #[test]
-fn test_jz15_78_self_write_in_other_class_is_resolved() {
+fn test_field_write_sync_self_write_in_other_class_is_resolved() {
     assert_accepted(
         r#"
 class A { pub n: i64; }
@@ -396,7 +396,7 @@ async fn main() { println(await read(new A(1))); }
 }
 
 #[test]
-fn test_jz15_78_unresolved_receiver_is_conservative() {
+fn test_field_write_sync_unresolved_receiver_is_conservative() {
     // A return-value receiver remains unknown to the pre-check inventory.
     assert_not_sync(
         r#"
@@ -411,7 +411,7 @@ async fn main() { let b = make(); b.n = 2; println(await read(new A(1))); }
 }
 
 #[test]
-fn test_jz15_78_synchronous_calls_unaffected() {
+fn test_field_write_sync_synchronous_calls_unaffected() {
     let (out, ok) = compile_and_run(
         r#"
 class C { pub n: i64; }
@@ -426,7 +426,7 @@ fn main() { let c = new C(1); c.n = 2; println(read(c)); }
 const COUNTER_MODULE: &str = "pub class Counter { pub n: i64; }\n";
 
 #[test]
-fn test_jz15_78_write_in_other_module_rejects_imported_class() {
+fn test_field_write_sync_write_in_other_module_rejects_imported_class() {
     let writer = "import counter::Counter;\npub fn bump(c: Counter) { c.n = c.n + 1; }\n";
     let main = r#"
 import counter::Counter;
@@ -447,7 +447,7 @@ async fn main() { let c = new Counter(1); writer::bump(c); println(await read(c)
 }
 
 #[test]
-fn test_jz15_78_write_in_entry_rejects_imported_class() {
+fn test_field_write_sync_write_in_entry_rejects_imported_class() {
     let main = r#"
 import counter::Counter;
 async fn read(c: Counter) -> i64 { await sleep(1); return c.n; }
@@ -463,7 +463,7 @@ async fn main() { let c = new Counter(1); c.n = 5; println(await read(c)); }
 }
 
 #[test]
-fn test_jz15_78_aliased_escaping_base_init_rejected() {
+fn test_field_write_sync_aliased_escaping_base_init_rejected() {
     // The base is spelled through an import alias, so the subclass names a
     // class that is not declared under that name anywhere.
     let base = r#"
@@ -485,7 +485,7 @@ async fn main() { println(new C().x); }
 }
 
 #[test]
-fn test_jz15_78_generic_program_sees_cross_module_writes() {
+fn test_field_write_sync_generic_program_sees_cross_module_writes() {
     // Generic code routes the build through the template phase first; the
     // whole-program write summary must still reach the final check.
     let writer = "import counter::Counter;\npub fn bump(c: Counter) { c.n = c.n + 1; }\n";
@@ -509,7 +509,7 @@ async fn main() { let c = id(new Counter(1)); writer::bump(c); println(await rea
 }
 
 #[test]
-fn test_jz15_78_unwritten_imported_class_stays_sync_and_runs() {
+fn test_field_write_sync_unwritten_imported_class_stays_sync_and_runs() {
     let main = r#"
 import counter::Counter;
 async fn read(c: Counter) -> i64 { await sleep(1); return c.n; }
@@ -524,7 +524,7 @@ async fn main() { println(await read(new Counter(7))); }
 }
 
 #[test]
-fn test_jz15_78_mutex_shared_counter_runs_exactly() {
+fn test_field_write_sync_mutex_shared_counter_runs_exactly() {
     let (out, ok) = compile_and_run(
         r#"
 import std::collections::Array;
@@ -548,16 +548,16 @@ async fn main() {
 }
 
 #[test]
-fn test_jz15_78_runnable_example() {
+fn test_field_write_sync_runnable_example() {
     let (out, ok) = compile_and_run(include_str!("../../../example/sync_field_reassignment.wi"));
     assert!(ok, "{out}");
     assert_eq!(out, "hits 800\ntotal 1600\nboxed 1600\n");
 }
 
-// willow-jz15.81: declaration-aware receiver inventory. Every variant checks
+// declaration-aware receiver inventory. Every variant checks
 // both the read-only namesake and rejection of the actually written class.
 #[test]
-fn test_jz15_81_sync_receiver_matrix() {
+fn test_sync_receiver_sync_receiver_matrix() {
     let cases = [
         ("new", "fn mutate() { let b = new B(0); b.cell = 1; }"),
         ("parameter", "fn mutate(b: B) { b.cell = 1; }"),
@@ -622,7 +622,7 @@ fn test_jz15_81_sync_receiver_matrix() {
 }
 
 #[test]
-fn test_jz15_81_sync_module_declarations() {
+fn test_sync_receiver_sync_module_declarations() {
     for (import, ty) in [
         ("import mutable::Record;", "Record"),
         ("import mutable::Record as Selected;", "Selected"),
@@ -671,7 +671,7 @@ fn test_jz15_81_sync_module_declarations() {
 }
 
 #[test]
-fn test_jz15_81_sync_atomic_stats_and_namesake_run() {
+fn test_sync_receiver_sync_atomic_stats_and_namesake_run() {
     let project = TestProject::new(
         "sync_atomic_namesake",
         &[
@@ -727,7 +727,7 @@ fn test_jz15_81_sync_atomic_stats_and_namesake_run() {
 }
 
 #[test]
-fn test_jz15_81_sync_genuine_shared_stats_rejected() {
+fn test_sync_receiver_sync_genuine_shared_stats_rejected() {
     let project = TestProject::new(
         "sync_mutable_stats",
         &[
@@ -754,7 +754,7 @@ fn test_jz15_81_sync_genuine_shared_stats_rejected() {
 }
 
 #[test]
-fn test_jz15_81_sync_inherited_import_alias() {
+fn test_sync_receiver_sync_inherited_import_alias() {
     for (reader, accepted) in [("Unrelated", true), ("Base", false)] {
         let main = format!(
             "import base::{{Base, Unrelated}}; import sub; async fn read(x: {reader}) -> i64 {{ return x.cell; }} async fn main() {{ println(await read(new {reader}(7))); }}"
@@ -787,7 +787,7 @@ fn test_jz15_81_sync_inherited_import_alias() {
 }
 
 #[test]
-fn test_jz15_81_sync_same_module_path_in_distinct_packages() {
+fn test_sync_receiver_sync_same_module_path_in_distinct_packages() {
     for (reader, accepted) in [("b", true), ("a", false)] {
         let main = format!(
             "import a::types::Record as Written; import {reader}::types::Record as Read; fn mutate(x: Written) {{ x.cell = 1; }} async fn read(x: Read) -> i64 {{ return x.cell; }} async fn main() {{ println(await read(new Read(7))); }}"
@@ -821,9 +821,9 @@ fn test_jz15_81_sync_same_module_path_in_distinct_packages() {
     }
 }
 
-// willow-jz15.110: exclusive sections do not exempt class field writes.
+// exclusive sections do not exempt class field writes.
 #[test]
-fn test_jz15_110_write_binding_field_updates_rejected_with_remedies() {
+fn test_binding_field_write_write_binding_field_updates_rejected_with_remedies() {
     for write in ["w.n = w.n + 1;", "w.n += 1;"] {
         let source = format!(
             r#"
@@ -847,7 +847,7 @@ async fn main() {{ await bump(RwLock::new(new C(1))); }}
 }
 
 #[test]
-fn test_jz15_110_replacement_does_not_hide_other_field_writes() {
+fn test_binding_field_write_replacement_does_not_hide_other_field_writes() {
     assert_not_sync(
         r#"
 class C { pub n: i64; pub fn bump(self) { self.n += 1; } }
@@ -859,7 +859,7 @@ async fn main() { await update(RwLock::new(new C(1))); }
 }
 
 #[test]
-fn test_jz15_110_runnable_example() {
+fn test_binding_field_write_runnable_example() {
     let source = include_str!("../../../example/rwlock_class_update.wi");
     assert_accepted(source);
     let (out, ok) = compile_and_run(source);

@@ -1,4 +1,4 @@
-// willow-8hq4.30: allocation-only literals, including allocation during unwind.
+// allocation-only literals, including allocation during unwind.
 import std::collections::Array;
 class Item { pub value: i64; }
 fn make(n: i64) -> Array<i64> { return [n, n]; }

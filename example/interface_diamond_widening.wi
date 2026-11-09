@@ -1,4 +1,4 @@
-// Interface widening in a diamond (willow-ssl7.5).
+// Interface widening in a diamond.
 //
 // `Panel` inherits both `Framed` and `Titled`, and both of those inherit
 // `Widget`, so there are two distinct inheritance PATHS from `Panel` to

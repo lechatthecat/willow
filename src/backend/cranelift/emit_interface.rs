@@ -93,7 +93,7 @@ impl InterfaceAnalysis {
 }
 
 /// What every function an interface method's vtable slots can hold has in
-/// common (willow-8hq4.14).
+/// common.
 #[derive(Clone, Copy)]
 pub(super) struct InterfaceSlotSummary {
     /// A complete singleton is unguarded; at most four guarded calls otherwise
@@ -181,7 +181,7 @@ struct DispatchHierarchy {
 
 impl DispatchHierarchy {
     /// The `extends` graph of every class with a runtime `type_id`, projected
-    /// into id space (willow-au5k): `classes` lists each class NAME with its
+    /// into id space: `classes` lists each class NAME with its
     /// id and `base_id_of` answers the id of a name's direct base. Every name
     /// for one class shares one id, so the projection collapses aliases onto
     /// exactly the relation the emitted dispatch chain tests. An edge to a
@@ -268,7 +268,7 @@ impl DispatchHierarchy {
     }
 }
 
-/// How one class-method call site must be emitted (willow-fm7t).
+/// How one class-method call site must be emitted.
 ///
 /// Produced by [`FuncGen::plan_virtual_call`] for LIR emission. The plan fixes
 /// whether the call is virtual, its slot, and the implementation ABI.
@@ -467,7 +467,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .hierarchy
                     .get_or_insert_with(|| {
                         // Over DECLARATION identities, not this unit's
-                        // spellings: the graph is build-wide (willow-kd1v).
+                        // spellings: the graph is build-wide.
                         std::rc::Rc::new(DispatchHierarchy::new(
                             self.classes.runtime_classes(),
                             |name| {
@@ -523,7 +523,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// How a call to `class_name::method_name` on a receiver of STATIC type
-    /// `class_name` must be emitted (willow-fm7t).
+    /// `class_name` must be emitted.
     ///
     /// Resolve once per scoped (receiver, method) pair. Static initializers and
     /// emitted functions share plans until registration or resolution changes.
@@ -583,7 +583,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// How `super.method_name(...)` inside a subclass of `base_class` is
-    /// emitted (willow-jz15.48): a direct call to the implementation `base_class`
+    /// emitted: a direct call to the implementation `base_class`
     /// resolves `method_name` to, so an override can extend the inherited body
     /// instead of re-dispatching to itself. Only that one body can run, so its
     /// own panic summary is the call site's.
@@ -639,7 +639,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// The nearest class in `class_name`'s own ancestry — itself first — that
     /// defines `method_name`, so a subclass that INHERITS a method resolves to
-    /// the implementation it actually inherits (willow-ftk).
+    /// the implementation it actually inherits.
     fn resolve_defining_class(&self, class_name: &str, method_name: &str) -> Option<String> {
         self.dispatch_cache
             .borrow_mut()
@@ -657,8 +657,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 }
 
-/// Element-kind tag for the collection debug-display runtime calls
-/// (willow-vwn6). Must match the runtime's `ELEM_KIND_*` constants.
+/// Element-kind tag for the collection debug-display runtime calls. Must match the runtime's
+/// `ELEM_KIND_*` constants.
 pub(super) fn collection_elem_kind(ty: &Type) -> Option<i64> {
     match ty {
         Type::I64 => Some(0),
@@ -677,7 +677,7 @@ pub(super) fn collection_elem_kind(ty: &Type) -> Option<i64> {
 /// The walk runs over whatever node the caller's tables are keyed by (names
 /// in the LIR walker, ids in the perspectives below) but COMPARES ids, so a
 /// class reached under an alias still meets its canonical spelling: every
-/// name for one class shares one `type_id` (willow-au5k). The relation is
+/// name for one class shares one `type_id`. The relation is
 /// DIRECTED: a base class is not a candidate for a receiver typed as one of
 /// its subclasses. The `seen` set makes a malformed `extends` cycle terminate
 /// instead of hanging the compiler — a cycle is a checker error, and codegen
@@ -1022,8 +1022,8 @@ pub(super) mod tests {
         for _ in 0..4 {
             assert_eq!(cg.resolve_class_method_func_id("B", "value"), Some(a));
         }
-        // A declaration identity's base is frozen at its first registration
-        // (willow-afb5.16): re-declaring `B` under another parent requests the
+        // A declaration identity's base is frozen at its first registration: re-declaring `B`
+        // under another parent requests the
         // same edge again, so the inherited method stays `A::value`.
         declare(&mut cg, "class B extends X {}");
         assert_eq!(cg.resolve_class_method_func_id("B", "value"), Some(a));
@@ -1247,7 +1247,7 @@ fn main() {}
     /// source. The exported `interface_probe` parameter is the backend fixture
     /// boundary: its two-word representation can have a valid outer box with a
     /// zero object word, without preserving a safe-language path that creates
-    /// that invalid state (willow-glaj.8).
+    /// that invalid state.
     fn compile_interface_probe() -> Vec<u8> {
         compile_dispatch_fixture(INVALID_BOX_FIXTURE_SOURCE)
     }

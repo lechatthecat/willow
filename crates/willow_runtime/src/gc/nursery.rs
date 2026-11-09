@@ -86,8 +86,8 @@ impl Policy {
         // between minors. Above the band, jump straight to 32 times the
         // survivors instead of doubling once per cycle: ramp-up cycles
         // otherwise copy (and tenure) nearly every in-flight object, and
-        // concurrent allocators each keep a live working set in flight
-        // (willow-jz15.120). Empty cycles carry no survival evidence; the dead
+        // concurrent allocators each keep a live working set in flight. Empty cycles carry no
+        // survival evidence; the dead
         // band avoids oscillation, and division keeps the comparisons safe
         // even for extreme accounting values.
         let target = if young_before == 0 {
@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn nursery_policy_jumps_to_32x_survivors_within_cap_and_limit() {
-        // willow-jz15.120: high survival jumps straight to 32x the survivors
+        // high survival jumps straight to 32x the survivors
         // instead of doubling once per cycle, bounded by the cap and limit.
         let policy = Policy::default();
         let mib = 1024 * 1024;

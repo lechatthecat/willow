@@ -1,4 +1,4 @@
-// Class-method dispatch (willow-au5k): a call on a receiver whose runtime class
+// Class-method dispatch: a call on a receiver whose runtime class
 // is not known statically dispatches on the object's own type, and the classes
 // it can dispatch to are exactly the receiver's static class and that class's
 // subclasses.

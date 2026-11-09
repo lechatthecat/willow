@@ -1,6 +1,6 @@
 //! A bare module class name is resolved against the modules the file being
-//! compiled can SEE, and only then against every module the build declared
-//! (willow-vtlr).
+//! compiled can SEE, and only then against every module the build declared.
+//!
 //!
 //! Module function signatures preserve their class access path —
 //! `shapes::make(1, 2)` is typed `shapes::Point` — so two modules that both
@@ -9,7 +9,7 @@
 //! and only then the whole build.
 //!
 //! Losing a body's lowering was never observable in a program's output, so the
-//! evidence here is the build itself — since willow-0g8j.3 an unlowered body
+//! evidence here is the build itself — since the lowered-IR cutover an unlowered body
 //! does not compile — and `WILLOW_LIR_LOG=1`, which names the bodies that were
 //! walked, alongside what the program prints.
 

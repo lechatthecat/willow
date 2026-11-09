@@ -1,6 +1,6 @@
 use super::*;
 
-// ── String content equality (willow-rpxh) ───────────────────────────────────
+// ── String content equality ───────────────────────────────────
 // == / != on String compare CONTENT via willow_string_eq, never pointers.
 // 20 perspectives: 1 concat==literal (the original bug), 2 != inverse,
 // 3 different strings unequal, 4 empty==empty, 5 empty vs non-empty,
@@ -10,7 +10,7 @@ use super::*;
 // drives while exit, 15 == inside lambda, 16 interpolated/format result ==
 // literal, 17 GC stress (rhs allocation during comparison, lhs rooted),
 // 18 chained comparisons via bools, 19 array element == literal (break
-// scenario from willow-kzka), 20 long strings differing at the last byte.
+// scenario from string-content comparison), 20 long strings differing at the last byte.
 
 #[test]
 fn streq_01_concat_vs_literal() {
@@ -159,7 +159,7 @@ fn streq_18_chained_bools() {
 
 #[test]
 fn streq_19_array_element_break_scenario() {
-    // The willow-kzka discovery case: break on a content match now fires.
+    // The string-content comparison discovery case: break on a content match now fires.
     let (out, ok) = compile_and_run(
         "import std::collections::Array;\nfn main() { let xs: Array<String> = [\"a\", \"b\", \"c\", \"d\"]; for s in xs { let t = s + \"!\"; if t == \"c!\" { break; } println(t); } println(\"done\"); }",
     );

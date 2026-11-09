@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Task-id + spawn-site debug traces (willow-0a6k.7 slice 2) ───────────────
+// ── Task-id + spawn-site debug traces (panic and cancellation policy slice 2) ───────────────
 // 10 perspectives on top of cancel_01-20: 1 panic trace carries task id,
 // 2 panic trace carries spawn file:line, 3 spawn line is the CALL site (not
 // the async fn definition), 4 fire-and-forget spawn (`let h = f();`) records

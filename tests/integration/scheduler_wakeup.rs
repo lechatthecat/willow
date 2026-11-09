@@ -1,4 +1,4 @@
-//! Scheduler wake-up and blocking-`select` behaviour (willow-atth).
+//! Scheduler wake-up and blocking-`select` behaviour.
 //!
 //! A claim pops a task out of every run queue before it registers as an active
 //! poll. A worker idling in that window used to observe an empty queue, zero

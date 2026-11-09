@@ -1,6 +1,6 @@
 use super::*;
 
-// ── GC-managed channels (willow-p4er) ───────────────────────────────────────
+// ── GC-managed channels ───────────────────────────────────────
 // Channels are ordinary GC objects now: a loop creating channels no longer
 // grows memory for the program's lifetime (registry deleted), and cancel
 // deregisters via task-side reverse references in O(parked channels).

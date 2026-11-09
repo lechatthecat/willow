@@ -1,4 +1,4 @@
-//! Array temporaries that need no shadow-stack root (willow-nzsg).
+//! Array temporaries that need no shadow-stack root.
 //!
 //! Lowering copies a method receiver into a synthetic temporary, so
 //! `while i < values.len()` evaluates `t = values; t.len()` on every trip.
@@ -220,7 +220,7 @@ fn scalar(ty: &Type) -> bool {
 
 /// The array an rvalue accesses only through the inline, nonallocating
 /// access path of `emit_array_access`: a length, a scalar-element read, or a
-/// scalar-element store (willow-ijui.10).
+/// scalar-element store.
 fn inspected_array(value: &LirRvalue) -> Option<LirLocalId> {
     match value {
         LirRvalue::IntrinsicCall {

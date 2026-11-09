@@ -1,4 +1,4 @@
-//! Shard-grouped wake publication (willow-ijui.5).
+//! Shard-grouped wake publication.
 use super::*;
 
 /// Reuse the buffers across channel notifications. Results last until the next batch.
@@ -35,7 +35,7 @@ impl ShardedTaskTable {
         // once and in ascending index order (as with_two_mut). A batch at
         // least as large as the shard count uses a counting partition,
         // O(ids + shards) = O(ids); a smaller one a stable sort, O(ids log ids),
-        // so a small batch pays nothing per shard (willow-8hq4.19). Both group
+        // so a small batch pays nothing per shard. Both group
         // in the reused `grouped` buffer.
         scratch.grouped.extend_from_slice(ids);
         if ids.len() >= TASK_TABLE_SHARDS {

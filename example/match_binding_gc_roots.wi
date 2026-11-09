@@ -1,4 +1,4 @@
-// A `match` binding is a GC root of its own (willow-10zt).
+// A `match` binding is a GC root of its own.
 //
 // Willow's collector is generational: the old generation never moves, but a
 // young object that survives a minor collection is COPIED into the old one and

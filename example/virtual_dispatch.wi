@@ -1,4 +1,4 @@
-// Virtual dispatch for overridden methods (willow-ftk): a call through a base
+// Virtual dispatch for overridden methods: a call through a base
 // reference dispatches on the object's runtime type, honoring overrides — and a
 // subclass that does NOT override inherits the base implementation. A base
 // method calling `self.method()` also dispatches virtually.

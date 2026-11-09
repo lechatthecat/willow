@@ -6,7 +6,7 @@
 // array local uses the same entry-allocated, entry-rooted stack slot a String
 // local does, and a fresh array is rooted while anything that can collect runs.
 // Building this program must print the same thing under WILLOW_GC_STRESS=alloc
-// as without it. Since willow-0g8j.3 a body outside the walker's subset is a
+// as without it. Since the lowered-IR cutover a body outside the walker's subset is a
 // compile error, so the build succeeding is itself the proof that the walker
 // compiled every function below.
 

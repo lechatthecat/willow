@@ -4603,7 +4603,7 @@ fn imported_constructor_effects_match_local_field_initialization() {
 
 #[test]
 fn local_selectors_symbol_line_order_and_rename_dry_run_counts() {
-    // willow-25da.29.53: offsets are identities, not selectors.
+    // offsets are identities, not selectors.
     let f = Fixture::new();
     fs::write(
         f.0.join("src/main.wi"),

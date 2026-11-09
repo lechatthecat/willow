@@ -49,7 +49,7 @@ fn test_workers_high_count_still_correct_under_gc_stress() {
 #[test]
 fn async_frame_call_safepoints_narrow_straight_line_locals() {
     // Each value is read by the following arithmetic statement, but neither
-    // statement executes a call. With willow-mpvo there is no preemption edge
+    // statement executes a call. With call-site preemption there is no preemption edge
     // between them, so only `total`, which is live at the final println call,
     // needs a frame slot.
     let mut source = String::from("async fn oversized() {\n    let mut total: i64 = 0;\n");
@@ -76,7 +76,7 @@ fn async_frame_call_safepoints_narrow_straight_line_locals() {
     );
 }
 
-/// willow-lpn.10: `example/async_frame_narrowing.wi` walks through every shape
+/// `example/async_frame_narrowing.wi` walks through every shape
 /// the frame-slot analysis distinguishes (dead-before-await, live-across-await,
 /// the loop back edge, branch union, shadowing, and GC-managed locals both read
 /// across a suspension and never read at all).
@@ -98,7 +98,7 @@ fn async_frame_narrowing_example_output_is_independent_of_framing() {
     assert_eq!(out, EXPECTED, "un-narrowed output");
 }
 
-/// willow-lpn.10: the same 1020 locals, but never read after their declaration,
+/// the same 1020 locals, but never read after their declaration,
 /// are dead at every suspension point and get no frame slot at all — so the
 /// frame stays tiny and the large-frame warning does not fire.
 ///
@@ -130,7 +130,7 @@ fn async_frame_narrowing_drops_locals_that_are_dead_at_every_suspension() {
 
 /// A GC local in the final statement of a cooperative poll segment is dead for
 /// value-liveness purposes and therefore uses a native stack root. The terminal
-/// Ready path and inner-scope fallthrough must pop that root (willow-p42j).
+/// Ready path and inner-scope fallthrough must pop that root.
 /// Before the fix, repeated calls aborted under allocation stress with
 /// "invalid GC pointer in GC root graph".
 #[test]
@@ -165,7 +165,7 @@ async fn main() {
     assert_eq!(out, "still alive\n");
 }
 
-/// willow-p42j: a large suffix of GC locals can be dead at an explicit await
+/// a large suffix of GC locals can be dead at an explicit await
 /// while remaining lexically in scope. Pending and budget-preemption returns
 /// must pop every native-slot root; dispatch restores zeroed slots before the
 /// next poll. A collection immediately after resume used to walk addresses in
@@ -203,7 +203,7 @@ async fn main() {
     assert_eq!(out, "still alive\n");
 }
 
-/// willow-p42j: match block arms use the general `emit_block` path rather than
+/// match block arms use the general `emit_block` path rather than
 /// `emit_coop_stmts`. Its runtime roots, scalar count, and cooperative binding
 /// tracker must all return to the arm-entry depth before the following await.
 #[test]
@@ -278,7 +278,7 @@ async fn main() {
     assert_eq!(out, "defer ok\n");
 }
 
-/// The p42j root protocol is what makes lpn.10 narrowing legal for GC locals,
+/// The reference-width root protocol makes async slot narrowing legal for GC locals,
 /// not only scalar locals. More dead GC locals than the 61-bit frame reference
 /// mask can represent must compile by staying in balanced stack-root slots. The
 /// frame-everything override also compiles, using the scalable bitmap when

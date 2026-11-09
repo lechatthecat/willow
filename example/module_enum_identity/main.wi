@@ -1,6 +1,6 @@
 // Two modules, one enum name. An enum's identity is the module that declares it
-// (`signal::Level`, `other::Level`), not the name a unit happens to spell it by
-// (willow-itcw), so both are in scope here at once and neither answers for the
+// (`signal::Level`, `other::Level`), not the name a unit happens to spell it by, so both are
+// in scope here at once and neither answers for the
 // other. The back end keeps ONE flat enum table for the whole build, and it is
 // keyed by that identity, so nothing has to be dropped or guessed.
 //

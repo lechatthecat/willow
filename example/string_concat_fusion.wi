@@ -1,4 +1,4 @@
-// Fused String concatenation (willow-8hq4.29).
+// Fused String concatenation.
 //
 // A chain such as `a + ":" + n.toString() + ":" + b` used to allocate one
 // intermediate String per `+` and one more per `toString()`, copying the

@@ -1,6 +1,6 @@
 use super::super::support::*;
 
-// Contextual enum payload typing — willow-glaj.1. These perspectives pin that
+// Contextual enum payload typing — contextual enum typing. These perspectives pin that
 // expected instantiated payload types flow recursively into nested variant
 // expressions instead of leaving `None` as `Option<Void>`.
 

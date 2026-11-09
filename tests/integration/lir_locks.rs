@@ -1,5 +1,5 @@
-//! `lock` / `read` / `write` critical sections compiled from Lowered IR
-//! (willow-0g8j.2.13).
+//! `lock` / `read` / `write` critical sections compiled from Lowered IR.
+//!
 //!
 //! A critical section is two edges the compiler owns rather than the program:
 //! an acquisition that may PARK the task, and a release on every way out of the
@@ -721,7 +721,7 @@ fn main() {
     );
 }
 
-/// A blocking cell is a GC object (willow-9tls.5), so the walker roots and
+/// A blocking cell is a GC object, so the walker roots and
 /// traces its receiver like any reference: the cell reached through a class
 /// field must survive the collections that the allocations around every
 /// access trigger, or `get()` reads reclaimed memory.

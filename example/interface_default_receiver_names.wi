@@ -1,5 +1,5 @@
 // A class whose name matches a private class of the module that declares its
-// interface still receives that interface's defaults (willow-nvi6).
+// interface still receives that interface's defaults.
 import interface_default_receiver_names_support::shapes;
 
 class Point implements shapes::Measured {

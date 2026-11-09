@@ -2,7 +2,7 @@
 //
 // Every free function here stays inside the walker's supported subset, so its
 // basic blocks are compiled directly from the lowered IR instead of the AST.
-// Since willow-0g8j.3 a body outside that subset is a compile error rather than
+// Since the lowered-IR cutover a body outside that subset is a compile error rather than
 // a fallback, so this file compiling at all is what keeps the claim above
 // honest.
 //

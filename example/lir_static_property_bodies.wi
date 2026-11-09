@@ -1,6 +1,6 @@
 // lir_static_property_bodies — a class's static property, assigned from inside
-// a bracketed or deferred body, through the LIR-walking backend
-// (willow-0g8j.15).
+// a bracketed or deferred body, through the LIR-walking backend.
+//
 //
 // A `defer { .. }` block, a `match` arm and a `select` case are not lowered
 // into the LIR block graph: the walker keeps each one as an HIR island and

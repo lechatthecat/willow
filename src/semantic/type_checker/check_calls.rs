@@ -37,7 +37,7 @@ impl TypeChecker {
     /// static constructors have no `ParamInfo` to run
     /// `check_call_arg_against_param` against, so without this the argument mode
     /// is dropped and `Channel::with_capacity(&n)` compiles as if the `&` were
-    /// not written (willow-o038 review).
+    /// not written.
     pub(super) fn reject_reference_args(&mut self, callee: &str, args: &[CallArg]) {
         for arg in args {
             if let CallArgMode::Reference { ampersand_span } = arg.mode {
@@ -135,7 +135,7 @@ impl TypeChecker {
     }
 
     /// `&place` written for a by-value parameter. Shared by the ordinary call
-    /// path and by `new` (willow-dssc), which checks argument modes without
+    /// path and by `new`, which checks argument modes without
     /// re-checking the argument expression.
     pub(super) fn push_unexpected_reference_arg(
         &mut self,
@@ -195,8 +195,8 @@ impl TypeChecker {
     pub(super) fn check_value_arg_type(&mut self, param_ty: &Type, arg: &CallArg) {
         // Route through `check_expr_expecting` so an unqualified enum-variant
         // construction in argument position (`unwrap_or_zero(Ok(42))`) resolves
-        // against the parameter type, just like a contextually-typed lambda
-        // (willow-60o.1).
+        // against the parameter type, just like a contextually-typed lambda.
+        //
         let arg_ty = if let Some(ty) = self.prechecked_array_args.remove(&arg.expr.id()) {
             ty
         } else {
@@ -345,20 +345,20 @@ impl TypeChecker {
         }
         // A ternary propagates the expected type into BOTH branches, so
         // `ok ? Ok(10) : Err("bad")` resolves its unqualified variants against
-        // the expected enum exactly like a direct `return` does (willow-ok7f).
+        // the expected enum exactly like a direct `return` does.
         if let Expr::Ternary(t) = expr {
             return self.check_ternary_expecting(t, expected);
         }
         // A `match` in value position is the same story one arm wider: the
-        // expected type reaches every arm VALUE (willow-0g8j.3).
+        // expected type reaches every arm VALUE.
         if let Expr::Match(m) = expr {
             let previous = self.local.match_expected.replace(expected.clone());
             let ty = self.check_match_expr(m);
             self.local.match_expected = previous;
             return ty;
         }
-        // Unqualified enum-variant construction resolved by the expected type
-        // (willow-60o.1): `Ok(42)` (payload) and `Closed`/`None` (fieldless), for
+        // Unqualified enum-variant construction resolved by the expected type: `Ok(42)`
+        // (payload) and `Closed`/`None` (fieldless), for
         // both non-generic enums and generic ones (`Result<i64, String>`, ...).
         if let Expr::Call(c) = expr
             && self.prelude_variant_name_is_unshadowed(&c.callee)
@@ -390,7 +390,7 @@ impl TypeChecker {
             }
         }
         // Generic calls and lock constructors pass the expected result into
-        // their arguments' context (willow-jz15.96). A local callable binding
+        // their arguments' context. A local callable binding
         // shadows a generic function of the same name, as in `check_expr`, and
         // a static call on a generic class template keeps `check_expr`, which
         // instantiates the class and checks the call against the instance.
@@ -493,7 +493,7 @@ impl TypeChecker {
     /// Check a ternary whose result flows into an expected type: the condition
     /// stays `bool`, and BOTH branches are checked expecting `expected`, so
     /// contextual forms (unqualified enum variants, contextually-typed lambdas,
-    /// nested ternaries) resolve inside the branches (willow-ok7f).
+    /// nested ternaries) resolve inside the branches.
     pub(super) fn check_ternary_expecting(&mut self, t: &TernaryExpr, expected: &Type) -> Type {
         let errors_before = self.error_generation;
         let cond_ty = self.check_expr(&t.condition);
@@ -567,7 +567,7 @@ impl TypeChecker {
 
     /// If `expected` is an enum type with a variant `name`, return the enum's
     /// name, the variant's payload types (instantiated for a generic enum's type
-    /// arguments), and the enum type to yield (willow-60o.1).
+    /// arguments), and the enum type to yield.
     pub(super) fn expected_variant(
         &self,
         name: &str,
@@ -626,7 +626,7 @@ impl TypeChecker {
 
     /// Validate an unqualified variant construction `name(args)` against the
     /// (possibly instantiated) payload types, record the resolution for the
-    /// backend, and yield `result` (the enum type) (willow-60o.1).
+    /// backend, and yield `result` (the enum type).
     pub(super) fn construct_variant_call(
         &mut self,
         c: &CallExpr,
@@ -681,12 +681,12 @@ impl TypeChecker {
     /// class is an enum's. A qualified variant may be spelled with any path the
     /// unit can resolve -- `std::result::Result::Ok`, `res::Result::Ok` under
     /// `import std::result as res`, or the bare `Result::Ok` -- and contextual
-    /// construction has to see through all of them (willow-0g8j.3).
+    /// construction has to see through all of them.
     /// The build-wide identity of the enum a written static-call class names,
     /// or `None` if it names no enum. An item-imported enum answers to the
     /// local spelling (`Level`, or `Rank` under an alias) and to its identity
     /// (`signal::Level`); the identity is what the enum tables are keyed by, so
-    /// that is what a call site records (willow-0g8j.3).
+    /// that is what a call site records.
     pub(super) fn static_call_enum_key(&self, class: &str) -> Option<String> {
         if let Some(info) = self.symbols.lookup_enum(class) {
             return Some(info.name.clone());
@@ -753,7 +753,7 @@ impl TypeChecker {
         }
         // Contextual construction returns before the ordinary static-call path
         // runs, so it owes lowering that path's record of what the written class
-        // resolved to (willow-0g8j.3).
+        // resolved to.
         if let Some(key) = self.static_call_enum_key(&call.class)
             && key != call.class
         {
@@ -868,7 +868,7 @@ impl TypeChecker {
     /// a task context (`obj.heavy()` where `obj: Work` and `Work::heavy` loops).
     /// `self.heavy()`, free-function, and static-method calls are handled by the
     /// AST-level `ConcurrencyAnalyzer`; this covers the typed-receiver case it
-    /// cannot resolve, so the two never overlap (willow-0a6k.2).
+    /// cannot resolve, so the two never overlap.
     pub(super) fn check_task_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) {
         if self.task_sync_preemption || !self.local.current_async_context {
             return;
@@ -1141,7 +1141,7 @@ impl TypeChecker {
         }
     }
 
-    /// Type-check `format(spec, args...)` (willow-csax): a string-literal
+    /// Type-check `format(spec, args...)`: a string-literal
     /// spec whose placeholders consume exactly the extra arguments. Returns
     /// `String`.
     pub(super) fn check_format_call(&mut self, c: &CallExpr) -> Type {
@@ -1149,7 +1149,7 @@ impl TypeChecker {
         Type::String
     }
 
-    /// Type-check a variadic `panic(spec, args...)` call (willow-csax). The
+    /// Type-check a variadic `panic(spec, args...)` call. The
     /// one-argument `panic(message)` form keeps its plain-String semantics and
     /// never goes through interpolation.
     pub(super) fn check_panic_interpolation(&mut self, c: &CallExpr) -> Type {
@@ -1157,7 +1157,7 @@ impl TypeChecker {
         Type::Never
     }
 
-    /// Shared spec validation for `format`/`panic` (willow-csax): the spec must
+    /// Shared spec validation for `format`/`panic`: the spec must
     /// be a string literal; each `{}` consumes one printable argument
     /// (i64/f64/bool/String); the f64 precision placeholders require `f64`.
     fn check_interpolation(&mut self, c: &CallExpr, fn_name: &str) {
@@ -1277,7 +1277,7 @@ impl TypeChecker {
 
 #[cfg(test)]
 mod ternary_expecting_tests {
-    //! willow-ok7f: the expected type propagates into ternary branches.
+    //! the expected type propagates into ternary branches.
     //! 20 perspectives: 1 return Result, 2 return Option, 3 annotated let,
     //! 4 bare fieldless variants (non-generic), 5 payload variants
     //! (non-generic), 6 mixed qualified/unqualified, 7 nested ternary chain,
@@ -1452,7 +1452,7 @@ mod ternary_expecting_tests {
 
 #[cfg(test)]
 mod printable_tests {
-    //! willow-0rq9: print/println of a non-printable type is a compile error
+    //! print/println of a non-printable type is a compile error
     //! (it used to compile and silently print nothing). 20 perspectives:
     //! 1-8 positives (i64, f64, bool, String, expressions, opened Option payload,
     //! panicking Never argument, print vs println), 9-20 negatives (Result,

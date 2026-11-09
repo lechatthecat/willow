@@ -32,7 +32,7 @@ thread_local! {
 /// Qualify a type's module-LOCAL declared type names to `module::Type`, leaving
 /// builtin generics (Array/Map/Result/Option/Channel/Future/...) and primitives
 /// untouched. Used so a module function signature that references one of its own
-/// types resolves in the importing file (willow-1js.5).
+/// types resolves in the importing file.
 pub(crate) fn qualify_local_type(
     ty: &Type,
     module: &str,
@@ -53,8 +53,8 @@ pub(crate) fn qualify_local_type(
 /// Replace type names a module reached through its OWN item imports with the
 /// identity they name. `import signal::Level as Grade;` lets a module write
 /// `Grade` in a public signature, and the importing file has no `Grade` at all;
-/// only the enum's build-wide identity is a name both units answer to
-/// (willow-0g8j.3). Complements [`qualify_local_type`], which does the same job
+/// only the enum's build-wide identity is a name both units answer to. Complements
+/// [`qualify_local_type`], which does the same job
 /// for the names a module DECLARES.
 fn rename_imported_type(ty: &Type, renames: &HashMap<String, String>) -> Type {
     ty.map_names(|name| renames.get(name).cloned().unwrap_or_else(|| name.clone()))
@@ -66,8 +66,8 @@ fn rename_imported_type(ty: &Type, renames: &HashMap<String, String>) -> Type {
 /// `ledger` may export `biz::Amount` because it wrote `import sales as biz;`,
 /// while the checker registered `sales` under whatever spelling reached it
 /// first -- `market`, say, because the entry file aliased it. `biz` names
-/// nothing here, and the two spellings made one class into two types
-/// (willow-uvlp). Only the leading segment is rewritten: what follows it is the
+/// nothing here, and the two spellings made one class into two types. Only the leading segment
+/// is rewritten: what follows it is the
 /// type's own name, which every unit spells the same way.
 fn rename_module_prefix(ty: &Type, prefixes: &HashMap<String, String>) -> Type {
     ty.map_names(|name| match QualifiedName::new(&name).split_first() {
@@ -85,14 +85,14 @@ enum ModuleScope {
     /// which local declarations may then not shadow.
     Imported,
     /// The unit only reaches it THROUGH another module's public signature. Its
-    /// types are registered so those signatures resolve; nothing else is
-    /// (willow-sxcp).
+    /// types are registered so those signatures resolve; nothing else is.
+    ///
     Types,
 }
 
 /// The AST type a std signature entry denotes.
 ///
-/// The schema is recursive (willow-uqzx, catalog item 11), so this is a thin
+/// The schema is recursive (shared compiler infrastructure, catalog item 11), so this is a thin
 /// wrapper over [`StdType::to_ast_type`] rather than the per-combination match
 /// it used to be. `Printable` is the only schema type without an AST type; it
 /// reaches this function only if a non-`std::io` signature starts using it,
@@ -465,7 +465,7 @@ impl TypeChecker {
     /// module's public signature may name a type from further down: `mid`
     /// exports `Crate extends Parcel`, and `Parcel` belongs to `base`. Without
     /// `base::Parcel` in the table the subclass has a base class that resolves
-    /// to nothing, so it exports none of what it inherits (willow-sxcp). The
+    /// to nothing, so it exports none of what it inherits. The
     /// module itself is deliberately NOT defined: nothing here lets the
     /// importing unit call into `base` or collide with its name.
     pub fn register_module_type_signatures(
@@ -615,7 +615,7 @@ impl TypeChecker {
     /// `name` is what THIS unit calls the module -- an alias, or the last
     /// segment of its path -- and is the spelling its items are registered
     /// under. `canonical` is the module's one identity in the build, which is
-    /// what a type declared in it is NAMED after (willow-itcw), so two modules
+    /// what a type declared in it is NAMED after, so two modules
     /// that both declare `Level` stay distinct wherever both are in scope.
     fn register_module_impl(
         &mut self,
@@ -637,7 +637,7 @@ impl TypeChecker {
         }
         // The spelling this checker reaches the module by, for the modules
         // registered AFTER it: dependency order means an importer is registered
-        // once its dependencies already answer to a name here (willow-sxcp).
+        // once its dependencies already answer to a name here.
         // The entry file registers some modules a second time under their
         // canonical path, which must not displace the access spelling the rest
         // of the build's types were qualified with.
@@ -648,8 +648,8 @@ impl TypeChecker {
         // Type names declared in this module. A module function signature that
         // names one of them by bare name is qualified to `module::Name` so the
         // importing file resolves it -- an interface argument against the right
-        // vtable (willow-1js.5), and an ENUM against the declaration it actually
-        // came from (willow-itcw): two modules that each declare `pub enum
+        // vtable, and an ENUM against the declaration it actually
+        // came from: two modules that each declare `pub enum
         // Level` both presented a bare `Level` to an importer, which then read
         // one's tag as the other's variant. Classes need the same distinction
         // at a call site: two imported modules may both return a class called
@@ -691,12 +691,12 @@ impl TypeChecker {
         // `import signal::Level as Grade;` — and that name means nothing in the
         // importing file. Modules are registered in dependency order, so the
         // declaring module's enum is already in the table and can answer with
-        // the identity both units share (willow-0g8j.3).
+        // the identity both units share.
         // A CLASS or INTERFACE reached the same way is spelled the same way,
         // and `mid::Parcel` — what blindly prefixing the declaring module's own
         // name used to produce for `import base::Parcel;` — is a class no unit
         // declares, so a subclass exported nothing it inherited and a signature
-        // mentioning the type resolved against nothing (willow-sxcp). Unlike an
+        // mentioning the type resolved against nothing. Unlike an
         // enum, a class answers here to the spelling THIS checker registered its
         // module under, not to its canonical path, so the import's canonical
         // module path is translated through `module_access_names` first.
@@ -731,7 +731,7 @@ impl TypeChecker {
         // checker keys that module's types by its canonical namespace, so the
         // exported signature is translated into it; otherwise one class under
         // two spellings is two types and nothing an importer passes ever
-        // matches (willow-uvlp). Dependency order guarantees the map is
+        // matches. Dependency order guarantees the map is
         // complete: a module is registered only once its own imports are.
         let own_module_prefixes: HashMap<String, String> = program
             .imports
@@ -951,7 +951,7 @@ impl TypeChecker {
         }
 
         // Types (class / interface / enum) are registered under `module::Item`.
-        // Bind them under the unqualified local name too (willow-64gs), with a
+        // Bind them under the unqualified local name too, with a
         // visibility check (E0419 for a private type).
         let qualified = QualifiedName::join(module, item);
         let private_type = |this: &mut Self| {
@@ -1126,7 +1126,7 @@ impl TypeChecker {
     ///
     /// The KEY is the bare name, because that is how the declaring body spells
     /// it. The IDENTITY -- `EnumInfo::name` -- is `module::Enum` whenever the
-    /// program is a module's (willow-itcw): two modules that each declare `pub
+    /// program is a module's: two modules that each declare `pub
     /// enum Level` are two different types, and the back-end's enum table is one
     /// namespace for the whole build, so a bare `Level` there could only ever
     /// answer for one of them. The canonical spelling is registered as a key of
@@ -1154,8 +1154,8 @@ impl TypeChecker {
         self.define_declared_enum(decl, variant_infos);
     }
 
-    /// Register an enum's IDENTITY ahead of every declaration's types
-    /// (willow-rlq9). `normalize_type` rewrites a bare enum name to its
+    /// Register an enum's IDENTITY ahead of every declaration's types. `normalize_type`
+    /// rewrites a bare enum name to its
     /// canonical `module::Enum` spelling by looking the name up, so a class
     /// field, interface signature or payload written before the enum's
     /// declaration used to keep the bare spelling and then mismatch every
@@ -1226,7 +1226,7 @@ impl TypeChecker {
             // `check_interface`, once every declaration is registered: a
             // method may name a type declared later in the file, and a
             // generic interface's `T` is only known to be a parameter once
-            // the whole declaration is in view (willow-rlq9). An imported
+            // the whole declaration is in view. An imported
             // module's interface keeps its own spellings; the module's
             // checker has already judged them.
             let return_type = if module_path.is_none() {
@@ -1262,7 +1262,7 @@ impl TypeChecker {
             // reference parameter is passed as a pointer, so dropping the mode
             // here would let a value-parameter implementation satisfy a
             // reference-parameter requirement and let a call site pass a value
-            // where the callee dereferences (willow-0g8j.9).
+            // where the callee dereferences.
             let param_infos = m
                 .params
                 .iter()
@@ -1309,7 +1309,7 @@ impl TypeChecker {
     /// to be that class, and a result that only contains `Self` would carry
     /// the class object unconverted. A whole `-> Self` result is rebuilt as
     /// the interface by the backend, and an interface default's own `self`
-    /// is the opaque receiver, so neither is rejected (willow-dnia).
+    /// is the opaque receiver, so neither is rejected.
     fn rejects_unknown_self(
         &mut self,
         iface: &InterfaceInfo,
@@ -1351,7 +1351,7 @@ impl TypeChecker {
 
     /// Substitute an interface's generic type parameters with `type_args` and
     /// `Self` with `class_name`, yielding concrete required method signatures
-    /// for conformance checking (willow-1js.1).
+    /// for conformance checking.
     pub(super) fn instantiate_interface(
         &self,
         iface: &InterfaceInfo,
@@ -1367,7 +1367,7 @@ impl TypeChecker {
         // `Self` resolves to the receiver type: the implementing class during
         // conformance checking, or the (possibly generic) interface instantiation
         // when a method is called on an interface-typed value so `-> Self` keeps
-        // its type arguments (`Box<i64>`, not bare `Box`) (willow-1js.5).
+        // its type arguments (`Box<i64>`, not bare `Box`).
         param_map.insert("Self".to_string(), self_ty.clone());
         if param_map.is_empty() {
             return iface.clone();
@@ -1476,7 +1476,7 @@ impl TypeChecker {
             }
         };
         // An interface default's receiver is any implementing class, so it
-        // has only the interface's methods (willow-dnia).
+        // has only the interface's methods.
         if class_name == "Self"
             && let Some(interface) = &self.local.self_interface
         {
@@ -1584,7 +1584,7 @@ impl TypeChecker {
         }
     }
 
-    /// Explicit wrapping/checked integer arithmetic (willow-jz15.14). Kept out
+    /// Explicit wrapping/checked integer arithmetic. Kept out
     /// of line: `resolve_method` recurses through nested calls, so its frame
     /// size bounds how deep a call chain the checker accepts.
     #[inline(never)]
@@ -1706,7 +1706,7 @@ impl TypeChecker {
             return ty;
         }
         // Built-in `toString()` on primitives: `i64`/`f64`/`bool`/`String` ->
-        // `String` (willow-fvfc). Class `toString()` falls through to normal
+        // `String`. Class `toString()` falls through to normal
         // instance-method resolution.
         if method_name == "toString"
             && matches!(obj_ty, Type::I64 | Type::F64 | Type::Bool | Type::String)
@@ -1771,7 +1771,7 @@ impl TypeChecker {
         }
         // A receiver typed as a generic interface instantiation (`Box<String>`):
         // resolve against the interface with its type parameters substituted, so
-        // `fn get(self) -> T` reports `String` here (willow-1js.1).
+        // `fn get(self) -> T` reports `String` here.
         if let Type::Generic(name, type_args) = obj_ty
             && let Some(iface) = self.symbols.lookup_interface(name).cloned()
         {
@@ -1784,7 +1784,7 @@ impl TypeChecker {
             return self.resolve_interface_method(&instantiated, method_name, args, span);
         }
         // An interface default's opaque receiver reaches its interface's
-        // methods, whose `Self` stays the receiver (willow-dnia).
+        // methods, whose `Self` stays the receiver.
         if matches!(obj_ty, Type::Named(n) if n == "Self")
             && let Some((name, type_args)) = match &self.local.self_interface {
                 Some(Type::Named(name)) => Some((name.clone(), Vec::new())),
@@ -1876,7 +1876,7 @@ impl TypeChecker {
             );
             return Type::Void;
         }
-        // Constructors are not directly callable as `obj.init(...)` (willow-scq2).
+        // Constructors are not directly callable as `obj.init(...)`.
         if method_name == "init" {
             self.push(
                 Diagnostic::new(
@@ -2084,8 +2084,8 @@ impl TypeChecker {
             // A `&`/`&mut` parameter is passed as a pointer, so an interface
             // call has to obey the same argument-mode rules as a direct call:
             // without this, `m.set(x)` on `fn set(self, value: &mut i64)` type
-            // checks and then hands the callee an integer to dereference
-            // (willow-0g8j.9). The shared checker also validates the place and
+            // checks and then hands the callee an integer to dereference. The shared checker
+            // also validates the place and
             // its mutability, and reports `&` on a by-value parameter.
             if let Some(param) = m.param_infos.get(idx)
                 && (matches!(param.mode, ParamMode::Reference { .. })
@@ -3085,7 +3085,7 @@ impl TypeChecker {
     /// records the resolution per expression ID for HIR lowering. Every branch
     /// that can name an enum must agree with the checking version, or lowering
     /// keeps the written spelling while the node's type carries the identity,
-    /// and the LIR walker rejects the call as outside its subset (willow-njot).
+    /// and the LIR walker rejects the call as outside its subset.
     pub(super) fn resolve_static_call_class_quiet(&self, class_name: &str) -> Option<String> {
         if class_name == "Self" {
             return self.local.current_class.clone();
@@ -3120,8 +3120,8 @@ impl TypeChecker {
         // An enum reached by any spelling this unit can write -- its own bare
         // `Color` for `pal::Color`, `Level` or `Rank` for `signal::Level` --
         // resolves to the build-wide identity the enum tables are keyed by. A
-        // class or interface name is its own identity and comes back unchanged
-        // (willow-0g8j.3).
+        // class or interface name is its own identity and comes back unchanged.
+        //
         Some(self.canonical_type_name(class_name))
     }
 
@@ -3140,8 +3140,8 @@ impl TypeChecker {
             // The same answer [`Self::resolve_static_call_class_quiet`] gives,
             // with the diagnostics a bad std path owes. `check_expr` records
             // what the written class resolved to, per expression, so HIR
-            // lowering does not have to keep the source's own spelling
-            // (willow-0g8j.3).
+            // lowering does not have to keep the source's own spelling.
+            //
             if let Some(item) = self.imported_collection_aliases.get(class_name).cloned() {
                 return Some(item);
             }
@@ -3166,7 +3166,7 @@ impl TypeChecker {
             // `as Rank`) is registered under the spelling THIS unit writes but
             // carries the build-wide identity, and that identity is the only
             // name the enum tables answer to. It is what lets `Level::High`
-            // reach the back end as `signal::Level::High` (willow-0g8j.3); a
+            // reach the back end as `signal::Level::High`; a
             // class or interface name is its own identity and passes through
             // unchanged.
             return Some(self.canonical_type_name(class_name));
@@ -3189,14 +3189,14 @@ impl TypeChecker {
         }
     }
 
-    /// Type-check a `ClassName::property` static read (willow-qsqf §7.1).
+    /// Type-check a `ClassName::property` static read (static member support §7.1).
     pub(super) fn resolve_static_field_read(
         &mut self,
         class_name: &str,
         field: &str,
         span: Span,
     ) -> Type {
-        // `config::LIMIT`: a module-qualified `const` (willow-jz15.10). A
+        // `config::LIMIT`: a module-qualified `const`. A
         // module's constants take precedence over a same-named class, exactly
         // as HIR lowering resolves the read.
         if let Some(info) = self
@@ -3275,7 +3275,7 @@ impl TypeChecker {
             }
             None => {
                 // Distinguish an instance field accessed via `::` from an unknown
-                // static member, for a clearer diagnostic (willow-qsqf §7.4).
+                // static member, for a clearer diagnostic (static member support §7.4).
                 if self.lookup_field_in_hierarchy(&resolved, field).is_some() {
                     self.push(
                         Diagnostic::new(
@@ -3335,14 +3335,14 @@ impl TypeChecker {
     }
 
     /// True when `child` is an interface that transitively extends interface
-    /// `parent` (willow-1js.2).
+    /// `parent`.
     pub(super) fn interface_extends(&self, child: &str, parent: &str) -> bool {
         if self.symbols.lookup_interface(child).is_none() {
             return false;
         }
         // Compare super names canonically so a directly-imported alias (`Named`)
-        // matches a module interface's qualified `extends` entry (`proto::Named`)
-        // (willow-1js.8).
+        // matches a module interface's qualified `extends` entry (`proto::Named`).
+        //
         let canon = |n: &str| -> String {
             self.symbols
                 .lookup_interface(n)
@@ -3383,10 +3383,10 @@ impl TypeChecker {
         }
         // Compare by declaration identity, not spelling: a directly-imported
         // local alias (`import mod::Iface` -> bare `Iface`) must match a class's
-        // qualified `implements mod::Iface` entry (willow-64gs.1), and so must
+        // qualified `implements mod::Iface` entry, and so must
         // its type arguments -- `Pred<Item>` written where `Item` is an item
         // import names the same instantiation as the defining module's
-        // `implements Pred<Item>` (willow-jz15.45).
+        // `implements Pred<Item>`.
         let mut current = Some(class.to_string());
         let mut seen = HashSet::new();
         while let Some(name) = current {
@@ -3412,7 +3412,7 @@ impl TypeChecker {
     /// folding a directly-imported local alias (`Iface`) onto the qualified
     /// name (`mod::Iface`) it was bound from. Generic type arguments are left
     /// untouched (instantiation matching stays exact). Non-interface types pass
-    /// through unchanged (willow-64gs.1).
+    /// through unchanged.
     pub(super) fn canonical_interface_type(&self, ty: &Type) -> Type {
         match ty {
             Type::Named(n) => match self.symbols.lookup_interface(n) {

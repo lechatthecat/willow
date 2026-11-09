@@ -78,7 +78,7 @@ pub extern "C" fn willow_pop_roots(count: i32) {
 /// the worker stack outside native tasks). Panic cleanup
 /// records a lexical scope's entry depth and restores it on every shared
 /// unwind edge, where the number of roots pushed before the panic is otherwise
-/// path-dependent (willow-s9ej.3).
+/// path-dependent.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_root_depth() -> i32 {
@@ -270,7 +270,7 @@ pub extern "C" fn willow_gc_remove_runtime_root(object: *mut u8) {
 }
 
 /// Keep the object stored in `*slot` alive through runtime-owned storage that
-/// a moving collection may rewrite (willow-9tls.9). A minor collection
+/// a moving collection may rewrite. A minor collection
 /// evacuates a young referent and stores its new address in `*slot`; the
 /// holder must reload the slot after any GC point instead of keeping a copy.
 /// `slot` must stay valid and pointer-aligned until the matching
@@ -320,7 +320,7 @@ pub(crate) fn leave_generated_roots() {
 
 pub(super) fn claim_root_stack_owner() {
     // Registered mutators are coordinated via the registry + STW, not the
-    // single-owner guard (willow-6fv.5.6).
+    // single-owner guard.
     if current_thread_is_registered() {
         return;
     }
@@ -407,7 +407,7 @@ pub(super) fn foreign_root_stack_owner_active_locked(coord: &GcCoord) -> bool {
 /// Number of distinct runtime-rooted objects and registered runtime root
 /// slots. Acceptance tests use this to prove that panic/recover releases every
 /// root it took, instead of only checking that the program printed the right
-/// text (willow-s9ej.7).
+/// text.
 pub fn runtime_root_count() -> usize {
     runtime().runtime_roots.len() + runtime().runtime_root_slots.len()
 }

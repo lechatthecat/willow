@@ -1,7 +1,7 @@
 use super::*;
 
 // ── Direct type imports: interface dispatch + module-body internal enum use ──
-//    (willow-64gs.1)
+//
 //
 // Two latent bugs are fixed and pinned here. (A) `import mod::Iface` binds the
 // bare interface name, but a class records its `implements` entry under the
@@ -405,7 +405,7 @@ fn main() {
     assert_eq!(out, "23\n");
 }
 
-// dti_enum_06: the willow-favj repro. A module's plain type import constructs
+// dti_enum_06: the imported enum identity repro. A module's plain type import constructs
 // each variant of another module's enum, and the entry never names the enum.
 #[test]
 fn dti_enum_06_module_plain_type_import_constructs_each_variant() {
@@ -419,8 +419,8 @@ fn main() {
 "#;
     let (out, ok) = compile_temp_project_and_run(
         &[
-            ("alpha.wi", FAVJ_ALPHA),
-            ("beta.wi", FAVJ_BETA),
+            ("alpha.wi", IMPORTED_ENUM_ALPHA),
+            ("beta.wi", IMPORTED_ENUM_BETA),
             ("main.wi", main),
         ],
         "main.wi",
@@ -443,8 +443,8 @@ fn main() {
 "#;
     let (out, ok) = compile_temp_project_and_run(
         &[
-            ("alpha.wi", FAVJ_ALPHA),
-            ("beta.wi", FAVJ_BETA),
+            ("alpha.wi", IMPORTED_ENUM_ALPHA),
+            ("beta.wi", IMPORTED_ENUM_BETA),
             ("main.wi", main),
         ],
         "main.wi",
@@ -467,8 +467,8 @@ fn main() {
 "#;
     let (out, ok) = compile_temp_project_and_run(
         &[
-            ("alpha.wi", FAVJ_ALPHA),
-            ("beta.wi", FAVJ_BETA),
+            ("alpha.wi", IMPORTED_ENUM_ALPHA),
+            ("beta.wi", IMPORTED_ENUM_BETA),
             ("main.wi", main),
         ],
         "main.wi",
@@ -493,8 +493,8 @@ fn main() {
 "#;
     let (out, ok) = compile_temp_project_and_run(
         &[
-            ("alpha.wi", FAVJ_ALPHA),
-            ("beta.wi", FAVJ_BETA),
+            ("alpha.wi", IMPORTED_ENUM_ALPHA),
+            ("beta.wi", IMPORTED_ENUM_BETA),
             ("main.wi", main),
         ],
         "main.wi",
@@ -531,8 +531,8 @@ fn main() {
 "#;
     let (out, ok) = compile_temp_project_and_run(
         &[
-            ("alpha.wi", FAVJ_ALPHA),
-            ("beta.wi", FAVJ_BETA),
+            ("alpha.wi", IMPORTED_ENUM_ALPHA),
+            ("beta.wi", IMPORTED_ENUM_BETA),
             ("gamma.wi", gamma),
             ("main.wi", main),
         ],

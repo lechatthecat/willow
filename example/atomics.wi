@@ -1,4 +1,4 @@
-// atomics.wi — AtomicI64 / AtomicBool (willow-dgwo.3).
+// atomics.wi — AtomicI64 / AtomicBool.
 //
 // Atomics are compiler-known, always-in-scope primitives for shared mutable
 // state. They are Send + Sync, so the same atomic can be handed to several

@@ -34,12 +34,12 @@ pub(crate) struct StdCollectionImports {
     aliases: HashMap<String, String>,
     /// Local alias -> canonical builtin module (`import std::fs as files;`
     /// records files -> fs), collected PER MODULE so each file's aliases only
-    /// apply to its own static calls (willow-2s3 review fix).
+    /// apply to its own static calls.
     builtin_module_aliases: HashMap<String, String>,
     /// False for a walk that must leave every spelling as written: bodies
     /// outside the normalization boundary still have lambdas to split.
     rewrite: bool,
-    /// Installed while one body query walks its syntax (willow-afb5.17).
+    /// Installed while one body query walks its syntax.
     split: std::cell::RefCell<Option<LambdaSplit>>,
 }
 
@@ -77,8 +77,8 @@ impl StdCollectionImports {
     }
 }
 
-/// Separates a body's lambdas from its normalized syntax, or puts them back
-/// (willow-afb5.17). Each lambda body is stored once, under its own
+/// Separates a body's lambdas from its normalized syntax, or puts them back. Each lambda body
+/// is stored once, under its own
 /// contextual `BodyId`; its parent keeps an empty placeholder in its place.
 pub(crate) struct LambdaSplit {
     index: std::rc::Rc<crate::compiler_db::ids::BodyIndex>,
@@ -229,7 +229,7 @@ pub(crate) fn std_collection_imports(program: &Program) -> StdCollectionImports 
 ///
 /// [`normalize_std_collection_program`] canonicalizes aliases for declaration
 /// processing. HIR is lowered from the original frontend program, so LIR
-/// emission also canonicalizes aliases at each use (willow-nswv).
+/// emission also canonicalizes aliases at each use.
 pub(crate) fn builtin_module_aliases(program: &Program) -> HashMap<String, String> {
     std_collection_imports(program).builtin_module_aliases
 }
@@ -447,7 +447,7 @@ pub(crate) fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollec
                 call.class = item.to_string();
             }
             // `files::exists(..)` under `import std::fs as files;` rewrites
-            // to the canonical builtin module name (willow-2s3 review fix).
+            // to the canonical builtin module name.
             if let Some(canonical) = imports.builtin_module_aliases.get(&call.class) {
                 call.class = canonical.clone();
             }

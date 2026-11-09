@@ -24,7 +24,7 @@ pub extern "C" fn willow_channel_new(is_ref: i64) -> *mut c_void {
     payload as *mut c_void
 }
 
-/// `Channel<T>::with_capacity(n)` (willow-o038): a BOUNDED channel — `send`
+/// `Channel<T>::with_capacity(n)`: a BOUNDED channel — `send`
 /// on a full buffer parks the producer until a `recv` frees space or the
 /// channel closes. Capacity must be positive; rendezvous (capacity 0) is
 /// explicitly unsupported in v1.
@@ -72,7 +72,7 @@ pub extern "C" fn willow_channel_try_send_ptr(raw: *mut c_void, value: *mut c_vo
     channel_try_send_value(raw, WillowChannelValue { ptr_value: value })
 }
 
-/// Send-readiness probe for select send cases (willow-o038): 1 when not full
+/// Send-readiness probe for select send cases: 1 when not full
 /// (or closed/unbounded); 0 after registering the running task as a send
 /// waiter on a FULL bounded channel.
 #[unsafe(no_mangle)]
@@ -102,7 +102,7 @@ pub extern "C" fn willow_channel_send_ready(raw: *mut c_void) -> i32 {
     0
 }
 
-/// Cooperative `recv` readiness probe (willow-dsw): returns 1 if a value is
+/// Cooperative `recv` readiness probe: returns 1 if a value is
 /// available OR the channel is closed (the caller then reads the value, or
 /// observes the closed-empty state: `willow_channel_recv_*` raises it as a
 /// language panic, `willow_channel_recv_opt_into` answers `None`);
@@ -172,8 +172,8 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
     0
 }
 
-/// Remove the currently-running task from this channel's waiter queue
-/// (willow-7aj). A cooperative `select` registers itself (via recv_ready) on
+/// Remove the currently-running task from this channel's waiter queue. A cooperative `select`
+/// registers itself (via recv_ready) on
 /// every recv channel while waiting; once it picks a case it must unregister
 /// from all of them so a later send/close does not spuriously wake the
 /// already-resumed task.
@@ -250,7 +250,7 @@ pub extern "C" fn willow_channel_send_bool(raw: *mut c_void, value: u8) {
 }
 
 /// A bool payload with every byte initialized: `recv_opt` hands the whole
-/// word out (willow-jz15.44), and the compiler narrows it back to `bool`.
+/// word out, and the compiler narrows it back to `bool`.
 fn bool_channel_value(value: u8) -> WillowChannelValue {
     WillowChannelValue {
         i64_value: i64::from(value),
@@ -293,7 +293,7 @@ pub extern "C" fn willow_channel_recv_ptr(raw: *mut c_void) -> *mut c_void {
     unsafe { willow_channel_recv_value(raw).ptr_value }
 }
 
-/// `Channel<T>::recv_opt()` (willow-jz15.44): like `recv`, but a closed,
+/// `Channel<T>::recv_opt()`: like `recv`, but a closed,
 /// drained channel answers `None` instead of raising. Returns 0 (`Some`) after
 /// writing the received storage word to `out_payload`, or 1 (`None`) — the
 /// same tag/payload protocol as `willow_map_get_into`, so the compiler builds
@@ -350,8 +350,8 @@ pub extern "C" fn willow_channel_close(raw: *mut c_void) {
     wake_recv_waiters(channel);
 }
 
-/// Monotonic seed for pseudo-random ready-case selection in `select`
-/// (willow-0a6k.6). Selection order is pseudo-randomized to avoid SYSTEMATIC
+/// Monotonic seed for pseudo-random ready-case selection in `select`. Selection order is
+/// pseudo-randomized to avoid SYSTEMATIC
 /// source-order starvation; this is not a bounded-fairness guarantee.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]

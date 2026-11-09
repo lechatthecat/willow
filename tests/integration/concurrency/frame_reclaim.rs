@@ -1,10 +1,10 @@
 use super::*;
 
-// ── Terminal task frames reclaimed during a long drive (willow-vjaf) ───────
+// ── Terminal task frames reclaimed during a long drive ───────
 // Finished task frames used to stay runtime roots until the outermost drive
 // returned, so a long-running `async main` retained every frame it finished.
 // Runtime-level perspectives live in willow_runtime's `frame_reclaim` and
-// `scheduler_tests` (vjaf_*); these cover the generated-code paths.
+// `scheduler_tests` (frame_reclaim_*); these cover the generated-code paths.
 
 // Completion and grace periods are separate: a poll that was already running
 // when a task completed must end before its frame can be unrooted. Bound each
@@ -49,7 +49,7 @@ async fn main() {
 "#;
 
 #[test]
-fn vjaf_int_01_parallel_workers_keep_heap_bounded() {
+fn frame_reclaim_int_01_parallel_workers_keep_heap_bounded() {
     // Completion batch size is independent of the runtime release threshold.
     for workers in ["1", "4", "8"] {
         for batch in [1, 7, 65, 257] {
@@ -65,7 +65,7 @@ fn vjaf_int_01_parallel_workers_keep_heap_bounded() {
 }
 
 #[test]
-fn vjaf_int_02_released_frames_survive_minor_gc_stress() {
+fn frame_reclaim_int_02_released_frames_survive_minor_gc_stress() {
     // Every allocation runs a minor collection while frames are released
     // mid-drive: awaited results stay readable and nothing dangles.
     for workers in ["1", "4", "8"] {

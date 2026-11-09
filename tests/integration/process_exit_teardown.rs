@@ -1,8 +1,8 @@
-//! A finished program must actually exit (willow-ihr5).
+//! A finished program must actually exit.
 //!
 //! A Willow program exits when `main` returns; the runtime deliberately does
 //! not drain unawaited tasks first, since a non-terminating background task
-//! would then hang the exit (willow-bsqy). Scheduler persistent workers, the
+//! would then hang the exit. Scheduler persistent workers, the
 //! GC coordinator, GC marker workers and the blocking pool are therefore all
 //! still alive at that moment, and the platform terminates them wherever they
 //! happen to be.

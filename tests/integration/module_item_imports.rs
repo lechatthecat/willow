@@ -1,11 +1,11 @@
-//! A MODULE's own single-item imports (willow-kxy8, willow-2g6s).
+//! A MODULE's own single-item imports.
 //!
 //! `import leaf::value;` binds one public item of another module under a local
 //! name. The entry file's item imports were wired into the back end from the
 //! start; a module's were not, and the two ways that broke are what this file
 //! pins.
 //!
-//! willow-kxy8 — the FUNCTION half. A module's item imports never reached the
+//! Imported function resolution — the FUNCTION half. A module's item imports never reached the
 //! back end at all, so the unqualified call had no symbol to resolve and lowered
 //! to a stub returning the zero of its return type:
 //!
@@ -19,10 +19,10 @@
 //!
 //! Per-unit import scoping fixed it: `classify_unit_imports` classifies every
 //! unit's own import lines, and `compile_module_bodies` installs that unit's
-//! bindings before its bodies and takes them back out afterwards
-//! (willow-vtlr / willow-28h8 / willow-kd1v).
+//! bindings before its bodies and takes them back out afterwards.
 //!
-//! willow-2g6s — the CLASS half, still broken after that. `alias_item_import_types`
+//!
+//! imported class resolution — the CLASS half, still broken after that. `alias_item_import_types`
 //! bound only the type scope, while the entry file's `register_item_import`
 //! also aliases every `{class}.{method}` symbol. A method call on an
 //! item-imported class inside a module therefore mangled to a symbol nothing
@@ -55,10 +55,10 @@
 //!  14 recursion through an item-imported helper
 //!  15 String, f64 and bool returns
 //!  16 an `Array<i64>` argument
-//!  17 a method call on an item-imported class (willow-2g6s)
-//!  18 a static method call on an item-imported class (willow-2g6s)
+//!  17 a method call on an item-imported class
+//!  18 a static method call on an item-imported class
 //!  19 control: a field read on an item-imported class always worked
-//!  20 own and inherited methods on an item-imported class (willow-2g6s)
+//!  20 own and inherited methods on an item-imported class
 //!  21 a module subclasses an item-imported open class and dispatches
 //!  22 two modules import two different classes of the same name
 //!  23 an item-imported enum is matched in a module
@@ -230,7 +230,7 @@ pub fn run() -> i64 {
     );
 }
 
-// 6. The heart of per-unit scoping (willow-28h8). One local name, two modules,
+// 6. The heart of per-unit scoping. One local name, two modules,
 //    two bodies: whichever unit is lowered second must not own the binding for
 //    the first.
 #[test]
@@ -382,7 +382,7 @@ pub fn run() -> i64 { return Holder::total(); }
     );
 }
 
-// 11. Lambdas are compiled first inside the unit's alias scope (willow-9yhi),
+// 11. Lambdas are compiled first inside the unit's alias scope,
 //     which is exactly why a lambda body sees the import.
 #[test]
 fn item_import_11_the_import_is_visible_in_a_lambda() {
@@ -547,7 +547,7 @@ pub fn run() -> i64 {
     );
 }
 
-// 17. willow-2g6s. `b.get()` mangles to `Box.get`, which only exists as an
+// 17. imported class resolution. `b.get()` mangles to `Box.get`, which only exists as an
 //     alias of `leaf.Box.get` — and the module side never installed it, so the
 //     body was rejected with E0800 rather than miscompiled.
 #[test]
@@ -595,7 +595,7 @@ pub fn run() -> i64 {
 }
 
 // 19. Control. A field read needs the LAYOUT, which the type alias already
-//     carried, so this half worked before willow-2g6s and must keep working.
+//     carried, so this half worked before imported class resolution and must keep working.
 #[test]
 fn item_import_19_a_field_read_on_an_imported_class() {
     assert_project(
@@ -620,7 +620,7 @@ pub fn run() -> i64 {
 // 20. Own and inherited methods on the same imported class. The two used to
 //     part company: the ancestry walk in `resolve_class_method` reaches the
 //     BASE under its qualified `leaf::Base` name and resolved `twice` even
-//     before willow-2g6s, while `thrice` — declared on the imported class
+//     before imported class resolution, while `thrice` — declared on the imported class
 //     itself — had no symbol under `Kid.thrice` and failed. The alias set is
 //     taken from every symbol under the class's method prefix, so both answer.
 #[test]
@@ -781,8 +781,8 @@ pub fn run() -> i64 {
 }
 
 // 24. An imported interface has to be aliased before the module's classes are
-//     declared, or the `implements` name misses and no vtable is built
-//     (willow-0g8j.3).
+//     declared, or the `implements` name misses and no vtable is built.
+//
 #[test]
 fn item_import_24_an_imported_interface_is_implemented_and_boxed() {
     assert_project(
@@ -816,7 +816,7 @@ pub fn run() -> String {
 
 // 25. The imported class appears in the module's OWN public signature, so the
 //     entry file passes and receives it — one runtime class under two
-//     spellings. This one held before willow-2g6s, but only by accident: the
+//     spellings. This one held before imported class resolution, but only by accident: the
 //     entry file item-imports the same class, and its bindings are global and
 //     installed before any module BODY is lowered, so the module borrowed the
 //     entry's `Box.get`. Kept because the borrowing is what perspective 26
@@ -893,7 +893,7 @@ fn main() {
     );
 }
 
-// 27. Control (willow-vtlr). A module's item import belongs to that module: a
+// 27. Control. A module's item import belongs to that module: a
 //     sibling that never imported it does not get the name.
 #[test]
 fn item_import_27_a_sibling_module_does_not_see_the_import() {

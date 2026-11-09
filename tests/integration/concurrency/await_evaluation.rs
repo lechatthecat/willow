@@ -1,7 +1,7 @@
 use super::*;
 
 // ── The awaited expression is evaluated ONCE, and awaitability follows the
-// TYPE, not the syntax (willow-qrj9) ────────────────────────────────────────
+// TYPE, not the syntax ────────────────────────────────────────
 // Cooperative resume re-enters the poll fn at a resume block. It used to
 // RE-EMIT the awaited expression there, so anything but a call/method-call ran
 // twice: `await tasks[next()]` could observe a side effect twice and, worse,

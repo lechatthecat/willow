@@ -1,5 +1,5 @@
-// module_frame_demo — a panic inside an imported module reports a call stack
-// (willow-0g8j.2.20).
+// module_frame_demo — a panic inside an imported module reports a call stack.
+//
 //
 // Every other user call emits a debug call-stack frame around itself: a name
 // and a call-site location pushed before the call and popped when it returns.

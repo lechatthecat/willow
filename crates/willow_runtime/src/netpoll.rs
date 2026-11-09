@@ -312,7 +312,7 @@ impl RuntimeNetPoll {
         !self.registrations.is_empty()
     }
 
-    /// Remove every registration owned by `task_id` (willow-vynv.1): a
+    /// Remove every registration owned by `task_id`: a
     /// cancelled task must not linger as an I/O waiter, and its fds must not
     /// keep firing wakeups for a task that will never poll again.
     pub fn purge_task(&mut self, task_id: RuntimeTaskId) {
@@ -461,7 +461,7 @@ pub(crate) fn has_waiters() -> bool {
     HAS_WAITERS.load(Ordering::Acquire)
 }
 
-/// Purge every registration owned by a cancelled task (willow-vynv.1). Safe
+/// Purge every registration owned by a cancelled task. Safe
 /// to call with the scheduler lock held: the netpoll lock is only ever held
 /// briefly (never across `epoll_wait`), and no path nests netpoll -> scheduler.
 pub(crate) fn purge_task(task_id: RuntimeTaskId) {
@@ -1368,7 +1368,7 @@ mod tests {
         reset_internal_for_test();
     }
 
-    // willow-vynv.1: a cancelled task's registrations are purged.
+    // a cancelled task's registrations are purged.
     #[test]
     fn netpoll_purge_task_removes_own_registrations() {
         let mut poll = RuntimeNetPoll::default();

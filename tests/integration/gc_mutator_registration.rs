@@ -1,4 +1,4 @@
-//! Collections that race scheduler mutator registration (willow-v6k0).
+//! Collections that race scheduler mutator registration.
 //!
 //! Every thread that can hold GC roots registers as a MUTATOR: the thread
 //! driving `main`, and each worker the scheduler spins up for a
@@ -549,7 +549,7 @@ async fn main() {
 
 #[test]
 fn gcreg_19_two_net_exchanges_under_stress() {
-    // The reported failure (willow-v6k0): two async exchanges whose frames hold
+    // The reported failure: two async exchanges whose frames hold
     // sockets and buffers across parks, under the stress mode where every
     // allocation collects.
     assert_env(

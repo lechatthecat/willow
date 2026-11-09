@@ -1,5 +1,5 @@
-//! An `import` line binds names in the FILE that writes it, and only there
-//! (willow-vtlr, willow-28h8).
+//! An `import` line binds names in the FILE that writes it, and only there.
+//!
 //!
 //! Two halves of the same rule, both of which the back end used to get wrong
 //! because it re-derived imports from the path string instead of taking the
@@ -124,7 +124,7 @@ fn project(entry: &'static str) -> Vec<(&'static str, &'static str)> {
 }
 
 // ---------------------------------------------------------------------------
-// An item import binds a local name in ONE file (willow-28h8).
+// An item import binds a local name in ONE file.
 // ---------------------------------------------------------------------------
 
 // 1. The bug: both files bind `discount`, and each has to call the module IT
@@ -458,7 +458,7 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// Which modules a file can SEE (willow-vtlr).
+// Which modules a file can SEE.
 // ---------------------------------------------------------------------------
 
 /// The entry file names a bare `Amount` (the type of what `sales::amount`
@@ -697,7 +697,7 @@ fn the_module_import_scope_example_is_fully_lowered() {
     assert_eq!(out, "7\nsale:3\n9\n100\n");
 }
 
-// willow-3d9k: a graph dependency does not grant the entry a source name.
+// a graph dependency does not grant the entry a source name.
 #[test]
 fn entry_cannot_use_another_units_module_spelling() {
     for (import, spelling) in [("import sales;", "sales"), ("import sales as biz;", "biz")] {

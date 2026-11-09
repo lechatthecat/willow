@@ -1,6 +1,6 @@
 use super::support::*;
 
-// Contextual Option<Interface> construction — willow-glaj.2.
+// Contextual Option<Interface> construction — contextual Option construction.
 //
 // These perspectives distinguish construction-time payload coercion from
 // forbidden generic covariance. A concrete object is boxed while building the

@@ -1,5 +1,5 @@
-//! Fuse string concatenation chains into one sized allocation
-//! (willow-8hq4.29).
+//! Fuse string concatenation chains into one sized allocation.
+//!
 //!
 //! `"k" + i.toString() + ":" + j.toString()` lowers to a left-nested chain of
 //! two-operand `String` additions whose every intermediate result is a fresh

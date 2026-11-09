@@ -2,7 +2,7 @@
 // module class implements.
 //
 // `implements` travels down an `extends` chain, and the ancestor that names the
-// interface here lives in `depot`, not in this file. Until willow-himv the
+// interface here lives in `depot`, not in this file. Until imported interface ancestry support the
 // desugaring pass that does the propagation only ever looked at the classes
 // declared in the SAME program, so `EntryParcel` below inherited nothing: no
 // `(EntryParcel, depot::Measured)` vtable was declared, and handing one to

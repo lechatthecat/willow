@@ -1,4 +1,4 @@
-// Cross-module type names in a module's exported signature (willow-sxcp).
+// Cross-module type names in a module's exported signature.
 //
 // `depot` reaches a class, an interface and an enum through its own item
 // imports of `shipping`, and writes all three into what it exports. The entry

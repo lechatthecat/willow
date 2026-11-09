@@ -1,6 +1,6 @@
 use super::support::*;
 
-// Final source-level `nil` removal — willow-glaj.10.
+// Final source-level `nil` removal — nil removal.
 
 fn removal_error(source: &str) -> String {
     let (ok, stderr) = compile_with_compiler_env(source, &[]);

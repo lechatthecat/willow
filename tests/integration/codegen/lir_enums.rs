@@ -1,7 +1,7 @@
 use super::*;
 
-// ── Enum values and `match` on the LIR path (willow-0g8j.8) ────────────────
-// The emitted-code half of willow-0g8j.8; the eligibility half is the m01-m28
+// ── Enum values and `match` on the LIR path ────────────────
+// The emitted-code half of enum lowering; the eligibility half is the m01-m28
 // perspectives in `src/backend/cranelift/lir_gen.rs`. Every program below runs
 // on both paths and must print the same thing, and the last four repeat that
 // under `WILLOW_GC_STRESS=alloc` — the mode that collects at every allocation,
@@ -552,7 +552,7 @@ fn lirreq_53_enum_match_example_is_fully_lir() {
 
 #[test]
 fn lirreq_54_generic_enums_are_claimed() {
-    // The boundary moved in willow-0g8j.2.1: `Option` and `Result` are ordinary
+    // With ordinary enum lowering: `Option` and `Result` are ordinary
     // prelude enums, so a function that matches one is inside the walker's
     // subset at all. Both representations appear here —
     // `Option<i64>` is boxed, `Option<String>` is the pointer niche — because
@@ -575,7 +575,7 @@ fn lirreq_54_generic_enums_are_claimed() {
 
 #[test]
 fn lirreq_55_a_closure_combinator_is_claimed() {
-    // The combinators arrived with function values (willow-0g8j.2.2): the
+    // The combinators arrived with function values: the
     // lambda is lifted to a top-level function and `map` calls it indirectly,
     // so both the caller and the lifted body are inside the walker's subset and
     // the build must accept the program rather than reject a body.
@@ -596,9 +596,9 @@ fn lirreq_55b_an_unsupported_lambda_body_fails_the_build() {
     // The unsupported body here is a static property whose TYPE is outside the
     // subset: a map keyed by a reference that is not a `String` has no `MapKey`
     // spelling the walker can pass. (Scalar `toString` served until it joined
-    // the subset in willow-0g8j.2.5, any static property read until
-    // willow-0g8j.2.4 gave the walker the same ancestry walk
-    // `emit_static_field_read` uses, and an f64-keyed map until willow-0g8j.3
+    // the subset in lowered-IR interface support, any static property read until
+    // lowered-IR inheritance support gave the walker the same ancestry walk
+    // `emit_static_field_read` uses, and an f64-keyed map until the lowered-IR cutover
     // admitted every scalar key.)
     let source = "import std::collections::Map;\n\
                   class Config { pub static bad: Map<Map<String, i64>, i64> = Map::new(); }\n\
@@ -633,7 +633,7 @@ fn lirreq_56_option_result_example_is_fully_lir() {
 
 #[test]
 fn lirreq_58_divergence_example_is_fully_lir() {
-    // The divergence example (willow-0g8j.2.5) exists to be compiled in this
+    // The divergence example exists to be compiled in this
     // mode: statement panics, formatted panics, `return`-diverging match arms
     // and an all-arms-returning match must every one of them stay inside the
     // walker's subset, or the build is a compile error.

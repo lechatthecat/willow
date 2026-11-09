@@ -1,5 +1,5 @@
 // lir_local_binding_order.wi — a local's storage does not depend on which
-// block the emitter reaches first (willow-34su).
+// block the emitter reaches first.
 //
 // Lowered IR is a graph, and a block's index in the function is not a position
 // in any order control can flow in. An async body is emitted in index order,

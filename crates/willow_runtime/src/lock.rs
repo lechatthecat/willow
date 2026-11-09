@@ -1,4 +1,4 @@
-//! Blocking compatibility cells (willow-dgwo.3, willow-38w.1.4/.1.5).
+//! Blocking compatibility cells (blocking cells, mutex and read/write lock lowering).
 //!
 //! `BlockingCell<T>` and `BlockingRwCell<T>` preserve the old single-operation
 //! API after public `Mutex<T>`/`RwLock<T>` became scheduler-aware lexical
@@ -7,7 +7,7 @@
 //! guards the word, so these explicit compatibility types may block a worker
 //! and should not be confused with scheduler-aware locks.
 //!
-//! GC (willow-9tls.5): a cell is an ordinary GC-managed object, allocated
+//! GC: a cell is an ordinary GC-managed object, allocated
 //! through `willow_alloc_with_layout` like a channel or a scheduler-aware lock
 //! handle. The collector traces the protected word of a reference cell through
 //! the registered trace hook, so a live cell keeps its value alive and an
@@ -699,7 +699,7 @@ mod tests {
     /// across the allocation; its stable root can be rewritten by copying,
     /// and the word written into the fresh payload must be the new address.
     ///
-    /// Deterministic ordering follows the map-copy recipe (willow-9tls.8): this
+    /// Deterministic ordering follows the map-copy recipe: this
     /// thread registers as a mutator so the collector cannot proceed until it
     /// parks; `alloc` stress makes the payload allocation reach
     /// `collect_internal`, whose first act under a pending stop is to park at

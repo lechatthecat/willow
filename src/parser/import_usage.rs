@@ -159,7 +159,7 @@ mod tests {
     };
 
     #[test]
-    fn iflh_default_import_lexical_scopes() {
+    fn import_usage_default_import_lexical_scopes() {
         // These are parser/name-scope tests; bodies need not be valid concrete
         // instantiations. No type-check traversal is used to obtain their facts.
         for (params, body, used) in [
@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn iflh_default_import_scopes_do_not_leak_between_methods_or_interfaces() {
+    fn import_usage_default_import_scopes_do_not_leak_between_methods_or_interfaces() {
         let source = "import helpers as read; interface A<T> { fn a(self, read: i64) { println(read); } fn b(self) { read(); } } interface B<T> { fn a(self) { let read = 1; println(read); } } interface C { fn a(self) { read(); } }";
         let (program, errors) = Parser::new(Lexer::new(source).tokenize().unwrap()).parse();
         assert!(errors.is_empty(), "{errors:?}");
@@ -279,7 +279,7 @@ mod namespace_tests {
     };
 
     #[test]
-    fn iflh_reference_namespaces_keep_type_and_value_shadowing_separate() {
+    fn import_usage_reference_namespaces_keep_type_and_value_shadowing_separate() {
         for (body, used) in [
             ("T();", true),
             ("T<i64>();", true),

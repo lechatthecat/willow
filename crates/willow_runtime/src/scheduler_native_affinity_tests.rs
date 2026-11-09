@@ -216,8 +216,8 @@ fn affinity_reroute_keeps_claim_visible_until_idle_snapshot_finishes() {
     global_task_table().with_mut(task, |record| record.native_stack = Some(stack));
     let state = Arc::new(ParallelRunState::default());
     // A stop decision in progress: the gate held with the intent raised. A
-    // claim with no decision in progress does not take the gate at all
-    // (willow-8hq4.19); its resolution is covered by the claim-word epoch.
+    // claim with no decision in progress does not take the gate at all; its resolution is
+    // covered by the claim-word epoch.
     let gate = state.claim_gate.lock().unwrap();
     state.stop_intent.store(true, Ordering::SeqCst);
     let (done_tx, done_rx) = std::sync::mpsc::channel();

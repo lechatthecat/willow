@@ -1,7 +1,7 @@
 use super::*;
 
 // ── Advanced interface features: cross-module inheritance, default methods,
-//    generic interfaces, Self resolution (willow-1js.5 / .7 / .8) ──
+//    generic interfaces, Self resolution ──
 //
 // 23 test perspectives (each pinned below; a test may cover several):
 //   P1  cross-module interface inheritance: entry class implements module Sub

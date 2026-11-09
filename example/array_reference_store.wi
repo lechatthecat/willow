@@ -1,4 +1,4 @@
-// Reference-element array stores (willow-8hq4.15).
+// Reference-element array stores.
 //
 // `xs[i] = value` on an array of references compiles to an inline bounds
 // check, a header-flag write-barrier filter and a plain store. Only stores

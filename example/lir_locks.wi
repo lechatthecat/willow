@@ -1,5 +1,5 @@
-// lir_locks.wi — the `lock` family compiled from Lowered IR
-// (willow-0g8j.2.13).
+// lir_locks.wi — the `lock` family compiled from Lowered IR.
+//
 //
 // This is the last construct the LIR walker did not own. A critical section is
 // two edges the compiler emits rather than the program: an acquisition that may
@@ -29,7 +29,7 @@
 // function and a `lock` is not (E2603).
 //
 // Every function declared here is compiled by the walker — since
-// willow-0g8j.3 there is nothing else to compile it. Run under
+// the lowered-IR cutover there is nothing else to compile it. Run under
 // `WILLOW_LIR_LOG=1` to watch each one being claimed.
 
 class Ledger {

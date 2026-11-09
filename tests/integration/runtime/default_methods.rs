@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Default interface methods (willow-1js.3) ─────────────────────────────────
+// ── Default interface methods ─────────────────────────────────
 
 #[test]
 fn default_method_01_used_when_not_overridden() {

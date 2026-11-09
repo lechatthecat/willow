@@ -1,4 +1,4 @@
-//! willow-jz15.87: 24 positive perspectives (two callable kinds, two caller
+//! 24 positive perspectives (two callable kinds, two caller
 //! nominal kinds, six import/caller/build shapes), capturing closure, primitive
 //! controls, invalid signature rejection, example, and increasing-size symbols.
 use super::support::TestProject;

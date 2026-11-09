@@ -1,6 +1,6 @@
 use super::*;
 
-// ── one object, two interfaces (willow-j260.1) ─────────────────────────────
+// ── one object, two interfaces ─────────────────────────────
 
 #[test]
 fn lir_diff_j37_one_object_boxed_into_two_interfaces_in_one_new() {
@@ -357,7 +357,7 @@ fn main() {
 
 #[test]
 fn lirreq_51_boxing_example_is_fully_lir() {
-    // Same contract as the other examples (willow-j260): every FREE function in
+    // Same contract as the other examples: every FREE function in
     // the boxing example must be claimed by the walker. Its class methods hold
     // the virtual calls and compile through `compile_class_method_inner`, which
     // the mode does not police, so this pins exactly what the header claims.

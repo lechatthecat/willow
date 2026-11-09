@@ -1,5 +1,5 @@
-// sync_field_reassignment.wi — when a class may be shared by tasks
-// (willow-jz15.78).
+// sync_field_reassignment.wi — when a class may be shared by tasks.
+//
 //
 // Willow fields have no readonly spelling, so a class is `Sync` (one object
 // may be read by several tasks at once) only when every field is `Sync` AND

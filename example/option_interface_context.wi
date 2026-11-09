@@ -1,4 +1,4 @@
-// Contextual Option<Interface> construction (willow-glaj.2).
+// Contextual Option<Interface> construction.
 //
 // `Some` is built with the expected Option payload type. A concrete value is
 // therefore boxed as the interface while the Option is being constructed; the

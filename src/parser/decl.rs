@@ -413,8 +413,8 @@ impl Parser {
                 false
             };
             // `init(...)` constructor — `init` is a contextual keyword: an
-            // identifier `init` immediately followed by `(` at member position
-            // (willow-scq2). It carries visibility but no other modifiers.
+            // identifier `init` immediately followed by `(` at member position. It carries
+            // visibility but no other modifiers.
             let is_init = self.is_constructor_init_ahead();
             if is_init {
                 if !contracts.is_empty() {
@@ -423,7 +423,7 @@ impl Parser {
                 constructors.push(self.parse_constructor(member_public, member_prot)?);
                 continue;
             }
-            // `static` marks a class-level member (willow-qsqf). It sits after
+            // `static` marks a class-level member. It sits after
             // visibility and before `open`/`override`/`async` for methods, and
             // before `mut` for a mutable static property.
             let member_static_span = if self.check(TokenKind::Static) {
@@ -505,7 +505,7 @@ impl Parser {
         let start = self.current_span();
         self.expect(TokenKind::Interface)?;
         let name = self.expect_ident()?;
-        // Optional generic type parameters: `<T>` or `<T, U>` (willow-1js.1).
+        // Optional generic type parameters: `<T>` or `<T, U>`.
         let mut type_params = Vec::new();
         if self.eat(TokenKind::Lt) {
             while !matches!(self.peek_kind(), TokenKind::Gt | TokenKind::Eof) {
@@ -516,7 +516,7 @@ impl Parser {
             }
             self.expect(TokenKind::Gt)?;
         }
-        // Optional super-interfaces: `interface B extends A` (willow-1js.2).
+        // Optional super-interfaces: `interface B extends A`.
         let mut extends = Vec::new();
         if self.eat(TokenKind::Extends) {
             loop {
@@ -565,7 +565,7 @@ impl Parser {
             let contracts = self.parse_effect_contracts()?;
             // Interface members carry no visibility/modifier keywords: methods are
             // public by contract. A leading `pub`/`prot`/`open`/etc. is not allowed.
-            // Static interface members are out of scope (willow-qsqf §17 → E0836).
+            // Static interface members are out of scope (static member support §17 → E0836).
             if self.check(TokenKind::Static) {
                 let span = self.current_span();
                 return Err(Diagnostic::new(
@@ -668,7 +668,7 @@ impl Parser {
             Type::Void
         };
 
-        // A method with a body (`{ ... }`) is a DEFAULT method (willow-1js.3);
+        // A method with a body (`{ ... }`) is a DEFAULT method;
         // a method ending in `;` is signature-only (required). A default method
         // must take `self` — there is no receiver to run a static default on.
         let (default_body, end) = if self.check(TokenKind::LBrace) {
@@ -808,7 +808,7 @@ impl Parser {
 
         if self.check(TokenKind::SelfKw) {
             // A static method has no receiver; an explicit `self` is always wrong
-            // (willow-qsqf §9.2). Instance methods take `self` implicitly, but an
+            // (static member support §9.2). Instance methods take `self` implicitly, but an
             // explicit `self` is still accepted during migration.
             if is_static {
                 let span = self.current_span();
@@ -883,7 +883,7 @@ impl Parser {
         })
     }
 
-    /// Parse an `init(self, params...) { body }` constructor (willow-scq2). No
+    /// Parse an `init(self, params...) { body }` constructor. No
     /// return type is allowed; the explicit `self` receiver is not stored in
     /// `params`, matching method lowering and `new Class(args...)` arity.
     pub(super) fn parse_constructor(
@@ -924,7 +924,7 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RParen)?;
-        // Constructors must not declare a return type (willow-scq2 §4.2).
+        // Constructors must not declare a return type (constructor support §4.2).
         if self.eat(TokenKind::Arrow) {
             return Err(self.err(
                 ErrorCode::E0840,
@@ -1018,14 +1018,14 @@ impl Parser {
         })
     }
 
-    /// `[pub] const NAME: T = literal;` (willow-jz15.10). The constant is
+    /// `[pub] const NAME: T = literal;`. The constant is
     /// represented as a zero-parameter function returning the literal and
     /// carrying the value in [`FunctionDecl::constant`]; see there.
     ///
     /// A syntactically complete declaration whose initializer or type is not a
     /// supported constant yields `Ok(None)` with its diagnostic recorded in
     /// `recovered_errors`: the whole declaration, `;` included, is consumed, so
-    /// item recovery must not run and skip the following item (willow-jz15.93).
+    /// item recovery must not run and skip the following item.
     pub(super) fn parse_const(&mut self, public: bool) -> Result<Option<FunctionDecl>, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::Const)?;
@@ -1178,7 +1178,7 @@ fn is_array_const(declared: &Type, value: &Expr) -> bool {
 
 /// The replacement for a constant array: a frozen array built once in a class
 /// static property. A function returning an array literal would rebuild the
-/// array on every call (willow-jz15.93).
+/// array on every call.
 fn frozen_array_static_help(declared: &Type) -> String {
     let element = match declared {
         Type::Array(element) | Type::FixedArray(element, _) => {
@@ -1350,7 +1350,7 @@ mod const_diagnostic_tests {
             .collect()
     }
 
-    // willow-jz15.93: a rejected `const` is fully consumed, so recovery must not
+    // a rejected `const` is fully consumed, so recovery must not
     // skip the next item. Every rejected const is reported once, in source
     // order, and every following valid item is kept.
     #[test]

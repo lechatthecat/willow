@@ -1,4 +1,4 @@
-// Collection debug display (willow-vwn6): Array<T>.toString() and
+// Collection debug display: Array<T>.toString() and
 // Map<K,V>.toString() for printable element types (i64, f64, bool, String).
 // Strings are quoted like Rust's Debug; map entries are sorted by key.
 

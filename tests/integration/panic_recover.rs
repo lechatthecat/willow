@@ -1,6 +1,6 @@
 use super::support::*;
 
-// Synchronous lexical panic/recover — willow-s9ej.3. These perspectives pin
+// Synchronous lexical panic/recover — lexical panic recovery. These perspectives pin
 // recovery capability, exactly-once defer consumption, lexical continuation,
 // nested-panic behavior, and the Stage-2 async/cross-call boundary.
 
@@ -676,7 +676,7 @@ fn main() {
     assert_eq!(out, "mixed\ncaller-root\n");
 }
 
-// Recoverable runtime language faults — willow-s9ej.5. Every helper returns a
+// Recoverable runtime language faults — recoverable runtime faults. Every helper returns a
 // neutral ABI value after raising; these tests prove generated code branches
 // before that placeholder can be printed, stored, or dereferenced.
 

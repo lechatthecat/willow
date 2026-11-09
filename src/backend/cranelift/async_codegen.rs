@@ -334,7 +334,7 @@ impl UnitCodegenContext<'_> {
         Ok((layout, offsets, defer_offsets, send_offsets))
     }
 
-    /// Cooperative-async lowering (willow-lpn.5.3 / willow-h2vf):
+    /// Cooperative-async lowering:
     /// compile `async fn main` as a SUSPENDING poll function driven
     /// by the cooperative scheduler. `willow_user_main` becomes a driver that
     /// allocates the frame, spawns the poll fn as a task, and runs the scheduler;
@@ -381,7 +381,7 @@ impl UnitCodegenContext<'_> {
 
         // Frame-back params and EVERY local (GC and non-GC) so they survive
         // suspension; only GC-managed slots are in `gc_slot_mask` (traced), so
-        // non-GC slots hold plain scalars (willow-lpn.5.3 slice 3b).
+        // non-GC slots hold plain scalars (cooperative suspension slice 3b).
         slots.extend(f.params.iter().map(|p| AsyncFrameSlot {
             storage_kind: crate::ir::lowered::LirStorageKind::Value,
             source_span: Some(p.span),
@@ -449,7 +449,7 @@ impl UnitCodegenContext<'_> {
         Ok(())
     }
 
-    /// Cooperative task lowering (willow-lpn.5.3 / willow-h2vf): compile `name`
+    /// Cooperative task lowering: compile `name`
     /// as a CONSTRUCTOR (its public symbol: alloc a frame whose slot 0 is the
     /// RESULT and slot 1 is TASK_ID, spawn the poll fn as a task, return the
     /// frame ptr) plus a suspending poll fn whose `return v` stores `v` at the
@@ -471,7 +471,7 @@ impl UnitCodegenContext<'_> {
                 .module
                 .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
         self.func_ids.insert(poll_symbol.clone(), poll_fid);
-        // Cancellation cleanup entry (willow-vynv.3), defined after the poll
+        // Cancellation cleanup entry, defined after the poll
         // fn (it needs the defer sites collected while emitting the body).
         let cancel_symbol = coop_cancel_symbol(name);
         let mut cancel_sig = self.output.module.make_signature();
@@ -645,7 +645,7 @@ impl UnitCodegenContext<'_> {
                 )
             })
         {
-            // Attach the cancellation cleanup entry (willow-vynv.3).
+            // Attach the cancellation cleanup entry.
             let cancel_ref = self
                 .output
                 .module
@@ -723,7 +723,7 @@ impl UnitCodegenContext<'_> {
                 .module
                 .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
         self.func_ids.insert(poll_symbol.clone(), poll_fid);
-        // Cancellation cleanup entry (willow-vynv.3).
+        // Cancellation cleanup entry.
         let cancel_symbol = coop_cancel_symbol(mangled);
         let mut cancel_sig = self.output.module.make_signature();
         cancel_sig.params.push(AbiParam::new(reference_type(
@@ -779,7 +779,7 @@ impl UnitCodegenContext<'_> {
         // the lowered parameters start one slot earlier than `m.params` does.
         // Handing `first_param_slot` straight to the LIR layout would map `self`
         // onto the first declared parameter's slot and shift every parameter by
-        // one (willow-0g8j.2.18).
+        // one.
         let lir_first_param_slot = if m.is_static {
             first_param_slot
         } else {
@@ -935,7 +935,7 @@ impl UnitCodegenContext<'_> {
                 )
             })
         {
-            // Attach the cancellation cleanup entry (willow-vynv.3).
+            // Attach the cancellation cleanup entry.
             let cancel_ref = self
                 .output
                 .module
@@ -1138,7 +1138,7 @@ impl UnitCodegenContext<'_> {
         let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);
         let main_task_id = builder.inst_results(spawn_call)[0];
 
-        // Drive the scheduler only until `main` itself completes (willow-bsqy):
+        // Drive the scheduler only until `main` itself completes:
         // the program exits when main returns, rather than draining every
         // unawaited task to quiescence (which could hang on a non-terminating
         // background task). Programs that need a result await their tasks before main
@@ -1357,7 +1357,7 @@ impl UnitCodegenContext<'_> {
         let frame = builder.block_params(entry)[0];
         let ptr_ty = reference_type(self.output.module.target_config());
         // Tag the running task with this async fn's name on every poll entry (so
-        // resumes re-tag too), before dispatch (willow-9lw).
+        // resumes re-tag too), before dispatch.
         if let Some(name) = &tag_name
             && let Some(&data_id) = self.output.string_literals.get(name)
         {
@@ -1548,7 +1548,7 @@ impl UnitCodegenContext<'_> {
     }
 
     /// Emit the compiler-generated cancellation cleanup entry
-    /// `extern "C" fn(frame)` for an async fn (willow-vynv.3). Deferred actions
+    /// `extern "C" fn(frame)` for an async fn. Deferred actions
     /// and lexical locks share one registration order; walking it backwards
     /// gives the same unwind order as an ordinary exit:
     ///
@@ -1946,15 +1946,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.finish_coop_builtin_suspend(suspends, frame);
     }
 
-    /// Emit a call-await (`await <coop-leaf-call>`) as a suspend point
-    /// (willow-lpn.5.3.1): call the callee constructor (which schedules the
+    /// Emit a call-await (`await <coop-leaf-call>`) as a suspend point: call the callee
+    /// constructor (which schedules the
     /// callee task and returns its frame), stash the frame in the awaiter's
     /// callee-frame slot, then `willow_sched_await(callee task id)`. If the
     /// callee already completed (returns 1) resume inline; otherwise store the
     /// resume state, return Pending, and resume when the scheduler wakes us. On
     /// resume, optionally read the callee's RESULT slot for let/assign/return.
-    /// Record the call-site of a task spawn for panic/debug traces
-    /// (willow-0a6k.7): willow_sched_set_spawn_site(id, file, line).
+    /// Record the call-site of a task spawn for panic/debug traces:
+    /// willow_sched_set_spawn_site(id, file, line).
     pub(super) fn emit_set_spawn_site(
         &mut self,
         task_id: cranelift_codegen::ir::Value,
@@ -2004,7 +2004,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         );
         // done = willow_frame_await(awaited, id): 1 = already terminal,
         // 0 = registered as a waiter. The frame's own header answers "already
-        // terminal?" without a scheduler lookup (willow-ezs.1.3); the id is
+        // terminal?" without a scheduler lookup; the id is
         // still needed to register this task when it is not.
         let await_fid = self.func_id(rt::willow_frame_await);
         let await_ref = self
@@ -2035,7 +2035,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// Read a completed callee frame's RESULT slot. A CANCELLED callee has no
     /// result to read, so the terminal state is resolved first — the same
-    /// located panic as `await` (willow-vynv.1), instead of reading garbage.
+    /// located panic as `await`, instead of reading garbage.
     pub(super) fn emit_coop_awaited_result(
         &mut self,
         awaited: cranelift_codegen::ir::Value,
@@ -2059,7 +2059,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Emit the acquire/park/poll/owned state machine using the acquisition's
-    /// LIR frame offsets (willow-0g8j.2.13).
+    /// LIR frame offsets.
     ///
     /// Lowering prepares three parts of the acquisition before emission.
     /// The handle was evaluated and stored by the `LirInst::Let` the lowerer
@@ -2408,7 +2408,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// The value of a task that has REACHED a terminal state, given its frame.
     ///
-    /// This is the one place the two await forms differ (willow-qrj9):
+    /// This is the one place the two await forms differ:
     ///
     /// * `cancel_aware == false` (`await task`) — a cancelled task is a located
     ///   runtime panic (`willow_frame_await_check`), and the result slot is read
@@ -2855,7 +2855,7 @@ mod task_boundary_callback_tests {
     }
 
     /// `fn work` must not be an inlinable scalar leaf, or the optimizer folds
-    /// the call away and no task-stack boundary exists to compile (willow-ssl7.3).
+    /// the call away and no task-stack boundary exists to compile.
     const WORK: &str = "fn work(x: i64) -> i64 { println(x); return x + 1; }";
 
     /// Compile `source` and return the callback preparation work the emitter

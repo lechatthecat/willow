@@ -1,4 +1,4 @@
-//! Focused old-LAB invariants (willow-jz15.53): unindexed lookups, flushing,
+//! Focused old-LAB invariants: unindexed lookups, flushing,
 //! allocation across mark closure and a pending sweep, and pruning of buffers
 //! owned by exited threads.
 use super::*;

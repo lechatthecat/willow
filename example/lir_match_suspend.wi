@@ -1,5 +1,5 @@
-// A suspension inside a `match` arm, compiled from Lowered IR
-// (willow-0g8j.2.11.1).
+// A suspension inside a `match` arm, compiled from Lowered IR.
+//
 //
 // An `await`, a channel `send`, a channel `recv` -- each one parks the task and
 // needs a resume point to come back to. The cooperative pass builds those out

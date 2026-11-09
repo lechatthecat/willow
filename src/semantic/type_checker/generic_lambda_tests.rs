@@ -1,4 +1,4 @@
-//! Lambda arguments to generic functions (willow-jz15.64): a lambda whose
+//! Lambda arguments to generic functions: a lambda whose
 //! formal still mentions a type parameter is typed after the other arguments,
 //! from what they bound, and its own type then binds the rest.
 use crate::diagnostics::Diagnostic;
@@ -230,7 +230,7 @@ fn p26_non_generic_capturing_lambda_diagnostic_is_unchanged() {
     );
 }
 
-// Generic callers (willow-jz15.97): a generic call made from inside another
+// Generic callers: a generic call made from inside another
 // generic function binds the callee's parameters to the caller's own, whose
 // names may coincide with the callee's. Lambda parameters are still inferred
 // from those bindings, and no conflicting-parameter error cascades.

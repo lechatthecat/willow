@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Interface -> concrete downcast via match (willow-1js.4) ──────────────────
+// ── Interface -> concrete downcast via match ──────────────────
 
 #[test]
 fn downcast_01_matches_concrete_and_calls_method() {

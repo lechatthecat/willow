@@ -1,5 +1,5 @@
-//! Boxing a value into an interface keeps the RUNTIME class's overrides
-//! (willow-tygf).
+//! Boxing a value into an interface keeps the RUNTIME class's overrides.
+//!
 //!
 //! An interface value is `[object | vtable]`, and the vtable is the static
 //! `(class, interface)` table chosen at the boxing site. Every slot of that

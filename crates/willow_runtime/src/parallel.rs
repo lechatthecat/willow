@@ -1,4 +1,4 @@
-//! Bounded parallel collection mapping on the M:N scheduler (willow-2s3.4).
+//! Bounded parallel collection mapping on the M:N scheduler.
 //!
 //! `parallel::map` accepts the runtime representation of a
 //! `FrozenArray<i64>` and a non-capturing `fn(i64) -> i64`. It creates at most

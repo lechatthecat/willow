@@ -1,4 +1,4 @@
-// Class METHOD bodies on the LIR-walking backend (willow-0g8j.2.18).
+// Class METHOD bodies on the LIR-walking backend.
 //
 // The walker used to be a free-function backend by accident. Eligibility knew
 // how to vet a method body, lowering already produced one under `Class::method`,
@@ -27,7 +27,7 @@
 //     self-calls and `await` do not become different constructs because they
 //     are inside a method, and this file exercises each of them there.
 //
-// Since willow-0g8j.3 a body outside the walker's subset is a compile error, so
+// Since the lowered-IR cutover a body outside the walker's subset is a compile error, so
 // this file compiling at all is the proof that every body here took the walker
 // path.
 

@@ -62,10 +62,10 @@ pub struct UnitImports {
 /// The back end needs the distinction for two things it cannot get from the
 /// import path alone. An item import binds the ITEM, so the module it came from
 /// is not a name this file can write, and letting it count as visible makes an
-/// unrelated class of the same bare name ambiguous (willow-vtlr). And the local
+/// unrelated class of the same bare name ambiguous. And the local
 /// name an item import does bind has to be wired to that module's mangled
 /// symbol per file: two files can bind the same local name to different
-/// modules' functions (willow-28h8).
+/// modules' functions.
 pub fn classify_unit_imports(program: &Program, modules: &[SourceFile]) -> UnitImports {
     classify_unit_imports_with(program, |path| {
         modules.iter().find(|m| m.canonical_path == path)
@@ -833,7 +833,7 @@ mod tests {
         program
     }
 
-    // willow-vtlr / willow-28h8 — what one file's imports bind, as the back end
+    // module import bindings / imported enum matching — what one file's imports bind, as the back end
     // has to be told rather than guess from the path shape.
 
     /// The classification of `entry`'s imports against a project's modules.

@@ -1,4 +1,4 @@
-// willow-d9lm.2: reference values and genuine 64-bit scalar values coexist.
+// reference values and genuine 64-bit scalar values coexist.
 // Expected output: reference, 4294967297, 4294967298, reference!
 import std::collections::Array;
 

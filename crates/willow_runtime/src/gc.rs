@@ -282,7 +282,7 @@ pub struct GcHeader {
     pub descriptor_owned: bool,
     /// Nonzero exactly while this payload is in `GcState::remembered_set`.
     /// Generated reference-array stores read it to skip a redundant barrier
-    /// call (willow-8hq4.15); only the runtime writes it, under the heap lock
+    /// call; only the runtime writes it, under the heap lock
     /// or with mutators stopped.
     pub remembered: u8,
     /// Live: immutable descriptor address. During minor STW only, a moved
@@ -299,8 +299,8 @@ pub struct GcHeader {
 /// path, registers the owning chunk, and may invalidate cursor/limit while the
 /// mutator is stopped for collection. Generated code writes cursor and start
 /// words with plain stores and keeps no per-object counters; the runtime
-/// derives fast-path bytes from the cursor and counts from the start words
-/// (willow-8hq4.16).
+/// derives fast-path bytes from the cursor and counts from the start words.
+///
 #[repr(C)]
 pub struct GcTlabState {
     cursor: AtomicUsize,
@@ -480,7 +480,7 @@ static EXTERNAL_HEADROOM: AtomicUsize = AtomicUsize::new(0);
 /// lock: no trigger can fire before they are used up. Zero under a hard
 /// reservation cap or a soft memory limit, at or past the pacer trigger, and
 /// after any policy-input change; recomputed by every locked check that finds
-/// nothing to do (willow-jz15.53). Capped so the pacer's allocation-rate
+/// nothing to do. Capped so the pacer's allocation-rate
 /// samples, taken by locked checks, stay at most this many bytes apart.
 static POLICY_HEADROOM: AtomicU64 = AtomicU64::new(0);
 const POLICY_HEADROOM_CAP: u64 = 1 << 20;
@@ -872,7 +872,7 @@ fn pacer_inputs(state: &GcState) -> pacer::Inputs {
 // but must not remove native allocation history from a rate sample. Young
 // allocation enters the domain only when promoted: minor collections reclaim
 // the rest, so a high young allocation rate alone must not shorten the major
-// runway (willow-jz15.120).
+// runway.
 fn policy_allocated_total(state: &GcState) -> u64 {
     state
         .total_allocated_bytes
@@ -884,8 +884,8 @@ fn policy_allocated_total(state: &GcState) -> u64 {
 /// Managed bytes the major policy is responsible for. Minor collections own
 /// young bytes up to the nursery budget; counting them would start whole-heap
 /// cycles for garbage the next minor reclaims anyway, and once the nursery
-/// approaches the goal every allocation sample would request a major
-/// (willow-jz15.120). Young growth beyond the budget (deferred minors) still
+/// approaches the goal every allocation sample would request a major. Young growth beyond the
+/// budget (deferred minors) still
 /// counts. Hard reservation pressure always sees every reserved byte.
 fn major_policy_managed_bytes(state: &GcState) -> usize {
     let nursery_owned = state
@@ -896,7 +896,7 @@ fn major_policy_managed_bytes(state: &GcState) -> usize {
 
 fn memory_inputs(state: &GcState) -> memory_control::Inputs {
     // A soft limit budgets every managed byte: excluding the nursery would let
-    // the heap exceed the limit by up to one nursery budget (willow-jz15.120).
+    // the heap exceed the limit by up to one nursery budget.
     // Its relief runway likewise measures all allocation.
     let (live, occupied, allocated_total) = if state.soft_memory.enabled() {
         (
@@ -1016,8 +1016,8 @@ impl RootStackAccess {
 }
 static ROOT_STACK: RootStackAccess = RootStackAccess;
 // ---------------------------------------------------------------------------
-// Multi-mutator coordination: registration + stop-the-world safepoints
-// (willow-6fv.5.6).
+// Multi-mutator coordination: registration + stop-the-world safepoints.
+//
 //
 // The single-mutator runtime reads the current context through ROOT_STACK.
 // When more than one mutator thread is registered (for example, a
@@ -1216,8 +1216,8 @@ fn hard_reservation_pressure(state: &mut GcState) -> bool {
 
 /// Mirror of `concurrent_cycle.is_some() || sweeping.is_some()`, written under
 /// the heap lock by every change to either, so allocation can skip a policy
-/// check that would only report "busy" without contending on the heap lock
-/// (willow-jz15.53). A stale read only shifts the check to the next slow path.
+/// check that would only report "busy" without contending on the heap lock. A stale read only
+/// shifts the check to the next slow path.
 static COLLECTION_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn publish_collection_busy(state: &GcState) {
@@ -1610,7 +1610,7 @@ fn object_in_retired_chunk(
 ) -> Option<HeapObject> {
     let relative = address.checked_sub(chunk.base as usize + GC_HEADER_SIZE)?;
     let offset = if chunk.needs_index() {
-        // Not indexed yet (willow-8hq4.21): its start bits name exactly its
+        // Not indexed yet: its start bits name exactly its
         // published headers. O(chunk words) for an interior lookup.
         if interior {
             chunk.mark_bitmap.last_start_in(0, relative)?
@@ -1711,7 +1711,7 @@ static RUNTIME_POLICY_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 std::thread_local! {
     /// `(epoch, bytes)` this thread's runtime allocations have made since its
-    /// last collection-policy check (willow-jz15.51).
+    /// last collection-policy check.
     static RUNTIME_POLICY_DEBT: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
@@ -1906,7 +1906,7 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
         && old_lab::available()
     {
         // Small runtime objects bump-allocate in this thread's old buffer and
-        // take the heap mutex only to refill it (willow-jz15.53).
+        // take the heap mutex only to refill it.
         if let Some(object) = old_lab::try_allocate(type_id, layout_id, gc_ref_mask, total, span) {
             return object.payload().as_ptr();
         }
@@ -2059,7 +2059,7 @@ pub extern "C" fn willow_gc_minor_collect() {
 
 /// Whether the GC stress mode `kind` is active via the `WILLOW_GC_STRESS`
 /// environment variable. The variable is a comma-separated list of modes; `all`
-/// enables every mode (willow-lpn.8).
+/// enables every mode.
 ///
 /// Modes (for local test runs / CI):
 /// - `alloc`     — collect at every heap allocation boundary.
@@ -2076,13 +2076,13 @@ pub extern "C" fn willow_gc_minor_collect() {
 /// Example: `WILLOW_GC_STRESS=alloc cargo test`, or `WILLOW_GC_STRESS=all`.
 ///
 /// `WILLOW_GC_VERIFY_NO_PIN=1` complements these modes: a minor collection
-/// that would pin a young object in place aborts and names the pin source
-/// (willow-9tls.9). Generated code pins only the owners of `&`/`&mut`
+/// that would pin a young object in place aborts and names the pin source. Generated code pins
+/// only the owners of `&`/`&mut`
 /// arguments that point into an object or array element.
 ///
 /// The variable is read once: every slow-path allocation asks for it several
 /// times, and `std::env::var` costs a `getenv` scan plus, on Windows, a heap
-/// allocation for the key on each call (willow-ssl7.12).
+/// allocation for the key on each call.
 pub(crate) fn gc_stress_enabled(kind: &str) -> bool {
     static MODES: LazyLock<Vec<String>> = LazyLock::new(|| {
         parse_gc_stress_modes(&std::env::var("WILLOW_GC_STRESS").unwrap_or_default())
@@ -2270,7 +2270,7 @@ enum CollectionAttempt {
 /// Only Completed proves collection; both contention and unsafe foreign roots
 /// defer the attempt without satisfying a request.
 fn try_collect_internal() -> CollectionAttempt {
-    // Collector election (willow-6fv.5.6): only one thread collects at a time.
+    // Collector election: only one thread collects at a time.
     // A thread that cannot become the collector must NOT block on runtime().collect_lock —
     // if a stop-the-world collection is in progress, the holder is waiting for
     // this thread to reach a safepoint, so blocking here would deadlock. Instead

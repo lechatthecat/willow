@@ -1,4 +1,4 @@
-//! Relocatable root slots (willow-9tls.9): a minor collection copies young
+//! Relocatable root slots: a minor collection copies young
 //! survivors held by generated-code root slots and rewrites those slots
 //! instead of pinning their nursery chunks. `WILLOW_GC_STRESS=relocate` moves
 //! objects at every generated allocation and poisons moved payloads, so a
@@ -591,7 +591,7 @@ fn main() -> Result<void, String> {
 }
 "#;
 
-/// The pinned root entry point is gone from the runtime ABI (willow-9tls.9);
+/// The pinned root entry point is gone from the runtime ABI;
 /// this guards against generated code reintroducing such a call.
 fn assert_no_pinned_entries(source: &str) {
     let names = compile_and_collect_relocation_targets_all(source, &[]);
@@ -998,7 +998,7 @@ fn main() {
 
 #[test]
 fn young_array_literals_and_push_buffers_move_in_every_mode() {
-    // willow-jz15.94: literals and grown push buffers are young TLAB objects;
+    // literals and grown push buffers are young TLAB objects;
     // relocate stress moves them at every allocation without pinning.
     let source = include_str!("../../example/array_literal_churn.wi");
     let expected = "50005000\n43\n6\nalphabetagamma\n10\n5050\n2555840\n87\n1999000\n";

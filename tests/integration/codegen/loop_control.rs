@@ -1,6 +1,6 @@
 use super::*;
 
-// ── break / continue (willow-kzka) ──────────────────────────────────────────
+// ── break / continue ──────────────────────────────────────────
 // 20 perspectives: 1 break in while, 2 break in range-for, 3 break in
 // array-for, 4 continue in while (cond re-evaluated), 5 continue in
 // range-for STILL INCREMENTS, 6 continue in array-for still advances,

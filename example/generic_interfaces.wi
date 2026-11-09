@@ -1,4 +1,4 @@
-// Generic interfaces (willow-1js.1): an interface may declare type parameters,
+// Generic interfaces: an interface may declare type parameters,
 // and a class implements a concrete instantiation of it. The interface method
 // signatures are checked with the type parameters substituted, and calls through
 // an interface-typed value dispatch via the per-(class, interface) vtable.

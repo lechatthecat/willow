@@ -44,7 +44,7 @@ pub(crate) fn has_internal_module_prefix(name: &str) -> bool {
 }
 
 /// Namespace that spells a receiving unit's unqualified type inside the scope
-/// of another unit whose interface defaults it copied (willow-nvi6). The
+/// of another unit whose interface defaults it copied. The
 /// entry file's classes keep bare identities (`A`), which the declaring
 /// unit's own `A` would shadow; source cannot spell this namespace.
 pub(crate) const FOREIGN_RECEIVER_NAMESPACE: &str = "$receiver";
@@ -459,7 +459,7 @@ impl TypeId {
         Self::intern(None, name.as_ref())
     }
     /// The entry file's identity a [`FOREIGN_RECEIVER_PREFIX`] spelling
-    /// names, in whichever scope it is resolved (willow-nvi6).
+    /// names, in whichever scope it is resolved.
     pub(crate) fn foreign_receiver_target(&self) -> Option<Self> {
         let prefix = FOREIGN_RECEIVER_NAMESPACE;
         let name = self.0.with_table(|table| {

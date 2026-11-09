@@ -1,6 +1,6 @@
 //! A value `match` arm that always leaves by `break`/`continue` of an
-//! enclosing loop is typed `Never`, like an arm that always returns
-//! (willow-jz15.46).
+//! enclosing loop is typed `Never`, like an arm that always returns.
+//!
 use super::*;
 
 const PREFIX: &str = r#"

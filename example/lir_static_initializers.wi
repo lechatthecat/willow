@@ -1,11 +1,11 @@
 // lir_static_initializers — a static property's INITIALIZER expression, on the
-// LIR-walking backend (willow-t0uy.3).
+// LIR-walking backend.
 //
 // A static property's initializer is not written inside any function, so the
 // compiler gives it one of its own: `Class::$static_init.field`, called from
 // `__willow_static_init` before `main`. That synthetic function was the last
 // body in the compiler still emitted by walking the AST; every other checked
-// body had moved to lowered IR in willow-0g8j.3. So an initializer silently
+// body had moved to lowered IR in the lowered-IR cutover. So an initializer silently
 // had a different expression subset than the same expression one line down in
 // a function — and the AST emitter had to be kept alive for it alone.
 //

@@ -369,7 +369,7 @@ fn stress_region_05_minor_major_and_remembered_set_interleave() {
 
 /// Reserved nursery plus old-region bytes. Without pinning, sparse survivor
 /// chunks are evacuated, so this stays near the live size instead of growing
-/// with the number of source chunks (willow-9tls.9).
+/// with the number of source chunks.
 fn reserved_managed_bytes() -> usize {
     (willow_gc_old_region_reserved_bytes() + willow_gc_tlab_reserved_bytes()) as usize
 }

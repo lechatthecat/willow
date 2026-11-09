@@ -1,5 +1,5 @@
-//! `Self::` and the implicit receiver on the LIR-walking backend
-//! (willow-0g8j.13, willow-0g8j.14, willow-h7hv).
+//! `Self::` and the implicit receiver on the LIR-walking backend.
+//!
 //!
 //! Three defects, one root: a class body can name things two ways, and the
 //! compiler took the shorter spelling to mean something weaker than it does.
@@ -25,7 +25,7 @@
 //!     virtual dispatch found two implementations with nowhere to dispatch
 //!     through and the compiler panicked.
 //!
-//! Since willow-0g8j.3 a body the walker cannot take is a compile error, so a
+//! Since the lowered-IR cutover a body the walker cannot take is a compile error, so a
 //! run that prints the right answer is proof the walker produced it. Where a
 //! perspective is about WHICH body was walked, the test reads
 //! `WILLOW_LIR_LOG=1` rather than the program's output.
@@ -69,7 +69,7 @@ use super::support::{
 const PLAIN: [(&str, &str); 0] = [];
 const LIR_LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 
-/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// The build runs and prints `expected`. Since the lowered-IR cutover every body is
 /// compiled from lowered IR, so a body the walker cannot take is a compile
 /// error here rather than a second emitter's answer.
 #[track_caller]
@@ -486,7 +486,7 @@ async fn main() { println(await new Slow(20).doubled(2)); }",
     );
 }
 
-// 23. The vtable half (willow-h7hv): an implicit-self `open`/`override` pair
+// 23. The vtable half: an implicit-self `open`/`override` pair
 // used to panic the compiler outright — two implementations, no slot to
 // dispatch through.
 #[test]

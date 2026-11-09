@@ -1,4 +1,4 @@
-//! Human-readable dump of the typed HIR — willow-mb5.
+//! Human-readable dump of the typed HIR — typed HIR lowering.
 //!
 //! Every expression is rendered with a trailing `: <type>` so the dump makes
 //! the whole point of the HIR visible: types are attached to nodes, not
@@ -355,7 +355,7 @@ fn format_expr(e: &HirExpr) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             // The environment is printed before the parameters because that is
-            // the order the lifted body binds them in (willow-0g8j.2.12).
+            // the order the lifted body binds them in.
             let captures = if captures.is_empty() {
                 String::new()
             } else {
@@ -487,8 +487,8 @@ fn type_str<N: std::fmt::Display>(ty: &Type<N>) -> String {
                 use std::fmt::Write;
                 let at = out.len();
                 write!(out, "{name}").expect("string write");
-                // A copied default's receiver is shown by its own name
-                // (willow-nvi6).
+                // A copied default's receiver is shown by its own name.
+                //
                 if out[at..].starts_with(crate::semantic::ids::FOREIGN_RECEIVER_PREFIX) {
                     out.replace_range(
                         at..at + crate::semantic::ids::FOREIGN_RECEIVER_PREFIX.len(),
@@ -795,7 +795,7 @@ mod tests {
     }
 
     // 25. `**` survives lowering as a binary operator, and the `: ty` suffix
-    // carries the i64/f64 distinction the backend needs (willow-n5yv.2).
+    // carries the i64/f64 distinction the backend needs.
     #[test]
     fn dump_25_pow_i64_keeps_operator_and_type() {
         let text = dump("fn f(a: i64, b: i64) -> i64 { return a ** b; }");

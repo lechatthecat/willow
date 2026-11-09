@@ -1,5 +1,5 @@
 // Explicit conversion with toString() — Willow keeps `+` String-only, so
-// non-String values must be converted before concatenation (willow-fvfc).
+// non-String values must be converted before concatenation.
 
 class Point {
     pub x: i64;

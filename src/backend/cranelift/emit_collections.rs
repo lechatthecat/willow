@@ -32,7 +32,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_option_from_tag_payload(tag, payload, value_ty)
     }
 
-    /// Receive from a channel. `closed_aware` (`recv_opt`, willow-jz15.44)
+    /// Receive from a channel. `closed_aware` (`recv_opt`, close-aware receive)
     /// yields `Option<elem_ty>`, `None` once the channel is closed and
     /// drained; otherwise a closed-empty receive raises in the runtime.
     pub(super) fn emit_channel_recv(

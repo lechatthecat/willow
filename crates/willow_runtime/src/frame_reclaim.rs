@@ -1,4 +1,4 @@
-//! Grace periods for retiring terminal task-frame runtime roots (willow-vjaf).
+//! Grace periods for retiring terminal task-frame runtime roots.
 //!
 //! A task frame is a runtime GC root while its task is live. Once the task
 //! is terminal the frame stays alive only through whoever still holds the
@@ -158,7 +158,7 @@ mod tests {
     use crate::gc::runtime_test_guard;
     use std::sync::Barrier;
 
-    // Perspectives (willow-vjaf): an idle process bounds nothing it has not
+    // Perspectives: an idle process bounds nothing it has not
     // tagged yet; a unit holds back exactly the frames retired after it began;
     // nesting keeps the outer epoch; another thread's unit counts; a thread
     // that dies inside a unit cannot wedge reclamation.

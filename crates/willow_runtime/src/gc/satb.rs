@@ -1,7 +1,7 @@
 //! Per-mutator deletion buffers. The owning heap mutex serializes producers
 //! with STW drains; callbacks publish values only and never trace/allocate GC.
 //! `SatbShards` are per-cycle buffers that concurrent-mark barriers fill under
-//! a private buffer mutex instead of the heap mutex (willow-jz15.53).
+//! a private buffer mutex instead of the heap mutex.
 //! The cycle's sharded registry retains buffers while publication is possible.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

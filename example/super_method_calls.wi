@@ -1,4 +1,4 @@
-// `super.method(args)` from an overriding method (willow-jz15.48).
+// `super.method(args)` from an overriding method.
 //
 // `super.describe()` calls the implementation the BASE class resolves
 // `describe` to. That call is direct: it never goes through `self`'s vtable,

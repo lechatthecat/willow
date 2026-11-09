@@ -1,5 +1,5 @@
-// `new` and `super.init(...)` under the reference-argument ABI (willow-0g8j.10,
-// willow-dssc).
+// `new` and `super.init(...)` under the reference-argument ABI (constructor reference arguments,
+// constructor GC roots).
 //
 // A constructor parameter can be declared `&` or `&mut` just like any other
 // parameter, and `init` has no other way to be called -- so `new C(&place)` and

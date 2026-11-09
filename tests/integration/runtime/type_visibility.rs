@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Module-qualified type visibility (willow-7ihl): E0419 for private types ──
+// ── Module-qualified type visibility: E0419 for private types ──
 
 #[test]
 fn module_vis_01_private_class_annotation_rejected() {

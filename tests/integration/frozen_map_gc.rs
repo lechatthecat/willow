@@ -1,4 +1,4 @@
-//! `Map::freeze()` under a moving collection (willow-9tls.8).
+//! `Map::freeze()` under a moving collection.
 //!
 //! A map's reference values are GC children reported by its trace hook. A
 //! class instance made by compiled code is young, and a minor collection MOVES

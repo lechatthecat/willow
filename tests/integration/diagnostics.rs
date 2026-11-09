@@ -173,7 +173,7 @@ fn main() {
 
 #[test]
 fn test_diagnostic_unary_not_requires_bool_or_i64_details() {
-    // `!` is logical on `bool` and bitwise on `i64` (willow-jz15.8).
+    // `!` is logical on `bool` and bitwise on `i64`.
     assert_compile_error_contains(
         r#"
 fn main() {
@@ -322,7 +322,7 @@ fn main() {
 
 #[test]
 fn test_diagnostic_bitwise_and_on_bool_suggests_logical_and() {
-    // Binary `&` is the `i64` bitwise operator (willow-jz15.8); on `bool`
+    // Binary `&` is the `i64` bitwise operator; on `bool`
     // operands it points at `&&`.
     assert_compile_error_contains(
         r#"
@@ -360,7 +360,7 @@ fn main() {
 
 #[test]
 fn test_diagnostic_single_pipe_on_bool_is_an_error() {
-    // Binary `|` is the `i64` bitwise operator (willow-jz15.8), so
+    // Binary `|` is the `i64` bitwise operator, so
     // `true | false` is a type error; logical or is `||`.
     assert!(expect_compile_error(
         r#"
@@ -1051,7 +1051,7 @@ fn main() { let reader: Reader = new Box(1); println(reader.read()); }
 // ── Match expression tests ─────────────────────────────────────────────────────
 
 #[test]
-fn ticket_52_frozen_array_import() {
+fn frozen_array_import() {
     let source = include_str!("../../example/diagnostic_collections.wi");
     let (out, ok) = compile_and_run(source);
     assert!(ok, "{out}");
@@ -1061,7 +1061,7 @@ fn ticket_52_frozen_array_import() {
 }
 
 #[test]
-fn ticket_52_substring_panic_values() {
+fn substring_panic_values() {
     for (text, start, end, len) in [
         ("s", 5, 100, 1),
         ("abc", -1, 1, 3),
@@ -1111,14 +1111,14 @@ fn generic_interface_extends_has_one_dedicated_diagnostic() {
 }
 
 #[test]
-fn ticket_42_diagnostic_workarounds_run() {
+fn diagnostic_workarounds_run() {
     let (output, ok) = compile_and_run(include_str!("../../example/diagnostic_workarounds.wi"));
     assert!(ok, "{output}");
     assert_eq!(output, "9\n6\n2\n4\n7\n");
 }
 
 #[test]
-fn ticket_42_unused_import_warning_is_successful_check() {
+fn unused_import_warning_is_successful_check() {
     let source = temp_path(format!("willow_unused_import_{}.wi", unique_test_id()));
     fs::write(&source, "import std::collections::Array; fn main() {}\n").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_willow"))
@@ -1133,7 +1133,7 @@ fn ticket_42_unused_import_warning_is_successful_check() {
 }
 
 #[test]
-fn ticket_42_enum_alias_checks_have_no_unused_warning() {
+fn enum_alias_checks_have_no_unused_warning() {
     for body in [
         "fn f() -> Result<i64, String> { return res::Result::Ok(1); }",
         "fn f(r: Result<i64, String>) { match r { res::Result::Ok(n) => println(n), res::Result::Err(e) => println(e) } }",
@@ -1196,7 +1196,7 @@ fn match_arm_diagnostic_workarounds_run() {
 }
 
 #[test]
-fn iflh_generic_import_warnings_are_source_owned() {
+fn import_usage_generic_import_warnings_are_source_owned() {
     for (kind, declaration, call) in [
         (
             "function",
@@ -1226,7 +1226,7 @@ fn iflh_generic_import_warnings_are_source_owned() {
             );
             let util = format!("module util; import other; import other as unused; {declaration}");
             let project = TestProject::new(
-                "iflh_imports",
+                "generic_imports",
                 &[
                     ("main.wi", &main),
                     ("util.wi", &util),
@@ -1258,9 +1258,9 @@ fn iflh_generic_import_warnings_are_source_owned() {
 }
 
 #[test]
-fn iflh_generic_import_example_runs_without_warnings() {
+fn import_usage_generic_import_example_runs_without_warnings() {
     let project = TestProject::new(
-        "iflh_example",
+        "generic_import_example",
         &[
             (
                 "main.wi",
@@ -1286,7 +1286,7 @@ fn iflh_generic_import_example_runs_without_warnings() {
 }
 
 #[test]
-fn iflh_type_parameters_do_not_shadow_imported_values() {
+fn import_usage_type_parameters_do_not_shadow_imported_values() {
     for (item, body) in [
         ("other::seven", "return T();"),
         ("other::generic", "return T<i64>();"),
@@ -1304,7 +1304,7 @@ fn iflh_type_parameters_do_not_shadow_imported_values() {
                 "import util; fn main() {}"
             };
             let project = TestProject::new(
-                "iflh_namespaces",
+                "generic_import_namespaces",
                 &[
                     ("main.wi", main),
                     ("util.wi", &util),
@@ -1335,7 +1335,7 @@ fn iflh_type_parameters_do_not_shadow_imported_values() {
     }
 }
 
-// willow-jz15.73: value tails, statement boundaries, and recovery.
+// value tails, statement boundaries, and recovery.
 #[test]
 fn block_arm_control_value_tail_diagnostics() {
     for body in [
@@ -1429,7 +1429,7 @@ fn block_arm_control_enum_payload_repro() {
 }
 
 #[test]
-fn jz15_86_missing_constructor_check_has_one_help_and_no_arity_cascade() {
+fn source_diagnostics_missing_constructor_check_has_one_help_and_no_arity_cascade() {
     for imported in [false, true] {
         let base = "open class Base { pub x: i64; pub init(self) { self.x = 42; } }";
         let main = format!(
@@ -1440,7 +1440,10 @@ fn jz15_86_missing_constructor_check_has_one_help_and_no_arity_cascade() {
             if imported { "base::" } else { "" },
         );
         let base_module = format!("module base; pub {base}");
-        let project = TestProject::new("jz15_86", &[("main.wi", &main), ("base.wi", &base_module)]);
+        let project = TestProject::new(
+            "missing_constructor_diagnostic",
+            &[("main.wi", &main), ("base.wi", &base_module)],
+        );
         let output = project.check("main.wi");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success());
@@ -1456,9 +1459,9 @@ fn jz15_86_missing_constructor_check_has_one_help_and_no_arity_cascade() {
 }
 
 #[test]
-fn jz15_86_misplaced_import_check_has_actionable_help() {
+fn source_diagnostics_misplaced_import_check_has_actionable_help() {
     let project = TestProject::new(
-        "jz15_86_import",
+        "misplaced_import_diagnostic",
         &[(
             "main.wi",
             "class C {} import std::io::println; fn main() {}",
@@ -1477,7 +1480,7 @@ fn jz15_86_misplaced_import_check_has_actionable_help() {
 }
 
 #[test]
-fn ticket_69_diagnostic_recovery_end_to_end() {
+fn diagnostic_recovery_end_to_end() {
     for (source, expected) in [
         ("fn main() { loop { break; } }", "use `while true { ... }`"),
         (
@@ -1498,7 +1501,7 @@ fn ticket_69_diagnostic_recovery_end_to_end() {
 }
 
 #[test]
-fn ticket_69_supported_example_runs() {
+fn supported_example_runs() {
     let (output, success) =
         compile_and_run(include_str!("../../example/match_import_diagnostics.wi"));
     assert!(success, "{output}");

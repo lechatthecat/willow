@@ -1,4 +1,4 @@
-// Sound interface-to-super-interface coercion (willow-1fc6).
+// Sound interface-to-super-interface coercion.
 //
 // `All extends Alpha, Beta, Gamma`, so Beta and Gamma do not begin at slot 0
 // of All's vtable. Converting an All value to either interface must adjust its

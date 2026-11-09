@@ -184,7 +184,7 @@ impl DesugarPass {
 /// Interface inheritance index: interface name -> (direct super names, own
 /// method declarations). Built per program, optionally enriched with the
 /// module-qualified interfaces of every imported module so cross-module
-/// `extends` / `implements` resolve (willow-1js.7, willow-1js.8).
+/// `extends` / `implements` resolve.
 type IfaceIndex =
     std::collections::HashMap<String, (Vec<String>, Vec<parser::ast::InterfaceMethodDecl>)>;
 
@@ -504,7 +504,7 @@ fn iface_inherited_default_conflicts<'a>(
 /// `mod::Iface -> (qualified supers, own methods)`. A same-module super name is
 /// qualified to `mod::Super`; an already-qualified super is kept as written.
 /// This lets a class in one module `implements`/`extends` an interface defined
-/// in another (willow-1js.7, willow-1js.8).
+/// in another.
 fn build_module_iface_index_with_imports(
     modules: &[module::ResolvedModule],
     imports: &[Vec<parser::ast::ImportDecl>],
@@ -649,7 +649,7 @@ fn qualify_imported_name(name: &str, imports: &std::collections::HashMap<&str, &
     }
 }
 
-/// Resolve interface inheritance (willow-1js.2 / willow-1js.8) by desugaring on
+/// Resolve interface inheritance by desugaring on
 /// the AST:
 ///  1. Compose each interface's method list as `[super methods..., own methods]`
 ///     (transitively, deduped by name; an own method overrides an inherited one
@@ -662,8 +662,8 @@ fn qualify_imported_name(name: &str, imports: &std::collections::HashMap<&str, &
 /// `external` carries the module-qualified interfaces of every imported module
 /// so cross-module `extends` / `implements` resolve, and `external_classes` the
 /// base class and `implements` clause of every imported CLASS, so step 2 keeps
-/// working when the ancestor that names the interface lives in a module
-/// (willow-himv). Must run BEFORE default-method injection.
+/// working when the ancestor that names the interface lives in a module. Must run BEFORE
+/// default-method injection.
 fn resolve_interface_inheritance(
     program: &mut parser::ast::Program,
     external: &IfaceIndex,
@@ -698,14 +698,14 @@ fn resolve_interface_inheritance(
 
     // class name -> (base class name, directly-implemented interface TYPES), so
     // a subclass can inherit the interfaces its ancestors implement — keeping
-    // generic type arguments, e.g. `Into<AppErr>` (willow-2s4i / willow-bpk6).
+    // generic type arguments, e.g. `Into<AppErr>`.
     //
     // Imported classes go in FIRST, under their module-qualified name and every
     // import-alias spelling of it, because an ancestor of a class declared here
     // may live in a module: without them `class EntryParcel extends lib::Parcel`
     // inherited nothing, so no `(EntryParcel, lib::Measured)` vtable was ever
-    // emitted and boxing it into that interface produced a box with no methods
-    // (willow-himv). This program's own classes are inserted after, so a local
+    // emitted and boxing it into that interface produced a box with no methods. This program's
+    // own classes are inserted after, so a local
     // declaration always wins over an entry of the same spelling. The imported
     // shapes carry each class's DIRECT `implements` only — they are built before
     // any program's propagation runs — which is why the walk below is transitive
@@ -800,7 +800,7 @@ fn resolve_interface_inheritance(
                 // Interfaces implemented through the base-class chain are added
                 // to this subclass too (preserving generic type args), so it gets
                 // its own (class, interface) vtable and is usable as that
-                // interface (willow-2s4i / willow-bpk6).
+                // interface.
                 let mut inherited = Vec::new();
                 inherited_class_interfaces(&c.name, &class_info, &mut inherited);
                 for iface_ty in inherited {
@@ -822,7 +822,7 @@ fn resolve_interface_inheritance(
                         // in its `implements` list. Skipping them here keeps the
                         // transitive marker out of `implements` so the manual-impl
                         // check (E2401) only flags directly-written `implements
-                        // Send/Sync` (willow-dgwo).
+                        // Send/Sync`.
                         if sup == "Send" || sup == "Sync" {
                             continue;
                         }
@@ -856,7 +856,7 @@ struct ClassShape {
 
 /// Substitute interface generic type parameters (and `Self`) in a type. Used so
 /// a default method inherited into a class that implements `Box<i64>` has its
-/// `T`s replaced by `i64` and `Self` by the class (willow-1js.7).
+/// `T`s replaced by `i64` and `Self` by the class.
 fn subst_iface_type(
     ty: &parser::ast::Type,
     map: &std::collections::HashMap<String, parser::ast::Type>,
@@ -867,7 +867,7 @@ fn subst_iface_type(
 /// Build the cross-module default-method index: for every interface declared in
 /// an imported module, its module-qualified name -> (type params, composed
 /// default methods). Composition pulls defaults inherited from super-interfaces
-/// too (willow-1js.7). `iface_index` supplies the qualified inheritance graph.
+/// too. `iface_index` supplies the qualified inheritance graph.
 fn build_module_default_methods(
     modules: &[module::ResolvedModule],
     iface_index: &IfaceIndex,
@@ -901,7 +901,7 @@ fn build_module_default_methods(
 /// A class's declared method set includes defaults its own `implements` clauses
 /// will synthesize later in this pass. This lets an entry subclass inherit that
 /// method from an imported base instead of receiving a second copy merely
-/// because the base's AST lives in another `Program` (willow-3eo1).
+/// because the base's AST lives in another `Program`.
 fn build_module_class_shapes_with_imports(
     modules: &[module::ResolvedModule],
     defaults: &DefaultMethodIndex,
@@ -1019,7 +1019,7 @@ fn build_module_class_shapes_with_imports(
     out
 }
 
-/// Inject default interface methods (willow-1js.3 / willow-1js.7): for each
+/// Inject default interface methods: for each
 /// class, for each interface it implements that defines a method with a default
 /// body, if the class does not already declare a method of that name, synthesize
 /// a class method whose body is the default. `self` then refers to the concrete
@@ -1065,10 +1065,10 @@ fn inject_default_interface_methods(
     // level, in the scope of the unit that declares the interface
     // (check_interface), so each injected class copy is marked to reuse that
     // record instead of being checked here. A copy from another unit's
-    // interface is also lowered and emitted in that unit's scope (willow-rvpp),
+    // interface is also lowered and emitted in that unit's scope,
     // so the provider's private helpers and types resolve as they do in the
     // interface. A generic interface's copy stays checkable: its substituted
-    // signature is this class's own (willow-1js.7).
+    // signature is this class's own.
 
     // Inheritance graph (own bare + imported qualified) for super/sub checks so
     // an inherited default does not count as "ambiguous" with its own super.
@@ -1116,14 +1116,14 @@ fn inject_default_interface_methods(
     // very same interface, type arguments included — and so receives the same
     // injected copy?
     //
-    // `implements` is propagated down an `extends` chain (willow-2s4i), so
+    // `implements` is propagated down an `extends` chain, so
     // without this every class in the chain would receive its own copy of the
     // same default body. Two copies of a method that is neither `open` nor
     // `override` have no vtable slot to disambiguate them, which the backend
     // reports as "no virtual slot but 2 candidate implementations". Injecting
     // only at the topmost class that implements the interface leaves the
-    // subclasses to INHERIT it, exactly as they inherit any other base method
-    // (willow-3eo1).
+    // subclasses to INHERIT it, exactly as they inherit any other base method.
+    //
     //
     // The interface type must match exactly: an ancestor implementing
     // `Holder<String>` does not provide the `Holder<i64>` copy this class needs,
@@ -1157,8 +1157,8 @@ fn inject_default_interface_methods(
         // interfaces were listed and each interface declared its methods. The
         // order these are appended in reaches HIR, the LIR dump and the emitted
         // symbols, so a hash map's arbitrary iteration order made those outputs
-        // differ between runs of the same compiler on the same source
-        // (willow-afb5.21). The name index keeps the conflict check O(1).
+        // differ between runs of the same compiler on the same source. The name index keeps
+        // the conflict check O(1).
         let mut chosen: Vec<(String, MethodDecl)> = Vec::new();
         let mut chosen_at: HashMap<String, usize> = HashMap::new();
         for iface_ty in &class.implements {
@@ -1551,7 +1551,7 @@ mod tests {
     /// on every run. Their order reaches HIR, the `--emit-lir` dump and the
     /// emitted symbol order, and `RandomState` reseeds per map instance, so
     /// collecting them in a `HashMap` made one compiler produce two different
-    /// binaries for the same source (willow-afb5.21).
+    /// binaries for the same source.
     #[test]
     fn injected_defaults_keep_declaration_order_on_every_run() {
         let source = r#"
@@ -1834,7 +1834,7 @@ fn main() {}
 
     #[test]
     fn pass_inherits_implements_from_a_module_base_class() {
-        // willow-himv: the ancestor naming the interface lives in an imported
+        // the ancestor naming the interface lives in an imported
         // module, so the propagation only reaches it through the class shapes
         // built from `modules` — `program.items` alone never sees `lib::Parcel`.
         let mut modules = [resolved_module(

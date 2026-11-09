@@ -1,4 +1,4 @@
-//! One monotone effect fixpoint over the shared call graph (willow-uqzx.1.3).
+//! One monotone effect fixpoint over the shared call graph.
 //!
 //! Three analyses used to own three hand-rolled propagation loops: the
 //! backend's recoverable-panic pass, the type checker's lock-effect pass behind
@@ -1015,7 +1015,7 @@ pub fn strongly_connected_components(adjacency: &[Vec<usize>]) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    //! Test perspectives for the shared effect fixpoint (willow-uqzx.1.3).
+    //! Test perspectives for the shared effect fixpoint.
     //!
     //! e01 an empty problem solves to no facts
     //! e02 a seed with no graph node is its own summary

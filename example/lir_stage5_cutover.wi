@@ -1,5 +1,5 @@
 // The last LIR fallback categories, compiled through lowered IR and exercised
-// together by tests/integration/lir_stage5_cutover.rs (willow-0g8j.3).
+// together by tests/integration/lir_stage5_cutover.rs.
 
 interface Box<T> {
     fn get(self) -> T;

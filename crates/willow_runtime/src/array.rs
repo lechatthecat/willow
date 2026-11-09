@@ -206,7 +206,7 @@ pub(crate) unsafe fn scalar_slot_unchecked(arr: *mut u8, index: i64) -> *mut i64
 /// GC-managed element types. Raises a language panic on a negative length.
 ///
 /// A handle and a buffer that fit a TLAB are bump-allocated young together, with no lock,
-/// root registration or old-region work (willow-jz15.94). Only a TLAB miss
+/// root registration or old-region work. Only a TLAB miss
 /// reaches a GC point, which may move this thread's root-slot referents like
 /// any generated allocation; generated code reloads its values after the call.
 #[unsafe(no_mangle)]
@@ -335,7 +335,7 @@ unsafe fn init_array(handle: *mut u8, buffer: *mut u8, len: i64, elem_is_ref: i6
 }
 
 /// Allocate an independent copy of `arr` (same length, element ref-ness, and
-/// element words). Backs `Array<T>::freeze()` -> `FrozenArray<T>` (willow-dgwo.7):
+/// element words). Backs `Array<T>::freeze()` -> `FrozenArray<T>`:
 /// the copy has no mutation API and shares no buffer with the original, so it is
 /// safe to treat as immutable. Shallow per the element word (ref elements share
 /// their — Sync — referents).
@@ -779,7 +779,7 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
 ///
 /// The buffer's traced prefix is not shrunk: it is a high-water mark of
 /// initialized slots. A `&mut` element reference keeps the buffer alive as its
-/// cell base and may store into the slot after the pop (willow-9tls.9); the
+/// cell base and may store into the slot after the pop; the
 /// store's barrier only remembers the buffer, so the slot must stay inside the
 /// traced prefix for its referent to be kept and relocated. Tracing costs
 /// O(high-water) <= capacity, and a value stored through such a reference is
@@ -860,7 +860,7 @@ fn raise_with(message: &str) {
     crate::panic_context::raise_language_message(message);
 }
 
-/// Element-kind tags for `willow_array_to_string` (willow-vwn6). Must match
+/// Element-kind tags for `willow_array_to_string`. Must match
 /// the compiler's `collection_elem_kind`.
 const ELEM_KIND_I64: i64 = 0;
 const ELEM_KIND_F64: i64 = 1;
@@ -881,7 +881,7 @@ pub(crate) fn element_word_to_string(word: i64, kind: i64) -> String {
 }
 
 /// Debug display of a whole array: `[1, 2, 3]` (strings quoted, f64 shortest
-/// round-trip). `elem_kind`: 0=i64, 1=f64, 2=bool, 3=String (willow-vwn6).
+/// round-trip). `elem_kind`: 0=i64, 1=f64, 2=bool, 3=String.
 /// Returns a newly allocated WillowString.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
@@ -1123,7 +1123,7 @@ mod tests {
 
     // Deterministic slot counts isolate tracing cost from allocation and GC timing.
     // The traced prefix is the buffer's high-water mark, bounded by capacity;
-    // popped slots stay traced but hold null (willow-9tls.9).
+    // popped slots stay traced but hold null.
     #[test]
     fn array_trace_work_is_bounded_by_high_water_after_pop_and_regrowth() {
         let _guard = runtime_test_guard();

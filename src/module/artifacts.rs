@@ -76,7 +76,7 @@ pub(crate) struct UnitArtifacts {
     /// one body identity, so the body cannot tell their syntax apart.
     initializers: HashMap<crate::parser::ast::ExprId, usize>,
     /// Field writes of each offloaded body or initializer, recorded while its
-    /// syntax is still resident (willow-jz15.78).
+    /// syntax is still resident.
     field_writes: HashMap<BodyId, HashSet<RawFieldWrite>>,
     sources: HashMap<FileId, usize>,
     pub(crate) bodies: Rc<crate::compiler_db::ids::BodyIndex>,

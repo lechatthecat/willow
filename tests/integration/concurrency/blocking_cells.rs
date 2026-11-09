@@ -1,6 +1,6 @@
 use super::*;
 
-// ── GC-managed blocking cells (willow-9tls.5) ───────────────────────────────
+// ── GC-managed blocking cells ───────────────────────────────
 // BlockingCell<T> / BlockingRwCell<T> are ordinary GC objects: a cell is
 // allocated on the GC heap, its protected word is traced through a runtime
 // hook, and an unreachable cell is swept with whatever only it held. The

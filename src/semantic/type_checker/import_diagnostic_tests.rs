@@ -28,7 +28,7 @@ fn diagnostics(source: &str) -> Vec<Diagnostic> {
 }
 
 #[test]
-fn ticket_42_collection_annotation_spans() {
+fn collection_annotation_spans() {
     for (annotation, code) in [
         ("Array<i64>", ErrorCode::E2001),
         ("Map<i64, i64>", ErrorCode::E2002),
@@ -47,7 +47,7 @@ fn ticket_42_collection_annotation_spans() {
 }
 
 #[test]
-fn ticket_42_unused_imports() {
+fn unused_imports() {
     for (source, unused) in [
         (
             "import helpers; fn main() { let text = helpers::read_to_string(\"x\"); }",
@@ -158,7 +158,7 @@ fn ticket_42_unused_imports() {
 }
 
 #[test]
-fn ticket_62_frozen_iteration_accepts_source_names() {
+fn frozen_iteration_accepts_source_names() {
     for name in ["samples", "pixels", "entries"] {
         let source = format!(
             "fn visit({name}: FrozenArray<i64>) {{ for pixel in {name} {{}} }} fn main() {{}}"
@@ -173,7 +173,7 @@ thread_local! {
 }
 
 #[test]
-fn ticket_42_import_probes_scale_linearly() {
+fn import_probes_scale_linearly() {
     let mut previous = None;
     for count in [8, 16, 32, 64] {
         let source = format!(
@@ -230,7 +230,7 @@ pub(super) fn enum_alias_sources() -> Vec<String> {
 }
 
 #[test]
-fn ticket_42_contextual_enum_and_pattern_imports() {
+fn contextual_enum_and_pattern_imports() {
     for source in enum_alias_sources() {
         let errors = diagnostics(&source);
         assert!(errors.is_empty(), "{source}: {errors:?}");
@@ -244,7 +244,7 @@ fn ticket_42_contextual_enum_and_pattern_imports() {
 }
 
 #[test]
-fn ticket_42_enum_alias_import_probes_scale_linearly() {
+fn enum_alias_import_probes_scale_linearly() {
     let mut previous = None;
     for count in [8, 16, 32, 64] {
         let functions: String = (0..count).map(|i| format!("fn f{i}(r: Result<i64, String>) -> Result<i64, String> {{ match r {{ res::Result::Ok(n) => println(n), res::Result::Err(e) => println(e) }} return res::Result::Ok(1); }}")).collect();
@@ -267,7 +267,7 @@ fn ticket_42_enum_alias_import_probes_scale_linearly() {
 }
 
 #[test]
-fn iflh_generic_body_imports() {
+fn import_usage_generic_body_imports() {
     // 3 template kinds × 4 source spellings × instantiated/uninstantiated = 24 cases.
     for (import, expression) in [
         ("import helpers;", "helpers::read_to_string(\"x\")"),
@@ -324,7 +324,7 @@ fn iflh_generic_body_imports() {
 }
 
 #[test]
-fn iflh_generic_import_probes_scale_linearly() {
+fn import_usage_generic_import_probes_scale_linearly() {
     for kind in ["function", "class", "interface"] {
         let mut previous = None;
         for count in [8, 16, 32, 64] {
@@ -357,7 +357,7 @@ fn iflh_generic_import_probes_scale_linearly() {
 }
 
 #[test]
-fn iflh_default_implicit_collection_imports() {
+fn import_usage_default_implicit_collection_imports() {
     for constructor in ["Array", "Map"] {
         let source = format!(
             "import std::collections; interface I<T> {{ fn f(self) {{ let x = {constructor}::new(); }} }} fn main() {{}}"

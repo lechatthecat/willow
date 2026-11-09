@@ -1,4 +1,4 @@
-//! E2604 for waits reached through function values (willow-h4t7); see
+//! E2604 for waits reached through function values; see
 //! [`crate::semantic::indirect_lock`] for the address-taken model.
 
 use std::collections::HashMap;

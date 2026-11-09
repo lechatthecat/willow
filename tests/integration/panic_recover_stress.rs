@@ -1,7 +1,7 @@
 use super::support::*;
 use std::time::Duration;
 
-// Panic/recover acceptance and stress suite — willow-s9ej.7 (Stage 6).
+// Panic/recover acceptance and stress suite — panic recovery (Stage 6).
 //
 // Stages 2-5 pin the *semantics* of lexical unwinding and recovery. This file
 // pins that those semantics survive the environments that break rooting,

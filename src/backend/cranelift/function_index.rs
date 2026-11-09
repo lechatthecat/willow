@@ -10,7 +10,7 @@ pub struct FunctionMap<'a, V> {
     generated: Option<&'a mut HashMap<FunctionId, V>>,
     /// This view's own answers for canonical functions, consulted first: a
     /// foreign default's scope reads the receivers' signatures under the
-    /// spelling that names the entry types there (willow-kptd).
+    /// spelling that names the entry types there.
     overlay: HashMap<FunctionId, V>,
 }
 

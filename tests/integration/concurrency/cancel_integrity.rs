@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Cancel runtime integrity (willow-vynv.1, defer Phase 1) ─────────────────
+// ── Cancel runtime integrity (cancellation integrity, defer Phase 1) ─────────────────
 // Integration half; unit half lives in the runtime crate (finalize wakes
 // parked awaiters + claims them, wake no-ops on Cancelled, stale timer entry
 // revalidated away, netpoll purge_task own/shared-fd, channel send drains all

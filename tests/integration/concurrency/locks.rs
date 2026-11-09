@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Mutex<T> / RwLock<T> (willow-dgwo.3) ─────────────────────────────────────
+// ── Mutex<T> / RwLock<T> ─────────────────────────────────────
 //
 // 20 test perspectives:
 //  1. Mutex<i64> get reads the initial value.
@@ -183,7 +183,7 @@ fn test_rwlock_has_no_get() {
     );
 }
 
-// Case A (willow-h2vf.5): an async fn already returns Task<ReturnType>, so its
+// Case A: an async fn already returns Task<ReturnType>, so its
 // declared return type must be the awaited value, not a task handle (E0809).
 #[test]
 fn test_async_return_task_handle_rejected_task() {
@@ -276,7 +276,7 @@ async fn main() {
 }
 
 // `await` resumes when the TARGET task completes, not when the whole scheduler
-// drains (willow-bsqy).
+// drains.
 #[test]
 fn test_await_returns_when_target_completes_not_draining_all() {
     // a completes immediately; b is unrelated and never awaited. With five
@@ -416,7 +416,7 @@ async fn main() {
 }
 
 #[test]
-fn test_async_9lw_two_concurrent_timers() {
+fn test_async_suspension_two_concurrent_timers() {
     // Two spawned async workers each loop awaiting sleep; the single-threaded
     // executor drives both concurrently to completion.
     let (stdout, ok) = compile_and_run(
@@ -442,7 +442,7 @@ async fn main() {
 }
 
 #[test]
-fn test_async_9lw_locals_live_across_await() {
+fn test_async_suspension_locals_live_across_await() {
     let (stdout, ok) = compile_and_run(
         r#"
 async fn main() {
@@ -462,7 +462,7 @@ async fn main() {
 }
 
 #[test]
-fn test_async_9lw_nested_await_passes_values() {
+fn test_async_suspension_nested_await_passes_values() {
     let (stdout, ok) = compile_and_run(
         r#"
 async fn inner(x: i64) -> i64 {
@@ -484,7 +484,7 @@ async fn main() {
 }
 
 #[test]
-fn test_async_9lw_panic_renders_async_chain() {
+fn test_async_suspension_panic_renders_async_chain() {
     // A panic inside a suspended async fn renders the async future chain
     // (current task first), not just the immediate location — the cooperative
     // scheduler flattens the OS call stack, so this comes from runtime state.
@@ -665,7 +665,7 @@ fn main() {
 
 #[test]
 fn test_select_block_is_supported() {
-    // `select` is implemented (willow-7aj): a ready recv case runs its body.
+    // `select` is implemented: a ready recv case runs its body.
     let (out, ok) = compile_and_run(
         r#"
 fn main() {

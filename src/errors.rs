@@ -68,7 +68,7 @@ pub enum CodegenStage {
     Initialize,
     Module(String),
     /// Interface defaults one module declares, emitted for a class another
-    /// unit declares (willow-rvpp).
+    /// unit declares.
     ForeignDefault {
         provider: String,
         receiver: String,

@@ -1,4 +1,4 @@
-// Reconstructed workload for willow-8hq4.41; not historical benchmark source.
+// Reconstructed workload for the scheduler/GC comparison; not historical benchmark source.
 async fn work(shared: AtomicI64, n: i64) {
     let mut i = 0;
     while i < n { let values = [i, i + 1, i + 2, i + 3]; shared.add(values[2]); if i % 100 == 0 { await yield(); } i = i + 1; }

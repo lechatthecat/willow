@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Function values, lambdas and indirect calls (willow-0g8j.2.2) ────────────
+// ── Function values, lambdas and indirect calls ────────────
 //
 // The eligibility boundary is pinned by the `f*` unit tests in
 // `src/backend/cranelift/lir_gen.rs`. These pin the OUTPUT. What makes the

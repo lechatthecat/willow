@@ -1,4 +1,4 @@
-// Relocatable root slots (willow-9tls.9).
+// Relocatable root slots.
 //
 // Generated code keeps every managed local in a registered root slot and
 // reloads it at each use. A minor collection may therefore COPY a young

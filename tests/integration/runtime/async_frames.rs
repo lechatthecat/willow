@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Async frame: frame-backed GC params survive across await (willow-lpn.5a) ──
+// ── Async frame: frame-backed GC params survive across await (async frame roots) ──
 
 #[test]
 fn async_frame_01_string_param_across_await() {
@@ -134,7 +134,7 @@ async fn main() {
     assert_eq!(out, "kept across await\n");
 }
 
-// ── lpn.5c slice 1: unannotated locals frame-backed via type-checker types ──
+// ── Async local slots: unannotated locals frame-backed via type-checker types ──
 
 #[test]
 fn async_frame_08_unannotated_local_across_await() {
@@ -194,7 +194,7 @@ async fn main() {
     assert_eq!(out, "inferred kept\n");
 }
 
-// ── Frame-backed values across await: GC tracing by type (lpn.5c perspectives) ──
+// ── Frame-backed values across await: GC tracing by type (typed frame roots) ──
 // Each value lives ONLY in the GC-rooted heap frame across the await, so these
 // verify the frame's per-type GC tracing under collection at every allocation.
 

@@ -1,6 +1,6 @@
 use crate::support::*;
 
-// ── Runtime production observability (willow-2vq) ──────────────────────────
+// ── Runtime production observability ──────────────────────────
 
 #[test]
 fn observability_01_scheduler_trace_reports_lifecycle_and_timer_events() {

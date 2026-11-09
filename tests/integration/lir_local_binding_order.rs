@@ -1,4 +1,4 @@
-//! Local storage is bound before any block that names it (willow-34su).
+//! Local storage is bound before any block that names it.
 //!
 //! A LIR block index is not a position in any order control can flow in, and
 //! an async body is emitted in index order. `lock` lowering is where the two
@@ -411,7 +411,7 @@ async fn main() {
 }
 
 /// Perspective 14: a `match` arm inside the body writes the outer local. Its
-/// own arm bindings are merge locals — the case willow-ht1h bound — and the
+/// own arm bindings are merge locals — the case match-local binding bound — and the
 /// outer local is a `let` whose block comes later, so both kinds meet here.
 #[test]
 fn lbo_14_a_match_arm_inside_the_section_sets_it() {

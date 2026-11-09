@@ -1,4 +1,4 @@
-// Many tasks parked on ONE channel (willow-ezs.1.2).
+// Many tasks parked on ONE channel.
 //
 // A fan-out worker pool is the shape that stresses a channel's waiter queue:
 // every idle consumer parks on the same channel, so the channel holds as many

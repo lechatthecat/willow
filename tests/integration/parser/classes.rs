@@ -252,7 +252,7 @@ fn main() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Module class inheritance across the module boundary (willow-2egr). A class
+// Module class inheritance across the module boundary. A class
 // `extends Base` declared in an imported module must: inherit base methods,
 // inherit the base's `implements` (incl. transitively, with a real vtable so
 // interface dispatch does not segfault), and resolve its qualified base chain.
@@ -281,7 +281,7 @@ fn main() {
 //   P20 a missing method on an imported subclass still reports E0502
 // ───────────────────────────────────────────────────────────────────────────
 
-const ZOO_MODULE_2EGR: &str = r#"
+const INHERITANCE_ZOO_MODULE: &str = r#"
 pub interface Speaker {
     fn speak(self) -> i64;
     fn intro(self) -> i64 { return self.speak() + 1; }
@@ -306,7 +306,7 @@ pub class Cat extends Animal {
 "#;
 
 #[test]
-fn test_2egr_module_subclass_inherited_concrete_methods() {
+fn test_module_inheritance_module_subclass_inherited_concrete_methods() {
     // P1 override, P2 transitive-base method, P3 intermediate-base method,
     // P4 un-overridden falls through, P5 direct-subclass inherited method.
     let main = r#"
@@ -323,8 +323,10 @@ fn main() {
     println(c.base_only());  // P5: inherited -> 4
 }
 "#;
-    let (out, ok) =
-        compile_temp_project_and_run(&[("zoo.wi", ZOO_MODULE_2EGR), ("main.wi", main)], "main.wi");
+    let (out, ok) = compile_temp_project_and_run(
+        &[("zoo.wi", INHERITANCE_ZOO_MODULE), ("main.wi", main)],
+        "main.wi",
+    );
     assert!(
         ok,
         "module subclass inherited methods failed to compile/run"
@@ -333,7 +335,7 @@ fn main() {
 }
 
 #[test]
-fn test_2egr_module_subclass_inherits_implements_via_interface() {
+fn test_module_inheritance_module_subclass_inherits_implements_via_interface() {
     // P6/P7 inherited `implements` + iface dispatch (the segfault case),
     // P8/P9 default interface method reached through inherited `implements`.
     let main = r#"
@@ -353,8 +355,10 @@ fn main() {
     println(via_default(c));  // P9: default `intro` -> 4
 }
 "#;
-    let (out, ok) =
-        compile_temp_project_and_run(&[("zoo.wi", ZOO_MODULE_2EGR), ("main.wi", main)], "main.wi");
+    let (out, ok) = compile_temp_project_and_run(
+        &[("zoo.wi", INHERITANCE_ZOO_MODULE), ("main.wi", main)],
+        "main.wi",
+    );
     assert!(
         ok,
         "inherited cross-module `implements` failed to compile/run"
@@ -363,7 +367,7 @@ fn main() {
 }
 
 #[test]
-fn test_2egr_upcast_and_entry_subclass_of_module_base() {
+fn test_module_inheritance_upcast_and_entry_subclass_of_module_base() {
     // P10 upcast, P11 pass-as-base, P12 dispatch through base binding,
     // P13 entry subclass + override, P14 entry subclass inherits base method,
     // P15 entry subclass usable as the imported base type.
@@ -388,8 +392,10 @@ fn main() {
     println(describe(e));     // P15: entry subclass as imported base -> 502
 }
 "#;
-    let (out, ok) =
-        compile_temp_project_and_run(&[("zoo.wi", ZOO_MODULE_2EGR), ("main.wi", main)], "main.wi");
+    let (out, ok) = compile_temp_project_and_run(
+        &[("zoo.wi", INHERITANCE_ZOO_MODULE), ("main.wi", main)],
+        "main.wi",
+    );
     assert!(
         ok,
         "upcast / entry-subclass-of-module-base failed to compile/run"
@@ -398,7 +404,7 @@ fn main() {
 }
 
 #[test]
-fn test_2egr_cross_module_super_init_and_fields() {
+fn test_module_inheritance_cross_module_super_init_and_fields() {
     // P16 inherited method after cross-module super.init, P17 own method calls
     // inherited method + own field, P18 inherited field, P19 own field.
     let base = r#"
@@ -438,7 +444,7 @@ fn main() {
 }
 
 #[test]
-fn test_2egr_missing_method_on_module_subclass_reports_e0502() {
+fn test_module_inheritance_missing_method_on_module_subclass_reports_e0502() {
     // P20: resolution must not become so permissive that a genuinely missing
     // method slips through — it still reports E0502.
     let main = r#"
@@ -449,7 +455,7 @@ fn main() {
 }
 "#;
     let stderr = compile_temp_project_error_stderr(
-        &[("zoo.wi", ZOO_MODULE_2EGR), ("main.wi", main)],
+        &[("zoo.wi", INHERITANCE_ZOO_MODULE), ("main.wi", main)],
         "main.wi",
     );
     assert!(

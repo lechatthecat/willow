@@ -1,5 +1,5 @@
-// Inheritance, virtual dispatch and class downcast on the LIR-walking backend
-// (willow-0g8j.2.4).
+// Inheritance, virtual dispatch and class downcast on the LIR-walking backend.
+//
 //
 // Every class that took part in inheritance used to be outside the walker's
 // subset, which took its instances, its base-typed slots, its arrays and its
@@ -26,7 +26,7 @@
 //     descendant of" — and binds the object unboxed. `Tile` therefore falls to
 //     the `_` arm even though a `Tile` is a `Square`.
 //
-// Since willow-0g8j.3 a body outside the walker's subset is a compile error, so
+// Since the lowered-IR cutover a body outside the walker's subset is a compile error, so
 // this file compiling at all is the proof that every free function below really
 // took the walker path.
 

@@ -1,4 +1,4 @@
-// Async defer + cancellation cleanup (willow-vynv.3): in an async fn, defer
+// Async defer + cancellation cleanup: in an async fn, defer
 // registers into the task frame (flag + stashed operands). Normal exits run
 // defers LIFO and clear the flags; t.cancel() runs a compiler-generated
 // cleanup entry that executes only the STILL-PENDING defers — so a resource

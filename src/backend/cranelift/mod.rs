@@ -104,7 +104,7 @@ use type_helpers::*;
 
 const USER_MAIN_SYMBOL: &str = "willow_user_main";
 /// Generated function that initializes all `static` properties before `main`
-/// (willow-qsqf §13.5).
+/// (static member support §13.5).
 const STATIC_INIT_SYMBOL: &str = "__willow_static_init";
 const GC_REF_MASK_BITS: usize = 64;
 #[cfg(test)]
@@ -224,8 +224,8 @@ pub struct UnitCodegenContext<'a> {
     builtin_module_aliases: HashMap<String, String>,
     lambda_names: HashMap<ExprId, FunctionId>,
     /// The lambda expressions among `lambda_names` whose lifted body is a
-    /// safepoint-free leaf, so it can neither raise nor reach a GC point
-    /// (willow-8hq4.28). Their closures tag the code word.
+    /// safepoint-free leaf, so it can neither raise nor reach a GC point. Their closures tag
+    /// the code word.
     leaf_lambdas: HashSet<ExprId>,
     indirect_leaves: indirect_leaf::Candidates,
     effect_queries: Option<(
@@ -239,7 +239,7 @@ pub struct UnitCodegenContext<'a> {
 }
 
 /// Whether `symbol` belongs to the runtime or to the compiler rather than to
-/// user code (willow-uqzx, catalog item 8).
+/// user code (shared compiler infrastructure, catalog item 8).
 ///
 /// The runtime library owns `willow_*` and the compiler owns `__willow_*` for
 /// its own generated data. A user definition landing on one of those names is
@@ -381,7 +381,7 @@ impl Codegen {
         let isa = isa_builder.finish(flags)?;
         // Reference lowering follows the target pointer width, but shared payload
         // storage and runtime layouts still assume 64 bits. Keep this
-        // guard until willow-d9lm's runtime/layout migrations and native-target
+        // guard until reference-width support's runtime/layout migrations and native-target
         // execution gate are complete; the lowering seam alone is insufficient.
         if isa.pointer_bits() != 64 {
             anyhow::bail!(
@@ -526,7 +526,7 @@ impl UnitCodegenContext<'_> {
     }
 
     /// Record `symbol` as belonging to `item`, or fail if it is already spoken
-    /// for (willow-uqzx, catalog item 8).
+    /// for (shared compiler infrastructure, catalog item 8).
     ///
     /// Two ways a user declaration can lose this race. It can land in the
     /// runtime's namespace, in which case the generated object defines a symbol
@@ -766,7 +766,7 @@ impl UnitCodegenContext<'_> {
     /// Walking the unit for lambda identities is O(AST); the declaration phase,
     /// the panic-effect analysis and the emission plan all need the same list in
     /// the same order, so it is walked once here and carried on the declared
-    /// unit (willow-afb5.18). Empty on the standalone path, which has no body
+    /// unit. Empty on the standalone path, which has no body
     /// index.
     fn unit_lambda_bodies(
         &self,
@@ -830,7 +830,7 @@ impl UnitCodegenContext<'_> {
     /// alone makes `Describable` and `proto::Describable` two types and every
     /// cross-unit call falls out of the walker's subset. An enum is different:
     /// the checker itself normalizes enum types to the identity, so the
-    /// signature has to as well (willow-0g8j.3).
+    /// signature has to as well.
     pub(super) fn canonical_enum_type<N: type_index::TypeLookup>(
         &self,
         ty: &crate::parser::ast::Type<N>,
@@ -856,9 +856,9 @@ impl UnitCodegenContext<'_> {
     /// rebuilt by every LATER unit's declaration phase, and are compared
     /// against HIR types the checker already normalized, so recording the
     /// written spelling leaves the two halves unable to agree that `Grade` and
-    /// `signal::Level` are one type (willow-0g8j.3) — or, worse, silently
-    /// rewrites an inherited layout to nothing once the alias is gone
-    /// (willow-kd1v). A name that is already an identity passes through.
+    /// `signal::Level` are one type — or, worse, silently
+    /// rewrites an inherited layout to nothing once the alias is gone. A name that is already
+    /// an identity passes through.
     pub(super) fn canonical_declared_type<N: type_index::TypeLookup>(
         &self,
         ty: &crate::parser::ast::Type<N>,
@@ -868,7 +868,7 @@ impl UnitCodegenContext<'_> {
 
     fn canonical_declared_id(&self, id: &TypeId) -> TypeId {
         // Already scope-independent; resolving it would hand back the bare
-        // entry name a later unit's own type can shadow (willow-nvi6).
+        // entry name a later unit's own type can shadow.
         if id.foreign_receiver_target().is_some() {
             return *id;
         }
@@ -892,7 +892,7 @@ impl UnitCodegenContext<'_> {
     /// `func_ids` is global and keyed by the local name, so the binding that
     /// stands is whichever unit bound it last: two files that both say
     /// `import <module>::add;` for different modules share the name `add`, and
-    /// the unit whose bodies are being lowered has to hold it (willow-28h8).
+    /// the unit whose bodies are being lowered has to hold it.
     ///
     /// Only the function half is rebound. A direct TYPE import aliases whole
     /// compiled tables — layouts, vtables, interface info — that the classes
@@ -913,7 +913,7 @@ impl UnitCodegenContext<'_> {
         if self.bind_item_import_function(local, module, item) {
             return;
         }
-        // Direct TYPE import (willow-64gs): alias the compiled tables of the
+        // Direct TYPE import: alias the compiled tables of the
         // module-qualified type (`module::Item`) under the unqualified `local`
         // name, so the entry's use of `local` resolves to the module's symbols.
         let qualified = QualifiedName::join(module, item);
@@ -939,8 +939,8 @@ impl UnitCodegenContext<'_> {
     /// `{receiver class}.{method}` by both the walker
     /// (`class_method_symbol_name`) and the emitter, so an item-imported class
     /// needs one alias per method or every call on it is unresolvable —
-    /// which, for a module body, is a hard `E0800` rather than a fallback
-    /// (willow-kxy8).
+    /// which, for a module body, is a hard `E0800` rather than a fallback.
+    ///
     fn item_import_method_aliases(
         &self,
         local: &str,
@@ -1047,11 +1047,11 @@ impl UnitCodegenContext<'_> {
     /// While compiling a module body, bind the types this unit IMPORTED by
     /// single-item import under the local names it spells them by
     /// (`import proto::Describable;` -> `Describable`), for the length of this
-    /// unit's bodies (willow-0g8j.3).
+    /// unit's bodies.
     ///
     /// The declaration phase deliberately does not do this — aliasing whole
     /// compiled tables per module changes what the classes declared after it
-    /// are compiled against (willow-28h8) — and only the function half is
+    /// are compiled against — and only the function half is
     /// rebound before the bodies. The type half is needed here all the same:
     /// the interface table is one flat build-wide namespace keyed by the
     /// CANONICAL name, so a module body that names an imported interface found
@@ -1081,7 +1081,7 @@ impl UnitCodegenContext<'_> {
             // declared. The entry file gets these from
             // `register_item_import`; a module unit gets them here, under the
             // snapshot, so the next unit's bodies do not inherit this one's
-            // spelling (willow-kxy8).
+            // spelling.
             for (alias, full) in
                 self.item_import_method_aliases(&item.local, &item.module, &item.item)
             {
@@ -1091,10 +1091,10 @@ impl UnitCodegenContext<'_> {
     }
 
     /// Bind module-local interfaces under their unqualified names for body
-    /// compilation (willow-64gs.1). Enum aliases are installed from the unit's
+    /// compilation. Enum aliases are installed from the unit's
     /// checker by `bind_unit_enum_aliases`: their identity uses the canonical
     /// path, which can differ from `mod_name`. Rebinding them here would
-    /// overwrite that identity and lose variant metadata (willow-wvlw).
+    /// overwrite that identity and lose variant metadata.
     fn alias_module_local_types(&mut self, program: &Program, mod_name: &str) {
         for item in &program.items {
             let Item::Interface(interface) = item else {
@@ -1122,7 +1122,7 @@ impl UnitCodegenContext<'_> {
             .filter(|f| !f.is_static)
             // Under the identity the tables answer to, not this unit's
             // spelling of it: the layout is build-wide and every later unit
-            // reads it with its own aliases installed (willow-kd1v).
+            // reads it with its own aliases installed.
             .map(|f| (f.name.clone(), self.canonical_declared_type(&f.ty)))
             .collect();
         let class_id = TypeId::from_source_name(&c.name);
@@ -1131,9 +1131,9 @@ impl UnitCodegenContext<'_> {
                 // `TypePath::name()` deliberately returns only the final segment,
                 // which is right for diagnostics but not for backend identity. A
                 // qualified base must keep its module/alias prefix so it matches
-                // the key `declare_module` registered (`lib::Parcel`) (willow-b929).
+                // the key `declare_module` registered (`lib::Parcel`).
                 // Resolved NOW, while this unit's own spellings are installed: the
-                // frozen edge is read again by every later unit (willow-kd1v).
+                // frozen edge is read again by every later unit.
                 let name = path.spelling();
                 self.type_scope.resolve(&TypeId::from_source_name(&name))
             })
@@ -1141,7 +1141,7 @@ impl UnitCodegenContext<'_> {
         // Only `open` and `override` instance methods get a virtual slot. A
         // plain method can neither be overridden nor override anything, so its
         // callee is fixed at compile time; static methods and constructors have
-        // no receiver to dispatch on at all (willow-fm7t).
+        // no receiver to dispatch on at all.
         let methods = c
             .methods
             .iter()
@@ -1151,7 +1151,7 @@ impl UnitCodegenContext<'_> {
         self.layout_queries
             .register_class(class_id, base, own, methods);
         // The runtime type_id lives at offset 0 of the class DESCRIPTOR, which
-        // word 0 of every object of the class points at (willow-fm7t).
+        // word 0 of every object of the class points at.
         self.layout_queries.register_runtime_type(class_id)?;
         Ok(())
     }
@@ -1225,7 +1225,7 @@ pub(super) struct DeferEntry {
     vars_at_registration: std::rc::Rc<HashMap<String, VarStorage>>,
     /// The deferred body contains a direct call to the compiler-known
     /// `recover()` builtin. Calls hidden behind another function/lambda do not
-    /// grant recovery capability (willow-s9ej.3).
+    /// grant recovery capability.
     recovery_capable: bool,
 }
 
@@ -1311,7 +1311,7 @@ pub(super) struct PanicScope {
     parent_cleanup: Option<cranelift_codegen::ir::Block>,
 }
 
-/// A `lock` critical section currently being emitted (willow-38w.1.4). The
+/// A `lock` critical section currently being emitted. The
 /// lock is held for exactly the CFG paths that leave the section, so release is
 /// driven from the same unwinding the `defer` machinery already performs.
 #[derive(Clone)]
@@ -1350,7 +1350,7 @@ pub(super) struct CoopLockScope {
     defer_depth: usize,
 }
 
-/// A `lock` site an async fn's cancel entry has to clean up (willow-38w.1.4):
+/// A `lock` site an async fn's cancel entry has to clean up:
 /// enough to drop a pending wait, commit a value the cancelled task had
 /// already loaded, and release a lock it still owns.
 ///
@@ -1656,7 +1656,7 @@ struct FlatReferenceDebug {
 /// Size of the reference cell a `&`/`&mut` argument points to: a managed base
 /// word (null for native stack storage) followed by a byte offset. Passing the
 /// owner and offset instead of an interior pointer lets a moving collection
-/// relocate the owner without pinning it (willow-9tls.9,
+/// relocate the owner without pinning it (relocatable roots,
 /// docs/decisions/0011-reference-cell-abi.md).
 const REFERENCE_CELL_BYTES: u32 = 16;
 
@@ -1681,7 +1681,7 @@ enum VarStorage {
         offset: i32,
         ty: Type,
     },
-    /// A slot inside the heap async frame (willow-lpn.5a). `offset` is the byte
+    /// A slot inside the heap async frame (async frame roots). `offset` is the byte
     /// offset of the slot from the frame base; the frame base lives in
     /// `FuncGen.suspension.async_frame`. Used for values that must survive `await`.
     Frame {
@@ -1717,7 +1717,7 @@ const FRAME_SLOT_RESULT: usize = 0;
 const FRAME_SLOT_TASK_ID: usize = 1;
 
 /// Frame-header status word bits — must match the `WILLOW_FRAME_STATUS_*`
-/// constants in `crates/willow_runtime/src/async_frame.rs` (willow-ezs.1.3).
+/// constants in `crates/willow_runtime/src/async_frame.rs`.
 /// Bits 0..2 are the terminal code (0 pending, 1 completed, 2 cancelled,
 /// 3 panicked); higher bits carry sticky flags such as cancel-requested.
 const WILLOW_FRAME_STATUS_TERMINAL_MASK: i64 = willow_abi::frame_status::TERMINAL_MASK;
@@ -1857,7 +1857,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// Bind a by-value parameter as a plain SSA variable. GC-managed values
     /// bound this way are NOT rooted; only a body that can never reach a
-    /// safepoint may bind them so (willow-8hq4.14).
+    /// safepoint may bind them so.
     fn bind_unrooted_param(&mut self, name: &str, ty: &Type, val: cranelift_codegen::ir::Value) {
         let var = self.builder.declare_var(self.clif_type(ty));
         self.builder.def_var(var, val);
@@ -1915,7 +1915,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    /// Bind a parameter directly into an async frame slot (willow-lpn.5a): store
+    /// Bind a parameter directly into an async frame slot (async frame roots): store
     /// the incoming value at `offset` and record `Frame` storage so all later
     /// reads/writes go through the heap frame, which survives `await`.
     fn bind_param_framed(
@@ -2073,7 +2073,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // payload coercion happens inside explicit `Some(...)` construction.
         // The interface name comes from either a plain interface (`Animal`) or a
         // generic interface instantiation (`Box<String>`); type args do not
-        // change the vtable, so boxing is identical (willow-1js.1).
+        // change the vtable, so boxing is identical.
         let iface_name = match target_ty {
             Type::Named(n) | Type::Generic(n, _) => n,
             _ => return value,
@@ -2110,7 +2110,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Whether [`Self::coerce_to_target`] pairs a class object with a vtable.
-    /// Interface values are inline object/vtable pairs (willow-9tls.12), so
+    /// Interface values are inline object/vtable pairs, so
     /// this builds no heap box: no coercion reaches a GC safepoint, and
     /// callers may keep using relocatably rooted operands across one.
     fn coercion_boxes(&self, value_ty: &Type, target_ty: &Type) -> bool {
@@ -2218,11 +2218,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Load a `ClassName::property` static value from its global storage
-    /// (willow-qsqf §13.4). The slot holds 8 bytes; the clif type comes from the
+    /// (static member support §13.4). The slot holds 8 bytes; the clif type comes from the
     /// property's declared type.
     /// Find a static property's storage, walking the class hierarchy so an
     /// inherited static (`Child::prop` declared on `Base`) resolves to the
-    /// declaring class (willow-qsqf §16.2). Static members are non-virtual.
+    /// declaring class (static member support §16.2). Static members are non-virtual.
     fn lookup_static_storage(&self, class: &str, field: &str) -> Option<StaticStorageInfo> {
         lookup_static_storage_in(self.static_storage, &self.classes, class, field)
     }
@@ -2429,7 +2429,7 @@ impl AsyncFrameLayout {
     /// are traced; `i64`/`f64`/`bool`/`void`, fieldless enums (immediate tags),
     /// and `T?` of a primitive are not. Channel/Future are opaque runtime
     /// pointers without a `GcHeader`, so they are NOT marked traceable here
-    /// either (tracing them would crash the collector, see willow-lpn.9);
+    /// either (tracing them would crash the collector, see managed-reference classification);
     /// JoinHandle is represented as a GC async-frame pointer and is traceable.
     pub fn try_new(slots: Vec<AsyncFrameSlot>, enum_infos: &TypeMap<EnumInfo>) -> Result<Self> {
         let mut gc_payload_bitmap =
@@ -2489,7 +2489,7 @@ impl AsyncFrameLayout {
 fn array_element_type(ty: &Type) -> Type {
     match ty {
         Type::Array(elem) => (**elem).clone(),
-        // FrozenArray<T> indexing yields T (willow-dgwo.7).
+        // FrozenArray<T> indexing yields T.
         Type::Generic(_, _) if builtin_types::unary_arg(ty, B::FrozenArray).is_some() => {
             builtin_types::unary_arg(ty, B::FrozenArray)
                 .unwrap()
@@ -2508,7 +2508,7 @@ fn array_element_type(ty: &Type) -> Type {
 
 /// The error payload type `E` if `f` returns `Result<void, E>`, else `None`.
 /// Such a function (when it is `main`) lowers to a void `willow_user_main` that
-/// inspects the result and exits accordingly (willow-exg).
+/// inspects the result and exits accordingly.
 fn main_result_err_type(f: &FunctionDecl) -> Option<Type> {
     builtin_types::binary_args(&f.return_type, B::Result)
         .filter(|(ok, _)| **ok == (Type::Void).to_source())
@@ -2615,7 +2615,7 @@ mod symbol_namespace_tests {
     }
 
     /// Perspective 51: a mangled symbol is never reserved, even when its first
-    /// component reads like a runtime name (willow-uqzx, catalog item 8 phase
+    /// component reads like a runtime name (shared compiler infrastructure, catalog item 8 phase
     /// 2). A runtime symbol is always a bare C identifier, so a joined symbol
     /// cannot be one — and before the scheme became injective, a class named
     /// `willow_box` was rejected for a collision that could not happen.
@@ -3218,7 +3218,7 @@ mod tests {
         assert_eq!(layout.bitmap, [0, 2]);
     }
 
-    // ── Async frame GC metadata (willow-lpn.4) ──────────────────────────────
+    // ── Async frame GC metadata ──────────────────────────────
     //
     // Each test is one perspective on the GC reference mask the compiler must
     // hand to willow_async_frame_alloc: which frame slots are heap references.
@@ -3385,7 +3385,7 @@ mod tests {
     }
 
     // 13. Future is an opaque runtime pointer (no GcHeader) and is NOT traced
-    //     from a frame slot; Channel became a GC OBJECT (willow-p4er) and
+    //     from a frame slot; Channel became a GC OBJECT and
     //     Task/JoinHandle are GC async frames — all three ARE traced.
     #[test]
     fn async_frame_13_runtime_pointer_generics_and_joinhandle() {

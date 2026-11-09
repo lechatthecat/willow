@@ -43,7 +43,7 @@ fn main() {
     assert_eq!(out, "30\n");
 }
 
-// ── Radix prefixes and digit separators (willow-jz15.55) ────────────────────
+// ── Radix prefixes and digit separators ────────────────────
 
 // End-to-end: prefixed and separated literals reach every literal position —
 // expressions, `const` initializers, (negated) match patterns, compound
@@ -129,7 +129,7 @@ fn lexer_diag_hex_sign_bit_e0052() {
     );
 }
 
-// ── Float exponents (willow-jz15.121) ────────────────────────────────────────
+// ── Float exponents ────────────────────────────────────────
 
 // End-to-end: exponent literals reach `let`, `const`, call arguments and
 // arithmetic, are `f64`, and equal the runtime `f64::parse` of their text.

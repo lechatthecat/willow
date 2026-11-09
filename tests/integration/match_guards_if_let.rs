@@ -1,4 +1,4 @@
-//! `if let`, `while let` and match guards (willow-jz15.6).
+//! `if let`, `while let` and match guards.
 //!
 //! `if let P = e { A } else { B }` is parsed as `match e { P => { A }, _ => { B } }`
 //! and `while let P = e { A }` as `while true { match e { P => { A }, _ => {

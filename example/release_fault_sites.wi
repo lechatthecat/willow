@@ -1,5 +1,5 @@
 // Synchronous hot loops publish no diagnostic site in release builds, while
-// async code keeps its own site for task diagnostics (willow-9686). Run with
+// async code keeps its own site for task diagnostics. Run with
 // `willow run example/release_fault_sites.wi --release` to exercise the
 // release code path; the output is identical in debug builds.
 import std::collections::Array;

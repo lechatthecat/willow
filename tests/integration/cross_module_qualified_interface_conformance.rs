@@ -1,6 +1,6 @@
 //! A class implementing (or overriding a method of) an imported declaration
 //! may write the imported interface by its access path in the signatures it
-//! provides (willow-k6n9).
+//! provides.
 //!
 //! The provider resolves its own signatures (`fn peer(self) -> Get`) to the
 //! interface's identity, while the implementing class writes `util::Get`, an

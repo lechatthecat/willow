@@ -7,16 +7,16 @@ use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 pub(super) struct BodyState {
     /// Nesting depth of enclosing loops; `break`/`continue` outside a loop is
     /// E0904. Reset to 0 inside a lambda body (a loop outside the lambda is
-    /// not breakable from within it) (willow-kzka).
+    /// not breakable from within it).
     pub(crate) loop_depth: u32,
     /// Nesting depth of enclosing `lock` statements. The depth keeps the
-    /// await scan from reporting the same `await` once per enclosing lock
-    /// (willow-38w.1.1). Reset inside a lambda body, which only gets
-    /// CONSTRUCTED in the section and holds nothing when it runs (willow-3kty).
+    /// await scan from reporting the same `await` once per enclosing lock. Reset inside a lambda body, which only gets
+    /// CONSTRUCTED in the section and holds nothing when it runs.
+    ///
     pub(crate) lock_depth: u32,
     /// Lexical statement-block depth within the current function-like body.
     /// The outer function/method body is depth 1. Reset for lambdas so recovery
-    /// capability cannot cross a function boundary (willow-s9ej.3).
+    /// capability cannot cross a function boundary.
     pub(crate) lexical_block_depth: u32,
     /// Types carried by the current callable's async locals and suspension
     /// temporaries. Each occurrence has its own slot, independent of source
@@ -31,15 +31,15 @@ pub(super) struct BodyState {
     /// being normalized or validated (`T` inside `enum Wrap<T>` or `interface Conv<T>`).
     /// A bare `T` there names a parameter, not a missing type, so
     /// [`Self::validate_type`] accepts it; every other position sees an empty
-    /// list and reports the name as unknown (willow-rlq9).
+    /// list and reports the name as unknown.
     pub(super) declared_type_params: Vec<String>,
     /// Unannotated map constructors and uses awaiting their first insertion.
     pub(super) inferred_maps: HashMap<Span, (Vec<ExprId>, Option<usize>)>,
     /// Every use recorded in `inferred_maps`, for the lambda boundary: a use
-    /// typed before its map is resolved holds a placeholder (willow-afb5.17).
+    /// typed before its map is resolved holds a placeholder.
     pub(super) pending_map_uses: HashSet<ExprId>,
-    /// Assignment statements already reported as writes to a capture
-    /// (willow-0g8j.2.12). The lambda body is checked again afterwards, where
+    /// Assignment statements already reported as writes to a capture. The lambda body is
+    /// checked again afterwards, where
     /// the target still resolves to the enclosing function's immutable local;
     /// without this the same statement would also be reported as an ordinary
     /// mutability error, which points the reader at the wrong fix.
@@ -48,7 +48,7 @@ pub(super) struct BodyState {
     pub(super) current_capture_declarations: HashSet<Span>,
     /// The type a `match` in value position flows into, set for the duration of
     /// that one `match` by [`TypeChecker::check_expr_expecting`] and taken by
-    /// [`TypeChecker::check_match_expr`] (willow-0g8j.3).
+    /// [`TypeChecker::check_match_expr`].
     pub(super) match_expected: Option<Type>,
     pub(super) current_return_type: Type,
     /// Stack of lambda return types being inferred. When non-empty, `return` stmts
@@ -58,23 +58,23 @@ pub(super) struct BodyState {
     /// still supply omitted Option/Result parameters of its returns.
     pub(super) lambda_holes_deferred: bool,
     pub(super) current_class: Option<String>,
-    /// While an interface default body is checked once for every receiver
-    /// (willow-dnia): the interface type its opaque `Self` converts to.
+    /// While an interface default body is checked once for every receiver: the interface type
+    /// its opaque `Self` converts to.
     pub(super) self_interface: Option<Type>,
     /// Whether the body being checked is an `async fn` (or async method), i.e.
     /// whether it has a task frame to suspend into. Cleared inside a lambda
     /// body: a lambda has no `async` form and the backend lifts it into a plain
     /// private function, so `lock` and `await` written there are E2603/E0801
-    /// however the enclosing function was declared (willow-3kty).
+    /// however the enclosing function was declared.
     pub(super) current_async_context: bool,
     /// Set while checking a `static fn` body — `self` is unavailable there
-    /// (willow-qsqf §9.2 → E0831).
+    /// (static member support §9.2 → E0831).
     pub(super) in_static_method: bool,
     /// Set while checking a `static` property initializer — `self` is unavailable
-    /// there (willow-qsqf §10.3 → E0837).
+    /// there (static member support §10.3 → E0837).
     pub(super) in_static_initializer: bool,
     /// Set while checking an `init(...)` constructor body — `return <value>` is
-    /// rejected (willow-scq2 §8 → E0841).
+    /// rejected (constructor support §8 → E0841).
     pub(super) in_constructor: bool,
     /// The function-like body currently being checked. A lambda is its own
     /// callable: body queries provide its contextual identity; standalone
@@ -116,7 +116,7 @@ impl Default for BodyState {
     }
 }
 
-/// Where one lambda's own outputs join its parent's (willow-afb5.17): the
+/// Where one lambda's own outputs join its parent's: the
 /// parent's own diagnostic and task-site counts when the lambda was checked.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct LambdaSplice {
@@ -167,7 +167,7 @@ pub(super) struct BodyOutputs {
 
 /// Body-local query output. Declaration metadata is shared by the evaluator,
 /// never copied into each body artifact. A lambda's outputs are its own
-/// artifact; the parent keeps only the splice points (willow-afb5.17).
+/// artifact; the parent keeps only the splice points.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct TypedBody {
     id: BodyId,
@@ -563,7 +563,7 @@ impl TypeChecker {
         self.errors.len() + self.lambdas.nested_errors
     }
 
-    /// Check a lambda body as its own `typed_body` query (willow-afb5.17).
+    /// Check a lambda body as its own `typed_body` query.
     ///
     /// The lambda is typed where it is written, against the enclosing body's
     /// visible locals and inference state, but everything it outputs goes to
@@ -774,7 +774,7 @@ mod tests {
     /// Instantiate and expand generic templates the way the driver does
     /// before body queries run: templates are checked by a checker without
     /// queries, and only the expanded, template-free program reaches the
-    /// cached body checker (willow-r6v4).
+    /// cached body checker.
     /// Arrays instantiate the bundled source template, so every program
     /// expands even without templates of its own.
     fn expand_generics(program: &mut Program) {
@@ -1093,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn ticket_42_import_declarations_do_not_count_as_usage_with_capture() {
+    fn import_declarations_do_not_count_as_usage_with_capture() {
         let dependency = parse("pub class Point { pub x: i64; } pub enum Status { Ready }");
         for (item, body, expected) in [
             ("Point", "", vec!["helpers", "Point"]),
@@ -1169,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn ticket_42_enum_alias_usage_survives_body_replay() {
+    fn enum_alias_usage_survives_body_replay() {
         for source in super::super::import_diagnostic_tests::enum_alias_sources() {
             let mut program = parse(&source);
             let queries = queries(&mut program);
@@ -1208,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn ticket_42_typed_body_retains_import_usage() {
+    fn typed_body_retains_import_usage() {
         for source in [
             "import std::fs; fn main() { let result = fs::read_to_string(\"x\"); }",
             "import std::fs; fn main() { let run = || fs::read_to_string(\"x\"); let result = run(); }",
@@ -1379,7 +1379,7 @@ mod tests {
         }
     }
 
-    /// willow-afb5.17: every lambda body is its own typed record, checked once
+    /// every lambda body is its own typed record, checked once
     /// under its contextual `BodyId`, and the spliced tables still match an
     /// inline check exactly, including diagnostic order around lambdas.
     fn assert_lambdas_typed_once(source: &str) -> TypeChecker {
@@ -1520,7 +1520,7 @@ mod tests {
         }
     }
 
-    /// willow-afb5.17 acceptance: every single-file example that writes a
+    /// lambda semantic indexing acceptance: every single-file example that writes a
     /// lambda types identically with per-lambda records and inline checking.
     #[test]
     fn lambda_examples_match_inline_typing() {
@@ -1562,9 +1562,9 @@ mod tests {
         assert!(checked >= 10, "only {checked} lambda examples checked");
     }
 
-    /// Lambdas passed to generic functions (willow-jz15.64) reach the cached
+    /// Lambdas passed to generic functions reach the cached
     /// checker only inside expanded instantiations, as in the driver; the
-    /// per-lambda records must then match inline checking (willow-r6v4).
+    /// per-lambda records must then match inline checking.
     #[test]
     fn expanded_generic_lambda_calls_match_inline_typing() {
         let mut program = parse(

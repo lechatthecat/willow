@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Explicit Option construction (willow-glaj.8 migration) ──────────────────
+// ── Explicit Option construction (explicit Option construction migration) ──────────────────
 
 // 1. Explicit Some(String) construction compiles and prints.
 #[test]

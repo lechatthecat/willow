@@ -1,4 +1,4 @@
-//! A module class's static properties (willow-6xgo).
+//! A module class's static properties.
 //!
 //! `static [mut] name: T = expr` gets one global slot per (class, property),
 //! declared under the class's REGISTERED name -- `counting::Counter` for a
@@ -19,7 +19,7 @@
 //! imports, its module spellings) reach the declaration's slot. And each module
 //! compiles its initializer expressions during its BODY phase under its own
 //! aliases. `__willow_static_init` calls and stores the results in build-wide
-//! dependency order (willow-9tls.32), retaining source order when independent.
+//! dependency order, retaining source order when independent.
 //!
 //! 36 perspectives:
 //!   1 a module function bumps its own class's static
@@ -1123,7 +1123,7 @@ fn msp_33_the_example_project() {
 }
 
 /// The initializer must use the module's canonical enum even when its graph
-/// name is an alias (willow-wvlw). Read before any assignment can hide tag zero.
+/// name is an alias. Read before any assignment can hide tag zero.
 #[test]
 fn msp_34_an_aliased_modules_enum_initializer() {
     assert_project(

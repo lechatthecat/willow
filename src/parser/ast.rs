@@ -184,8 +184,8 @@ impl PatternId {
     }
 }
 
-/// `Eq`/`Hash` so a written type can key the checker's normalization table
-/// (willow-0g8j.3): HIR lowering re-spells an AST annotation with what the
+/// `Eq`/`Hash` so a written type can key the checker's normalization table: HIR lowering
+/// re-spells an AST annotation with what the
 /// checker made of it.
 pub enum Type<Name = String> {
     I64,
@@ -201,8 +201,8 @@ pub enum Type<Name = String> {
     /// `fn(T1, T2) -> R` — plain function pointer type (non-capturing)
     Fn(Vec<Type<Name>>, Box<Type<Name>>),
     /// `closure(T1, T2) -> R` — a GC-managed closure object: word 0 is the
-    /// code pointer and the words after it are the captured environment
-    /// (willow-0g8j.2.12). Kept apart from [`Type::Fn`] because the two are
+    /// code pointer and the words after it are the captured environment. Kept apart from
+    /// [`Type::Fn`] because the two are
     /// CALLED differently: a `fn` value is the code address itself, while a
     /// closure value is the object and its code pointer takes that object as a
     /// hidden leading argument, so neither is assignable to the other: a bare
@@ -257,7 +257,7 @@ pub enum Item {
     Function(FunctionDecl),
     Class(ClassDecl),
     Enum(EnumDecl),
-    // Payload consumed by the interface type checker/codegen (willow-t8b, willow-xds).
+    // Payload consumed by the interface type checker/codegen.
     #[allow(dead_code)]
     Interface(InterfaceDecl),
 }
@@ -268,7 +268,7 @@ pub enum Item {
 /// no fields, and no constructors. Classes declare conformance via an
 /// `implements` clause. See requirements/willow_interface_requirements.md.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)] // fields consumed by the interface type checker (willow-t8b)
+#[allow(dead_code)] // fields consumed by the interface type checker
 pub struct InterfaceDecl {
     /// Lexically free import spellings from generic defaults, captured during parsing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -276,16 +276,16 @@ pub struct InterfaceDecl {
     pub name: String,
     pub public: bool,
     /// Generic type parameter names in declaration order (`interface Foo<T, U>`).
-    /// Empty for non-generic interfaces (willow-1js.1).
+    /// Empty for non-generic interfaces.
     pub type_params: Vec<String>,
     /// Super-interfaces this interface extends (`interface B extends A`),
-    /// inheriting their required methods (willow-1js.2). Names may be `::`
+    /// inheriting their required methods. Names may be `::`
     /// qualified. v1 supports a single super-interface.
     pub extends: Vec<String>,
     pub methods: Vec<InterfaceMethodDecl>,
     /// For a generic interface's concrete instance, the written
     /// instantiation it stands for (`Get<i64>`): `self` in its defaults has
-    /// that type (willow-rktm). `None` for a declared interface.
+    /// that type. `None` for a declared interface.
     pub instance_of: Option<Type>,
     /// Set by generic expansion on a generic template it keeps as a
     /// declaration: its defaults were abstract-checked against the
@@ -336,7 +336,7 @@ pub struct EffectContract {
 
 /// A required method signature inside an interface (no body).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)] // fields consumed by the interface type checker (willow-t8b)
+#[allow(dead_code)] // fields consumed by the interface type checker
 pub struct InterfaceMethodDecl {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effect_contracts: Vec<EffectContract>,
@@ -345,8 +345,8 @@ pub struct InterfaceMethodDecl {
     pub is_static: bool,
     pub return_type: Type,
     /// A default method body (`fn m(self) { ... }`), if provided. Classes that
-    /// implement the interface but do not override `m` inherit this body
-    /// (willow-1js.3). `None` for a signature-only (required) method.
+    /// implement the interface but do not override `m` inherit this body. `None` for a
+    /// signature-only (required) method.
     pub default_body: Option<Block>,
     pub span: Span,
 }
@@ -389,7 +389,7 @@ pub struct ClassDecl {
     pub base_class: Option<TypePath>,
     /// Interfaces this class declares conformance to via `implements I, J`.
     /// Each entry is a `Type` so generic interfaces (`implements From<E>`) carry
-    /// their type arguments (willow-1js.1). Consumed by the conformance checker.
+    /// their type arguments. Consumed by the conformance checker.
     #[allow(dead_code)]
     pub implements: Vec<Type>,
     /// Original source prefix; desugaring appends inherited contracts. Only
@@ -397,7 +397,7 @@ pub struct ClassDecl {
     pub source_implements_len: usize,
     pub fields: Vec<FieldDecl>,
     pub methods: Vec<MethodDecl>,
-    /// `init(self, ...)` constructors (willow-scq2). MVP allows at most one.
+    /// `init(self, ...)` constructors. MVP allows at most one.
     /// Empty when the class relies on the implicit memberwise constructor.
     pub constructors: Vec<ConstructorDecl>,
     pub span: Span,
@@ -421,7 +421,7 @@ impl ClassDecl {
     }
 }
 
-/// An `init(self, params...) { ... }` constructor declaration (willow-scq2). No
+/// An `init(self, params...) { ... }` constructor declaration. No
 /// return type; `self` is bound in the body and omitted from `params`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConstructorDecl {
@@ -438,7 +438,7 @@ pub struct FieldDecl {
     pub ty: Type,
     pub public: bool,
     pub protected: bool,
-    /// `static` class-level property (willow-qsqf). Static properties live in
+    /// `static` class-level property. Static properties live in
     /// global storage and are not part of instance layout.
     pub is_static: bool,
     /// `static mut` — a mutable static property. Only meaningful with
@@ -479,7 +479,7 @@ pub struct MethodDecl {
     pub is_async: bool,
     pub is_open: bool,
     pub is_override: bool,
-    /// `static fn` (willow-qsqf): class-level method with no receiver. A static
+    /// `static fn`: class-level method with no receiver. A static
     /// method is called as `Type::method(...)` and has no `self` in its body.
     pub is_static: bool,
     pub params: Vec<Param>,
@@ -487,7 +487,7 @@ pub struct MethodDecl {
     pub body: Block,
     pub span: Span,
     /// True for a default-interface-method body injected into this class by the
-    /// desugar (willow-1js.7). The body is the canonical interface default, so
+    /// desugar. The body is the canonical interface default, so
     /// for a NON-generic interface it is type-checked once at the interface level
     /// and skipped here to avoid duplicate diagnostics; generic-interface
     /// injections are left `false` so they are checked with substituted type args.
@@ -498,7 +498,7 @@ pub struct MethodDecl {
     ///
     /// Default injection consults local and imported ancestor shapes so only the
     /// highest class that needs a default receives a copy; subclasses inherit it
-    /// normally (willow-3eo1).
+    /// normally.
     pub is_interface_default: bool,
 }
 
@@ -524,7 +524,7 @@ pub struct FunctionDecl {
     pub return_type_span: Option<Box<Span>>,
     pub body: Block,
     pub span: Span,
-    /// `Some` for a module-level `const NAME: T = literal;` (willow-jz15.10).
+    /// `Some` for a module-level `const NAME: T = literal;`.
     /// The parser represents a constant as a zero-parameter function whose
     /// body returns the literal, so declaration registration, visibility,
     /// item imports and incremental tracking treat it like any other item;
@@ -534,7 +534,7 @@ pub struct FunctionDecl {
     pub constant: Option<ConstValue>,
 }
 
-/// The compile-time value of a module-level `const` (willow-jz15.10).
+/// The compile-time value of a module-level `const`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ConstValue {
     Integer(i64),
@@ -618,22 +618,22 @@ pub enum Stmt {
     FieldAssign(FieldAssignStmt),
     /// `super.init(args...);` — constructor-only base initialization.
     SuperInit(SuperInitStmt),
-    /// `ClassName::property = value;` — static property assignment (willow-qsqf).
+    /// `ClassName::property = value;` — static property assignment.
     StaticFieldAssign(StaticFieldAssignStmt),
     IndexAssign(IndexAssignStmt),
     If(IfStmt),
     While(WhileStmt),
-    /// `break;` — exit the innermost enclosing loop (willow-kzka).
+    /// `break;` — exit the innermost enclosing loop.
     Break(crate::diagnostics::Span),
     /// `continue;` — skip to the next iteration of the innermost loop.
     Continue(crate::diagnostics::Span),
     /// `defer <call>;`, `defer match ... { ... }`, or `defer { ... }` — run the
     /// body when the enclosing SCOPE exits (LIFO; fallthrough/return/`?`/
-    /// break/continue; not on panic) (willow-vynv.2 / willow-oorh).
+    /// break/continue; not on panic).
     /// A direct call's receiver and arguments are evaluated at registration.
     Defer(DeferStmt),
     /// `lock <expr> as [mut] <ident> { ... }` — a compiler-managed critical
-    /// section over a `Mutex<T>` or `RwLock<T>` (willow-38w.1.1).
+    /// section over a `Mutex<T>` or `RwLock<T>`.
     Lock(LockStmt),
     For(ForStmt),
     Return(ReturnStmt),
@@ -644,7 +644,7 @@ impl Stmt {
     /// The statement's source span. Debug builds publish it as the runtime
     /// fault site so a fault raised inside a runtime helper (array bounds, a
     /// blocked channel op, an awaited cancelled task) still gets a source
-    /// location in `PanicInfo` (willow-s9ej.7).
+    /// location in `PanicInfo`.
     pub fn span(&self) -> Span {
         match self {
             Stmt::Let(s) => s.span,
@@ -665,7 +665,7 @@ impl Stmt {
     }
 }
 
-/// Which lock discipline a `lock` statement acquires (willow-38w.1.1).
+/// Which lock discipline a `lock` statement acquires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LockMode {
     /// `lock m as [mut] v { ... }` — exclusive access to a `Mutex<T>`.
@@ -705,7 +705,7 @@ impl LockMode {
 }
 
 /// `lock <expr> as [mut] <ident> { ... }` — a lexical critical section whose
-/// acquisition and release the compiler owns end to end (willow-38w.1).
+/// acquisition and release the compiler owns end to end.
 ///
 /// `target` is evaluated exactly once, never re-evaluated when a contended
 /// acquisition resumes. The statement is allowed only inside an `async fn`,
@@ -751,7 +751,7 @@ impl LockStmt {
     }
 
     /// Stable synthetic key for the async-frame slot holding the evaluated lock
-    /// target (willow-38w.1.4). The target is evaluated once, before the task
+    /// target. The target is evaluated once, before the task
     /// can park, so the handle has to survive the park in the frame rather than
     /// on the native stack.
     pub fn handle_frame_key(&self) -> Span {
@@ -769,7 +769,7 @@ impl LockStmt {
     /// PHASE: `0` until the protected value has been loaded into its binding
     /// slot, `1` from then until the value is committed back.
     ///
-    /// The cancellation entry needs it (willow-38w.1.4 review). A non-null
+    /// The cancellation entry needs it. A non-null
     /// handle alone does not mean the cancelled task owns the lock: it is also
     /// non-null while the task is queued, and while a release has already
     /// handed ownership over but the resumed poll has not consumed the handoff
@@ -830,8 +830,8 @@ pub struct SuperInitStmt {
     pub span: Span,
 }
 
-/// `ClassName::property = value;` — assignment to a `static mut` property
-/// (willow-qsqf). `class` may be module-qualified or `Self`.
+/// `ClassName::property = value;` — assignment to a `static mut` property. `class` may be
+/// module-qualified or `Self`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StaticFieldAssignStmt {
     pub class: String,
@@ -952,11 +952,11 @@ pub enum Expr {
     MethodCall(Box<MethodCallExpr>),
     /// `ClassName::method(args)` — static/constructor call
     StaticCall(Box<StaticCallExpr>),
-    /// `ClassName::property` — static property read (willow-qsqf). No parens; the
+    /// `ClassName::property` — static property read. No parens; the
     /// value is loaded from the class's static global storage.
     StaticField(StaticFieldExpr),
-    /// `new ClassName(args...)` — object construction via a constructor
-    /// (willow-scq2). Resolves to an explicit `init` or an implicit memberwise
+    /// `new ClassName(args...)` — object construction via a constructor. Resolves to an
+    /// explicit `init` or an implicit memberwise
     /// constructor.
     New(Box<NewExpr>),
     /// `ClassName { field: value, ... }`
@@ -970,8 +970,8 @@ pub enum Expr {
     /// `start..end` — half-open i64 range for `for` loops
     Range(Box<RangeExpr>),
     /// `|params| expr` or `|params| { block }` — anonymous function. It is a
-    /// `fn` value when it captures nothing and a `closure` value when it does
-    /// (willow-0g8j.2.12); the two are different types.
+    /// `fn` value when it captures nothing and a `closure` value when it does; the two are
+    /// different types.
     Lambda(Box<LambdaExpr>),
     Match(Box<MatchExpr>),
     /// `expr?` — propagate Result::Err early (the ? operator)
@@ -1021,7 +1021,7 @@ pub struct RangeExpr {
     pub span: Span,
 }
 
-/// `ClassName::property` — a static property read (willow-qsqf). `class` may be
+/// `ClassName::property` — a static property read. `class` may be
 /// module-qualified (e.g. `geom::Config`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StaticFieldExpr {
@@ -1031,7 +1031,7 @@ pub struct StaticFieldExpr {
     pub span: Span,
 }
 
-/// `new ClassName(args...)` object construction (willow-scq2).
+/// `new ClassName(args...)` object construction.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NewExpr {
     pub id: ExprId,
@@ -1156,7 +1156,7 @@ pub struct StaticCallExpr {
 impl StaticCallExpr {
     /// `Path::Member` written without parentheses: the parser reads an
     /// uppercase member as a fieldless enum variant, so this is also how a
-    /// module's `const` (`config::LIMIT`, willow-jz15.10) arrives. The call
+    /// module's `const` (`config::LIMIT`, constant resolution) arrives. The call
     /// span ends at the member token exactly when no argument list follows.
     pub fn is_bare_member(&self) -> bool {
         self.args.is_empty() && self.span.end == self.method_span.end
@@ -1206,7 +1206,7 @@ pub enum SelectCaseKind {
     /// `v = ch.recv() => { ... }` — ready when the channel has a value or is
     /// closed (closed-empty selection raises when the receive executes).
     /// `closed_aware` is the `v = ch.recv_opt()` form: `v: Option<T>`, `None`
-    /// when the case ran because the channel closed (willow-jz15.44).
+    /// when the case ran because the channel closed.
     Recv {
         binding: String,
         channel: Expr,
@@ -1216,10 +1216,10 @@ pub enum SelectCaseKind {
     /// `ch.send(x) => { ... }` — ready immediately for an (unbounded) channel.
     Send { channel: Expr, value: Expr },
     /// `sleep(ms) => { ... }` — ready once `ms` milliseconds have elapsed
-    /// since select entry (deadline fixed at entry; willow-soro).
+    /// since select entry (deadline fixed at entry; select deadline handling).
     Timeout { millis: Expr },
     /// `let v = await t => { ... }` — ready when the task reaches a terminal
-    /// state; the binding takes the task result (willow-soro, willow-qrj9).
+    /// state; the binding takes the task result.
     ///
     /// The awaited expression is retained intact. Whether cancellation becomes
     /// a panic or `Err(Cancelled)` is determined from its type (`Task<T>` or
@@ -1274,7 +1274,7 @@ pub enum Pattern {
         id: PatternId,
     },
     /// `Dog(d)` — downcast an interface-typed scrutinee to the concrete class
-    /// `Dog`, binding `d: Dog` in the arm (willow-1js.4). `binding` may be `_`
+    /// `Dog`, binding `d: Dog` in the arm. `binding` may be `_`
     /// to match the type without binding.
     ClassDowncast {
         class_name: String,
@@ -1319,7 +1319,7 @@ pub enum MatchBody {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MatchArm {
     pub pattern: Pattern,
-    /// `pattern if guard => body` (willow-jz15.6). Evaluated after the
+    /// `pattern if guard => body`. Evaluated after the
     /// pattern's bindings are in scope; a false guard falls through to the
     /// next arm, so a guarded arm never counts toward exhaustiveness.
     pub guard: Option<Expr>,
@@ -1337,8 +1337,8 @@ pub struct MatchExpr {
     pub arms: Vec<MatchArm>,
     pub span: Span,
     /// The surface syntax this `match` was written as. `if let` / `while let`
-    /// are parsed into a `match` whose last arm is a synthetic `_`
-    /// (willow-jz15.6); only diagnostics look at this.
+    /// are parsed into a `match` whose last arm is a synthetic `_`; only diagnostics look at this.
+    ///
     pub source: MatchSource,
 }
 
@@ -1365,7 +1365,7 @@ pub enum BinOp {
     /// `**`. Right-associative and tighter than `*` and unary negation, so
     /// `-2 ** 2` is `-(2 ** 2)` and `2 ** 3 ** 2` is `2 ** (3 ** 2)`.
     Pow,
-    /// Bitwise `&`, `|`, `^` on `i64` (willow-jz15.8).
+    /// Bitwise `&`, `|`, `^` on `i64`.
     BitAnd,
     BitOr,
     BitXor,
@@ -1385,7 +1385,7 @@ pub enum BinOp {
 }
 
 impl BinOp {
-    /// Bitwise and shift operators, which apply only to `i64` (willow-jz15.8).
+    /// Bitwise and shift operators, which apply only to `i64`.
     pub fn is_integer_only(&self) -> bool {
         matches!(
             self,
@@ -1421,7 +1421,7 @@ impl BinOp {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum UnaryOp {
     Neg,
-    /// `!`: logical not on `bool`, bitwise not on `i64` (willow-jz15.8).
+    /// `!`: logical not on `bool`, bitwise not on `i64`.
     Not,
 }
 
@@ -1527,7 +1527,7 @@ mod node_identity_tests {
         assert_eq!(ids.fresh(), rollover + 1);
     }
 
-    /// willow-9tls.1: the process-wide allocator used to start at 0, so the
+    /// the process-wide allocator used to start at 0, so the
     /// first real node of the first session carried `ExprId::placeholder()`.
     /// Drive a pristine allocator from the same start the static uses.
     #[test]

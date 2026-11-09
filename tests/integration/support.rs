@@ -435,7 +435,7 @@ pub(super) fn compile_and_run_gc_stress_mode(source: &str, mode: &str) -> (Strin
 ///
 /// Returns `(output, ok)`. `ok` is false when compilation fails OR when the
 /// compiled binary exits unsuccessfully; a program that prints the expected
-/// stdout and then aborts must not report success (willow-4t7t). On a
+/// stdout and then aborts must not report success. On a
 /// successful run `output` is stdout only, so snapshot expectations stay
 /// stable; on binary failure it is stdout followed by stderr, so the runtime
 /// diagnostic is visible in the test failure.
@@ -546,8 +546,8 @@ pub(super) fn compile_and_collect_relocation_targets_mode(
 /// An instruction that calls or addresses a symbol lives in a text section; a
 /// vtable or class-descriptor slot that holds the same symbol's address is a
 /// data relocation. Counting them apart is the difference between "this many
-/// call sites were emitted" and "this many tables mention the function"
-/// (willow-76bf).
+/// call sites were emitted" and "this many tables mention the function".
+///
 pub(super) fn compile_and_collect_relocations_by_section(
     source: &str,
     env: &[(&str, &str)],
@@ -1039,8 +1039,8 @@ impl TestProject {
     ///
     /// The concurrency is part of the perspective rather than a speed-up: a
     /// process-exit stall needs the machine contended before it shows up at
-    /// all, which is why it reached CI and not a developer's single run
-    /// (willow-ihr5). Reports the failing run's index and output.
+    /// all, which is why it reached CI and not a developer's single run. Reports the failing
+    /// run's index and output.
     ///
     /// Windows-only, like its only caller: the stall it guards against is
     /// specific to a platform that terminates threads before running
@@ -1174,7 +1174,7 @@ impl TestProject {
 
     /// Size in bytes of the executable the last compile produced.
     ///
-    /// Used by the dispatch-chain code-size test (willow-au5k), which compares
+    /// Used by the dispatch-chain code-size test, which compares
     /// two near-identical programs built by the same compiler: the interesting
     /// quantity is the DIFFERENCE, so linker and runtime overhead cancel out.
     /// Windows names the output with an `.exe` suffix, so both spellings are
@@ -1415,7 +1415,7 @@ pub(super) fn compile_with_compiler_env(source: &str, env: &[(&str, &str)]) -> (
 }
 
 /// [`compile_with_compiler_env`] for a `--release` build, where `i64`
-/// arithmetic carries no debug overflow checks (willow-jz15.14).
+/// arithmetic carries no debug overflow checks.
 pub(super) fn compile_release_with_compiler_env(
     source: &str,
     env: &[(&str, &str)],
@@ -1440,7 +1440,7 @@ fn compile_with_compiler_env_mode(
     }
     cmd.env_remove("WILLOW_DATA_RACE_CHECK");
     cmd.env_remove("WILLOW_WORKERS");
-    // The only backend switch left is the log (willow-0g8j.3 retired the
+    // The only backend switch left is the log (the lowered-IR cutover retired the
     // kill-switch and the require mode along with the AST fallback), and a test
     // that asserts on its absence must not inherit it from the environment.
     cmd.env_remove("WILLOW_LIR_LOG");
@@ -1466,7 +1466,7 @@ pub(super) fn compile_with_data_race_check(source: &str) -> (bool, String) {
 
 /// Compile normally, then run the binary with extra RUNTIME environment
 /// variables and a hard timeout: a preemption/scheduler regression must fail
-/// the test, not hang CI (willow-0a6k.2 review fix).
+/// the test, not hang CI.
 pub(super) fn compile_and_run_with_runtime_env(
     source: &str,
     env: &[(&str, &str)],
@@ -1518,7 +1518,7 @@ pub(super) fn compile_and_run_with_runtime_env(
 }
 
 /// Like [`compile_with_env_and_run`], but returns the binary's stdout AND
-/// stderr, so a test can assert on a runtime panic message (willow-0g8j.4).
+/// stderr, so a test can assert on a runtime panic message.
 pub(super) fn compile_with_env_and_run_combined(
     source: &str,
     compile_env: &[(&str, &str)],
@@ -1614,7 +1614,7 @@ pub(super) fn compile_with_env_and_run_under(
 }
 
 /// Compile with extra COMPILER environment variables, then run the binary.
-/// Used by tests that vary compiler settings (willow-0g8j).
+/// Used by tests that vary compiler settings.
 pub(super) fn compile_with_env_and_run(source: &str, env: &[(&str, &str)]) -> (String, bool) {
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_lirdiff_test_{}.wi", id));
@@ -1653,7 +1653,7 @@ pub(super) fn compile_with_env_and_run(source: &str, env: &[(&str, &str)]) -> (S
     )
 }
 
-/// Contract tests for the environment-based runner itself (willow-4t7t).
+/// Contract tests for the environment-based runner itself.
 ///
 /// `compile_and_run_with_env` used to return `true` unconditionally once
 /// compilation succeeded, so a program that printed the expected stdout and

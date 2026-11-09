@@ -1,4 +1,4 @@
-//! Scheduler/runtime tracing, metrics, and profiling hooks (willow-2vq).
+//! Scheduler/runtime tracing, metrics, and profiling hooks.
 //!
 //! Recording is allocation-free unless textual tracing is enabled. Hooks are
 //! invoked only from call sites that have released scheduler, task-shard,
@@ -32,7 +32,7 @@ pub enum RuntimeEventKind {
     ChannelWait = 14,
     BlockingDetach = 15,
     /// A Task had to wait for a blocking-pool queue slot; `value` is the
-    /// number of slot waiters after it registered (willow-9tls.6).
+    /// number of slot waiters after it registered.
     BlockingQueueFull = 16,
 }
 

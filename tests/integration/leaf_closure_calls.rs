@@ -1,7 +1,7 @@
-//! Safepoint-free leaf closures and root-free closure call sites
-//! (willow-8hq4.28).
+//! Safepoint-free leaf closures and root-free closure call sites.
 //!
-//! A lambda body that is a safepoint-free leaf (willow-8hq4.14) binds its
+//!
+//! A lambda body that is a safepoint-free leaf binds its
 //! closure environment, captures and parameters without roots and has no
 //! entry poll. A closure whose body cannot raise tags bit 0 of its code word,
 //! so a call through it skips the `willow_panic_depth` protocol; every other
@@ -515,7 +515,7 @@ fn indirect_callee_loops_preempt_with_one_worker() {
     }
 }
 
-// willow-8hq4.44: guarded scalar expansion preserves all other call paths.
+// guarded scalar expansion preserves all other call paths.
 #[test]
 fn promoted_function_values_cover_storage_and_combinators() {
     let source = include_str!("../../example/lir_function_values.wi");

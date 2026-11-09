@@ -1,4 +1,4 @@
-// Class field layout does not depend on DECLARATION ORDER (willow-59gx).
+// Class field layout does not depend on DECLARATION ORDER.
 //
 // A class's layout is its base's layout followed by the fields it declares
 // itself. Base fields come FIRST, which is what lets an inherited field sit at

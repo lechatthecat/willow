@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Generic interface declarations (willow-1js.1, slice 1) ───────────────────
+// ── Generic interface declarations (generic interfaces, slice 1) ───────────────────
 
 #[test]
 fn generic_interface_01_declaration_compiles() {
@@ -21,7 +21,7 @@ fn main() { println(7); }
     assert_eq!(out, "7\n");
 }
 
-// ── Generic interfaces: implement, dispatch, conformance (willow-1js.1) ──────
+// ── Generic interfaces: implement, dispatch, conformance ──────
 
 #[test]
 fn generic_interface_02_implement_and_dispatch_i64() {

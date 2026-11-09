@@ -1,4 +1,4 @@
-// Expected-type propagation into ternary branches (willow-ok7f).
+// Expected-type propagation into ternary branches.
 //
 // Unqualified enum variants resolve against the expected type inside ternary
 // branches, exactly like direct returns: `ok ? Ok(10) : Err("bad")`.

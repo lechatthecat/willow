@@ -1,5 +1,5 @@
 // Finished task frames are reclaimed while a long-running `async main` is
-// still running (willow-vjaf). Each phase finishes thousands of tasks; after
+// still running. Each phase finishes thousands of tasks; after
 // a collection the live heap stays near zero instead of growing with every
 // task the program ever completed.
 

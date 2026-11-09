@@ -1,4 +1,4 @@
-//! Cooperative async bodies compiled from Lowered IR (willow-0g8j.2.11).
+//! Cooperative async bodies compiled from Lowered IR.
 //!
 //! This first vertical slice covers bodies without language-level suspension
 //! operations. The poll function still inserts cooperative preemption points,
@@ -352,7 +352,7 @@ async fn main() { println(await value()); }
     assert_eq!(out, "42\n");
 }
 
-// --- `await f(..)` on a cooperative leaf, split from LIR (willow-0g8j.2.11) ---
+// --- `await f(..)` on a cooperative leaf, split from LIR ---
 
 #[test]
 fn async_lir_12_leaf_call_await_in_let_initialiser() {
@@ -610,13 +610,13 @@ async fn main() { println(await twice(21)); }
 
 #[test]
 fn async_lir_26_await_example_is_fully_lir() {
-    // The await example (willow-0g8j.2.11) exists to be compiled this way:
+    // The await example exists to be compiled this way:
     // every one of its `async fn`s — leaf calls, builtin awaits, suspending
     // loops and branches — must stay on the LIR path.
     let source = include_str!("../../example/lir_async_await.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "example/lir_async_await.wi did not compile: {stderr}");
-    // Compiling at all is the proof since willow-0g8j.3 — a body outside the
+    // Compiling at all is the proof since the lowered-IR cutover — a body outside the
     // subset is a hard `E0800` — so what is left to check is that the async
     // bodies really went through the async LIR path and not some other one.
     assert!(
@@ -625,7 +625,7 @@ fn async_lir_26_await_example_is_fully_lir() {
     );
 }
 
-// --- preemption safepoints sit on loop back edges only (willow-0g8j.2.11) ---
+// --- preemption safepoints sit on loop back edges only ---
 //
 // A safepoint parks the poll fn, and a local left in an SSA value does not
 // survive that park: liveness models suspension at loop back edges and at
@@ -793,7 +793,7 @@ async fn main() {
     );
 }
 
-// --- awaits in value position (willow-0g8j.2.11) -------------------------
+// --- awaits in value position -------------------------
 //
 // `let s = await f() + "!"` suspends in the MIDDLE of a statement. A Cranelift
 // value computed before the park does not survive the poll function's return,
@@ -1565,7 +1565,7 @@ async fn main() {
     }
 }
 
-// Recovery-capable cooperative `defer` on the LIR path (willow-0g8j.2.11).
+// Recovery-capable cooperative `defer` on the LIR path.
 //
 // `defer match recover() { .. }` gives its scope a second exit: the panic ends
 // there and the statement after the scope runs. In an async body that
@@ -2105,7 +2105,7 @@ fn async_lir_85_cancelling_a_task_with_an_open_recovery_scope_runs_its_defer_onc
     // never left must still be cleaned up, and exactly once.
     //
     // `main` cancels only after `slow` reports from inside the scope: a timer
-    // margin instead would leave the order to the scheduler (willow-ssl7.13).
+    // margin instead would leave the order to the scheduler.
     assert_recovery(
         r#"
 async fn slow(entered: Channel<i64>) -> i64 {
@@ -2142,7 +2142,7 @@ fn async_lir_86_a_defer_consumed_by_the_recovery_is_not_rerun_by_a_later_cancel(
     // recovery, and `main` cancels only then. Ordering the two by timer
     // deadlines instead (`sleep(1)` against `sleep(5)`) let a late resume on a
     // loaded worker pool deliver the cancellation while the scope was still
-    // open, which printed `d: clean` on macos-15 (willow-ssl7.13).
+    // open, which printed `d: clean` on macos-15.
     assert_recovery(
         r#"
 async fn run(recovered: Channel<i64>, hold: Channel<i64>) -> i64 {

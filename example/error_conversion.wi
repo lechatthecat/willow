@@ -1,4 +1,4 @@
-// Automatic error conversion for `?` (willow-1ow).
+// Automatic error conversion for `?`.
 //
 // When `?` propagates an error whose type `E1` differs from the enclosing
 // function's error type `E2`, the compiler converts it automatically — provided

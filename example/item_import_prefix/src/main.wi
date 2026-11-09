@@ -1,5 +1,5 @@
 // Module-qualified calls through prefixes this file only item-imported, in a
-// project.toml build where modules carry package identities (willow-jz15.43).
+// project.toml build where modules carry package identities.
 import ops::Op;
 import report::text::Filter;
 

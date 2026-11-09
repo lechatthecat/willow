@@ -1,5 +1,5 @@
 //! The last fallback categories the LIR walker turned down, closed for the
-//! Stage 5 cutover (willow-0g8j.3).
+//! Stage 5 cutover.
 //!
 //! Every one of these programs was correct already — the AST emitter compiled
 //! it — so nothing here is a bug fix in the usual sense. What each perspective

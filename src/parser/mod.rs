@@ -36,7 +36,7 @@ pub struct Parser {
     pending_type_eq: bool,
     last_span: Option<Span>,
     allow_object_literals: bool,
-    /// Statement-level errors recovered inside blocks (willow-qzxg): the block
+    /// Statement-level errors recovered inside blocks: the block
     /// keeps parsing after a bad statement, so one error no longer swallows the
     /// rest of the surrounding item (which used to cascade into a false
     /// `missing entry point` on `main`).
@@ -462,7 +462,7 @@ impl Parser {
         // `new` is a prefix keyword for object construction (`new Class(...)`),
         // matched before this point in expression position. As a plain
         // identifier — a method/function name like `Channel::new` or
-        // `static fn new` — it is still accepted here (willow-scq2).
+        // `static fn new` — it is still accepted here.
         if matches!(self.peek_kind(), TokenKind::New) {
             self.advance();
             return Ok("new".to_string());
@@ -537,7 +537,7 @@ impl Parser {
     /// Recovery after a failed top-level item that began at token `item_start`.
     /// When the item consumed tokens and failed at module level (outside any
     /// brace) on the start of the next item — `const A: i64 = 1 const B ...` —
-    /// that item is kept instead of skipped (willow-jz15.93). Otherwise, e.g.
+    /// that item is kept instead of skipped. Otherwise, e.g.
     /// on an error inside a class body or on the item's own first token, the
     /// first token is skipped as before so recovery always makes progress.
     fn recover_after_item_error(&mut self, item_start: usize) {
@@ -819,7 +819,7 @@ class ProtectedCtor { prot init(self) {} }
         assert!(errs.iter().any(|e| e.code == ErrorCode::E0850));
     }
 
-    // ── Module declarations (willow-y0o, spec 4.1 / 20.1) ──────────────────
+    // ── Module declarations (module declarations, spec 4.1 / 20.1) ──────────────────
 
     #[test]
     fn module_decl_simple() {
@@ -907,7 +907,7 @@ class ProtectedCtor { prot init(self) {} }
         );
     }
 
-    // Grouped-import perspectives (willow-4bv.7):
+    // Grouped-import perspectives:
     // P01 two std items expand in source order
     // P02 a one-item group is valid
     // P03 a trailing comma is valid
@@ -1443,7 +1443,7 @@ class ProtectedCtor { prot init(self) {} }
         );
     }
 
-    // ── Interface declarations & implements (willow-7kw, spec 4 / 5 / 6) ────
+    // ── Interface declarations & implements (interface declarations, spec 4 / 5 / 6) ────
 
     fn first_interface(program: &Program) -> &InterfaceDecl {
         program
@@ -1499,7 +1499,7 @@ class ProtectedCtor { prot init(self) {} }
 
     #[test]
     fn interface_generic_single_type_param() {
-        // `interface Box<T> { fn get(self) -> T; }` (willow-1js.1).
+        // `interface Box<T> { fn get(self) -> T; }`.
         let p = parse_ok("interface Box<T> { fn get(self) -> T; }");
         let i = first_interface(&p);
         assert_eq!(i.name, "Box");
@@ -1622,7 +1622,7 @@ class ProtectedCtor { prot init(self) {} }
 
     #[test]
     fn interface_14_method_body_rejected() {
-        // A body WITH `self` is a valid default method (willow-1js.3).
+        // A body WITH `self` is a valid default method.
         let p = parse_ok("interface Greet { fn hi(self) { return; } }");
         let i = first_interface(&p);
         assert_eq!(i.methods[0].name, "hi");
@@ -1712,7 +1712,7 @@ class ProtectedCtor { prot init(self) {} }
         assert_eq!(dog.implements.len(), 2);
     }
 
-    // ── ternary `?` vs try-propagate `?` disambiguation (willow-0g8j find) ──
+    // ── ternary `?` vs try-propagate `?` disambiguation ──
     // The heuristic peeks at the token after `?`; every token that can START a
     // ternary then-branch must be listed, or the `?` is misread as try-propagate.
     // 8 perspectives: string/array/new/self/paren/negative/call/nested branches,
@@ -1805,7 +1805,7 @@ class ProtectedCtor { prot init(self) {} }
     // `classify_after_question` matches EVERY TokenKind with no wildcard arm.
     // Adding a new token variant breaks this compile, forcing a decision on
     // whether it can start a ternary then-branch — the exact failure mode that
-    // produced willow-7qt5 (StringLiteral & co. missing from the heuristic).
+    // produced the literal lookahead regression (StringLiteral & co. missing from the heuristic).
 
     /// How a `?` reads when this token follows it.
     #[derive(Debug, PartialEq)]
@@ -2149,7 +2149,7 @@ class ProtectedCtor { prot init(self) {} }
         ));
     }
 
-    // ── assignment targets + statement-level recovery (willow-qzxg) ─────────
+    // ── assignment targets + statement-level recovery ─────────
     // 10 parser perspectives (runtime behavior covered in integration tests):
     // 1 nested field target parses as FieldAssign, 2 index-then-field,
     // 3 call-then-field, 4 deep chain, 5 invalid call target -> E0106 (not a
@@ -2257,7 +2257,7 @@ class ProtectedCtor { prot init(self) {} }
         );
     }
 
-    // ── parser robustness mini-fuzzer (willow-qzxg bug CLASS detector) ──────
+    // ── parser robustness mini-fuzzer (parser robustness bug CLASS detector) ──────
     // Systematic single-token mutations (deletion and duplication) over
     // representative programs: the parser must NEVER panic or hang on
     // malformed input — it must return diagnostics. This is the generalized
@@ -2319,7 +2319,7 @@ class ProtectedCtor { prot init(self) {} }
     #[test]
     fn fuzz_03_stmt_junk_never_cascades_to_missing_main() {
         // Statement-level junk inside main must produce errors WITHOUT losing
-        // main itself (the qzxg cascade). Junk snippets are inserted as a
+        // main itself (the parser recovery cascade). Junk snippets are inserted as a
         // statement in an otherwise-valid main.
         let junks = [
             "1 = 2;",
@@ -2360,8 +2360,8 @@ class ProtectedCtor { prot init(self) {} }
     }
 
     // select case forms drop `CallArgMode`, so a reference argument has to be
-    // rejected at parse time or it is silently downgraded to a value argument
-    // (willow-o038 review).
+    // rejected at parse time or it is silently downgraded to a value argument.
+    //
     #[test]
     fn select_ref_01_send_reference_argument_is_rejected() {
         let errors = parse_errors(
@@ -2450,7 +2450,7 @@ class ProtectedCtor { prot init(self) {} }
         );
     }
 
-    // ── Exponentiation `**` precedence and associativity (willow-n5yv.2) ─────
+    // ── Exponentiation `**` precedence and associativity ─────
     //
     // `**` sits between unary and multiplicative in the grammar: it binds
     // tighter than `*` AND tighter than prefix `-`, and it is right
@@ -2515,7 +2515,7 @@ class ProtectedCtor { prot init(self) {} }
         shape(&let_stmt.init)
     }
 
-    // ── Bitwise and shift precedence (willow-jz15.8) ────────────────────────
+    // ── Bitwise and shift precedence ────────────────────────
     #[test]
     fn bitwise_precedence_follows_rust() {
         assert_eq!(expr_shape("a | b ^ c & d"), "(a | (b ^ (c & d)))");
@@ -2850,7 +2850,7 @@ class ProtectedCtor { prot init(self) {} }
         assert_eq!(BinOp::Pow.symbol(), "**");
     }
 
-    // ── `lock` statement grammar (willow-38w.1.1) ────────────────────────────
+    // ── `lock` statement grammar ────────────────────────────
     //
     // `lock`, `read` and `write` are CONTEXTUAL keywords: a program that used
     // any of them as an ordinary identifier before this feature existed must
@@ -3161,7 +3161,7 @@ class ProtectedCtor { prot init(self) {} }
         }
     }
 
-    // Node identity (willow-njot). The checker and the backend key their side
+    // Node identity. The checker and the backend key their side
     // tables by `Expr::id`/`Pattern::id` rather than by `Span`, so these pin
     // what an ID promises: unique per parsed node, stable across a clone, and
     // never reused by a node the compiler builds later.
@@ -3309,7 +3309,7 @@ class ProtectedCtor { prot init(self) {} }
         assert!(PatternId::fresh() < PatternId::fresh());
     }
 
-    // ── `else if` chains (willow-hg6e) ───────────────────────────────────
+    // ── `else if` chains ───────────────────────────────────
 
     /// Structural rendering of an if-ladder: `if(<cond>){<n>}else{...}`.
     /// Distinguishes a synthetic single-statement else block from a

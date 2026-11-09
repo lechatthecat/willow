@@ -1,5 +1,5 @@
 // module_class_values — values of an imported module's class, in a file that
-// never imports the class itself (willow-0g8j.2.19).
+// never imports the class itself.
 //
 // `import geom;` names the module. It does NOT bring `Point` into this file:
 // the type cannot be written here, so a parameter cannot be annotated with it,

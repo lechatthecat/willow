@@ -38,7 +38,7 @@ pub enum TokenKind {
     Select,
     Match,
     Enum,
-    /// `const NAME: T = literal;` module-level constant (willow-jz15.10).
+    /// `const NAME: T = literal;` module-level constant.
     Const,
     ColonColon,
 
@@ -62,7 +62,7 @@ pub enum TokenKind {
     MinusEq,
     Star,
     StarEq,
-    /// `**`, the right-associative exponentiation operator (willow-n5yv.2).
+    /// `**`, the right-associative exponentiation operator.
     StarStar,
     Slash,
     SlashEq,
@@ -77,7 +77,7 @@ pub enum TokenKind {
     GtEq,
     And,
     Ampersand,
-    /// `&=`, `|=`, `^=` and `^` (willow-jz15.8). `<<`/`>>` and their
+    /// `&=`, `|=`, `^=` and `^`. `<<`/`>>` and their
     /// compound forms are adjacent `<`/`>` tokens assembled by the parser.
     AmpersandEq,
     Or,

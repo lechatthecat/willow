@@ -1,5 +1,5 @@
 // Binding a match payload whose type is a class or interface from a module
-// other than the enum's own (willow-jz15.38). Before the fix, `scene` and the
+// other than the enum's own. Before the fix, `scene` and the
 // entry both type-checked but the build stopped with an internal compiler
 // error, because the payload was typed by the declaring file's local spelling
 // (`Rect`, `Caption`, `Area`) rather than its identity (`shapes::Rect`, ...).

@@ -380,7 +380,7 @@ impl BodyIndex {
         self.origins.get(&body).copied().unwrap_or(body)
     }
     /// The unit that declared the interface default `method` was injected
-    /// from, when that is not `unit` itself (willow-rvpp). Such a copy reuses
+    /// from, when that is not `unit` itself. Such a copy reuses
     /// the declaring unit's check and is lowered and emitted in its scope.
     pub fn foreign_default(
         &self,

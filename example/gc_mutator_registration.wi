@@ -1,5 +1,5 @@
-// gc_mutator_registration.wi — collections that race the worker pool
-// (willow-v6k0).
+// gc_mutator_registration.wi — collections that race the worker pool.
+//
 //
 // Every thread that can hold GC roots registers itself as a MUTATOR: the thread
 // driving `main`, and each worker the scheduler spins up to run a

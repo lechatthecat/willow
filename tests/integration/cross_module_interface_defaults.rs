@@ -1,4 +1,4 @@
-//! Cross-module interface default bodies (willow-rvpp).
+//! Cross-module interface default bodies.
 //!
 //! A class in module M that implements a non-generic interface declared in
 //! module P receives P's default body. That body is checked once with its

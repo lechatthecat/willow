@@ -1,4 +1,4 @@
-//! Cross-module type names in a module's exported signature (willow-sxcp).
+//! Cross-module type names in a module's exported signature.
 //!
 //! A module that reaches a type through its OWN item import writes that type's
 //! BARE name into what it exports:
@@ -52,7 +52,7 @@
 //!  22 `extends` and `implements`, both item-imported
 //!  23 a static method returning the imported class
 //!  24 an entry subclass of a module class whose own base is imported
-//!  25 the entry file aliases the module the item import names (willow-kd1v)
+//!  25 the entry file aliases the module the item import names
 //!  26 control: the entry cannot name the module's imported class
 //!  27 control: a sibling module cannot see another module's import
 //!  28 control: an unrelated class still mismatches, named by its own module
@@ -963,8 +963,8 @@ fn main() {
 //     keyed `proto::Parcel` while `mid` names the very same class `Parcel`
 //     through its own canonical item import. Once the checker agreed the two
 //     were one class, the back end had to agree as well: the item import's
-//     aliases are installed under the spelling the tables answer to
-//     (willow-kd1v), not the canonical one the import line writes.
+//     aliases are installed under the spelling the tables answer to, not the canonical one the
+//     import line writes.
 #[test]
 fn cmt_25_the_entry_aliases_the_module_the_item_import_names() {
     assert_project(

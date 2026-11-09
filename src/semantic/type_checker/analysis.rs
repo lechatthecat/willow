@@ -58,7 +58,7 @@ pub(crate) fn reference_place_key(mut expr: &Expr) -> Option<String> {
 
 /// Whether every path through a `match` arm's block leaves the arm without
 /// reaching its end: by `return`, or by a `break`/`continue` of a loop that
-/// encloses the `match` (willow-jz15.46). Such an arm hands no value to the
+/// encloses the `match`. Such an arm hands no value to the
 /// match, so it is typed `Never`. Loops written inside the arm are not entered,
 /// so their own `break`/`continue` never count.
 #[cfg(test)]
@@ -197,7 +197,7 @@ fn always_leaves(
 
 #[cfg(test)]
 mod tests {
-    //! Constructor-scan perspectives (willow-uqzx.1.1, shared structural walk).
+    //! Constructor-scan perspectives (shared AST walking, shared structural walk).
     //!
     //! The structural walker is statement-only, so the perspectives are: a1
     //! direct assignment, a2 nested block statements (`if` / `else` / `while` /

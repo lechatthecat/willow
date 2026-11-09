@@ -1,8 +1,8 @@
 use super::*;
 
-// Concurrency unification (willow-h2vf Stage 1): an async fn call returns an
+// Concurrency unification (async task unification Stage 1): an async fn call returns an
 // eager Task that can be awaited directly — no `spawn` needed.
-// ── Send / Sync marker interfaces (willow-dgwo.1) ────────────────────────────
+// ── Send / Sync marker interfaces ────────────────────────────
 //
 // 20 test perspectives for the compiler-known Send/Sync markers:
 //  1. `class C implements Send` is rejected (E2401).

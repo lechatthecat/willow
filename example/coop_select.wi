@@ -1,4 +1,4 @@
-// Cooperative-suspend `select` (willow-7aj).
+// Cooperative-suspend `select`.
 //
 // A `select` inside an async task is a suspend point: when no case is ready the
 // task PARKS on every recv channel (instead of busy-driving the scheduler) and

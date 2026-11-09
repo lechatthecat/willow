@@ -1,4 +1,4 @@
-// Static members under inheritance + interfaces (willow-qsqf, Stage 4).
+// Static members under inheritance + interfaces (static member support, Stage 4).
 //
 // Static members are NON-VIRTUAL: they are resolved by explicit type name and
 // inherited statics are reachable through a subclass. A subclass may NOT

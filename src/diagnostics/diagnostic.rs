@@ -178,7 +178,7 @@ pub(crate) fn source_names(
             copied = start + 6 + module + 2;
             continue;
         }
-        // A copied default's receiver (willow-nvi6).
+        // A copied default's receiver.
         if text[start..].starts_with(crate::semantic::ids::FOREIGN_RECEIVER_PREFIX) {
             out.push_str(&text[copied..start]);
             copied = start + crate::semantic::ids::FOREIGN_RECEIVER_PREFIX.len();

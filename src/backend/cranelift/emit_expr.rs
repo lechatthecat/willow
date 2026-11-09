@@ -4,7 +4,7 @@ use willow_abi::runtime_symbols::names as rt;
 
 use super::*;
 
-/// `willow_int_overflow_panic` operator kinds (willow-jz15.14).
+/// `willow_int_overflow_panic` operator kinds.
 pub(super) const INT_OVERFLOW_ADD: i64 = 0;
 pub(super) const INT_OVERFLOW_SUB: i64 = 1;
 pub(super) const INT_OVERFLOW_MUL: i64 = 2;
@@ -100,7 +100,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ///
     /// Both emitters share this: the AST caller — static-property initializers,
     /// the only bodies still on that path — assembles the message from
-    /// `CallArg`s, the LIR walker from `HirExpr`s (willow-0g8j.2.5), and the
+    /// `CallArg`s, the LIR walker from `HirExpr`s, and the
     /// unwind protocol below — which branch of the three panic worlds applies,
     /// and in what order the file metadata is built relative to the message's
     /// root — must not be able to differ between them.
@@ -157,7 +157,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Lower the compiler-known `recover()` builtin. Runtime capability is
     /// consulted only for a direct call inside the deferred AST currently
     /// executing; ordinary code and helper/lambda bodies construct `None`
-    /// without touching panic state (willow-s9ej.3).
+    /// without touching panic state.
     pub(super) fn emit_recover_call(&mut self) -> cranelift_codegen::ir::Value {
         let panic_info_ty = Type::Named("PanicInfo".to_string().into());
         if self.cleanup.recover_eligible_depth == 0 {
@@ -298,8 +298,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Whether `+ - * **` and unary `-` on `i64` are checked for signed
-    /// overflow: debug builds raise a recoverable panic, release builds wrap
-    /// (willow-jz15.14).
+    /// overflow: debug builds raise a recoverable panic, release builds wrap.
+    ///
     pub(super) fn overflow_checks(&self) -> bool {
         self.diagnostics.build_mode == BuildMode::Debug
     }
@@ -353,7 +353,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Debug-build `<<`/`>>` on `i64`: raise a recoverable panic when the
-    /// amount is outside `0..64` (willow-jz15.8). One unsigned compare covers
+    /// amount is outside `0..64`. One unsigned compare covers
     /// negative amounts too.
     pub(super) fn emit_checked_shift(
         &mut self,

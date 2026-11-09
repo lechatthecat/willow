@@ -1,4 +1,4 @@
-//! Regression perspectives for willow-jz15.56. Inputs also reproduce the audit.
+//! Regression perspectives for generic closer recovery. Inputs also reproduce the audit.
 use super::*;
 use crate::diagnostics::FileId;
 use crate::lexer::Lexer;

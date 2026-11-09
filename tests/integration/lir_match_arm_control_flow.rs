@@ -1,5 +1,5 @@
-//! Control flow inside a body the walker keeps as an HIR island
-//! (willow-0g8j.2.16).
+//! Control flow inside a body the walker keeps as an HIR island.
+//!
 //!
 //! LIR lowers a function-level `if` into blocks of its own, but a `match` arm,
 //! a `select` case and a `defer` block stay in HIR shape, and the statements
@@ -16,7 +16,7 @@
 //! now read off the arms, and admitted wherever nothing follows the `match` in
 //! the same Cranelift block.
 //!
-//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! Since the lowered-IR cutover a body outside the walker's subset is a compile error,
 //! so a run that prints the right answer is proof the walker produced it.
 //!
 //! 31 perspectives:

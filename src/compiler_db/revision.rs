@@ -1464,7 +1464,7 @@ mod tests {
 
     #[test]
     fn revision_shifted_type_declaration_keeps_function_value_keys() {
-        // willow-25da.29.57: indirect-call keys must not depend on declaration
+        // indirect-call keys must not depend on declaration
         // offsets, since a reused body keeps the keys it was checked with
         // while a re-checked one gets fresh keys.
         let f = Fixture::new();

@@ -192,7 +192,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// `iface.method(args)` on an interface-typed receiver: an indirect call
-    /// through the receiver pair's vtable (willow-0g8j.6).
+    /// through the receiver pair's vtable.
     ///
     /// The pair is `[object | vtable]`, so the concrete class is not known
     /// statically: extract the object and vtable, load the slot's function
@@ -222,7 +222,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .interface(&iface_name)
             .expect("interface info vetted by LIR eligibility");
         // The composed layout the vtables are emitted from, so the slot indexed
-        // here is the slot the data object holds (willow-1fc6).
+        // here is the slot the data object holds.
         let slot = super::vtable_layout::slot_of(&self.classes, &info.name, method)
             .expect("interface method slot vetted by LIR eligibility");
         let sig_info = info.methods[method].clone();
@@ -270,8 +270,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Pin the hidden receiver even when the interface pair is held only by
         // an async frame's interior slot. Nothing between this load and the
         // callee's entry is a safepoint, so a call whose every target roots
-        // `self` itself before its first safepoint needs no second root
-        // (willow-8hq4.14).
+        // `self` itself before its first safepoint needs no second root.
+        //
         let receiver_roots = usize::from(slots.needs_receiver_root);
         if slots.needs_receiver_root {
             self.emit_push_call_root(obj);
@@ -304,7 +304,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         call_args.extend(arg_vals);
         // Interface dispatch is indirect, so only a proof covering every
         // function any vtable slot for this method holds may skip the panic
-        // bracket (willow-8hq4.14).
+        // bracket.
         let panic_depth = if slots.may_panic {
             self.emit_pre_willow_call_panic_depth()
         } else {
@@ -400,8 +400,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if pushed {
             self.emit_callstack_pop();
         }
-        // The record naming this call's `&place` must not outlive the call
-        // (willow-0g8j.11).
+        // The record naming this call's `&place` must not outlive the call.
+        //
         if has_reference_args {
             self.emit_flat_reference_call_end();
         }

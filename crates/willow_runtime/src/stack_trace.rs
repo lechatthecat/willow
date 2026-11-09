@@ -103,7 +103,7 @@ pub struct RuntimeStackTrace {
 /// Diagnostics of the async task last polled on this thread: its async fn name
 /// (tagged at every poll entry) and latest published site. They are kept here
 /// rather than in the shared task table so publishing costs no lock or
-/// allocation on the hot path (willow-a6o0). The owner id keeps another task
+/// allocation on the hot path. The owner id keeps another task
 /// polled on this worker from reading them, and the cell is deliberately not
 /// part of the native-stack trace exchange, so the scheduler can still read
 /// them after a poll returns. A task copies them into its record when it
@@ -172,7 +172,7 @@ thread_local! {
     /// `willow_callstack_push` with the caller name/location before each call and a matching
     /// `willow_callstack_pop` after it returns. When a call never returns (it
     /// panics/aborts), its frames remain on the stack and the panic handlers
-    /// print the chain (willow-992h).
+    /// print the chain.
     static CALL_STACK: RefCell<RuntimeStackTrace> = RefCell::new(RuntimeStackTrace::default());
 }
 
@@ -209,7 +209,7 @@ unsafe fn raw_str(ptr: *const u8, len: i64) -> String {
 
 /// Push a call frame. `function`/`file` are pointers to raw static UTF-8 bytes
 /// (NOT WillowStrings) with explicit lengths, copied onto the Rust heap so the
-/// debug call stack does not allocate on the Willow GC heap (willow-992h).
+/// debug call stack does not allocate on the Willow GC heap.
 /// Each frame names the caller and a location inside that caller.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
@@ -264,7 +264,7 @@ pub extern "C" fn willow_callstack_activate() {
 /// Flags: bit 0 identifies async source code; bit 1 enables the debug call chain;
 /// bit 2 marks a call into generated code. Release builds publish no fault
 /// location for such a call: an async callee publishes its own, and a
-/// synchronous callee's faults stay location-free (willow-9686).
+/// synchronous callee's faults stay location-free.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_trace_site_set(
@@ -279,8 +279,8 @@ pub extern "C" fn willow_trace_site_set(
     let asynchronous = flags & 1 != 0;
     let debug = flags & 2 != 0;
     if !asynchronous && !debug {
-        // Release synchronous code keeps runtime faults location-free
-        // (willow-s9ej.7); drop any site an async caller published. Current
+        // Release synchronous code keeps runtime faults location-free; drop any site an async
+        // caller published. Current
         // codegen does not publish release synchronous sites at all.
         crate::panic_context::willow_fault_site_clear();
         CALL_STACK.with(|slot| slot.borrow_mut().current = None);
@@ -458,7 +458,7 @@ mod tests {
         replace_current(previous);
     }
 
-    /// willow-9686: a release async call into generated code keeps the task's
+    /// a release async call into generated code keeps the task's
     /// own site but publishes no fault location for the callee; debug code
     /// still publishes it; and every poll boundary drops a stale location.
     #[test]

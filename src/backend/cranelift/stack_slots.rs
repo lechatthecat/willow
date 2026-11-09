@@ -1,4 +1,4 @@
-//! Conservative native root-slot coloring (willow-jz15.50).
+//! Conservative native root-slot coloring.
 //!
 //! Only single-definition locals whose entire storage lifetime is in one LIR
 //! block participate. Clears are writes and extend that lifetime; address uses,

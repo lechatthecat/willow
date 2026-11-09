@@ -126,12 +126,12 @@ pub(super) fn may_push_gc_roots(function: &LirFunction) -> bool {
 /// computation or a plain heap load. Such a body needs no entry poll — the
 /// caller's own polls bound the work around it — and no GC value it reads can
 /// move or die before it returns, so an instance method need not root its
-/// receiver (willow-8hq4.14), nor a lambda its closure environment and the
-/// captures read from it (willow-8hq4.28). The same instruction set also has
+/// receiver, nor a lambda its closure environment and the
+/// captures read from it. The same instruction set also has
 /// no panic path, so nothing jumps to the panic-return block either.
 ///
 /// Debug builds pass `overflow_checks`: their checked integer arithmetic has
-/// a panic path (willow-jz15.14).
+/// a panic path.
 ///
 /// Unknown operations, terminators and parameter modes fail closed.
 pub(super) fn is_safepoint_free_leaf(function: &LirFunction, overflow_checks: bool) -> bool {
@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn leaf_proof_accepts_captures_and_rejects_async() {
         // Captures are read from the environment like any parameter; the
-        // environment is the lambda's first parameter (willow-8hq4.28).
+        // environment is the lambda's first parameter.
         let mut function = LirFunction::empty_artifact_region();
         function.blocks = vec![LirBlock {
             id: BlockId(0),

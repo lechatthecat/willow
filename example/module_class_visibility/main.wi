@@ -3,7 +3,7 @@ import report;
 
 // A bare `Point` in this file is `shapes::Point`. Another module in the build
 // declares a class of the same name, but this file cannot see it, so it must
-// not make the name ambiguous here (willow-vtlr).
+// not make the name ambiguous here.
 fn total() -> i64 {
     let p = shapes::make(3, 4);
     return shapes::sum_of(p);

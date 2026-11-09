@@ -1,4 +1,4 @@
-//! Retained storage of released old regions (willow-8hq4.47).
+//! Retained storage of released old regions.
 //!
 //! Releasing an empty region through `dealloc` lets the system allocator trim
 //! it back to the OS, so the next region of the same size refaults every page.

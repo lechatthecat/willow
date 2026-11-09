@@ -1,5 +1,5 @@
 // A module the ENTRY file never imports -- only `relay` does. Its enums reach
-// the back end through `relay`'s checker alone, so before willow-nm0g the enum
+// the back end through `relay`'s checker alone, so before module enum table merging the enum
 // table held neither `Deep` nor `depth::Deep` under any name.
 module depth;
 

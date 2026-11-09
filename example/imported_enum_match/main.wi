@@ -1,7 +1,7 @@
 // Matching an enum that was declared in ANOTHER file, under each name an
 // import can give it: module-qualified (`palette::Color`), aliased
 // (`import palette::Color as Hue;`), and bare through a direct type import of
-// a child module's enum (`Shade`) — willow-28h8.
+// a child module's enum (`Shade`) — imported enum matching.
 import palette;
 import palette::shades::Shade;
 import palette::Color as Hue;

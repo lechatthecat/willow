@@ -10,7 +10,7 @@
 //! supported target. The semantic tests below therefore pin the
 //! [`AbiTy::Word`] / [`AbiTy::I64`] positions of each payload-carrying row in
 //! [`willow_abi::RUNTIME_SYMBOLS`] against the order the runtime declares, so a
-//! transposed row (willow-9tls.7) fails here instead of working by
+//! transposed row fails here instead of working by
 //! coincidence until the two representations diverge.
 
 use std::collections::BTreeSet;
@@ -182,7 +182,7 @@ const WORD_PINS: &[(&str, &[AbiTy], Option<AbiTy>)] = &[
     ("willow_array_pop", &[Ptr], Some(Word)),
     // (map, key_word, key_is_ref, val_word, val_is_ref): the flag for a word
     // follows that word. The old schema `[Ptr, Word, Word, I64, I64]` only
-    // linked because both kinds lower to I64 (willow-9tls.7).
+    // linked because both kinds lower to I64.
     ("willow_map_insert", &[Ptr, Word, I64, Word, I64], None),
     // (map, key_word, key_is_ref, use_niche) and (map, key_word, key_is_ref).
     ("willow_map_get", &[Ptr, Word, I64, I64], Some(Ptr)),

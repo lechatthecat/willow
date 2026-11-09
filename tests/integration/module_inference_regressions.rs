@@ -1,4 +1,4 @@
-//! Package identities, imported contracts, and inferred match values (willow-5lz8).
+//! Package identities, imported contracts, and inferred match values.
 use super::support::*;
 
 const MANIFEST: &str =
@@ -341,8 +341,8 @@ fn inferred_result_rejects_conflicting_payloads_and_shadowed_values() {
 }
 
 /// Module-qualified calls through a prefix the file only item-imported, in a
-/// real `project.toml` layout where modules carry package identities
-/// (willow-jz15.43). `willow check` and `willow build` must agree.
+/// real `project.toml` layout where modules carry package identities. `willow check` and
+/// `willow build` must agree.
 #[test]
 fn project_item_import_keeps_module_prefix_callable() {
     const A: &str = "pub enum Op { Eq, Ne }\npub fn twice(n: i64) -> i64 { return n * 2; }\n\

@@ -1,4 +1,4 @@
-// frozen_array.wi — immutable, shareable FrozenArray<T> (willow-dgwo.7).
+// frozen_array.wi — immutable, shareable FrozenArray<T>.
 //
 // `arr.freeze()` returns a FrozenArray<T>: an independent immutable copy with no
 // mutation API (reads via for-in, `[i]`, and `.len()`). Because it can never change, a

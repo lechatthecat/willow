@@ -1,5 +1,5 @@
-//! Interface → super-interface coercion when an interface has SEVERAL supers
-//! (willow-1fc6).
+//! Interface → super-interface coercion when an interface has SEVERAL supers.
+//!
 //!
 //! An interface value is a two-word box, `[object | vtable]`, and a call
 //! through it indexes the vtable by a slot number computed from the receiver's
@@ -12,8 +12,8 @@
 //!
 //! An interface's vtable now holds its composed method pointers followed by
 //! one POINTER per direct super, each aimed at that super's own table — one
-//! shared static symbol per interface rather than a copy embedded per child
-//! (willow-ssl7.5). Widening therefore loads the target's table through those
+//! shared static symbol per interface rather than a copy embedded per child. Widening
+//! therefore loads the target's table through those
 //! pointers, one load per `extends` hop, and reboxes with it; only widening an
 //! interface to itself keeps the box untouched. The tests below drive the
 //! widening from every position that stores a value, and from every shape of
@@ -75,7 +75,7 @@ fn program(rest: &str) -> String {
     format!("{DECLS}{rest}")
 }
 
-/// The program compiles and prints `expected`. Since willow-0g8j.3 a coercion
+/// The program compiles and prints `expected`. Since the lowered-IR cutover a coercion
 /// the walker refuses is a compile error, so a passing run is the proof it
 /// emitted the coercion itself.
 #[track_caller]

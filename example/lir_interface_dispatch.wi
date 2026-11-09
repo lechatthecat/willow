@@ -1,8 +1,8 @@
-// Virtual dispatch through an interface box, on the LIR-walking backend
-// (willow-0g8j.6).
+// Virtual dispatch through an interface box, on the LIR-walking backend.
+//
 //
 // An interface value is a 16-byte GC box holding `[concrete object | vtable]`.
-// Building one is boxing (willow-j260, example/lir_interface_boxing.wi); this
+// Building one is boxing (interface boxing, example/lir_interface_boxing.wi); this
 // file is about USING one: `s.area()` loads the object and the vtable out of
 // the box, indexes the vtable by the method's declaration-order slot and makes
 // an indirect call with the concrete object as the receiver. Nothing here knows
@@ -20,7 +20,7 @@
 // Building this program must print the same thing under WILLOW_GC_STRESS=alloc
 // as without it: the receiver object is only reachable through the box while
 // the arguments are evaluated, so the walker has to root it across them. Since
-// willow-0g8j.3 a body outside the walker's subset is a compile error, so this
+// the lowered-IR cutover a body outside the walker's subset is a compile error, so this
 // file compiling at all is the proof that every free function below took the
 // walker path.
 

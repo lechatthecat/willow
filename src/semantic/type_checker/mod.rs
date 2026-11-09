@@ -86,11 +86,11 @@ pub struct ResolutionContext {
     /// Whether the items being checked belong to the ENTRY program rather than
     /// an imported module. Only [`ReturnSite::EntryMain`] reads it, and only to
     /// decide whether a `main` is the real entry point — a module's `main` is
-    /// an ordinary function (willow-ltkj). `check_program` sets it; a pass that
+    /// an ordinary function. `check_program` sets it; a pass that
     /// ever checks module bodies must clear it first.
     pub(crate) entry_program: bool,
     /// The canonical path of the module these items belong to, when they are a
-    /// MODULE's (willow-itcw). A type declared here is registered under
+    /// MODULE's. A type declared here is registered under
     /// `module::Name` as well as the bare spelling its own body uses, and
     /// `normalize_type` answers the bare spelling with the qualified identity,
     /// so one enum has ONE name in every unit that can see it. `None` for the
@@ -125,7 +125,7 @@ pub struct ResolutionContext {
     /// Enforce the Send/Sync async checks (E2402-E2405). Compiler entry points
     /// always enable these; direct checker tests can isolate individual rules.
     enforce_send_sync: bool,
-    /// Whole-program instance-field reassignments (willow-jz15.78). The driver
+    /// Whole-program instance-field reassignments. The driver
     /// supplies one summary for every unit; a direct `check_program` derives
     /// it from its own program.
     field_writes: Option<std::rc::Rc<crate::semantic::field_writes::FieldWrites>>,
@@ -134,7 +134,7 @@ pub struct ResolutionContext {
     /// bare fn names), with the helper's definition span and the reason. Used
     /// to flag such a method called through a typed NON-`self` receiver from a
     /// task context (E0810) — the AST-only `ConcurrencyAnalyzer` cannot resolve
-    /// such a receiver's class (willow-0a6k.2).
+    /// such a receiver's class.
     nonpreemptible_methods: std::sync::Arc<crate::compiler_db::HelperSummary>,
     /// Non-preemptible methods of IMPORTED classes, keyed by the receiver class
     /// name as the type checker sees it (`module::Class::method` for a
@@ -142,7 +142,7 @@ pub struct ResolutionContext {
     /// to the source module's display name and the reason. Seeded from
     /// `main.rs` before `check_program`. The helper's definition span lives in
     /// another file the entry diagnostic map cannot render, so the E0810 uses a
-    /// note instead of a secondary label (willow-0a6k.2).
+    /// note instead of a secondary label.
     nonpreemptible_module_methods: HashMap<FunctionId, (String, NonpreemptibleReason)>,
     effect_index: crate::compiler_db::effects::CallableIndex,
 }
@@ -175,12 +175,12 @@ pub struct TypeChecker {
     )>,
     pub(crate) checked_bodies: Vec<BodyId>,
     /// Injected interface-default copies whose interface-level check this
-    /// unit reuses instead of checking them itself (willow-rvpp).
+    /// unit reuses instead of checking them itself.
     pub(crate) reused_bodies: Vec<BodyId>,
     /// Lambdas checked as their own `typed_body` inside the current body.
     lambdas: body::LambdaChildren,
     /// Lambdas that were checked inline because their body query had already
-    /// been evaluated (willow-afb5.17); tests assert this stays zero.
+    /// been evaluated; tests assert this stays zero.
     #[cfg(test)]
     pub(crate) inline_lambda_rechecks: usize,
     local: body::BodyState,
@@ -192,20 +192,20 @@ pub struct TypeChecker {
     /// Maps the ID of an UNQUALIFIED enum-variant construction (`Ok(42)` in an
     /// expected-enum position) to the enum it resolved to. The backend consults
     /// this to lower such a `Call` as a variant allocation instead of a function
-    /// call (willow-60o.1). The variant name is the call's callee.
+    /// call. The variant name is the call's callee.
     pub enum_variant_resolutions: HashMap<ExprId, String>,
     /// Maps an unqualified match pattern's ID (`Ok(v)` / `Closed`, which parse as
     /// `ClassDowncast` / `Binding`) to the enum-variant pattern it was
     /// reinterpreted as when the scrutinee is an enum. The backend consults this
-    /// to lower the arm as a variant match (willow-60o.1).
+    /// to lower the arm as a variant match.
     pub pattern_resolutions: HashMap<PatternId, Pattern>,
     /// Syntax-only arm-exit facts; transported with body outputs for HIR reuse.
     pub arm_leaves: HashMap<BodyId, bool>,
     /// The resolved type of every checked expression, keyed by its node ID. The
     /// authoritative record for consumers (HIR lowering) that must not
-    /// re-derive types from the AST (willow-mb5 checker pivot). A node ID is
+    /// re-derive types from the AST (typed HIR lowering checker pivot). A node ID is
     /// syntax identity rather than a source coordinate, so a pass that rebuilds
-    /// a node cannot silently inherit its neighbour's type (willow-njot).
+    /// a node cannot silently inherit its neighbour's type.
     pub expr_types: HashMap<ExprId, Type>,
     // One-shot argument results used to infer a source Array static call.
     prechecked_array_args: HashMap<ExprId, Type>,
@@ -213,8 +213,8 @@ pub struct TypeChecker {
     pub reference_arg_modes: HashMap<ExprId, ReferenceArgMode>,
     /// What every type ANNOTATION the checker normalized became: the written
     /// spelling (`Arr<i64>`, `std::result::Result<i64, String>`, a module's own
-    /// `Level`) mapped to the type the rest of the compiler uses for it
-    /// (willow-0g8j.3). HIR lowering takes annotations straight off the AST,
+    /// `Level`) mapped to the type the rest of the compiler uses for it. HIR lowering takes
+    /// annotations straight off the AST,
     /// which is the one place a written spelling could still reach the back end
     /// and be turned down as an unknown type.
     pub normalized_types: HashMap<Type, Type>,
@@ -229,13 +229,13 @@ pub struct TypeChecker {
     pub static_call_classes: HashMap<ExprId, crate::semantic::ids::TypeId>,
     /// What each lambda captures from its enclosing function, keyed by the
     /// lambda expression's ID and ordered as the closure environment lays the
-    /// slots out (willow-0g8j.2.12). An empty vector denotes a non-capturing
+    /// slots out. An empty vector denotes a non-capturing
     /// lambda; an absent entry is a missing required fact at lowering.
     pub lambda_captures: HashMap<ExprId, Vec<LambdaCapture>>,
     /// Canonical names of every class already labelled by an E0426 class
     /// `extends` cycle diagnostic. Each member of a cycle discovers the same
     /// cycle from its own declaration; the first one in declaration order
-    /// reports it and the rest stay silent (willow-jlky).
+    /// reports it and the rest stay silent.
     reported_class_cycles: ObservedSet<String>,
     invalid_type_names: std::rc::Rc<std::cell::RefCell<ObservedSet<String>>>,
     import_type_hints: std::rc::Rc<std::cell::OnceCell<HashMap<String, Vec<String>>>>,
@@ -263,7 +263,7 @@ pub struct TypeChecker {
     pub(crate) template_precheck: bool,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
     effect_inputs: crate::compiler_db::effects::EffectInputs,
-    /// Function values and indirect calls for E2604 (willow-h4t7).
+    /// Function values and indirect calls for E2604.
     indirect_lock: crate::semantic::indirect_lock::IndirectInputs,
     effect_graph_only: Option<crate::semantic::call_graph::CallGraph>,
 }
@@ -295,7 +295,7 @@ struct ReferencePlaceInfo {
     /// Set when the place is immutable because of what it *is* rather than how
     /// it was declared (a `PanicInfo` field). `&mut` on such a place is
     /// reported with this message instead of the "declare it `mut`" advice,
-    /// which would be unactionable (willow-s9ej.7).
+    /// which would be unactionable.
     immutable_reason: Option<&'static str>,
 }
 
@@ -444,8 +444,8 @@ impl TypeChecker {
         }
     }
 
-    /// Name the module whose items this checker is about to check
-    /// (willow-itcw), so its own declarations get a canonical identity. Call
+    /// Name the module whose items this checker is about to check, so its own declarations get
+    /// a canonical identity. Call
     /// before `check_module_program`; the entry program leaves it unset.
     pub(crate) fn capture_generic_call_targets(&mut self) {
         self.capture_call_sites = true;
@@ -460,13 +460,13 @@ impl TypeChecker {
     }
 
     /// Enable the Send/Sync async checks. Turned on when targeting multi-worker
-    /// execution (willow-dgwo.4/.9).
+    /// execution.
     pub fn set_enforce_send_sync(&mut self, on: bool) {
         self.enforce_send_sync = on;
     }
 
     /// Supply the whole-program field-write summary before registering any
-    /// class, so imported and local `FieldInfo`s agree (willow-jz15.78).
+    /// class, so imported and local `FieldInfo`s agree.
     pub(crate) fn set_field_writes(
         &mut self,
         writes: std::rc::Rc<crate::semantic::field_writes::FieldWrites>,
@@ -494,7 +494,7 @@ impl TypeChecker {
 
     /// Seed the non-preemptible methods of imported classes (keyed by receiver
     /// class name -> source module display name and reason) so a cross-module
-    /// typed-receiver call to one is flagged E0810 (willow-0a6k.2). Call before
+    /// typed-receiver call to one is flagged E0810. Call before
     /// `check_program`.
     pub fn set_nonpreemptible_module_methods(
         &mut self,
@@ -504,7 +504,7 @@ impl TypeChecker {
     }
 
     /// The one name an enum answers to build-wide, given any spelling this unit
-    /// can reach it by (willow-itcw). Every other type name is its own identity
+    /// can reach it by. Every other type name is its own identity
     /// and passes through: a class or interface is only ever registered by one
     /// unit's checker, while enums are registered by every unit that can see
     /// them and share one back-end table.
@@ -517,10 +517,10 @@ impl TypeChecker {
 
     /// Whether this unit may write the enum's members with no enum name in
     /// front of them. A unit spells an enum bare when it declares it or when it
-    /// item-imported it (willow-64gs); one that only reaches the enum through
+    /// item-imported it; one that only reaches the enum through
     /// `module::Enum` may not, so a module's variants stay invisible to its
-    /// importers even though both now agree on the enum's identity
-    /// (willow-itcw).
+    /// importers even though both now agree on the enum's identity.
+    ///
     pub(super) fn enum_nameable_bare(&self, identity: &str) -> bool {
         self.symbols.enum_nameable_bare(identity)
     }
@@ -1131,7 +1131,7 @@ impl TypeChecker {
                 }
                 // `PanicInfo` is runtime-owned panic metadata: direct assignment
                 // is already rejected, and `&mut info.line` must not be a way
-                // around that (willow-s9ej.7).
+                // around that.
                 let panic_info_field = obj_ty == Type::Named("PanicInfo".to_string());
                 Some(ReferencePlaceInfo {
                     name: reference_place_key(expr).unwrap_or_else(|| field_name.clone()),
@@ -1301,7 +1301,7 @@ impl TypeChecker {
 
     /// Two values of distinct types that both convert to the type their
     /// expression flows into (return type, `let` annotation, argument) take
-    /// that type, e.g. two classes implementing one interface (willow-jz15.47).
+    /// that type, e.g. two classes implementing one interface.
     fn unify_to_expected(&self, expected: Option<&Type>, a: &Type, b: &Type) -> Option<Type> {
         let expected = expected?;
         #[cfg(test)]
@@ -1312,7 +1312,7 @@ impl TypeChecker {
 
     /// Help for a `match`/ternary whose values have incompatible types and no
     /// expected type: name a base class or interface of `a` that `b` also
-    /// converts to, when one exists. Diagnostic path only (willow-jz15.47).
+    /// converts to, when one exists. Diagnostic path only.
     fn common_supertype_help(&self, a: &Type, b: &Type) -> String {
         let mut current = match a {
             Type::Named(name) => Some(name.clone()),
@@ -1579,7 +1579,7 @@ impl TypeChecker {
                 }
                 // A generic enum or interface is a type family, not a type: the
                 // bare name supplies no type arguments, so nothing downstream can
-                // instantiate it (willow-rlq9).
+                // instantiate it.
                 self.check_type_argument_count(name, 0, span);
                 self.check_type_visibility(name, span);
             }
@@ -1593,8 +1593,8 @@ impl TypeChecker {
         normalized
     }
 
-    /// Validate `ty` as written inside a declaration that binds `type_params`
-    /// (willow-rlq9). Runs after every declaration is registered, so a
+    /// Validate `ty` as written inside a declaration that binds `type_params`. Runs after
+    /// every declaration is registered, so a
     /// forward reference resolves, and with the parameters in scope, so `T`
     /// is a parameter rather than an unknown type.
     pub(super) fn validate_declared_type(&mut self, ty: &Type, type_params: &[String], span: Span) {
@@ -1604,7 +1604,7 @@ impl TypeChecker {
     }
 
     /// Check a written type's type-argument count against the declaration
-    /// its head names (willow-rlq9). Only declarations the symbol table owns
+    /// its head names. Only declarations the symbol table owns
     /// are judged here; a compiler-known generic (`Map<K, V>`, `Task<T>`,
     /// `Mutex<T>`, ...) is not a symbol, and the std ones already have their
     /// arity checked when the spelling is normalized.
@@ -1911,10 +1911,10 @@ impl TypeChecker {
 
     /// Two spellings of ONE interface: `Describable`, bound bare by an item
     /// import, against the `proto::Describable` a module that imported it the
-    /// same way now writes in its public signature (willow-sxcp). An interface
+    /// same way now writes in its public signature. An interface
     /// is registered under the access spelling of whichever unit brought it in,
     /// so only its registered name is an identity both units share -- the
-    /// reasoning `class_extends` already applies to classes (willow-2egr).
+    /// reasoning `class_extends` already applies to classes.
     fn same_interface(&self, expected: &Type, actual: &Type) -> bool {
         let named = |ty: &Type| match ty {
             Type::Named(name) | Type::Generic(name, _) => self.symbols.lookup_interface(name),
@@ -1951,7 +1951,7 @@ impl TypeChecker {
 
     fn is_subtype(&self, actual: &Type, expected: &Type) -> bool {
         // An interface default's opaque receiver converts to its interface,
-        // and on from there (willow-dnia).
+        // and on from there.
         if let (Type::Named(name), Some(interface)) = (actual, &self.local.self_interface)
             && name == "Self"
         {
@@ -1961,27 +1961,27 @@ impl TypeChecker {
             (Type::Named(child), Type::Named(parent)) => {
                 // A class is a subtype of its base class, and of any interface it
                 // implements (directly or through an ancestor); an interface is a
-                // subtype of any interface it transitively extends (willow-1js.2).
+                // subtype of any interface it transitively extends.
                 self.class_extends(child, parent)
                     || self.class_implements_interface(child, expected)
                     || self.interface_extends(child, parent)
             }
             // A class is a subtype of a generic interface instantiation it
-            // implements, e.g. `Dog` <: `Box<String>` (willow-1js.1).
+            // implements, e.g. `Dog` <: `Box<String>`.
             (Type::Named(child), Type::Generic(_, _)) => {
                 self.class_implements_interface(child, expected)
             }
             // A generic interface instantiation is a subtype of every
             // interface its declaration extends: `extends` names no type
-            // arguments (E0427), so `Get<i64>` <: `Base` (willow-rktm).
+            // arguments (E0427), so `Get<i64>` <: `Base`.
             (Type::Generic(child, _), Type::Named(parent)) => self.interface_extends(child, parent),
             _ => false,
         }
     }
 
     /// True when error type `e1` can be converted to `e2` for `?` automatic
-    /// error conversion: `e1` is a concrete class implementing `Into<e2>`
-    /// (willow-1ow).
+    /// error conversion: `e1` is a concrete class implementing `Into<e2>`.
+    ///
     fn err_converts_via_into(&self, e1: &Type, e2: &Type) -> bool {
         let Type::Named(e1_name) = e1 else {
             return false;
@@ -1996,7 +1996,7 @@ impl TypeChecker {
         // Compare class identity by the registered (canonical) name so a
         // directly-imported subclass alias (`Dog`) is recognized as extending a
         // module base whose `base_class` is qualified (`shp::Animal`), and the
-        // bare imported parent alias (`Animal`) matches it (willow-2egr).
+        // bare imported parent alias (`Animal`) matches it.
         let canon = |n: &str| -> String {
             self.symbols
                 .lookup_class(n)
@@ -2028,7 +2028,7 @@ impl TypeChecker {
     /// chain order starting at the first class the walk met twice, or `None`
     /// when the chain ends at a class with no (registered) base. A class that
     /// merely extends INTO a cycle gets that cycle back too; the caller tells
-    /// the two apart by membership (willow-jlky).
+    /// the two apart by membership.
     ///
     /// Identity is the registered `ClassInfo::name`, as in `class_extends`, so
     /// a chain that comes back through an imported alias still closes.
@@ -2193,8 +2193,8 @@ fn param_infos_from_decl(params: &[Param], module_prefix: Option<&str>) -> Vec<P
 /// `qualify` turns a type as the module wrote it into the name that type
 /// answers to in the checker doing the registering: a module-local name gets
 /// the module's spelling, and a name the module reached through an item import
-/// of its own gets the key the DECLARING module's type is registered under
-/// (willow-sxcp). It replaces a plain `module_prefix`, which prefixed every
+/// of its own gets the key the DECLARING module's type is registered under. It replaces a
+/// plain `module_prefix`, which prefixed every
 /// bare name blindly and so exported `mid::Parcel` — a class no unit declares —
 /// for a base, field, or parameter that came from `import base::Parcel;`.
 fn imported_class_info_from_decl(
@@ -2293,7 +2293,7 @@ fn imported_class_info_from_decl(
             // `import base::Parcel;` names the base module's class, not one of
             // this module's. A QUALIFIED one because the module wrote it in its
             // own spelling of that module -- `extends biz::Amount` -- which the
-            // checker may have registered under another (willow-uvlp).
+            // checker may have registered under another.
             let written = base.spelling();
             match &qualify(&Type::Named(written)) {
                 Type::Named(qualified) => qualified.clone(),
@@ -3129,7 +3129,7 @@ fn f() {
     }
 
     // Builtin static constructors have no `ParamInfo` to check the argument
-    // mode against, so each one rejects `&arg` explicitly (willow-o038 review).
+    // mode against, so each one rejects `&arg` explicitly.
     #[test]
     fn unit_builtin_ref_01_channel_with_capacity_rejects_reference_argument() {
         assert_typecheck_error_contains(
@@ -4494,7 +4494,7 @@ fn f() {
         );
     }
 
-    // ── 50 for-loop unit perspectives (willow-u39v) ─────────────────────────
+    // ── 50 for-loop unit perspectives ─────────────────────────
     // Range basics and static loop-variable rules.
 
     for_loop_ok_case!(
@@ -5631,7 +5631,7 @@ fn f(value: Option<i64>) -> bool {
         );
     }
 
-    // ── Interface conformance (willow-t8b, spec 7 / 15) ────────────────────
+    // ── Interface conformance (interface conformance, spec 7 / 15) ────────────────────
 
     #[test]
     fn iface_01_exact_match_ok() {
@@ -5836,7 +5836,7 @@ class Dog implements Animal, Animal {
     fn iface_16b_phantom_generic_two_instantiations_ok() {
         // A phantom type parameter (used in no method signature) lets a class
         // implement two instantiations of the same generic interface; the dup
-        // check keys on the full instantiated type, not the name (willow-1js.6).
+        // check keys on the full instantiated type, not the name.
         assert_typecheck_ok(
             r#"
 interface Tagged<T> { fn tag_name(self) -> String; }
@@ -5896,8 +5896,8 @@ class Dog implements Animal {
     #[test]
     fn iface_18_static_method_cannot_satisfy_instance_requirement() {
         // With implicit `self`, a plain `fn speak()` IS an instance method and
-        // satisfies the interface. Only a `static fn` (no receiver) is rejected
-        // (willow-qsqf).
+        // satisfies the interface. Only a `static fn` (no receiver) is rejected.
+        //
         assert_typecheck_error_contains(
             r#"
 interface Animal { fn speak(self) -> String; }
@@ -5994,7 +5994,7 @@ class Robot {
         );
     }
 
-    // ── Interface assignability + method resolution (willow-xds type side) ──
+    // ── Interface assignability + method resolution ──
 
     const ANIMAL_DOG: &str = r#"
 interface Animal { fn speak(self) -> String; }
@@ -6108,7 +6108,7 @@ fn f() { let h = new Holder(new Rock()); }
     #[test]
     fn iface_36_nonempty_array_literal_with_interface_annotation() {
         // Differing classes that both implement the interface are accepted
-        // element-wise against the annotation (willow-w8af).
+        // element-wise against the annotation.
         assert_typecheck_ok(&format!(
             "import std::collections::Array;\n{ANIMAL_DOG}\nclass Cat implements Animal {{ pub fn speak(self) -> String {{ return \"meow\"; }} }}\nfn f() {{ let xs: Array<Animal> = [new Dog(), new Cat()]; }}"
         ));
@@ -6140,7 +6140,7 @@ fn f() { let xs: Array<Animal> = [new Dog(), new Rock()]; }
         );
     }
 
-    // ── Interface method parameter MODES (willow-0g8j.9)
+    // ── Interface method parameter MODES
     //
     // A `&`/`&mut` parameter is passed as a POINTER, so the mode is part of an
     // interface method's ABI, not decoration. Dropping it let a by-value
@@ -6999,7 +6999,7 @@ async fn f() {
         );
     }
 
-    // ── Exponentiation `**` typing (willow-n5yv.2, willow-n5yv.3) ────────────
+    // ── Exponentiation `**` typing ────────────
     //
     // `**` has exactly two signatures: `i64 ** i64 -> i64` and
     // `f64 ** f64 -> f64`. Both lower natively; mixed numeric operands remain
@@ -7192,7 +7192,7 @@ async fn f() {
 
     // Perspective 16: a negative exponent still parses without parentheses, but
     // an integer power has no fractional result, so the literal form is a
-    // compile error rather than a guaranteed runtime panic (willow-n5yv.3).
+    // compile error rather than a guaranteed runtime panic.
     #[test]
     fn pow_type_16_negative_integer_exponent_literal_is_rejected() {
         let errors = check_source("fn main() { let x: i64 = 2 ** -3; }");
@@ -7301,11 +7301,11 @@ async fn f() {
         assert_pow_accepted("fn main() { let x: i64 = 2 ** 3; }");
     }
 
-    // ── Scheduler-aware `lock` statement (willow-38w.1.1) ────────────────────
+    // ── Scheduler-aware `lock` statement ────────────────────
     //
-    // The Mutex form is fully lowered as of willow-38w.1.4, so a well-formed
+    // The Mutex form is fully lowered as of mutex lowering, so a well-formed
     // `lock <mutex> as [mut] v` now type-checks with NO diagnostics at all.
-    // `lock read`/`lock write` are fully lowered as of willow-38w.1.5 too.
+    // `lock read`/`lock write` are fully lowered as of read/write lock lowering too.
 
     /// Historical helper name retained for the perspective table; no staged
     /// gate exists after Stage 5, so this is the complete error list.
@@ -7625,7 +7625,7 @@ async fn f() {
 
     // Perspective 28: a malformed lock does NOT raise the staged gate — the
     // type error is the useful message, and the gate would bury it. The Mutex
-    // form never gates at all now that it is lowered (willow-38w.1.4).
+    // form never gates at all now that it is lowered.
     #[test]
     fn lock_check_28_gate_only_fires_for_well_formed_locks() {
         for source in [
@@ -7690,7 +7690,7 @@ async fn f() {
         }
     }
 
-    // Perspective 30: the Mutex API cutover (willow-38w.1.4). `Mutex<T>` has no
+    // Perspective 30: the Mutex API cutover. `Mutex<T>` has no
     // accessors at all — the help routes to `lock` and to `BlockingCell<T>` —
     // while `BlockingCell<T>` and `BlockingRwCell<T>` keep theirs.
     #[test]
@@ -7771,7 +7771,7 @@ async fn f() {
     }
 
     // Perspectives 35-38 cover what makes the E2604 scan SEMANTIC rather than
-    // the Stage 1 `await`/`select` syntax scan (willow-38w.1.4). Removing the
+    // the Stage 1 `await`/`select` syntax scan. Removing the
     // codegen gate for the Mutex form is only safe if every operation that can
     // park the task is caught, and whether an operation parks depends on the
     // RECEIVER'S TYPE, which syntax alone cannot answer.
@@ -8127,7 +8127,7 @@ async fn f() {
         );
     }
 
-    // ── `lock` inside a `match` arm (willow-0g8j.3) ──────────────────────────
+    // ── `lock` inside a `match` arm ──────────────────────────
     //
     // Stage 5 lowers an arm that contains a lock to explicit LIR blocks, so a
     // contended acquisition has the same frame-backed resume edge as a lock in
@@ -8360,7 +8360,7 @@ async fn f() {
         );
     }
 
-    // ── The lambda boundary (willow-3kty) ────────────────────────────────────
+    // ── The lambda boundary ────────────────────────────────────
     //
     // A lambda has no `async` form in the grammar and the backend lifts its
     // body into a plain private function, so the body is NOT part of the
@@ -8464,7 +8464,7 @@ async fn f() {
     // 5-7. The other half: the enclosing body resumes with its own counters.
     //
     // Perspective 5 used to read the arm counter through E2606. Stage 5 lowers
-    // a lock in an arm to explicit blocks and the rule is gone (willow-0g8j.3),
+    // a lock in an arm to explicit blocks and the rule is gone,
     // so what is pinned here is the shape itself: an arm that runs a lambda and
     // then acquires a lock is accepted, with no residue of the lambda's own
     // (synchronous, E2603-worthy) body left behind on the enclosing async fn.
@@ -8582,7 +8582,7 @@ async fn f() {
     }
 
     // 12. The reset that was already there stays there: an enclosing loop is
-    // not breakable from inside a lambda body (willow-kzka).
+    // not breakable from inside a lambda body.
     #[test]
     fn lock_lambda_12_loop_depth_still_resets_at_the_boundary() {
         assert_lock_error_count(
@@ -8624,7 +8624,7 @@ async fn f() {
         }
     }
 
-    // ── Panic/recover runtime surface (willow-s9ej.2) ──────────────────────
+    // ── Panic/recover runtime surface ──────────────────────
 
     #[test]
     fn panic_surface_01_recover_has_option_panic_info_type() {
@@ -8710,7 +8710,7 @@ async fn f() {
         assert_typecheck_ok("fn main() { defer { let value: Option<PanicInfo> = recover(); } }");
     }
 
-    // Review follow-ups (willow-s9ej.10). A bare `recover(...)` call always
+    // Review follow-ups. A bare `recover(...)` call always
     // lowers to the builtin, so any binding of that name would be silently
     // ignored at the call site: the name is reserved at every binding site,
     // not only for top-level functions.
@@ -8903,7 +8903,7 @@ mod continuation_depth_tests {
         nesting
     }
 
-    /// willow-5gke: generic calls, match guards and callable lambdas each
+    /// generic calls, match guards and callable lambdas each
     /// re-entered a synchronous checker wrapper per nesting level.
     #[test]
     fn generic_calls_guards_and_callable_lambdas_deep_on_one_mib() {
@@ -8983,7 +8983,7 @@ mod type_identity_scaling_tests {
     /// `implements` entries are matched against an alias-spelled generic target
     /// without allocating canonical copies: each entry costs one visit per node
     /// up to its first mismatch, so a lookup is linear in the entries' combined
-    /// size (willow-jz15.45).
+    /// size.
     #[test]
     fn implements_lookup_visits_each_entry_node_once() {
         let mut checker = TypeChecker::new();
@@ -9019,7 +9019,7 @@ mod type_identity_scaling_tests {
     /// Interface conformance compares each required signature by identity in
     /// one structural pass: every parameter and return node is visited once
     /// per requirement, so checking a class is linear in its interface's
-    /// signature size, however the class spells the types (willow-k6n9).
+    /// signature size, however the class spells the types.
     #[test]
     fn conformance_visits_each_signature_node_once() {
         let parse = |source: &str| {
@@ -9098,7 +9098,7 @@ mod loop_exit_arms_tests;
 mod import_diagnostic_tests;
 
 #[cfg(test)]
-mod ticket_69_tests;
+mod unsupported_syntax_diagnostic_tests;
 
 #[cfg(test)]
 thread_local! {

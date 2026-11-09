@@ -213,7 +213,7 @@ fn assert_satb_variant_mutation_retains(
     });
 }
 
-/// willow-jz15.53: while concurrently marking, write barriers and logical
+/// while concurrently marking, write barriers and logical
 /// deletions publish into the cycle's shard buffers without the heap lock.
 /// The closure/remark drain seals the shards and enqueues their entries;
 /// later publications take the heap-locked path.
@@ -776,7 +776,7 @@ static ASSIST_ABORT: AtomicBool = AtomicBool::new(false);
 // Preserve the cause without unwinding out of a GC trace callback or off a
 // worker thread. The collector owns live cycle state while a callback runs,
 // and a thread that unwinds out of the fixture cannot report anything itself,
-// so every failure becomes a flag the main thread asserts on (willow-utqy).
+// so every failure becomes a flag the main thread asserts on.
 const MARKER_NEVER_TRACED: usize = 1;
 const REMARK_NEVER_REQUESTED: usize = 4;
 const CYCLE_MISSING: usize = 8;
@@ -934,7 +934,7 @@ fn remark_waits_for_an_in_flight_mutator_assist() {
         std::thread::spawn(move || {
             // The guard, not a trailing call, owns the unregistration: this
             // thread must leave the mutator registry even if it unwinds, or
-            // the collector waits for it forever (willow-utqy).
+            // the collector waits for it forever.
             let _mutator = crate::gc::MutatorRegistration::new();
             ready.store(true, Ordering::Release);
             if await_assist_step(
@@ -3527,7 +3527,7 @@ fn run_wedge_child(test: &str) -> std::process::Output {
 }
 
 /// Without the bound, this is the shape that spent a whole 90-minute Windows
-/// CI job inside one `cv.wait` and printed nothing at all (willow-utqy).
+/// CI job inside one `cv.wait` and printed nothing at all.
 #[test]
 fn a_mutator_that_dies_registered_reports_instead_of_hanging_the_collector() {
     let test = "gc::concurrent_tests::a_mutator_that_dies_registered_reports_instead_of_hanging_the_collector";

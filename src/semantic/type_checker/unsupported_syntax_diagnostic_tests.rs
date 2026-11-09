@@ -1,4 +1,4 @@
-//! Diagnostic recovery regressions for willow-jz15.69.
+//! Diagnostic recovery regressions.
 use super::*;
 use crate::{lexer::Lexer, parser::Parser};
 
@@ -25,7 +25,7 @@ fn diagnostics(source: &str) -> Vec<Diagnostic> {
 }
 
 #[test]
-fn ticket_69_loop_hint_and_identifier_compatibility() {
+fn loop_hint_and_identifier_compatibility() {
     for source in [
         "fn main() { loop {} }",
         "fn main() { loop { break; } }",
@@ -60,7 +60,7 @@ fn ticket_69_loop_hint_and_identifier_compatibility() {
 }
 
 #[test]
-fn ticket_69_invalid_patterns_do_not_cascade() {
+fn invalid_patterns_do_not_cascade() {
     for (scrutinee, arms) in [
         (
             "f64::parse(\"1\")",
@@ -91,7 +91,7 @@ fn ticket_69_invalid_patterns_do_not_cascade() {
 }
 
 #[test]
-fn ticket_69_independent_errors_and_valid_exhaustiveness_survive() {
+fn independent_errors_and_valid_exhaustiveness_survive() {
     for (source, code) in [
         (
             "fn main() { match f64::parse(\"1\") { Some(x) => println(missing), _ => println(0) } }",
@@ -119,7 +119,7 @@ fn ticket_69_independent_errors_and_valid_exhaustiveness_survive() {
 }
 
 #[test]
-fn ticket_69_collection_imports_and_unresolved_warnings() {
+fn collection_imports_and_unresolved_warnings() {
     for annotation in ["FrozenMap<i64, i64>", "FrozenArray<i64>"] {
         let name = annotation.split('<').next().unwrap();
         let source = format!(
@@ -163,7 +163,7 @@ fn ticket_69_collection_imports_and_unresolved_warnings() {
 }
 
 #[test]
-fn ticket_69_recovery_visits_each_binding_once() {
+fn recovery_visits_each_binding_once() {
     use super::check_lambda_match::INVALID_PATTERN_BINDINGS;
     for arms in [8, 32, 128] {
         let source = format!(

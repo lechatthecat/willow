@@ -1,4 +1,4 @@
-// `if let`, `while let` and match guards (willow-jz15.6).
+// `if let`, `while let` and match guards.
 //
 // `if let P = e { ... } else { ... }` runs the first block when `e` matches `P`,
 // with `P`'s bindings in scope there only. `while let P = e { ... }` loops while

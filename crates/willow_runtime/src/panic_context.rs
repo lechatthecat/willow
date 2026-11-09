@@ -1,4 +1,4 @@
-//! Explicit Willow language-panic state (willow-s9ej.2).
+//! Explicit Willow language-panic state.
 //!
 //! This module is deliberately independent of Rust unwinding. A context owns a
 //! stack of GC-rooted [`PanicInfo`] objects; generated code in later stages will
@@ -33,7 +33,7 @@ struct PanicRecord {
     info: usize,
     /// Diagnostic metadata is captured at raise time. Generated propagation
     /// balances and removes caller shadow frames before an outer boundary
-    /// eventually reports the panic (willow-s9ej.4).
+    /// eventually reports the panic.
     call_stack: String,
     async_stack: String,
     reference_call: Option<String>,
@@ -61,7 +61,7 @@ pub struct PanicContext {
     /// Preemption request flag of the owning task. It shares this immovable
     /// `Arc` allocation instead of a separate box per task: task records move
     /// on task-table rehash, and the flag's address must stay valid while a
-    /// worker polls the task (willow-lk92). Unused by synchronous contexts.
+    /// worker polls the task. Unused by synchronous contexts.
     preempt_flag: AtomicBool,
 }
 
@@ -388,7 +388,7 @@ pub extern "C" fn willow_fault_site_clear() {
 /// execution. Requiring an active panic record on top of it would drop the
 /// guard exactly where it is still needed — after `recover()` consumed the
 /// panic but the deferred body is still running, and throughout cancellation
-/// cleanup, which has no panic record at all (willow-s9ej.7).
+/// cleanup, which has no panic record at all.
 pub(crate) fn panic_unwind_cleanup_active() -> bool {
     current_context().is_some_and(|context| context.snapshot().panic_defer_depth > 0)
 }
@@ -1139,8 +1139,8 @@ mod tests {
 
     // ── Stage 6 acceptance: counters, stress, and worker isolation ──────────
     //
-    // These prove cleanup with numbers instead of program output
-    // (willow-s9ej.7). Every one of them measures runtime roots, context
+    // These prove cleanup with numbers instead of program output. Every one of them measures
+    // runtime roots, context
     // counters, or per-task ownership rather than only asserting that a panic
     // message came back.
 
@@ -1525,7 +1525,7 @@ mod tests {
     // Array bounds, blocked channel operations and cancelled awaits are raised
     // from Rust, which has no Willow span. Debug builds publish the enclosing
     // statement first, so the recovered `PanicInfo` is not `:0:0`
-    // (willow-s9ej.7 review finding 6).
+    // (panic recovery review finding 6).
 
     /// Publish a fault site the way generated debug code does.
     fn set_fault_site(file: &str, line: i64, column: i64) {

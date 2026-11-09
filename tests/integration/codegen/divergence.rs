@@ -1,6 +1,6 @@
 use super::*;
 
-// ── divergence at runtime (willow-0g8j.2.5) ─────────────────────────────────
+// ── divergence at runtime ─────────────────────────────────
 //
 // The `d*` unit tests in `src/backend/cranelift/lir_gen.rs` pin the
 // eligibility boundary. These pin the BEHAVIOUR: a `panic` is an unwind, not a
@@ -229,7 +229,7 @@ fn lirreq_57_function_values_example_is_fully_lir() {
 
 #[test]
 fn lirreq_59_closures_example_is_fully_lir() {
-    // The capturing half of the same contract (willow-0g8j.2.12). A closure
+    // The capturing half of the same contract. A closure
     // brings an environment allocation, a hidden leading argument and an
     // indirect call whose address comes out of a heap word, so a body that
     // slipped out of the walker's subset would show up here as a compile error

@@ -1,5 +1,5 @@
-//! Statements inside `match` arm bodies, compiled from Lowered IR
-//! (willow-0g8j.2.13).
+//! Statements inside `match` arm bodies, compiled from Lowered IR.
+//!
 //!
 //! A `match` used as a STATEMENT is how Willow spells a multi-way store, and the
 //! walker previously admitted only arms whose body was a single expression. A
@@ -15,7 +15,7 @@
 //! collected rather than merely at risk.
 //!
 //! A `let` is admitted only where the bracket exists. A `select` case has one of
-//! its own, so it takes a `let` too, and as of willow-0g8j.3 so does a `defer`
+//! its own, so it takes a `let` too, and as of the lowered-IR cutover so does a `defer`
 //! block: `emit_deferred_action` brackets a replayed body the same way, so the
 //! rooted slot a binding takes is popped at every exit the registration is live
 //! for. Perspectives 18, 19 and 20 pin that down from all three sides.
@@ -637,7 +637,7 @@ fn main() {
     );
 }
 
-// 18. A `let` in a deferred block is admitted (willow-0g8j.3). The unwinder
+// 18. A `let` in a deferred block is admitted. The unwinder
 //     replays that body inside the bracket `emit_deferred_action` opens for it,
 //     so the GC-managed binding's rooted slot is popped again on the way out and
 //     the code after the flush stays at the depth it was emitted for. Run under

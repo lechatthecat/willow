@@ -1,10 +1,10 @@
-//! A module body is emitted with its OWN checker's tables (willow-9vvn).
+//! A module body is emitted with its OWN checker's tables.
 //!
 //! `compile_program_with_modules` registers the backend's span-keyed
 //! resolution tables — `enum_variant_resolutions`, `pattern_resolutions`,
 //! `expr_types`, `static_call_classes` — exactly once, from the ENTRY file's
 //! checker. But a module is type-checked
-//! in its own scope by `typecheck_modules` (willow-3eo1), so everything those
+//! in its own scope by `typecheck_modules`, so everything those
 //! passes resolved inside a module body lived in a checker the backend never
 //! saw. Module bodies were emitted against an empty resolution table.
 //!
@@ -28,7 +28,7 @@
 //! `file_id` of the file it came from, so a module's keys can never collide
 //! with the entry file's or with another module's.
 //!
-//! The LIR walker was already correct here — willow-0g8j.16 lowers each module
+//! The LIR walker was already correct here — module body lowering lowers each module
 //! with its own `CheckerTables` — so every perspective below pins the ANSWER a
 //! module's own tables produce, which is what the divergence used to corrupt.
 

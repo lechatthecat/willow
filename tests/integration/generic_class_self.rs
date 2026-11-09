@@ -1,4 +1,4 @@
-//! Generic class receiver identity (willow-sfab).
+//! Generic class receiver identity.
 use super::support::*;
 
 fn runs(files: &[(&str, &str)], expected: &str) {

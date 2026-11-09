@@ -18,7 +18,7 @@
 // One restriction is deliberate and visible in what this program does NOT do:
 // no arm has a block body, since a `return` or a local declaration inside an
 // arm is a statement form the walker has no emitter for in expression position,
-// and since willow-0g8j.3 that is a compile error rather than a fallback.
+// and since the lowered-IR cutover that is a compile error rather than a fallback.
 //
 // Generic enums are no longer a restriction here. `Option` and `Result` are
 // ordinary generic enums and the walker compiles them too, including the

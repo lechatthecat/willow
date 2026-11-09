@@ -1,4 +1,4 @@
-//! Receiver-root reuse (willow-dcre): stack snapshots pin SSA receivers;
+//! Receiver-root reuse: stack snapshots pin SSA receivers;
 //! async-frame snapshots must retain their additional direct root.
 use super::support::{compile_and_collect_panic_events_mode, compile_and_run_gc_stress_all};
 
@@ -156,8 +156,8 @@ fn repeated_stack_calls_add_only_entry_roots() {
                 .count()
         };
         // Lowering keeps both the operand and prepared receiver snapshots in
-        // entry-rooted slots, and successive calls reuse those slots
-        // (willow-jz15.50). Dispatch must not add a root per call.
+        // entry-rooted slots, and successive calls reuse those slots. Dispatch must not add a
+        // root per call.
         assert_eq!(roots(8) - roots(1), 0, "release={release}");
     }
 }

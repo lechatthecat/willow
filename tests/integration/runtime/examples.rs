@@ -1041,7 +1041,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
                 "  message: array index out of bounds: the length is 3 but the index is 9\n",
                 "  file set: true\n",
                 // The location of the faulting statement inside `lookup`, not
-                // of the caller that invoked it (willow-s9ej.7 review).
+                // of the caller that invoked it.
                 "  raised at line 23\n",
                 "-1\n",
                 "missing value:\n",
@@ -1073,7 +1073,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             ),
         ),
         // One shared virtual-dispatch union feeding both the may-panic and the
-        // lock-effect analyses (willow-uqzx.1.2). `recovered:` proves the
+        // lock-effect analyses. `recovered:` proves the
         // landing pad survived a panic that only a subclass override raises;
         // the three balances prove the locked sections still run.
         (
@@ -1089,7 +1089,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             ),
         ),
         // One effect lattice and one fixpoint behind may-panic, E2604, and
-        // E0810 (willow-uqzx.1.3). `no panic` proves the pure chain kept its
+        // E0810. `no panic` proves the pure chain kept its
         // proof, `recovered: division by zero` proves a seed on `ratio`
         // propagated two hops to `guarded_average`, and `111` proves the eager
         // async call left the critical section wait-free.
@@ -1129,7 +1129,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             ),
         ),
         // Every intrinsic family the resolver owns, in source order
-        // (willow-uqzx, catalog item 7). A lowering that goes missing changes a
+        // (shared compiler infrastructure, catalog item 7). A lowering that goes missing changes a
         // line here instead of failing silently.
         (
             "example/intrinsic_methods.wi",
@@ -1219,7 +1219,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "5\n5\n5\n5\n5\n5\n5\n5\n5\n5\nfive\n2.5\ntrue\n5\n5\n5\n5\n5\n5\n5\n",
         ),
         ("example/rename_values/main.wi", "14\n7\n9\n"),
-        // Examples added without a catalog entry (found by willow-jz15.94).
+        // Examples added without a catalog entry (found by the example audit).
         (
             "example/array_runtime_marker.wi",
             "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
@@ -1909,7 +1909,7 @@ fn test_future_example_catalog_covers_planned_features() {
         .join("\n");
 
     // `enum`/`match` graduated from future/ when statement-position match
-    // shipped (willow-zvkv, example/pattern_matching.wi).
+    // shipped (statement-position matching, example/pattern_matching.wi).
     let required_fragments = ["import ", "class ", "extends ", "String", "[i64]", "for "];
 
     for fragment in required_fragments {

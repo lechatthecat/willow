@@ -1,4 +1,4 @@
-// Advanced interface features across a module boundary (willow-1js):
+// Advanced interface features across a module boundary:
 //   - interface inheritance (`Greeter extends Named`)
 //   - a default method (`greet`) that calls a required method
 //   - a generic interface (`Box<T>`) with a generic default method (`dup`)

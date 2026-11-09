@@ -1,4 +1,4 @@
-//! Scheduler scaling and footprint measurements (willow-ezs.2, willow-ezs.3).
+//! Scheduler scaling and footprint measurements.
 //!
 //! These are measurements, not assertions about wall-clock time: they print a
 //! CSV table and only assert the invariants that must hold regardless of the
@@ -20,7 +20,7 @@
 //! count is the quadratic behavior this work removed. `bytes_per_task` reports
 //! the inline `RuntimeTask` size plus the heap its metadata owns.
 //!
-//! ## Checked-in footprint record (willow-ezs.3)
+//! ## Checked-in footprint record
 //!
 //! Requested heap bytes per task at 10,000 simultaneously active tasks, release
 //! build, **measured through a counting global allocator** rather than estimated
@@ -93,7 +93,7 @@ const TASK_COUNTS: [usize; 4] = [1_000, 2_500, 5_000, 10_000];
 /// Besides the process-wide totals it keeps per-thread counters, which is what
 /// a single-threaded allocation *assertion* needs: the process totals move
 /// under every other test thread in the same binary, the thread-local ones see
-/// only the calling thread's own work (willow-ssl7.7).
+/// only the calling thread's own work.
 #[cfg(test)]
 pub(crate) mod counting_allocator {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -209,7 +209,7 @@ fn report(case: &str, tasks: usize, elapsed: std::time::Duration, bytes_per_task
 fn task_metadata_bytes(task: &RuntimeTask) -> usize {
     let id = std::mem::size_of::<RuntimeTaskId>();
     let entry = id + std::mem::size_of::<u64>();
-    // The lazy wait/debug boxes themselves (willow-ezs.3): a task that never
+    // The lazy wait/debug boxes themselves: a task that never
     // waits and is never tagged pays for neither.
     let wait_box = if task.owns_wait_links() {
         std::mem::size_of::<crate::task::TaskWaitLinks>()
@@ -297,7 +297,7 @@ fn task_inspection_does_not_allocate_or_duplicate_payloads() {
     }
 }
 
-/// Fan-in registration: every task awaits the same task (willow-ezs.2).
+/// Fan-in registration: every task awaits the same task.
 #[test]
 #[ignore = "scheduler scaling measurement"]
 fn scaling_01_fan_in_registration() {
@@ -422,8 +422,8 @@ fn scaling_04_waiter_teardown() {
     }
 }
 
-/// Metadata footprint of simultaneously active tasks, by workload
-/// (willow-ezs.3). The `bytes_per_task` column is the number to beat.
+/// Metadata footprint of simultaneously active tasks, by workload. The `bytes_per_task` column
+/// is the number to beat.
 #[test]
 #[ignore = "scheduler scaling measurement"]
 fn scaling_05_active_task_footprint_by_workload() {
@@ -500,8 +500,8 @@ fn scaling_05_active_task_footprint_by_workload() {
     }
 }
 
-/// Heap the allocator was actually asked for by N simultaneously active tasks
-/// (willow-ezs.3).
+/// Heap the allocator was actually asked for by N simultaneously active tasks.
+///
 ///
 /// [`scaling_05_active_task_footprint_by_workload`] estimates a task's metadata
 /// from what the task structurally owns; this one measures. The two disagree by
@@ -651,7 +651,7 @@ fn scaling_06_short_task_throughput() {
     }
 }
 
-// ─── Global-lock contention profiles (willow-ezs.4) ─────────────────────────
+// ─── Global-lock contention profiles ─────────────────────────
 //
 // These profiles were introduced while every scheduler operation ran inside
 // one process-global `Mutex<RuntimeScheduler>`. They now exercise the extracted
@@ -690,7 +690,7 @@ fn scaling_06_short_task_throughput() {
 // variance on the first four cases is a few hundredths, so the right-hand
 // column confirms that moving timers out did not disturb them.
 //
-// How to read the two new rows (willow-9ha4):
+// How to read the two new rows:
 //
 //   * `idle_timer_probe` is the operation the run loop actually performs on
 //     every worker on every iteration: "is any timer due?" with nothing
@@ -891,7 +891,7 @@ fn contention_04_uncontended_control() {
 }
 
 /// Threads that register a sleep and drain it back out through the dedicated
-/// timer queue (willow-9ha4).
+/// timer queue.
 ///
 /// This is the loaded timer path: registration takes the heap lock and then a
 /// task shard, and the drain takes the heap lock and wakes from inside it. It
@@ -978,7 +978,7 @@ fn contention_05_timer_register_and_drain() {
 /// the most frequent timer operation in a real program, since every worker runs
 /// it on every scheduling iteration whether or not anything is sleeping.
 ///
-/// Before willow-9ha4 this cost one acquisition of the process-global scheduler
+/// Before timer-lock decomposition this cost one acquisition of the process-global scheduler
 /// mutex per worker per iteration. It is now a single atomic load against the
 /// timer queue's published hint, so this case is expected to scale ~linearly.
 #[test]
@@ -1009,7 +1009,7 @@ fn contention_06_idle_timer_probe() {
     }
 }
 
-// willow-9tls.38: queue-only spawn/steal profiles. No task-table allocation,
+// queue-only spawn/steal profiles. No task-table allocation,
 // shared ID allocator, or per-pop shared verification counter in the timed loop.
 #[derive(Clone, Copy, Debug)]
 enum QueueProfile {

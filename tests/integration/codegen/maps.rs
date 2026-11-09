@@ -45,7 +45,7 @@ fn main() {
     assert_eq!(out, "4\n0\n");
 }
 
-// ── Map<K,V> type (willow-5t6) ─────────────────────────────────────────────
+// ── Map<K,V> type ─────────────────────────────────────────────
 // GC-managed hash map: Map::new(), .insert(k,v), .get(k) -> Option<V>,
 // .contains(k) -> bool, .len() -> i64. Keys: String (by content) or i64.
 

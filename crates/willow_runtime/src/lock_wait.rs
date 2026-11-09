@@ -1,11 +1,11 @@
-//! Scheduler-aware lock waiter protocol (willow-38w.1.2, spec §8.1–§8.4, §12).
+//! Scheduler-aware lock waiter protocol (lock waiter protocol, spec §8.1–§8.4, §12).
 //!
 //! This is the shared plumbing under the future `Mutex` and `RwLock` runtimes:
 //! who is queued on a lock, how a waiter is identified across cancel/retry, and
 //! in which order the two locks involved (the lock's own state, and the task
 //! table shard holding the waiting task) may be taken. No public lock API uses
-//! it yet — the state machine lands in willow-38w.1.3 and the lowering in
-//! willow-38w.1.4/.5 — so nothing here changes observable program behavior.
+//! it yet — the state machine lands in scheduler-aware mutex support and the lowering in
+//! mutex and read/write lock lowering — so nothing here changes observable program behavior.
 //!
 //! Three rules carry the design:
 //!
@@ -183,8 +183,8 @@ struct LockStateInner {
     next_token: RegistrationToken,
     native_tables: [usize; 3],
     /// FIFO admission order. `WaitQueue` gives O(1) membership and removal with
-    /// tombstone compaction, so a cancellation does not scan the queue
-    /// (willow-ezs.2).
+    /// tombstone compaction, so a cancellation does not scan the queue.
+    ///
     waiters: WaitQueue<RuntimeTaskId>,
     /// The token each queued task registered with. Split from `waiters` so the
     /// queue keeps its O(1) removal; a task waits on at most one lock at a time,
@@ -944,7 +944,7 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::atomic::AtomicU64;
 
-    // Test perspectives for the Stage 2 waiter protocol (willow-38w.1.2). Each
+    // Test perspectives for the Stage 2 waiter protocol. Each
     // maps to at least one test below.
     //
     //  1. LockId is monotonic, never 0, and never repeats.
@@ -999,7 +999,7 @@ mod tests {
     // 38. Handoff consumption requires both the exact reverse link and the
     //     matching lock-side owner reservation.
     //
-    // Atomic acquire-or-register (willow-38w.1.4). Splitting the decision into
+    // Atomic acquire-or-register. Splitting the decision into
     // `try_acquire_uncontended` then `register_waiter` drops the state lock in
     // between, and a release landing in that window hands off to an
     // still-empty queue — the caller then parks behind an idle lock with no

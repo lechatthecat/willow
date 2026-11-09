@@ -2,7 +2,7 @@ use super::*;
 
 // ── Arithmetic ───────────────────────────────────────────────────────────────
 
-// ── Cooperative task cancellation (willow-0a6k.7) ───────────────────────────
+// ── Cooperative task cancellation ───────────────────────────
 // 20 perspectives: 1 cancel request visible immediately on an in-flight task, 2 cancel while parked on a
 // timer (wakes + finalizes promptly), 3 is_cancelled true after request,
 // 4 is_cancelled false for untouched task, 5 cancel is idempotent, 6 cancel

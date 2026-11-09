@@ -24,7 +24,7 @@ fn empty_root_arena_first_snapshot_is_allocation_free() {
     .unwrap();
 }
 
-// willow-ssl7.12: stress-mode checks sit on the allocation slow path, so
+// stress-mode checks sit on the allocation slow path, so
 // they must not read the environment (a Windows `getenv` allocates) per
 // call. The environment is parsed once; tests switch modes through the
 // override without touching the process environment.
@@ -160,7 +160,7 @@ fn gc_counts_collections_skipped_for_foreign_root_owner() {
     let mut slot: *mut u8 = std::ptr::null_mut();
     willow_push_root(&mut slot as *mut *mut u8);
     // A foreign thread cannot scan our root stack, so its collection must be
-    // skipped — and counted (willow-6fv.2).
+    // skipped — and counted.
     std::thread::spawn(|| willow_gc_collect()).join().unwrap();
     willow_pop_root();
     let after = willow_gc_skipped_collections();
@@ -170,7 +170,7 @@ fn gc_counts_collections_skipped_for_foreign_root_owner() {
     );
 }
 
-// ── Multi-mutator coordination + STW (willow-6fv.5.6) ───────────────────
+// ── Multi-mutator coordination + STW ───────────────────
 
 #[test]
 fn coord_register_makes_multi_mutator_active_from_other_thread() {
@@ -365,7 +365,7 @@ fn multi_mutator_concurrent_collection_does_not_deadlock() {
     // Two registered mutators each allocate garbage and trigger collections
     // concurrently. The collector-election (try_lock + safepoint) must keep
     // this deadlock-free: when one thread is collecting, the other parks at a
-    // safepoint instead of blocking on the collect lock (willow-6fv.5.6).
+    // safepoint instead of blocking on the collect lock.
     let handles: Vec<_> = (0..2)
         .map(|_| {
             std::thread::spawn(|| {
@@ -430,7 +430,7 @@ fn multi_mutator_stw_frees_unrooted_object() {
     willow_gc_unregister_mutator();
 }
 
-// ── A registration that races a collection (willow-v6k0) ────────────────
+// ── A registration that races a collection ────────────────
 //
 // The collector used to ask `multi_mutator_active()` and, when it was the
 // only registered mutator, scan just its own root stack and sweep without
@@ -750,7 +750,7 @@ fn fast_alloc_for_test(tls: &GcTlabState, bytes: usize) -> usize {
     cursor
 }
 
-/// Generated code keeps no counters (willow-8hq4.16): fast counts come from
+/// Generated code keeps no counters: fast counts come from
 /// start bits and bytes from the cursor. Both must stay continuous across
 /// refills, retirement and unregister, without double counting.
 #[test]
@@ -1090,8 +1090,8 @@ fn test_gc_tlab_refill_slow_path_coordinates_threshold_collection() {
     let first = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
     assert!(!first.is_null());
     assert_eq!(willow_gc_tlab_refills(), 1);
-    // Young bytes within the nursery budget belong to minor collections
-    // (willow-jz15.120); a zero budget lets the first chunk's bytes reach the
+    // Young bytes within the nursery budget belong to minor collections; a zero budget lets
+    // the first chunk's bytes reach the
     // major threshold.
     runtime().heap.lock().unwrap().nursery_threshold_bytes = 0;
     set_threshold(1);
@@ -1155,7 +1155,7 @@ fn test_gc_minor_collection_defers_direct_young_root_outside_relocation_scope() 
     willow_push_root(&mut young as *mut *mut u8);
 
     // Runtime code may hold a raw copy, so the collection waits instead of
-    // pinning the referent's chunk (willow-9tls.9).
+    // pinning the referent's chunk.
     crate::gc::minor_collect_internal();
 
     assert_eq!(young, original);
@@ -1854,7 +1854,7 @@ fn test_gc_sweep_scaling_and_fragmentation() {
             // The visit counts above are the proof; this line is the
             // separate pause measurement, and it carries the build
             // configuration it was taken in because the two are not
-            // comparable across profiles (willow-ssl7.1, willow-tqzq).
+            // comparable across profiles.
             eprintln!(
                 "sweep profile={} large={large} dead={n} regions={} objects={} elapsed_ns={}",
                 if cfg!(debug_assertions) {
@@ -3145,7 +3145,7 @@ fn test_gc_realloc_after_auto_trigger_works() {
 }
 
 // 観点33: threshold=1 でも runtime 確保は TLAB チャンク 1 つ分ごとにだけ
-// ポリシーを確認する (willow-jz15.51)。先頭の確保と予算を超えた確保で
+// ポリシーを確認する。先頭の確保と予算を超えた確保で
 // auto-collect が走り、確保ごとにヒープロックを取らない。
 #[test]
 fn test_gc_threshold_one_triggers_collect_once_per_policy_budget() {
@@ -4040,7 +4040,7 @@ fn enum_variant_mixed_pair_words_preserve_offsets_and_gc_edges() {
     reset_gc();
 }
 
-// willow-jz15.51: root push/pop asks whether the current thread is a
+// root push/pop asks whether the current thread is a
 // registered mutator. A thread-local epoch cache answers without the
 // coordination lock and must track register, unregister and heap resets.
 #[test]
@@ -4118,7 +4118,7 @@ fn registered_root_pushes_match_the_coordination_registry() {
     reset_gc();
 }
 
-// willow-jz15.51: runtime allocations consult the collection policy (which
+// runtime allocations consult the collection policy (which
 // locks the heap) once per TLAB-chunk budget per thread, not per allocation.
 #[test]
 fn runtime_policy_budget_checks_first_then_once_per_chunk() {
@@ -4142,7 +4142,7 @@ fn runtime_policy_budget_checks_first_then_once_per_chunk() {
     assert!(runtime_policy_check_due(1), "reset expires every budget");
 }
 
-// willow-jz15.53: a locked policy check that finds nothing to do publishes a
+// a locked policy check that finds nothing to do publishes a
 // bounded lock-free headroom; it is zero at a trigger, under any memory cap,
 // and after every policy-input change.
 #[test]
@@ -4307,7 +4307,7 @@ fn cumulative_allocation_bytes_clamp_without_wrapping() {
     reset_gc();
 }
 
-/// willow-jz15.120: young bytes up to the nursery budget belong to minor
+/// young bytes up to the nursery budget belong to minor
 /// collections and never shorten the major runway; deferred young growth past
 /// the budget and promoted bytes do.
 #[test]
@@ -4354,7 +4354,7 @@ fn major_policy_domain_counts_young_bytes_only_past_the_nursery_budget() {
     reset_gc();
 }
 
-/// willow-jz15.120: a soft limit budgets every managed byte. However large
+/// a soft limit budgets every managed byte. However large
 /// the nursery grows, young bytes count toward the soft decision, so the heap
 /// cannot exceed the limit by a nursery budget. Without a soft limit the same
 /// young bytes stay with minor collections.
@@ -4405,7 +4405,7 @@ fn soft_memory_limit_counts_young_bytes_at_every_nursery_size() {
     reset_gc();
 }
 
-/// willow-jz15.120: chunk storage is prepared outside the heap lock; a refill
+/// chunk storage is prepared outside the heap lock; a refill
 /// the reservation refuses keeps it for a retry, and installation takes it.
 #[test]
 fn tlab_chunk_storage_is_kept_when_refused_and_taken_when_installed() {

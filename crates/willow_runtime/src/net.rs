@@ -1,4 +1,4 @@
-//! Scheduler-aware TCP runtime for `std::net` (willow-2s3.1).
+//! Scheduler-aware TCP runtime for `std::net`.
 //!
 //! Listener and stream handles are GC-managed objects with finalizers that
 //! close their native sockets. `connect_async`, `accept_async`, `read_async`,

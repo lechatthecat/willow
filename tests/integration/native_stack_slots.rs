@@ -1,4 +1,4 @@
-//! willow-jz15.50: shared native slots must preserve GC and control-flow behavior.
+//! shared native slots must preserve GC and control-flow behavior.
 use super::support::{compile_and_run_release, compile_and_run_with_env};
 
 #[test]

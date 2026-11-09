@@ -145,7 +145,7 @@ fn diagnostic_recovery_fanout_counts() {
 }
 
 #[test]
-fn ticket_52_type_typo_spans_and_hints() {
+fn type_typo_spans_and_hints() {
     for (ty, expected) in [
         ("Arry", "Array"),
         ("FrozenArry<i64>", "FrozenArray"),
@@ -173,7 +173,7 @@ fn ticket_52_type_typo_spans_and_hints() {
 }
 
 #[test]
-fn ticket_52_channel_capacity_hint() {
+fn channel_capacity_hint() {
     for call in [
         "Channel::new(1)",
         "Channel<i64>::new(1)",
@@ -197,7 +197,7 @@ fn ticket_52_channel_capacity_hint() {
 }
 
 #[test]
-fn ticket_52_typo_work_counts() {
+fn typo_work_counts() {
     let checker = TypeChecker::new();
     // Built-in candidate lengths total 48; no scan over program declarations.
     for length in [8, 64, 512] {
@@ -214,7 +214,7 @@ fn ticket_52_typo_work_counts() {
 }
 
 #[test]
-fn ticket_52_annotation_span_preserves_file_identity() {
+fn annotation_span_preserves_file_identity() {
     for ty in ["Arry", "FrozenArry<i64>", "Option<Arry>"] {
         let source = format!("fn main() {{ let value: {ty}=1; }}");
         let mut tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();

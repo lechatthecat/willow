@@ -1,4 +1,4 @@
-//! Concurrent-mark work queue substrate (willow-6fv.5.6.1).
+//! Concurrent-mark work queue substrate.
 //!
 //! This module owns the *transport* for concurrent old-generation marking: the
 //! structure that moves mark work between background mark workers, root-scan
@@ -46,7 +46,7 @@
 //!
 //! # Termination accounting
 //!
-//! Termination detection (willow-6fv.5.6.5) needs one question answered without
+//! Termination detection needs one question answered without
 //! taking a lock: *is any mark work left anywhere?* Exactly one counter answers
 //! it. `outstanding` counts every item that has been accepted and not yet
 //! completed — items in the injector, in a shared segment, in an owner-private
@@ -557,7 +557,7 @@ impl MarkWorkQueue {
     /// The epoch is drawn from a monotonic counter, so it is always one this
     /// queue has never issued before — including across an
     /// [`Self::end_epoch`]. Any work left from a previous cycle is discarded:
-    /// a restart (willow-6fv.5.6.5) begins from a fresh root set, so carrying
+    /// a restart begins from a fresh root set, so carrying
     /// stale items forward would only re-trace objects under the wrong tag.
     ///
     /// Callers are expected to have quiesced consumers first — this is a

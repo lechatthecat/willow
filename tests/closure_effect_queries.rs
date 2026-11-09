@@ -1,4 +1,4 @@
-//! Focused body-based effects regression for willow-25da.29.44.
+//! Focused body-based effects regression for closure body effects.
 use willow_compiler::{
     CompilerOptions, CompilerSession,
     ai::{QueryRequest, QuerySession, Snapshot},
@@ -390,7 +390,7 @@ fn evidence_operation(result: &serde_json::Value, effect: u64) -> String {
 
 #[test]
 fn closure_effects_cite_indirect_site_not_caller_lambda_body() {
-    // willow-25da.29.53: caller-supplied lambda bodies keep their bounds but
+    // caller-supplied lambda bodies keep their bounds but
     // are cited at the reaching indirect call; the lambda owner cites the body.
     let source = "fn apply<T>(x: T, f: closure(T) -> T) -> T { return f(x); }\nfn relay(f: closure(i64) -> i64) -> i64 { return apply(1, f); }\nfn main() { let c = BlockingCell::new(false); relay(|x: i64| { c.get(); return x; }); }";
     let snapshot = snapshot(source, "caller-lambda");

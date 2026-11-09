@@ -1,7 +1,7 @@
 // async_frame_narrowing.wi -- which async locals need a heap frame slot.
 //
 // An async fn's locals live in a GC-allocated frame so they survive the poll
-// function returning to the scheduler. Not all of them have to: willow-lpn.10
+// function returning to the scheduler. Not all of them have to: async slot narrowing
 // runs a backward liveness analysis and gives a frame slot only to the bindings
 // that are live across a suspension. Everything here is ordinary Willow -- the
 // narrowing is invisible at the source level -- but each function below is
@@ -90,7 +90,7 @@ async fn gc_local_dead_at_suspend(n: i64) -> i64 {
 
 // The other direction, and the one narrowing that survives today's safepoint
 // placement: `unused` is never read, so it is live nowhere and gets no frame
-// slot even though it is GC-managed. That is safe because willow-p42j makes the
+// slot even though it is GC-managed. That is safe because reference-width classification makes the
 // cooperative emitter balance the shadow-stack root at every poll return and
 // hand the resume trampoline a null-initialized slot, so an unframed GC local is
 // fine in an ordinary poll-fn stack slot.

@@ -102,8 +102,8 @@ fn steal_counts_visited_victims_and_preserves_fifo() {
 #[test]
 fn empty_scan_and_last_victim_counts_scale_with_workers_and_attempts() {
     // Exact work, not a wall-clock inference: A scans visit A*(W-1) victims
-    // but lock none of them, because every length hint reads empty
-    // (willow-8hq4.19). A successful last-victim scan locks only that victim.
+    // but lock none of them, because every length hint reads empty. A successful last-victim
+    // scan locks only that victim.
     for workers in [1, 2, 4, 8, 16, 32] {
         for attempts in [1, 8, 64] {
             let queues = RunQueues::new(workers);

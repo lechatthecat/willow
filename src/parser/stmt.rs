@@ -64,8 +64,8 @@ impl Parser {
                 Ok(stmt) => stmts.push(stmt),
                 Err(e) => {
                     // Record and resume at the next statement so one bad
-                    // statement cannot swallow the rest of the item
-                    // (willow-qzxg).
+                    // statement cannot swallow the rest of the item.
+                    //
                     self.recovered_errors.push(e);
                     self.recover_to_next_stmt(statement_depth);
                 }
@@ -210,7 +210,7 @@ impl Parser {
             TokenKind::For => self.parse_for(),
             TokenKind::Return => self.parse_return(),
             // `match s { ... }` is block-like as a statement (arms may use
-            // `return`/blocks); tolerate an optional trailing `;` (willow-zvkv).
+            // `return`/blocks); tolerate an optional trailing `;`.
             TokenKind::Match => {
                 let span = self.current_span();
                 let mut expr = self.parse_match_expr()?;
@@ -531,7 +531,7 @@ impl Parser {
     /// Rungs are collected in a loop and folded from the last one, so a long
     /// ladder costs no parser recursion.
     ///
-    /// Any rung may be `if let P = e { }` (willow-jz15.6). It folds into
+    /// Any rung may be `if let P = e { }`. It folds into
     /// `match e { P => { then }, _ => { else } }`, so pattern checking,
     /// exhaustiveness, binding scopes and GC roots are the `match` ones.
     pub(super) fn parse_if(&mut self) -> Result<Stmt, Diagnostic> {
@@ -603,7 +603,7 @@ impl Parser {
         }
     }
 
-    /// `while c { }`, or `while let P = e { }` (willow-jz15.6), which becomes
+    /// `while c { }`, or `while let P = e { }`, which becomes
     /// `while true { match e { P => { body }, _ => { break; } } }`: the
     /// scrutinee is re-evaluated before every iteration, `continue` re-tests
     /// it, and `break` leaves the loop.
@@ -821,7 +821,7 @@ impl Parser {
         // `obj.field = value;` where `obj` is an arbitrary place expression
         // (`a.b.v`, `ps[0].x`, `make().x`). The one-level `x.f = v` fast path is
         // caught by lookahead in `parse_stmt`; this handles the general case
-        // after the lvalue has been parsed (willow-qzxg).
+        // after the lvalue has been parsed.
         if matches!(expr, Expr::FieldAccess(..))
             && matches!(self.peek_kind(), TokenKind::Eq)
             && !matches!(
@@ -844,7 +844,7 @@ impl Parser {
             }));
         }
         // Any other expression followed by `=` is an invalid assignment target;
-        // report it as such instead of a misleading `expected ;` (willow-qzxg).
+        // report it as such instead of a misleading `expected ;`.
         if matches!(self.peek_kind(), TokenKind::Eq)
             && !matches!(
                 self.tokens.get(self.pos + 1).map(|t| &t.kind),

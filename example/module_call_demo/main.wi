@@ -1,5 +1,5 @@
 // module_call_demo — calls into an imported module, from every position a call
-// can occupy (willow-7nc6).
+// can occupy.
 //
 // `import tally;` names the module; `import tally::Entry;` additionally brings
 // the module's CLASS into this file under its own name, which is what makes a

@@ -1,11 +1,11 @@
-//! A static property's INITIALIZER expression on the LIR-walking backend
-//! (willow-t0uy.3).
+//! A static property's INITIALIZER expression on the LIR-walking backend.
+//!
 //!
 //! An initializer is written outside every function, so the compiler gives it
 //! one of its own — `Class::$static_init.field`, called from
 //! `__willow_static_init` before `main`. Until this bead that synthetic
 //! function was the last body still emitted by walking the AST: every other
-//! checked body moved to lowered IR in willow-0g8j.3, and the AST emitter was
+//! checked body moved to lowered IR in the lowered-IR cutover, and the AST emitter was
 //! kept alive for this one caller. So an initializer quietly had a different
 //! expression subset than the identical expression one line down in a
 //! function, and nothing reported the difference.
@@ -43,7 +43,7 @@ const ALLOC_STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 const MINOR_STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "minor")];
 
 /// The program builds and prints `expected`. A body the walker cannot take is
-/// a compile error since willow-0g8j.3, so this also asserts the initializer
+/// a compile error since the lowered-IR cutover, so this also asserts the initializer
 /// stayed inside the lowered subset.
 #[track_caller]
 fn assert_output(source: &str, expected: &str) {

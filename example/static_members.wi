@@ -1,4 +1,4 @@
-// Static methods and implicit `self` (willow-qsqf, Stage 1).
+// Static methods and implicit `self` (static member support, Stage 1).
 //
 //   static fn  -> class-level method, called as `Type::method(...)`, no `self`.
 //   fn         -> instance method, called as `object.method()`; `self` is the

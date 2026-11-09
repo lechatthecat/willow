@@ -1,4 +1,4 @@
-// Cooperative `await` compiled from Lowered IR (willow-0g8j.2.11).
+// Cooperative `await` compiled from Lowered IR.
 //
 // An `async fn` compiles to a constructor plus a poll function, and every
 // `await` splits that poll function into a suspension point: the state word is

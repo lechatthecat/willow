@@ -1,4 +1,4 @@
-//! Every path out of a value-returning body must be a `return` (willow-x8sj).
+//! Every path out of a value-returning body must be a `return`.
 //!
 //! Willow has no implicit tail expression: a body produces its value only
 //! through a `return` statement. Nothing used to check that one was reached, so
@@ -100,10 +100,10 @@ impl TypeChecker {
         }
         // The entry point is the one body where running off the end MEANS
         // something: `fn main() -> Result<void, E>` exits 0 on the implicit end
-        // exactly as it does on `return Ok()` (willow-exg). The caller decides
+        // exactly as it does on `return Ok()`. The caller decides
         // what is the entry point; this must never be re-derived from the name,
         // because an imported module's `main` is an ordinary function with an
-        // ordinary caller reading its `Result` (willow-ltkj).
+        // ordinary caller reading its `Result`.
         if matches!(site, ReturnSite::EntryMain) && is_result_void(return_type) {
             return;
         }
@@ -168,7 +168,7 @@ impl TypeChecker {
             },
             // A critical section runs unconditionally, so a `return` inside it
             // returns from the enclosing function once the compiler-inserted
-            // release has run (willow-38w.1.3).
+            // release has run.
             Stmt::Lock(s) => self.block_diverges(&s.body),
             // `while true` with no way out is the idiomatic never-returning
             // loop. Any other condition may be false on the first test.

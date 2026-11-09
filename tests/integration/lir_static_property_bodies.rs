@@ -1,6 +1,6 @@
 //! A store into a class's static property from inside an HIR island — a
-//! `defer` block, a `match` arm, a `select` case — on the LIR-walking backend
-//! (willow-0g8j.15).
+//! `defer` block, a `match` arm, a `select` case — on the LIR-walking backend.
+//!
 //!
 //! A function-level `Class::prop = value;` is `LirInst::StaticFieldAssign` and
 //! has always been walked and emitted. An island is different: it is not
@@ -17,12 +17,12 @@
 //!
 //! The store is admitted in BOTH island scopes: its destination is a data
 //! segment, so it needs no storage of its own at all. A `let` beside it is
-//! admitted too as of willow-0g8j.3 — `emit_deferred_action` brackets a
+//! admitted too as of the lowered-IR cutover — `emit_deferred_action` brackets a
 //! deferred body's `vars` and GC root depth the way the match emitter brackets
 //! an arm — and perspective 23 is the pair of them together, a `let` a
 //! deferred static store reads.
 //!
-//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! Since the lowered-IR cutover a body outside the walker's subset is a compile error,
 //! so a run that prints the right answer is proof the walker produced it.
 //!
 //! 24 perspectives:
@@ -49,7 +49,7 @@ const LIR_LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 const ALLOC_STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 const MINOR_STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "minor")];
 
-/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// The build runs and prints `expected`. Since the lowered-IR cutover every body is
 /// compiled from lowered IR, so a body the walker cannot take is a compile
 /// error here rather than a second emitter's answer.
 #[track_caller]
@@ -298,7 +298,7 @@ fn main() { println(selected()); }",
 }
 
 // 9. `Self::` inside a deferred body resolves to the class the body is
-// DECLARED in (willow-0g8j.13), and the store is the same store.
+// DECLARED in, and the store is the same store.
 #[test]
 fn lir_static_body_09_self_prop_in_a_defer() {
     assert_project_output(
@@ -664,7 +664,7 @@ fn main() {
     );
 }
 
-// 23. The boundary that MOVED (willow-0g8j.3): a `let` in a deferred body is
+// 23. The boundary that MOVED: a `let` in a deferred body is
 // admitted, and a deferred static store can read it. `emit_deferred_action`
 // replays the body inside a bracket of its own — `vars` and the GC root depth
 // snapshotted before and restored after — so the binding's rooted slot is

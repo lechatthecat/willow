@@ -14,8 +14,8 @@ thread_local! {
 
 #[willow_continuations::checker]
 impl TypeChecker {
-    /// Validate an enum's payload types once every declaration is registered
-    /// (willow-rlq9): `enum Box { Value(Option<i64, i64>) }` and
+    /// Validate an enum's payload types once every declaration is registered: `enum Box {
+    /// Value(Option<i64, i64>) }` and
     /// `enum Box { Value(Bogus) }` are errors of the payload, and the
     /// declaration's own parameters (`enum Wrap<T> { Val(T) }`) are the one
     /// kind of bare name a payload may use without declaring it. Registration
@@ -42,9 +42,9 @@ impl TypeChecker {
         }
     }
 
-    /// Validate an interface's `extends` clause (willow-1js.2 / willow-1js.8):
+    /// Validate an interface's `extends` clause:
     /// each super must be a registered interface, with no cycle, and its
-    /// method signatures against the registered types (willow-rlq9).
+    /// method signatures against the registered types.
     pub(super) fn check_interface_header(&mut self, decl: &InterfaceDecl) {
         // Signature types were normalized at registration and are judged here,
         // once a later declaration can be named and the interface's own
@@ -110,7 +110,7 @@ impl TypeChecker {
     pub(super) fn check_interface(&mut self, decl: &InterfaceDecl) {
         self.cached_interface_validation(decl);
         // Type-check default method bodies even when no class implements the
-        // interface (willow-1js.7). `self` is the opaque `Self`; the body is the
+        // interface. `self` is the opaque `Self`; the body is the
         // canonical default (the injected class copies of non-generic defaults are
         // skipped in check_class to avoid duplicates). Generic interfaces are
         // skipped — their type parameters are not concrete, so the body is checked
@@ -125,7 +125,7 @@ impl TypeChecker {
     }
 
     /// Type-check an interface default method body with `self` bound to the
-    /// opaque receiver type `Self` (willow-1js.7, willow-dnia). Mirrors `check_method`'s scope handling.
+    /// opaque receiver type `Self`. Mirrors `check_method`'s scope handling.
     pub(super) fn check_interface_default_body(
         &mut self,
         m: &InterfaceMethodDecl,
@@ -156,7 +156,7 @@ impl TypeChecker {
         // `self` is the receiver, opaque here: `Self`, which converts to the
         // interface (the written instantiation for a generic interface's
         // instance) and reaches its methods. Each receiver's copy lowers it
-        // as its own class (willow-dnia).
+        // as its own class.
         // An abstract check of a generic template has no instance: `self`
         // is then the interface at its own type parameters (`Meter<T>`).
         let previous_self =
@@ -256,8 +256,8 @@ impl TypeChecker {
         // chain, so the checks that walk it (base constructor rules, interface
         // conformance through inherited methods) are skipped; E0426 already
         // owns the cycle. Its fields, bodies and constructors are still
-        // checked so an editor keeps reporting the errors around the cycle
-        // (willow-jlky).
+        // checked so an editor keeps reporting the errors around the cycle.
+        //
         if self.class_extends_cycle(&c.name).is_none() {
             self.check_constructor_inheritance_rules(c);
             self.check_class_implements(c, &receiver_ty);
@@ -289,7 +289,7 @@ impl TypeChecker {
             }
             // A non-generic interface default body is checked once at the
             // interface level; skip the injected class copy to avoid duplicate
-            // diagnostics (willow-1js.7).
+            // diagnostics.
             if m.is_default_injected {
                 self.reused_bodies.push(m.body.id);
                 continue;
@@ -301,7 +301,7 @@ impl TypeChecker {
         }
     }
 
-    /// Type-check an `init(...)` constructor body (willow-scq2): bind `self`,
+    /// Type-check an `init(...)` constructor body: bind `self`,
     /// reject returning a value (E0841), and require every instance field to be
     /// assigned (E0842).
     pub(super) fn check_constructor(
@@ -368,7 +368,7 @@ impl TypeChecker {
         // E0842: every successful exit must initialize every instance field;
         // E0852/E0853: no use of `self` may observe an unassigned part.
         // This cached pass treats every call as panicking; a constructor it
-        // flags is decided with the unit's effect facts (willow-ssl7.19).
+        // flags is decided with the unit's effect facts.
         // The cached summary does not depend on the base chain, which is
         // consulted below through the build-wide write summary.
         let fields: Vec<_> = c.fields.iter().filter(|field| !field.is_static).collect();
@@ -794,7 +794,7 @@ impl TypeChecker {
             && self.symbols.lookup_var("super").is_none()
     }
 
-    /// `super.method(args)` (willow-jz15.48): call the implementation the
+    /// `super.method(args)`: call the implementation the
     /// current class's BASE resolves `method` to, on `self`. Typed exactly as
     /// `method` called on a base-typed receiver; the `super` receiver itself is
     /// recorded as the base class so lowering and the call graph can name the
@@ -865,7 +865,7 @@ impl TypeChecker {
         ))
     }
 
-    /// Type-check `new Class(args...)` (willow-scq2 §10): resolve the class, pick
+    /// Type-check `new Class(args...)` (constructor support §10): resolve the class, pick
     /// the explicit `init` or the implicit memberwise constructor, check
     /// visibility and arguments, and yield `Class`.
     pub(super) fn check_new(&mut self, n: &NewExpr, class_name: &str) -> Type {
@@ -915,7 +915,7 @@ impl TypeChecker {
         // constructor: its memberwise field list and inherited `init` both
         // depend on a base chain that never ends. E0426 already reports the
         // cycle, so only the arguments' own diagnostics are kept and the call
-        // still yields the class type for the code around it (willow-jlky).
+        // still yields the class type for the code around it.
         if self.class_extends_cycle(&resolved).is_some() {
             for arg in &n.args {
                 self.check_expr(&arg.expr);
@@ -944,7 +944,7 @@ impl TypeChecker {
         // order, matching the runtime object layout).
         let mut param_infos: Vec<ParamInfo> = match &class.constructor {
             Some(ci) => {
-                // Visibility of an explicit constructor (willow-scq2 §9).
+                // Visibility of an explicit constructor (constructor support §9).
                 if !ci.public {
                     let allowed = if ci.protected {
                         self.can_access_protected_member(&resolved)
@@ -995,7 +995,7 @@ impl TypeChecker {
         // declared parameter/field type into its argument so contextual enum
         // variants work in memberwise and explicit constructors too. In
         // particular, `new Holder(Some(new Dog()))` must construct the inner
-        // payload as the Holder field's `Option<Greeter>` (willow-glaj.2).
+        // payload as the Holder field's `Option<Greeter>`.
         // Extra arguments have no corresponding context but are still checked.
         let mut arg_types = Vec::with_capacity(n.args.len());
         for (idx, arg) in n.args.iter().enumerate() {
@@ -1024,7 +1024,7 @@ impl TypeChecker {
             // so the argument MODES are checked here too. Without this, `&x` on
             // a by-value parameter is silently dropped, and a missing `&` on a
             // `&mut` parameter passes a value where `init` dereferences a
-            // pointer (willow-dssc).
+            // pointer.
             for (i, (aty, param)) in arg_types.iter().zip(param_infos.iter()).enumerate() {
                 let arg = &n.args[i];
                 match (&param.mode, &arg.mode) {
@@ -1134,7 +1134,7 @@ impl TypeChecker {
         }
     }
 
-    /// Type-check `static [mut] name: T = expr` initializers (willow-qsqf §10).
+    /// Type-check `static [mut] name: T = expr` initializers (static member support §10).
     /// Each initializer must be assignable to the declared type, cannot use
     /// `self`. The build-wide dependency plan orders reads and rejects cycles.
     pub(super) fn check_static_property_initializers(&mut self, c: &ClassDecl) {
@@ -1242,7 +1242,7 @@ impl TypeChecker {
 
             // `Send` / `Sync` are compiler-known marker interfaces: the compiler
             // infers them from a type's structure, so they may not be implemented
-            // manually (willow-dgwo, E2401). Incorrect manual `Sync` could make
+            // manually (Send/Sync checking, E2401). Incorrect manual `Sync` could make
             // data races possible.
             if iface_name == "Send" || iface_name == "Sync" {
                 self.push(
@@ -1267,7 +1267,7 @@ impl TypeChecker {
             // A class may implement a given interface instantiation at most once,
             // keyed by the FULL instantiated type (name + type arguments). Two
             // distinct instantiations of the same generic interface
-            // (`Container<i64>`, `Container<String>`) are allowed (willow-1js.6):
+            // (`Container<i64>`, `Container<String>`) are allowed:
             // each compiled class method is monomorphic and a generic interface's
             // vtable slot order is independent of its type arguments, so all
             // instantiations of one interface on one class share a single,
@@ -1408,7 +1408,7 @@ impl TypeChecker {
             // Receiver compatibility: an interface instance method requires an
             // instance method to satisfy it. With implicit `self`, the
             // implementing method need not write `self` explicitly — it just must
-            // not be `static` (a static method has no receiver). (willow-qsqf)
+            // not be `static` (a static method has no receiver).
             if !req.is_static && method.is_static {
                 self.push(
                     Diagnostic::new(
@@ -1434,11 +1434,11 @@ impl TypeChecker {
             // in MVP). The mode matters as much as the type: a `&mut i64`
             // parameter arrives as a POINTER, so a value-parameter method
             // reached through the interface's vtable would dereference an
-            // integer (willow-0g8j.9).
+            // integer.
             // Types compare by identity, not spelling: an imported interface's
             // signature names its types as the provider resolved them
             // (`$local::util::Get`), while the class writes its own access path
-            // (`util::Get`, or an alias of it) (willow-k6n9).
+            // (`util::Get`, or an alias of it).
             let params_match = method.params.len() == req.params.len()
                 && method
                     .params
@@ -1637,7 +1637,7 @@ impl TypeChecker {
                 // methods and "hide" its own statics. The cycle is the one
                 // diagnostic such a class gets, ahead of E0701, and a class
                 // that merely extends into a cycle says nothing of its own
-                // (willow-jlky → E0426).
+                // (class cycle detection → E0426).
                 if let Some(cycle) = self.class_extends_cycle(&c.name) {
                     self.report_class_extends_cycle(c, &cycle);
                     return;
@@ -1664,7 +1664,7 @@ impl TypeChecker {
         }
 
         // Static members are non-virtual: a subclass may not redefine (hide) a
-        // static member inherited from a base class (willow-qsqf §16.3 → E0839).
+        // static member inherited from a base class (static member support §16.3 → E0839).
         for method in &c.methods {
             if method.is_static
                 && let Some((owner, _)) = self.lookup_method_in_hierarchy(&base_name, &method.name)
@@ -1713,7 +1713,7 @@ impl TypeChecker {
             // Static methods participate in the class namespace but are not
             // inherited/overridable like instance methods, so skip override
             // validation for them. Instance methods (implicit or explicit `self`)
-            // are still validated (willow-qsqf).
+            // are still validated.
             if method.is_static {
                 continue;
             }
@@ -1782,7 +1782,7 @@ impl TypeChecker {
                     };
                     let base_call_return_type = method_call_return_type(&base_method);
                     // Identity, not spelling: an imported base class's signature
-                    // names types as its provider resolved them (willow-k6n9).
+                    // names types as its provider resolved them.
                     if method_params.len() != base_method.params.len()
                         || !method_params
                             .iter()
@@ -1868,7 +1868,7 @@ impl TypeChecker {
         let async_locals_before = self.local.async_local_types.len();
 
         // Instance methods bind `self` to the enclosing class — implicitly, whether
-        // or not the (legacy) explicit `self` parameter was written (willow-qsqf
+        // or not the (legacy) explicit `self` parameter was written (static member support
         // §9.1). Static methods get no `self`; references to it there are E0831.
         if !m.is_static {
             self.define_var(
@@ -1954,7 +1954,7 @@ impl TypeChecker {
         }
         // An async fn already returns `Task<ReturnType>`, so its declared return
         // type must be the awaited value, not a task handle — otherwise the call
-        // would be a confusing nested `Task<Task<T>>` (willow-h2vf, case A → E0809).
+        // would be a confusing nested `Task<Task<T>>` (async task unification, case A → E0809).
         if f.is_async && is_task_handle_type(&return_type) {
             self.push(
                 Diagnostic::new(
@@ -1999,7 +1999,7 @@ impl TypeChecker {
         self.check_block(&f.body);
         // Entry-point status comes from WHICH PROGRAM this is, never from the
         // name: a module's `main` is called and compiled like any other
-        // function (willow-ltkj).
+        // function.
         let site = if self.entry_program && f.name == "main" {
             ReturnSite::EntryMain
         } else {

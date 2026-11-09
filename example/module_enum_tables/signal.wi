@@ -5,8 +5,8 @@
 // declaration is module-qualified whole before it is declared.
 //
 // Both spellings must reach the same declaration in the back end's enum table
-// (willow-nm0g) and compare as one representation in the LIR walker
-// (willow-0g8j.3.2).
+// and compare as one representation in the LIR walker.
+//
 module signal;
 
 // Fieldless: every value is a tag integer, never a pointer. The back end has to

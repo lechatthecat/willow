@@ -1,6 +1,6 @@
 use crate::support::*;
 
-// ── Bounded parallel mapping (willow-2s3.4) ────────────────────────────────
+// ── Bounded parallel mapping ────────────────────────────────
 // The public v1 surface is deliberately narrow: immutable i64 input and a
 // non-capturing scalar function. Runtime unit tests pin chunk-count bounds and
 // exact range coverage; these tests pin the language contract, ordering,
@@ -187,7 +187,7 @@ async fn main() {
 
 /// `parallel::map`'s v1 mapper is a `fn(i64) -> i64` — a bare code address the
 /// worker calls with no environment — so a capturing lambda is refused there
-/// even though captures are legal in general (willow-0g8j.2.12). The refusal
+/// even though captures are legal in general. The refusal
 /// has to name the capture, since the fix is to stop capturing rather than to
 /// change the mapper.
 #[test]

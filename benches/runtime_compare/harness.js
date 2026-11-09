@@ -28,7 +28,7 @@ if(ti >= 0) { trials = Number(args[ti+1]); args.splice(ti,2); }
 const expected = {mutex_contention:'1600000',mutex_split:'1600000',atomic_counter:'400000',producer_consumer:'19999900000',gc_scheduler:'10000600000'};
 if (!Number.isInteger(trials) || trials < 1) throw Error('trials must be positive integer');
 if(args.includes('mutex_contention') && !args.includes('mutex_split')) args.push('mutex_split');
-const dir = fs.mkdtempSync(path.join(os.tmpdir(),'willow-8hq4-42-'));
+const dir = fs.mkdtempSync(path.join(os.tmpdir(),'willow-lock-contention-'));
 async function trial(binary, name, language) {
   return new Promise((resolve,reject) => {
     const child = spawn(binary, language === 'go' ? [name] : [], {env:{...process.env,WILLOW_WORKERS:'8'}});

@@ -2,8 +2,8 @@
 //! allocation sites instead reference immutable object-module data directly.
 //!
 //! Runtime allocation acquires a descriptor per object from many threads, so
-//! the hit path takes only the shared lock and an atomic reference increment
-//! (willow-jz15.53); a single mutex here serialized every runtime allocation.
+//! the hit path takes only the shared lock and an atomic reference increment; a single mutex
+//! here serialized every runtime allocation.
 //! Entries whose count reaches zero stay interned until the map doubles past
 //! its size after the previous purge, so hot shapes are not reinserted under
 //! the exclusive lock after every sweep and the map stays O(peak live shapes).

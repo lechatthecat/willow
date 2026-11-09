@@ -16,7 +16,7 @@ use crate::semantic::ids::SemanticType as Type;
 
 /// Reference and function-address width comes from the selected target.
 /// The 64-bit target guard remains until the runtime and layouts are migrated
-/// together (willow-d9lm.4 / willow-d9lm.5).
+/// together.
 pub(crate) fn reference_type(
     config: cranelift_codegen::isa::TargetFrontendConfig,
 ) -> cranelift_codegen::ir::Type {
@@ -114,7 +114,7 @@ pub(crate) fn channel_element_type(ty: &Type) -> Option<Type> {
 /// Generic types that are opaque RUNTIME pointers (`Box::into_raw` / task-data
 /// areas) WITHOUT a `willow_alloc_object` GcHeader: the collector must never
 /// root or trace them as heap objects (it would read a bogus header at
-/// `payload_to_header` and crash — see willow-lpn.9). Any GC references they
+/// `payload_to_header` and crash — see managed-reference classification). Any GC references they
 /// hold are kept alive by the runtime instead. All other generics
 /// (`Task`/`JoinHandle` async frames, `Range`, `Map`, user generics) are real
 /// GC heap objects.

@@ -1,6 +1,6 @@
 // Provider module: the default bodies below use items that are private to
 // this module. Classes in other modules that implement `Greeter` run these
-// bodies in this module's scope (willow-rvpp).
+// bodies in this module's scope.
 module greeting;
 
 fn decorate(text: String) -> String {

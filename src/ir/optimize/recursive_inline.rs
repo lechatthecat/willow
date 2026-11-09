@@ -11,7 +11,7 @@ use crate::parser::ast::BinOp;
 use crate::semantic::ids::SemanticType as Type;
 
 /// With `overflow_checks` (debug builds), checked integer arithmetic is a
-/// fault whose call stack must keep every recursive frame (willow-jz15.14).
+/// fault whose call stack must keep every recursive frame.
 pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_checks: bool) {
     const MAX_DEPTH: u32 = 3;
     const MAX_INSTRUCTIONS: usize = 256;

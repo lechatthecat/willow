@@ -1,10 +1,10 @@
 // lir_main_result.wi -- `fn main() -> Result<void, E>` compiled from the
-// Lowered IR (willow-0g8j.2.14).
+// Lowered IR.
 //
 // `main` is not an ordinary function: its result becomes the process exit
 // status. The compiler lowers a `Result<void, E>` main to a VOID
 // `willow_user_main`, and every way out of it is an EXIT rather than a value
-// handed back to a caller (willow-exg):
+// handed back to a caller:
 //
 //   return Result::Ok();        -> flush defers, exit 0
 //   return Result::Err(e);      -> report `e`, exit non-zero

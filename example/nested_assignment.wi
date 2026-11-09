@@ -1,4 +1,4 @@
-// Nested-place assignment (willow-qzxg): the assignment target can be any
+// Nested-place assignment: the assignment target can be any
 // field-access chain — `a.b.v`, `ps[0].x`, `make().x` — not just one level.
 
 class Point {

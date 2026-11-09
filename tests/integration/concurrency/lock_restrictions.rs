@@ -437,7 +437,7 @@ async fn main() {
 
 /// Perspective 41: a class receiver's declared type only bounds the dynamic
 /// type from above, so E2604 must consider the whole override union. This
-/// program compiled clean before willow-uqzx.1.2: `Base::run` is pure, and the
+/// program compiled clean before shared call-graph analysis: `Base::run` is pure, and the
 /// waiting body lives in a subclass the call site never names.
 #[test]
 fn lock_lower_41_subclass_override_wait_is_rejected_through_a_base_receiver() {
@@ -554,7 +554,7 @@ async fn main() {
     );
 }
 
-/// Perspective 44 (willow-uqzx.1.3): an `async` callee is an edge in the shared
+/// Perspective 44: an `async` callee is an edge in the shared
 /// graph, but a masked one. Calling one eagerly creates a Task; the waiting
 /// happens on the Task, not on the caller's stack, so a helper that only spawns
 /// stays wait-free and remains legal inside a critical section.

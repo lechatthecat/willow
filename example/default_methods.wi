@@ -1,4 +1,4 @@
-// Default interface methods (willow-1js.3): an interface method may carry a
+// Default interface methods: an interface method may carry a
 // body. A class that implements the interface but does not override the method
 // inherits the default; `self` in the default refers to the concrete class, so
 // the default can call the interface's other (required or default) methods.

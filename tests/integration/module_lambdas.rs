@@ -1,5 +1,5 @@
-//! A lambda in an imported module's body is lifted to a real function
-//! (willow-9yhi).
+//! A lambda in an imported module's body is lifted to a real function.
+//!
 //!
 //! Lambda lifting is a DECLARATION-phase job. `declare_program` collects the
 //! entry file's lambdas, declares a symbol for each, and records
@@ -22,7 +22,7 @@
 //!
 //! This is capture-FREE lambdas only, which is all the checker admits today; a
 //! capture is still rejected in a module body exactly as in the entry file, and
-//! real closures wait on willow-bv9.
+//! real closures wait on closure support.
 //!
 //! The lifted symbols carry the module prefix (`calc.$lambda.0`).
 //! `collect_lambdas_in_program` restarts its numbering for every unit it walks,

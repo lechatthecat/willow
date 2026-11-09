@@ -1,4 +1,4 @@
-// Cooperative task cancellation (willow-0a6k.7): t.cancel() requests
+// Cooperative task cancellation: t.cancel() requests
 // cancellation; the scheduler finalizes the task (never polls it again) at
 // the next claim. is_cancelled() observes the request/state; `await` on a
 // cancelled task is a runtime panic, so check first — or use

@@ -1,4 +1,4 @@
-//! E2604 through function values (willow-h4t7).
+//! E2604 through function values.
 //!
 //! A call through a `fn`/`closure` value has no static target, so the lock
 //! effect graph cannot see what it runs. Instead the checker keeps an

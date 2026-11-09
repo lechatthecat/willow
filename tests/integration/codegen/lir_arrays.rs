@@ -1,6 +1,6 @@
 use super::*;
 
-// ── LIR backend: Array<T> (willow-0g8j.4) ───────────────────────────────────
+// ── LIR backend: Array<T> ───────────────────────────────────
 // The walker now emits array literals, indexing, index-assignment and the
 // builtin len/push/pop/toString. An array is a GC handle whose pointer is
 // stable across growth, so an array local uses the same entry-rooted slot a

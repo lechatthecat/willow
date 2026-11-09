@@ -1,5 +1,5 @@
 // `Self::` inside a class body, and instance methods that take their receiver
-// implicitly (willow-0g8j.13, willow-0g8j.14, willow-h7hv).
+// implicitly.
 //
 //   Self::name   -> the class the BODY is declared in: a static method, a
 //                   static property, read or assigned.

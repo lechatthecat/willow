@@ -1,5 +1,5 @@
 //! Builtin namespaces reached through an `import` alias, compiled from Lowered
-//! IR (willow-nswv).
+//! IR.
 //!
 //! `import std::fs as files;` makes `files::exists(..)` the same call as
 //! `fs::exists(..)`. The former AST emitter never saw the alias: a normalization pass
@@ -15,7 +15,7 @@
 //! user module of the same name win — the order the normalization pass and the
 //! AST dispatch apply between them, so both paths admit the same set of calls.
 //!
-//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! Since the lowered-IR cutover a body outside the walker's subset is a compile error,
 //! so a run that prints the right answer is proof the walker produced it.
 //!
 //! Nothing asserts on a host string. Paths come from `fs::temp_path`, which is

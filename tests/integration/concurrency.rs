@@ -1,7 +1,7 @@
 use super::support::*;
 
 // ---------------------------------------------------------------------------
-// Async state machines + async stack traces — willow-9lw acceptance.
+// Async state machines + async stack traces — async execution acceptance.
 // ---------------------------------------------------------------------------
 
 // WILLOW_WORKERS honors any positive count; the default is available
@@ -19,10 +19,10 @@ async fn main() {
 }
 "#;
 
-// ── Async-call capture checking (willow-dgwo.4) ──────────────────────────────
+// ── Async-call capture checking ──────────────────────────────
 // Always enforced, independently of WILLOW_WORKERS or WILLOW_DATA_RACE_CHECK.
 //
-// 20 perspectives (this block + the dgwo.2 classifier unit tests in
+// 20 perspectives (this block + the Send/Sync classifier unit tests in
 // type_checker/send_sync.rs cover the underlying type rules):
 //  1. non-Sync GC arg (Array) rejected under the check (E2402)
 //  2. a single-worker override still rejects unsafe captures
@@ -50,7 +50,7 @@ async fn use_xs(xs: Array<i64>) -> i64 { await sleep(1); return xs[0]; }
 async fn main() { let xs: Array<i64> = [1, 2, 3]; println(await use_xs(xs)); }
 "#;
 
-// ── Multi-worker capstone (willow-dgwo.9) ─────────────────────────────────────
+// ── Multi-worker capstone ─────────────────────────────────────
 // Send/Sync checks make task migration sound regardless of worker count.
 const NONSEND_ASYNC_FRAME_SRC: &str = r#"
 async fn run() -> i64 {
@@ -63,7 +63,7 @@ async fn main() { println(await run()); }
 
 // Many concurrent tasks: start 30 async workers, collect handles in an array,
 // await them all. Verifies the scheduler + array-of-Task + targeted-await scale
-// and that each task keeps its own identity/result (willow-9lw/h2vf/bsqy).
+// and that each task keeps its own identity/result.
 const THIRTY_WORKERS_SRC: &str = r#"
 import std::collections::Array;
 async fn worker(id: i64) -> i64 {
@@ -91,7 +91,7 @@ async fn main() {
 }
 "#;
 
-// ── Scheduler stays alive for BlockedSyscall-only workloads (willow-0a6k.5) ─
+// ── Scheduler stays alive for BlockedSyscall-only workloads ─
 // With no ready tasks, no timers, and no netpoll waiters, a pending blocking-
 // pool job must still keep the scheduler waiting: run_until returning early
 // would hand the awaiter an unfinished result. A FIFO makes the I/O genuinely

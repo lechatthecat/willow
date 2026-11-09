@@ -20,7 +20,7 @@ impl TypeChecker {
                     let ch_ty = self.check_expr(channel);
                     let elem = self.select_channel_elem(&ch_ty, channel.span());
                     // `recv_opt` binds `Option<T>`: `None` when the case ran
-                    // because the channel closed (willow-jz15.44).
+                    // because the channel closed.
                     let elem = if *closed_aware && elem != Type::Void {
                         B::Option.apply(vec![elem])
                     } else {
@@ -99,7 +99,7 @@ impl TypeChecker {
                 SelectCaseKind::Join { binding, task } => {
                     // A task case IS an `await`, so it obeys the same rule as
                     // one written outside a select: waiting on a task is only
-                    // possible in an async fn (willow-qrj9). Channel and
+                    // possible in an async fn. Channel and
                     // `sleep` cases stay legal in a sync select.
                     if !self.local.current_async_context {
                         self.push(
@@ -119,7 +119,7 @@ impl TypeChecker {
                     // Cancellation-awareness follows the awaited TYPE, not the
                     // syntax. An inline `t.result()`, a held `TaskResult<T>`,
                     // and a user-defined `result()` returning `Task<T>` are
-                    // therefore classified consistently (willow-qrj9).
+                    // therefore classified consistently.
                     let (output_ty, cancel_aware) = match awaitable_task_type(&task_ty) {
                         Some(shape) => shape,
                         None if Self::contains_error_type(&task_ty) => (Self::error_type(), false),
@@ -185,7 +185,7 @@ impl TypeChecker {
     /// (`close`, `send`, `recv`) on a CLASS receiver must resolve through
     /// normal class-method lookup: either the user's method, or a proper
     /// "no method on class" error — never the misleading channel-builtin
-    /// "expected `Channel<T>`" (willow-vynv.2 found via `defer r.close()`).
+    /// "expected `Channel<T>`" (deferred action checking found via `defer r.close()`).
     fn class_defines_method(&self, obj_ty: &Type, _method: &str) -> bool {
         matches!(obj_ty, Type::Named(name) if self.symbols.lookup_class(name).is_some())
     }
@@ -319,7 +319,7 @@ impl TypeChecker {
     /// Type-check a method on the explicitly native-blocking compatibility
     /// cells. Scheduler-aware `Mutex<T>` / `RwLock<T>` have no accessors.
     ///
-    /// `Mutex<T>` has NO accessor methods (willow-38w.1.4). A `get`/`set` pair
+    /// `Mutex<T>` has NO accessor methods. A `get`/`set` pair
     /// around a read-modify-write drops concurrent updates, which is exactly the
     /// bug a mutex exists to prevent, so exclusive access is only reachable
     /// through `lock <mutex> as [mut] value { .. }`.
@@ -390,7 +390,7 @@ impl TypeChecker {
         ret
     }
 
-    /// Type-check a method on `AtomicI64` / `AtomicBool` (willow-dgwo.3).
+    /// Type-check a method on `AtomicI64` / `AtomicBool`.
     /// `compare_exchange(T, T) -> bool`, `load() -> T`, `store(T)`, `add(T)/sub(T) -> T` (i64 only), `swap(T) -> T`.
     pub(super) fn check_atomic_method_call(&mut self, atomic: &str, call: &MethodCallExpr) -> Type {
         let elem = if B::from_name(atomic) == Some(B::AtomicI64) {
@@ -452,7 +452,7 @@ impl TypeChecker {
         obj_ty: &Type,
         call: &MethodCallExpr,
     ) -> Option<Type> {
-        // Atomic primitives (willow-dgwo.3).
+        // Atomic primitives.
         if let Some(id @ (B::AtomicI64 | B::AtomicBool)) =
             builtin_types::resolve(obj_ty).map(|resolved| resolved.id)
         {
@@ -579,7 +579,7 @@ impl TypeChecker {
             return Some(self.check_lock_method_call(n, &args[0].clone(), call));
         }
         match call.method.as_str() {
-            // `result()` (willow-qrj9): a cancellation-aware awaitable VIEW of
+            // `result()`: a cancellation-aware awaitable VIEW of
             // the same task and the same async frame. It starts nothing, waits
             // for nothing, and duplicates nothing — only `await` on the
             // returned `TaskResult<T>` waits, and it maps a cancelled task to
@@ -594,7 +594,7 @@ impl TypeChecker {
                 );
                 Some(B::TaskResult.apply(vec![join_handle_result_type(obj_ty).unwrap()]))
             }
-            // Cooperative cancellation (willow-0a6k.7).
+            // Cooperative cancellation.
             "cancel" | "is_cancelled" if join_handle_result_type(obj_ty).is_some() => {
                 self.check_builtin_arity(
                     method_arity("Task", &call.method),
@@ -609,7 +609,7 @@ impl TypeChecker {
                     Type::Bool
                 })
             }
-            // `join()` and `try_join()` are REMOVED (willow-qrj9): every Task
+            // `join()` and `try_join()` are REMOVED: every Task
             // completion wait is expressed through `await`. Keep both names
             // intercepted for Task handles so users get a migration diagnostic
             // rather than an unrelated "unknown method" error. Unrelated user
@@ -671,7 +671,7 @@ impl TypeChecker {
                 }
                 let element_ty = channel_type.unwrap();
                 // A sent value crosses task/worker boundaries, so the channel
-                // item type must be Send (willow-dgwo.6, spec §10; gated like the
+                // item type must be Send (parallel-map Send checking, spec §10; gated like the
                 // other data-race checks).
                 if self.enforce_send_sync && element_ty != Type::Void && !self.is_send(&element_ty)
                 {
@@ -703,7 +703,7 @@ impl TypeChecker {
                     // Record each suspended value independently: a
                     // cooperative `send` on a bounded channel is a suspend
                     // point, so the lowering frame-backs channel + value and
-                    // carries the value into the task (willow-o038).
+                    // carries the value into the task.
                     if self.local.current_async_context && element_ty != Type::Void {
                         self.record_async_local(
                             element_ty.clone(),
@@ -751,7 +751,7 @@ impl TypeChecker {
                 );
                 match channel_element_type(obj_ty) {
                     // `recv_opt` answers `None` once the channel is closed and
-                    // drained instead of raising (willow-jz15.44).
+                    // drained instead of raising.
                     Some(element_ty) if method == "recv_opt" => {
                         Some(B::Option.apply(vec![element_ty]))
                     }

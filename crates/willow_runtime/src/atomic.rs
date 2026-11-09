@@ -1,4 +1,4 @@
-//! Atomic integer/boolean primitives (willow-dgwo.3).
+//! Atomic integer/boolean primitives.
 //!
 //! `AtomicI64` / `AtomicBool` are GC-managed heap cells holding a single
 //! sequentially-consistent atomic value. They are allocated with

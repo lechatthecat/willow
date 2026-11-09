@@ -1,4 +1,4 @@
-// Short-lived array literals (willow-jz15.94).
+// Short-lived array literals.
 //
 // A small array literal and a pushed array's grown buffer are bump-allocated
 // in the young generation, the same way objects are, so a loop that builds

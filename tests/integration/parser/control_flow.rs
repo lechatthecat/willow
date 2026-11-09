@@ -352,7 +352,7 @@ fn main() {
     assert_eq!(out, "1\n0\n");
 }
 
-// ── `else if` chains (willow-hg6e) ───────────────────────────────────────────
+// ── `else if` chains ───────────────────────────────────────────
 
 fn run_ok(src: &str) -> String {
     let (out, ok) = compile_and_run(src);

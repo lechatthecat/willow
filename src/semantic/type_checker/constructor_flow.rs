@@ -1,4 +1,4 @@
-//! Definite initialization on successful constructor exits (willow-9tls.31).
+//! Definite initialization on successful constructor exits.
 //!
 //! Build a control-flow DAG, then union *possibly uninitialized* fields at
 //! joins. A normal return and fallthrough share one exit; an unrecovered panic
@@ -7,8 +7,8 @@
 //! other defers merely clean up and leave panics on their outer target.
 //! Calls consult a caller-supplied may-panic oracle keyed by the checked
 //! call expression; the type checker first runs with an all-panicking oracle
-//! and refines only reported constructors with unit effect facts
-//! (willow-ssl7.19). Loop backedges are omitted: assignments only add initialization, and
+//! and refines only reported constructors with unit effect facts. Loop backedges are omitted:
+//! assignments only add initialization, and
 //! each abstract branch is already possible on the first iteration. Later
 //! iterations cannot weaken that first-iteration state. `break` reaches the
 //! loop's successor; `continue` and the body tail end this abstract iteration.
@@ -370,7 +370,7 @@ impl<'a, 'f> Graph<'a, 'f> {
                         if cleanup.recovers && !recovers {
                             // Recovery resumes after this lexical scope. Only
                             // a direct recover() can end a panic: a helper's
-                            // recover() is not eligible (willow-s9ej.3).
+                            // recover() is not eligible.
                             active.panic_to = if flow.panic_to == DEAD {
                                 next
                             } else {

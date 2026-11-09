@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Scheduler-aware `lock` statement, end to end (willow-38w.1.1 … .1.4) ─────
+// ── Scheduler-aware `lock` statement, end to end (scheduler-aware locks … .1.4) ─────
 //
 // The unit tests in `src/parser` and `src/semantic/type_checker` cover the
 // grammar and the rule set (`lock_check_01` … `lock_check_30`). The suite below

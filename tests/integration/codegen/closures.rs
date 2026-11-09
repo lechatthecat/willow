@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Closures: lambdas that capture (willow-0g8j.2.12) ───────────────────────
+// ── Closures: lambdas that capture ───────────────────────
 //
 // A capturing lambda is a `closure`, not a `fn`: its value is a GC object
 // whose payload word 0 holds the lifted function's code address and whose

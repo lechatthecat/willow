@@ -1,5 +1,5 @@
 //! Binding an enum payload whose type is a class or interface declared in a
-//! module OTHER than the enum's own (willow-jz15.38).
+//! module OTHER than the enum's own.
 //!
 //! `willow check` accepted these programs and the build then stopped with
 //! "E0800 internal compiler error ... the field `hi` on a `bx::Bx` ... has

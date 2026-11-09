@@ -42,8 +42,8 @@ impl TypeScope {
                 Some(TypeBinding::Alias(next)) => current = *next,
                 Some(TypeBinding::Canonical(target)) => return *target,
                 // The receiver prefix names the entry file's identity in
-                // every unit: no unit's own alias may answer to it
-                // (willow-nvi6).
+                // every unit: no unit's own alias may answer to it.
+                //
                 None => return current.foreign_receiver_target().unwrap_or(current),
             }
         }
@@ -226,7 +226,7 @@ impl<V> TypeMap<'_, V> {
         self.get(key).is_some()
     }
     /// Look `key` up as a DECLARATION identity, ignoring whatever aliases the
-    /// unit being compiled has installed (willow-kd1v).
+    /// unit being compiled has installed.
     ///
     /// For the build-wide passes that walk names the tables themselves
     /// recorded: those names are already canonical, and a unit that binds one
@@ -575,7 +575,7 @@ mod tests {
         map.set_scope(scope.clone());
         assert_eq!(map.get("ui::Color"), Some(&7));
         // A build-wide pass walking recorded names must still see the entry it
-        // recorded (willow-kd1v).
+        // recorded.
         assert_eq!(map.get_canonical("ui::Color"), Some(&9));
     }
 
@@ -700,7 +700,7 @@ mod tests {
     #[test]
     fn ti_27_receiver_spelling_names_the_entry_identity_in_any_scope() {
         // A unit whose own `Me` shadows the entry's still reaches the entry's
-        // through the receiver prefix, bound or not (willow-nvi6).
+        // through the receiver prefix, bound or not.
         let mut scope = TypeScope::default().fork_unit();
         scope.bind_canonical("Me", "$local::util::Me");
         let receiver = TypeId::from_source_name("$receiver::Me");

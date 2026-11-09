@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Lambda return type inference (willow-cuq) ────────────────────────────────
+// ── Lambda return type inference ────────────────────────────────
 
 // and_then with unannotated expression-body lambda
 #[test]
@@ -172,7 +172,7 @@ fn main() {
     assert_eq!(out, "2\n");
 }
 
-// willow-jz15.115: the callable signature and body constructor must agree.
+// the callable signature and body constructor must agree.
 #[test]
 fn test_lambda_result_expression_context_matrix() {
     for callable in ["fn", "closure"] {

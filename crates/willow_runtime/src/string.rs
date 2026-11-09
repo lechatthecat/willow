@@ -177,7 +177,7 @@ unsafe fn ws_as_bytes(s: *const u8) -> (*const u8, usize) {
     (unsafe { s.add(DATA_OFFSET) }, len)
 }
 
-/// Content equality of two strings (willow-rpxh): `==` on `String` must
+/// Content equality of two strings: `==` on `String` must
 /// compare bytes, not pointers. Null-safe: two nils are equal, nil never
 /// equals a real string (this also gives `s == nil` the right meaning).
 #[unsafe(no_mangle)]
@@ -231,7 +231,7 @@ pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u
 }
 
 /// Concatenate `count` parts into one new string: one size-summed allocation,
-/// then one copy per part (willow-8hq4.29). `parts` holds `[kind, value]` word
+/// then one copy per part. `parts` holds `[kind, value]` word
 /// pairs encoded as in [`willow_abi::string_concat`].
 ///
 /// Called directly by generated code. The call roots the string slots of

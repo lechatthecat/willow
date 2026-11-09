@@ -10,7 +10,7 @@ fn void_tasks_frozen_iteration_example() {
     }
 }
 
-// ── Array<T> type (willow-xqm) ─────────────────────────────────────────────
+// ── Array<T> type ─────────────────────────────────────────────
 // GC-managed arrays: literals, indexing (read/write), `.len()`, bounds checks.
 // Element types cover scalars (i64/bool/f64) and GC references (String/object).
 

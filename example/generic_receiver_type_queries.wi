@@ -1,6 +1,6 @@
 // `willow type` on member calls through generic receivers reports the
 // receiver-instantiated member type, and locals inside generic bodies never
-// show compiler-internal instantiation aliases (willow-25da.29.55).
+// show compiler-internal instantiation aliases.
 
 interface PQueue<T> {
     fn pop(self) -> Option<T>;

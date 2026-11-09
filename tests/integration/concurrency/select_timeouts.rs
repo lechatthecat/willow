@@ -1,6 +1,6 @@
 use super::*;
 
-// ── select timeout + task-completion cases (willow-soro) ────────────────────
+// ── select timeout + task-completion cases ────────────────────
 // `sleep(ms) =>` : deadline fixed ONCE at select entry; parks with the
 // scheduler timer armed to the nearest deadline; ready when now >= deadline.
 // `let v = await t =>` registers on the task's waiter list (via
@@ -57,8 +57,8 @@ fn stmo_05_coop_task_await_beats_timeout() {
 
 #[test]
 fn stmo_06_sync_task_case_is_rejected() {
-    // A task case IS an `await`, so a sync `select` cannot wait on a task
-    // (willow-qrj9); its channel and `sleep` cases stay legal.
+    // A task case IS an `await`, so a sync `select` cannot wait on a task; its channel and
+    // `sleep` cases stay legal.
     let (ok, stderr) = compile_with_compiler_env(
         "async fn quick() -> i64 { await sleep(10); return 9; }\nfn main() { let t = quick(); select { let v = await t => { println(v); } sleep(5000) => { println(\"late\"); } } }",
         &[],

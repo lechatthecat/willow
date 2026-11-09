@@ -1,9 +1,9 @@
-//! `fn main() -> Result<void, E>` compiled from Lowered IR (willow-0g8j.2.14).
+//! `fn main() -> Result<void, E>` compiled from Lowered IR.
 //!
 //! `main` is the one function whose return value is not handed to a caller: it
 //! becomes the process exit status. The compiler lowers a `Result<void, E>`
 //! main to a VOID `willow_user_main` and turns each way out of it into an EXIT
-//! (willow-exg) — `Ok` flushes defers and returns nothing, `Err` reports the
+//! — `Ok` flushes defers and returns nothing, `Err` reports the
 //! payload through `willow_main_fail` and exits non-zero, and a `?` on an `Err`
 //! does the same instead of returning the failure.
 //!
@@ -15,7 +15,7 @@
 //! the walker's `return` and `?` emitters had no Result-main epilogue.
 //!
 //! Each test pins down the output AND the success/failure status, and since
-//! willow-0g8j.3 a body outside the walker's subset is a compile error, so a
+//! the lowered-IR cutover a body outside the walker's subset is a compile error, so a
 //! run that produces both is proof the walker produced them. Each also runs
 //! under `WILLOW_GC_STRESS=alloc`, because a reported `Err` payload is a heap
 //! value that has to survive the defer flush standing between its construction
@@ -546,7 +546,7 @@ async fn main() -> Result<void, String> {
 
 // 24. The cooperative driver must inspect the published result after main's
 //     task completes. An Err reports its String payload and exits non-zero on
-//     both the AST and LIR poll-body paths (willow-4ylu).
+//     both the AST and LIR poll-body paths.
 #[test]
 fn lir_main_result_24_async_err_reports_and_fails() {
     assert_main(

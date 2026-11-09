@@ -2,8 +2,8 @@
 // module, under each name an import can give them: a direct item import
 // (`Rect`), an aliased one (`Caption`), an item-imported interface (`Area`),
 // and the module-qualified `shapes::Label`. Its own functions bind those
-// payloads in `match` and read fields and call methods on them
-// (willow-jz15.38).
+// payloads in `match` and read fields and call methods on them.
+//
 module scene;
 
 import shapes;

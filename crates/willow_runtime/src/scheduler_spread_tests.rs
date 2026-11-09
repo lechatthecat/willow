@@ -1,4 +1,4 @@
-//! willow-jz15.120: a worker with queued local work hands an unpinned first
+//! a worker with queued local work hands an unpinned first
 //! poll back to the shared queue while a peer is idle, so allocation-heavy
 //! tasks do not get pinned together on one worker.
 use super::*;
@@ -111,7 +111,7 @@ fn rerouted_task_reaches_its_owner_without_waking_idle_thieves() {
     assert_eq!(queues.pop_for_worker(0), Some(66));
 }
 
-/// willow-xere: a resumed task is not a first claim. Spreading every yield
+/// a resumed task is not a first claim. Spreading every yield
 /// resume tripled yield_switch's shared-queue traffic and wall time.
 #[test]
 fn a_started_task_never_spreads() {
@@ -147,7 +147,7 @@ fn every_scheduler_claim_marks_the_task_started() {
     assert_eq!(scheduler.with_task(direct, |task| task.started), Some(true));
 }
 
-/// willow-xere: a peer with queued local work is busy even between polls, so
+/// a peer with queued local work is busy even between polls, so
 /// a spawn burst that batch pops filled every local queue does not spread.
 #[test]
 fn peers_with_local_backlog_are_not_idle() {
@@ -171,7 +171,7 @@ fn peers_with_local_backlog_are_not_idle() {
     }
 }
 
-/// willow-xere: a shared queue that already holds a task per idle peer gains
+/// a shared queue that already holds a task per idle peer gains
 /// nothing from one more.
 #[test]
 fn spread_requires_fewer_shared_tasks_than_idle_peers() {

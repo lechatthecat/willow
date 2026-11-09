@@ -1,4 +1,4 @@
-//! The atomic task state machine (willow-ezs.4).
+//! The atomic task state machine.
 //!
 //! This is the contract the scheduler lock decomposition is built on, specified
 //! and tested here before any queue is moved out from under the global mutex.
@@ -48,8 +48,8 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-/// Advances after every cancel request that set a task's request bit
-/// (willow-jz15.120). A predicate `cancel_requested || Cancelling` can only
+/// Advances after every cancel request that set a task's request bit. A predicate
+/// `cancel_requested || Cancelling` can only
 /// become true through such a request, so a reader that already looked at a
 /// task's state after observing epoch `E` need not look again until the epoch
 /// moves. Starts at 1 so a zero cache always forces the first look.
@@ -590,7 +590,7 @@ mod tests {
         state
     }
 
-    /// willow-jz15.120: every recorded request advances the cancel epoch
+    /// every recorded request advances the cancel epoch
     /// before its caller returns, so a reader caching "not cancelled" against
     /// an older epoch looks again. Other tests may advance it concurrently, so
     /// only strict growth is asserted.

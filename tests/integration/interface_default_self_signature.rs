@@ -1,4 +1,4 @@
-//! Interface defaults whose signature names `Self` (willow-dnia).
+//! Interface defaults whose signature names `Self`.
 //!
 //! The body is checked once at the interface, with `self: Self` an opaque
 //! receiver that converts to the interface and reaches its methods; every

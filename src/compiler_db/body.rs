@@ -25,7 +25,7 @@ enum NormalizedBody {
     Method(MethodDecl),
     Constructor(ConstructorDecl),
     Static(FieldDecl),
-    /// A lambda's own body, with its nested lambdas detached (willow-afb5.17).
+    /// A lambda's own body, with its nested lambdas detached.
     Lambda(LambdaBody),
 }
 
@@ -1830,7 +1830,7 @@ mod tests {
         "#,
             false,
         );
-        // Three roots plus two lambda records (willow-afb5.17).
+        // Three roots plus two lambda records.
         assert_repeated_normalization(&program, &queries, 5);
         // The root record keeps only a placeholder where each lambda was, so
         // every lambda body is serialized once, under its own key.
@@ -1916,7 +1916,7 @@ mod tests {
         assert_eq!(queries.typed.stats().computations, typed_computations);
     }
 
-    // Measurement harness for willow-r52c.20; no production behavior changes.
+    // Measurement harness for shared default-body analysis; no production behavior changes.
     #[test]
     fn default_body_clone_measurements() {
         use crate::ir::{lower, lowered};
@@ -2014,7 +2014,7 @@ mod tests {
         }
     }
 
-    /// willow-dnia: a default whose signature names `Self` is typed once for
+    /// a default whose signature names `Self` is typed once for
     /// the interface: next to the same program without it, it adds one body
     /// check whatever the receiver count, and every copy reuses the canonical
     /// record.
@@ -2077,7 +2077,7 @@ mod tests {
         assert_eq!(added(16), 1);
     }
 
-    /// willow-afb5.17: lambdas in constructors, static initializers and each
+    /// lambdas in constructors, static initializers and each
     /// copy of an injected default get their own normalized records, and the
     /// walk-only split leaves bodies outside the normalization boundary as
     /// written.
@@ -2104,7 +2104,7 @@ mod tests {
         assert_repeated_normalization(&program, &queries, 5 + lambdas);
     }
 
-    /// willow-afb5.17: a lambda nested `depth` deep is normalized and stored
+    /// a lambda nested `depth` deep is normalized and stored
     /// once, so records and stored bytes grow linearly with depth instead of
     /// each ancestor re-serializing every nested body.
     #[test]

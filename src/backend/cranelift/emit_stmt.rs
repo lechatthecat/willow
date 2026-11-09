@@ -40,7 +40,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// Run every registered defer from frame `depth` outward, innermost frame
     /// first, newest registration first (LIFO). Frames are left in place —
-    /// scope bookkeeping pops them (willow-vynv.2).
+    /// scope bookkeeping pops them.
     pub(super) fn emit_flush_defers_from(&mut self, depth: usize) {
         let frames = self.cleanup.defer_stack.frames.clone();
         let frame_count = self.cleanup.defer_stack.len();
@@ -51,7 +51,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Each registration is emitted under the bindings it captured, so the
         // flush rewrites `vars`. Whatever comes after it — the `return` whose
         // value was bound AFTER the registration, the rest of an enclosing
-        // scope — still expects its own bindings (willow-0g8j.2.15).
+        // scope — still expects its own bindings.
         let vars_before = self.locals.vars.clone();
         'frames: for (index, (frame, guarded)) in
             frames.iter_rev().take(frame_count - depth).enumerate()
@@ -60,7 +60,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // finishes unwinding, which is what orders the section's defers
             // (still holding the lock) before the enclosing scopes' defers
             // (after the release) on EVERY exit path — fallthrough, `return`,
-            // `?`, `break` and `continue` all reach here (willow-38w.1.4).
+            // `?`, `break` and `continue` all reach here.
             let lock_depth = frame_count - index - 1;
             for entry in frame.iter_rev() {
                 if self.cleanup.unavailable_defer_ids.contains(&entry.id) {
@@ -97,14 +97,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.locals.vars = (*entry.vars_at_registration).clone();
                 // Rebind the hidden frame operands: coop loop bodies restore
                 // `vars`, wiping the names between registration and a
-                // function-exit flush (willow-vynv.3).
+                // function-exit flush.
                 for (name, storage) in entry.bindings.iter() {
                     self.locals.vars.insert(name.clone(), storage.clone());
                 }
                 // Async: leave REGISTERED before entering user cleanup code.
                 // A future recoverable panic may unwind out of that code; if
                 // the flag stayed set until afterwards, cancellation/recovery
-                // could run this same registration twice (willow-s9ej.1).
+                // could run this same registration twice.
                 if let (Some(off), Some(frame_ptr)) =
                     (entry.flag_offset, self.suspension.coop_frame)
                 {
@@ -121,7 +121,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // panic-defer depth is per execution context, so a defer that
                 // runs while an OUTER frame is unwinding would otherwise be able
                 // to consume that frame's panic — a helper called from panic
-                // cleanup could steal its caller's panic (willow-s9ej.7). Only
+                // cleanup could steal its caller's panic. Only
                 // the cleanup emitted for the unwinding scope itself may
                 // recover; here `recover()` lowers to a constant `None`.
                 let eligible_before = self.cleanup.recover_eligible_depth;
@@ -155,7 +155,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Commit and release every `lock` whose critical section owns the defer
-    /// frame at `depth` (willow-38w.1.4), innermost first.
+    /// frame at `depth`, innermost first.
     ///
     /// The handle slot is cleared after the runtime relationship is gone, so a
     /// path that reaches this hook twice — a recovered panic that then falls
@@ -570,13 +570,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// they enter the runtime when a collector actually requests a stop.
     /// Inside a task native stack, `poll.active` is the stack's inline
     /// countdown: each safepoint decrements it and the runtime is entered only
-    /// when the batch the runtime granted is used up (willow-jz15.40).
+    /// when the batch the runtime granted is used up.
     ///
     /// A loop poll (`in_loop`) decrements the countdown unconditionally:
     /// outside task stacks that is the frame's spare, which only rearms after
     /// `i32::MAX` polls. Its fast path then has one gate branch and one
     /// countdown branch, neither taken, instead of a taken branch around the
-    /// countdown whose cost depends on code alignment (willow-nzsg). The
+    /// countdown whose cost depends on code alignment. The
     /// entry poll keeps the presence test, so calls pay no spare setup.
     pub(super) fn emit_sync_safepoint(&mut self, poll: SyncPoll, in_loop: bool) {
         // Atomic loads cannot be hoisted out of the source loop. The GC flag
@@ -1158,7 +1158,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// [`Self::emit_runtime_call_with_cleanup`] with arguments produced right
     /// before the call itself, after any panic-depth snapshot. A cold caller
     /// reloads spilled operands here so they are not live across that
-    /// snapshot call (willow-nzsg).
+    /// snapshot call.
     pub(super) fn emit_runtime_call_late_args<A, F>(
         &mut self,
         name: &str,
@@ -1308,8 +1308,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Publish the executing function and location before a call that can raise.
     /// Debug builds retain the synchronous leaf; async tasks retain their own
     /// location in every mode. Release synchronous code publishes only the
-    /// separate overflow name: ordinary faults remain location-free
-    /// (willow-s9ej.7), without the full trace-site call (willow-9686). An async site cannot
+    /// separate overflow name: ordinary faults remain location-free, without the full
+    /// trace-site call. An async site cannot
     /// leak into it because the runtime drops the fault location when async
     /// code enters a Willow call and at every poll boundary.
     pub(super) fn emit_fault_site(&mut self) {
@@ -1364,7 +1364,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Branch away before observing a neutral result only when the callee
-    /// added a new panic record (willow-s9ej.4).
+    /// added a new panic record.
     pub(super) fn emit_post_willow_call_panic_check(
         &mut self,
         depth_before: Option<cranelift_codegen::ir::Value>,

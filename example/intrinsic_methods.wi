@@ -1,5 +1,5 @@
 // intrinsic_methods.wi — the builtin methods the compiler resolves as
-// intrinsics, gathered in one program (willow-uqzx, catalog item 7).
+// intrinsics, gathered in one program (shared compiler infrastructure, catalog item 7).
 //
 // `xs.len()`, `flag.load()` and `scope.finish()` are not ordinary method calls:
 // there is no user-written body behind them. The compiler recognises the

@@ -1,4 +1,4 @@
-//! Focused invariants for per-yield accounting (willow-8hq4.26).
+//! Focused invariants for per-yield accounting.
 use super::*;
 use std::sync::Barrier;
 

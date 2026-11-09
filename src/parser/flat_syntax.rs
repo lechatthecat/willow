@@ -35,11 +35,11 @@ enum ExprWire {
     MethodCall(Box<MethodCallExpr>),
     /// `ClassName::method(args)` — static/constructor call
     StaticCall(Box<StaticCallExpr>),
-    /// `ClassName::property` — static property read (willow-qsqf). No parens; the
+    /// `ClassName::property` — static property read. No parens; the
     /// value is loaded from the class's static global storage.
     StaticField(StaticFieldExpr),
-    /// `new ClassName(args...)` — object construction via a constructor
-    /// (willow-scq2). Resolves to an explicit `init` or an implicit memberwise
+    /// `new ClassName(args...)` — object construction via a constructor. Resolves to an
+    /// explicit `init` or an implicit memberwise
     /// constructor.
     New(Box<NewExpr>),
     /// `ClassName { field: value, ... }`
@@ -53,8 +53,8 @@ enum ExprWire {
     /// `start..end` — half-open i64 range for `for` loops
     Range(Box<RangeExpr>),
     /// `|params| expr` or `|params| { block }` — anonymous function. It is a
-    /// `fn` value when it captures nothing and a `closure` value when it does
-    /// (willow-0g8j.2.12); the two are different types.
+    /// `fn` value when it captures nothing and a `closure` value when it does; the two are
+    /// different types.
     Lambda(Box<LambdaExpr>),
     Match(Box<MatchExpr>),
     /// `expr?` — propagate Result::Err early (the ? operator)
@@ -73,22 +73,22 @@ enum StmtWire {
     FieldAssign(FieldAssignStmt),
     /// `super.init(args...);` — constructor-only base initialization.
     SuperInit(SuperInitStmt),
-    /// `ClassName::property = value;` — static property assignment (willow-qsqf).
+    /// `ClassName::property = value;` — static property assignment.
     StaticFieldAssign(StaticFieldAssignStmt),
     IndexAssign(IndexAssignStmt),
     If(IfStmt),
     While(WhileStmt),
-    /// `break;` — exit the innermost enclosing loop (willow-kzka).
+    /// `break;` — exit the innermost enclosing loop.
     Break(crate::diagnostics::Span),
     /// `continue;` — skip to the next iteration of the innermost loop.
     Continue(crate::diagnostics::Span),
     /// `defer <call>;`, `defer match ... { ... }`, or `defer { ... }` — run the
     /// body when the enclosing SCOPE exits (LIFO; fallthrough/return/`?`/
-    /// break/continue; not on panic) (willow-vynv.2 / willow-oorh).
+    /// break/continue; not on panic).
     /// A direct call's receiver and arguments are evaluated at registration.
     Defer(DeferStmt),
     /// `lock <expr> as [mut] <ident> { ... }` — a compiler-managed critical
-    /// section over a `Mutex<T>` or `RwLock<T>` (willow-38w.1.1).
+    /// section over a `Mutex<T>` or `RwLock<T>`.
     Lock(LockStmt),
     For(ForStmt),
     Return(ReturnStmt),

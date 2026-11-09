@@ -109,7 +109,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// Convert error `e1_payload` (static class `e1_name`, implementing
     /// `Into<E2>`) to `E2` by calling `into`, dispatching VIRTUALLY on the
-    /// payload's runtime type so a subclass override is honored (willow-bpk6).
+    /// payload's runtime type so a subclass override is honored.
     pub(super) fn emit_into_conversion(
         &mut self,
         e1_payload: cranelift_codegen::ir::Value,
@@ -154,7 +154,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Leave a `Result<void, E>` main by inspecting the `Result` value: `Err`
     /// reports the payload and exits non-zero; `Ok` returns void (exit 0). Pops
     /// the function's GC roots first (we leave the function on both paths).
-    /// See willow-exg.
+    /// See value-producing control flow.
     pub(super) fn emit_main_result_exit(&mut self, result_ptr: cranelift_codegen::ir::Value) {
         if self.roots.gc_root_count > 0 {
             self.emit_pop_roots_n(self.roots.gc_root_count);

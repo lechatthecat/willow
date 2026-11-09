@@ -1,7 +1,7 @@
 use super::*;
 
 // ----------------------------------------------------------------------------
-// Cooperative awaiter-suspend model (willow-lpn.5.3.1): a `let x = await f()` /
+// Cooperative awaiter-suspend model: a `let x = await f()` /
 // `await f()` of a cooperative leaf SUSPENDS the awaiter via willow_sched_await
 // (dependency-wake) rather than block-on, so a fn that MIXES call-awaits and
 // sleep-awaits is itself a cooperative task. The callee frame is held in a

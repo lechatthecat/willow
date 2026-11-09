@@ -2,7 +2,7 @@
 //!
 //! A Willow program exits when `main` returns; the runtime deliberately does
 //! not drain unawaited tasks first, because a non-terminating background task
-//! would then hang the exit (willow-bsqy). So there are always runtime-owned
+//! would then hang the exit. So there are always runtime-owned
 //! threads alive at exit — scheduler persistent workers, the GC coordinator,
 //! GC marker workers, the blocking pool — and the platform terminates them
 //! wherever they happen to be.
@@ -13,7 +13,7 @@
 //! may have been holding. A GC marker or scheduler worker caught inside
 //! `malloc`/`free` while tracing therefore strands the exiting thread forever:
 //! the process keeps one thread, in a `WrAlertByThreadId` lock wait, with its
-//! exit status already published and its image still mapped. willow-ihr5 is
+//! exit status already published and its image still mapped. The exit teardown regression is
 //! two Windows CI jobs that spent their whole budget there, one of them three
 //! hours, after the program had printed all of its expected output.
 //!

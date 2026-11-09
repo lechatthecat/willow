@@ -1,4 +1,4 @@
-// Interface -> concrete class downcast via `match` (willow-1js.4).
+// Interface -> concrete class downcast via `match`.
 //
 // A `match` on an interface-typed value may use class patterns `Dog(d)` that
 // match when the value's runtime type is that concrete class, binding `d` to

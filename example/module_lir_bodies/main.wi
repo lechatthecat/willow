@@ -1,5 +1,5 @@
 // module_lir_bodies — an imported module whose every body compiles from
-// lowered IR (willow-0g8j.16).
+// lowered IR.
 //
 // src/lib.rs used to lower ONLY the entry program: `register_lir_functions`
 // was called once, for `main.wi`, and the loop that compiles each imported
@@ -14,8 +14,8 @@
 // shapes.wi: virtual dispatch, subclass widening, a class-typed field, an
 // array field, a `defer` observed through a reference parameter, a match on
 // the module's own enum, and recursion. None of it is expressible from the
-// entry file, which cannot even name `Rect`. Its lambdas are lifted here too
-// (willow-9yhi): a module never got a lambda-lifting pass, so any lambda in a
+// entry file, which cannot even name `Rect`. Its lambdas are lifted here too: a module never
+// got a lambda-lifting pass, so any lambda in a
 // module body used to ICE the compiler.
 //
 // Build it with the selection log — the whole project, module included:

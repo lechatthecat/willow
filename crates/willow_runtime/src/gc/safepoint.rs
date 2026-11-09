@@ -35,7 +35,7 @@ std::thread_local! {
 /// Marks a runtime entry point called directly by generated code at a GC
 /// point (allocation slow path, poll, collection builtins). Within its extent
 /// this thread's root-slot referents may move; elsewhere a park publishes them
-/// as values that stay in place (willow-9tls.9). Runtime frames that call back
+/// as values that stay in place. Runtime frames that call back
 /// into generated code are scheduler/main trampolines holding no raw pointers.
 pub(crate) struct RelocationSafeScope(bool);
 
@@ -199,7 +199,7 @@ pub(super) fn multi_mutator_active() -> bool {
         .any(|&id| id != current)
 }
 
-/// Register the current thread as a GC mutator (willow-6fv.5.6). A mutator that
+/// Register the current thread as a GC mutator. A mutator that
 /// can allocate or hold GC references on worker threads must register so a
 /// stop-the-world collection scans its roots.
 #[unsafe(no_mangle)]
@@ -274,7 +274,7 @@ pub extern "C" fn willow_gc_unregister_mutator() {
 ///
 /// A thread that stops while still registered leaves its id in
 /// `GcCoord::mutators`, and every later collection then waits for an
-/// acknowledgement that can never arrive (willow-utqy). An explicit
+/// acknowledgement that can never arrive. An explicit
 /// register/unregister pair is skipped by an unwind, so one panic on a worker
 /// wedges the whole process; the guard runs the unregistration on the unwind
 /// path as well. Prefer it over the bare pair wherever the registered region
@@ -359,13 +359,13 @@ const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 120;
 ///
 /// An acknowledgement that never arrives means a registered thread stopped
 /// without unregistering. The wait then cannot end, and the process produces
-/// no further output at all — willow-utqy is a Windows CI job that spent its
+/// no further output at all — the stalled GC regression is a Windows CI job that spent its
 /// whole 90-minute budget inside one such wait. All builds give up after the
 /// bound and name the threads instead; release builds must not silently wait
 /// forever for a vanished mutator.
 /// `WILLOW_GC_HANDSHAKE_TIMEOUT_SECS=0` disables the bound everywhere.
 ///
-/// Read once: `std::env::var` allocates for the key on Windows (willow-ssl7.12).
+/// Read once: `std::env::var` allocates for the key on Windows.
 fn handshake_timeout() -> Option<std::time::Duration> {
     static TIMEOUT: LazyLock<Option<std::time::Duration>> = LazyLock::new(|| {
         let seconds = match std::env::var("WILLOW_GC_HANDSHAKE_TIMEOUT_SECS")
@@ -432,7 +432,7 @@ pub extern "C" fn willow_gc_stop_flag() -> *const u8 {
     runtime().poll_requested.as_ptr().cast::<u8>()
 }
 
-/// A cooperative GC safepoint (willow-6fv.5.6). Cheap when no collection is
+/// A cooperative GC safepoint. Cheap when no collection is
 /// pending. When a stop-the-world collection is in progress, the calling mutator
 /// publishes a snapshot of its roots and parks here until the collector resumes
 /// it. The scheduler polls this between task polls; future compiler-inserted
@@ -451,7 +451,7 @@ pub extern "C" fn willow_gc_safepoint() {
         return;
     }
     // Past the fast path this thread is about to park. Parking while holding a
-    // mark-queue lock deadlocks the collector (willow-6fv.5.6.1): the world
+    // mark-queue lock deadlocks the collector: the world
     // cannot restart until this thread runs, and this thread cannot run until
     // the world restarts. Checking here makes that rule enforced rather than
     // merely documented, and costs one TLS read on the already-slow path.
@@ -602,7 +602,7 @@ impl Drop for RegionReentry {
 
 /// Run `collect` with the world stopped: request a safepoint, wait until every
 /// other registered mutator has parked, then run `collect` (which scans all
-/// published roots), then resume the world (willow-6fv.5.6).
+/// published roots), then resume the world.
 pub(super) fn with_stw<R>(
     reason: crate::gc_telemetry::stops::StopReason,
     collect: impl FnOnce(&GcCoord, &mut crate::gc_telemetry::stops::StopWorkV2) -> R,
@@ -636,7 +636,7 @@ pub(super) fn with_stw<R>(
     // a corrupt root, and callers catch that. The world has to be resumed
     // either way — an unwind that leaves `stop_requested` set parks every other
     // mutator forever, and one that unwinds out of the guard poisons the
-    // registry, taking every later collection down with it (willow-v6k0).
+    // registry, taking every later collection down with it.
     measurement.stopped();
     let collector_start = crate::gc_telemetry::timestamp_ns();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

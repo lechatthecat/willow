@@ -1,5 +1,5 @@
 // The module half of module_lir_bodies. Every body in this file compiles from
-// lowered IR (willow-0g8j.16); before that, an imported module's bodies were
+// lowered IR; before that, an imported module's bodies were
 // AST-emitted unconditionally, because only the entry program was ever lowered.
 module shapes;
 
@@ -126,7 +126,7 @@ pub fn grow(r: Rect, by: i64) -> Rect {
     return new Rect(r.name, r.w + by, r.h + by);
 }
 
-// Lambda lifting is a DECLARATION-phase job, and until willow-9yhi a module
+// Lambda lifting is a DECLARATION-phase job, and until module lambda lifting a module
 // never had one: `lambda_names` held entry-file spans alone, so a lambda here
 // reached codegen with no lifted symbol and ICEd the compiler.
 // The lifted functions are module-qualified (`shapes.$lambda.0`) because the

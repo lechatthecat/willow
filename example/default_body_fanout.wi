@@ -1,4 +1,4 @@
-// willow-r52c.20: one default body, sixteen independent receivers.
+// one default body, sixteen independent receivers.
 interface Answer {
     fn seed(self) -> i64;
     fn value(self) -> i64 { return self.seed() + 42; }

@@ -1,5 +1,5 @@
-//! The zero-argument GC statistic builtins through the LIR walker
-//! (willow-0g8j.3.1).
+//! The zero-argument GC statistic builtins through the LIR walker.
+//!
 //!
 //! `gc_collect()` and `gc_minor_collect()` — the two VOID collection triggers —
 //! were already in the walker's subset. Their read-only siblings,
@@ -14,7 +14,7 @@
 //! only what holds on every platform and under every collection schedule: a
 //! counter is never negative, a cumulative counter never goes backwards, and two
 //! reads with nothing between them agree. What each test really pins down is
-//! that the walker COMPILED the function: since willow-0g8j.3 a body outside
+//! that the walker COMPILED the function: since the lowered-IR cutover a body outside
 //! its subset is a compile error, and the log perspectives name the functions
 //! the walker had to take.
 //!
@@ -79,7 +79,7 @@ const COUNTERS: [&str; 33] = [
     "gc_major_collections",
 ];
 
-/// The program builds and prints `expected`. Since willow-0g8j.3 a body outside
+/// The program builds and prints `expected`. Since the lowered-IR cutover a body outside
 /// the walker's subset is a compile error, so a passing run is the proof that
 /// the walker compiled it.
 fn assert_project_output(source: &str, expected: &str) {

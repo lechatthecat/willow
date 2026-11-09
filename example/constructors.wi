@@ -1,4 +1,4 @@
-// Object creation with `new` and `init` constructors (willow-scq2, Stage 1).
+// Object creation with `new` and `init` constructors (constructor support, Stage 1).
 //
 //   new Class(args...)        creates an object
 //   init(self, params...) { ... }   declares a constructor with an explicit receiver

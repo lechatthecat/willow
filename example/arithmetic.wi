@@ -1,4 +1,4 @@
-// `i64 ** i64` is a compiler primitive now (willow-n5yv.3), so `power(2, 10)`
+// `i64 ** i64` is a compiler primitive now, so `power(2, 10)`
 // below can be written as `2 ** 10`. The loop is kept as a plain example of
 // `while` and `let mut`. See example/exponentiation.wi for the operator.
 fn power(base: i64, exponent: i64) -> i64 {

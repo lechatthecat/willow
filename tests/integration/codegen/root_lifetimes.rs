@@ -1,6 +1,6 @@
 use super::*;
 
-// ── GC safety: remaining fixes (willow-7q1) ──────────────────────────────────
+// ── GC safety: remaining fixes ──────────────────────────────────
 
 // Fix 2: GC-managed function parameter survives allocation in function body
 #[test]

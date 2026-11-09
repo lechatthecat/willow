@@ -1,6 +1,6 @@
 //! `==` and `!=` on class and interface values compare reference identity;
 //! types without defined equality are rejected by the checker instead of
-//! reaching lowering without an operand (willow-zvnt).
+//! reaching lowering without an operand.
 use super::support::{assert_compile_error_contains, compile_and_run_with_env};
 
 const HEADER: &str = r#"

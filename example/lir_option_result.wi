@@ -3,7 +3,7 @@
 // Every free function here stays inside the walker's supported subset, so its
 // basic blocks are compiled directly from the lowered IR instead of the AST.
 // Building this program must print the same thing under WILLOW_GC_STRESS=alloc
-// as without it. Since willow-0g8j.3 a body outside that subset is a compile
+// as without it. Since the lowered-IR cutover a body outside that subset is a compile
 // error rather than a fallback, so the build succeeding is what keeps the claim
 // above honest.
 //

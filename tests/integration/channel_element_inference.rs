@@ -1,5 +1,5 @@
-//! Where a channel's element type comes from, and what the runtime does with it
-//! (willow-nk3g).
+//! Where a channel's element type comes from, and what the runtime does with it.
+//!
 //!
 //! `Channel::new()` written without a type argument carries no element of its
 //! own: the checker types it `Channel<void>` and a `let` annotation supplies the
@@ -513,7 +513,7 @@ fn channel_element_16_no_annotation_stays_void() {
 }
 
 // 17. Constructor fields now supply the same expected element type as let
-//     annotations (willow-jz15.28). Prove that the contextual reference flag
+//     annotations. Prove that the contextual reference flag
 //     traces a queued, dynamically allocated String during collection.
 #[test]
 fn channel_element_17_constructor_argument_uses_field_context() {

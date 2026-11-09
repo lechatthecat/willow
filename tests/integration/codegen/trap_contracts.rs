@@ -1,10 +1,10 @@
 use super::*;
 
-// ── Trap contract sweep (willow-l9lx bug CLASS detector) ────────────────────
+// ── Trap contract sweep (trap contracts bug CLASS detector) ────────────────────
 // Every aborting runtime failure in a DEBUG build must present as a located
 // `runtime panic:` message — never a silent raw hardware signal (which prints
 // nothing). One table; new trappable constructs must join it. A row failing
-// with EMPTY output means a raw SIGILL/SIGFPE regression of the l9lx class.
+// with EMPTY output means a raw SIGILL/SIGFPE regression in trap handling.
 #[test]
 fn trap_contract_all_aborts_have_panic_messages() {
     let scenarios: &[(&str, &str)] = &[
@@ -14,8 +14,8 @@ fn trap_contract_all_aborts_have_panic_messages() {
             // run queues and polled by a peer worker immediately, so with a
             // short sleep it can reach `return 1` before `h.cancel()` lands and
             // the await then succeeds instead of aborting — a load-sensitive
-            // flake that only showed up when the whole suite ran in parallel
-            // (willow-fqzz). An hour is not a wait: `cancel()` re-queues the
+            // flake that only showed up when the whole suite ran in parallel. An hour is not a
+            // wait: `cancel()` re-queues the
             // task and the await aborts in milliseconds. If cancellation ever
             // stops landing, the scenario parks instead of finishing, which is
             // why every row below runs under a hard deadline.
@@ -76,7 +76,7 @@ fn trap_contract_all_aborts_have_panic_messages() {
         assert!(!ok, "{what}: expected an abort, got success: {out}");
         assert!(
             out.contains("runtime panic:") || out.contains("panic:"),
-            "{what}: aborted with NO panic message (raw signal — l9lx-class \
+            "{what}: aborted with NO panic message (raw signal — trap-contract \
              regression). output: {out:?}"
         );
     }

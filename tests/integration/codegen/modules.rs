@@ -1,6 +1,6 @@
 use super::*;
 
-// ── User module declarations (willow-y0o, spec 4.1 / 8 / 20) ───────────────
+// ── User module declarations (module declarations, spec 4.1 / 8 / 20) ───────────────
 
 // Perspective 1: a module declaration is accepted and the program runs (the
 // declaration is otherwise inert for an entry file).
@@ -357,7 +357,7 @@ fn test_item_import_mixed() {
     assert_eq!(out, "3\n12\n");
 }
 
-// ── validate_type rejects unknown/module type annotations (willow-a7j) ─────
+// ── validate_type rejects unknown/module type annotations ─────
 
 // A module name used as a type is rejected.
 #[test]

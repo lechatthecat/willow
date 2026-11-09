@@ -43,10 +43,10 @@ struct WillowChannelState {
     gc_scan_remaining: usize,
     closed: bool,
     /// Cooperative consumers parked on an empty `recv`, woken FIFO by `send` /
-    /// `close` (willow-dsw).
+    /// `close`.
     waiters: WaiterQueue,
-    /// Bounded capacity (`Channel<T>::with_capacity(n)`); `None` = unbounded
-    /// (willow-o038).
+    /// Bounded capacity (`Channel<T>::with_capacity(n)`); `None` = unbounded.
+    ///
     capacity: Option<usize>,
     /// Cooperative producers parked on a FULL bounded channel. A `recv` that
     /// frees one slot wakes one live producer; `close` wakes all.
@@ -88,7 +88,7 @@ pub struct ChannelCore {
     state: Mutex<WillowChannelState>,
     /// True when the element type is a GC reference (String / class / array /
     /// ...): queued values are then GC roots scanned by the collector
-    /// (willow-dsw GC tracing).
+    /// (channel payload GC tracing).
     is_ref: bool,
 }
 
@@ -110,7 +110,7 @@ impl WillowAbiChannel {
     }
 }
 
-/// GC type id for channel objects (willow-p4er): channels are GC-MANAGED —
+/// GC type id for channel objects: channels are GC-MANAGED —
 /// unreachable channels are reclaimed by the collector like any object, and
 /// their queued reference values are traced by [`trace_channel`]. The old
 /// program-lifetime leak + global registry (and its O(all-channels)
@@ -347,7 +347,7 @@ fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
 pub(crate) fn purge_task(task_id: u64) {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     // O(channels the task actually parked on), via the task-side reverse
-    // references recorded at registration (willow-p4er). Native core addresses
+    // references recorded at registration. Native core addresses
     // stay stable and live while the waiter's rooted frame retains the wrapper.
     let ownership = crate::scheduler::take_channel_waits(task_id);
     purge_task_from_tokens(task_id, ownership);
@@ -422,7 +422,7 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
     // Bounded channel is FULL in a synchronous context: help drive the
     // scheduler so consumers can free space (mirror of sync recv). If no
     // task can progress and the buffer is still full/open, abort with a
-    // clear runtime panic instead of deadlocking (willow-o038).
+    // clear runtime panic instead of deadlocking.
     loop {
         // Re-probe this channel even if unrelated tasks remain runnable.
         // An unbounded nested drive can wait for a task that is itself waiting
@@ -440,8 +440,8 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
         if completed == 0 {
             // "No task completed" is not proof that nothing can ever happen: a
             // drive can race a claim or stop on a timer boundary. Only an
-            // absent wake source means this send would block forever
-            // (willow-atth).
+            // absent wake source means this send would block forever.
+            //
             if crate::scheduler::scheduler_has_wake_source() {
                 crate::scheduler::wait_for_any_wake_briefly();
                 continue;
@@ -737,7 +737,7 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
 
 /// Receive the next value, blocking while the channel is empty and open.
 /// `None` means the channel is closed AND drained (`Channel<T>::recv_opt()`,
-/// willow-jz15.44); `recv()` turns that into its closed-empty panic. A null
+/// close-aware receive); `recv()` turns that into its closed-empty panic. A null
 /// channel also answers `None`. Other failures (a wait that can never be
 /// satisfied) still raise.
 fn channel_recv_or_closed(raw: *mut c_void) -> Option<WillowChannelValue> {

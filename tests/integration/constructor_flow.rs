@@ -1,4 +1,4 @@
-//! End-to-end proof of path-sensitive field initialization (willow-9tls.31).
+//! End-to-end proof of path-sensitive field initialization.
 use super::support::{
     TestProject, assert_compile_error_contains, compile_and_run, compile_and_run_gc_stress,
     compile_and_run_release, compile_file_and_run, compile_release_with_compiler_env,
@@ -111,7 +111,7 @@ fn main() { println(new C().x); }
     assert_eq!(out, "42\n");
 }
 
-// willow-ssl7.19: checker-owned panic facts refine constructor recovery.
+// checker-owned panic facts refine constructor recovery.
 
 #[test]
 fn constructor_flow_cleanup_only_defer_accepts_panicking_constructor() {

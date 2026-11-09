@@ -1066,7 +1066,7 @@ fn main() {
 
 #[test]
 fn test_format_f64_invalid_specifier_reports_e1401() {
-    // `{}` became a valid display placeholder (willow-csax); a genuinely
+    // `{}` became a valid display placeholder; a genuinely
     // unsupported specifier still reports E1401.
     assert_compile_error_contains(
         r#"

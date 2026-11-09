@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Command-line arguments: fn main(args) and env::args() (willow-b86) ──────
+// ── Command-line arguments: fn main(args) and env::args() ──────
 
 // Perspective 1: main(args) receives the user arguments (excluding program name).
 #[test]

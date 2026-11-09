@@ -3,7 +3,7 @@ use super::support::*;
 #[path = "codegen/static_members.rs"]
 mod static_members;
 
-// ── Single-item imports (willow-om7, spec 10 / 12.2) ───────────────────────
+// ── Single-item imports (item imports, spec 10 / 12.2) ───────────────────────
 
 fn math_module() -> (&'static str, &'static str) {
     (
@@ -12,7 +12,7 @@ fn math_module() -> (&'static str, &'static str) {
     )
 }
 
-// ── Module aliases + `::` access; `.` reserved for instances (willow-u98) ──
+// ── Module aliases + `::` access; `.` reserved for instances ──
 
 fn aliasable_math() -> (&'static str, &'static str) {
     (
@@ -21,7 +21,7 @@ fn aliasable_math() -> (&'static str, &'static str) {
     )
 }
 
-// ── Import visibility + collision diagnostics (willow-pwa, spec 11/13) ─────
+// ── Import visibility + collision diagnostics (import diagnostics, spec 11/13) ─────
 
 fn s5_modules() -> Vec<(&'static str, &'static str)> {
     vec![
@@ -59,13 +59,13 @@ fn assert_catalog_lines(out: &str, cases: &[(&str, &str)]) {
     }
 }
 
-// ── willow-ca2: lexer numeric/comment diagnostics (end-to-end) ───────────────
+// ── lexer numeric/comment diagnostics (end-to-end) ───────────────
 
 // End-to-end: an integer literal that overflows i64 surfaces as E0052 through
 // the full compiler (previously it was silently parsed as 0).
 
-// ── LIR-walking backend (willow-0g8j) ────────────────────────────────────────
-// Every function body compiles from the lowered IR (willow-0g8j.3 retired the
+// ── LIR-walking backend ────────────────────────────────────────
+// Every function body compiles from the lowered IR (the lowered-IR cutover retired the
 // AST emitter for function bodies, so a body outside the walker's reach is a
 // compile error naming the construct rather than a second emitter's answer).
 // The perspectives below pin the answers themselves: recursion, loops
@@ -84,7 +84,7 @@ fn assert_program_output(source: &str, expected: &str) {
     assert_eq!(out, expected);
 }
 
-// ── LIR backend: GC-managed values and rooting (willow-0g8j.1) ──────────────
+// ── LIR backend: GC-managed values and rooting ──────────────
 // `String` is the first GC-managed type the LIR walker emits. Because the LIR
 // is a FLAT basic-block graph with no scopes, a GC-managed local cannot use
 // the AST path's per-`let` root push/pop (that would grow the shadow root
@@ -140,7 +140,7 @@ pub class Dog extends Animal {
 }
 "#;
 
-// ── LIR walker: class -> interface boxing (willow-j260) ─────────────────────
+// ── LIR walker: class -> interface boxing ─────────────────────
 // An interface-typed slot does not hold a class pointer, it holds a 16-byte GC
 // box `[object | vtable]`. So every store of a class value into an interface
 // position is a conversion the walker has to emit, and — because the box
@@ -162,7 +162,7 @@ pub class Dog extends Animal {
 // j35 the array handle rooted across a pushed box, j36 early return with live
 // boxes leaves the root stack balanced.
 //
-// j37-j50 (willow-j260.1) cover the case the tests above never reach: ONE
+// j37-j50 cover the case the tests above never reach: ONE
 // object boxed into TWO DIFFERENT interfaces. That splits into two properties
 // nothing else pins down.
 //
@@ -194,7 +194,7 @@ pub class Dog extends Animal {
 /// Shared shape for the boxing tests. The only way to OBSERVE a box is to read
 /// back through it, and when these tests were written a virtual `name()` call
 /// was still outside the walker — so every read happens inside a class METHOD.
-/// Dispatch has since joined the subset (willow-0g8j.6, the k24+ block below);
+/// Dispatch has since joined the subset (interface dispatch lowering, the k24+ block below);
 /// the reads stay in methods here so these tests keep isolating the STORE
 /// side.
 const BOXING_PRELUDE: &str = r##"
@@ -302,7 +302,7 @@ fn boxing_source(body: &str) -> String {
     format!("{BOXING_PRELUDE}{body}")
 }
 
-// ── LIR walker: interface dispatch (willow-0g8j.6) ─────────────────────────
+// ── LIR walker: interface dispatch ─────────────────────────
 // Reading back THROUGH an interface: `s.area()` loads `[object | vtable]` out
 // of the box, indexes the vtable by the method's declaration-order slot and
 // issues an indirect call with the concrete object as the receiver. Nothing in
@@ -372,7 +372,7 @@ fn dispatch_source(body: &str) -> String {
     format!("{DISPATCH_PRELUDE}{body}")
 }
 
-// ── Interface dispatch with REFERENCE parameters (willow-0g8j.9) ────────────
+// ── Interface dispatch with REFERENCE parameters ────────────
 //
 // A `&`/`&mut` parameter is passed as a POINTER. The interface tables used to
 // keep parameter TYPES only, so `emit_interface_dispatch` built its
@@ -380,7 +380,7 @@ fn dispatch_source(body: &str) -> String {
 // the concrete method then dereferenced an integer and the program crashed.
 // These tests run the real thing end to end.
 //
-// Perspectives 19..30 of willow-0g8j.9 (1..18 are the type-checker tests):
+// Perspectives 19..30 of reference-argument lowering (1..18 are the type-checker tests):
 // 19 `&mut i64` mutates the caller's local · 20 `& i64` reads it ·
 // 21 a `&mut String` place (GC-managed) · 22 the same under GC stress ·
 // 23 a field place · 24 an array element · 25 an inherited (`extends`) slot ·
@@ -432,7 +432,7 @@ fn refmode_source(body: &str) -> String {
 }
 
 /// A reference ARGUMENT used to leave the LIR subset, so these programs were
-/// the mixed-path case; the walker takes them whole now (willow-0g8j.2.13), and
+/// the mixed-path case; the walker takes them whole now, and
 /// what is pinned is the answer.
 fn assert_refmode_output(source: &str, expected: &str) {
     let (out, ok) = compile_with_env_and_run(source, &PLAIN);
@@ -449,7 +449,7 @@ fn assert_refmode_output_under_gc_stress(source: &str, expected: &str) {
     assert_eq!(out, expected);
 }
 
-// ── Every body walks the LIR (willow-0g8j.3) ────────────────────────────────
+// ── Every body walks the LIR ────────────────────────────────
 // Stage 5 retired the AST emitter for function bodies. There is no fallback
 // left to fall into and no environment variable that restores one: a function
 // the walker cannot take is a COMPILE ERROR that names the function and the
@@ -476,11 +476,11 @@ fn assert_refmode_output_under_gc_stress(source: &str, expected: &str) {
 /// check exactly which name is reported.
 ///
 /// Every earlier stand-in here kept getting promoted into the subset — plain
-/// class field access (willow-0g8j.5), class-to-interface widening
-/// (willow-j260), dispatch through an interface box (willow-0g8j.6), then
-/// `Option`/`Result` themselves (willow-0g8j.2.1), and lowering now alpha-renames
-/// shadowed bindings (willow-0g8j.2.10), then reference parameters
-/// (willow-0g8j.2.7), then scalar map keys (willow-0g8j.3). What is left is a
+/// class field access, class-to-interface widening, dispatch through an interface box, then
+/// `Option`/`Result` themselves, and lowering now alpha-renames
+/// shadowed bindings, then reference parameters, then scalar map keys. What is left is a
+///
+///
 /// map keyed by a REFERENCE that is not a `String`: the runtime's key is
 /// `Int(i64) | Str(String)`, so it would read the inner map's pointer as a
 /// `WillowString`, and no widening of the walker can change that.
@@ -494,8 +494,8 @@ fn unsupported() -> Map<Map<String, i64>, i64> { return Map::new(); }
 fn main() { println(eligible(1)); }
 "#;
 
-// ── Maps and frozen collections on the LIR path (willow-0g8j.7) ─────────────
-// The emitted-code half of willow-0g8j.7; the eligibility half is the c01-c24
+// ── Maps and frozen collections on the LIR path ─────────────
+// The emitted-code half of array and map lowering; the eligibility half is the c01-c24
 // perspectives in `src/backend/cranelift/lir_gen.rs`. Every program below runs
 // on both paths and must print the same thing, and c42-c46 repeat that under
 // `WILLOW_GC_STRESS=alloc` — the mode that collects at every allocation, so a
@@ -522,7 +522,7 @@ fn map_source(body: &str) -> String {
     format!("{MAP_IMPORTS}{body}")
 }
 
-// ── Debug-build integer division guards (willow-l9lx) ───────────────────────
+// ── Debug-build integer division guards ───────────────────────
 // `/` and `%` used to die with a raw hardware signal; debug builds now emit a
 // located runtime panic, consistent with the array bounds panics. 20
 // perspectives: 1 div-by-zero message+location (LIR path), 2 same on the AST
@@ -571,7 +571,7 @@ fn assert_dfr_exit_contains(source: &str, needles: &[&str]) {
     }
 }
 
-// Explicit Result handling inside defer bodies (willow-oorh).
+// Explicit Result handling inside defer bodies.
 //
 // 22 perspectives:
 // 01 plain-call Err is discarded without panic/propagation
@@ -604,7 +604,7 @@ fn cleanup(ok: bool) -> Result<void, String> {
 }
 "#;
 
-// ── std::net v1 (willow-2s3.1) ───────────────────────────────────────
+// ── std::net v1 ───────────────────────────────────────
 // Numeric-address bind is synchronous; connect/accept/read/write return Tasks
 // whose poll functions park on the platform netpoll backend.
 

@@ -1,6 +1,6 @@
 use super::*;
 
-// ── std::fs v1 (willow-2s3 Stage 5 slice) ───────────────────────────────────
+// ── std::fs v1 (filesystem support Stage 5 slice) ───────────────────────────────────
 // Unsuffixed operations are synchronous compatibility APIs. Their `_async`
 // counterparts execute in the scheduler blocking pool and return Tasks;
 // all fallible ops return Result<_, IoError> with the
@@ -197,7 +197,7 @@ fn fs_20_two_files_independent() {
     assert_eq!(out, "A\nB\n");
 }
 
-// Review fixes on std::fs dispatch (willow-2s3): 21 a USER module imported
+// Review fixes on std::fs dispatch: 21 a USER module imported
 // as `fs` must win over the builtin (the emit arm used to fire on the bare
 // string name before user-module resolution — the user's exists() was
 // silently replaced by willow_fs_exists); 22 `import std::fs as files;`
@@ -329,7 +329,7 @@ async fn main() {
 
 #[test]
 fn fs_29_async_burst_over_blocking_queue_capacity_all_complete() {
-    // Overload policy (willow-9tls.6): a bounded pool (1 thread, 2 queued
+    // Overload policy: a bounded pool (1 thread, 2 queued
     // jobs) receives 40 `*_async` reads of a 128 KiB file at once, so the
     // queue is full long before the burst is spawned. None fails or is
     // dropped: over-capacity Tasks wait for a slot and every one completes

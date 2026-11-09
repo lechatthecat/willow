@@ -1,4 +1,4 @@
-//! Scheduler-aware `Mutex` runtime state machine (willow-38w.1.3,
+//! Scheduler-aware `Mutex` runtime state machine (scheduler-aware mutex support,
 //! spec §8.4–§8.7, §11, §12.2–§12.4, §15.1).
 //!
 //! Stage 2 ([`crate::lock_wait`]) built the waiter protocol: who is queued, how
@@ -43,9 +43,9 @@
 //!    reports [`ReclamationStatus::Reclaimable`]. A mismatch is fatal in every
 //!    build rather than risking a use-after-free.
 //!
-//! `lock <mutex> as [mut] value` lowers onto these entry points
-//! (willow-38w.1.4); `lock read` / `lock write` use
-//! [`crate::async_rwlock`] (willow-38w.1.5).
+//! `lock <mutex> as [mut] value` lowers onto these entry points; `lock read` / `lock write` use
+//! [`crate::async_rwlock`].
+//!
 
 use crate::lock_wait::{
     AcquireOutcome, AsyncLockState, LockCancelOutcome, LockId, LockWaitLink, LockWaitPhase,

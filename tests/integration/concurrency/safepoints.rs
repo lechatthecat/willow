@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Preempt 2 closure: safepoint coverage decisions pinned (willow-0a6k.2) ──
+// ── Preempt 2 closure: safepoint coverage decisions pinned ──
 // The task-aware design closed as: (1) coop loops (ALL while/for in async
 // fns, await or not) carry backedge safepoints; (2) long sync helpers called
 // from task context are REJECTED (E0810) rather than safepoint-cloned;
@@ -9,7 +9,7 @@ use super::*;
 // call-bearing statement boundaries carry safepoints; (5) runtime calls
 // (string/array/map ops) are
 // BOUNDED no-preempt regions and run to completion. 11 pinning perspectives
-// (psp_07b added by Stage A-prime, willow-38w.2.1).
+// (psp_07b added by Stage A-prime, stack safepoints).
 
 #[test]
 fn psp_01_await_free_while_is_preemptible() {
@@ -150,7 +150,7 @@ fn psp_07_call_boundary_safepoints() {
 )))]
 #[test]
 fn psp_07b_recursive_sync_helper_rejected() {
-    // Stage A-prime (willow-38w.2.1): recursion contains no loop but still runs
+    // Stage A-prime: recursion contains no loop but still runs
     // unbounded work on a scheduler worker, so a task-context call to it is
     // rejected. The message must name recursion rather than claim a loop the
     // programmer would then go looking for.
@@ -207,7 +207,7 @@ fn psp_10_cancel_preempted_busy_task() {
 
 #[test]
 fn psp_11_sync_helper_countdown_preempts_and_cancels() {
-    // willow-jz15.40: loops in synchronous helpers on a task native stack
+    // loops in synchronous helpers on a task native stack
     // count safepoints inline and enter the runtime once per granted batch.
     // Budget 1 (a grant per safepoint) and the default budget must both keep
     // a single worker fair, and a sync spinner must still observe cancel.

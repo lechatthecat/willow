@@ -1,4 +1,4 @@
-// Names, and the linker symbols they turn into (willow-uqzx, catalog item 8).
+// Names, and the linker symbols they turn into (shared compiler infrastructure, catalog item 8).
 //
 // Willow used to flatten `::` into `__` when it built a linker symbol, so
 // `shapes::Square::area` became `shapes__Square__area`. Nothing stops a Willow

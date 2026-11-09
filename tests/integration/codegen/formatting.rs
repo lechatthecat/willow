@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Formatted panic + generalized format (willow-csax) ──────────────────────
+// ── Formatted panic + generalized format ──────────────────────
 // 20 perspectives (plus 10 spec-parser unit tests in src/interpolate.rs):
 // 1 i64 {}, 2 f64 {}, 3 bool {}, 4 String {}, 5 multiple args in order,
 // 6 brace escapes at runtime, 7 f64 precision placeholders still work,

@@ -1,4 +1,4 @@
-//! Scalar element stores inside GC-free runs (willow-ijui.10): the receiver
+//! Scalar element stores inside GC-free runs: the receiver
 //! copy of a store needs no root, and a store reuses the owner, length and
 //! buffer an earlier access of the same run validated.
 

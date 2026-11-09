@@ -1,4 +1,4 @@
-// Class -> interface boxing through the LIR-walking backend (willow-j260).
+// Class -> interface boxing through the LIR-walking backend.
 //
 // An interface value is not a class pointer: it is a 16-byte GC box holding
 // `[concrete object | vtable]`. So putting a `new Item(..)` into anything typed
@@ -7,7 +7,7 @@
 // array element and through `push`.
 //
 // Reading back through an interface is a separate step, and the walker now
-// does that too — see example/lir_interface_dispatch.wi (willow-0g8j.6). Here
+// does that too — see example/lir_interface_dispatch.wi. Here
 // every virtual `n.name()` call stays inside a CLASS METHOD, which compiles
 // through its own emitter, so this file keeps isolating the STORE side. Every
 // FREE function in it — the ones that build and move the boxes — is compiled
@@ -18,8 +18,8 @@
 // site that roots a live temporary across the value has to count the box as
 // allocating too.
 //
-// The last section covers one object boxed into TWO DIFFERENT interfaces
-// (willow-j260.1): a class has one vtable PER INTERFACE, so the two boxes must
+// The last section covers one object boxed into TWO DIFFERENT interfaces: a class has one
+// vtable PER INTERFACE, so the two boxes must
 // carry different vtables while still holding one shared object.
 
 import std::collections::Array;

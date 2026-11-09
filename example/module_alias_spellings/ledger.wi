@@ -3,8 +3,8 @@
 // The back end registers a module once, under the first importer's spelling,
 // which here is the entry file's `market`. This file never writes that name, so
 // every type it reaches through `sales::` — the class it binds, the base it
-// extends, the enum it matches — has to resolve to the same registered module
-// (willow-kd1v).
+// extends, the enum it matches — has to resolve to the same registered module.
+//
 module ledger;
 
 import sales;

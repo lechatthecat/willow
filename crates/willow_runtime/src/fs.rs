@@ -1,7 +1,7 @@
-//! File-system runtime for `std::fs` (willow-2s3 Stage 5, v1).
+//! File-system runtime for `std::fs` (filesystem support Stage 5, v1).
 //!
 //! V1 is SYNCHRONOUS under the hood: regular files are not epoll-pollable, so
-//! non-blocking file I/O needs the blocking-syscall pool (willow-0a6k.5).
+//! non-blocking file I/O needs the blocking-syscall pool.
 //! Errors surface as Willow `Result<_, IoError>` values built here — the
 //! layouts must match the compiler's enum lowering:
 //!   Result::Ok(v)  -> [tag = 0, payload]
@@ -59,7 +59,7 @@ pub(crate) fn alloc_io_err(message: &str) -> *mut u8 {
 /// `fs::temp_path(prefix) -> String`: a process-unique path under the OS
 /// temp directory (`<tmp>/<prefix>_<pid>_<counter>`). Uniqueness across
 /// processes comes from the pid, within the process from the counter — so
-/// parallel test/example runs cannot collide (willow-2s3 review fix).
+/// parallel test/example runs cannot collide.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fs_temp_path(prefix: *const u8) -> *mut u8 {
@@ -163,7 +163,7 @@ struct BlockingFsState {
     task_id: AtomicU64,
     result: Mutex<Option<BlockingFsResult>>,
     /// The pool job while the bounded queue had no room for it: the Task owns
-    /// it and re-submits on each poll until admitted (willow-9tls.6). The job
+    /// it and re-submits on each poll until admitted. The job
     /// captures an `Arc` of this state, so whoever drops the state without
     /// running the job must `take()` it first or the cycle leaks.
     pending: Mutex<Option<crate::blocking::BlockingWork>>,
@@ -341,7 +341,7 @@ fn spawn_blocking_fs_after_publication(
         let result = work();
         state_for_work.finish(result);
     })) {
-        // Bounded queue is full (willow-9tls.6): the Task keeps the job and
+        // Bounded queue is full: the Task keeps the job and
         // registers as a slot waiter on its first poll, once it has an id.
         // Nothing is refused, so the caller still gets a real Task.
         state.keep_pending(job);
@@ -666,7 +666,7 @@ mod tests {
         assert!(observed);
     }
 
-    /// Overload policy (willow-9tls.6): with every pool thread stalled and the
+    /// Overload policy: with every pool thread stalled and the
     /// bounded queue full, `*_async` calls still return real Tasks. Those Tasks
     /// keep their job, park as slot waiters (observable as BlockedSyscall,
     /// `willow_blocking_slot_waiters`, and the `blocking_queue_full` metric),

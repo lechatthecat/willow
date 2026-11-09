@@ -398,7 +398,7 @@ pub(crate) fn instruction_use_def(
         }
         // Releasing reads all four of the acquisition's frame slots, so
         // each one stays live from the `lock` down to every exit that
-        // leaves the section (willow-0g8j.2.13). A `lock` body's scope
+        // leaves the section. A `lock` body's scope
         // reads them too: its panic cleanup is where an unwind releases.
         SourceInst::ReleaseLock(slots)
         | SourceInst::EnterDeferScope {
@@ -413,8 +413,8 @@ pub(crate) fn instruction_use_def(
         // The scrutinee is READ by every dispatch block and by the bind at
         // the top of each arm; the bindings are DEFINED there. That is what
         // puts a binding an arm reads after suspending into the frame, and
-        // keeps a scrutinee nothing reads again out of it
-        // (willow-0g8j.2.11.1).
+        // keeps a scrutinee nothing reads again out of it.
+        //
         SourceInst::MatchTest {
             scrutinee, result, ..
         } => {
@@ -435,7 +435,7 @@ pub(crate) fn instruction_use_def(
         }
         // Naming a local does not read it: the instruction drops the GC
         // root of a scope that ended, so nothing it names is live past it
-        // and nothing it names is redefined either (willow-0g8j.3.3).
+        // and nothing it names is redefined either.
         SourceInst::EnterDeferScope { .. }
         | SourceInst::LeaveDeferScope { .. }
         | SourceInst::FlushDefers { .. }

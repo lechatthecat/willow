@@ -1,6 +1,6 @@
 use super::*;
 
-// ── panic() builtin (regression: codegen no longer crashes; willow-4j6) ──────
+// ── panic() builtin (regression: codegen no longer crashes; panic lowering) ──────
 
 #[test]
 fn panic_01_compiles_runs_and_exits_nonzero() {
@@ -30,7 +30,7 @@ fn main() { helper(); }
 
 #[test]
 fn panic_03_debug_build_reports_source_location() {
-    // Debug builds include the panic call-site location (willow-4j6).
+    // Debug builds include the panic call-site location.
     let (out, ok) = compile_and_run_check_exit("fn main() {\n    panic(\"located\");\n}\n");
     assert!(!ok, "panic must exit non-zero");
     assert!(out.contains("located"), "message present: {out}");

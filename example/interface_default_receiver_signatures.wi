@@ -1,6 +1,6 @@
 // A class whose name matches an interface of the module that declares the
 // interface it implements still receives that interface's defaults, and its
-// own methods typed with its name keep their meaning there (willow-kptd).
+// own methods typed with its name keep their meaning there.
 import interface_default_receiver_signatures_support::sizing;
 
 class Box implements sizing::Sized {

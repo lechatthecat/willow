@@ -7,7 +7,7 @@ use super::*;
 
 #[willow_continuations::checker]
 impl TypeChecker {
-    /// Whether `==`/`!=` is defined on `ty` (willow-zvnt): by value on
+    /// Whether `==`/`!=` is defined on `ty`: by value on
     /// scalars, strings, and payload-free enums (the value is its tag), and by
     /// reference identity on class and interface values. Containers, payload
     /// enums, `Result`, and callables have no equality, so they are rejected
@@ -134,13 +134,13 @@ impl TypeChecker {
         }
         match &b.op {
             // `**` is deliberately narrower than the other arithmetic operators:
-            // only `i64 ** i64 -> i64` and `f64 ** f64 -> f64` are defined
-            // (willow-n5yv.2).  There is no mixed-type form, so `2 ** 0.5` is an
+            // only `i64 ** i64 -> i64` and `f64 ** f64 -> f64` are defined.  There is no
+            // mixed-type form, so `2 ** 0.5` is an
             // error rather than an implicit widening, and `String ** String` gets
             // an exponent-specific message instead of the concatenation help text.
             BinOp::Pow => {
                 if lty == Type::I64 && rty == Type::I64 {
-                    // `i64 ** i64` is lowered natively (willow-n5yv.3). A
+                    // `i64 ** i64` is lowered natively. A
                     // literal negative exponent has no integer result, so it is
                     // a compile error rather than a guaranteed runtime panic.
                     if let Some(span) = negative_exponent_literal_span(&b.rhs) {
@@ -192,7 +192,7 @@ impl TypeChecker {
 
                 // String concatenation is strongly typed: `String + non-String`
                 // (or the reverse) is rejected with a `toString()` suggestion
-                // rather than an implicit stringify (willow-fvfc).
+                // rather than an implicit stringify.
                 if b.op == BinOp::Add && (lty == Type::String || rty == Type::String) {
                     let (non_str, side) = if lty == Type::String {
                         (&rty, "right")
@@ -256,7 +256,7 @@ impl TypeChecker {
                 }
                 lty
             }
-            // Bitwise and shift operators are integer-only (willow-jz15.8):
+            // Bitwise and shift operators are integer-only:
             // `bool` uses `&&`/`||`, and there is no `f64` bit pattern access.
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
                 if lty != Type::I64 || rty != Type::I64 {
@@ -342,7 +342,7 @@ impl TypeChecker {
                     return Type::Bool;
                 }
                 // Identity comparison is symmetric: `dog == animal` asks the
-                // same question as `animal == dog` (willow-zvnt).
+                // same question as `animal == dog`.
                 if !self.types_compatible(&lty, &rty) && !self.types_compatible(&rty, &lty) {
                     self.push(
                         Diagnostic::new(
@@ -464,7 +464,7 @@ impl TypeChecker {
                 }
                 ty
             }
-            // Bitwise complement on `i64` (willow-jz15.8).
+            // Bitwise complement on `i64`.
             UnaryOp::Not if ty == Type::I64 => Type::I64,
             UnaryOp::Not => {
                 if ty != Type::Bool {
@@ -491,7 +491,7 @@ impl TypeChecker {
         }
     }
 
-    /// Type-check `ClassName::property = value` (willow-qsqf §5/§13.4): the
+    /// Type-check `ClassName::property = value` (static member support §5/§13.4): the
     /// property must be `static mut`, the value must match its type, and
     /// visibility must allow the write.
     pub(super) fn check_static_field_assign(&mut self, s: &StaticFieldAssignStmt) {
@@ -583,14 +583,14 @@ impl TypeChecker {
     }
 
     /// Reject a module-qualified reference to a non-`pub` type (class, interface,
-    /// or enum) from another module (willow-7ihl). A module-qualified name
+    /// or enum) from another module. A module-qualified name
     /// contains `::`; same-module references are unqualified and never checked.
     pub(super) fn check_type_visibility(&mut self, name: &str, span: Span) {
         let Some((namespace, _)) = QualifiedName::new(&name).split_last() else {
             return;
         };
-        // A module's own declarations carry its canonical identity now
-        // (willow-itcw), so a private enum a module uses in its OWN body reaches
+        // A module's own declarations carry its canonical identity now, so a private enum a
+        // module uses in its OWN body reaches
         // here fully qualified. It is at home; only the units that had to import
         // it are asking about visibility.
         if self.module_path.as_deref() == Some(namespace) {
@@ -660,7 +660,7 @@ fn negative_exponent_literal_span(exponent: &Expr) -> Option<Span> {
 
 /// `i64 ** i64` has no fractional result, so a negative exponent can only ever
 /// panic. When the exponent is written as a literal the compiler can say so
-/// before the program runs (willow-n5yv.3).
+/// before the program runs.
 pub(crate) fn negative_exponent_literal(span: Span) -> Diagnostic {
     Diagnostic::new(
         Severity::Error,

@@ -1,7 +1,7 @@
 // An interface default whose signature names `Self` is checked once, with
 // `self` as the opaque receiver, and each implementing class gets it typed
 // as itself: in this module and from another module's generic and plain
-// interfaces, whose private helpers stay reachable (willow-dnia).
+// interfaces, whose private helpers stay reachable.
 import interface_default_self_signature_support::shapes;
 
 interface Named {

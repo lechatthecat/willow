@@ -1,4 +1,4 @@
-// A module's own single-item imports (willow-kxy8, willow-2g6s).
+// A module's own single-item imports.
 //
 // `inventory` imports one function and one class out of `pricing`, and uses
 // both by their bare names: an unqualified call, a constructor, an instance

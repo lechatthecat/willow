@@ -1,4 +1,4 @@
-//! willow-bv9.1 — lexical function values shadow unqualified free functions.
+//! Lexical callable lookup — lexical function values shadow unqualified free functions.
 //!
 //! Perspectives:
 //!  01 same-scope lambda, 02 nested block, 03 fn-valued parameter,
@@ -86,7 +86,7 @@ fn lambda_shadow_01_through_12_and_17_23_runtime_matrix() {
 }
 
 /// Shadowing does not depend on the lambda being a bare code address: since
-/// willow-0g8j.2.12 a capturing lambda is a `closure` value, and the local
+/// closure conversion a capturing lambda is a `closure` value, and the local
 /// still wins over the free function of the same name — the call goes through
 /// the environment rather than to `f`'s symbol.
 #[test]
@@ -201,8 +201,8 @@ fn main() { println(chosen()); }
     assert!(ok, "{out}");
     assert_eq!(out, "101\n");
 
-    // The walker emits the indirect local call itself now
-    // (willow-0g8j.2.2), so this shape no longer falls back — and the result
+    // The walker emits the indirect local call itself now, so this shape no longer falls back
+    // — and the result
     // proves it resolved the callee to the local slot rather than to the
     // top-level `f`, which would have printed `2`.
     let (out, ok) = compile_and_run_with_env(

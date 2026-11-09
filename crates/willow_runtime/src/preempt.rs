@@ -1,4 +1,4 @@
-//! Preemption primitives (willow-0a6k.1, preemption spec §7-9, §22-23).
+//! Preemption primitives (preemption primitives, preemption spec §7-9, §22-23).
 //!
 //! Stage 1 of the preemptible-task roadmap: the *runtime-side* protocol and
 //! quantum machinery that later stages build on. It provides
@@ -11,12 +11,12 @@
 //!     tests plus a wall-clock time quantum for production fairness (§8),
 //!   * env configuration via `WILLOW_TASK_BUDGET` / `WILLOW_TIME_QUANTUM_MS`,
 //!   * `willow_preempt_check`, the safepoint hook compiler-inserted safepoints
-//!     (willow-0a6k.2) will call, plus no-preempt-region guards (§22).
+//!     will call, plus no-preempt-region guards (§22).
 //!
 //! The scheduler binds a task's flag and starts a fresh quantum around every
 //! poll. Compiler-generated async statement boundaries and loop backedges call
 //! `willow_preempt_check` and return `PREEMPTED` with a saved resume state when
-//! it trips (willow-0a6k.2). Additional task-aware safepoints inside synchronous
+//! it trips. Additional task-aware safepoints inside synchronous
 //! helpers and generated runtime loops remain staged work.
 
 use std::cell::Cell;
@@ -73,8 +73,8 @@ impl PreemptConfig {
 /// The scheduler starts a quantum around every task poll, so this is on the
 /// per-poll path. `std::env::var` takes std's process-global environment
 /// `RwLock` and scans `environ`; with every worker doing that per poll, the
-/// lock's reader count bounces between cores and cost ~10% of `yield_switch`
-/// (willow-g7cs). Tuning goes through the environment of a fresh process, which
+/// lock's reader count bounces between cores and cost ~10% of `yield_switch`. Tuning goes
+/// through the environment of a fresh process, which
 /// is how every test that sets these variables runs; tests that need a specific
 /// config in-process use [`begin_quantum`] instead.
 pub fn runtime_preempt_config() -> PreemptConfig {
@@ -448,7 +448,7 @@ pub(crate) fn charge_safepoints(count: u64) -> i32 {
 /// Maximum inline safepoints generated synchronous code runs between runtime
 /// checks. It bounds how stale the time quantum, preemption flag, and
 /// cancellation state can be while the per-safepoint cost stays one counter
-/// decrement (willow-jz15.40).
+/// decrement.
 pub const SYNC_POLL_STRIDE: u64 = 256;
 
 /// The next inline safepoint grant: never past the remaining budget, so the

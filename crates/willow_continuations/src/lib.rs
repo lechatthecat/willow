@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn parser_call_cycles_are_fully_lowered() {
-        // willow-w1tl: parse_if_statement_block and parse_let_head were
+        // parse_if_statement_block and parse_let_head were
         // missing, costing a fresh executor per nested `if` level.
         let leaks = boundary_leaks(&call_graph("src/parser", "Parser"), PARSER_METHODS);
         assert!(leaks.is_empty(), "add to PARSER_METHODS: {leaks:?}");
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn checker_call_cycles_are_fully_lowered() {
-        // willow-5gke: generic calls, match guards, callable lambdas and
+        // generic calls, match guards, callable lambdas and
         // their helpers each re-entered a synchronous wrapper per level.
         let leaks = boundary_leaks(&call_graph("src/semantic", "TypeChecker"), CHECKER_METHODS);
         assert!(leaks.is_empty(), "add to CHECKER_METHODS: {leaks:?}");

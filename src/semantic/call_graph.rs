@@ -1,5 +1,5 @@
 //! One call graph and one virtual-dispatch resolution, shared by every analysis
-//! that needs to know what a body can reach (willow-uqzx.1.2, catalog item 4).
+//! that needs to know what a body can reach (shared call-graph analysis, catalog item 4).
 //!
 //! Before this module the compiler built the same graph twice, with two
 //! different dispatch rules that could disagree:
@@ -10,7 +10,7 @@
 //! * `semantic::type_checker::check` builds typed call edges keyed by
 //!   [`FunctionId`] as a side effect of the checker's own type-directed walk.
 //!
-//! The willow-s9ej.11 bug — a `self.method()` fast path that bypassed dispatch
+//! The virtual-dispatch effect analysis bug — a `self.method()` fast path that bypassed dispatch
 //! resolution and so missed a panicking override — is exactly the defect that a
 //! single shared resolution makes impossible to write twice.
 //!
@@ -180,7 +180,7 @@ impl ClassHierarchy {
     /// The receiver's static type only bounds the dynamic type from above, so
     /// the answer is the union over every concrete class at or below it — an
     /// override in a subclass is reachable even though the call site names the
-    /// base. Resolving only `declared_class` upward is the willow-s9ej.11 bug.
+    /// base. Resolving only `declared_class` upward is the virtual-dispatch effect analysis bug.
     ///
     /// An empty result means "no body in this unit", which callers must treat as
     /// unknown rather than as safe.
@@ -414,7 +414,7 @@ impl CallGraph {
 }
 #[cfg(test)]
 mod tests {
-    //! Resolution perspectives for the shared call graph (willow-uqzx.1.2).
+    //! Resolution perspectives for the shared call graph.
     //!
     //! 01 direct free call, 02 unknown free name is still an edge the consumer
     //! can classify, 03 a call through a parameter is indirect, 04 a call
@@ -434,7 +434,7 @@ mod tests {
     //! cyclic hierarchy terminates, 25 an unrelated class is not a dispatch
     //! candidate.
     //!
-    //! Lexical-scope perspectives (willow-uqzx.1.3), which the flat pre-pass
+    //! Lexical-scope perspectives, which the flat pre-pass
     //! could not express: 26 a sibling scope's binding stops shadowing when that
     //! scope closes, 27 the same for a `match` arm binding, 28 for a lambda
     //! parameter, 29 for a loop variable, 30 for a `lock` binding, 31 a `let`

@@ -1,7 +1,7 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Runtime-owned TLAB for string and array results (willow-8hq4.29, jz15.94)
+// Runtime-owned TLAB for string and array results
 // ---------------------------------------------------------------------------
 //
 // Runtime allocations normally go to the old generation under the heap lock.
@@ -84,7 +84,7 @@ const fn descriptor_table(kind: GcObjectKind, type_id: u32) -> DescriptorTable {
 
 static STRING_DESCRIPTORS: DescriptorTable = descriptor_table(GcObjectKind::String, 0);
 
-/// Array buffers (willow-jz15.94): scalar elements, and reference elements
+/// Array buffers: scalar elements, and reference elements
 /// traced by the registered `ARRAY_REF_TYPE_ID` hook.
 static ARRAY_BUFFER_DESCRIPTORS: DescriptorTable = descriptor_table(GcObjectKind::ArrayBuffer, 0);
 static REF_ARRAY_BUFFER_DESCRIPTORS: DescriptorTable = descriptor_table(

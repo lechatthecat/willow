@@ -1,4 +1,4 @@
-//! Imported module bodies are type-checked, in their own scope (willow-3eo1).
+//! Imported module bodies are type-checked, in their own scope.
 //!
 //! `typecheck_phase` used to call `check_program` on the ENTRY program only.
 //! Imported modules went through `register_module_with_id`, which records
@@ -30,7 +30,7 @@
 //!  10 a name only the ENTRY file imported is not in a module's scope
 //!  11 a module using a module it imported itself is accepted
 //!  12 an import alias inside a module is honoured
-//!  13 a single-item import inside a module is honoured (willow-kxy8)
+//!  13 a single-item import inside a module is honoured
 //!  14 a module's `std` import works in its own body
 //!  15 a transitively imported module is checked too
 //!  16 errors in two different modules are all reported
@@ -361,12 +361,12 @@ pub fn run() -> i64 {
 // 13. A single-item import binds one name directly. The resolver records these
 //     for the entry file only, so a module's are derived from its import lines.
 //
-//     Was `#[ignore]`d on willow-kxy8: the unqualified call lowered to a
+//     Previously ignored: the unqualified call lowered to a
 //     zero-returning stub (it printed 4) because a module's own item imports
 //     were never registered with the backend. Per-unit import scoping — every
 //     unit's own `unit_imports` installed for its declaration and body and
-//     taken back out afterwards (willow-28h8/willow-vtlr/willow-kd1v) — is what
-//     made the name resolve; kxy8 is closed on this test.
+//     taken back out afterwards — is what
+//     made the name resolve; this test guards the fix.
 #[test]
 fn module_typecheck_13_a_single_item_import_inside_a_module_is_honoured() {
     assert_module_output(

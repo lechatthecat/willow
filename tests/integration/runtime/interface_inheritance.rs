@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Interface inheritance (willow-1js.2) ─────────────────────────────────────
+// ── Interface inheritance ─────────────────────────────────────
 
 #[test]
 fn iface_inherit_01_class_usable_as_sub_and_super() {

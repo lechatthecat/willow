@@ -30,7 +30,7 @@ pub const MUTEX_STATUS_LOST: i32 = willow_abi::LockAcquireStatus::Lost as i32;
 /// No registration was published because the task may not park: it is
 /// cancel-requested, already `Cancelling`, or terminal.
 ///
-/// Deliberately distinct from [`MUTEX_STATUS_LOST`] (willow-38w.1.4 review): a
+/// Deliberately distinct from [`MUTEX_STATUS_LOST`]: a
 /// retry cannot clear this condition, since only the scheduler can — by
 /// claiming the task and running its cancellation entry. Generated code
 /// therefore returns `Pending` and gives the worker back instead of re-arming

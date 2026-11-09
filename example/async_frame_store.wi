@@ -1,9 +1,9 @@
-// Async frame reference stores (willow-jz15.51).
+// Async frame reference stores.
 //
 // Locals of an async function that live across an `await` are stored in its
 // heap-allocated frame. The frame is an old-generation object, so storing a
 // young reference into it uses the same inline header-flag barrier filter as
-// object field stores (willow-8hq4.22): the first young store remembers the
+// object field stores: the first young store remembers the
 // frame, and later stores skip the runtime call until a minor collection
 // clears the remembered set. Parallel workers therefore no longer serialize on
 // the runtime barrier for every frame store.

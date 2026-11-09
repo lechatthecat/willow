@@ -1,4 +1,4 @@
-//! A `match` pattern binding is a GC root of its own (willow-10zt).
+//! A `match` pattern binding is a GC root of its own.
 //!
 //! Willow's collector is generational, and only half of it stands still. The
 //! old generation never moves and a *direct* root is promoted in place -- that
@@ -49,7 +49,7 @@ const LIR_LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 ///
 /// Mutation goes through `bump`, `set_side` and `put` rather than a field store
 /// written in the arm itself, because a field store inside a `match` arm is not
-/// yet in the walker's statement subset, and since willow-0g8j.3 that is a
+/// yet in the walker's statement subset, and since the lowered-IR cutover that is a
 /// compile error rather than a fallback.
 const PRELUDE: &str = r#"class Node { pub v: i64; }
 class Cell { pub n: Node; }
@@ -328,8 +328,8 @@ fn main() { println(total(Boxed::One(new Node(2)))); }
 //     is an `I8`, but an arm may still end in an expression statement that has
 //     an `i64` value -- `bump(n, 41);` here. Handing that word to the result
 //     variable is a Cranelift type error that aborted the compiler; the arm
-//     value is dropped now, the way the AST emitter already dropped it
-//     (willow-vdfj).
+//     value is dropped now, the way the AST emitter already dropped it.
+//
 #[test]
 fn binding_roots_10_a_void_match_with_a_non_void_arm_tail() {
     assert_binding(
@@ -431,7 +431,7 @@ fn main() { println(deep(Wrap::Inner(Boxed::One(new Node(7))))); }
     );
 }
 
-// 14. The willow-vdfj crash on its own, with no GC-managed binding anywhere:
+// 14. The match-arm control-flow crash on its own, with no GC-managed binding anywhere:
 //     a `Void` match whose arms end in `i64` calls still has to compile.
 #[test]
 fn binding_roots_14_a_non_gc_match_is_unchanged() {

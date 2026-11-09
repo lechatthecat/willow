@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Array for-loop inline element access (willow-pcoy) ──────────────────────
+// ── Array for-loop inline element access ──────────────────────
 // The loop header now loads len from the handle and the body loads the
 // element through a re-read buffer pointer (no willow_array_len/get calls).
 // 20 perspectives: 1 i64 sum, 2 String elements (GC-managed), 3 f64

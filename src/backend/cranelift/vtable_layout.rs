@@ -86,7 +86,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    // Layout perspectives (willow-ssl7.5). 1 leaf interface exposes only its
+    // Layout perspectives. 1 leaf interface exposes only its
     // own method slots, 2 `slot_of` finds a declared method and rejects an
     // undeclared one, 3 an unknown interface has no slots and no supers,
     // 4 a chain hop lands at `methods.max(1) + super index`, 5 a widening path

@@ -1,5 +1,5 @@
-//! A suspension inside a `match` arm, compiled from Lowered IR
-//! (willow-0g8j.2.11.1).
+//! A suspension inside a `match` arm, compiled from Lowered IR.
+//!
 //!
 //! A `match` lowered to ONE LIR instruction holding its arms as an HIR tree, so
 //! an `await` or a channel operation inside an arm had nowhere to become a block
@@ -13,7 +13,7 @@
 //! covers the single-instruction form that everything else still uses, and
 //! perspectives 20 and 21 here pin down that it stays that way.
 //!
-//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! Since the lowered-IR cutover a body outside the walker's subset is a compile error,
 //! so a run that prints the right answer is proof the walker produced it.
 //! Several tests also run under a
 //! one-safepoint task budget (preemption between every safepoint) and under
@@ -746,7 +746,7 @@ async fn main() { println(await apply(Mutex::new(0), 1)); }
     assert_lir_suspends(lock_in_arm, "1\n", &["apply", "main"]);
 }
 
-// 24. The sibling shape that the same block split exposed (willow-ht1h): a
+// 24. The sibling shape that the same block split exposed: a
 //     ternary whose CONDITION suspends while its branches do not. The merge
 //     local is written by an `Assign` in each branch and never by a `let`, so
 //     neither existing binding pass gave it storage and it reached codegen

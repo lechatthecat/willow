@@ -1,4 +1,4 @@
-//! Match guards and `if let` / `while let` diagnostics (willow-jz15.6).
+//! Match guards and `if let` / `while let` diagnostics.
 use super::{ErrorCode, check_source};
 use crate::diagnostics::Severity;
 

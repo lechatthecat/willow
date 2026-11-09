@@ -1,4 +1,4 @@
-//! Imported Result error identity (willow-jz15.114).
+//! Imported Result error identity.
 //! 24 perspectives: class/enum × brace/single/alias import × entry header
 //! present/absent × entry/helper caller. Every case exercises Ok and Err.
 use super::support::*;

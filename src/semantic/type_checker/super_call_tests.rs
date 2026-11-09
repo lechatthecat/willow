@@ -1,4 +1,4 @@
-//! `super.method(args)` checking and unresolved-name recovery (willow-jz15.48).
+//! `super.method(args)` checking and unresolved-name recovery.
 //!
 //! Perspectives:
 //!   1. a super call from an override checks clean and takes the base's type

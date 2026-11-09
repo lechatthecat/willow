@@ -90,7 +90,7 @@ impl TypeChecker {
                     // ok_ty is the success value type
                     ok_ty
                 } else if self.err_converts_via_into(&err_ty, return_err) {
-                    // Automatic error conversion (willow-1ow): the operand error
+                    // Automatic error conversion: the operand error
                     // `E1` implements `Into<E2>`, so `?` converts `E1 -> E2` on
                     // the Err early-return path. Codegen emits `e1.into()`.
                     ok_ty
@@ -140,7 +140,7 @@ impl TypeChecker {
 
     /// Check a lambda against the callable type its context asks for. Both
     /// callable types supply the same context — parameter types and a return
-    /// type — and differ only in what the lambda ends up being (willow-0g8j.2.12).
+    /// type — and differ only in what the lambda ends up being.
     pub(super) fn check_lambda_expecting(&mut self, l: &LambdaExpr, expected: &Type) -> Type {
         let (Type::Fn(params, ret) | Type::Closure(params, ret)) = expected else {
             return self.check_lambda(l);
@@ -175,7 +175,7 @@ impl TypeChecker {
         let (actual, captured) =
             self.check_lambda_in_context(l, params, ret, matches!(signature, Type::Closure(..)));
         // A `fn` value is a bare code address with no room for an environment,
-        // so a capturing lambda cannot be one (willow-0g8j.2.12). Reporting it
+        // so a capturing lambda cannot be one. Reporting it
         // here keeps the message about the capture rather than about a type
         // mismatch the user cannot act on.
         let (Type::Fn(signature_params, signature_ret), Type::Closure(actual_params, actual_ret)) =
@@ -208,8 +208,8 @@ impl TypeChecker {
         (Type::Fn(actual_params.clone(), actual_ret.clone()), true)
     }
 
-    /// Work out what a lambda takes from its enclosing function
-    /// (willow-0g8j.2.12). Names bound INSIDE the lambda — params, `let`s,
+    /// Work out what a lambda takes from its enclosing function. Names bound INSIDE the lambda
+    /// — params, `let`s,
     /// loop/match/select bindings — are tracked with proper scoping; any other
     /// variable that resolves to a visible local is a capture.
     ///
@@ -290,18 +290,18 @@ impl TypeChecker {
     /// A lambda body is a new function, and every piece of state that describes
     /// "where in the current function am I" has to stop at that boundary.
     ///
-    /// * `loop_depth`: an enclosing loop is NOT breakable from inside the body
-    ///   (willow-kzka).
+    /// * `loop_depth`: an enclosing loop is NOT breakable from inside the body.
+    ///
     /// * `lock_depth`: the lambda is only CONSTRUCTED inside a critical
     ///   section. Its body runs whenever it is called, holding nothing, so a
-    ///   `lock` there is not a nested acquisition (willow-3kty).
+    ///   `lock` there is not a nested acquisition.
     /// * `current_async_context`: a lambda has no `async` form in the grammar,
     ///   and the backend lifts its body into a plain private function. Leaving
     ///   the enclosing `async fn`'s context switched on told every check in
     ///   here that the body had a task frame to suspend into, so `lock` passed
     ///   E2603 and `await` passed E0801 and both reached codegen, where one
-    ///   ICEd on an unbound binding and the other on an unsplit await
-    ///   (willow-3kty).
+    ///   ICEd on an unbound binding and the other on an unsplit await.
+    ///
     ///
     /// Restoring rather than clearing matters: the lambda is an expression of
     /// the enclosing body, which continues after it.
@@ -330,7 +330,7 @@ impl TypeChecker {
         // that merely constructs the lambda). Under body queries the lambda
         // has its own contextual identity, so its edges join the resolved
         // graph under the same id the backend's effect inventory uses, and its
-        // checked tables are its own `typed_body` (willow-afb5.17).
+        // checked tables are its own `typed_body`.
         let lambda_body = self
             .local
             .current_body
@@ -339,7 +339,7 @@ impl TypeChecker {
         // The lambda's callable identity. Without body queries an expression
         // body has no BodyId, so it gets a fresh one: its waits and calls must
         // still be attributed to it, as under body queries, or a function
-        // value made from it could not be classified (willow-h4t7).
+        // value made from it could not be classified.
         let callable = lambda_body
             .or(match &l.body {
                 LambdaBody::Block(body) => Some(body.id),
@@ -406,7 +406,7 @@ impl TypeChecker {
         // What the lambda takes from the enclosing function decides which of
         // the two callable types it has, so this runs first — and it must run
         // while the enclosing function's locals are still the visible variable
-        // scope (willow-0g8j.2.12).
+        // scope.
         let captures = self.collect_lambda_captures(l);
         let saved_capture_declarations = std::mem::replace(
             &mut self.local.current_capture_declarations,
@@ -420,7 +420,7 @@ impl TypeChecker {
         // An annotation is normalized the way a named function's is: it may
         // spell an item-imported enum by the local name (`Rank`, under
         // `import signal::Level as Rank;`), and only the identity is comparable
-        // to what the rest of the program produces (willow-0g8j.3).
+        // to what the rest of the program produces.
         let mut param_types = Vec::new();
         for (idx, p) in l.params.iter().enumerate() {
             match &p.ty {
@@ -507,7 +507,7 @@ impl TypeChecker {
                     }
                     // A block-bodied lambda returns only through `return`, so
                     // one that owes a value has the same obligation a named
-                    // function has (willow-x8sj).
+                    // function has.
                     let annotation = ann.clone();
                     self.check_all_paths_return(
                         b,
@@ -533,8 +533,8 @@ impl TypeChecker {
                     // only the moment differs. The type is the RESULT of the
                     // walk above, so the check has to run here rather than
                     // before the body, and it is skipped for the inferred
-                    // `void` that a lambda returning nothing lands on
-                    // (willow-x8sj).
+                    // `void` that a lambda returning nothing lands on.
+                    //
                     self.check_all_paths_return(
                         b,
                         &inferred,
@@ -595,7 +595,7 @@ impl TypeChecker {
 
         // A lambda that takes nothing is a plain code address; one that
         // captures is a GC environment object and is CALLED differently, so the
-        // two carry different types (willow-0g8j.2.12). A non-capturing lambda
+        // two carry different types. A non-capturing lambda
         // still becomes a closure when the context asks for one, so that
         // `closure(i64) -> i64` accepts `|x| x * 2` — the environment is then
         // just the code pointer.
@@ -612,13 +612,13 @@ impl TypeChecker {
         // `check_expr`, and that is exactly the case whose parameter types come
         // from the call site rather than from annotations. Without this the
         // backend and the HIR lowering would have no type for it at all
-        // (willow-0g8j.3, replacing the `lambda_fn_types` side table).
+        // (the lowered-IR cutover, replacing the `lambda_fn_types` side table).
         self.expr_types.insert(l.id, fn_ty.clone());
         (fn_ty, captured)
     }
 
     /// Reinterpret an unqualified match pattern as an enum-variant pattern when
-    /// the scrutinee is an enum with that variant (willow-60o.1): `Ok(v)` parses
+    /// the scrutinee is an enum with that variant: `Ok(v)` parses
     /// as `ClassDowncast` → `EnumVariantTuple`; a bare `Closed` parses as
     /// `Binding` → `EnumVariant` (only for a fieldless variant; otherwise it is a
     /// genuine catch-all binding). Returns `None` when no reinterpretation
@@ -635,7 +635,7 @@ impl TypeChecker {
         let info = self.symbols.lookup_enum(enum_name)?;
         // A bare `Boxy(v)` / `Round` is only the enum's variant for a unit that
         // can name the enum bare; an importer of `kinds` writes
-        // `kinds::Kind::Boxy(v)` (willow-itcw). The qualified arms below stay
+        // `kinds::Kind::Boxy(v)`. The qualified arms below stay
         // open to every spelling the unit can actually resolve.
         let bare = self.enum_nameable_bare(&info.name);
         match pattern {
@@ -678,7 +678,7 @@ impl TypeChecker {
             // on its own `Level` against a scrutinee typed `signal::Level`, or
             // an importer matching `Level::On` on one it imported by item name.
             // Rewriting to the scrutinee's spelling is what makes one enum one
-            // type however the unit reached it (willow-itcw), and the resolution
+            // type however the unit reached it, and the resolution
             // is recorded, so the back end reads the canonical name too.
             Pattern::EnumVariant {
                 enum_name: written,
@@ -723,7 +723,7 @@ impl TypeChecker {
     }
 
     /// A match guard is a `bool` condition checked with the arm's pattern
-    /// bindings in scope (willow-jz15.6).
+    /// bindings in scope.
     fn check_match_guard(&mut self, guard: &Expr) {
         let errors_before = self.error_generation;
         let guard_ty = self.check_expr(guard);
@@ -779,7 +779,7 @@ impl TypeChecker {
 
     pub(super) fn check_match_expr(&mut self, m: &MatchExpr) -> Type {
         // The type this `match` flows into, when it was reached through
-        // `check_expr_expecting` (willow-0g8j.3). Taken, not borrowed: a
+        // `check_expr_expecting`. Taken, not borrowed: a
         // `match` nested anywhere inside an arm gets its own context or none,
         // never this one by accident.
         let expected = self.local.match_expected.take();
@@ -814,7 +814,7 @@ impl TypeChecker {
                 found_unreachable = true;
             }
             // A guarded arm may decline a value its pattern matches, so it
-            // covers nothing for exhaustiveness (willow-jz15.6).
+            // covers nothing for exhaustiveness.
             let covers = arm.guard.is_none();
 
             let errors_before_pattern = self.error_generation;
@@ -1723,7 +1723,7 @@ impl TypeChecker {
                 // flows into, so `return match x { Some(v) => Result::Ok(v),
                 // None => Result::Err("none") }` types both arms as the
                 // function's `Result<i64, String>` instead of leaving the first
-                // one an `Ok` with no error type (willow-0g8j.3). This is what
+                // one an `Ok` with no error type. This is what
                 // a ternary in the same position already does.
                 match expected {
                     Some(expected) => {
@@ -1738,10 +1738,10 @@ impl TypeChecker {
                 // recovery boundary. Real arm blocks still add lexical depth.
                 self.check_block_scope(block, source != MatchSource::TupleLet);
                 // An arm that always leaves — by `return`, or by `break` /
-                // `continue` of an enclosing loop (willow-jz15.46) — diverges:
+                // `continue` of an enclosing loop — diverges:
                 // type it `Never` so it unifies with value arms
                 // (`Ok(v) => v, Err(_) => { continue; }`) and with
-                // statement-position matches (willow-zvkv).
+                // statement-position matches.
                 if crate::semantic::type_checker::analysis::cached_arm_leaves(
                     block,
                     &mut self.arm_leaves,
@@ -1755,13 +1755,13 @@ impl TypeChecker {
     }
 }
 
-/// The lambda capture scan, on the shared structural walk (willow-uqzx.1.1).
+/// The lambda capture scan, on the shared structural walk.
 ///
 /// It needs exactly the walk's own shadowing rule — a name bound inside the
 /// lambda is not a capture — so the scope stack comes from the walker's
 /// [`AstVisitor::enter_scope`]/[`AstVisitor::bind`] hooks rather than being
 /// re-implemented here. Everything else is one check on [`Expr::Var`].
-/// One value a lambda takes from its enclosing function (willow-0g8j.2.12).
+/// One value a lambda takes from its enclosing function.
 ///
 /// The name is the enclosing function's spelling, which is also the name the
 /// lifted body binds the environment slot under, so the body's own references
@@ -1914,12 +1914,12 @@ fn has_array_placeholder(mut ty: &Type) -> bool {
 mod lambda_capture_tests {
     //! What a lambda takes from its enclosing function, and what that makes it.
     //!
-    //! willow-thqe first wrote these perspectives when a capture was an error
-    //! (it used to silently read 0). willow-0g8j.2.12 gave lambdas a real
+    //! These regression tests were first written when a capture was an error
+    //! (it used to silently read 0). Closure conversion gave lambdas a real
     //! environment, so the same 30 shapes now pin the OPPOSITE answer: the
     //! capture is accepted, recorded in slot order, and turns the lambda into a
     //! `closure` value. The scan itself is the same code, so a container the
-    //! shared walk (willow-uqzx.1.1) misses is still a silent wrong answer —
+    //! shared walk misses is still a silent wrong answer —
     //! now a capture the environment never carries rather than a missed error.
     //!
     //! 1 read capture, 2 param use, 3 own `let`, 4 shadowing param, 5 block-
@@ -1932,7 +1932,7 @@ mod lambda_capture_tests {
     //! 25 `for` iterable, 26 `while` condition, 27 a `let` initializer is not
     //! excused by its own binding, 28 match payload binding.
     //!
-    //! Then the rules the environment brought with it (willow-0g8j.2.12):
+    //! Then the rules the environment brought with it:
     //! 29 `self` is a reference capture, 30 immutable capture writes are E1009, 31 `let mut`
     //! permits sharing, 32 the write is reported once, 33 a capturing lambda
     //! is not a `fn` value (E1011), 34 but is a `closure` one, 35 a
@@ -2229,7 +2229,7 @@ mod lambda_capture_tests {
         );
     }
 
-    // --- Shared structural AST walk (willow-uqzx.1.1) ---
+    // --- Shared structural AST walk ---
     //
     // The scan reads the shared walk in `parser::visit`, so a slot the walk
     // misses is a value the environment never carries — the body would read an
@@ -2330,7 +2330,7 @@ mod lambda_capture_tests {
         );
     }
 
-    // --- What an environment does and does not allow (willow-0g8j.2.12) ---
+    // --- What an environment does and does not allow ---
 
     /// The receiver is a normal reference capture, just like an alias.
     #[test]

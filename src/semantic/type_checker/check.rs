@@ -31,8 +31,8 @@ impl TypeChecker {
     /// call or to a constant `None` depends on the enclosing defer, and both
     /// the checker and the backend dispatch it by callee name. A local binding
     /// or parameter named `recover` would therefore be silently ignored at the
-    /// call site and compile to the builtin instead of the bound value
-    /// (willow-s9ej.7), so the name is reserved at every binding site the same
+    /// call site and compile to the builtin instead of the bound value, so the name is
+    /// reserved at every binding site the same
     /// way a top-level `fn recover` is.
     pub(super) fn define_var(&mut self, name: String, info: VarInfo) {
         if name == "recover" {
@@ -128,7 +128,7 @@ impl TypeChecker {
     /// Check the ENTRY program: the file named on the command line.
     ///
     /// Its `main` is the process entry point, which is the one body allowed to
-    /// run off the end of a `Result<void, E>` (willow-ltkj). Use
+    /// run off the end of a `Result<void, E>`. Use
     /// [`Self::check_module_program`] for an imported module, whose `main`, if
     /// it has one, is an ordinary function.
     pub fn check_program(&mut self, program: &Program) {
@@ -164,7 +164,7 @@ impl TypeChecker {
     /// entry point. The caller is responsible for the module's scope — prelude,
     /// the modules IT imports, its own item imports — exactly as
     /// `typecheck_phase` builds the entry scope, because a module sees its own
-    /// imports and not the entry file's (willow-3eo1).
+    /// imports and not the entry file's.
     pub fn check_module_program(&mut self, program: &Program) {
         self.entry_program = false;
         self.check_program_items(program);
@@ -231,7 +231,7 @@ impl TypeChecker {
         // Looping sync helpers indexed by `Class::method`, so a call through a
         // typed non-`self` receiver (`obj.heavy()`) in a task context is flagged
         // E0810 — the AST-only ConcurrencyAnalyzer cannot resolve the receiver
-        // type (willow-0a6k.2).
+        // type.
         // Helper effects depend on checked call resolution. Collect their
         // diagnostic sites while checking; solve and replay them afterward.
         self.task_method_calls.clear();
@@ -239,8 +239,8 @@ impl TypeChecker {
         // Pass 0: enum identities. Normalizing a written type canonicalizes a
         // bare enum name by lookup, so every enum must be findable before any
         // declaration's types are normalized: a class field, interface
-        // signature or payload may name an enum declared later in the file
-        // (willow-rlq9). The reserved name is left to pass 1's diagnostic.
+        // signature or payload may name an enum declared later in the file. The reserved name
+        // is left to pass 1's diagnostic.
         for item in &program.items {
             if let Item::Enum(e) = item
                 && e.name != "PanicInfo"
@@ -405,7 +405,7 @@ impl TypeChecker {
     }
 
     /// Reset and index the named callables consumed by the semantic
-    /// `MAY_BLOCK | MAY_SUSPEND` analysis for E2604 (willow-38w.1.4).
+    /// `MAY_BLOCK | MAY_SUSPEND` analysis for E2604.
     fn prepare_lock_effect_analysis(&mut self, program: &Program) {
         self.local.current_effect_callable = None;
         self.effect_index.callables.clear();
@@ -883,7 +883,7 @@ impl TypeChecker {
     /// `async fn` eagerly creates a Task, which allocates in the caller, while
     /// the callee's waiting happens on that Task rather than on the caller's
     /// stack. `report_transitive_lock_effects` installs the mask that drops
-    /// `MAY_SUSPEND | MAY_BLOCK` across such an edge (willow-38w.1.4), so the
+    /// `MAY_SUSPEND | MAY_BLOCK` across such an edge, so the
     /// graph stays complete without the wait leaking into the caller. For the
     /// same reason a bare async call is never itself a lock-held wait site.
     pub(super) fn record_lock_effect_call(&mut self, callee: FunctionId, span: Span) {
@@ -964,8 +964,8 @@ impl TypeChecker {
     /// class receiver resolves to the shared dispatch union: every body an
     /// instance of that class or any subclass would select. Resolving only the
     /// declaring class upward misses an override that waits, which is the
-    /// willow-s9ej.11 defect in the backend's copy of this rule
-    /// (willow-uqzx.1.2).
+    /// virtual-dispatch effect analysis defect in the backend's copy of this rule.
+    ///
     ///
     /// Interface receivers resolve to the single synthetic union node connected
     /// to every known implementation by `connect_interface_lock_effects`.
@@ -1397,7 +1397,7 @@ impl TypeChecker {
         });
         callsites.dedup_by(|a, b| a.span == b.span && a.callee == b.callee);
         // One call site is one diagnostic. A virtual call now records an edge
-        // per member of its dispatch union (willow-uqzx.1.2), so report the
+        // per member of its dispatch union, so report the
         // first waiting target in the sorted order and suppress the rest of
         // that span instead of emitting the same error once per override.
         let mut reported_spans = HashSet::new();
@@ -1462,7 +1462,7 @@ impl TypeChecker {
         self.local.lexical_block_depth -= u32::from(lexical);
     }
 
-    /// Type-check `lock <target> as [mut] <binding> { .. }` (willow-38w.1.1).
+    /// Type-check `lock <target> as [mut] <binding> { .. }`.
     ///
     /// V1 rules, in the order they are reported:
     ///   * the target must be the lock type the mode requires (E2602),
@@ -1471,7 +1471,7 @@ impl TypeChecker {
     ///   * nested acquisitions must be provably distinct and ordered (E2605).
     ///
     /// A statement that breaks none of those lowers through
-    /// `emit_coop_lock` (willow-38w.1.4). Only `lock read` / `lock write` on an
+    /// `emit_coop_lock`. Only `lock read` / `lock write` on an
     /// `RwLock<T>` remain behind the staged gate (E2502) until Stage 5.
     pub(super) fn check_lock_stmt(&mut self, s: &LockStmt) {
         // A target that already reported its own error (an unknown name, a bad
@@ -1537,10 +1537,10 @@ impl TypeChecker {
 
         let binding_ty = protected.unwrap_or(Type::Never);
         // An async fn resumes into the critical section after a contended
-        // acquisition, so the binding lives in the async frame (willow-38w.1.3),
+        // acquisition, so the binding lives in the async frame,
         // and so do the three pieces of compiler-owned state the resumed poll
         // and the cancel entry need: the evaluated lock handle, this
-        // acquisition's registration token, and its phase (willow-38w.1.4).
+        // acquisition's registration token, and its phase.
         if self.local.current_async_context {
             self.record_async_local(
                 binding_ty.clone(),
@@ -2663,7 +2663,7 @@ impl TypeChecker {
         // What the written class turned out to name, per call site: HIR lowering
         // rewrites `Level::High` to the build-wide identity `signal::Level::High`
         // with this, because the node's type already carries that identity and
-        // the enum tables answer to nothing else (willow-njot).
+        // the enum tables answer to nothing else.
         let written_class = match expr {
             Expr::StaticCall(s) => Some(s.class.as_str()),
             Expr::StaticField(s) => Some(s.class.as_str()),
@@ -2691,9 +2691,9 @@ impl TypeChecker {
         };
         self.record_static_target(expr);
         // Record the authoritative expression type for downstream consumers
-        // (HIR lowering, willow-mb5): keyed by node ID, so a pass that rebuilds
+        // (HIR lowering, typed HIR lowering): keyed by node ID, so a pass that rebuilds
         // or duplicates syntax cannot inherit another node's entry the way two
-        // nodes sharing a span could (willow-njot).
+        // nodes sharing a span could.
         self.expr_types.insert(expr.id(), ty.clone());
         self.record_resolved_call(expr);
         self.record_symbol_use(expr);
@@ -2795,7 +2795,7 @@ impl TypeChecker {
         };
         self.record_indirect_uses(expr, &targets);
         // Constructors always record them: E0842 refinement looks up each
-        // call's panic fact by expression id (willow-ssl7.19).
+        // call's panic fact by expression id.
         if self.capture_call_sites || self.local.in_constructor {
             // Keep only a unique compiler-resolved target. Polymorphic sites
             // remain explicit unknowns, without copying dispatch fan-out per site.
@@ -2906,7 +2906,7 @@ impl TypeChecker {
         sites.targets.extend(targets);
     }
 
-    /// `LIMIT()` where `LIMIT` is a module-level `const` (willow-jz15.10): a
+    /// `LIMIT()` where `LIMIT` is a module-level `const`: a
     /// constant is a value, never a callable function, even though it is
     /// registered in the function namespace.
     pub(super) fn reject_constant_call(
@@ -3045,7 +3045,7 @@ impl TypeChecker {
                 // Named function used as a value: `apply(10, double)` where `double: fn(...)`
                 if let Some(info) = self.symbols.lookup_func(name) {
                     // A module-level `const` is a value of its declared type,
-                    // inlined by lowering (willow-jz15.10).
+                    // inlined by lowering.
                     if info.constant.is_some() {
                         return info.return_type.clone();
                     }
@@ -3053,8 +3053,8 @@ impl TypeChecker {
                     let ret = info.return_type.clone();
                     // An async function has no plain entry point (a call
                     // creates its Task), and a builtin is lowered inline at
-                    // each call site, so neither has an address to take
-                    // (willow-yf49). Builtins are the functions without a
+                    // each call site, so neither has an address to take. Builtins are the functions without a
+                    //
                     // source declaration; a few are defined as real functions.
                     let is_async = info.is_async;
                     let not_addressable = if is_async {
@@ -3176,7 +3176,7 @@ impl TypeChecker {
                     .with_label(Label::primary(*span, "not found in this scope")),
                 );
                 // The error type suppresses cascades: a use of the missing name
-                // must not be judged as some guessed type (willow-jz15.48).
+                // must not be judged as some guessed type.
                 Self::error_type()
             }
             Expr::Binary(_) | Expr::Unary(_) => self.check_operator_tree(expr),
@@ -3184,7 +3184,7 @@ impl TypeChecker {
                 // Lexical value bindings win over module/free-function names.
                 // Looking up the free function first silently compiled
                 // `let f = |...| ...; f(...)` as a direct call when a top-level
-                // `fn f` also existed (willow-bv9.1).
+                // `fn f` also existed.
                 if let Some(var_info) = self.symbols.lookup_var(&c.callee).cloned() {
                     if !c.type_args.is_empty() {
                         self.generic_error(
@@ -3196,8 +3196,8 @@ impl TypeChecker {
                         );
                     }
                     match &var_info.ty {
-                        // Both callable types are called the same way in source
-                        // (willow-0g8j.2.12); they differ only in what codegen
+                        // Both callable types are called the same way in source; they differ only in what codegen
+                        //
                         // has to load first.
                         Type::Fn(param_types, ret) | Type::Closure(param_types, ret) => {
                             if param_types.len() != c.args.len() {
@@ -3260,7 +3260,7 @@ impl TypeChecker {
                 if c.callee == "format" {
                     return self.check_format_call(c);
                 }
-                // Variadic formatted panic (willow-csax): `panic(spec, args...)`.
+                // Variadic formatted panic: `panic(spec, args...)`.
                 // The one-argument form stays a plain-String builtin call.
                 if c.callee == "panic" && c.args.len() != 1 {
                     return self.check_panic_interpolation(c);
@@ -3384,7 +3384,7 @@ impl TypeChecker {
                     return Self::error_type();
                 }
                 // `Task<T>`/`JoinHandle<T>` yield `T`; `Future<T>` yields `T`;
-                // `await task.result()` (willow-qrj9) is the same wait, same
+                // `await task.result()` is the same wait, same
                 // frame and same waiter registration as `await task` — only the
                 // cancelled mapping differs, so `TaskResult<T>` yields
                 // `Result<T, Cancelled>`. `JoinHandle<T>` must be here because
@@ -3438,7 +3438,7 @@ impl TypeChecker {
                 // Printable: i64/f64/bool/String and Never (a panicking
                 // argument never reaches the print). Option values require
                 // explicit matching/unwrapping. Anything else used to compile
-                // and silently print NOTHING (willow-0rq9).
+                // and silently print NOTHING.
                 if !matches!(
                     &arg_ty,
                     Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never
@@ -3601,7 +3601,7 @@ impl TypeChecker {
 
     /// Migration target when `await` is applied to an unsuffixed synchronous
     /// std::fs call. The explicit suffix keeps sync compatibility and makes the
-    /// scheduling effect visible at the call site (willow-2s3.2).
+    /// scheduling effect visible at the call site.
     fn sync_fs_await_replacement(&self, expr: &Expr) -> Option<String> {
         let sync_method = |method: &str| {
             matches!(
@@ -3849,7 +3849,7 @@ fn defer_body_contains_suspend(body: &DeferBody) -> bool {
 /// Whether this deferred AST directly contains the compiler-known
 /// `recover()` builtin. The generic defer walker deliberately treats lambdas
 /// as opaque, so a helper/lambda cannot inherit the caller's recovery
-/// capability (willow-s9ej.3).
+/// capability.
 pub(crate) fn defer_body_contains_direct_recover(body: &DeferBody) -> bool {
     let mut contains = false;
     walk_defer_body(body, &mut |_| {}, &mut |expr| {
@@ -3920,7 +3920,7 @@ fn defer_scheduler_drive_span(
 }
 
 /// Perspectives for the checker's virtual-dispatch resolution in the E2604
-/// lock-effect graph (willow-uqzx.1.2).
+/// lock-effect graph.
 ///
 /// Before this, `concrete_method_effect_id` resolved a receiver call by
 /// walking *up* from the receiver's declared class to the nearest declaring
@@ -3929,7 +3929,7 @@ fn defer_scheduler_drive_span(
 /// bounds the dynamic type from *above*, so a subclass override was invisible
 /// and a waiting override under a lock compiled clean. Resolution now goes
 /// through the shared [`ClassHierarchy::dispatch_targets`], the same union the
-/// backend's panic-effect analysis uses — the willow-s9ej.11 defect class.
+/// backend's panic-effect analysis uses — the virtual-dispatch effect analysis defect class.
 ///
 /// Perspectives:
 ///   d01 direct  — the receiver's own class declares the waiting body
@@ -4098,7 +4098,7 @@ async fn main() {
     }
 
     /// d04: `self.hook()` inside an inherited body is a virtual call too. This
-    /// is the exact shape of the willow-s9ej.11 backend bug.
+    /// is the exact shape of the virtual-dispatch effect analysis backend bug.
     #[test]
     fn d04_self_call_reaches_a_subclass_override() {
         assert_lock_effect_witness(
@@ -4695,7 +4695,7 @@ async fn main() {
     /// d23: when one helper reaches both a suspending and a blocking owner, the
     /// blocking one is reported.
     ///
-    /// The shared fixpoint (willow-uqzx.1.3) seeds the kind-specific lattice bit
+    /// The shared fixpoint seeds the kind-specific lattice bit
     /// instead of one boolean, and `EffectSummary::witness` answers from the
     /// lowest set bit in the query — `MAY_BLOCK` (bit 1) before `MAY_SUSPEND`
     /// (bit 2). That deliberately outranks the older "lexicographically smallest

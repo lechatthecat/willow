@@ -1,4 +1,4 @@
-//! Conservative recoverable-panic effect analysis (willow-s9ej.8).
+//! Conservative recoverable-panic effect analysis.
 //!
 //! The analysis proves a deliberately small `NO_PANIC` subset. Unknown calls,
 //! function values, interface dispatch, operations with language-level guards,
@@ -7,8 +7,8 @@
 //! pure recursive SCC be proved safe without ever making an unknown edge safe.
 //!
 //! The call edges come from the shared graph in [`crate::semantic::call_graph`]
-//! (willow-uqzx.1.2) and the propagation from the shared fixpoint in
-//! [`crate::semantic::effects`] (willow-uqzx.1.3); this module owns only the
+//! and the propagation from the shared fixpoint in
+//! [`crate::semantic::effects`]; this module owns only the
 //! standalone external-call adaptation and [`FunctionId`] -> linker-symbol mapping in
 //! [`backend_symbol`].
 
@@ -301,7 +301,7 @@ impl FuncGen<'_, '_> {
 
     /// Whether the lifted body of lambda `expr` may raise: no-panic by effect
     /// summary (block lambdas) or by the safepoint-free leaf proof, which also
-    /// covers expression lambdas that have no summary (willow-8hq4.28).
+    /// covers expression lambdas that have no summary.
     pub(super) fn lambda_may_panic(&self, expr: &ExprId, id: &FunctionId) -> bool {
         self.user_function_may_panic_id(id)
             && !(optimization_enabled() && self.leaf_lambdas.contains(expr))
@@ -310,7 +310,7 @@ impl FuncGen<'_, '_> {
     /// What every function an `interface` vtable slot for `method` can hold
     /// guarantees. Every vtable of the build is declared before any body is
     /// lowered, so the slot targets are complete here; a re-dispatching thunk
-    /// or an unresolved slot keeps the conservative answer (willow-8hq4.14).
+    /// or an unresolved slot keeps the conservative answer.
     pub(super) fn interface_slot_summary(
         &self,
         interface: TypeId,
@@ -522,7 +522,7 @@ mod tests {
         assert_eq!(effects.get("odd"), Some(&false));
     }
 
-    // Standalone analysis assumes debug overflow checks (willow-jz15.14).
+    // Standalone analysis assumes debug overflow checks.
     #[test]
     fn checked_integer_arithmetic_is_may_panic() {
         let effects = analyze(
@@ -581,7 +581,7 @@ mod tests {
         assert_eq!(effects.get("Work.reaches"), Some(&true));
     }
 
-    // willow-s9ej.11 perspectives 1-8, 13, and 20: a virtual self-call
+    // virtual-dispatch effect analysis perspectives 1-8, 13, and 20: a virtual self-call
     // participates in the same whole-hierarchy target union as another
     // class-typed receiver. These analysis-level cases pin safe controls,
     // direct/transitive descendant hazards, nearest inherited targets,

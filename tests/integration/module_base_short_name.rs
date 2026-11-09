@@ -1,4 +1,4 @@
-//! A module-qualified base class keeps its module in lowering (willow-ejg5).
+//! A module-qualified base class keeps its module in lowering.
 //!
 //! `src/ir/lower.rs` types member accesses from a table of the unit's own
 //! classes, walking each class's base chain for inherited members. That table

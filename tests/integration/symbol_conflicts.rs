@@ -1,4 +1,4 @@
-//! End-to-end coverage for linker-symbol conflicts (willow-uqzx, catalog
+//! End-to-end coverage for linker-symbol conflicts (shared compiler infrastructure, catalog
 //! item 8).
 //!
 //! The backend used to build linker symbols by flattening `::` to `__`. That

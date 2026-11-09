@@ -1,4 +1,4 @@
-//! Cross-module GENERIC interface default bodies (willow-s71l).
+//! Cross-module GENERIC interface default bodies.
 //!
 //! A class in module M that implements `P::Get<A>` receives P's default body.
 //! The interface is instantiated once per distinct type argument list in P,

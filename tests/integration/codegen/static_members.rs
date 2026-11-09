@@ -1,7 +1,7 @@
 use super::super::support::*;
 
 // ---------------------------------------------------------------------------
-// Static members + implicit self — willow-qsqf Stage 1 (static fn + implicit
+// Static members + implicit self — static member support Stage 1 (static fn + implicit
 // self). `static fn` is class-level (called `Type::m(...)`, no `self`); a plain
 // `fn` is an instance method whose `self` is implicit (no `self` parameter).
 //
@@ -398,7 +398,7 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// Immutable static properties — willow-qsqf Stage 2. A `static name: T = expr`
+// Immutable static properties — static member support Stage 2. A `static name: T = expr`
 // property lives in global storage, is initialized once before `main`, and is
 // read as `ClassName::property`.
 //
@@ -643,7 +643,7 @@ fn main() {
 
 #[test]
 fn test_static_prop_17_assign_to_immutable_static_rejected() {
-    // Immutable static properties cannot be reassigned (willow-qsqf §5.1). In
+    // Immutable static properties cannot be reassigned (static member support §5.1). In
     // Stage 2 this is a compile error (static-field assignment + the dedicated
     // E0832 message arrive with `static mut` in Stage 3).
     let (_out, ok) = compile_and_run(
@@ -697,7 +697,7 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// Mutable static properties + mutability enforcement — willow-qsqf Stage 3.
+// Mutable static properties + mutability enforcement — static member support Stage 3.
 // `static mut name: T = expr` is reassignable via `ClassName::name = value`;
 // a plain `static` rejects assignment (E0832).
 //
@@ -1041,7 +1041,7 @@ fn main() { C::x = 2; }
 }
 
 // ---------------------------------------------------------------------------
-// Static members: visibility, inheritance, interfaces — willow-qsqf Stage 4.
+// Static members: visibility, inheritance, interfaces — static member support Stage 4.
 // Static members are non-virtual (resolved by type name, inherited statics
 // reachable through a subclass, redefinition rejected); interfaces reject
 // static members; explicit `self` keeps a migration path.

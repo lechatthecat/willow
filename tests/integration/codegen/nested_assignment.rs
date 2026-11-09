@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Nested-place field assignment (willow-qzxg) ──────────────────────────────
+// ── Nested-place field assignment ──────────────────────────────
 // 10 runtime perspectives completing the 20 with the parser tests: 11 two-level
 // write, 12 three-level write, 13 array-element field write, 14 call-result
 // field write (mutates the returned object), 15 write then read back through

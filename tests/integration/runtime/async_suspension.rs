@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Cooperative async suspension (willow-lpn.5.3 Stage 2) ────────────────────
+// ── Cooperative async suspension (cooperative suspension Stage 2) ────────────────────
 
 #[test]
 fn coop_async_01_main_suspends_at_sleep() {
@@ -53,7 +53,7 @@ async fn main() {
 #[test]
 fn coop_async_04_gc_locals_across_awaits() {
     // GC-managed locals declared before an await and used after must survive
-    // suspension (frame-backed). Run under GC stress (willow-lpn.5.3 slice 3).
+    // suspension (frame-backed). Run under GC stress (cooperative suspension slice 3).
     let (out, ok) = compile_and_run_gc_stress(
         r#"
 async fn main() {
@@ -73,7 +73,7 @@ async fn main() {
 #[test]
 fn coop_async_05_non_gc_locals_across_awaits() {
     // i64/scalar locals across awaits are frame-backed too (not just GC), and
-    // are not GC-traced (willow-lpn.5.3 slice 3b). GC-stress.
+    // are not GC-traced (cooperative suspension slice 3b). GC-stress.
     let (out, ok) = compile_and_run_gc_stress(
         r#"
 async fn main() {
@@ -96,7 +96,7 @@ async fn main() {
 fn coop_async_06_await_cooperative_leaf() {
     // A no-param leaf async fn (sleep + return) compiles to a cooperative
     // constructor + poll fn; `await f()` block-runs the scheduler and reads the
-    // result (willow-lpn.5.3 slice 4). GC-stress.
+    // result (cooperative suspension slice 4). GC-stress.
     let (out, ok) = compile_and_run_gc_stress(
         r#"
 async fn wait_value() -> i64 {
@@ -167,7 +167,7 @@ async fn main() {
 fn coop_async_07_cooperative_leaf_with_params() {
     // A leaf async fn with by-value params (GC + scalar) compiles to a
     // cooperative constructor that stores args into frame slots; the poll fn
-    // reads them back across the suspension (willow-lpn.5.3 slice 4b). GC-stress.
+    // reads them back across the suspension (cooperative suspension slice 4b). GC-stress.
     let (out, ok) = compile_and_run_gc_stress(
         r#"
 async fn greet(name: String, n: i64) -> String {
@@ -193,7 +193,7 @@ async fn main() {
 #[test]
 fn coop_async_08_cooperative_leaf_with_locals() {
     // A cooperative leaf may declare locals (GC + scalar) that survive its own
-    // suspensions, frame-backed after the param slots (willow-lpn.5.3 4c).
+    // suspensions, frame-backed after the param slots (cooperative suspension 4c).
     let (out, ok) = compile_and_run_gc_stress(
         r#"
 async fn calc(base: i64) -> i64 {
@@ -392,7 +392,7 @@ fn main() {
 "#;
     let (out, ok) = compile_and_run_with_env(source, &[]);
     assert!(ok, "survivor program failed: {out}");
-    // Counts include the young array literals (willow-jz15.94): `values`
+    // Counts include the young array literals: `values`
     // copies and tenures its handle and buffer with the 32 payloads, and the
     // still-live `temporary` handle and buffer are promoted while its 32
     // drained payloads are not.

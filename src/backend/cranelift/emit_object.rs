@@ -5,7 +5,7 @@ use super::*;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// The address of `class`'s DESCRIPTOR: the value that lives in word 0 of
-    /// every object of that class (willow-fm7t).
+    /// every object of that class.
     ///
     /// The descriptor holds the class's `type_id` at its own offset 0, followed
     /// by one word per virtual method slot. One store of this pointer at
@@ -25,7 +25,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Store `class`'s descriptor address into word 0 of a freshly allocated
-    /// object (willow-fm7t).
+    /// object.
     pub(super) fn emit_store_class_descriptor(
         &mut self,
         ptr: cranelift_codegen::ir::Value,
@@ -37,7 +37,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .store(MemFlagsData::new(), descriptor, ptr, 0i32);
     }
 
-    /// Load the runtime `type_id` of the object `ptr` points at (willow-fm7t).
+    /// Load the runtime `type_id` of the object `ptr` points at.
     ///
     /// Two dependent loads rather than one: word 0 of the object is the
     /// descriptor address, and offset 0 of the descriptor is the id. Only the

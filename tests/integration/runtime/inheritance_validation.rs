@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Interface inheritance validation (willow-1js.8) ──────────────────────────
+// ── Interface inheritance validation ──────────────────────────
 
 #[test]
 fn iface_inherit_neg_01_cycle_rejected() {
@@ -58,8 +58,8 @@ fn main() {}
 
 #[test]
 fn downcast_05_generic_interface_scrutinee() {
-    // Downcast works when the scrutinee is a generic interface instantiation
-    // (willow-1js.9).
+    // Downcast works when the scrutinee is a generic interface instantiation.
+    //
     let (out, ok) = compile_and_run(
         r#"
 interface Box<T> { fn get(self) -> T; }
@@ -84,7 +84,7 @@ fn main() {
     assert_eq!(out, "99\n1\n");
 }
 
-// ── Subclass usable as a base-declared interface (willow-2s4i) ───────────────
+// ── Subclass usable as a base-declared interface ───────────────
 
 #[test]
 fn subclass_iface_01_used_as_base_interface() {

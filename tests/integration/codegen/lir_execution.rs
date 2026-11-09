@@ -1,6 +1,6 @@
 use super::*;
 
-// Channel/select/lock acceptance matrix (willow-0g8j.2.9), exercised by three
+// Channel/select/lock acceptance matrix, exercised by three
 // runnable examples: the two below, and `shared_call_graph` in the test after
 // them, where the lock is the point:
 //  1 Channel return type               11 default arm
@@ -32,7 +32,7 @@ fn lirreq_channels_select_and_lock_20_perspectives() {
 
 /// Perspective 20 on its own, because it is the case the matrix took longest
 /// to reach. `lock` acquires and releases around a body that may suspend, and
-/// the protocol used to be AST-owned; since willow-0g8j.2.13 the walker owns it
+/// the protocol used to be AST-owned; since lowered-IR runtime call support the walker owns it
 /// too, so a lock-bearing async body — including the class `Ledger` that holds
 /// a `Mutex<i64>` field — compiles from lowered IR like any other.
 #[test]
@@ -96,7 +96,7 @@ fn main() {
     );
 }
 
-// Reference-parameter acceptance matrix (willow-0g8j.2.7), exercised by the
+// Reference-parameter acceptance matrix, exercised by the
 // two runnable examples below under forced LIR and compared with AST codegen:
 //  1. shared scalar read                 11. array-element place
 //  2. mutable scalar write              12. direct-function pointer ABI
@@ -127,8 +127,8 @@ fn lir_diff_interface_reference_params() {
 /// A debug build used to keep every `&place` call site on the AST emitter,
 /// because a debug build also records the reference-call context a panic
 /// reports and only that emitter wrote it. The walker writes it now, so the
-/// call site compiles from lowered IR and the program is still right
-/// (willow-0g8j.2.17).
+/// call site compiles from lowered IR and the program is still right.
+///
 #[test]
 fn lir_debug_reference_call_is_walker_owned() {
     let source =
@@ -136,7 +136,7 @@ fn lir_debug_reference_call_is_walker_owned() {
     assert_program_output(source, "7\n");
 }
 
-// Generic-interface acceptance matrix (willow-0g8j.2.8), exercised by the
+// Generic-interface acceptance matrix, exercised by the
 // runnable examples:
 //  1. i64 type argument                 11. parameter typed by instantiation
 //  2. String type argument              12. return typed by instantiation

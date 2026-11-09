@@ -1,4 +1,4 @@
-// Item-imported functions are function values like local ones (willow-yf49).
+// Item-imported functions are function values like local ones.
 // An async function or an inline builtin has no address: wrap the call in a
 // lambda instead (`let f = later;` is E1012).
 import worker::twice;

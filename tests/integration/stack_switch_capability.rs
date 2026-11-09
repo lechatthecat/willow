@@ -1,7 +1,7 @@
 //! Capability probes for Cranelift's `stack_switch` instruction.
 //!
 //! These back the decision record at
-//! `docs/decisions/0001-task-stack-switch-capability.md` (willow-38w.2.2, A2),
+//! `docs/decisions/0001-task-stack-switch-capability.md` (stack-switch capability, A2),
 //! which is the input to A3's task-owned synchronous stack. The record makes
 //! claims about what the pinned Cranelift can and cannot do; without probes,
 //! those claims silently rot the next time the dependency is bumped.

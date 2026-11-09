@@ -1,6 +1,6 @@
-//! End-to-end perspectives for native `i64 **` and `f64 **` (willow-n5yv).
+//! End-to-end perspectives for native `i64 **` and `f64 **`.
 //!
-//! Stage 1 (willow-n5yv.2) gave `**` a lexer token, a right-associative parse
+//! Stage 1 gave `**` a lexer token, a right-associative parse
 //! and a type rule, but every well-typed power was rejected by a codegen gate.
 //! Stage 2 lowers `i64 ** i64` natively: a literal exponent unrolls into a
 //! chain of `imul`s and everything else — a variable, or a constant expression

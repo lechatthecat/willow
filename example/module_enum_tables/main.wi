@@ -2,9 +2,9 @@
 // declaring module's own body, a second module that imports it, and this entry
 // file. The back end keeps ONE flat enum table for the whole build, and each
 // unit spells the same declaration differently -- bare inside the module,
-// qualified everywhere else -- so the table has to answer to both names
-// (willow-nm0g), and the LIR walker has to treat the two names as one
-// representation (willow-0g8j.3.2).
+// qualified everywhere else -- so the table has to answer to both names, and the LIR walker has to treat the two names as one
+// representation.
+//
 //
 // Run it under `WILLOW_GC_STRESS=alloc` too: a fieldless enum is a tag integer,
 // and a back end that does not recognise the name assumes a pointer and roots

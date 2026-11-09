@@ -1,4 +1,4 @@
-// send_sync_markers.wi — the Send / Sync marker interfaces (willow-dgwo).
+// send_sync_markers.wi — the Send / Sync marker interfaces.
 //
 // `Send` and `Sync` are compiler-known marker interfaces, always in scope (no
 // import needed):

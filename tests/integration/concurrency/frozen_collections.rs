@@ -1,6 +1,6 @@
 use super::*;
 
-// ── FrozenArray<T> (willow-dgwo.7) ───────────────────────────────────────────
+// ── FrozenArray<T> ───────────────────────────────────────────
 // Perspectives: 1 freeze+len; 2 indexing read; 3 independent copy (original
 // mutation does not leak); 4 push rejected; 5 pop rejected; 6 index-assign
 // rejected; 7 unknown method rejected; 8 freeze takes no args; 9 FrozenArray<i64>
@@ -109,7 +109,7 @@ async fn main() {
     assert!(!ok, "FrozenArray<Array<i64>> is not Sync");
 }
 
-// ── FrozenMap<K,V> (willow-dgwo.10) ──────────────────────────────────────────
+// ── FrozenMap<K,V> ──────────────────────────────────────────
 // Perspectives: 1 freeze+len; 2 contains; 3 get->Option<V>; 4 independent copy;
 // 5 insert rejected; 6 remove rejected; 7 unknown method rejected; 8 freeze no
 // args; 9 FrozenMap<String,i64> is Sync (passable to async under the check).

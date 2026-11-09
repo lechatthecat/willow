@@ -1,7 +1,7 @@
 use super::*;
 
 // ----------------------------------------------------------------------------
-// Async-GC stress suite (willow-lpn.5.5): GC-safety of the cooperative state
+// Async-GC stress suite: GC-safety of the cooperative state
 // machine — collection before await, after await, GC objects/strings carried
 // across awaits, and JoinHandle keeping a GC result alive. All under
 // WILLOW_GC_STRESS=alloc (collect at every allocation) plus explicit gc_collect.
@@ -108,7 +108,7 @@ async fn main() { println(await build(4)); }
 }
 
 // Awaiting a cooperative-leaf async fn must return the async function's
-// REAL result, not the constructor's frame pointer (willow-lpn.5.4 fix).
+// REAL result, not the constructor's frame pointer.
 #[test]
 fn coop_spawn_06_spawn_async_leaf_sync_main() {
     let (out, ok) = compile_and_run(
@@ -161,7 +161,7 @@ fn coop_spawn_08_spawn_async_leaf_runs_to_completion() {
     // block the spawner, and await returns the leaf's real result.
     //
     // The exact interleaving of the spawner's prints with the leaf's is NOT an
-    // invariant and must not be asserted (willow-0uce). `willow_sched_spawn`
+    // invariant and must not be asserted. `willow_sched_spawn`
     // publishes the task to the shared run queues and the runtime drives them
     // on the configured worker pool. With multiple workers, a peer worker
     // may claim and poll `work` the instant it is spawned,
@@ -227,9 +227,9 @@ async fn main() {
 
 // Cooperative concurrency: spawned async-leaf tasks suspend independently at
 // their awaits and the scheduler interleaves them — observably distinct from
-// sequential execution (willow-lpn.5.4). The scheduler is a worker POOL, not a
+// sequential execution. The scheduler is a worker POOL, not a
 // single thread, so only each task's own output order is an invariant; the
-// interleaving between tasks is not (willow-0uce).
+// interleaving between tasks is not.
 #[test]
 fn coop_concurrent_01_two_workers_interleave() {
     let (out, ok) = compile_and_run(

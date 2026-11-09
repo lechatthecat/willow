@@ -440,7 +440,7 @@ fn managed_growth_consumes_lock_free_native_headroom_before_pacer_crossing() {
         state.threshold_bytes = usize::MAX / 2;
         // Young bytes within the nursery budget belong to minor collections;
         // pin the budget so the managed growth below counts toward the major
-        // policy (willow-jz15.120).
+        // policy.
         state.nursery_threshold_bytes = state.young_allocated_bytes;
         state.pacer_trigger = memory_inputs(&state).occupied + room;
     }
@@ -636,7 +636,7 @@ fn m0_threshold_locked_sample_reports_actual_limit_and_categories() {
     println!("{record}");
 }
 
-/// willow-8hq4.47: storage parked by a sweep shares the cap with native bytes,
+/// storage parked by a sweep shares the cap with native bytes,
 /// so lock-free charges after the release cannot push reserved + native +
 /// retained past the hard-pressure watermark.
 #[test]
@@ -709,7 +709,7 @@ fn lock_free_native_headroom_counts_retained_region_storage() {
     reset_internal();
 }
 
-/// willow-8hq4.47: a soft limit bounds retained region storage. A collection
+/// a soft limit bounds retained region storage. A collection
 /// cannot reclaim it, so it is evicted instead of counted as soft pressure.
 #[test]
 fn soft_limit_bounds_retained_region_storage() {

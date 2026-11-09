@@ -4,7 +4,7 @@
 // `(map, key_word, key_is_ref, val_word, val_is_ref)`: each payload word is
 // followed by its own is-reference flag. The four combinations below exercise
 // both flags in both states, and a collection between insert and lookup shows
-// that reference values are traced through the map (willow-9tls.7).
+// that reference values are traced through the map.
 
 import std::collections::Map;
 

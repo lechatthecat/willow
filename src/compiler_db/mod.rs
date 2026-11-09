@@ -39,7 +39,7 @@ use std::sync::Arc;
 struct CheckedUnitRecord {
     artifact: usize,
     bodies: Vec<crate::parser::ast::BodyId>,
-    /// Default copies injected from another unit's interface (willow-rvpp):
+    /// Default copies injected from another unit's interface:
     /// their interface-level records join this unit's tables because this
     /// unit still declares the copies' symbols (methods and lifted lambdas,
     /// whose callable types come from these records). Their bodies are

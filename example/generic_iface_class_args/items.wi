@@ -1,5 +1,5 @@
-// Plain data types for the cross-module generic-interface example
-// (willow-jz15.45). They live in their own module so the instantiation
+// Plain data types for the cross-module generic-interface example. They live in their own
+// module so the instantiation
 // `Pred<Item>` spans three modules: interface, type argument and implementor.
 pub class Item {
     pub n: i64;

@@ -1,4 +1,4 @@
-// Class virtual dispatch through a per-class VTABLE (willow-fm7t).
+// Class virtual dispatch through a per-class VTABLE.
 //
 // Word 0 of every class object points at that class's DESCRIPTOR: a static
 // table holding the class's runtime `type_id` followed by one slot per virtual

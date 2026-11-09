@@ -25,7 +25,7 @@ pub enum ParseFloatError {
     Invalid(String),
 }
 
-// File-system error (std::fs, willow-2s3): carries the failing path + OS
+// File-system error (std::fs, filesystem support): carries the failing path + OS
 // message.
 pub enum IoError {
     Failed(String),
@@ -41,7 +41,7 @@ pub interface Into<T> {
     fn into(self) -> T;
 }
 
-// Compiler-known marker interfaces for safe concurrency (willow-dgwo).
+// Compiler-known marker interfaces for safe concurrency.
 // `Send` = a value may be transferred across worker/task boundaries.
 // `Sync` = a value may be shared by multiple workers/tasks concurrently.
 // These are not normal interfaces: the compiler INFERS them from a type's

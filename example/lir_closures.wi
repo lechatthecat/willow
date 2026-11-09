@@ -2,7 +2,7 @@
 //
 // `lir_function_values.wi` covers the lambda that captures NOTHING, whose
 // value is just the lifted function's code address. This file covers the other
-// half (willow-0g8j.2.12): a lambda that reads a local of its enclosing
+// half: a lambda that reads a local of its enclosing
 // function is a `closure`, and its value is a GC object laid out exactly like a
 // class instance — payload word 0 is the lifted function's code address, words
 // 1..N are the captured values, and the lifted body takes that object as a

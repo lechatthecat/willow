@@ -1,4 +1,4 @@
-//! Synchronous `defer` scopes across LIR blocks (willow-0g8j.2.15).
+//! Synchronous `defer` scopes across LIR blocks.
 //!
 //! A `defer` scope is left by more than fallthrough. An explicit `return`, a
 //! `break`, a `continue` and a `?` that propagates all leave early, and each has
@@ -18,7 +18,7 @@
 //! once the body is finished, since an inner scope's cleanup jumps to its
 //! parent's and block order can finish the inner one last.
 //!
-//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! Since the lowered-IR cutover a body outside the walker's subset is a compile error,
 //! so a run that prints the right answer is proof the walker produced it. Each
 //! program also runs under `WILLOW_GC_STRESS=alloc`, because a defer body
 //! allocates while the value being returned past it is still live.

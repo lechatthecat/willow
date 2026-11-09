@@ -1,4 +1,4 @@
-// Task status is answered by the task's own frame (willow-ezs.1.3).
+// Task status is answered by the task's own frame.
 //
 // Every task handle IS a pointer to that task's async frame, and the frame's
 // header carries the terminal status (completed / cancelled / panicked) plus a

@@ -1,4 +1,4 @@
-// exponentiation.wi — native `**` on i64 and f64 (willow-n5yv).
+// exponentiation.wi — native `**` on i64 and f64.
 //
 // `**` is a compiler primitive, not a runtime call: a literal exponent unrolls
 // into a chain of multiplications, and everything else — a variable, or even a

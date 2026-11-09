@@ -3,7 +3,7 @@ use super::*;
 // ───────────────────────────────────────────────────────────────────────────
 // E0810 for a looping method reached through a typed NON-`self` receiver
 // (`obj.heavy()`), resolved by the type checker since the AST-only
-// ConcurrencyAnalyzer cannot type the receiver (willow-0a6k.2).
+// ConcurrencyAnalyzer cannot type the receiver.
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -248,8 +248,8 @@ async fn main() {
 }
 
 // Cross-module typed receiver: a looping method of an IMPORTED class, called
-// through a typed receiver in a task context, is flagged with a module note
-// (willow-0a6k.2). The receiver-class key differs by import style.
+// through a typed receiver in a task context, is flagged with a module note. The
+// receiver-class key differs by import style.
 
 #[cfg(not(any(
     all(

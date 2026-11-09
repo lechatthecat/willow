@@ -1,5 +1,5 @@
 //! Lowered IR (LIR): the typed HIR with control flow made explicit as basic
-//! blocks — willow-mb5, the `Lowered IR` stage of the pipeline mandated by the
+//! blocks — typed HIR lowering, the `Lowered IR` stage of the pipeline mandated by the
 //! project conventions (`AST → Typed AST → Lowered IR → Cranelift IR`).
 //!
 //! Statement-level control flow becomes blocks and terminators:
@@ -46,8 +46,8 @@ use async_liveness::LirAsyncFrameLayout;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SourceProgram {
     pub functions: Vec<SourceFunction>,
-    /// Lambda bodies, lifted out of the expressions that contain them
-    /// (willow-0g8j.2.2). They are kept apart from `functions` because the LIR
+    /// Lambda bodies, lifted out of the expressions that contain them. They are kept apart
+    /// from `functions` because the LIR
     /// cannot name them: the backend assigns each lambda its `$lambda.N`
     /// symbol, so the pairing is by span and the name is filled in there.
     pub lambdas: Vec<SourceLambda>,
@@ -76,8 +76,8 @@ pub(crate) struct SourceFunction {
     /// Frame ownership belongs to LIR: this is computed from the final CFG,
     /// after synthetic locals and explicit suspension edges exist.
     pub async_frame: LirAsyncFrameLayout,
-    /// The captured environment this body is entered with, in slot order
-    /// (willow-0g8j.2.12). Empty for every function that is not a lifted
+    /// The captured environment this body is entered with, in slot order. Empty for every
+    /// function that is not a lifted
     /// capturing lambda. Each entry is also a `parameter` local, because the
     /// backend binds it at entry exactly like a parameter — the difference is
     /// only where the value comes from: environment word `i + 1` instead of an
@@ -237,8 +237,8 @@ pub(crate) struct SourceBlock {
     pub instrs: Vec<SourceInst>,
     pub terminator: SourceTerminator,
     /// Where a panic raised in this block can continue: the resume block of
-    /// every enclosing recovery-capable `defer` scope, innermost first
-    /// (willow-0g8j.2.11).
+    /// every enclosing recovery-capable `defer` scope, innermost first.
+    ///
     ///
     /// This edge exists in no terminator because a panic can leave from ANY
     /// point in the block — a call, an index, a division — and the cleanup CFG
@@ -284,15 +284,15 @@ pub enum SuspendOp {
         channel: LirLocalId,
         result: Option<LirLocalId>,
         elem_ty: Type,
-        /// `recv_opt()` (willow-jz15.44): `result` is `Option<elem_ty>` and a
+        /// `recv_opt()`: `result` is `Option<elem_ty>` and a
         /// closed, drained channel yields `None` instead of raising.
         closed_aware: bool,
     },
     SelectWait {
         operations: Vec<LirSelectWaitOp>,
     },
-    /// Acquire the critical section of a `lock`/`read`/`write` statement
-    /// (willow-0g8j.2.13).
+    /// Acquire the critical section of a `lock`/`read`/`write` statement.
+    ///
     ///
     /// A contended acquisition parks, so this is a suspension like any other —
     /// but unlike the rest it is a suspension the RESUME does not simply follow:
@@ -432,7 +432,7 @@ pub(crate) struct SourceDeferBody {
     pub recovery_capable: bool,
 }
 
-/// The frame-backed slots one critical section owns (willow-0g8j.2.13).
+/// The frame-backed slots one critical section owns.
 ///
 /// The same four locals appear at the acquisition, at every release, and on the
 /// scope that owns the section's panic cleanup, so they travel together: a
@@ -480,8 +480,8 @@ pub(crate) enum SourceInst {
         value: LirRvalue,
         span: Span,
     },
-    /// Open a lexical scope that owns `sites` defer registrations
-    /// (willow-0g8j.2.3).
+    /// Open a lexical scope that owns `sites` defer registrations.
+    ///
     ///
     /// `defer` is a LEXICAL construct — a defer in a loop body runs once per
     /// iteration — but the LIR is a flat block graph with no scopes of its
@@ -501,7 +501,7 @@ pub(crate) enum SourceInst {
         /// explicit continuation; synchronous scopes carry it when one of
         /// their defers can recover a panic.
         resume: Option<BlockId>,
-        /// Set when this scope IS a `lock` body (willow-0g8j.2.13). The scope
+        /// Set when this scope IS a `lock` body. The scope
         /// is what gives the critical section a panic cleanup block, so the
         /// section is identified here rather than at the acquisition: a
         /// consumer walks blocks in index order, which a suspension split can
@@ -516,7 +516,7 @@ pub(crate) enum SourceInst {
         sites: Vec<LirDeferId>,
     },
     /// Run the named registrations newest first, without changing lexical
-    /// scope metadata (willow-0g8j.2.3). Emitted immediately before a
+    /// scope metadata. Emitted immediately before a
     /// `return`, `break` or `continue` that leaves their scopes.
     FlushDefers {
         sites: Vec<LirDeferId>,
@@ -524,7 +524,7 @@ pub(crate) enum SourceInst {
         /// scope has no sites, so the sites alone cannot say where it stops.
         scopes: usize,
     },
-    /// The end of the lexical scope that declared `locals` (willow-0g8j.3.3).
+    /// The end of the lexical scope that declared `locals`.
     ///
     /// A GC-managed local gets ONE slot for the whole function and that slot is
     /// its root, so nothing stops a loop body's binding from keeping the last
@@ -544,7 +544,7 @@ pub(crate) enum SourceInst {
     ClearScopeRoots {
         locals: Vec<LirLocalId>,
     },
-    /// `defer` registration (willow-vynv.2). `span` is the `defer` statement's
+    /// `defer` registration. `span` is the `defer` statement's
     /// own span — the key its scope's cleanup flag is registered under, so it
     /// must match the entry in the enclosing `EnterDeferScope::sites`.
     Defer {
@@ -561,8 +561,8 @@ pub(crate) enum SourceInst {
         /// The type the name is bound with — the annotation when the source
         /// wrote one, otherwise `value.ty`. A consumer must size and type the
         /// variable's storage from this, because `let a: Animal = new Dog();`
-        /// binds `a` as the interface while the initialiser is the class
-        /// (willow-0g8j.5).
+        /// binds `a` as the interface while the initialiser is the class.
+        ///
         ty: Type,
         value: HirExpr,
     },
@@ -590,7 +590,7 @@ pub(crate) enum SourceInst {
         args: Vec<HirExpr>,
         /// The `super.init(...)` statement's own span. A zero-argument call has
         /// no expression to borrow a position from, and the emitted call still
-        /// needs one for its panic call-chain frame (willow-0g8j.2.18).
+        /// needs one for its panic call-chain frame.
         span: Span,
     },
     SelectInit {
@@ -613,7 +613,7 @@ pub(crate) enum SourceInst {
         success: LirLocalId,
     },
     /// Commit the protected value and release the critical section opened by a
-    /// [`SuspendOp::LockAcquire`] (willow-0g8j.2.13).
+    /// [`SuspendOp::LockAcquire`].
     ///
     /// Emitted on every exit that LEAVES the section under its own power:
     /// fallthrough off the end, and a `return`/`break`/`continue` that jumps
@@ -626,7 +626,7 @@ pub(crate) enum SourceInst {
     /// own. Running twice is harmless — the release is guarded by the handle
     /// slot, which it clears.
     ReleaseLock(LirLockSlots),
-    /// Does the scrutinee match one arm's pattern? (willow-0g8j.2.11.1)
+    /// Does the scrutinee match one arm's pattern?
     ///
     /// Emitted only when lowering has split a `match` into blocks because an
     /// arm suspends. Nonsuspending matches use the same explicit pattern
@@ -643,8 +643,8 @@ pub(crate) enum SourceInst {
         result: LirLocalId,
         span: Span,
     },
-    /// Bring one arm's pattern bindings into their own LIR locals
-    /// (willow-0g8j.2.11.1).
+    /// Bring one arm's pattern bindings into their own LIR locals.
+    ///
     ///
     /// `bindings` are positional: one local per binding the pattern names, in
     /// the order [`HirPattern`] lists them. They are LIR locals rather than
@@ -699,7 +699,7 @@ pub(crate) fn lower_source_program(program: &HirProgram) -> SourceProgram {
 
 /// `overflow_checks` is set for debug builds, whose checked integer
 /// arithmetic is a fault that leaf/recursive inlining must not move across a
-/// call-stack frame (willow-jz15.14).
+/// call-stack frame.
 pub(crate) fn lower_source_program_with(
     program: &HirProgram,
     overflow_checks: bool,
@@ -752,7 +752,7 @@ pub(crate) fn lower_source_program_with(
 }
 
 /// Lift every lambda in a statement body, innermost first, into its own block
-/// graph (willow-0g8j.2.2).
+/// graph.
 ///
 /// A lambda body is not part of the enclosing function's control flow — it is a
 /// separate function the backend compiles under its own symbol — so lowering it
@@ -1188,8 +1188,8 @@ fn lower_function(
 /// One enclosing loop, for the early exits that jump out of it: where `break`
 /// and `continue` go, and how much nesting they leave on the way. The two
 /// depths are what an early exit needs and a fallthrough does not: how many
-/// defer scopes to flush (willow-0g8j.2.3) and how many lexical scopes' GC
-/// roots to drop (willow-0g8j.3.3) — the ones opened inside the loop body, not
+/// defer scopes to flush and how many lexical scopes' GC
+/// roots to drop — the ones opened inside the loop body, not
 /// the ones that were already open when the loop started.
 #[derive(Debug, Clone, Copy)]
 struct LirLoopFrame {
@@ -1199,7 +1199,7 @@ struct LirLoopFrame {
     scope_depth: usize,
 }
 
-/// One open lexical scope, for the GC-root close at its end (willow-0g8j.3.3).
+/// One open lexical scope, for the GC-root close at its end.
 #[derive(Debug, Clone)]
 struct LirScopeMark {
     /// Where this scope's locals begin in [`Builder::locals`]. Locals are handed
@@ -1239,8 +1239,8 @@ struct Builder {
     /// Counter for synthesized `for` induction variables, unique per function
     /// so nested loops do not collide.
     for_counter: usize,
-    /// Innermost-first loop context for break/continue lowering
-    /// (willow-kzka).
+    /// Innermost-first loop context for break/continue lowering.
+    ///
     loop_stack: Vec<LirLoopFrame>,
     /// How many defer scopes are currently open. `return` flushes all of them.
     defer_depth: usize,
@@ -1249,7 +1249,7 @@ struct Builder {
     is_async: bool,
     suspend_counter: usize,
     locals: Vec<LirLocal>,
-    /// The currently open lexical scopes, outermost first (willow-0g8j.3.3).
+    /// The currently open lexical scopes, outermost first.
     scope_starts: Vec<LirScopeMark>,
     scope_roots: Vec<LirLocalId>,
     /// Flat rather than a scope stack, because HIR names are already unique
@@ -1304,7 +1304,7 @@ fn suspends_anywhere(expr: &HirExpr) -> bool {
 }
 
 /// The names a pattern binds, with the type each is bound at, in the order the
-/// emitter destructures them (willow-0g8j.2.11.1).
+/// emitter destructures them.
 ///
 /// A variant whose payloads are ALL `void` carries no word, so its bindings
 /// name values that do not exist. They are deliberately absent here: nothing
@@ -1568,7 +1568,7 @@ impl Builder {
     }
 
     /// A lifted lambda body, whose entry binds the captured environment before
-    /// the declared parameters (willow-0g8j.2.12).
+    /// the declared parameters.
     ///
     /// Captures come first because that is the order lowering bound them in,
     /// and they are `parameter` locals for the same reason a parameter is: the
@@ -1873,7 +1873,7 @@ impl Builder {
             // a `Suspend` would hand `SuspendOp::AwaitTask` a raw future
             // pointer to read frame slots out of, so this refuses the SPLIT and
             // leaves the await as an ordinary expression for the walker to emit
-            // as that call (willow-0g8j.3) — the function itself still compiles
+            // as that call — the function itself still compiles
             // from LIR. `await sleep(..)` / `await yield()` are not this case:
             // their type is `Future<void>` too, but they are recognised by
             // their CALL shape below and become real suspensions.
@@ -1987,7 +1987,7 @@ impl Builder {
 
         // Evaluated once, before any test. A suspension in the scrutinee itself
         // splits here, in front of the whole dispatch.
-        // The whole `match` is a scope of its own (willow-0g8j.3.3). The
+        // The whole `match` is a scope of its own. The
         // scrutinee is held in a temp that outlives every arm and that no source
         // scope declared, so — like a `for` loop's hoisted iterable — the
         // construct has to drop its root itself, at the merge every arm reaches.
@@ -2053,7 +2053,7 @@ impl Builder {
             self.switch_to(arm_block);
             // The arm is a scope, and its pattern bindings belong to it: they
             // are declared HERE, ahead of the body's own scope, so the body's
-            // close does not reach them (willow-0g8j.3.3).
+            // close does not reach them.
             let arm_scope = self.scope_starts.len();
             self.scope_starts.push(LirScopeMark::opening_at(
                 self.locals.len(),
@@ -2088,7 +2088,7 @@ impl Builder {
                     span: arm.span,
                 });
             }
-            // `pattern if guard` (willow-jz15.6): the guard sees the bindings.
+            // `pattern if guard`: the guard sees the bindings.
             // A false guard leaves the arm scope, dropping its roots exactly
             // as the body's fallthrough does, and tries the next arm.
             if let Some(guard) = &arm.guard {
@@ -2335,7 +2335,7 @@ impl Builder {
     }
 
     /// Evaluate one operand into a local of its own, splitting the suspension it
-    /// holds out of the expression that reads it (willow-0g8j.3).
+    /// holds out of the expression that reads it.
     ///
     /// `None` when the suspension sits somewhere no split reaches; the operand
     /// then keeps its suspension and the enclosing statement is refused as a
@@ -2360,7 +2360,7 @@ impl Builder {
 
     /// An operand of a statement that is ITSELF about to park: anything it
     /// suspends on runs first, in its own split, so the park that follows holds
-    /// no nested suspension (willow-0g8j.3). `done.send(work.recv())` parks on
+    /// no nested suspension. `done.send(work.recv())` parks on
     /// the recv and sends the value it resumed with.
     fn lower_operand_before_suspend(&mut self, operand: &HirExpr) -> Option<HirExpr> {
         if expression_needs_cfg(operand) {
@@ -2372,7 +2372,7 @@ impl Builder {
         self.lower_suspending_operand(operand)
     }
 
-    /// Split a suspension out of an assignment's operands (willow-0g8j.3).
+    /// Split a suspension out of an assignment's operands.
     ///
     /// `obj.field = await task;` and `xs[i] = await task;` park in the middle of
     /// a store, so their operands are ANF'd here the way a `let`'s initialiser
@@ -3372,8 +3372,8 @@ impl Builder {
     }
 
     /// Lower a statement list as a lexical scope: if it registers any `defer`,
-    /// bracket it with [`SourceInst::EnterDeferScope`]/[`SourceInst::LeaveDeferScope`]
-    /// (willow-0g8j.2.3).
+    /// bracket it with [`SourceInst::EnterDeferScope`]/[`SourceInst::LeaveDeferScope`].
+    ///
     ///
     /// Scopes without a `defer` get no markers at all because nothing would
     /// run at their exit.
@@ -3385,7 +3385,7 @@ impl Builder {
     /// IS the body of, and opens the scope even when the body registers no
     /// `defer` at all.
     ///
-    /// A `lock` body needs one regardless (willow-0g8j.2.13): the scope is what
+    /// A `lock` body needs one regardless: the scope is what
     /// gives the critical section a cleanup block, and a panic inside the
     /// section has to release the lock on its way out even when the section
     /// defers nothing.
@@ -3480,7 +3480,7 @@ impl Builder {
             // In the resume block, not before the jump: a recovered panic
             // branches straight here from wherever it was raised, so a clear on
             // the fallthrough path alone would leave the scope's roots standing
-            // on the recovery path (willow-0g8j.3.3). Both paths have run the
+            // on the recovery path. Both paths have run the
             // scope's `defer`s by the time they arrive, which is what the clear
             // has to come after — a deferred body may read the bindings.
             if recovers {
@@ -3533,8 +3533,8 @@ impl Builder {
         }
     }
 
-    /// Drop the GC roots of every lexical scope an early exit is about to leave
-    /// (willow-0g8j.3.3).
+    /// Drop the GC roots of every lexical scope an early exit is about to leave.
+    ///
     ///
     /// `break` and `continue` jump out without passing the fallthrough close,
     /// so the boundary that close marks has to be re-stated here — the same
@@ -3546,7 +3546,7 @@ impl Builder {
     }
 
     /// Flush every defer scope an early exit is about to leave, releasing the
-    /// critical section it leaves on the way out (willow-0g8j.2.13).
+    /// critical section it leaves on the way out.
     ///
     /// The release sits BETWEEN the two flushes rather than before or after
     /// both: the section's own `defer`s are part of the critical section and
@@ -3947,7 +3947,7 @@ impl Builder {
         }
     }
 
-    /// `lock <target> as [mut] <binding> { .. }` (willow-0g8j.2.13).
+    /// `lock <target> as [mut] <binding> { .. }`.
     ///
     /// The critical section becomes a suspension edge plus a forced defer
     /// scope:
@@ -4131,7 +4131,7 @@ impl Builder {
         let n = self.for_counter;
         self.for_counter += 1;
         let i_name = format!("__for{n}_i");
-        // The whole `for` construct is a scope of its own (willow-0g8j.3.3).
+        // The whole `for` construct is a scope of its own.
         // The desugaring hoists the iterable into a synthetic `let` that lives
         // as long as the loop does; nothing in the source scope holds it, so
         // without a close of its own that temp keeps the array — and everything
@@ -4172,7 +4172,7 @@ impl Builder {
         // Entry instructions, the loop-variable binding for the body, and the
         // header's upper bound. A range's bound is evaluated once up front; an
         // array's length is re-read on every header entry, so a `push`/`pop`
-        // inside the body changes how far the walk goes (willow-0g8j.4).
+        // inside the body changes how far the walk goes.
         let bound_expr: HirExpr;
         let element_binding: HirExpr;
         match (&iterable.kind, &iterable.ty) {
@@ -4242,7 +4242,7 @@ impl Builder {
             }
             // A range held as a VALUE (`let r = 0..3; for x in r`, or a call
             // that returns one) — for x in r  →  rng = r; i = rng.start;
-            // end = rng.end; while i < end { x = i; .. } (willow-0g8j.2.10).
+            // end = rng.end; while i < end { x = i; .. }.
             //
             // Both bounds are read once before the loop. A `Range<i64>` is
             // immutable, so re-reading them per iteration could only cost
@@ -4287,7 +4287,7 @@ impl Builder {
         let header = self.new_block();
         let body_block = self.new_block();
         // Dedicated increment block: `continue` jumps HERE so the induction
-        // variable still advances (willow-kzka).
+        // variable still advances.
         let inc_block = self.new_block();
         let exit = self.new_block();
 
@@ -4304,7 +4304,7 @@ impl Builder {
         // binding: lowering emits that `let` ahead of the body's own scope, and
         // flags it synthetic because it synthesized it from the iteration
         // protocol, but the binding is the source loop variable and its root
-        // ends with the iteration like any other (willow-0g8j.3.3).
+        // ends with the iteration like any other.
         let iteration = self.scope_starts.len();
         self.scope_starts.push(LirScopeMark::opening_at(
             self.locals.len(),
@@ -4542,7 +4542,7 @@ fn format_inst(inst: &SourceInst) -> String {
         } => {
             let kw = if *mutable { "let mut" } else { "let" };
             // Only an annotation that WIDENS the initialiser is printed — that
-            // is the case a reader cannot infer from the value (willow-0g8j.5).
+            // is the case a reader cannot infer from the value.
             if *ty == value.ty {
                 format!("{kw} {name} = {};", e(value))
             } else {
@@ -5401,7 +5401,7 @@ mod tests {
             SourceInst::Let { name, .. } if name == "i"
         ));
         // The increment lives in a dedicated block (the `continue` target,
-        // willow-kzka): body jumps to it, and it assigns the induction var.
+        // string-content comparison): body jumps to it, and it assigns the induction var.
         let SourceTerminator::Jump(inc) = body.terminator else {
             panic!("body must jump to the increment block");
         };
@@ -5844,7 +5844,7 @@ async fn f() -> i64 {
         assert_eq!(f.locals[return_local.0 as usize].name, return_name);
     }
 
-    /// The blocks a `match` arm's suspension is cut into (willow-0g8j.2.11.1).
+    /// The blocks a `match` arm's suspension is cut into.
     /// A `match` whose arms do not suspend stays a single `Expr`/`Assign`
     /// instruction, so every assertion here is also a check that the split is
     /// taken only when an arm needs it.
@@ -6139,7 +6139,7 @@ async fn f(which: i64) -> i64 {
     }
 
     // 37. a `lock` body and its continuation are emitted BEFORE the block
-    // that holds the `let` they read (willow-34su).
+    // that holds the `let` they read.
     //
     // This is the shape that made lazy binding at `SourceInst::Let` wrong: the
     // assignment in the section and the read after it both land in blocks of
@@ -6265,7 +6265,7 @@ async fn nested(a: Mutex<i64>, b: Mutex<i64>, c: Mutex<i64>) {{
 
     // 38. the same in a synchronous body: `if/else` lowers the merge block
     // before the `else` arm that jumps to it, so a block index has never been
-    // a position in an order control can flow in (willow-ht1h, willow-fvt4).
+    // a position in an order control can flow in.
     #[test]
     fn l38_if_else_merge_is_emitted_before_its_predecessor() {
         let p = lir("fn f(c: bool) -> i64 { if c { return 1; } else { print(2); } return 3; }");

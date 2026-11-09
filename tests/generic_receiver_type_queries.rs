@@ -1,5 +1,5 @@
 //! Member calls through generic receivers report receiver-instantiated callee
-//! types, and generic bodies never expose instantiation aliases (willow-25da.29.55).
+//! types, and generic bodies never expose instantiation aliases.
 use willow_compiler::{
     CompilerOptions, CompilerSession,
     ai::{QueryRequest, QuerySession, Snapshot},

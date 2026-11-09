@@ -1,8 +1,8 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Task-aware preemption analysis (E0810) across imported modules
-// (willow-0a6k.2). The analyzer previously ran only on the entry program, so a
+// Task-aware preemption analysis (E0810) across imported modules. The analyzer previously ran
+// only on the entry program, so a
 // looping synchronous helper called from an async fn *inside an imported
 // module* slipped through. These cover the per-module analysis, the resolved
 // module file in the diagnostic, transitive reachability inside a module, and

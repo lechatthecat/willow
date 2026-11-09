@@ -313,7 +313,7 @@ fn gc_region_01_runtime_old_allocations_expose_region_metadata() {
     let src = r#"
 import std::collections::Array;
 fn main() {
-    // Array literals start young (willow-jz15.94); two minor collections
+    // Array literals start young; two minor collections
     // tenure this one into an old region.
     let xs: Array<i64> = [];
     gc_minor_collect();
@@ -376,7 +376,7 @@ fn main() {
 
 #[test]
 fn gc_region_04_direct_young_root_relocates_without_pinned_region() {
-    // A rooted local's slot is rewritten (willow-9tls.9): the survivor is
+    // A rooted local's slot is rewritten: the survivor is
     // copied, and no pinned region is created for it.
     let src = r#"
 class Box {

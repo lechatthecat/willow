@@ -1,4 +1,4 @@
-//! One module, two spellings, one type (willow-uvlp).
+//! One module, two spellings, one type.
 //!
 //! A module is registered ONCE, under the spelling of whichever unit reached it
 //! first, and every other unit is free to write its own: `import sales as biz;`
@@ -13,7 +13,7 @@
 //!     (`expected market::Amount, found sales::Amount`), for annotations,
 //!     parameters, fields, bases and `implements` alike;
 //!   * an enum written under the exporting module's own alias escaped the
-//!     canonicalization willow-itcw gave enums, so one enum was two.
+//!     canonicalization enum canonicalization gave enums, so one enum was two.
 //!
 //! The fix keeps ONE registration per module and binds every other spelling to
 //! it: `alias_module_spelling` re-keys the same `ClassInfo`/`InterfaceInfo`/
@@ -256,7 +256,7 @@ fn main() { println(books::twice(ledger::make(6))); }
     );
 }
 
-// 6. The third shape. An enum has ONE identity build-wide (willow-itcw), but a
+// 6. The third shape. An enum has ONE identity build-wide, but a
 //    module that writes it under its own module alias exported `biz::Grade`,
 //    which the canonicalization never saw.
 #[test]
@@ -1158,7 +1158,7 @@ fn main() {
 //     annotation does: `new market::Amount(..)` in the entry was
 //     `error[E0844] unknown class market::Amount` whenever another unit reached
 //     the module first -- here by an item import, whose own subclass is
-//     constructed under both the module's and the entry's names (willow-mxnh).
+//     constructed under both the module's and the entry's names.
 #[test]
 fn mai_31_new_through_the_entrys_alias_over_an_item_imported_base() {
     assert_project(

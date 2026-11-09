@@ -1,5 +1,5 @@
-//! Inheritance, virtual dispatch and class downcast on the LIR-walking backend
-//! (willow-0g8j.2.4).
+//! Inheritance, virtual dispatch and class downcast on the LIR-walking backend.
+//!
 //!
 //! Before this change any class that took part in inheritance was outside the
 //! walker's subset, which took its instances, its base-typed slots, its arrays
@@ -17,7 +17,7 @@
 //!     object's `type_id` EXACTLY, so a descendant of the arm's class does not
 //!     match it.
 //!
-//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! Since the lowered-IR cutover a body outside the walker's subset is a compile error,
 //! so a run that prints the right answer is proof the walker produced it —
 //! the failure mode these tests exist to rule out is a walker that gets
 //! dispatch wrong, not one that quietly declines the body.
@@ -56,7 +56,7 @@ use super::support::{compile_with_compiler_env, compile_with_env_and_run};
 /// No extra compiler environment: the ordinary build.
 const PLAIN: [(&str, &str); 0] = [];
 
-/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// The build runs and prints `expected`. Since the lowered-IR cutover every body is
 /// compiled from lowered IR, so a body the walker cannot take is a compile
 /// error here rather than a second emitter's answer.
 #[track_caller]

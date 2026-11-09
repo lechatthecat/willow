@@ -1,6 +1,6 @@
 use super::*;
 
-// ── defer (willow-vynv.2, sync Phase 2) ─────────────────────────────────────
+// ── defer (deferred action checking, sync Phase 2) ─────────────────────────────────────
 // Scope-based (Zig-style, per-iteration in loops), LIFO, operands evaluated
 // at registration. Runs on: fallthrough, return, `?`, break, continue. Not
 // on panic (abort, no unwind). 20 perspectives: 1 runs at scope end, 2 LIFO
@@ -185,7 +185,7 @@ fn dfr_20_runs_before_unhandled_panic_finishes() {
     assert!(out.contains("runtime panic: stop"), "{out}");
 }
 
-// Review fixes on sync defer (willow-vynv.2): two silent-misbehavior holes
+// Review fixes on sync defer: two silent-misbehavior holes
 // closed as compile errors. 21 reference args would mutate the hidden
 // registration-time COPY, not the caller's variable; 22 an async callee
 // would only SPAWN a task at scope exit (cleanup body never driven);

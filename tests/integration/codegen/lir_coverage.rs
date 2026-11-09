@@ -48,7 +48,7 @@ fn lirreq_41_diagnostic_names_the_function() {
 fn lirreq_42_diagnostic_gives_the_reason() {
     let (_ok, stderr) = compile_with_compiler_env(LIR_MIXED_SOURCE, &PLAIN);
     // The reason names the construct that blocked it, not just that something
-    // did (willow-0g8j.2): the generic return type is outside the subset.
+    // did: the generic return type is outside the subset.
     assert!(
         stderr.contains("return type `Map<Map<String, i64>, i64>` is outside the walker's subset"),
         "diagnostic must say which construct blocked the walker: {stderr}"
@@ -106,7 +106,7 @@ fn lirreq_45_no_environment_setting_restores_a_fallback() {
 fn lirreq_46_scalar_map_keys_are_inside_the_subset() {
     // The counterexample to 40-42: an `f64` key crosses the runtime ABI as the
     // one word `MapKey::Int` holds, so it compiles, runs, and renders back as a
-    // float rather than as its bit pattern (willow-0g8j.3).
+    // float rather than as its bit pattern.
     assert_program_output(
         r#"
 import std::collections::Map;
@@ -169,7 +169,7 @@ async fn main() { work(1); }
 #[test]
 fn lirreq_48b_awaiting_async_bodies_are_lir_too() {
     // `await` used to be the construct that sent a poll body back to the
-    // cooperative AST emitter. Since willow-0g8j.3 there is nowhere to go: the
+    // cooperative AST emitter. Since the lowered-IR cutover there is nowhere to go: the
     // suspending body itself is walked, and says so.
     let (ok, stderr) = compile_with_compiler_env(
         r#"
@@ -202,8 +202,8 @@ fn lirreq_49_array_example_is_fully_lir() {
 
 #[test]
 fn lirreq_50_object_example_is_fully_lir() {
-    // Same contract for the class-object example (willow-0g8j.5), and here it
-    // covers the method side as well: since willow-0g8j.3 a class method has
+    // Same contract for the class-object example, and here it
+    // covers the method side as well: since the lowered-IR cutover a class method has
     // the same hard LIR requirement its free functions do.
     let source = include_str!("../../../example/lir_gc_objects.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
@@ -215,7 +215,7 @@ fn lirreq_50_object_example_is_fully_lir() {
 
 #[test]
 fn lirreq_51_collections_example_is_fully_lir() {
-    // Same contract for the collections example (willow-0g8j.7): its header
+    // Same contract for the collections example: its header
     // claims every function is compiled from the lowered IR.
     let source = include_str!("../../../example/lir_gc_collections.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);

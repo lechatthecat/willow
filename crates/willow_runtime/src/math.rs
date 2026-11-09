@@ -71,7 +71,7 @@ fn c_double_format(format: &[u8], value: f64, capacity: usize) -> String {
     }
 }
 
-/// `i64 ** i64` with a negative exponent (willow-n5yv.3). Integer
+/// `i64 ** i64` with a negative exponent. Integer
 /// exponentiation has no fractional result, so this is a language fault rather
 /// than a value: generated code checks the exponent's sign and calls this
 /// instead of running the multiplication loop. Raising (rather than aborting)

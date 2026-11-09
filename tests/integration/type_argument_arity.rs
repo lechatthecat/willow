@@ -1,18 +1,18 @@
-//! Type-argument arity of written types, end to end (willow-rlq9).
+//! Type-argument arity of written types, end to end.
 //!
 //! The checker-level perspectives live in
 //! `src/semantic/type_checker/type_arity_tests.rs`. What these add is the
 //! full pipeline: the shapes that used to pass the checker and die in code
 //! generation (`Option<i64, i64>`, `Foo<i64>`, `Bar<i64>`) now stop at the
 //! checker with a diagnostic and no "internal compiler error"; the bare
-//! spelling from the original report (willow-53hg) is rejected across a module
+//! spelling from the original report is rejected across a module
 //! boundary with a message that names the missing argument; and the
 //! module-qualified spellings resolve to the same rule.
 //!
 //! Perspectives:
 //!  1 `Option<i64, i64>` return: no ICE     2 `Result<i64>` return: no ICE
 //!  3 `Foo<i64>` on a plain class: no ICE   4 `Bar<i64>` unknown head: no ICE
-//!  5 willow-53hg: bare `Option` in a module fn
+//!  5 bare `Option` in a module fn
 //!  6 bare `m::Wrap` from the importer     7 `m::Wrap<i64, i64>` from the importer
 //!  8 bare `m::Conv` (generic interface)   9 `m::Color<i64>` on a plain module enum
 //! 10 private generic `m::Hidden<i64>` is E0419

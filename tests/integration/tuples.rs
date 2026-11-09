@@ -201,7 +201,7 @@ async fn main() { println(value()); println(await work()); }
     assert_eq!(out, "1\nsync\noldest\n9\nasync\n10\n");
 }
 
-// willow-jz15.57: the example enumerates twenty distinct signature/call
+// the example enumerates twenty distinct signature/call
 // perspectives. Check and execute the exact same project in both build modes.
 #[test]
 fn tuple_same_module_signatures_check_debug_release() {

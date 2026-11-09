@@ -1,4 +1,4 @@
-// task_sharing.wi — data-race-safe sharing across async tasks (willow-dgwo.4).
+// task_sharing.wi — data-race-safe sharing across async tasks.
 //
 // An `async fn` argument is captured into a Task that may run on another worker,
 // so it must be Send/Sync. A plain `Array<T>`/`Map<K,V>` or a class with such a

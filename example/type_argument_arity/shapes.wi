@@ -1,7 +1,7 @@
 // shapes.wi -- the generic and non-generic declarations the entry file names.
 //
 // Every type here is written in the entry file both as a parameter/return
-// type and, in comments, in the spellings the compiler rejects (willow-rlq9).
+// type and, in comments, in the spellings the compiler rejects.
 module shapes;
 
 // Declarations are judged once the whole module is registered, so this
@@ -48,7 +48,7 @@ pub class Doubler implements Conv<i64>, Labelled {
 }
 
 // A module function whose return type is a prelude generic. The original
-// report (willow-53hg) spelled this `-> Option` with no type argument; the
+// report spelled this `-> Option` with no type argument; the
 // compiler now rejects that spelling with a message naming the missing
 // argument instead of leaving `Some(n)` unresolvable.
 pub fn only_some(n: i64) -> Option<i64> {

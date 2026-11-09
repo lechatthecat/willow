@@ -368,7 +368,7 @@ fn direct_and_indirect_foreign_calls_are_rejected_under_mutex_lock() {
             !output.status.success(),
             "{name}: lock-held foreign call accepted"
         );
-        // Indirect forms call a waiting function value (willow-h4t7).
+        // Indirect forms call a waiting function value.
         assert!(error.contains("E2604"), "{name}: {error}");
     }
 }

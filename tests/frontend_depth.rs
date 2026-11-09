@@ -42,7 +42,7 @@ fn compiler_pipeline_deep_contexts_on_one_mib() {
         assert_eq!(String::from_utf8_lossy(&run.stdout),"7\n7\n7\n7\n");
     }).unwrap().join().unwrap();
 }
-/// `else if` ladders desugar to nested `if`s (willow-hg6e); a long ladder must
+/// `else if` ladders desugar to nested `if`s; a long ladder must
 /// compile through the whole pipeline on the same small stack.
 #[test]
 fn compiler_pipeline_else_if_ladder_on_one_mib() {

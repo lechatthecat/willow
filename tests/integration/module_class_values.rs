@@ -1,5 +1,5 @@
 //! Values of an imported module's class in a file that never imports the class
-//! itself, compiled from Lowered IR (willow-0g8j.2.19).
+//! itself, compiled from Lowered IR.
 //!
 //! `import geom;` names the module but not its `Point`. The type therefore
 //! cannot be WRITTEN in the entry file — no parameter annotation, no field
@@ -713,7 +713,7 @@ fn module_class_26_a_same_named_entry_class_does_not_reinterpret_a_module_value(
     // the module made is read through the MODULE's layout even though the entry
     // declares its own `Point`. Unifying the two once let `theirs.w` --
     // `String` in the entry, `i64` at offset 0 in the module -- compile, and the
-    // program dereferenced the integer 4 as a string pointer (willow-wdoz).
+    // program dereferenced the integer 4 as a string pointer.
     let files = geom_project(
         r#"
 import geom;

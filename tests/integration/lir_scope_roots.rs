@@ -1,4 +1,4 @@
-//! A lexical scope's GC roots end where the scope does (willow-0g8j.3.3).
+//! A lexical scope's GC roots end where the scope does.
 //!
 //! The LIR back end gives every GC-managed local ONE stack slot, allocated and
 //! rooted once at function entry: the lowered IR is a flat basic-block graph, so
@@ -80,7 +80,7 @@ const LABEL: &str = "class Label {
 }
 ";
 
-/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// The build runs and prints `expected`. Since the lowered-IR cutover every body is
 /// compiled from lowered IR, so a body the walker cannot take is a compile
 /// error here rather than a second emitter's answer.
 fn assert_project_output(source: &str, expected: &str) {
@@ -1196,7 +1196,7 @@ fn main() {{
     assert_eq!(out, "survivor\n");
 }
 
-// willow-8hq4.13: a source local held across one suspension must stop
+// a source local held across one suspension must stop
 // retaining its object after its last use, even before its lexical scope ends.
 #[test]
 fn async_last_use_releases_frame_root_before_next_await() {

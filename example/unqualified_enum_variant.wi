@@ -1,4 +1,4 @@
-// Unqualified enum variants — construction and patterns (willow-60o.1).
+// Unqualified enum variants — construction and patterns.
 //
 // When the expected type (or the match scrutinee) is the enum, a variant can be
 // used with its bare name (`Active(42)`, `Active(n) =>`) instead of the

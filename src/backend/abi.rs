@@ -452,8 +452,8 @@ mod tests {
 /// emitter reads it yet — `emit_runtime_call_with_cleanup` acts on `MAY_PANIC`
 /// and `NO_PREEMPT_REGION` only — which is exactly why it needs pinning: an
 /// understated row is invisible until the day the bit is wired into a rooting
-/// decision, and then it is a GC bug with no failing test behind it
-/// (willow-8hk7).
+/// decision, and then it is a GC bug with no failing test behind it.
+///
 ///
 /// Perspectives:
 ///

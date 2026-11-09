@@ -1,5 +1,5 @@
 // What the backend does when it is handed an impossible state
-// (willow-uqzx, catalog item 14).
+// (shared compiler infrastructure, catalog item 14).
 //
 // Every construct below reaches a place in the Cranelift backend that has to
 // look something up: a Map method name, an interface vtable slot, a class
