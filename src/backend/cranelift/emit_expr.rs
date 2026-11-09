@@ -111,7 +111,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         msg: cranelift_codegen::ir::Value,
         span: crate::diagnostics::Span,
     ) -> cranelift_codegen::ir::Value {
-        if self.coop_frame.is_some() {
+        if self.suspension.coop_frame.is_some() {
             let result = self
                 .builder
                 .ins()
@@ -119,12 +119,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_language_panic(msg, Some(span));
             return result;
         }
-        if !self.is_async {
+        if !self.locals.is_async {
             // Build file metadata while the message is rooted: creating the
             // file String may collect before the runtime has taken ownership
             // of either argument.
             let msg_root = self.emit_push_relocatable_root(msg);
-            let source_file = self.source_file.to_string();
+            let source_file = self.diagnostics.source_file.to_string();
             let file_ptr = self.emit_string_literal(&source_file);
             let msg = self.emit_reload_root(msg_root, msg);
             let line = self.builder.ins().iconst(types::I64, span.line as i64);
@@ -141,12 +141,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 &[msg, file_ptr, line, col],
                 |this| {
                     this.emit_pop_roots_n(1);
-                    this.gc_root_count -= 1;
+                    this.roots.gc_root_count -= 1;
                 },
             );
             // `willow_panic_raise` must always increase panic depth.
             self.builder.ins().trap(TrapCode::unwrap_user(1));
-            self.terminated = true;
+            self.locals.terminated = true;
             return result;
         }
 
@@ -159,7 +159,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// without touching panic state (willow-s9ej.3).
     pub(super) fn emit_recover_call(&mut self) -> cranelift_codegen::ir::Value {
         let panic_info_ty = Type::Named("PanicInfo".to_string().into());
-        if self.recover_eligible_depth == 0 {
+        if self.cleanup.recover_eligible_depth == 0 {
             return self.emit_alloc_option_none(&panic_info_ty);
         }
 
@@ -205,7 +205,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     pub(super) fn emit_debug_reference_call_scope_push(&mut self) {
-        if self.build_mode != BuildMode::Debug {
+        if self.diagnostics.build_mode != BuildMode::Debug {
             return;
         }
         let push_id = self.func_id("willow_debug_reference_call_scope_push");
@@ -214,7 +214,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     pub(super) fn emit_debug_reference_call_clear(&mut self) {
-        if self.build_mode != BuildMode::Debug {
+        if self.diagnostics.build_mode != BuildMode::Debug {
             return;
         }
         self.emit_void_runtime_call("willow_debug_reference_call_clear", &[]);
@@ -280,7 +280,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(panic_block);
         self.builder.seal_block(panic_block);
         let kind = self.builder.block_params(panic_block)[0];
-        let source_file = self.source_file.to_string();
+        let source_file = self.diagnostics.source_file.to_string();
         let file_ptr = self.emit_string_literal(&source_file);
         let line_val = self.builder.ins().iconst(types::I32, span.line as i64);
         let col_val = self.builder.ins().iconst(types::I32, span.col as i64);
@@ -297,7 +297,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// overflow: debug builds raise a recoverable panic, release builds wrap
     /// (willow-jz15.14).
     pub(super) fn overflow_checks(&self) -> bool {
-        self.build_mode == BuildMode::Debug
+        self.diagnostics.build_mode == BuildMode::Debug
     }
 
     /// Signed `+`, `-` or `*` and its overflow flag. Shared by the debug
@@ -394,7 +394,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.seal_block(panic_block);
         self.builder.set_cold_block(panic_block);
         let kind = self.builder.ins().iconst(types::I64, kind);
-        let source_file = self.source_file.to_string();
+        let source_file = self.diagnostics.source_file.to_string();
         let file_ptr = self.emit_string_literal(&source_file);
         let line_val = self.builder.ins().iconst(types::I32, span.line as i64);
         let col_val = self.builder.ins().iconst(types::I32, span.col as i64);
@@ -423,15 +423,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_caller_frame(&mut self, span: crate::diagnostics::Span, runtime: &str) -> bool {
-        if self.build_mode != BuildMode::Debug {
+        if self.diagnostics.build_mode != BuildMode::Debug {
             return false;
         }
         let Some((name_ptr, name_len)) =
-            self.emit_static_str_bytes(&self.diagnostic_function.clone())
+            self.emit_static_str_bytes(&self.diagnostics.diagnostic_function.clone())
         else {
             return false;
         };
-        let file = self.source_file.to_string();
+        let file = self.diagnostics.source_file.to_string();
         let Some((file_ptr, file_len)) = self.emit_static_str_bytes(&file) else {
             return false;
         };
@@ -443,24 +443,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             push_ref,
             &[name_ptr, name_len, file_ptr, file_len, line, col],
         );
-        self.callstack_frame_depth += 1;
+        self.diagnostics.callstack_frame_depth += 1;
         true
     }
 
     /// Debug builds: pop the most recent call-chain frame after a call returns.
     pub(super) fn emit_callstack_unwind_edge(&mut self) {
-        for _ in 0..self.lir_reference_scopes.len() {
+        for _ in 0..self.diagnostics.lir_reference_scopes.len() {
             self.emit_debug_reference_call_clear();
         }
-        let depth = self.callstack_frame_depth;
+        let depth = self.diagnostics.callstack_frame_depth;
         for _ in 0..depth {
             self.emit_callstack_pop();
         }
-        self.callstack_frame_depth = depth;
+        self.diagnostics.callstack_frame_depth = depth;
     }
 
     pub(super) fn emit_callstack_pop(&mut self) {
-        self.callstack_frame_depth = self
+        self.diagnostics.callstack_frame_depth = self
+            .diagnostics
             .callstack_frame_depth
             .checked_sub(1)
             .expect("compiler call-stack frame underflow");
@@ -468,7 +469,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     pub(super) fn emit_replay_reference_scopes(&mut self) {
-        for scope in self.lir_reference_scopes.clone() {
+        for scope in self.diagnostics.lir_reference_scopes.clone() {
             self.emit_debug_reference_call_scope_push();
             for record in scope {
                 self.emit_flat_reference_debug(&record.argument, &record.callee, record.index);

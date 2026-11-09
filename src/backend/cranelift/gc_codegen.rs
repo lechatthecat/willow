@@ -604,7 +604,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) {
         if self.is_inline_pair(value_ty)
             && destination == GcStoreDestination::AsyncFrameSlot
-            && self.coop_result_offset == Some(offset)
+            && self.suspension.coop_result_offset == Some(offset)
         {
             // The runtime task-id word remains at data slot 1. Pair results
             // reserve data slot 2 for their payload, leaving this shared ABI intact.

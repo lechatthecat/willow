@@ -82,7 +82,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.switch_to_block(done);
             self.builder.seal_block(done);
             self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
+            self.roots.gc_root_count -= 1;
             return self.builder.ins().iconst(types::I64, 0);
         }
         let array = self.emit_lir_operand(function, array);
@@ -214,6 +214,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // A scalar store leaves the header alone, so reads and stores share
         // the facts of the current GC-free run (willow-ijui.10).
         let known = self
+            .reuse
             .lir_reuse
             .as_ref()
             .and_then(|reuse| reuse.arrays.get(&array).copied());
@@ -248,6 +249,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // The length is not negative, so an unsigned comparison also
             // rejects negative indexes.
             let bounded = self
+                .reuse
                 .lir_reuse
                 .as_ref()
                 .is_some_and(|reuse| reuse.bound == Some((index, facts.len)));
@@ -293,7 +295,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             facts.len
         };
-        if let Some(reuse) = &mut self.lir_reuse {
+        if let Some(reuse) = &mut self.reuse.lir_reuse {
             reuse.arrays.insert(array, facts);
         }
         // The fast path is `done`'s only predecessor, so `result` dominates it.
@@ -303,7 +305,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(slow);
         self.builder.seal_block(slow);
         let params = self.builder.block_params(slow).to_vec();
-        let spill = *self.array_fault_spill.get_or_insert_with(|| {
+        let spill = *self.reuse.array_fault_spill.get_or_insert_with(|| {
             self.builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
                 3 * 8,
@@ -336,10 +338,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
         self.emit_runtime_call_late_args(name, reload, |_| {});
         // The runtime raised, so the panic check above has already diverged.
-        if !self.terminated {
+        if !self.locals.terminated {
             self.builder.ins().trap(TrapCode::unwrap_user(1));
         }
-        self.terminated = false;
+        self.locals.terminated = false;
         self.builder.switch_to_block(done);
         self.builder.seal_block(done);
         result
@@ -435,7 +437,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mask = self.builder.ins().iconst(types::I64, -1);
         self.emit_void_runtime_call("willow_array_resize", &[array, length, mask]);
         self.emit_pop_roots_n(1);
-        self.gc_root_count -= 1;
+        self.roots.gc_root_count -= 1;
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);
         self.builder.seal_block(done);
@@ -621,7 +623,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         if roots > 0 {
             self.emit_pop_roots_n(roots);
-            self.gc_root_count -= roots;
+            self.roots.gc_root_count -= roots;
         }
         self.emit_post_willow_call_panic_check(panic_depth);
         self.builder.ins().iconst(types::I64, 0)

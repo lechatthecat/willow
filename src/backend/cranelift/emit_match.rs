@@ -66,7 +66,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let value = self.stack_load(types::I128, root);
             self.emit_gc_heap_store(ptr, 0, value, ty, GcStoreDestination::InterfaceObject);
             self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
+            self.roots.gc_root_count -= 1;
             return ptr;
         }
         if super::option_repr::is_scalar_pair(ty) {
@@ -155,10 +155,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// the function's GC roots first (we leave the function on both paths).
     /// See willow-exg.
     pub(super) fn emit_main_result_exit(&mut self, result_ptr: cranelift_codegen::ir::Value) {
-        if self.gc_root_count > 0 {
-            self.emit_pop_roots_n(self.gc_root_count);
+        if self.roots.gc_root_count > 0 {
+            self.emit_pop_roots_n(self.roots.gc_root_count);
         }
-        let err_is_string = self.main_result_err_ty.as_ref() == Some(&Type::String);
+        let err_is_string = self.locals.main_result_err_ty.as_ref() == Some(&Type::String);
 
         let fail_id = self.func_id("willow_main_fail");
         emit_main_result_exit_raw(

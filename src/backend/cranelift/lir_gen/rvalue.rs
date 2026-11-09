@@ -237,7 +237,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         match value {
             LirRvalue::BeginReferenceCall => {
                 self.emit_debug_reference_call_scope_push();
-                self.lir_reference_scopes.push(Vec::new());
+                self.diagnostics.lir_reference_scopes.push(Vec::new());
                 self.builder.ins().iconst(types::I8, 0)
             }
             LirRvalue::ReferenceDebug {
@@ -246,7 +246,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 index,
             } => {
                 self.emit_flat_reference_debug(argument, callee, *index);
-                self.lir_reference_scopes
+                self.diagnostics
+                    .lir_reference_scopes
                     .last_mut()
                     .expect("prepared reference scope")
                     .push(FlatReferenceDebug {
@@ -263,7 +264,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let (args, roots) = self.emit_flat_call_operands(function, args);
                 let result = self.emit_flat_start_task(*callee, &args, span);
                 self.emit_pop_roots_n(roots);
-                self.gc_root_count -= roots;
+                self.roots.gc_root_count -= roots;
                 if has_references {
                     self.emit_flat_reference_call_end();
                 }
@@ -289,7 +290,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let receiver =
                     self.emit_flat_prepare_method(receiver, receiver_ty, method, span, true);
                 if self.flat_method_frame_enabled(method) {
-                    self.lir_call_frames.push((method.clone(), span));
+                    self.diagnostics
+                        .lir_call_frames
+                        .push((method.clone(), span));
                 }
                 receiver
             }
@@ -303,7 +306,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 ..
             } => {
                 if self.flat_method_frame_enabled(method) {
-                    let (prepared, _) = self.lir_call_frames.pop().expect("prepared method frame");
+                    let (prepared, _) = self
+                        .diagnostics
+                        .lir_call_frames
+                        .pop()
+                        .expect("prepared method frame");
                     assert_eq!(prepared, *method);
                 }
                 // PrepareMethod snapshots the receiver before evaluating arguments.
@@ -312,7 +319,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Heap-frame fields and borrowed storage do not pin an SSA alias.
                 let receiver_rooted = match receiver {
                     crate::ir::lowered::LirOperand::Local(id) => matches!(
-                        self.vars.get(&function.locals[id.0 as usize].name),
+                        self.locals.vars.get(&function.locals[id.0 as usize].name),
                         Some(VarStorage::Stack { ty, .. })
                             if is_gc_managed(ty, self.enum_infos)
                     ),
@@ -345,7 +352,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     )
                 };
                 self.emit_pop_roots_n(roots);
-                self.gc_root_count -= roots;
+                self.roots.gc_root_count -= roots;
                 result
             }
             LirRvalue::Coerce {
@@ -415,10 +422,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     result,
                     span,
                 );
-                if !self.terminated {
+                if !self.locals.terminated {
                     self.emit_pop_roots_n(roots);
                 }
-                self.gc_root_count -= roots;
+                self.roots.gc_root_count -= roots;
                 result
             }
             LirRvalue::EnumAlloc {
@@ -492,7 +499,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     if callee.is_free_named("$contract_check") {
                         args[0] = self.builder.ins().uextend(types::I64, args[0]);
                     }
-                    let file = self.emit_string_literal(self.source_file);
+                    let file = self.emit_string_literal(self.diagnostics.source_file);
                     let line = self.builder.ins().iconst(types::I32, span.line as i64);
                     let col = self.builder.ins().iconst(types::I32, span.col as i64);
                     args.extend([file, line, col]);
@@ -536,7 +543,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 };
                 let converted = self.emit_into_conversion(value, &class.to_string());
                 self.emit_pop_roots_n(1);
-                self.gc_root_count -= 1;
+                self.roots.gc_root_count -= 1;
                 self.emit_post_willow_call_panic_check(panic_depth);
                 converted
             }
@@ -672,7 +679,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_flat_reference_call_end();
                 }
                 self.emit_pop_roots_n(roots);
-                self.gc_root_count -= roots;
+                self.roots.gc_root_count -= roots;
                 self.emit_post_willow_call_panic_check(panic_depth);
                 result
             }
@@ -769,7 +776,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // zero nor the overflow guard.
                 let unguarded_divisor = matches!(rhs, crate::ir::lowered::LirOperand::Int(divisor) if *divisor != 0 && *divisor != -1);
                 let nonnegative_lhs =
-                    *operand_ty == Type::I64 && self.lir_nonnegative.contains(lhs);
+                    *operand_ty == Type::I64 && self.reuse.lir_nonnegative.contains(lhs);
                 let unsigned_rem = if nonnegative_lhs && matches!(op, BinOp::Rem) {
                     match rhs {
                         crate::ir::lowered::LirOperand::Int(n) if *n > 0 => Some(*n as u64),
@@ -796,7 +803,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let raw = self
                         .emit_runtime_call_with_cleanup(name, &[lhs, rhs], |this| {
                             this.emit_pop_roots_n(2);
-                            this.gc_root_count -= 2;
+                            this.roots.gc_root_count -= 2;
                         })
                         .expect("string runtime operation returns a value");
                     return match op {
@@ -852,7 +859,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                 } else if nonnegative_lhs && matches!(op, BinOp::Lt) {
                     let test = self.builder.ins().icmp(IntCC::SignedLessThan, lhs, rhs);
-                    if let Some(reuse) = &mut self.lir_reuse {
+                    if let Some(reuse) = &mut self.reuse.lir_reuse {
                         reuse.comparison = Some((test, lhs, rhs));
                     }
                     test
@@ -1134,7 +1141,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let handle = self.emit_value_runtime_call(&runtime, &[word, flag]);
             if is_ref {
                 self.emit_pop_roots_n(1);
-                self.gc_root_count -= 1;
+                self.roots.gc_root_count -= 1;
             }
             return handle;
         }
@@ -1152,7 +1159,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .emit_runtime_call_with_cleanup(entry.runtime, &arg_vals, |this| {
                     if arg_roots > 0 {
                         this.emit_pop_roots_n(arg_roots);
-                        this.gc_root_count -= arg_roots;
+                        this.roots.gc_root_count -= arg_roots;
                     }
                 })
                 .expect("every builtin namespace entry returns a value");
@@ -1198,7 +1205,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             if arg_roots > 0 {
                 self.emit_pop_roots_n(arg_roots);
-                self.gc_root_count -= arg_roots;
+                self.roots.gc_root_count -= arg_roots;
             }
             self.emit_post_willow_call_panic_check(panic_depth);
             return result;
@@ -1241,7 +1248,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         if arg_roots > 0 {
             self.emit_pop_roots_n(arg_roots);
-            self.gc_root_count -= arg_roots;
+            self.roots.gc_root_count -= arg_roots;
         }
         self.emit_post_willow_call_panic_check(panic_depth);
         result
@@ -1374,7 +1381,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let roots = slots.iter().flatten().count();
         if roots > 0 {
             self.emit_pop_roots_n(roots);
-            self.gc_root_count -= roots;
+            self.roots.gc_root_count -= roots;
         }
         ptr
     }
@@ -1434,7 +1441,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let layout = self.enum_payload_layout(class, variant, enum_ty);
         // No GC point sits between these roots and the store below.
-        let before = self.gc_root_count;
+        let before = self.roots.gc_root_count;
         if layout.is_heap {
             self.emit_push_relocatable_root(object);
         }
@@ -1457,8 +1464,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             );
             object
         };
-        self.emit_pop_roots_n(self.gc_root_count - before);
-        self.gc_root_count = before;
+        self.emit_pop_roots_n(self.roots.gc_root_count - before);
+        self.roots.gc_root_count = before;
         result
     }
 }

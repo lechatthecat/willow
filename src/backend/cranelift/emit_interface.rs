@@ -378,7 +378,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(nil_block);
         self.builder.seal_block(nil_block);
 
-        let source_file = self.source_file.to_string();
+        let source_file = self.diagnostics.source_file.to_string();
         let context_owned = context.to_string();
         let file_ptr = self.emit_string_literal(&source_file);
         let ctx_ptr = self.emit_string_literal(&context_owned);

@@ -136,7 +136,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Cleanup may allocate a deferred channel-wake job. Keep the
                 // chosen wrapper relocatable across all arm cleanups, without
                 // rescanning the case list after each safepoint.
-                let roots_before = self.gc_root_count;
+                let roots_before = self.roots.gc_root_count;
                 let winner_root = self.emit_push_relocatable_root(winner_raw);
                 let receive_only = !operations
                     .iter()
@@ -191,8 +191,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         LirSelectOp::Timeout { .. } | LirSelectOp::Default => {}
                     }
                 }
-                self.emit_pop_roots_n(self.gc_root_count - roots_before);
-                self.gc_root_count = roots_before;
+                self.emit_pop_roots_n(self.roots.gc_root_count - roots_before);
+                self.roots.gc_root_count = roots_before;
             }
             LirInst::SelectCommit { operation, success } => {
                 let mut committed = true;
@@ -222,7 +222,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             "willow_channel_try_send_{}",
                             channel_runtime_suffix(elem_ty)
                         );
-                        let before = self.gc_root_count;
+                        let before = self.roots.gc_root_count;
                         let (channel, value) = if self.is_inline_pair(elem_ty) {
                             let channel_root = self.emit_push_relocatable_root(channel);
                             let word = self.emit_to_storage_word(value, elem_ty);
@@ -232,8 +232,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             (channel, value)
                         };
                         let sent = self.emit_value_runtime_call(&runtime, &[channel, value]);
-                        self.emit_pop_roots_n(self.gc_root_count - before);
-                        self.gc_root_count = before;
+                        self.emit_pop_roots_n(self.roots.gc_root_count - before);
+                        self.roots.gc_root_count = before;
                         let sent = self.builder.ins().icmp_imm_s(IntCC::NotEqual, sent, 0);
                         let one = self.builder.ins().iconst(types::I8, 1);
                         let zero = self.builder.ins().iconst(types::I8, 0);
@@ -285,7 +285,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) {
         match operation {
             SuspendOp::Sleep { millis } => {
-                let deadline_slot = self.lir_frame_offsets[millis];
+                let deadline_slot = self.suspension.lir_frame_offsets[millis];
                 let millis = self.load_lir_local(function, *millis);
                 self.emit_coop_sleep_value(millis, deadline_slot, suspends, frame);
             }
@@ -313,7 +313,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 result_ty,
                 cancel_aware,
             } => {
-                self.emit_coop_frame_await(self.lir_frame_offsets[task], suspends, frame);
+                self.emit_coop_frame_await(
+                    self.suspension.lir_frame_offsets[task],
+                    suspends,
+                    frame,
+                );
                 let task_frame = self.load_lir_local(function, *task);
                 if let Some(result) = result {
                     let value = self
@@ -362,7 +366,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 value,
                 elem_ty,
             } => {
-                let scratch = self.lir_send_offsets.get(value).copied();
+                let scratch = self.suspension.lir_send_offsets.get(value).copied();
                 if let Some(offset) = scratch {
                     let raw = self.load_lir_local(function, *value);
                     let from_ty = &function.locals[value.0 as usize].ty;
@@ -485,14 +489,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         defers: &mut LirBlockDeferCtx<'_>,
     ) {
         if let Some((poll, in_loop)) = sync_poll
-            && (self.lir_cleanup_exit.is_none() || block.id.0 != 0)
+            && (self.cleanup.lir_cleanup_exit.is_none() || block.id.0 != 0)
         {
             // Native stacks preserve SSA values and roots across this hook;
             // function entry and cycle headers cover recursion and loops.
             self.emit_sync_safepoint(poll, in_loop);
         }
         for (inst_index, inst) in block.instrs.iter().enumerate() {
-            if self.terminated {
+            if self.locals.terminated {
                 continue;
             }
             // Debug builds report runtime-raised faults (array bounds, a
@@ -500,15 +504,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // LIR path must publish its own site too. Without this the fault
             // would inherit the caller's statement.
             if let Some(span) = lir_inst_span(inst) {
-                self.fault_site_span = Some(span);
+                self.diagnostics.fault_site_span = Some(span);
             }
             // A GC point ends the run of reusable loads.
             if coop.is_some()
                 || !crate::backend::cranelift::transient_roots::gc_free(function, inst)
             {
-                self.lir_reuse = None;
-            } else if self.lir_reuse.is_none() {
-                self.lir_reuse = Some(Default::default());
+                self.reuse.lir_reuse = None;
+            } else if self.reuse.lir_reuse.is_none() {
+                self.reuse.lir_reuse = Some(Default::default());
             }
             match inst {
                 LirInst::Compute { local, value, span } => {
@@ -520,7 +524,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         continue;
                     }
                     let result = self.emit_lir_rvalue(function, value, *span);
-                    if !self.terminated
+                    if !self.locals.terminated
                         && (function.locals[local.0 as usize].is_gc_owner()
                             || !matches!(
                                 function.locals[local.0 as usize].ty,
@@ -537,8 +541,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         unreachable!()
                     };
                     let scope = &mut defers.bindings.scopes[id.0];
-                    scope.call_frames_at_entry = self.lir_call_frames.clone();
-                    scope.reference_scopes_at_entry = self.lir_reference_scopes.clone();
+                    scope.call_frames_at_entry = self.diagnostics.lir_call_frames.clone();
+                    scope.reference_scopes_at_entry = self.diagnostics.lir_reference_scopes.clone();
                     if let crate::backend::cranelift::RootDepth::Variable(var) =
                         scope.root_depth_at_entry
                     {
@@ -546,7 +550,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.builder.def_var(var, depth);
                         for (site, _) in sites {
                             let zero = self.builder.ins().iconst(types::I64, 0);
-                            self.stack_store(zero, self.sync_defer_flags[site]);
+                            self.stack_store(zero, self.cleanup.sync_defer_flags[site]);
                         }
                     }
                     self.install_lir_cleanup(defers.bindings.state(state));
@@ -559,17 +563,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     else {
                         unreachable!()
                     };
-                    if let Some(frame) = self.coop_frame.filter(|_| coop.is_some()) {
+                    if let Some(frame) = self.suspension.coop_frame.filter(|_| coop.is_some()) {
                         let one = self.builder.ins().iconst(types::I64, 1);
                         self.builder.ins().store(
                             MemFlagsData::new(),
                             one,
                             frame,
-                            self.lir_defer_offsets[&id],
+                            self.suspension.lir_defer_offsets[&id],
                         );
                     } else {
                         let one = self.builder.ins().iconst(types::I64, 1);
-                        self.stack_store(one, self.sync_defer_flags[&id]);
+                        self.stack_store(one, self.cleanup.sync_defer_flags[&id]);
                     }
                     self.install_lir_cleanup(defers.bindings.state(state));
                 }
@@ -587,12 +591,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             defers.bindings,
                         );
                     }
-                    if coop.is_none() && !self.terminated {
-                        let roots = self.gc_root_count - defers.bindings.roots;
+                    if coop.is_none() && !self.locals.terminated {
+                        let roots = self.roots.gc_root_count - defers.bindings.roots;
                         if roots > 0 {
                             self.emit_pop_roots_n(roots);
                         }
-                        self.gc_root_count = defers.bindings.roots;
+                        self.roots.gc_root_count = defers.bindings.roots;
                     }
                     self.install_lir_cleanup(defers.bindings.state(after));
                 }
@@ -668,7 +672,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 | LirInst::SelectCommit { .. } => self.emit_lir_select_instruction(function, inst),
             }
         }
-        if self.terminated {
+        if self.locals.terminated {
             return;
         }
         match &block.terminator {
@@ -681,7 +685,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 else_block,
             } => {
                 let c = self.emit_lir_operand(function, cond);
-                if let Some(reuse) = &mut self.lir_reuse {
+                if let Some(reuse) = &mut self.reuse.lir_reuse {
                     reuse.branch_bound = reuse.comparison.take().and_then(|(test, index, len)| {
                         (test == c).then_some((then_block.0, index, len))
                     });
@@ -710,12 +714,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             Terminator::CleanupReturn => {
                 let (exit, roots, _) = self
+                    .cleanup
                     .lir_cleanup_exit
                     .expect("cleanup terminator outside cleanup region");
-                self.emit_pop_roots_n(self.gc_root_count - roots);
+                self.emit_pop_roots_n(self.roots.gc_root_count - roots);
                 self.builder.ins().jump(exit, &[]);
-                self.lir_cleanup_exit.as_mut().unwrap().2 = true;
-                self.terminated = true;
+                self.cleanup.lir_cleanup_exit.as_mut().unwrap().2 = true;
+                self.locals.terminated = true;
             }
             Terminator::Return(v) => {
                 self.emit_lir_operand_return(function, v.as_ref(), return_type);
@@ -754,15 +759,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .iter()
             .map(|member| crate::backend::cranelift::LockGroupMember {
                 mode: member.mode,
-                handle_offset: self.lir_frame_offsets[&member.handle],
-                value_offset: self.lir_frame_offsets[&member.binding],
+                handle_offset: self.suspension.lir_frame_offsets[&member.handle],
+                value_offset: self.suspension.lir_frame_offsets[&member.binding],
                 value_ty: member.value_ty.clone(),
             })
             .collect()
     }
 
     pub(super) fn lir_lock_offsets(&self, slots: &LirLockSlots) -> [i32; 4] {
-        slots.locals().map(|local| self.lir_frame_offsets[&local])
+        slots
+            .locals()
+            .map(|local| self.suspension.lir_frame_offsets[&local])
     }
 
     fn emit_lir_shared_normal_cleanup(
@@ -773,7 +780,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) {
         // Active reference/call preparations carry per-site diagnostic values.
         // Their cleanup remains local rather than merging distinct protocols.
-        if !self.lir_call_frames.is_empty() || !self.lir_reference_scopes.is_empty() {
+        if !self.diagnostics.lir_call_frames.is_empty()
+            || !self.diagnostics.lir_reference_scopes.is_empty()
+        {
             self.emit_flush_defers_from(depth);
             return;
         }
@@ -784,27 +793,27 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // longer dominates the switch at the end of the shared region, so the
         // sharing is only sound while every edge into the flush comes from the
         // flush's own entry.
-        if self.async_frame.is_some() {
+        if self.suspension.async_frame.is_some() {
             self.emit_flush_defers_from(depth);
             return;
         }
         let key = NormalCleanupKey {
             region,
-            entries: self.defer_stack.identity,
+            entries: self.cleanup.defer_stack.identity,
             depth,
-            roots: self.gc_root_count,
-            panic_target: self.panic_scopes.last().map(|scope| scope.cleanup),
-            panic_depth: self.panic_defer_codegen_depth,
-            recover_depth: self.recover_eligible_depth,
-            call_depth: self.callstack_frame_depth,
-            native_active: self.sync_native_active.is_some(),
+            roots: self.roots.gc_root_count,
+            panic_target: self.cleanup.panic_scopes.last().map(|scope| scope.cleanup),
+            panic_depth: self.cleanup.panic_defer_codegen_depth,
+            recover_depth: self.cleanup.recover_eligible_depth,
+            call_depth: self.diagnostics.callstack_frame_depth,
+            native_active: self.cleanup.sync_native_active.is_some(),
         };
         let (entry, index) = if let Some(cleanup) = ledger.normal.get(&key) {
             (cleanup.entry, cleanup.continuations.len())
         } else {
             let entry = self.builder.create_block();
             self.builder.append_block_param(entry, types::I32);
-            if let Some(active) = self.sync_native_active {
+            if let Some(active) = self.cleanup.sync_native_active {
                 self.builder
                     .append_block_param(entry, self.builder.func.dfg.value_type(active));
             }
@@ -812,20 +821,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
         let selector = self.builder.ins().iconst(types::I32, index as i64);
         let mut args = vec![selector.into()];
-        if let Some(active) = self.sync_native_active {
+        if let Some(active) = self.cleanup.sync_native_active {
             args.push(active.into());
         }
         self.builder.ins().jump(entry, &args);
         if !ledger.normal.contains_key(&key) {
             self.builder.switch_to_block(entry);
             let selector = self.builder.block_params(entry)[0];
-            let before_active = self.sync_native_active;
+            let before_active = self.cleanup.sync_native_active;
             if before_active.is_some() {
-                self.sync_native_active = Some(self.builder.block_params(entry)[1]);
+                self.cleanup.sync_native_active = Some(self.builder.block_params(entry)[1]);
             }
             self.emit_flush_defers_from(depth);
-            self.sync_native_active = before_active;
-            let end = (!self.terminated).then(|| self.builder.current_block().unwrap());
+            self.cleanup.sync_native_active = before_active;
+            let end = (!self.locals.terminated).then(|| self.builder.current_block().unwrap());
             ledger.normal.insert(
                 key.clone(),
                 NormalCleanup {
@@ -841,9 +850,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let continuation = self.builder.create_block();
             cleanup.continuations.push(continuation);
             self.builder.switch_to_block(continuation);
-            self.terminated = false;
+            self.locals.terminated = false;
         } else {
-            self.terminated = true;
+            self.locals.terminated = true;
         }
     }
 
@@ -853,8 +862,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value: Option<&crate::ir::lowered::LirOperand>,
         return_type: &Type,
     ) {
-        if let Some(frame) = self.coop_frame {
-            if let (Some(value), Some(offset)) = (value, self.coop_result_offset) {
+        if let Some(frame) = self.suspension.coop_frame {
+            if let (Some(value), Some(offset)) = (value, self.suspension.coop_result_offset) {
                 let result = self.emit_lir_operand_store(function, value, return_type);
                 self.emit_gc_heap_store(
                     frame,
@@ -869,24 +878,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_lir_operand(function, value);
             }
             self.emit_flush_defers_from(0);
-            if !self.terminated {
+            if !self.locals.terminated {
                 // A return nested inside a LIR expression (notably a
                 // statement-position `match` arm) may still hold temporary
                 // roots owned by that expression. They do not survive this
                 // poll return, so pop the complete runtime depth here; keep
                 // the compile-time count intact for sibling CFG paths.
                 self.emit_callstack_unwind_edge();
-                self.emit_pop_roots_n(self.gc_root_count);
+                self.emit_pop_roots_n(self.roots.gc_root_count);
                 let ready = self.builder.ins().iconst(types::I32, 1);
                 self.builder.ins().return_(&[ready]);
-                self.terminated = true;
+                self.locals.terminated = true;
             }
             return;
         }
         // `fn main -> Result<void, E>`: `willow_user_main` is void, so a
         // `return` is an EXIT rather than a value handed back -- `Err` reports
         // its payload and exits non-zero, `Ok` exits 0.
-        if self.main_result_err_ty.is_some() {
+        if self.locals.main_result_err_ty.is_some() {
             match value {
                 Some(value) => {
                     let result = self.emit_lir_operand(function, value);
@@ -895,14 +904,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let slot = is_gc_managed(return_type, self.enum_infos)
                         .then(|| self.emit_push_relocatable_root(result));
                     self.emit_flush_defers_from(0);
-                    if self.terminated {
+                    if self.locals.terminated {
                         return;
                     }
                     let result = match slot {
                         Some(slot) => {
                             let result = self.emit_reload_root(slot, result);
                             self.emit_pop_roots_n(1);
-                            self.gc_root_count -= 1;
+                            self.roots.gc_root_count -= 1;
                             result
                         }
                         None => result,
@@ -915,15 +924,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // success, and neither needs the object built to say so.
                 None => {
                     self.emit_flush_defers_from(0);
-                    if self.terminated {
+                    if self.locals.terminated {
                         return;
                     }
                     self.emit_callstack_unwind_edge();
-                    self.emit_pop_roots_n(self.gc_root_count);
+                    self.emit_pop_roots_n(self.roots.gc_root_count);
                     self.builder.ins().return_(&[]);
                 }
             }
-            self.terminated = true;
+            self.locals.terminated = true;
             return;
         }
         match value {
@@ -933,12 +942,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
                 let val = self.emit_lir_operand_store(function, v, return_type);
                 self.emit_callstack_unwind_edge();
-                self.emit_pop_roots_n(self.gc_root_count);
+                self.emit_pop_roots_n(self.roots.gc_root_count);
                 self.builder.ins().return_(&[val]);
             }
             None => {
                 self.emit_callstack_unwind_edge();
-                self.emit_pop_roots_n(self.gc_root_count);
+                self.emit_pop_roots_n(self.roots.gc_root_count);
                 if *return_type == Type::Void {
                     self.builder.ins().return_(&[]);
                 } else {
@@ -952,6 +961,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
         }
-        self.terminated = true;
+        self.locals.terminated = true;
     }
 }

@@ -46,7 +46,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// count is the maximum live lexical root depth across all emitted paths,
     /// including cleanup. Loop scopes pop before their next iteration.
     pub(super) fn begin_root_reservation(&mut self) {
-        self.root_reservation = Some(self.emit_root_reservation_check());
+        self.roots.root_reservation = Some(self.emit_root_reservation_check());
     }
 
     fn emit_root_reservation_check(&mut self) -> RootReservation {
@@ -74,7 +74,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let reservation = RootReservation {
             count: count_inst,
             check: self.builder.func.dfg.value_def(fits).inst().unwrap(),
-            base: self.gc_root_count,
+            base: self.roots.gc_root_count,
         };
         let cold = self.builder.create_block();
         let ready = self.builder.create_block();
@@ -92,8 +92,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     pub(super) fn finish_root_reservation(&mut self) {
-        if let Some(reservation) = self.root_reservation {
-            self.patch_root_reservation(reservation, self.root_peak_count);
+        if let Some(reservation) = self.roots.root_reservation {
+            self.patch_root_reservation(reservation, self.roots.root_peak_count);
         }
     }
 
@@ -102,9 +102,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// does not cover pushes made by deferred actions there. Check capacity
     /// again on cleanup entry for the roots the cleanup itself pushes.
     pub(super) fn begin_cleanup_root_reservation(&mut self) -> Option<(RootReservation, usize)> {
-        let outer = self.root_reservation?;
-        let outer_peak = std::mem::replace(&mut self.root_peak_count, self.gc_root_count);
-        self.root_reservation = Some(self.emit_root_reservation_check());
+        let outer = self.roots.root_reservation?;
+        let outer_peak =
+            std::mem::replace(&mut self.roots.root_peak_count, self.roots.gc_root_count);
+        self.roots.root_reservation = Some(self.emit_root_reservation_check());
         Some((outer, outer_peak))
     }
 
@@ -116,11 +117,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return;
         };
         let inner = self
+            .roots
             .root_reservation
             .replace(outer)
             .expect("cleanup root reservation");
-        self.patch_root_reservation(inner, self.root_peak_count);
-        self.root_peak_count = self.root_peak_count.max(outer_peak);
+        self.patch_root_reservation(inner, self.roots.root_peak_count);
+        self.roots.root_peak_count = self.roots.root_peak_count.max(outer_peak);
     }
 
     fn patch_root_reservation(&mut self, reservation: RootReservation, peak: usize) {
@@ -163,14 +165,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Equal root depth means the earlier temporary has been popped (or
         // belongs to an alternate path). Never share with entry binding roots:
         // those have their own slots and remain included in gc_root_count.
-        let key = (self.gc_root_count, spill_bytes);
-        let slot = *self.temporary_root_slots.entry(key).or_insert_with(|| {
-            self.builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                spill_bytes,
-                0,
-            ))
-        });
+        let key = (self.roots.gc_root_count, spill_bytes);
+        let slot = *self
+            .roots
+            .temporary_root_slots
+            .entry(key)
+            .or_insert_with(|| {
+                self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    spill_bytes,
+                    0,
+                ))
+            });
         self.stack_store(val, slot);
         self.emit_push_root_slot(slot);
         slot
@@ -197,7 +203,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_push_root_entry(&mut self, slot: cranelift_codegen::ir::StackSlot, symbol: &str) {
         let ptr_ty = reference_type(self.module.target_config());
         let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
-        if self.root_reservation.is_some() {
+        if self.roots.root_reservation.is_some() {
             let context = self.builder.ins().get_pinned_reg(ptr_ty);
             let flags = MemFlagsData::trusted();
             let top = self.builder.ins().load(
@@ -225,13 +231,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
                 eprintln!("[inline-root-push]");
             }
-            self.root_peak_count = self.root_peak_count.max(self.gc_root_count + 1);
+            self.roots.root_peak_count =
+                self.roots.root_peak_count.max(self.roots.gc_root_count + 1);
         } else {
             let push_id = self.func_id(symbol);
             let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
             self.builder.ins().call(push_ref, &[addr]);
         }
-        self.gc_root_count += 1;
+        self.roots.gc_root_count += 1;
     }
 
     /// Pop `n` GC roots by calling `willow_pop_roots(n)`.

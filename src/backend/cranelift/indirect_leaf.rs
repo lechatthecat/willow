@@ -132,7 +132,7 @@ impl FuncGen<'_, '_> {
         // paths. Bound expansion across the entire body, not merely each site:
         // chains of C calls must not produce O(C²) machine code. The common
         // one-site hot loop still benefits; later sites retain one shared call.
-        if self.indirect_leaf_promoted
+        if self.reuse.indirect_leaf_promoted
             || self.indirect_leaves.0.is_empty()
             || params.len() > 8
             || !matches!(result, Type::I64 | Type::F64 | Type::Bool)
@@ -161,7 +161,7 @@ impl FuncGen<'_, '_> {
         {
             return self.emit_lir_indirect_call(signature, target, args, name, span, None);
         }
-        self.indirect_leaf_promoted = true;
+        self.reuse.indirect_leaf_promoted = true;
         if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
             eprintln!("[indirect-leaf-expand]");
         }

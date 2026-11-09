@@ -140,7 +140,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // needs from these slots. `coerce_to_target` never allocates (it
         // builds inline interface pairs), so the only such allocation is
         // boxing an inline pair into its storage word.
-        let roots_before = self.gc_root_count;
+        let roots_before = self.roots.gc_root_count;
         let roots = OperandRoots {
             receiver: is_gc_managed(receiver_ty, self.enum_infos)
                 .then(|| self.emit_push_relocatable_root(receiver)),
@@ -162,8 +162,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             &roots,
             span,
         );
-        self.emit_pop_roots_n(self.gc_root_count - roots_before);
-        self.gc_root_count = roots_before;
+        self.emit_pop_roots_n(self.roots.gc_root_count - roots_before);
+        self.roots.gc_root_count = roots_before;
         value
     }
 
@@ -465,7 +465,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let payload = |i: usize| resolved.args.get(i).cloned().unwrap_or(Type::Void);
         let (ok_ty, err_ty) = (payload(0), payload(1));
         let recv = receiver;
-        let roots_before = self.gc_root_count;
+        let roots_before = self.roots.gc_root_count;
         // The operands stay rooted for the whole method. Every combinator
         // reads the receiver and its arguments before its first GC point (the
         // callback call, an allocation or a panic), never after one, so the
@@ -561,8 +561,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             _ => unreachable!("unsupported `{method}` on an Option/Result passed eligibility"),
         };
-        self.emit_pop_roots_n(self.gc_root_count - roots_before);
-        self.gc_root_count = roots_before;
+        self.emit_pop_roots_n(self.roots.gc_root_count - roots_before);
+        self.roots.gc_root_count = roots_before;
         value
     }
 

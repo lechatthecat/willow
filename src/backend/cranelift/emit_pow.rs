@@ -236,7 +236,7 @@ impl FuncGen<'_, '_> {
     /// runtime must not return here; if it does, the multiplication loop would
     /// run on a nonsensical exponent, so that is an ABI violation.
     fn emit_pow_negative_exponent_panic(&mut self, exponent: Value, span: Span) {
-        let source_file = self.source_file.to_string();
+        let source_file = self.diagnostics.source_file.to_string();
         let file_ptr = self.emit_string_literal(&source_file);
         let line = self.builder.ins().iconst(types::I32, span.line as i64);
         let column = self.builder.ins().iconst(types::I32, span.col as i64);

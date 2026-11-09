@@ -116,7 +116,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.enum_infos,
             )),
         );
-        let constructor = if self.lir_confined_maps {
+        let constructor = if self.suspension.lir_confined_maps {
             "willow_map_new_local"
         } else {
             "willow_map_new"

@@ -574,12 +574,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // fault occurs before any callee marker could execute in either case.
         if !super::root_effect::is_safepoint_free_leaf(
             f,
-            self.build_mode == crate::BuildMode::Debug,
+            self.diagnostics.build_mode == crate::BuildMode::Debug,
         ) {
             self.emit_stack_helper();
             // For proven runtime-only bodies, every path is dominated by this
             // publication and no body operation changes the helper marker.
-            self.stack_helper_established = super::root_effect::preserves_stack_helper(f);
+            self.diagnostics.stack_helper_established =
+                super::root_effect::preserves_stack_helper(f);
         }
         self.emit_lir_function_inner(f, None);
     }
@@ -587,41 +588,46 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Replay a cleanup graph with fresh region storage and the enclosing
     /// panic/defer state. CleanupReturn rejoins this replay's continuation.
     pub(super) fn emit_lir_cleanup_region(&mut self, region: &LirFunction) {
-        let vars = self.vars.clone();
-        let roots = self.gc_root_count;
+        let vars = self.locals.vars.clone();
+        let roots = self.roots.gc_root_count;
         let active_roots = self
+            .roots
             .coop_shadow_roots
             .as_ref()
             .map(|roots| roots.active.clone());
-        let defers = self.defer_stack.clone();
-        let panic_scopes = self.panic_scopes.clone();
-        let flags = self.sync_defer_flags.clone();
-        let frame_offsets = std::mem::take(&mut self.lir_frame_offsets);
-        let before_exit = self.lir_cleanup_exit;
+        let defers = self.cleanup.defer_stack.clone();
+        let panic_scopes = self.cleanup.panic_scopes.clone();
+        let flags = self.cleanup.sync_defer_flags.clone();
+        let frame_offsets = std::mem::take(&mut self.suspension.lir_frame_offsets);
+        let before_exit = self.cleanup.lir_cleanup_exit;
         let exit = self.builder.create_block();
-        self.lir_cleanup_exit = Some((exit, roots, false));
+        self.cleanup.lir_cleanup_exit = Some((exit, roots, false));
         // Region temporaries can share a spelling with a subsequently declared
         // outer temporary; their lifetimes and storage are independent.
         for local in region.locals.iter().filter(|local| !local.parameter) {
-            self.vars.remove(&local.name);
+            self.locals.vars.remove(&local.name);
         }
         self.emit_lir_function_inner(region, None);
-        let reached = self.lir_cleanup_exit.expect("cleanup exit installed").2;
-        self.lir_cleanup_exit = before_exit;
-        self.vars = vars;
-        self.gc_root_count = roots;
-        self.defer_stack = defers;
-        self.panic_scopes = panic_scopes;
-        self.sync_defer_flags = flags;
-        self.lir_frame_offsets = frame_offsets;
-        if let (Some(active), Some(state)) = (active_roots, self.coop_shadow_roots.as_mut()) {
+        let reached = self
+            .cleanup
+            .lir_cleanup_exit
+            .expect("cleanup exit installed")
+            .2;
+        self.cleanup.lir_cleanup_exit = before_exit;
+        self.locals.vars = vars;
+        self.roots.gc_root_count = roots;
+        self.cleanup.defer_stack = defers;
+        self.cleanup.panic_scopes = panic_scopes;
+        self.cleanup.sync_defer_flags = flags;
+        self.suspension.lir_frame_offsets = frame_offsets;
+        if let (Some(active), Some(state)) = (active_roots, self.roots.coop_shadow_roots.as_mut()) {
             state.active = active;
         }
         if reached {
             self.builder.switch_to_block(exit);
             self.builder.seal_block(exit);
         }
-        self.terminated = !reached;
+        self.locals.terminated = !reached;
     }
 
     /// Emit an async poll body from LIR while retaining the established
@@ -642,21 +648,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f: &LirFunction,
         mut coop: Option<(&mut CoopSuspendPoints, cranelift_codegen::ir::Value)>,
     ) {
-        let proof = if coop.is_none() && self.lir_frame_offsets.is_empty() {
+        let proof = if coop.is_none() && self.suspension.lir_frame_offsets.is_empty() {
             super::nonnegative::analyze(f)
         } else {
             Default::default()
         };
-        let outer_nonnegative = std::mem::replace(&mut self.lir_nonnegative, proof);
-        let outer_confined_maps = self.lir_confined_maps;
-        self.lir_confined_maps = super::local_maps::confined_scalar_maps(f);
+        let outer_nonnegative = std::mem::replace(&mut self.reuse.lir_nonnegative, proof);
+        let outer_confined_maps = self.suspension.lir_confined_maps;
+        self.suspension.lir_confined_maps = super::local_maps::confined_scalar_maps(f);
         let incoming_frames =
             lir_call_frame_entries(f).expect("validated method preparation frames");
         let incoming_references =
             lir_reference_scope_entries(f).expect("validated reference argument scopes");
-        let outer_references = self.lir_reference_scopes.clone();
-        let outer_frames = self.lir_call_frames.clone();
-        let outer_frame_depth = self.callstack_frame_depth;
+        let outer_references = self.diagnostics.lir_reference_scopes.clone();
+        let outer_frames = self.diagnostics.lir_call_frames.clone();
+        let outer_frame_depth = self.diagnostics.callstack_frame_depth;
         let entry = self.builder.current_block().expect("entry block active");
         let mut poll_blocks = lir_sync_poll_blocks(f);
         let loop_depths = super::block_layout::lir_loop_depths(f);
@@ -730,23 +736,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.switch_to_block(blocks[i]);
             }
             self.install_lir_cleanup(cleanup_bindings.state(cleanup_graph.incoming_states[i]));
-            self.gc_root_count = cleanup_bindings.roots;
+            self.roots.gc_root_count = cleanup_bindings.roots;
             // Each LIR block starts a fresh Cranelift block, so whatever the
             // previous one ended with (a `return`, a diverging statement) says
             // nothing about this one.
-            self.terminated = false;
-            self.lir_call_frames = outer_frames.clone();
-            self.lir_reference_scopes = outer_references.clone();
-            self.lir_reference_scopes
+            self.locals.terminated = false;
+            self.diagnostics.lir_call_frames = outer_frames.clone();
+            self.diagnostics.lir_reference_scopes = outer_references.clone();
+            self.diagnostics
+                .lir_reference_scopes
                 .extend(incoming_references[i].clone());
             let frames: Vec<_> = incoming_frames[i]
                 .iter()
                 .filter(|(method, _)| self.flat_method_frame_enabled(method))
                 .cloned()
                 .collect();
-            self.lir_call_frames.extend(frames);
-            self.callstack_frame_depth =
-                outer_frame_depth + self.lir_call_frames.len() - outer_frames.len();
+            self.diagnostics.lir_call_frames.extend(frames);
+            self.diagnostics.callstack_frame_depth =
+                outer_frame_depth + self.diagnostics.lir_call_frames.len() - outer_frames.len();
             let block_coop = coop
                 .as_mut()
                 .map(|(suspends, frame)| (&mut **suspends, *frame));
@@ -764,19 +771,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else {
                 sync_poll.filter(|_| poll_blocks[i])
             };
-            let outer_active = self.sync_native_active;
-            self.sync_native_active = block_poll
+            let outer_active = self.cleanup.sync_native_active;
+            self.cleanup.sync_native_active = block_poll
                 .or(sync_poll)
                 .map(|poll| poll.active)
                 .or_else(|| deferred_active.map(|var| self.builder.use_var(var)));
             // Continue the predecessor's GC-free run only along its edge into
             // a block without an entry poll. The predecessor's
             // exit dominates this block whatever order emits the two.
-            self.lir_reuse = match reuse_preds[i] {
+            self.reuse.lir_reuse = match reuse_preds[i] {
                 Some(pred) if !poll_blocks[i] => reuse_exits[pred].clone(),
                 _ => None,
             };
-            if let Some(reuse) = &mut self.lir_reuse {
+            if let Some(reuse) = &mut self.reuse.lir_reuse {
                 if let Some((target, index, len)) = reuse.branch_bound.take()
                     && target == i
                 {
@@ -794,9 +801,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 super::block_layout::prefer_then_fallthrough(f, &loop_depths, i),
                 &mut defer_ctx,
             );
-            self.sync_native_active = outer_active;
-            let facts = self.lir_reuse.take();
-            if !self.terminated
+            self.cleanup.sync_native_active = outer_active;
+            let facts = self.reuse.lir_reuse.take();
+            if !self.locals.terminated
                 && matches!(
                     block.terminator,
                     Terminator::Jump(_) | Terminator::Branch { .. }
@@ -805,15 +812,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 reuse_exits[i] = facts.filter(|facts| facts.carriable());
             }
         }
-        self.lir_call_frames = outer_frames;
-        self.lir_reference_scopes = outer_references;
-        self.callstack_frame_depth = outer_frame_depth;
-        self.terminated = true;
+        self.diagnostics.lir_call_frames = outer_frames;
+        self.diagnostics.lir_reference_scopes = outer_references;
+        self.diagnostics.callstack_frame_depth = outer_frame_depth;
+        self.locals.terminated = true;
         // Panic CFG resources exist before any source block is emitted. Every
         // lexical program is emitted once, independently of which exit ran last.
         for index in (0..cleanup_bindings.scopes.len()).rev() {
             self.install_lir_cleanup(&cleanup_bindings.panic_states[index]);
-            self.gc_root_count = cleanup_bindings.roots;
+            self.roots.gc_root_count = cleanup_bindings.roots;
             self.emit_shared_panic_cleanup(&cleanup_bindings.scopes[index]);
         }
         for scope in &cleanup_bindings.scopes {
@@ -837,17 +844,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // The enclosing function compiler may append shared panic-return CFG
         // after the LIR body. It seals all blocks once that ABI edge exists
         //.
-        self.terminated = true;
-        self.lir_confined_maps = outer_confined_maps;
-        self.lir_nonnegative = outer_nonnegative;
+        self.locals.terminated = true;
+        self.suspension.lir_confined_maps = outer_confined_maps;
+        self.reuse.lir_nonnegative = outer_nonnegative;
     }
 
     /// Pre-bind the locals selected by LIR liveness to their LIR-owned frame
     /// slots. Source spans are intentionally absent from this lookup.
     fn bind_coop_lir_locals(&mut self, f: &LirFunction) {
         for local in &f.locals {
-            if let Some(offset) = self.lir_frame_offsets.get(&local.id).copied() {
-                self.vars
+            if let Some(offset) = self.suspension.lir_frame_offsets.get(&local.id).copied() {
+                self.locals
+                    .vars
                     .insert(local.name.clone(), VarStorage::async_local(local, offset));
             }
         }
@@ -860,6 +868,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let name = &function.locals[local.0 as usize].name;
         let storage = self
+            .locals
             .vars
             .get(name)
             .cloned()
@@ -868,7 +877,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // run last read from it.
         let reusable = match storage {
             VarStorage::Stack { slot, .. }
-                if self.lir_reuse.is_some()
+                if self.reuse.lir_reuse.is_some()
                     && super::transient_roots::is_array(&function.locals[local.0 as usize].ty) =>
             {
                 Some(slot)
@@ -876,12 +885,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             _ => None,
         };
         if let Some(slot) = reusable {
-            let reuse = self.lir_reuse.as_ref().expect("checked above");
+            let reuse = self.reuse.lir_reuse.as_ref().expect("checked above");
             if let Some(&owner) = reuse.slots.get(&slot) {
                 return owner;
             }
             let owner = self.stack_load(reference_type(self.module.target_config()), slot);
-            self.lir_reuse
+            self.reuse
+                .lir_reuse
                 .as_mut()
                 .expect("checked above")
                 .slots
@@ -895,7 +905,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 VarStorage::Frame { offset, .. } => self.builder.ins().load(
                     ptr_ty,
                     MemFlagsData::new(),
-                    self.async_frame.expect("GC owner frame"),
+                    self.suspension.async_frame.expect("GC owner frame"),
                     offset,
                 ),
                 _ => panic!("opaque GC owner must occupy rooted storage"),
@@ -903,13 +913,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let scalar = matches!(storage, VarStorage::Value { .. })
             && self
+                .reuse
                 .lir_nonnegative
                 .contains(&crate::ir::lowered::LirOperand::Local(local));
-        if scalar && let Some(value) = self.lir_reuse.as_ref().and_then(|r| r.scalars.get(&local)) {
+        if scalar
+            && let Some(value) = self
+                .reuse
+                .lir_reuse
+                .as_ref()
+                .and_then(|r| r.scalars.get(&local))
+        {
             return *value;
         }
         let value = self.load_var(&storage);
-        if scalar && let Some(reuse) = &mut self.lir_reuse {
+        if scalar && let Some(reuse) = &mut self.reuse.lir_reuse {
             reuse.scalars.insert(local, value);
         }
         value
@@ -921,11 +938,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         local: LirLocalId,
         value: cranelift_codegen::ir::Value,
     ) {
-        if let Some(reuse) = &mut self.lir_reuse {
+        if let Some(reuse) = &mut self.reuse.lir_reuse {
             reuse.scalars.remove(&local);
         }
         let name = &function.locals[local.0 as usize].name;
         let storage = self
+            .locals
             .vars
             .get(name)
             .cloned()
@@ -934,7 +952,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             match storage {
                 VarStorage::Stack { slot, .. } => self.stack_store(value, slot),
                 VarStorage::Frame { offset, .. } => self.emit_gc_owner_frame_store(
-                    self.async_frame.expect("GC owner frame"),
+                    self.suspension.async_frame.expect("GC owner frame"),
                     offset,
                     value,
                 ),
@@ -954,8 +972,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .map(|local| {
                 (!local.parameter
                     && !unrooted.contains(&local.id)
-                    && !self.vars.contains_key(local.name.as_str())
-                    && !self.address_taken.contains(local.name.as_str())
+                    && !self.locals.vars.contains_key(local.name.as_str())
+                    && !self.locals.address_taken.contains(local.name.as_str())
                     && (local.is_gc_owner() || is_gc_managed(&local.ty, self.enum_infos)))
                 .then(|| self.clif_type(&local.ty).bytes().max(8))
             })
@@ -964,12 +982,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for group in super::stack_slots::groups(f, &widths) {
             let first = &f.locals[group[0].0 as usize];
             self.bind_lir_rooted_slot(&first.name, &first.ty, &mut null);
-            let VarStorage::Stack { slot, .. } = self.vars[&first.name] else {
+            let VarStorage::Stack { slot, .. } = self.locals.vars[&first.name] else {
                 unreachable!("new rooted slot");
             };
             for id in &group[1..] {
                 let local = &f.locals[id.0 as usize];
-                self.vars.insert(
+                self.locals.vars.insert(
                     local.name.clone(),
                     VarStorage::Stack {
                         slot,
@@ -995,7 +1013,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if !is_gc_managed(ty, self.enum_infos) {
                     continue;
                 }
-                if self.vars.contains_key(name) {
+                if self.locals.vars.contains_key(name) {
                     continue;
                 }
                 self.bind_lir_rooted_slot(name, ty, &mut null);
@@ -1026,7 +1044,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         self.emit_push_root_slot(slot);
         self.track_coop_binding_root(slot);
-        self.vars.insert(
+        self.locals.vars.insert(
             name.to_string(),
             VarStorage::Stack {
                 slot,
@@ -1063,7 +1081,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let roots: Vec<Root> = locals
             .iter()
             .filter_map(|local| function.locals.get(local.0 as usize))
-            .filter_map(|local| match self.vars.get(local.name.as_str()) {
+            .filter_map(|local| match self.locals.vars.get(local.name.as_str()) {
                 Some(VarStorage::Stack { slot, ty })
                     if local.is_gc_owner() || is_gc_managed(ty, self.enum_infos) =>
                 {
@@ -1082,7 +1100,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let ptr_ty = reference_type(self.module.target_config());
         let zero = self.builder.ins().iconst(ptr_ty, 0);
-        let frame_base = self.async_frame;
+        let frame_base = self.suspension.async_frame;
         for root in roots {
             match root {
                 Root::Slot(slot) => self.stack_store(zero, slot),
@@ -1138,7 +1156,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             ..
                         } = operand
                         {
-                            self.address_taken
+                            self.locals
+                                .address_taken
                                 .insert(f.locals[id.0 as usize].name.clone());
                         }
                     }
@@ -1147,7 +1166,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let mut null = None;
         for local in &f.locals {
-            if local.parameter || self.vars.contains_key(local.name.as_str()) {
+            if local.parameter || self.locals.vars.contains_key(local.name.as_str()) {
                 continue;
             }
             // See `transient_roots`: no GC point can move these referents
@@ -1158,7 +1177,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.bind_lir_rooted_slot(&local.name, &local.ty, &mut null);
                 continue;
             }
-            if self.address_taken.contains(local.name.as_str()) {
+            if self.locals.address_taken.contains(local.name.as_str()) {
                 // Give an address-taken local its definitive slot at function
                 // entry so no `&` use inserts path-local promotion, and so the
                 // one slot is the same one whichever block writes it first.
@@ -1169,7 +1188,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_zero(clif)
                 };
                 let storage = self.create_local_stack_slot(&local.ty, zero);
-                self.vars.insert(local.name.clone(), storage);
+                self.locals.vars.insert(local.name.clone(), storage);
                 continue;
             }
             // Seeded so a path that reads the local without having run its
@@ -1183,7 +1202,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 ty => self.emit_zero(ty),
             };
             self.builder.def_var(var, zero);
-            self.vars
+            self.locals
+                .vars
                 .insert(local.name.clone(), VarStorage::Value { var });
         }
     }
@@ -1294,17 +1314,18 @@ pub(super) fn task_cleanup_symbol(poll: u32, flag: i32, recovery: bool) -> Strin
 
 impl FuncGen<'_, '_> {
     pub(super) fn emit_task_cleanup_callback(&mut self, region: &LirFunction, recovery: bool) {
-        self.recover_eligible_depth = usize::from(recovery);
+        self.cleanup.recover_eligible_depth = usize::from(recovery);
         let panic_exit = self.builder.create_block();
-        self.panic_return_block = Some(panic_exit);
+        self.cleanup.panic_return_block = Some(panic_exit);
         self.emit_lir_cleanup_region(region);
-        if !self.terminated {
+        if !self.locals.terminated {
             let ready = self.builder.ins().iconst(types::I32, 1);
             self.builder.ins().return_(&[ready]);
         }
         self.builder.switch_to_block(panic_exit);
         let depth = self.emit_value_runtime_call("willow_root_depth", &[]);
         let baseline = self
+            .cleanup
             .panic_function_root_depth
             .expect("cleanup root baseline");
         let count = self.builder.ins().isub(depth, baseline);
@@ -1326,8 +1347,8 @@ impl FuncGen<'_, '_> {
         use crate::ir::lowered::{LirOperand, LirRvalue as R};
         for id in task_boundary_locals(function, local, value) {
             let binding = &function.locals[id.0 as usize];
-            let offset = self.lir_frame_offsets[&id];
-            self.vars.insert(
+            let offset = self.suspension.lir_frame_offsets[&id];
+            self.locals.vars.insert(
                 binding.name.clone(),
                 VarStorage::async_local(binding, offset),
             );
@@ -1335,23 +1356,25 @@ impl FuncGen<'_, '_> {
             super::async_codegen::count_callback_binding();
         }
         let panic_exit = self.builder.create_block();
-        self.panic_return_block = Some(panic_exit);
+        self.cleanup.panic_return_block = Some(panic_exit);
         if let R::MethodCall { method, .. } = value
             && self.flat_method_frame_enabled(method)
         {
-            self.lir_call_frames.push((method.clone(), span));
-            self.callstack_frame_depth = 1;
+            self.diagnostics
+                .lir_call_frames
+                .push((method.clone(), span));
+            self.diagnostics.callstack_frame_depth = 1;
         }
         if value
             .operands()
             .iter()
             .any(|arg| matches!(arg, LirOperand::Reference { .. }))
         {
-            self.lir_reference_scopes.push(Vec::new());
+            self.diagnostics.lir_reference_scopes.push(Vec::new());
         }
-        self.fault_site_span = Some(span);
+        self.diagnostics.fault_site_span = Some(span);
         let result = self.emit_lir_rvalue(function, value, span);
-        if !self.terminated {
+        if !self.locals.terminated {
             if function.locals[local.0 as usize].is_gc_owner()
                 || !matches!(
                     function.locals[local.0 as usize].ty,
@@ -1366,6 +1389,7 @@ impl FuncGen<'_, '_> {
         self.builder.switch_to_block(panic_exit);
         let depth = self.emit_value_runtime_call("willow_root_depth", &[]);
         let baseline = self
+            .cleanup
             .panic_function_root_depth
             .expect("boundary root baseline");
         let count = self.builder.ins().isub(depth, baseline);
@@ -1429,7 +1453,8 @@ impl FuncGen<'_, '_> {
         if let Some(R::MethodCall { method, .. }) = value
             && self.flat_method_frame_enabled(method)
         {
-            self.lir_call_frames
+            self.diagnostics
+                .lir_call_frames
                 .pop()
                 .expect("prepared boundary method");
             self.emit_callstack_pop();
@@ -1452,8 +1477,8 @@ impl FuncGen<'_, '_> {
         self.builder.switch_to_block(panicked);
         self.emit_sync_panic_unwind();
         self.builder.switch_to_block(normal);
-        self.terminated = false;
-        self.panic_depth_snapshot = None;
+        self.locals.terminated = false;
+        self.cleanup.panic_depth_snapshot = None;
     }
 }
 

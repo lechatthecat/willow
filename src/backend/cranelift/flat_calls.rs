@@ -30,9 +30,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     pub(super) fn flat_method_frame_enabled(&self, method: &str) -> bool {
-        self.build_mode == BuildMode::Debug
+        self.diagnostics.build_mode == BuildMode::Debug
             && self.string_literals.contains_key(method)
-            && self.string_literals.contains_key(self.source_file)
+            && self
+                .string_literals
+                .contains_key(self.diagnostics.source_file)
     }
 
     fn root_flat_call_args(
@@ -173,7 +175,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_callstack_pop();
         }
         self.emit_pop_roots_n(arg_roots + receiver_roots);
-        self.gc_root_count -= arg_roots + receiver_roots;
+        self.roots.gc_root_count -= arg_roots + receiver_roots;
         self.emit_post_willow_call_panic_check(panic_depth);
         result
     }
@@ -307,7 +309,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Promote a small polymorphic set without multiplying argument evaluation,
         // roots, panic handling or cleanup. Each guard compares the actual slot
         // address; unknown slots and ABI mismatches always retain the fallback.
-        let direct_targets = if self.build_mode == BuildMode::Release {
+        let direct_targets = if self.diagnostics.build_mode == BuildMode::Release {
             slots.direct_targets
         } else {
             [None; 4]
@@ -395,7 +397,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_flat_reference_call_end();
         }
         self.emit_pop_roots_n(arg_roots + receiver_roots);
-        self.gc_root_count -= arg_roots + receiver_roots;
+        self.roots.gc_root_count -= arg_roots + receiver_roots;
         self.emit_post_willow_call_panic_check(panic_depth);
         // `-> Self` yields a bare object of the receiver's own class. Pair it
         // only after the panic edge has rejected the neutral placeholder.

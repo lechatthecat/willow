@@ -8,7 +8,8 @@ use cranelift_module::Module;
 impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_flat_reference_call_end(&mut self) {
         self.emit_debug_reference_call_clear();
-        self.lir_reference_scopes
+        self.diagnostics
+            .lir_reference_scopes
             .pop()
             .expect("prepared reference scope");
     }
@@ -35,7 +36,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         function: &LirFunction,
         args: &[LirOperand],
     ) -> (Vec<Value>, usize) {
-        let before = self.gc_root_count;
+        let before = self.roots.gc_root_count;
         let mut values = Vec::with_capacity(args.len());
         for argument in args {
             let value = if let LirOperand::Reference { place, .. } = argument {
@@ -54,7 +55,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             };
             values.push(value);
         }
-        (values, self.gc_root_count - before)
+        (values, self.roots.gc_root_count - before)
     }
 
     /// Build the reference cell for `place` and return its address. A managed
@@ -64,6 +65,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let (base, offset) = match place {
             LirPlace::Local(id) => {
                 let storage = self
+                    .locals
                     .vars
                     .get(&function.locals[id.0 as usize].name)
                     .cloned()
@@ -81,7 +83,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                     // Root the frame owner when borrowing an ordinary local slot.
                     VarStorage::Frame { offset, .. } => {
-                        let frame = self.async_frame.expect("frame place");
+                        let frame = self.suspension.async_frame.expect("frame place");
                         let offset = self.builder.ins().iconst(ptr, i64::from(offset));
                         (Some(frame), offset)
                     }
@@ -152,7 +154,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         callee: &FunctionId,
         index: usize,
     ) {
-        if self.build_mode != BuildMode::Debug {
+        if self.diagnostics.build_mode != BuildMode::Debug {
             return;
         }
         let LirOperand::Reference {
@@ -228,7 +230,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             LirPlace::Field { .. } => "field",
             LirPlace::ArrayElement { .. } => "array_element",
         };
-        let file = self.source_file.to_owned();
+        let file = self.diagnostics.source_file.to_owned();
         let file = self.emit_string_literal(&file);
         let line = self.builder.ins().iconst(types::I32, span.line as i64);
         let column = self.builder.ins().iconst(types::I32, span.col as i64);

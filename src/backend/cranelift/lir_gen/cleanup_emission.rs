@@ -11,9 +11,9 @@ impl LirCleanupBindings {
 
 impl FuncGen<'_, '_> {
     pub(super) fn install_lir_cleanup(&mut self, state: &LirCleanupState) {
-        self.defer_stack = state.entries.clone();
-        self.panic_scopes = state.panic.clone();
-        self.lock_scopes = state.locks.clone();
+        self.cleanup.defer_stack = state.entries.clone();
+        self.cleanup.panic_scopes = state.panic.clone();
+        self.cleanup.lock_scopes = state.locks.clone();
     }
 
     pub(super) fn prepare_lir_cleanup(
@@ -24,14 +24,15 @@ impl FuncGen<'_, '_> {
         cooperative: bool,
     ) -> LirCleanupBindings {
         let initial = LirCleanupState {
-            entries: self.defer_stack.clone(),
-            panic: self.panic_scopes.clone(),
-            locks: self.lock_scopes.clone(),
+            entries: self.cleanup.defer_stack.clone(),
+            panic: self.cleanup.panic_scopes.clone(),
+            locks: self.cleanup.lock_scopes.clone(),
         };
-        let roots = self.gc_root_count;
-        let variables = Rc::new(self.vars.clone());
+        let roots = self.roots.gc_root_count;
+        let variables = Rc::new(self.locals.vars.clone());
         let bindings = Rc::new(if cooperative {
-            self.vars
+            self.locals
+                .vars
                 .iter()
                 .filter(|(_, storage)| {
                     matches!(
@@ -56,18 +57,18 @@ impl FuncGen<'_, '_> {
                         ))
                     });
                     if let Some(slot) = slot {
-                        self.sync_defer_flags.insert(*id, slot);
+                        self.cleanup.sync_defer_flags.insert(*id, slot);
                     }
                     let entry = Rc::new(super::super::DeferEntry {
-                        id: self.defer_counter,
+                        id: self.cleanup.defer_counter,
                         action: Rc::new(body.clone()),
-                        flag_offset: cooperative.then(|| self.lir_defer_offsets[id]),
+                        flag_offset: cooperative.then(|| self.suspension.lir_defer_offsets[id]),
                         sync_flag_slot: slot,
                         bindings: bindings.clone(),
                         vars_at_registration: variables.clone(),
                         recovery_capable: body.contains_recover(),
                     });
-                    self.defer_counter += 1;
+                    self.cleanup.defer_counter += 1;
                     sites.insert(*id, entry);
                 }
             }
@@ -89,7 +90,9 @@ impl FuncGen<'_, '_> {
             let defer_depth = initial.entries.len() + depths[scope.entry_state.unwrap().0] - 1;
             let root_depth_at_entry = if cooperative {
                 super::super::RootDepth::Value(
-                    self.panic_function_root_depth.expect("poll root depth"),
+                    self.cleanup
+                        .panic_function_root_depth
+                        .expect("poll root depth"),
                 )
             } else {
                 let var = self.builder.declare_var(types::I32);
@@ -146,21 +149,24 @@ impl FuncGen<'_, '_> {
                     };
                     if let Some(lock) = &scope_locks[id.0] {
                         let order = self.next_cleanup_order();
-                        self.collected_lock_sites.push(super::super::AsyncLockSite {
-                            members: lock.members.clone(),
-                            mode: lock.mode,
-                            handle_offset: lock.handle_offset,
-                            token_offset: lock.token_offset,
-                            phase_offset: lock.phase_offset,
-                            value_offset: lock.value_offset,
-                            value_ty: lock.value_ty.clone(),
-                            order,
-                        });
+                        self.cleanup
+                            .collected_lock_sites
+                            .push(super::super::AsyncLockSite {
+                                members: lock.members.clone(),
+                                mode: lock.mode,
+                                handle_offset: lock.handle_offset,
+                                token_offset: lock.token_offset,
+                                phase_offset: lock.phase_offset,
+                                value_offset: lock.value_offset,
+                                value_ty: lock.value_ty.clone(),
+                                order,
+                            });
                     }
                     for site in &graph.scopes[id.0].sites {
                         let entry = &sites[site];
                         let order = self.next_cleanup_order();
-                        self.collected_defer_sites
+                        self.cleanup
+                            .collected_defer_sites
                             .push(super::super::AsyncDeferSite {
                                 action: entry.action.clone(),
                                 flag_offset: entry.flag_offset.unwrap(),

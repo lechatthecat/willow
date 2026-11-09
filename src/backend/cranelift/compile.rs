@@ -1935,96 +1935,17 @@ impl UnitCodegenContext<'_> {
         // Main has no generated caller to finish an unhandled panic.
         let panic_return_block = (!is_main).then(|| builder.create_block());
 
-        let mut fg = FuncGen {
-            builder: &mut builder,
-            defer_stack: DeferStack::default(),
-            defer_counter: 0,
-            lir_reuse: None,
-            lir_nonnegative: Default::default(),
-            array_fault_spill: None,
-            sync_defer_flags: HashMap::new(),
-            panic_scopes: Default::default(),
-            unavailable_defer_ids: HashSet::new(),
-            sync_cancel_defer_context: 0,
-            panic_defer_codegen_depth: 0,
-            recover_eligible_depth: 0,
-            panic_recovery_targets: HashSet::new(),
-            panic_return_block,
-            panic_function_root_depth: None,
-            panic_depth_snapshot: None,
-            emitting_sync_cancel_cleanup: false,
-            sync_cancel_cleanups: HashMap::new(),
-            sync_native_active: None,
-            lir_cleanup_exit: None,
-            callstack_frame_depth: 0,
-            lir_call_frames: Vec::new(),
-            lir_reference_scopes: Vec::new(),
-            fault_site_span: None,
-            collected_defer_sites: Vec::new(),
-            lock_scopes: Default::default(),
-            collected_lock_sites: Vec::new(),
-            collected_cleanup_order: 0,
-            module: &mut self.output.module,
-            gc_bitmap_descriptors: &mut self.output.gc_bitmap_descriptors,
-            gc_layout_descriptors: &mut self.output.gc_layout_descriptors,
-            func_ids: &self.func_ids,
-            func_return_types: &self.func_return_types,
-            fn_types: &self.fn_types,
-            func_param_modes: &self.func_param_modes,
-            func_param_debug: &self.func_param_debug,
-            function_may_panic: &self.function_may_panic,
-            known_modules: &self.known_modules,
-            visible_modules: &self.visible_modules,
-            builtin_module_aliases: &self.builtin_module_aliases,
-            lambda_names: &self.lambda_names,
-            leaf_lambdas: &self.leaf_lambdas,
-            indirect_leaves: &self.indirect_leaves,
-            indirect_leaf_promoted: false,
-            string_literals: &self.output.string_literals,
-            classes: ClassView::new(&self.type_scope, &self.layout_queries),
-            static_storage: &self.static_storage,
-            enum_infos: &self.enum_infos,
-            class_descriptor_ids: &self.class_descriptor_ids,
-            dispatch_cache: &self.dispatch_cache,
-            vtable_ids: &self.vtable_ids,
-            interface_slot_targets: &self.interface_slot_targets,
-            interface_slot_summaries: &self.output.interface_slot_summaries,
-            coop_frame: None,
-            coop_suspend_points: None,
-            coop_result_offset: None,
-            async_frame: None,
-            async_frame_offsets: HashMap::new(),
-            lir_frame_offsets: HashMap::new(),
-            lir_confined_maps: false,
-            lir_defer_offsets: HashMap::new(),
-            lir_send_offsets: HashMap::new(),
-            main_result_err_ty,
-            vars: HashMap::new(),
-            current_class: None,
-            // Every async function returned above through the cooperative
-            // constructor/poll pair, so what is left here is synchronous.
-            is_async: false,
-            terminated: false,
-            gc_root_count: 0,
-            root_reservation: None,
-            root_peak_count: 0,
-            temporary_root_slots: HashMap::new(),
-            enum_payload_layouts: &mut self.output.enum_payload_layouts,
-            coop_shadow_roots: None,
-            build_mode: self.build_mode,
-            source_file: &self.source_file,
-            diagnostic_function,
-            diagnostic_async: false,
-            overflow_helper_literal: None,
-            stack_helper_established: false,
-            address_taken: super::lir_address_taken_locals(&lir_fn),
-        };
+        let mut fg = FuncGen::new(&mut builder, self);
+        fg.cleanup.panic_return_block = panic_return_block;
+        fg.locals.main_result_err_ty = main_result_err_ty;
+        fg.diagnostics.diagnostic_function = diagnostic_function;
+        fg.locals.address_taken = super::lir_address_taken_locals(&lir_fn);
         // A safepoint-free leaf neither roots its GC parameters nor reaches
         // the panic-return block (willow-8hq4.14).
         let unrooted = !is_main
             && super::root_effect::is_safepoint_free_leaf(
                 &lir_fn,
-                self.build_mode == BuildMode::Debug,
+                fg.diagnostics.build_mode == BuildMode::Debug,
             );
         if !unrooted {
             fg.begin_root_reservation();
@@ -2033,7 +1954,7 @@ impl UnitCodegenContext<'_> {
             && !unrooted
             && super::root_effect::may_push_gc_roots(&lir_fn)
         {
-            fg.panic_function_root_depth =
+            fg.cleanup.panic_function_root_depth =
                 Some(fg.emit_value_runtime_call("willow_root_depth", &[]));
         }
 
@@ -2058,7 +1979,7 @@ impl UnitCodegenContext<'_> {
                 let val = fg.builder.block_params(entry_block)[i];
                 // Frame-back a GC-managed value param (its name is in the map).
                 let framed = matches!(param.mode, ParamMode::Value)
-                    .then(|| fg.async_frame_offsets.get(&param.span).copied())
+                    .then(|| fg.suspension.async_frame_offsets.get(&param.span).copied())
                     .flatten();
                 if let Some(offset) = framed {
                     fg.bind_param_framed(
@@ -2083,7 +2004,7 @@ impl UnitCodegenContext<'_> {
         // a GC-managed one is rooted here by exactly the machinery that roots a
         // parameter, and the body cannot tell a capture from a parameter.
         if !lir_fn.captures.is_empty() {
-            let env = fg.vars[CLOSURE_ENV_PARAM].clone();
+            let env = fg.locals.vars[CLOSURE_ENV_PARAM].clone();
             let env = fg.load_var(&env);
             let mut capture_word = 1;
             for capture in &lir_fn.captures {
@@ -2112,10 +2033,10 @@ impl UnitCodegenContext<'_> {
         fg.emit_lir_function(&lir_fn);
 
         // Implicit return at end of function body.
-        if !fg.terminated {
+        if !fg.locals.terminated {
             // Pop any GC roots that were pushed for parameters.
-            if fg.gc_root_count > 0 {
-                fg.emit_pop_roots_n(fg.gc_root_count);
+            if fg.roots.gc_root_count > 0 {
+                fg.emit_pop_roots_n(fg.roots.gc_root_count);
             }
             if call_return_type != Type::Void && !force_void_main {
                 // A value-returning fn can END with a statement whose arms all
@@ -2387,89 +2308,7 @@ impl UnitCodegenContext<'_> {
             .iconst(types::I64, willow_abi::fingerprint::ABI_HASH_64 as i64);
         builder.ins().call(check, &[expected]);
 
-        let mut fg = FuncGen {
-            builder: &mut builder,
-            defer_stack: DeferStack::default(),
-            defer_counter: 0,
-            lir_reuse: None,
-            lir_nonnegative: Default::default(),
-            array_fault_spill: None,
-            sync_defer_flags: HashMap::new(),
-            panic_scopes: Default::default(),
-            unavailable_defer_ids: HashSet::new(),
-            sync_cancel_defer_context: 0,
-            panic_defer_codegen_depth: 0,
-            recover_eligible_depth: 0,
-            panic_recovery_targets: HashSet::new(),
-            panic_return_block: None,
-            panic_function_root_depth: None,
-            panic_depth_snapshot: None,
-            emitting_sync_cancel_cleanup: false,
-            sync_cancel_cleanups: HashMap::new(),
-            sync_native_active: None,
-            lir_cleanup_exit: None,
-            callstack_frame_depth: 0,
-            lir_call_frames: Vec::new(),
-            lir_reference_scopes: Vec::new(),
-            fault_site_span: None,
-            collected_defer_sites: Vec::new(),
-            lock_scopes: Default::default(),
-            collected_lock_sites: Vec::new(),
-            collected_cleanup_order: 0,
-            module: &mut self.output.module,
-            gc_bitmap_descriptors: &mut self.output.gc_bitmap_descriptors,
-            gc_layout_descriptors: &mut self.output.gc_layout_descriptors,
-            func_ids: &self.func_ids,
-            func_return_types: &self.func_return_types,
-            fn_types: &self.fn_types,
-            func_param_modes: &self.func_param_modes,
-            func_param_debug: &self.func_param_debug,
-            function_may_panic: &self.function_may_panic,
-            known_modules: &self.known_modules,
-            visible_modules: &self.visible_modules,
-            builtin_module_aliases: &self.builtin_module_aliases,
-            lambda_names: &self.lambda_names,
-            leaf_lambdas: &self.leaf_lambdas,
-            indirect_leaves: &self.indirect_leaves,
-            indirect_leaf_promoted: false,
-            string_literals: &self.output.string_literals,
-            classes: ClassView::new(&self.type_scope, &self.layout_queries),
-            static_storage: &self.static_storage,
-            enum_infos: &self.enum_infos,
-            class_descriptor_ids: &self.class_descriptor_ids,
-            dispatch_cache: &self.dispatch_cache,
-            vtable_ids: &self.vtable_ids,
-            interface_slot_targets: &self.interface_slot_targets,
-            interface_slot_summaries: &self.output.interface_slot_summaries,
-            coop_frame: None,
-            coop_suspend_points: None,
-            coop_result_offset: None,
-            async_frame: None,
-            async_frame_offsets: HashMap::new(),
-            lir_frame_offsets: HashMap::new(),
-            lir_confined_maps: false,
-            lir_defer_offsets: HashMap::new(),
-            lir_send_offsets: HashMap::new(),
-            main_result_err_ty: None,
-            vars: HashMap::new(),
-            current_class: None,
-            is_async: false,
-            terminated: false,
-            gc_root_count: 0,
-            root_reservation: None,
-            root_peak_count: 0,
-            temporary_root_slots: HashMap::new(),
-            enum_payload_layouts: &mut self.output.enum_payload_layouts,
-            coop_shadow_roots: None,
-            build_mode: self.build_mode,
-            source_file: &self.source_file,
-            diagnostic_function: String::new(),
-            diagnostic_async: false,
-            overflow_helper_literal: None,
-            stack_helper_established: false,
-            // Static initialisers hold no user body, so nothing takes an address.
-            address_taken: HashSet::new(),
-        };
+        let mut fg = FuncGen::new(&mut builder, self);
 
         // Register before ANY initializer can drive tasks, including initializers
         // in other modules that precede the mutable property's own initializer.
@@ -2481,7 +2320,7 @@ impl UnitCodegenContext<'_> {
         let ptr_ty = reference_type(fg.module.target_config());
         for item in items {
             // The expression body has already been resolved in its own unit.
-            fg.fault_site_span = Some(item.initializer.span);
+            fg.diagnostics.fault_site_span = Some(item.initializer.span);
             let callee = fg.func_ids[&item.initializer.name];
             let callee = fg.module.declare_func_in_func(callee, fg.builder.func);
             let depth = fg.emit_pre_user_call_panic_depth(&item.initializer.name);
@@ -2989,94 +2828,16 @@ impl UnitCodegenContext<'_> {
         builder.seal_block(entry_block);
         let panic_return_block = Some(builder.create_block());
 
-        let mut fg = FuncGen {
-            builder: &mut builder,
-            defer_stack: DeferStack::default(),
-            defer_counter: 0,
-            lir_reuse: None,
-            lir_nonnegative: Default::default(),
-            array_fault_spill: None,
-            sync_defer_flags: HashMap::new(),
-            panic_scopes: Default::default(),
-            unavailable_defer_ids: HashSet::new(),
-            sync_cancel_defer_context: 0,
-            panic_defer_codegen_depth: 0,
-            recover_eligible_depth: 0,
-            panic_recovery_targets: HashSet::new(),
-            panic_return_block,
-            panic_function_root_depth: None,
-            panic_depth_snapshot: None,
-            emitting_sync_cancel_cleanup: false,
-            sync_cancel_cleanups: HashMap::new(),
-            sync_native_active: None,
-            lir_cleanup_exit: None,
-            callstack_frame_depth: 0,
-            lir_call_frames: Vec::new(),
-            lir_reference_scopes: Vec::new(),
-            fault_site_span: None,
-            collected_defer_sites: Vec::new(),
-            lock_scopes: Default::default(),
-            collected_lock_sites: Vec::new(),
-            collected_cleanup_order: 0,
-            module: &mut self.output.module,
-            gc_bitmap_descriptors: &mut self.output.gc_bitmap_descriptors,
-            gc_layout_descriptors: &mut self.output.gc_layout_descriptors,
-            func_ids: &self.func_ids,
-            func_return_types: &self.func_return_types,
-            fn_types: &self.fn_types,
-            func_param_modes: &self.func_param_modes,
-            func_param_debug: &self.func_param_debug,
-            function_may_panic: &self.function_may_panic,
-            known_modules: &self.known_modules,
-            visible_modules: &self.visible_modules,
-            builtin_module_aliases: &self.builtin_module_aliases,
-            lambda_names: &self.lambda_names,
-            leaf_lambdas: &self.leaf_lambdas,
-            indirect_leaves: &self.indirect_leaves,
-            indirect_leaf_promoted: false,
-            string_literals: &self.output.string_literals,
-            classes: ClassView::new(&self.type_scope, &self.layout_queries),
-            static_storage: &self.static_storage,
-            enum_infos: &self.enum_infos,
-            class_descriptor_ids: &self.class_descriptor_ids,
-            dispatch_cache: &self.dispatch_cache,
-            vtable_ids: &self.vtable_ids,
-            interface_slot_targets: &self.interface_slot_targets,
-            interface_slot_summaries: &self.output.interface_slot_summaries,
-            coop_frame: None,
-            coop_suspend_points: None,
-            coop_result_offset: None,
-            async_frame: None,
-            async_frame_offsets: HashMap::new(),
-            lir_frame_offsets: HashMap::new(),
-            lir_confined_maps: false,
-            lir_defer_offsets: HashMap::new(),
-            lir_send_offsets: HashMap::new(),
-            main_result_err_ty: None,
-            vars: HashMap::new(),
-            current_class: Some(class_name),
-            // An async method returned above through `compile_cooperative_method`.
-            is_async: false,
-            terminated: false,
-            gc_root_count: 0,
-            root_reservation: None,
-            root_peak_count: 0,
-            temporary_root_slots: HashMap::new(),
-            enum_payload_layouts: &mut self.output.enum_payload_layouts,
-            coop_shadow_roots: None,
-            build_mode: self.build_mode,
-            source_file: &self.source_file,
-            diagnostic_function,
-            diagnostic_async: false,
-            overflow_helper_literal: None,
-            stack_helper_established: false,
-            address_taken: super::lir_address_taken_locals(&lir_fn),
-        };
+        let mut fg = FuncGen::new(&mut builder, self);
+        fg.cleanup.panic_return_block = panic_return_block;
+        fg.locals.current_class = Some(class_name);
+        fg.diagnostics.diagnostic_function = diagnostic_function;
+        fg.locals.address_taken = super::lir_address_taken_locals(&lir_fn);
         // Instance methods bind a rooted `self`, even for scalar bodies, unless
         // the body can never reach a safepoint (willow-8hq4.14).
         let unrooted = super::root_effect::is_safepoint_free_leaf(
             &lir_fn,
-            self.build_mode == BuildMode::Debug,
+            fg.diagnostics.build_mode == BuildMode::Debug,
         );
         if !unrooted {
             fg.begin_root_reservation();
@@ -3085,7 +2846,7 @@ impl UnitCodegenContext<'_> {
             && !unrooted
             && (!m.is_static || super::root_effect::may_push_gc_roots(&lir_fn))
         {
-            fg.panic_function_root_depth =
+            fg.cleanup.panic_function_root_depth =
                 Some(fg.emit_value_runtime_call("willow_root_depth", &[]));
         }
 
@@ -3116,7 +2877,7 @@ impl UnitCodegenContext<'_> {
                 slot: self_slot,
                 ty: receiver_ty,
             };
-            fg.vars.insert("self".to_string(), receiver_storage);
+            fg.locals.vars.insert("self".to_string(), receiver_storage);
         }
 
         // Bind remaining method params
@@ -3139,10 +2900,10 @@ impl UnitCodegenContext<'_> {
         }
         fg.emit_lir_function(&lir_fn);
 
-        if !fg.terminated {
+        if !fg.locals.terminated {
             // Pop any GC roots (self, params) before the implicit void return.
-            if fg.gc_root_count > 0 {
-                fg.emit_pop_roots_n(fg.gc_root_count);
+            if fg.roots.gc_root_count > 0 {
+                fg.emit_pop_roots_n(fg.roots.gc_root_count);
             }
             if call_return_type != Type::Void {
                 // Unreachable fall-through after a body that ends with an

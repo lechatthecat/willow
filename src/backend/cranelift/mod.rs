@@ -1405,30 +1405,70 @@ struct RootReservation {
     base: usize,
 }
 
+/// Per-function emitter with independently owned state for each responsibility.
+/// Unit metadata and shared object output remain borrowed, never copied.
 struct FuncGen<'a, 'b> {
     enum_payload_layouts: &'a mut HashMap<Type, HashMap<String, std::sync::Arc<EnumPayloadLayout>>>,
     builder: &'a mut FunctionBuilder<'b>,
     module: &'a mut ObjectModule,
     gc_bitmap_descriptors: &'a mut HashMap<Vec<u64>, (DataId, u64)>,
     gc_layout_descriptors: &'a mut HashMap<willow_abi::GcLayoutDescriptor, DataId>,
+    func_ids: &'a FunctionMap<'a, FuncId>,
+    func_return_types: &'a FunctionMap<'a, Type>,
+    fn_types: &'a FunctionMap<'a, Type>,
+    func_param_modes: &'a FunctionMap<'a, Vec<ParamMode>>,
+    func_param_debug: &'a FunctionMap<'a, Vec<ParamDebug>>,
+    function_may_panic: &'a FunctionMap<'a, bool>,
+    known_modules: &'a ModuleSymbols<'a>,
+    /// The module access names the file being compiled imports.
+    /// Read only to resolve a bare module class name, and read there because
+    /// eligibility resolves it from the same set.
+    visible_modules: &'a HashSet<String>,
+    /// Local alias -> canonical builtin schema module, for the file being
+    /// compiled. Only the LIR path reads it.
+    builtin_module_aliases: &'a HashMap<String, String>,
+    lambda_names: &'a HashMap<ExprId, FunctionId>,
+    leaf_lambdas: &'a HashSet<ExprId>,
+    indirect_leaves: &'a indirect_leaf::Candidates,
+    string_literals: &'a HashMap<String, StringLiteralData>,
+    /// This unit's alias-resolving view of the frozen class layouts, base
+    /// edges, runtime type ids, virtual slot orders and interface
+    /// compositions. The runtime id is not stored
+    /// inline in the object: word 0 points at the class DESCRIPTOR, which
+    /// holds the id at its own offset 0.
+    classes: ClassView<'a>,
+    static_storage: &'a TypeMap<'a, HashMap<String, StaticStorageInfo>>,
+    enum_infos: &'a TypeMap<'a, EnumInfo>,
+    /// Maps class name → its descriptor data symbol, the value stored in word 0
+    /// of every object of that class.
+    class_descriptor_ids: &'a TypeMap<'a, DataId>,
+    /// Shared across functions until scoped metadata changes.
+    dispatch_cache: &'a std::cell::RefCell<emit_interface::DispatchCache>,
+    /// Static `(class, interface)` vtable data objects for class→interface boxing.
+    vtable_ids: &'a VtableMap<'a, DataId>,
+    interface_slot_targets: &'a InterfaceSlotTargets,
+    interface_slot_summaries: &'a std::cell::RefCell<emit_interface::InterfaceAnalysis>,
+    cleanup: CleanupState,
+    reuse: LirReuseState,
+    diagnostics: FunctionDiagnostics<'a>,
+    suspension: SuspensionState,
+    locals: FunctionLocals<'a>,
+    roots: FunctionRoots,
+}
+
+#[derive(Default)]
+struct CleanupState {
     /// Lexical scope frames of registered `defer` actions: synthetic
     /// statements whose operands were already evaluated into hidden locals,
     /// plus (async only) the frame offset of the registration FLAG consumed
-    /// before cleanup begins (willow-s9ej.1).
+    /// before cleanup begins.
     defer_stack: DeferStack,
     defer_counter: usize,
-    /// Array loads the current GC-free run of LIR instructions can reuse;
-    /// `None` outside such a run (willow-nzsg).
-    lir_reuse: Option<transient_roots::LirReuse>,
-    lir_nonnegative: nonnegative::Proof,
-    /// Frame slot the array fault paths share for their operands; see
-    /// `emit_array_access` (willow-nzsg).
-    array_fault_spill: Option<cranelift_codegen::ir::StackSlot>,
     /// Pre-zeroed registration flags for synchronous defer sites in the
     /// lexical block currently being emitted, keyed by source span.
     sync_defer_flags: HashMap<crate::ir::lowered::LirDeferId, cranelift_codegen::ir::StackSlot>,
     /// Synchronous lexical scopes that are valid recovery continuations.
-    /// Async panic unwinding is deliberately deferred to willow-s9ej.6.
+    /// These continuations apply to synchronous panic unwinding.
     panic_scopes: Chain<PanicScope>,
     /// Defer registrations already consumed on the cleanup path currently
     /// being emitted. A nested panic must not execute them again.
@@ -1447,7 +1487,7 @@ struct FuncGen<'a, 'b> {
     panic_recovery_targets: HashSet<cranelift_codegen::ir::Block>,
     /// Shared abnormal return used by synchronous non-boundary functions.
     /// Callees return an ABI-safe neutral value while panic state remains
-    /// active; callers branch before observing that value (willow-s9ej.4).
+    /// active; callers branch before observing that value.
     panic_return_block: Option<cranelift_codegen::ir::Block>,
     /// Shadow-root depth inherited from the caller at function entry. Omitted
     /// for synchronous bodies proven unable to push roots (root_effect).
@@ -1461,6 +1501,34 @@ struct FuncGen<'a, 'b> {
     /// task stacks) known to dominate the current LIR block.
     sync_native_active: Option<cranelift_codegen::ir::Value>,
     lir_cleanup_exit: Option<(cranelift_codegen::ir::Block, usize, bool)>,
+    /// Async defer sites recorded while emitting a poll fn — consumed by the
+    /// generated cancel entry.
+    collected_defer_sites: Vec<AsyncDeferSite>,
+    /// `lock` critical sections enclosing the code currently being emitted,
+    /// outermost first.
+    lock_scopes: Chain<CoopLockScope>,
+    /// Every `lock` site seen while emitting a poll fn — consumed by the
+    /// generated cancel entry, which has no lexical context of its own.
+    collected_lock_sites: Vec<AsyncLockSite>,
+    /// Monotonic sequence shared by `collected_defer_sites` and
+    /// `collected_lock_sites`, so the cancel entry can merge them back into one
+    /// reverse-lexical cleanup order.
+    collected_cleanup_order: usize,
+}
+
+#[derive(Default)]
+struct LirReuseState {
+    /// Array loads the current GC-free run of LIR instructions can reuse;
+    /// `None` outside such a run.
+    lir_reuse: Option<transient_roots::LirReuse>,
+    lir_nonnegative: nonnegative::Proof,
+    /// Frame slot the array fault paths share for their operands; see
+    /// `emit_array_access`.
+    array_fault_spill: Option<cranelift_codegen::ir::StackSlot>,
+    indirect_leaf_promoted: bool,
+}
+
+struct FunctionDiagnostics<'a> {
     /// Debug call-chain frames installed by this generated function and not
     /// yet popped on the source path currently being emitted.
     callstack_frame_depth: usize,
@@ -1472,70 +1540,36 @@ struct FuncGen<'a, 'b> {
     /// the runtime fault site before every runtime call that can raise, so a
     /// fault with no location of its own (array bounds, a blocked channel op,
     /// an awaited cancelled task) still records `file:line:column` in its
-    /// `PanicInfo` (willow-s9ej.7).
+    /// `PanicInfo`.
     fault_site_span: Option<crate::diagnostics::Span>,
-    /// Async defer sites recorded while emitting a poll fn — consumed by the
-    /// generated cancel entry.
-    collected_defer_sites: Vec<AsyncDeferSite>,
-    /// `lock` critical sections enclosing the code currently being emitted,
-    /// outermost first (willow-38w.1.4).
-    lock_scopes: Chain<CoopLockScope>,
-    /// Every `lock` site seen while emitting a poll fn — consumed by the
-    /// generated cancel entry, which has no lexical context of its own.
-    collected_lock_sites: Vec<AsyncLockSite>,
-    /// Monotonic sequence shared by `collected_defer_sites` and
-    /// `collected_lock_sites`, so the cancel entry can merge them back into one
-    /// reverse-lexical cleanup order (willow-38w.1.4 review).
-    collected_cleanup_order: usize,
-    func_ids: &'a FunctionMap<'a, FuncId>,
-    func_return_types: &'a FunctionMap<'a, Type>,
-    fn_types: &'a FunctionMap<'a, Type>,
-    func_param_modes: &'a FunctionMap<'a, Vec<ParamMode>>,
-    func_param_debug: &'a FunctionMap<'a, Vec<ParamDebug>>,
-    function_may_panic: &'a FunctionMap<'a, bool>,
-    known_modules: &'a ModuleSymbols<'a>,
-    /// The module access names the file being compiled imports (willow-vtlr).
-    /// Read only to resolve a bare module class name, and read there because
-    /// eligibility resolves it from the same set.
-    visible_modules: &'a HashSet<String>,
-    /// Local alias -> canonical builtin schema module, for the file being
-    /// compiled (willow-nswv). Only the LIR path reads it.
-    builtin_module_aliases: &'a HashMap<String, String>,
-    lambda_names: &'a HashMap<ExprId, FunctionId>,
-    leaf_lambdas: &'a HashSet<ExprId>,
-    indirect_leaves: &'a indirect_leaf::Candidates,
-    indirect_leaf_promoted: bool,
-    string_literals: &'a HashMap<String, StringLiteralData>,
-    /// This unit's alias-resolving view of the frozen class layouts, base
-    /// edges, runtime type ids, virtual slot orders and interface
-    /// compositions. Since willow-fm7t the runtime id is no longer stored
-    /// inline in the object: word 0 points at the class DESCRIPTOR, which
-    /// holds the id at its own offset 0.
-    classes: ClassView<'a>,
-    static_storage: &'a TypeMap<'a, HashMap<String, StaticStorageInfo>>,
-    enum_infos: &'a TypeMap<'a, EnumInfo>,
-    /// Maps class name → its descriptor data symbol, the value stored in word 0
-    /// of every object of that class (willow-fm7t).
-    class_descriptor_ids: &'a TypeMap<'a, DataId>,
-    /// Shared across functions until scoped metadata changes.
-    dispatch_cache: &'a std::cell::RefCell<emit_interface::DispatchCache>,
-    /// Static `(class, interface)` vtable data objects for class→interface boxing.
-    vtable_ids: &'a VtableMap<'a, DataId>,
-    interface_slot_targets: &'a InterfaceSlotTargets,
-    interface_slot_summaries: &'a std::cell::RefCell<emit_interface::InterfaceAnalysis>,
+    /// Build mode for source locations, call stacks, and debug instrumentation.
+    build_mode: BuildMode,
+    /// Source file path used in runtime diagnostics.
+    source_file: &'a str,
+    /// Source-level owner of diagnostic locations (including class qualification).
+    diagnostic_function: String,
+    diagnostic_async: bool,
+    overflow_helper_literal: Option<DataId>,
+    /// A proven runtime-only body has published its marker at entry; no body
+    /// operation can replace it, so subsequent runtime calls need no store.
+    stack_helper_established: bool,
+}
+
+#[derive(Default)]
+struct SuspensionState {
     /// When emitting a cooperative poll fn: the async frame pointer, so a
     /// `return` inside nested statement control flow (e.g. a statement-position
-    /// match arm, willow-zvkv) stores the result and returns the Ready status
+    /// match arm) stores the result and returns the Ready status
     /// instead of a future pointer.
     coop_frame: Option<cranelift_codegen::ir::Value>,
     coop_suspend_points: Option<CoopSuspendPoints>,
     /// Byte offset of the poll frame's `__result` slot, when it has one.
     coop_result_offset: Option<i32>,
     /// Base pointer of this function's heap async frame, if one was allocated
-    /// (async fns with values that must survive `await`; willow-lpn.5a).
+    /// (async fns with values that must survive `await`).
     async_frame: Option<cranelift_codegen::ir::Value>,
     /// For an async fn with a frame: maps each GC-managed frame-backed name
-    /// (param or annotated local) to its byte offset in the frame (willow-lpn.5b).
+    /// (param or annotated local) to its byte offset in the frame.
     async_frame_offsets: HashMap<crate::diagnostics::Span, i32>,
     /// LIR-owned async frame slots. This is the identity map used by the LIR
     /// poll emitter; source spans remain available only for diagnostics.
@@ -1543,13 +1577,26 @@ struct FuncGen<'a, 'b> {
     lir_confined_maps: bool,
     lir_defer_offsets: HashMap<crate::ir::lowered::LirDeferId, i32>,
     lir_send_offsets: HashMap<crate::ir::lowered::LirLocalId, i32>,
+}
+
+#[derive(Default)]
+struct FunctionLocals<'a> {
     /// When compiling `fn main() -> Result<void, E>`: the error payload type `E`.
-    /// Each return inspects the Result and exits accordingly (willow-exg).
+    /// Each return inspects the Result and exits accordingly.
     main_result_err_ty: Option<Type>,
     vars: HashMap<String, VarStorage>,
     current_class: Option<&'a str>,
     is_async: bool,
     terminated: bool,
+    /// Locals of this function whose address is taken by some `&place`
+    /// argument. They are bound to a stack slot at their declaration instead of
+    /// to an SSA variable, so the slot exists on every path and is written
+    /// exactly where the binding says.
+    address_taken: HashSet<String>,
+}
+
+#[derive(Default)]
+struct FunctionRoots {
     /// Number of GC roots currently on the root stack for this function invocation.
     gc_root_count: usize,
     root_reservation: Option<RootReservation>,
@@ -1562,22 +1609,6 @@ struct FuncGen<'a, 'b> {
     /// resumed poll can register the fresh invocation's corresponding slots.
     /// `None` outside a cooperative poll function.
     coop_shadow_roots: Option<CoopShadowRoots>,
-    /// Build mode for source locations, call stacks, and debug instrumentation.
-    build_mode: BuildMode,
-    /// Source file path used in runtime diagnostics.
-    source_file: &'a str,
-    /// Source-level owner of diagnostic locations (including class qualification).
-    diagnostic_function: String,
-    diagnostic_async: bool,
-    overflow_helper_literal: Option<DataId>,
-    /// A proven runtime-only body has published its marker at entry; no body
-    /// operation can replace it, so subsequent runtime calls need no store.
-    stack_helper_established: bool,
-    /// Locals of this function whose address is taken by some `&place`
-    /// argument. They are bound to a stack slot at their declaration instead of
-    /// to an SSA variable, so the slot exists on every path and is written
-    /// exactly where the binding says (willow-0g8j.2.17).
-    address_taken: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -1650,7 +1681,7 @@ enum VarStorage {
     },
     /// A slot inside the heap async frame (willow-lpn.5a). `offset` is the byte
     /// offset of the slot from the frame base; the frame base lives in
-    /// `FuncGen.async_frame`. Used for values that must survive `await`.
+    /// `FuncGen.suspension.async_frame`. Used for values that must survive `await`.
     Frame {
         offset: i32,
         ty: Type,
@@ -1695,6 +1726,60 @@ fn async_frame_slot_offset(n: usize, pointer_bytes: u32) -> i32 {
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    /// All entry paths start with the same empty emission state. Callers only
+    /// supply the state specific to their body, poll entry or cancellation entry.
+    /// Async bodies use the cooperative poll path, so `is_async` starts false
+    /// even when the diagnostic owner is an async source function.
+    fn new(builder: &'a mut FunctionBuilder<'b>, unit: &'a mut UnitCodegenContext<'_>) -> Self {
+        Self {
+            builder,
+            module: &mut unit.output.module,
+            gc_bitmap_descriptors: &mut unit.output.gc_bitmap_descriptors,
+            gc_layout_descriptors: &mut unit.output.gc_layout_descriptors,
+            func_ids: &unit.func_ids,
+            func_return_types: &unit.func_return_types,
+            fn_types: &unit.fn_types,
+            func_param_modes: &unit.func_param_modes,
+            func_param_debug: &unit.func_param_debug,
+            function_may_panic: &unit.function_may_panic,
+            known_modules: &unit.known_modules,
+            visible_modules: &unit.visible_modules,
+            builtin_module_aliases: &unit.builtin_module_aliases,
+            lambda_names: &unit.lambda_names,
+            leaf_lambdas: &unit.leaf_lambdas,
+            indirect_leaves: &unit.indirect_leaves,
+            string_literals: &unit.output.string_literals,
+            classes: ClassView::new(&unit.type_scope, &unit.layout_queries),
+            static_storage: &unit.static_storage,
+            enum_infos: &unit.enum_infos,
+            class_descriptor_ids: &unit.class_descriptor_ids,
+            dispatch_cache: &unit.dispatch_cache,
+            vtable_ids: &unit.vtable_ids,
+            interface_slot_targets: &unit.interface_slot_targets,
+            interface_slot_summaries: &unit.output.interface_slot_summaries,
+            enum_payload_layouts: &mut unit.output.enum_payload_layouts,
+            cleanup: CleanupState::default(),
+            reuse: LirReuseState::default(),
+            diagnostics: FunctionDiagnostics {
+                callstack_frame_depth: 0,
+                lir_call_frames: Vec::new(),
+                lir_reference_scopes: Vec::new(),
+                fault_site_span: None,
+                build_mode: unit.build_mode,
+                source_file: &unit.source_file,
+                diagnostic_function: String::new(),
+                diagnostic_async: false,
+                overflow_helper_literal: None,
+                stack_helper_established: false,
+            },
+            suspension: SuspensionState::default(),
+            locals: FunctionLocals::default(),
+            roots: FunctionRoots::default(),
+        }
+    }
+}
+
+impl<'a, 'b> FuncGen<'a, 'b> {
     /// Cranelift 0.134 requires the target pointer type when lowering the
     /// implicit address calculation performed by stack-slot loads/stores.
     fn stack_load(
@@ -1711,7 +1796,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value: cranelift_codegen::ir::Value,
         slot: cranelift_codegen::ir::StackSlot,
     ) {
-        if let Some(reuse) = &mut self.lir_reuse {
+        if let Some(reuse) = &mut self.reuse.lir_reuse {
             reuse.slots.remove(&slot);
         }
         let ptr_ty = reference_type(self.module.target_config());
@@ -1774,7 +1859,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn bind_unrooted_param(&mut self, name: &str, ty: &Type, val: cranelift_codegen::ir::Value) {
         let var = self.builder.declare_var(self.clif_type(ty));
         self.builder.def_var(var, val);
-        self.vars
+        self.locals
+            .vars
             .insert(name.to_string(), VarStorage::Value { var });
     }
 
@@ -1796,7 +1882,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 ));
                 self.stack_store(val, slot);
                 self.emit_push_root_slot(slot);
-                self.vars.insert(
+                self.locals.vars.insert(
                     name.to_string(),
                     VarStorage::Stack {
                         slot,
@@ -1804,19 +1890,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     },
                 );
             }
-            ParamMode::Value if self.address_taken.contains(name) => {
+            ParamMode::Value if self.locals.address_taken.contains(name) => {
                 // The body passes `&name` somewhere, so the parameter needs an
                 // address that exists from entry rather than one conjured at
                 // whichever `&` the control flow happens to reach first.
                 let storage = self.create_local_stack_slot(ty, val);
-                self.vars.insert(name.to_string(), storage);
+                self.locals.vars.insert(name.to_string(), storage);
             }
             ParamMode::Value => self.bind_unrooted_param(name, ty, val),
             ParamMode::Reference { .. } => {
                 let ptr_ty = reference_type(self.module.target_config());
                 let var = self.builder.declare_var(ptr_ty);
                 self.builder.def_var(var, val);
-                self.vars.insert(
+                self.locals.vars.insert(
                     name.to_string(),
                     VarStorage::ReferencePtr {
                         var,
@@ -1838,10 +1924,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         offset: i32,
     ) {
         let base = self
+            .suspension
             .async_frame
             .expect("bind_param_framed requires an allocated async frame");
         self.emit_gc_heap_store(base, offset, val, ty, GcStoreDestination::AsyncFrameSlot);
-        self.vars.insert(
+        self.locals.vars.insert(
             name.to_string(),
             VarStorage::Frame {
                 offset,
@@ -1891,6 +1978,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             VarStorage::Frame { offset, ty } => {
                 let base = self
+                    .suspension
                     .async_frame
                     .expect("frame-backed var requires an allocated async frame");
                 self.builder.ins().load(
@@ -1921,6 +2009,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             VarStorage::Frame { offset, ty } => {
                 let base = self
+                    .suspension
                     .async_frame
                     .expect("frame-backed var requires an allocated async frame");
                 self.emit_gc_heap_store(base, *offset, val, ty, GcStoreDestination::AsyncFrameSlot);
@@ -1939,7 +2028,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     fn frame_reference_cell(&mut self, offset: i32) -> cranelift_codegen::ir::Value {
         self.builder.ins().iadd_imm_s(
-            self.async_frame.expect("reference frame"),
+            self.suspension.async_frame.expect("reference frame"),
             i64::from(offset),
         )
     }
@@ -2037,7 +2126,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     fn static_call_class_name(&self, class_name: &str) -> String {
         if class_name == "Self" {
-            self.current_class.unwrap_or(class_name).to_string()
+            self.locals.current_class.unwrap_or(class_name).to_string()
         } else {
             class_name.to_string()
         }

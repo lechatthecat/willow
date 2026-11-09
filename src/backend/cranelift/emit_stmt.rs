@@ -27,8 +27,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// before its body is emitted, so reversing this sequence produces
     /// `body defers -> lock cleanup -> enclosing defers`.
     pub(super) fn next_cleanup_order(&mut self) -> usize {
-        let order = self.collected_cleanup_order;
-        self.collected_cleanup_order = self
+        let order = self.cleanup.collected_cleanup_order;
+        self.cleanup.collected_cleanup_order = self
+            .cleanup
             .collected_cleanup_order
             .checked_add(1)
             .expect("async cleanup order overflow");
@@ -39,17 +40,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// first, newest registration first (LIFO). Frames are left in place —
     /// scope bookkeeping pops them (willow-vynv.2).
     pub(super) fn emit_flush_defers_from(&mut self, depth: usize) {
-        let frames = self.defer_stack.frames.clone();
-        let frame_count = self.defer_stack.len();
-        let locks = self.lock_scopes.clone();
+        let frames = self.cleanup.defer_stack.frames.clone();
+        let frame_count = self.cleanup.defer_stack.len();
+        let locks = self.cleanup.lock_scopes.clone();
         let mut locks = locks.iter_rev().peekable();
-        let unavailable_before = self.unavailable_defer_ids.clone();
-        let cancel_context_before = self.sync_cancel_defer_context;
+        let unavailable_before = self.cleanup.unavailable_defer_ids.clone();
+        let cancel_context_before = self.cleanup.sync_cancel_defer_context;
         // Each registration is emitted under the bindings it captured, so the
         // flush rewrites `vars`. Whatever comes after it — the `return` whose
         // value was bound AFTER the registration, the rest of an enclosing
         // scope — still expects its own bindings (willow-0g8j.2.15).
-        let vars_before = self.vars.clone();
+        let vars_before = self.locals.vars.clone();
         'frames: for (index, (frame, guarded)) in
             frames.iter_rev().take(frame_count - depth).enumerate()
         {
@@ -60,11 +61,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // `?`, `break` and `continue` all reach here (willow-38w.1.4).
             let lock_depth = frame_count - index - 1;
             for entry in frame.iter_rev() {
-                if self.unavailable_defer_ids.contains(&entry.id) {
+                if self.cleanup.unavailable_defer_ids.contains(&entry.id) {
                     continue;
                 }
                 let flag = if let (Some(off), Some(frame_ptr)) =
-                    (entry.flag_offset, self.coop_frame)
+                    (entry.flag_offset, self.suspension.coop_frame)
                 {
                     Some(
                         self.builder
@@ -89,20 +90,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Consume before entering user code. If this action panics, its
                 // nested unwind sees the registration as unavailable and cannot
                 // execute it a second time.
-                self.unavailable_defer_ids.insert(entry.id);
-                self.sync_cancel_defer_context = self.defer_stack.fresh_identity();
-                self.vars = (*entry.vars_at_registration).clone();
+                self.cleanup.unavailable_defer_ids.insert(entry.id);
+                self.cleanup.sync_cancel_defer_context = self.cleanup.defer_stack.fresh_identity();
+                self.locals.vars = (*entry.vars_at_registration).clone();
                 // Rebind the hidden frame operands: coop loop bodies restore
                 // `vars`, wiping the names between registration and a
                 // function-exit flush (willow-vynv.3).
                 for (name, storage) in entry.bindings.iter() {
-                    self.vars.insert(name.clone(), storage.clone());
+                    self.locals.vars.insert(name.clone(), storage.clone());
                 }
                 // Async: leave REGISTERED before entering user cleanup code.
                 // A future recoverable panic may unwind out of that code; if
                 // the flag stayed set until afterwards, cancellation/recovery
                 // could run this same registration twice (willow-s9ej.1).
-                if let (Some(off), Some(frame_ptr)) = (entry.flag_offset, self.coop_frame) {
+                if let (Some(off), Some(frame_ptr)) =
+                    (entry.flag_offset, self.suspension.coop_frame)
+                {
                     let zero = self.builder.ins().iconst(types::I64, 0);
                     self.builder
                         .ins()
@@ -119,18 +122,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // cleanup could steal its caller's panic (willow-s9ej.7). Only
                 // the cleanup emitted for the unwinding scope itself may
                 // recover; here `recover()` lowers to a constant `None`.
-                let eligible_before = self.recover_eligible_depth;
-                self.recover_eligible_depth = 0;
+                let eligible_before = self.cleanup.recover_eligible_depth;
+                self.cleanup.recover_eligible_depth = 0;
                 self.emit_deferred_action(&entry.action, entry.flag_offset);
-                self.recover_eligible_depth = eligible_before;
+                self.cleanup.recover_eligible_depth = eligible_before;
                 if let Some(inactive) = inactive {
-                    if !self.terminated {
+                    if !self.locals.terminated {
                         self.builder.ins().jump(inactive, &[]);
                     }
                     self.builder.switch_to_block(inactive);
                     self.builder.seal_block(inactive);
-                    self.terminated = false;
-                } else if self.terminated {
+                    self.locals.terminated = false;
+                } else if self.locals.terminated {
                     break 'frames;
                 }
             }
@@ -138,15 +141,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // releases the lock itself; releasing here too would be dead code
             // after a block terminator.
             while let Some(lock) = locks.peek().filter(|lock| lock.defer_depth >= lock_depth) {
-                if lock.defer_depth == lock_depth && !self.terminated {
+                if lock.defer_depth == lock_depth && !self.locals.terminated {
                     self.emit_lock_scope_release(lock);
                 }
                 locks.next();
             }
         }
-        self.unavailable_defer_ids = unavailable_before;
-        self.sync_cancel_defer_context = cancel_context_before;
-        self.vars = vars_before;
+        self.cleanup.unavailable_defer_ids = unavailable_before;
+        self.cleanup.sync_cancel_defer_context = cancel_context_before;
+        self.locals.vars = vars_before;
     }
 
     /// Commit and release every `lock` whose critical section owns the defer
@@ -158,10 +161,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// releases exactly once at run time. Ownership is proven by the token, so
     /// a stale release can never steal a lock a later task now owns.
     pub(super) fn emit_lock_release_at_depth(&mut self, depth: usize) {
-        if self.terminated || self.lock_scopes.is_empty() {
+        if self.locals.terminated || self.cleanup.lock_scopes.is_empty() {
             return;
         }
         let scopes: Vec<super::CoopLockScope> = self
+            .cleanup
             .lock_scopes
             .iter_rev()
             .take_while(|scope| scope.defer_depth >= depth)
@@ -211,6 +215,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let [handle_offset, token_offset, phase_offset, value_offset] = frame_offsets;
         let frame = self
+            .suspension
             .async_frame
             .expect("lock cleanup requires its compiler-generated async frame");
         let handle = self.builder.ins().load(
@@ -369,6 +374,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) {
         let [handle_offset, token_offset, phase_offset, _] = frame_offsets;
         let frame = self
+            .suspension
             .async_frame
             .expect("lock group cleanup requires its async frame");
         let group = self
@@ -496,8 +502,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         flag_offset: Option<i32>,
     ) {
         if let (Some(frame), Some(mut suspends), Some(flag)) = (
-            self.coop_frame,
-            self.coop_suspend_points.clone(),
+            self.suspension.coop_frame,
+            self.suspension.coop_suspend_points.clone(),
             flag_offset,
         ) && super::lir_gen::cleanup_needs_task_stack(&action.function)
         {
@@ -507,7 +513,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let symbol = super::lir_gen::task_cleanup_symbol(
                 name.index,
                 flag,
-                self.recover_eligible_depth > 0,
+                self.cleanup.recover_eligible_depth > 0,
             );
             self.emit_task_boundary(None, &symbol, &mut suspends, frame);
         } else {
@@ -629,13 +635,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     pub(super) fn emit_sync_cancel_check(&mut self) {
-        if self.emitting_sync_cancel_cleanup {
+        if self.cleanup.emitting_sync_cancel_cleanup {
             return;
         }
         // Synchronous main/thread execution has no cancellable native task.
         // Nested scheduler drives restore the enclosing native context, so
         // the activity value obtained before a user call is still valid here.
-        let resume = self.sync_native_active.map(|active| {
+        let resume = self.cleanup.sync_native_active.map(|active| {
             let check = self.builder.create_block();
             self.builder.set_cold_block(check);
             let resume = self.builder.create_block();
@@ -661,32 +667,32 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_sync_cancel_branch(&mut self, cancelled: cranelift_codegen::ir::Value) {
-        if self.emitting_sync_cancel_cleanup {
+        if self.cleanup.emitting_sync_cancel_cleanup {
             return;
         }
         // Poll-shaped entries can resume in the middle of a cleanup, so only
         // ordinary synchronous functions share this terminal path.
-        let key = (self.async_frame.is_none()
-            && self.coop_frame.is_none()
-            && self.panic_return_block.is_some())
+        let key = (self.suspension.async_frame.is_none()
+            && self.suspension.coop_frame.is_none()
+            && self.cleanup.panic_return_block.is_some())
         .then(|| SyncCancelCleanupKey {
-            defers: self.defer_stack.identity,
-            consumed: self.sync_cancel_defer_context,
+            defers: self.cleanup.defer_stack.identity,
+            consumed: self.cleanup.sync_cancel_defer_context,
             // A lexical cleanup block identifies its entire enclosing chain.
-            panic_target: self.panic_scopes.last().map(|scope| scope.cleanup),
-            roots: self.gc_root_count,
-            panic_depth: self.panic_defer_codegen_depth,
-            recover_depth: self.recover_eligible_depth,
-            call_depth: self.callstack_frame_depth,
-            reference_depth: self.lir_reference_scopes.len(),
-            native_active: self.sync_native_active.is_some(),
+            panic_target: self.cleanup.panic_scopes.last().map(|scope| scope.cleanup),
+            roots: self.roots.gc_root_count,
+            panic_depth: self.cleanup.panic_defer_codegen_depth,
+            recover_depth: self.cleanup.recover_eligible_depth,
+            call_depth: self.diagnostics.callstack_frame_depth,
+            reference_depth: self.diagnostics.lir_reference_scopes.len(),
+            native_active: self.cleanup.sync_native_active.is_some(),
         });
         let resume = self.builder.create_block();
-        let active_arg = self.sync_native_active.map(Into::into);
+        let active_arg = self.cleanup.sync_native_active.map(Into::into);
         let args = active_arg.as_slice();
         if let Some(unwind) = key
             .as_ref()
-            .and_then(|key| self.sync_cancel_cleanups.get(key))
+            .and_then(|key| self.cleanup.sync_cancel_cleanups.get(key))
         {
             self.builder
                 .ins()
@@ -697,7 +703,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let unwind = self.builder.create_block();
         self.builder.set_cold_block(unwind);
-        let active_before = self.sync_native_active;
+        let active_before = self.cleanup.sync_native_active;
         if key.is_some() {
             if let Some(active) = active_before {
                 self.builder
@@ -712,19 +718,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(unwind);
         if let Some(key) = key {
             // Seal with the function, after every equivalent edge is emitted.
-            self.sync_cancel_cleanups.insert(key, unwind);
+            self.cleanup.sync_cancel_cleanups.insert(key, unwind);
             if active_before.is_some() {
-                self.sync_native_active = Some(self.builder.block_params(unwind)[0]);
+                self.cleanup.sync_native_active = Some(self.builder.block_params(unwind)[0]);
             }
         } else {
             self.builder.seal_block(unwind);
         }
-        let roots_before = self.gc_root_count;
-        let defer_depth_before = self.panic_defer_codegen_depth;
-        let eligible_depth_before = self.recover_eligible_depth;
-        let callstack_depth_before = self.callstack_frame_depth;
-        let prepared_frames_before = std::mem::take(&mut self.lir_call_frames);
-        let reference_scopes_before = std::mem::take(&mut self.lir_reference_scopes);
+        let roots_before = self.roots.gc_root_count;
+        let defer_depth_before = self.cleanup.panic_defer_codegen_depth;
+        let eligible_depth_before = self.cleanup.recover_eligible_depth;
+        let callstack_depth_before = self.diagnostics.callstack_frame_depth;
+        let prepared_frames_before = std::mem::take(&mut self.diagnostics.lir_call_frames);
+        let reference_scopes_before = std::mem::take(&mut self.diagnostics.lir_reference_scopes);
         for _ in 0..defer_depth_before {
             self.emit_void_runtime_call("willow_panic_leave_defer", &[]);
         }
@@ -734,11 +740,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for _ in 0..reference_scopes_before.len() {
             self.emit_debug_reference_call_clear();
         }
-        self.panic_defer_codegen_depth = 0;
-        self.recover_eligible_depth = 0;
-        self.emitting_sync_cancel_cleanup = true;
+        self.cleanup.panic_defer_codegen_depth = 0;
+        self.cleanup.recover_eligible_depth = 0;
+        self.cleanup.emitting_sync_cancel_cleanup = true;
         self.emit_void_runtime_call("willow_sync_cleanup_enter", &[]);
-        if self.coop_frame.is_some() {
+        if self.suspension.coop_frame.is_some() {
             // The runtime invokes this poll's collected cleanup entry, whose
             // frame flags cover every registration on the actual runtime path.
             self.emit_void_runtime_call("willow_sync_poll_cancel_cleanup", &[]);
@@ -746,7 +752,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // Cancellation abandons this poll rather than resuming at a LIR
             // suspension point. Constructor/call temporaries can still be
             // rooted here; pop them together with lexical binding roots.
-            self.emit_pop_roots_n(self.gc_root_count);
+            self.emit_pop_roots_n(self.roots.gc_root_count);
             // Cleanup can raise a panic even while cancellation is sticky.
             // Publish that outcome before the scheduler wakes any awaiter.
             let active = self.emit_value_runtime_call("willow_panic_active", &[]);
@@ -754,9 +760,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let panicked = self.builder.ins().iconst(types::I32, COOP_POLL_PANICKED);
             let outcome = self.builder.ins().select(active, panicked, ready);
             self.builder.ins().return_(&[outcome]);
-        } else if let Some(return_block) = self.panic_return_block {
+        } else if let Some(return_block) = self.cleanup.panic_return_block {
             self.emit_flush_defers_from(0);
-            if !self.terminated {
+            if !self.locals.terminated {
                 self.emit_void_runtime_call("willow_sync_cleanup_leave", &[]);
                 self.builder.ins().jump(return_block, &[]);
             }
@@ -766,31 +772,31 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_void_runtime_call("willow_sync_cleanup_leave", &[]);
             self.builder.ins().jump(resume, &[]);
         }
-        self.emitting_sync_cancel_cleanup = false;
-        self.gc_root_count = roots_before;
-        self.panic_defer_codegen_depth = defer_depth_before;
-        self.recover_eligible_depth = eligible_depth_before;
-        self.callstack_frame_depth = callstack_depth_before;
-        self.lir_call_frames = prepared_frames_before;
-        self.lir_reference_scopes = reference_scopes_before;
-        self.sync_native_active = active_before;
+        self.cleanup.emitting_sync_cancel_cleanup = false;
+        self.roots.gc_root_count = roots_before;
+        self.cleanup.panic_defer_codegen_depth = defer_depth_before;
+        self.cleanup.recover_eligible_depth = eligible_depth_before;
+        self.diagnostics.callstack_frame_depth = callstack_depth_before;
+        self.diagnostics.lir_call_frames = prepared_frames_before;
+        self.diagnostics.lir_reference_scopes = reference_scopes_before;
+        self.cleanup.sync_native_active = active_before;
         self.builder.switch_to_block(resume);
         self.builder.seal_block(resume);
-        self.terminated = false;
+        self.locals.terminated = false;
     }
 
     /// Branch an already-raised synchronous language panic to the nearest
     /// shared lexical cleanup. The cleanup flags, rather than duplicated AST,
     /// decide which registrations were active at this exact panic site.
     pub(super) fn emit_sync_panic_unwind(&mut self) {
-        if self.emitting_sync_cancel_cleanup {
+        if self.cleanup.emitting_sync_cancel_cleanup {
             // A panic exits the cancellation cleanup path before its normal
             // epilogue. Balance suppression even if a defer later recovers it.
             self.emit_void_runtime_call("willow_sync_cleanup_leave", &[]);
         }
-        let codegen_depth_before = self.panic_defer_codegen_depth;
-        let eligible_depth_before = self.recover_eligible_depth;
-        let callstack_depth_before = self.callstack_frame_depth;
+        let codegen_depth_before = self.cleanup.panic_defer_codegen_depth;
+        let eligible_depth_before = self.cleanup.recover_eligible_depth;
+        let callstack_depth_before = self.diagnostics.callstack_frame_depth;
         for _ in 0..codegen_depth_before {
             self.emit_void_runtime_call("willow_panic_leave_defer", &[]);
         }
@@ -799,29 +805,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for _ in 0..callstack_depth_before {
             self.emit_callstack_pop();
         }
-        for _ in 0..self.lir_reference_scopes.len() {
+        for _ in 0..self.diagnostics.lir_reference_scopes.len() {
             self.emit_debug_reference_call_clear();
         }
-        self.panic_defer_codegen_depth = 0;
-        self.recover_eligible_depth = 0;
-        if let Some(scope) = self.panic_scopes.last() {
+        self.cleanup.panic_defer_codegen_depth = 0;
+        self.cleanup.recover_eligible_depth = 0;
+        if let Some(scope) = self.cleanup.panic_scopes.last() {
             self.builder.ins().jump(scope.cleanup, &[]);
-        } else if let Some(panic_return) = self.panic_return_block {
+        } else if let Some(panic_return) = self.cleanup.panic_return_block {
             self.builder.ins().jump(panic_return, &[]);
         } else {
-            if self.coop_frame.is_some() {
+            if self.suspension.coop_frame.is_some() {
                 self.emit_unhandled_panic_exit();
             } else {
-                if self.gc_root_count > 0 {
-                    self.emit_pop_roots_n(self.gc_root_count);
+                if self.roots.gc_root_count > 0 {
+                    self.emit_pop_roots_n(self.roots.gc_root_count);
                 }
                 self.emit_unhandled_panic_exit();
             }
         }
-        self.panic_defer_codegen_depth = codegen_depth_before;
-        self.recover_eligible_depth = eligible_depth_before;
-        self.callstack_frame_depth = callstack_depth_before;
-        self.terminated = true;
+        self.cleanup.panic_defer_codegen_depth = codegen_depth_before;
+        self.cleanup.recover_eligible_depth = eligible_depth_before;
+        self.diagnostics.callstack_frame_depth = callstack_depth_before;
+        self.locals.terminated = true;
     }
 
     /// Emit one shared panic cleanup block for a defer-owning lexical scope.
@@ -829,30 +835,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// flags. Both consume a registration before user cleanup, so a nested
     /// panic cannot run the same action twice.
     pub(super) fn emit_shared_panic_cleanup(&mut self, scope: &super::PanicScope) {
-        let vars_before = self.vars.clone();
+        let vars_before = self.locals.vars.clone();
         // Every incoming panic edge already removed the function-owned frames.
         // Cleanup calls therefore start with an empty native debug stack suffix.
-        let prepared_frames_before = std::mem::take(&mut self.lir_call_frames);
-        let reference_scopes_before = std::mem::take(&mut self.lir_reference_scopes);
-        let callstack_depth_before = std::mem::replace(&mut self.callstack_frame_depth, 0);
-        let roots_before = self.gc_root_count;
+        let prepared_frames_before = std::mem::take(&mut self.diagnostics.lir_call_frames);
+        let reference_scopes_before = std::mem::take(&mut self.diagnostics.lir_reference_scopes);
+        let callstack_depth_before =
+            std::mem::replace(&mut self.diagnostics.callstack_frame_depth, 0);
+        let roots_before = self.roots.gc_root_count;
         let coop_active_before = self
+            .roots
             .coop_shadow_roots
             .as_ref()
             .map(|roots| roots.active.clone());
-        let unavailable_before = self.unavailable_defer_ids.clone();
-        let codegen_depth_before = self.panic_defer_codegen_depth;
-        let eligible_depth_before = self.recover_eligible_depth;
+        let unavailable_before = self.cleanup.unavailable_defer_ids.clone();
+        let codegen_depth_before = self.cleanup.panic_defer_codegen_depth;
+        let eligible_depth_before = self.cleanup.recover_eligible_depth;
 
         self.builder.switch_to_block(scope.cleanup);
-        self.terminated = false;
+        self.locals.terminated = false;
         // Every incoming unwind removed this function's active panic-defer
         // suffix. Enclosing deferred actions are suspended, not installed,
         // until a recovered edge resumes them.
-        self.panic_defer_codegen_depth = 0;
+        self.cleanup.panic_defer_codegen_depth = 0;
         if let Some(depth) = scope.coop_root_depth_at_entry {
-            self.gc_root_count = depth;
-            self.coop_shadow_roots
+            self.roots.gc_root_count = depth;
+            self.roots
+                .coop_shadow_roots
                 .as_mut()
                 .expect("cooperative panic scope requires a root tracker")
                 .active
@@ -869,9 +878,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if index > 0 {
                 self.builder.switch_to_block(blocks[index]);
             }
-            self.terminated = false;
-            self.panic_defer_codegen_depth = 0;
-            self.recover_eligible_depth = eligible_depth_before;
+            self.locals.terminated = false;
+            self.cleanup.panic_defer_codegen_depth = 0;
+            self.cleanup.recover_eligible_depth = eligible_depth_before;
             for instruction in &block.instructions {
                 match instruction {
                     I::Consume(id) => {
@@ -880,7 +889,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         if let Some(slot) = entry.sync_flag_slot {
                             self.stack_store(zero, slot);
                         } else {
-                            let frame = self.coop_frame.expect("poll cleanup frame");
+                            let frame = self.suspension.coop_frame.expect("poll cleanup frame");
                             self.builder.ins().store(
                                 MemFlagsData::new(),
                                 zero,
@@ -891,21 +900,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                     I::Invoke(id) => {
                         let entry = &scope.entries[id];
-                        self.vars = (*entry.vars_at_registration).clone();
+                        self.locals.vars = (*entry.vars_at_registration).clone();
                         for (name, storage) in entry.bindings.iter() {
-                            self.vars.insert(name.clone(), storage.clone());
+                            self.locals.vars.insert(name.clone(), storage.clone());
                         }
                         self.emit_void_runtime_call("willow_panic_enter_defer", &[]);
-                        self.panic_defer_codegen_depth = 1;
-                        self.recover_eligible_depth =
+                        self.cleanup.panic_defer_codegen_depth = 1;
+                        self.cleanup.recover_eligible_depth =
                             eligible_depth_before + usize::from(entry.recovery_capable);
                         self.emit_deferred_action(&entry.action, entry.flag_offset);
-                        if !self.terminated {
+                        if !self.locals.terminated {
                             self.emit_void_runtime_call("willow_panic_leave_defer", &[]);
                         }
-                        self.panic_defer_codegen_depth = 0;
-                        self.recover_eligible_depth = eligible_depth_before;
-                        self.vars = vars_before.clone();
+                        self.cleanup.panic_defer_codegen_depth = 0;
+                        self.cleanup.recover_eligible_depth = eligible_depth_before;
+                        self.locals.vars = vars_before.clone();
                     }
                     I::ReleaseLock(_) => self.emit_lock_release_at_depth(scope.defer_depth),
                     I::RestoreRoots(_) => {
@@ -922,10 +931,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         };
                         let count = self.builder.ins().isub(current, target);
                         self.emit_void_runtime_call("willow_pop_roots", &[count]);
-                        self.vars = (*scope.vars_before).clone();
+                        self.locals.vars = (*scope.vars_before).clone();
                         if let Some(depth) = scope.coop_root_depth_at_entry {
-                            self.gc_root_count = depth;
-                            self.coop_shadow_roots
+                            self.roots.gc_root_count = depth;
+                            self.roots
+                                .coop_shadow_roots
                                 .as_mut()
                                 .expect("poll root tracker")
                                 .active
@@ -933,11 +943,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         }
                     }
                 }
-                if self.terminated {
+                if self.locals.terminated {
                     break;
                 }
             }
-            if self.terminated {
+            if self.locals.terminated {
                 continue;
             }
             match block.terminator {
@@ -946,7 +956,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let flag = if let Some(slot) = entry.sync_flag_slot {
                         self.stack_load(types::I64, slot)
                     } else {
-                        let frame = self.coop_frame.expect("poll cleanup frame");
+                        let frame = self.suspension.coop_frame.expect("poll cleanup frame");
                         self.builder.ins().load(
                             types::I64,
                             MemFlagsData::new(),
@@ -975,21 +985,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         for (_, span) in &scope.call_frames_at_entry {
                             self.emit_callstack_reserve(*span);
                         }
-                        self.lir_reference_scopes = scope.reference_scopes_at_entry.clone();
+                        self.diagnostics.lir_reference_scopes =
+                            scope.reference_scopes_at_entry.clone();
                         self.emit_replay_reference_scopes();
                         for _ in 0..codegen_depth_before {
                             self.emit_void_runtime_call("willow_panic_enter_defer", &[]);
                         }
                         self.builder.ins().jump(scope.resume, &[]);
-                        self.callstack_frame_depth = 0;
-                        self.lir_reference_scopes.clear();
-                        self.panic_recovery_targets.insert(scope.resume);
+                        self.diagnostics.callstack_frame_depth = 0;
+                        self.diagnostics.lir_reference_scopes.clear();
+                        self.cleanup.panic_recovery_targets.insert(scope.resume);
                         self.builder.switch_to_block(propagate);
                         self.builder.seal_block(propagate);
                     }
                     if let Some(parent) = scope.parent_cleanup {
                         self.builder.ins().jump(parent, &[]);
-                    } else if let Some(panic_return) = self.panic_return_block {
+                    } else if let Some(panic_return) = self.cleanup.panic_return_block {
                         self.builder.ins().jump(panic_return, &[]);
                     } else {
                         self.emit_unhandled_panic_exit();
@@ -1002,33 +1013,35 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         self.finish_cleanup_root_reservation(cleanup_reservation);
-        self.lir_call_frames = prepared_frames_before;
-        self.lir_reference_scopes = reference_scopes_before;
-        self.callstack_frame_depth = callstack_depth_before;
-        self.vars = vars_before;
-        self.gc_root_count = roots_before;
-        self.unavailable_defer_ids = unavailable_before;
-        self.panic_defer_codegen_depth = codegen_depth_before;
-        self.recover_eligible_depth = eligible_depth_before;
-        if let (Some(active), Some(roots)) = (coop_active_before, self.coop_shadow_roots.as_mut()) {
+        self.diagnostics.lir_call_frames = prepared_frames_before;
+        self.diagnostics.lir_reference_scopes = reference_scopes_before;
+        self.diagnostics.callstack_frame_depth = callstack_depth_before;
+        self.locals.vars = vars_before;
+        self.roots.gc_root_count = roots_before;
+        self.cleanup.unavailable_defer_ids = unavailable_before;
+        self.cleanup.panic_defer_codegen_depth = codegen_depth_before;
+        self.cleanup.recover_eligible_depth = eligible_depth_before;
+        if let (Some(active), Some(roots)) =
+            (coop_active_before, self.roots.coop_shadow_roots.as_mut())
+        {
             roots.active = active;
         }
-        self.terminated = true;
+        self.locals.terminated = true;
     }
 
     /// Leave the generated Willow boundary while preserving the active panic.
     /// Cooperative polls publish the Panicked outcome to the scheduler first;
     /// synchronous native boundaries report and abort here.
     fn emit_unhandled_panic_exit(&mut self) {
-        if self.coop_frame.is_some() {
+        if self.suspension.coop_frame.is_some() {
             // Unlike an ordinary suspension boundary, an unhandled panic can
             // be observed immediately after a call while expression
             // temporaries are still rooted.  The native poll frame is being
             // abandoned, so remove every root registered on this CFG path;
             // requiring all of them to be tracked lexical bindings would
             // reject otherwise-valid allocating expressions.
-            if self.gc_root_count > 0 {
-                self.emit_pop_roots_n(self.gc_root_count);
+            if self.roots.gc_root_count > 0 {
+                self.emit_pop_roots_n(self.roots.gc_root_count);
             }
             let panicked = self.builder.ins().iconst(types::I32, COOP_POLL_PANICKED);
             self.builder.ins().return_(&[panicked]);
@@ -1043,7 +1056,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         name: &str,
         args: &[cranelift_codegen::ir::Value],
     ) {
-        if name == "willow_pop_roots" && self.root_reservation.is_some() {
+        if name == "willow_pop_roots" && self.roots.root_reservation.is_some() {
             if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
                 eprintln!("[inline-root-pop]");
             }
@@ -1078,7 +1091,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         name: &str,
         args: &[cranelift_codegen::ir::Value],
     ) -> cranelift_codegen::ir::Value {
-        if name == "willow_root_depth" && self.root_reservation.is_some() {
+        if name == "willow_root_depth" && self.roots.root_reservation.is_some() {
             if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
                 eprintln!("[inline-root-depth]");
             }
@@ -1188,7 +1201,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // its entry marker throughout, so it needs no duplicate publication.
         // MAY_PANIC already publishes via
         // its pre-call bracket. Never recursively instrument the marker itself.
-        if !may_panic && name != "willow_stack_helper_set" && !self.stack_helper_established {
+        if !may_panic
+            && name != "willow_stack_helper_set"
+            && !self.diagnostics.stack_helper_established
+        {
             self.emit_stack_helper();
         }
         let call = self.builder.ins().call(fref, &args);
@@ -1225,17 +1241,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         enters_willow: bool,
     ) -> Option<cranelift_codegen::ir::Value> {
-        let reusable = self.panic_depth_snapshot.and_then(|(block, depth)| {
-            (self.builder.current_block() == Some(block)
-                && std::env::var_os("WILLOW_PANIC_SNAPSHOT_REUSE").is_none_or(|value| value != "0")
-                && self
-                    .builder
-                    .func
-                    .layout
-                    .block_insts(block)
-                    .all(|inst| !self.builder.func.dfg.insts[inst].opcode().is_call()))
-            .then_some(depth)
-        });
+        let reusable = self
+            .cleanup
+            .panic_depth_snapshot
+            .and_then(|(block, depth)| {
+                (self.builder.current_block() == Some(block)
+                    && std::env::var_os("WILLOW_PANIC_SNAPSHOT_REUSE")
+                        .is_none_or(|value| value != "0")
+                    && self
+                        .builder
+                        .func
+                        .layout
+                        .block_insts(block)
+                        .all(|inst| !self.builder.func.dfg.insts[inst].opcode().is_call()))
+                .then_some(depth)
+            });
         // Publishing diagnostic location cannot mutate panic depth. Query the
         // proof before emitting this marker so debug metadata is not itself
         // an artificial invalidation at this call's snapshot point.
@@ -1249,24 +1269,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Overflow names are independent of debug/panic source locations.
         // Publish before a potentially stack-consuming call, including release
         // synchronous code. The handler consumes only static bytes.
-        if !self.diagnostic_async && !self.diagnostic_function.is_empty() {
+        if !self.diagnostics.diagnostic_async && !self.diagnostics.diagnostic_function.is_empty() {
             // Publish one immutable {bytes, length} descriptor atomically. The
             // context follows the native task across worker migration.
-            let data = if let Some(data) = self.overflow_helper_literal {
+            let data = if let Some(data) = self.diagnostics.overflow_helper_literal {
                 data
             } else {
-                let bytes = self.string_literals[&self.diagnostic_function].bytes;
+                let bytes = self.string_literals[&self.diagnostics.diagnostic_function].bytes;
                 let data = self.module.declare_anonymous_data(false, false).unwrap();
                 let mut desc = DataDescription::new();
                 let mut contents = vec![0; willow_abi::generated_context::HELPER_DESCRIPTOR_SIZE];
-                contents[willow_abi::generated_context::HELPER_LENGTH_OFFSET..]
-                    .copy_from_slice(&(self.diagnostic_function.len() as u64).to_ne_bytes());
+                contents[willow_abi::generated_context::HELPER_LENGTH_OFFSET..].copy_from_slice(
+                    &(self.diagnostics.diagnostic_function.len() as u64).to_ne_bytes(),
+                );
                 desc.define(contents.into_boxed_slice());
                 desc.set_align(8);
                 let reference = self.module.declare_data_in_data(bytes, &mut desc);
                 desc.write_data_addr(0, reference, 0);
                 self.module.define_data(data, &desc).unwrap();
-                self.overflow_helper_literal = Some(data);
+                self.diagnostics.overflow_helper_literal = Some(data);
                 data
             };
             let global = self.module.declare_data_in_func(data, self.builder.func);
@@ -1298,22 +1319,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_fault_site_for(&mut self, enters_willow: bool) {
         // Entry and post-call restoration already name this caller. Runtime
         // entry bridges restore names after nested generated callbacks.
-        if !enters_willow && !self.stack_helper_established {
+        if !enters_willow && !self.diagnostics.stack_helper_established {
             self.emit_stack_helper();
         }
-        if self.diagnostic_function.is_empty()
-            || (self.build_mode != BuildMode::Debug && !self.diagnostic_async)
+        if self.diagnostics.diagnostic_function.is_empty()
+            || (self.diagnostics.build_mode != BuildMode::Debug
+                && !self.diagnostics.diagnostic_async)
         {
             return;
         }
-        let Some(span) = self.fault_site_span else {
+        let Some(span) = self.diagnostics.fault_site_span else {
             return;
         };
-        let file = self.source_file.to_string();
+        let file = self.diagnostics.source_file.to_string();
         let Some((file_ptr, file_len)) = self.emit_static_str_bytes(&file) else {
             return;
         };
-        let name = self.diagnostic_function.clone();
+        let name = self.diagnostics.diagnostic_function.clone();
         let (name_ptr, name_len) = self
             .emit_static_str_bytes(&name)
             .expect("diagnostic function literal declared");
@@ -1321,8 +1343,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let column = self.builder.ins().iconst(types::I64, span.col as i64);
         let asynchronous = self.builder.ins().iconst(
             types::I32,
-            i64::from(self.diagnostic_async)
-                | (i64::from(self.build_mode == BuildMode::Debug) << 1)
+            i64::from(self.diagnostics.diagnostic_async)
+                | (i64::from(self.diagnostics.build_mode == BuildMode::Debug) << 1)
                 | (i64::from(enters_willow) << 2),
         );
         self.emit_void_runtime_call(
@@ -1348,7 +1370,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // The callee's marker must not survive its return, even if there is
         // no panic/cancellation branch on the continuation. Runtime-only bodies
         // also use this panic bracket, but their callees preserve the marker.
-        if !self.stack_helper_established {
+        if !self.diagnostics.stack_helper_established {
             self.emit_stack_helper();
         }
         // Cancellation is sticky even through functions whose panic summary
@@ -1377,25 +1399,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(panicked);
         self.builder.seal_block(panicked);
-        if self.coop_frame.is_some() {
+        if self.suspension.coop_frame.is_some() {
             self.emit_sync_panic_unwind();
-        } else if self.is_async {
+        } else if self.locals.is_async {
             self.emit_void_runtime_call("willow_panic_finish_unhandled", &[]);
             self.builder.ins().trap(TrapCode::unwrap_user(1));
-            self.terminated = true;
+            self.locals.terminated = true;
         } else {
             self.emit_sync_panic_unwind();
         }
 
         self.builder.switch_to_block(normal);
         self.builder.seal_block(normal);
-        self.terminated = false;
+        self.locals.terminated = false;
         // Cache the OBSERVED depth, never the entry/expected depth: a callee
         // may recover an existing panic and lower the depth. The observation
         // dominates this new, empty continuation block. Any intervening call
         // (including recover, indirect calls, or context switches) invalidates
         // reuse, as does moving to another control-flow block.
-        self.panic_depth_snapshot = Some((normal, depth_after));
+        self.cleanup.panic_depth_snapshot = Some((normal, depth_after));
     }
 
     /// Raise a user-visible language fault whose message is already a Willow
@@ -1408,7 +1430,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         span: Option<crate::diagnostics::Span>,
     ) {
         let message_root = self.emit_push_relocatable_root(message);
-        let source_file = self.source_file.to_string();
+        let source_file = self.diagnostics.source_file.to_string();
         let file = self.emit_string_literal(&source_file);
         let message = self.emit_reload_root(message_root, message);
         let line = self
@@ -1424,25 +1446,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             &[message, file, line, column],
             |this| {
                 this.emit_pop_roots_n(1);
-                this.gc_root_count -= 1;
+                this.roots.gc_root_count -= 1;
             },
         );
         // `willow_panic_raise` must always increase panic depth. Reaching the
         // metadata-generated normal branch is an ABI violation.
         self.builder.ins().trap(TrapCode::unwrap_user(1));
-        self.terminated = true;
+        self.locals.terminated = true;
     }
 
     /// Materialize the shared abnormal ABI return of a synchronous callee.
     /// Restore the caller's exact root depth, then return a typed neutral value
     /// without consuming or clearing the active panic.
     pub(super) fn emit_panic_return(&mut self, return_ty: &Type, force_void: bool) {
-        let Some(block) = self.panic_return_block else {
+        let Some(block) = self.cleanup.panic_return_block else {
             return;
         };
         self.builder.switch_to_block(block);
         self.builder.seal_block(block);
-        if let Some(entry_depth) = self.panic_function_root_depth {
+        if let Some(entry_depth) = self.cleanup.panic_function_root_depth {
             let current_depth = self.emit_value_runtime_call("willow_root_depth", &[]);
             let roots_to_pop = self.builder.ins().isub(current_depth, entry_depth);
             self.emit_void_runtime_call("willow_pop_roots", &[roots_to_pop]);
@@ -1456,6 +1478,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             };
             self.builder.ins().return_(&[zero]);
         }
-        self.terminated = true;
+        self.locals.terminated = true;
     }
 }

@@ -67,7 +67,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(some_block);
         self.builder.seal_block(some_block);
-        self.terminated = false;
+        self.locals.terminated = false;
         self.emit_option_payload(ptr, inner_ty)
     }
 
@@ -127,7 +127,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
-        self.terminated = false;
+        self.locals.terminated = false;
         let clif_ty = self.clif_type(payload_ty);
         let raw = self.emit_enum_payload_bits(ptr, payload_ty);
         if clif_ty == types::F64 {
@@ -513,7 +513,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         );
         if payload_is_gc {
             self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
+            self.roots.gc_root_count -= 1;
         }
         ptr
     }
