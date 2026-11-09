@@ -341,60 +341,109 @@ impl Capture {
             .map(|f| f.id.clone())
             .chain(removed_functions.iter().cloned());
         let (mut affected, mut graph_edges) = next.retained.closure(seeds);
+        graph_edges +=
+            next.remove_previous_declarations(patch, removed_functions, removed_symbols)?;
+        next.update_symbol_declarations(patch)?;
+        graph_edges += next.update_retained_functions(patch)?;
+        let (new_affected, new_edges) = next.retained.closure(affected.iter().cloned());
+        affected.extend(new_affected);
+        graph_edges += new_edges;
+        let mut owners = function_owner_ranges(patch);
+        let extra = next.reference_edges(patch, &mut owners);
+        graph_edges += next.update_function_facts(patch, extra, removed_functions.len())?;
+        next.graph_edges = graph_edges;
+        next.retained.replace_leaves(patch, &mut next.causes);
+        (next.witness_updates, next.witness_edges, next.witness_queue) =
+            next.retained.repair_causes(&affected, &mut next.causes);
+        for id in removed_symbols.iter().chain(removed_functions) {
+            if !next.retained.functions.contains_key(id) {
+                next.retained.ids.remove(id);
+            }
+        }
+        next.update_diagnostics(
+            &self.baseline.diagnostics,
+            diagnostics,
+            patch,
+            relocations,
+            &mut owners,
+        )?;
+        // This private capture is compared in memory; the public report receives
+        // the independently captured source-tree digest, not a serialized baseline.
+        matching::update_shapes(
+            &mut next.shapes,
+            &mut next.lambda_owners,
+            patch,
+            &next.retained.ids,
+        )?;
+        next.baseline.revision = patch.revision.clone();
+        Ok(next)
+    }
+
+    fn remove_previous_declarations(
+        &mut self,
+        patch: &Snapshot,
+        removed_functions: &[String],
+        removed_symbols: &[String],
+    ) -> Result<usize> {
+        let mut graph_edges = 0;
         for id in patch
             .functions
             .iter()
             .map(|f| &f.id)
             .chain(removed_functions)
         {
-            if let Some(old) = next.retained.functions.get(id) {
+            if let Some(old) = self.retained.functions.get(id) {
                 graph_edges += old.callees.len();
                 for callee in &old.callees {
-                    if let Some(callers) = next.retained.reverse.get_mut(callee) {
+                    if let Some(callers) = self.retained.reverse.get_mut(callee) {
                         callers.remove(id);
                     }
                 }
             }
         }
         for id in removed_functions {
-            next.retained.functions.remove(id);
-            next.retained.asynchronous.remove(id);
-            next.retained.reverse.remove(id);
+            self.retained.functions.remove(id);
+            self.retained.asynchronous.remove(id);
+            self.retained.reverse.remove(id);
         }
         for id in removed_symbols.iter().chain(removed_functions) {
-            if let Some(key) = next.retained.ids.get(id) {
-                next.shapes.remove(key);
+            if let Some(key) = self.retained.ids.get(id) {
+                self.shapes.remove(key);
                 if matching::is_lambda(key)
                     && let Some(owner) = matching::scope(key)
-                    && let Some(lambdas) = next.lambda_owners.get_mut(&owner)
+                    && let Some(lambdas) = self.lambda_owners.get_mut(&owner)
                 {
                     lambdas.remove(key);
                     if lambdas.is_empty() {
-                        next.lambda_owners.remove(&owner);
+                        self.lambda_owners.remove(&owner);
                     }
                 }
-                if let Some(old) = next.baseline.facts.remove(key) {
-                    next.baseline.public_count -=
+                if let Some(old) = self.baseline.facts.remove(key) {
+                    self.baseline.public_count -=
                         usize::from(public_signature(old.signature.as_ref()));
                     graph_edges += old.callees.len();
                     for callee in &old.callees {
-                        if let Some(callers) = next.baseline.callers.get_mut(callee) {
+                        if let Some(callers) = self.baseline.callers.get_mut(callee) {
                             callers.remove(key);
                         }
                     }
                 }
-                next.baseline.callers.remove(key);
-                next.baseline.refresh_effect_fact_index(key)?;
-                next.contracts.remove(key);
-                next.violations.remove(key);
-                Node::remove(&mut next.contract_index, &hash(key), key);
+                self.baseline.callers.remove(key);
+                self.baseline.refresh_effect_fact_index(key)?;
+                self.contracts.remove(key);
+                self.violations.remove(key);
+                Node::remove(&mut self.contract_index, &hash(key), key);
                 for bit in 0..RuntimeEffects::BIT_COUNT {
                     let address = (key.clone(), RuntimeEffects::from_bit(bit).bits());
-                    next.causes.remove_leaf(&address);
+                    self.causes.remove_leaf(&address);
                 }
-                next.causes.unknown.remove(key);
+                self.causes.unknown.remove(key);
             }
         }
+        Ok(graph_edges)
+    }
+
+    fn update_symbol_declarations(&mut self, patch: &Snapshot) -> Result<()> {
         for symbol in &patch.semantic.symbols {
             if !matches!(
                 symbol.kind.as_str(),
@@ -417,7 +466,7 @@ impl Capture {
             if super::super::super::bundled_source(&location.path).is_some() {
                 continue;
             }
-            let key = next
+            let key = self
                 .retained
                 .ids
                 .get(&symbol.id)
@@ -434,8 +483,8 @@ impl Capture {
                         ),
                     )
                 });
-            next.retained.ids.insert(symbol.id.clone(), key.clone());
-            let mut fact = next.baseline.facts.get(&key).map_or(
+            self.retained.ids.insert(symbol.id.clone(), key.clone());
+            let mut fact = self.baseline.facts.get(&key).map_or(
                 Fact {
                     signature: None,
                     effects: None,
@@ -444,37 +493,42 @@ impl Capture {
                 },
                 |f| (**f).clone(),
             );
-            next.baseline.public_count -= usize::from(public_signature(fact.signature.as_ref()));
-            fact.signature = Some(declaration_signature(symbol, &next.retained.types));
-            next.baseline.public_count += usize::from(public_signature(fact.signature.as_ref()));
-            next.baseline.facts.insert(key.clone(), Arc::new(fact));
-            next.baseline.refresh_effect_fact_index(&key)?;
+            self.baseline.public_count -= usize::from(public_signature(fact.signature.as_ref()));
+            fact.signature = Some(declaration_signature(symbol, &self.retained.types));
+            self.baseline.public_count += usize::from(public_signature(fact.signature.as_ref()));
+            self.baseline.facts.insert(key.clone(), Arc::new(fact));
+            self.baseline.refresh_effect_fact_index(&key)?;
             if symbol.details.effect_contracts.is_empty() {
-                next.contracts.remove(&key);
-                next.violations.remove(&key);
-                Node::remove(&mut next.contract_index, &hash(&key), &key);
+                self.contracts.remove(&key);
+                self.violations.remove(&key);
+                Node::remove(&mut self.contract_index, &hash(&key), &key);
             } else {
                 let contract: BTreeSet<_> =
                     symbol.details.effect_contracts.iter().cloned().collect();
                 Node::insert(
-                    &mut next.contract_index,
+                    &mut self.contract_index,
                     &hash(&key),
                     &key,
                     hash_serialized(&contract)?,
                 );
-                next.contracts.insert(key, contract);
+                self.contracts.insert(key, contract);
             }
         }
+        Ok(())
+    }
+
+    fn update_retained_functions(&mut self, patch: &Snapshot) -> Result<usize> {
+        let mut graph_edges = 0;
         // Establish all new function identities before resolving their edges.
         for f in &patch.functions {
-            if !next.retained.ids.contains_key(&f.id) {
+            if !self.retained.ids.contains_key(&f.id) {
                 let key = QualifiedName::from_segments([
                     relative(&f.module, &patch.workspace).as_str(),
                     "function",
                     &f.name,
                 ]);
-                next.retained.ids.insert(f.id.clone(), key.clone());
-                next.baseline.facts.insert(
+                self.retained.ids.insert(f.id.clone(), key.clone());
+                self.baseline.facts.insert(
                     key,
                     Arc::new(Fact {
                         signature: None,
@@ -486,46 +540,41 @@ impl Capture {
             }
         }
         for f in &patch.functions {
-            next.retained
+            self.retained
                 .functions
                 .insert(f.id.clone(), std::sync::Arc::new(f.clone()));
             if patch.semantic.async_functions.contains(&f.id) {
-                next.retained.asynchronous.insert(f.id.clone());
+                self.retained.asynchronous.insert(f.id.clone());
             } else {
-                next.retained.asynchronous.remove(&f.id);
+                self.retained.asynchronous.remove(&f.id);
             }
             graph_edges += f.callees.len();
             for callee in &f.callees {
                 ensure!(
-                    next.retained.ids.contains_key(callee),
+                    self.retained.ids.contains_key(callee),
                     "missing retained callee"
                 );
-                next.retained
+                self.retained
                     .reverse
                     .entry(callee.clone())
                     .or_default()
                     .insert(f.id.clone());
             }
         }
-        let (new_affected, new_edges) = next.retained.closure(affected.iter().cloned());
-        affected.extend(new_affected);
-        graph_edges += new_edges;
+        Ok(graph_edges)
+    }
+
+    fn reference_edges<'a>(
+        &self,
+        patch: &'a Snapshot,
+        owners: &mut OwnerRanges<'a>,
+    ) -> HashMap<&'a str, Vec<String>> {
         // Assign changed references with the same ordered interval sweep as cold
         // capture, including nested callable ownership. Unchanged declarations
         // are resolved through the retained identity table.
-        let mut owners: BTreeMap<&str, Vec<(usize, usize, &str)>> = BTreeMap::new();
-        for f in &patch.functions {
-            for location in &f.locations {
-                owners.entry(&location.path).or_default().push((
-                    location.start,
-                    location.end,
-                    &f.id,
-                ));
-            }
-        }
         let mut refs: BTreeMap<&str, Vec<_>> = BTreeMap::new();
         for r in &patch.semantic.references {
-            if let Some(key) = next.retained.ids.get(&r.target) {
+            if let Some(key) = self.retained.ids.get(&r.target) {
                 refs.entry(&r.location.path)
                     .or_default()
                     .push((&r.location, key));
@@ -553,16 +602,26 @@ impl Capture {
                     stack.pop();
                 }
                 if let Some((_, _, id)) = stack.last()
-                    && next.retained.ids[*id] != **target
+                    && self.retained.ids[*id] != **target
                 {
                     extra.entry(id).or_default().push((*target).clone());
                 }
             }
         }
-        next.fact_updates = removed_functions.len();
+        extra
+    }
+
+    fn update_function_facts(
+        &mut self,
+        patch: &Snapshot,
+        mut extra: HashMap<&str, Vec<String>>,
+        removed_count: usize,
+    ) -> Result<usize> {
+        let mut graph_edges = 0;
+        self.fact_updates = removed_count;
         for f in &patch.functions {
-            let key = &next.retained.ids[&f.id];
-            let old = next
+            let key = &self.retained.ids[&f.id];
+            let old = self
                 .baseline
                 .facts
                 .get(key)
@@ -573,7 +632,7 @@ impl Capture {
             fact.callees = f
                 .callees
                 .iter()
-                .map(|id| next.retained.ids[id].clone())
+                .map(|id| self.retained.ids[id].clone())
                 .chain(extra.remove(f.id.as_str()).unwrap_or_default())
                 .collect();
             fact.callees.sort();
@@ -598,42 +657,44 @@ impl Capture {
             });
             graph_edges += old.callees.len() + fact.callees.len();
             for callee in &old.callees {
-                if let Some(callers) = next.baseline.callers.get_mut(callee) {
+                if let Some(callers) = self.baseline.callers.get_mut(callee) {
                     callers.remove(key);
                 }
             }
             for callee in &fact.callees {
-                next.baseline
+                self.baseline
                     .callers
                     .entry(callee.clone())
                     .or_default()
                     .insert(key.clone());
             }
-            next.baseline.facts.insert(key.clone(), Arc::new(fact));
-            next.baseline.refresh_effect_fact_index(key)?;
-            next.fact_updates += 1;
-            if let Some(contract) = next.contracts.get(key) {
+            self.baseline.facts.insert(key.clone(), Arc::new(fact));
+            self.baseline.refresh_effect_fact_index(key)?;
+            self.fact_updates += 1;
+            if let Some(contract) = self.contracts.get(key) {
                 if bits & contract_bits(contract) != 0
                     || (f.unknown && contract_bits(contract) != 0)
                 {
-                    next.violations.insert(key.clone());
+                    self.violations.insert(key.clone());
                 } else {
-                    next.violations.remove(key);
+                    self.violations.remove(key);
                 }
             }
         }
-        next.graph_edges = graph_edges;
-        next.retained.replace_leaves(patch, &mut next.causes);
-        (next.witness_updates, next.witness_edges, next.witness_queue) =
-            next.retained.repair_causes(&affected, &mut next.causes);
-        for id in removed_symbols.iter().chain(removed_functions) {
-            if !next.retained.functions.contains_key(id) {
-                next.retained.ids.remove(id);
-            }
-        }
+        Ok(graph_edges)
+    }
+
+    fn update_diagnostics(
+        &mut self,
+        previous_diagnostics: &[DiagnosticFact],
+        diagnostics: Vec<DiagnosticFact>,
+        patch: &Snapshot,
+        relocations: &[crate::ai::VerificationRelocation],
+        owners: &mut OwnerRanges<'_>,
+    ) -> Result<()> {
         let relocation = RelocationIndex::new(relocations, &patch.workspace);
         let mut old_sites = HashMap::new();
-        for diagnostic in &self.baseline.diagnostics {
+        for diagnostic in previous_diagnostics {
             for site in &diagnostic.locations {
                 let mut location = json!({"path":site.path,"start":site.start,"end":site.end});
                 relocation.apply(&mut location);
@@ -650,9 +711,9 @@ impl Capture {
                 );
             }
         }
-        next.baseline.diagnostics = diagnostics;
+        self.baseline.diagnostics = diagnostics;
         let mut diagnostic_sites: BTreeMap<&str, Vec<_>> = BTreeMap::new();
-        for diagnostic in &mut next.baseline.diagnostics {
+        for diagnostic in &mut self.baseline.diagnostics {
             for site in &mut diagnostic.locations {
                 site.owner = old_sites
                     .get(&(
@@ -673,7 +734,7 @@ impl Capture {
             }
         }
         for (path, sites) in &mut diagnostic_sites {
-            let Some(ranges) = owners.get_mut(path) else {
+            let Some(ranges) = owners.get_mut::<str>(path) else {
                 continue;
             };
             ranges.sort_by_key(|(start, end, _)| (*start, Reverse(*end)));
@@ -693,21 +754,27 @@ impl Capture {
                     stack.pop();
                 }
                 if let Some((_, _, id)) = stack.last() {
-                    **owner = Some(next.retained.ids[*id].clone());
+                    **owner = Some(self.retained.ids[*id].clone());
                 }
             }
         }
-        next.baseline.normalize_diagnostics(&patch.workspace);
-        next.baseline.reindex_diagnostics()?;
-        // This private capture is compared in memory; the public report receives
-        // the independently captured source-tree digest, not a serialized baseline.
-        matching::update_shapes(
-            &mut next.shapes,
-            &mut next.lambda_owners,
-            patch,
-            &next.retained.ids,
-        )?;
-        next.baseline.revision = patch.revision.clone();
-        Ok(next)
+        self.baseline.normalize_diagnostics(&patch.workspace);
+        self.baseline.reindex_diagnostics()?;
+        Ok(())
     }
+}
+
+type OwnerRanges<'a> = BTreeMap<&'a str, Vec<(usize, usize, &'a str)>>;
+
+fn function_owner_ranges(patch: &Snapshot) -> OwnerRanges<'_> {
+    let mut owners: BTreeMap<&str, Vec<(usize, usize, &str)>> = BTreeMap::new();
+    for f in &patch.functions {
+        for location in &f.locations {
+            owners
+                .entry(&location.path)
+                .or_default()
+                .push((location.start, location.end, &f.id));
+        }
+    }
+    owners
 }

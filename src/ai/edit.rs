@@ -1258,14 +1258,8 @@ fn structured_changes(
     sources: &BTreeMap<String, String>,
     operations: Vec<Operation>,
 ) -> Result<(Vec<Change>, EditWork)> {
-    use crate::lexer::{Lexer, token::TokenKind};
-    let mut work = EditWork::default();
-    let mut patches: BTreeMap<String, Vec<Patch>> = BTreeMap::new();
-    let functions: BTreeMap<_, _> = snapshot
-        .functions
-        .iter()
-        .map(|f| (f.id.as_str(), f))
-        .collect();
+    use crate::lexer::Lexer;
+    let mut state = FunctionEdits::default();
     let mut tokens = BTreeMap::new();
     for (path, source) in sources {
         if path.ends_with(".wi") {
@@ -1277,157 +1271,10 @@ fn structured_changes(
             );
         }
     }
-    let mut identifiers: BTreeMap<&str, Vec<(&str, &crate::diagnostics::Span)>> = BTreeMap::new();
-    let mut call_names = BTreeMap::new();
-    let mut qualifiers = std::collections::HashSet::new();
-    let mut alias_tokens = std::collections::HashSet::new();
-    for (path, ts) in &tokens {
-        for (i, token) in ts.iter().enumerate() {
-            work.tokens_indexed += 1;
-            if let TokenKind::Ident(name) = &token.kind {
-                if i > 0 && ts[i - 1].kind == TokenKind::As {
-                    alias_tokens.insert((Path::new(path), token.span.start, token.span.end));
-                }
-                if ts
-                    .get(i + 1)
-                    .is_some_and(|t| t.kind == TokenKind::ColonColon)
-                {
-                    qualifiers.insert((path.as_str(), token.span.start, token.span.end));
-                }
-                identifiers
-                    .entry(name)
-                    .or_default()
-                    .push((path, &token.span));
-                if ts.get(i + 1).is_some_and(|t| t.kind == TokenKind::LParen) {
-                    let mut first = i;
-                    while first >= 2
-                        && ts[first - 1].kind == TokenKind::ColonColon
-                        && matches!(ts[first - 2].kind, TokenKind::Ident(_))
-                    {
-                        first -= 2;
-                    }
-                    call_names.insert(
-                        (path.as_str(), ts[first].span.start),
-                        (name.as_str(), token.span.start),
-                    );
-                    call_names.insert(
-                        (path.as_str(), token.span.start),
-                        (name.as_str(), token.span.start),
-                    );
-                }
-            }
-        }
-    }
-    let mut references: BTreeMap<&str, Vec<_>> = BTreeMap::new();
-    for expression in &snapshot.semantic.expressions {
-        work.expressions_indexed += 1;
-        if let Some(target) = &expression.target {
-            references.entry(target).or_default().push(expression);
-        }
-    }
-    // Synthetic dispatch unions connect implementations sharing a dispatch
-    // contract. Follow only those edges, never ordinary caller/callee edges.
-    let mut dispatch: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for f in &snapshot.functions {
-        if f.synthetic && f.name.starts_with("$dispatch$") {
-            for callee in &f.callees {
-                dispatch.entry(&f.id).or_default().push(callee);
-                dispatch.entry(callee).or_default().push(&f.id);
-            }
-        }
-    }
-    let requested_renames: std::collections::HashSet<_> = operations
-        .iter()
-        .filter_map(|op| {
-            if let Operation::Rename { function, .. } = op {
-                Some(function.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
-    let has_member_rename = snapshot.semantic.symbols.iter().any(|symbol| {
-        requested_renames.contains(symbol.id.as_str())
-            && matches!(
-                symbol.kind.as_str(),
-                "method" | "field" | "static-field" | "variant" | "binding" | "parameter"
-            )
-    });
-    let local_ids: std::collections::HashSet<_> = snapshot
-        .semantic
-        .symbols
-        .iter()
-        .filter(|s| matches!(s.kind.as_str(), "binding" | "parameter"))
-        .map(|s| s.id.as_str())
-        .collect();
-    if requested_renames.iter().any(|id| local_ids.contains(id)) {
-        let mut destinations = std::collections::HashSet::new();
-        for operation in &operations {
-            if let Operation::Rename { name, .. } = operation {
-                ensure!(
-                    destinations.insert(name),
-                    "batch rename with local bindings requires distinct destination names to prevent capture"
-                );
-            }
-        }
-    }
-    // Exact checker-owned identifier ranges, indexed once for all operations.
-    // Unlike expression ranges these cover values as well as calls.
-    let mut value_targets: std::collections::HashMap<_, std::collections::HashSet<&str>> =
-        std::collections::HashMap::new();
-    let mut explicit_aliases = std::collections::HashSet::new();
-    let mut alias_points = std::collections::HashSet::new();
-    for symbol in &snapshot.semantic.symbols {
-        if symbol.kind == "import"
-            && let Some(l) = &symbol.location
-            && let Ok(path) = Path::new(&l.path).strip_prefix(root)
-            && alias_tokens.contains(&(path, l.start, l.end))
-        {
-            explicit_aliases.insert(symbol.id.as_str());
-            alias_points.insert((path, l.start, l.end));
-        }
-        work.value_facts_indexed += 1;
-        if local_ids.contains(symbol.id.as_str())
-            && let Some(l) = &symbol.location
-            && let Ok(path) = Path::new(&l.path).strip_prefix(root)
-        {
-            value_targets
-                .entry((path, l.start, l.end))
-                .or_default()
-                .insert(symbol.id.as_str());
-        }
-    }
-    for reference in &snapshot.semantic.references {
-        work.value_facts_indexed += 1;
-        let l = &reference.location;
-        let Ok(path) = Path::new(&l.path).strip_prefix(root) else {
-            continue;
-        };
-        // Import provenance accompanies the actual resolved value target. An
-        // explicit alias owns its own spelling and must survive target renames.
-        if reference.role == "import" {
-            if explicit_aliases.contains(reference.target.as_str()) {
-                alias_points.insert((path, l.start, l.end));
-            }
-            continue;
-        }
-        // Import-target facts select a spelling within the whole import and
-        // may point at a repeated module name. The dedicated rename_imports
-        // path below proves the final item token, excluding qualifiers/aliases.
-        if reference.role == "import-target" {
-            continue;
-        }
-        value_targets
-            .entry((path, l.start, l.end))
-            .or_default()
-            .insert(reference.target.as_str());
-    }
-    let mut semantic_renames = has_member_rename
-        .then(|| super::rename::Index::new(snapshot, root, &identifiers, &qualifiers));
-    let mut renamed = std::collections::HashSet::new();
-    // Built lazily, once per request, only when a same-spelled token is not a
-    // proven declaration/reference of the renamed function.
-    let mut builtin_members = None;
+    let index = StructuredIndex::new(snapshot, root, &tokens, &operations, &mut state.work)?;
+    let mut semantic_renames = index
+        .has_member_rename
+        .then(|| super::rename::Index::new(snapshot, root, &index.identifiers, &index.qualifiers));
     for operation in operations {
         let id = match &operation {
             Operation::Rename { function, .. } | Operation::ReplaceBody { function, .. } => {
@@ -1438,10 +1285,13 @@ fn structured_changes(
             && let Some(index) = &mut semantic_renames
             && index.supports(id)
         {
-            index.plan(id, name, root, &mut patches, &mut work)?;
+            index.plan(id, name, root, &mut state.patches, &mut state.work)?;
             continue;
         }
-        let function = functions.get(id.as_str()).context("unknown function")?;
+        let function = index
+            .functions
+            .get(id.as_str())
+            .context("unknown function")?;
         ensure!(
             !function.synthetic && function.locations.len() == 1,
             "function has no unique source declaration"
@@ -1457,277 +1307,585 @@ fn structured_changes(
         let declaration = &file_tokens[start..end];
         match operation {
             Operation::ReplaceBody { body, .. } => {
-                let ts = Lexer::new(&body)
-                    .tokenize()
-                    .map_err(|_| anyhow::anyhow!("invalid replacement body"))?;
-                ensure!(
-                    ts.first().is_some_and(|t| t.kind == TokenKind::LBrace),
-                    "replacement must be one block"
-                );
-                let mut depth = 0usize;
-                for (i, t) in ts.iter().enumerate().take(ts.len() - 1) {
-                    match t.kind {
-                        TokenKind::LBrace => depth += 1,
-                        TokenKind::RBrace => {
-                            depth = depth.checked_sub(1).context("unbalanced replacement")?;
-                            ensure!(
-                                depth != 0 || i == ts.len() - 2,
-                                "replacement contains trailing declarations"
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-                ensure!(depth == 0, "unbalanced replacement");
-                let body_location = function
-                    .body_location
-                    .as_ref()
-                    .context("missing compiler body range")?;
-                ensure!(
-                    body_location.path == location.path,
-                    "body is in a different source"
-                );
-                patches.entry(path.into()).or_default().push(Patch {
-                    start: body_location.start,
-                    end: body_location.end,
-                    text: body,
-                });
+                plan_body_replacement(function, path, body, &mut state.patches)?;
             }
             Operation::Rename { name, .. } => {
-                ensure!(
-                    !renamed.contains(&function.id),
-                    "duplicate rename of dispatch family"
-                );
-                super::rename::validate_name(&name)?;
-                let marker = declaration
-                    .iter()
-                    .position(|t| matches!(t.kind, TokenKind::Fn | TokenKind::Const))
-                    .context("unsupported declaration")?;
-                let old = match &declaration
-                    .get(marker + 1)
-                    .context("missing declaration name")?
-                    .kind
-                {
-                    TokenKind::Ident(s) => s,
-                    _ => anyhow::bail!("unsupported declaration name"),
-                };
-                ensure!(name != *old, "rename has no effect");
-                if let Some(occurrences) = identifiers.get(name.as_str()) {
-                    // Cite the conflicting declaration rather than an import or a
-                    // use of it: source declarations rank before import aliases,
-                    // then the first occurrence. Error path only: one scan of the
-                    // symbols spelled `name` plus that spelling's occurrences.
-                    let declarations: std::collections::HashMap<_, _> = snapshot
-                        .semantic
-                        .symbols
-                        .iter()
-                        .filter(|s| QualifiedName::new(&s.name).last_segment() == name.as_str())
-                        .filter_map(|s| {
-                            let l = s.location.as_ref()?;
-                            let path = Path::new(&l.path).strip_prefix(root).ok()?;
-                            Some(((path, l.start), usize::from(s.kind == "import")))
-                        })
-                        .collect();
-                    let declaration = occurrences
-                        .iter()
-                        .filter_map(|occurrence @ (path, span)| {
-                            Some((
-                                declarations.get(&(Path::new(path), span.start))?,
-                                occurrence,
-                            ))
-                        })
-                        .min_by_key(|(rank, _)| **rank);
-                    let (message, &(path, span)) = match declaration {
-                        Some((_, found)) => (
-                            "rename destination conflicts with an existing declaration",
-                            found,
-                        ),
-                        None => (
-                            "rename destination already occurs in workspace",
-                            &occurrences[0],
-                        ),
-                    };
-                    return Err(Rejection {
-                        message: message.into(),
-                        location: RejectionLocation {
-                            path: path.into(),
-                            start: span.start,
-                            end: span.end,
-                            line: span.line,
-                            column: span.col,
-                        },
-                    }
-                    .into());
-                }
-                // Conservative closed-world rename: every same-spelled token
-                // must be proven to belong to the target or a local binding.
-                // Unknown or conflicting semantic targets still fail closed.
-                let mut family = std::collections::BTreeSet::new();
-                let mut pending = vec![function.id.as_str()];
-                while let Some(id) = pending.pop() {
-                    if family.insert(id)
-                        && let Some(edges) = dispatch.get(id)
-                    {
-                        pending.extend(edges);
-                    }
-                }
-                renamed.extend(family.iter().map(|id| (*id).to_owned()));
-                let mut allowed: BTreeMap<String, std::collections::BTreeSet<usize>> =
-                    BTreeMap::new();
-                for id in &family {
-                    let member = functions[id];
-                    for location in &member.rename_calls {
-                        let p = Path::new(&location.path)
-                            .strip_prefix(root)?
-                            .to_str()
-                            .context("non UTF-8 path")?;
-                        if let Some(&(name, start)) = call_names.get(&(p, location.start))
-                            && name == old
-                        {
-                            allowed.entry(p.into()).or_default().insert(start);
-                        }
-                    }
-                    if !member.synthetic {
-                        for location in &member.locations {
-                            let p = Path::new(&location.path)
-                                .strip_prefix(root)?
-                                .to_str()
-                                .context("non UTF-8 path")?;
-                            let ts = &tokens[p];
-                            let a = ts.partition_point(|t| t.span.start < location.start);
-                            let b = ts.partition_point(|t| t.span.end <= location.end);
-                            let marker = ts[a..b]
-                                .iter()
-                                .position(|t| matches!(t.kind, TokenKind::Fn | TokenKind::Const))
-                                .context("unsupported rename declaration")?
-                                + a;
-                            let t = ts
-                                .get(marker + 1)
-                                .context("missing declaration identifier")?;
-                            ensure!(
-                                matches!(&t.kind, TokenKind::Ident(s) if s == old),
-                                "inconsistent dispatch declaration"
-                            );
-                            if allowed.entry(p.into()).or_default().insert(t.span.start) {
-                                work.declarations += 1;
-                            }
-                        }
-                    }
-                    // Item imports (`import m::{f}` / `import m::f as g`) name the
-                    // target by its declared spelling: the final path segment.
-                    for location in &member.rename_imports {
-                        let p = Path::new(&location.path)
-                            .strip_prefix(root)?
-                            .to_str()
-                            .context("non UTF-8 path")?;
-                        let ts = &tokens[p];
-                        let a = ts.partition_point(|t| t.span.start < location.start);
-                        let b = ts.partition_point(|t| t.span.end <= location.end);
-                        for i in a..b {
-                            if matches!(&ts[i].kind, TokenKind::Ident(s) if s == old)
-                                && ts
-                                    .get(i + 1)
-                                    .is_none_or(|t| t.kind != TokenKind::ColonColon)
-                                && (i == 0 || ts[i - 1].kind != TokenKind::As)
-                            {
-                                allowed
-                                    .entry(p.into())
-                                    .or_default()
-                                    .insert(ts[i].span.start);
-                            }
-                        }
-                    }
-                    for expression in references.get(id).into_iter().flatten() {
-                        work.references_visited += 1;
-                        let p = Path::new(&expression.location.path)
-                            .strip_prefix(root)?
-                            .to_str()
-                            .context("non UTF-8 path")?;
-                        if let Some(&(name, start)) =
-                            call_names.get(&(p, expression.location.start))
-                            && name == old
-                        {
-                            allowed.entry(p.into()).or_default().insert(start);
-                        }
-                    }
-                }
-                for &(p, span) in identifiers.get(old.as_str()).into_iter().flatten() {
-                    work.value_probes += 1;
-                    // Functions and constants cannot own a namespace. A
-                    // same-spelled path qualifier is not a use of this target.
-                    if qualifiers.contains(&(p, span.start, span.end)) {
-                        continue;
-                    }
-                    let point = (Path::new(p), span.start, span.end);
-                    if alias_points.contains(&point) {
-                        continue;
-                    }
-                    let mut proven_value = false;
-                    if let Some(targets) = value_targets.get(&point) {
-                        if targets.iter().all(|target| local_ids.contains(target)) {
-                            continue;
-                        }
-                        if targets.iter().all(|target| family.contains(target)) {
-                            proven_value = true;
-                        } else if targets.iter().any(|target| family.contains(target)) {
-                            anyhow::bail!(
-                                "rename occurrence has conflicting semantic targets at {p}:{}:{}",
-                                span.line,
-                                span.col
-                            );
-                        }
-                    }
-                    if !proven_value && !allowed.get(p).is_some_and(|a| a.contains(&span.start)) {
-                        if builtin_members
-                            .get_or_insert_with(|| builtin_member_points(snapshot, root))
-                            .contains(&(Path::new(p), span.start))
-                        {
-                            continue;
-                        }
-                        let ts = &tokens[p];
-                        let index = ts.partition_point(|t| t.span.start < span.start);
-                        let reason = match index
-                            .checked_sub(1)
-                            .and_then(|i| ts.get(i))
-                            .map(|t| &t.kind)
-                        {
-                            Some(TokenKind::Fn) => {
-                                "function/method declaration outside the supported dispatch family; interface contract declarations are not covered"
-                            }
-                            Some(TokenKind::Dot) => {
-                                "member reference without a proven target in the supported dispatch family"
-                            }
-                            Some(TokenKind::ColonColon) => {
-                                "qualified reference without a proven target in the supported dispatch family"
-                            }
-                            _ => {
-                                "same-name identifier outside the proven declaration/reference set"
-                            }
-                        };
-                        return Err(Rejection {
-                            message: format!(
-                                "rename coverage incomplete or ambiguous: `{old}` is a {reason}. Inspect this occurrence with `willow symbol {p}:{}:{}` and `willow refs`; no files changed",
-                                span.line, span.col
-                            ),
-                            location: RejectionLocation {
-                                path: p.into(),
-                                start: span.start,
-                                end: span.end,
-                                line: span.line,
-                                column: span.col,
-                            },
-                        }
-                        .into());
-                    }
-                    patches.entry(p.into()).or_default().push(Patch {
-                        start: span.start,
-                        end: span.end,
-                        text: name.clone(),
-                    });
-                }
+                index.plan_function_rename(function, declaration, name, &mut state)?;
             }
         }
     }
+    let changes = apply_structured_patches(sources, state.patches, &mut state.work)?;
+    Ok((changes, state.work))
+}
+
+#[derive(Default)]
+struct FunctionEdits<'a> {
+    patches: BTreeMap<String, Vec<Patch>>,
+    work: EditWork,
+    renamed: std::collections::HashSet<String>,
+    // Built lazily, once per request, only for unproven same-spelled tokens.
+    builtin_members: Option<std::collections::HashSet<(&'a Path, usize)>>,
+}
+
+struct TokenIndex<'a> {
+    identifiers: BTreeMap<&'a str, Vec<(&'a str, &'a crate::diagnostics::Span)>>,
+    call_names: BTreeMap<(&'a str, usize), (&'a str, usize)>,
+    qualifiers: std::collections::HashSet<(&'a str, usize, usize)>,
+    alias_tokens: std::collections::HashSet<(&'a Path, usize, usize)>,
+}
+
+impl<'a> TokenIndex<'a> {
+    fn new(
+        tokens: &'a BTreeMap<String, Vec<crate::lexer::token::Token>>,
+        work: &mut EditWork,
+    ) -> Self {
+        use crate::lexer::token::TokenKind;
+        let mut identifiers: BTreeMap<&str, Vec<(&str, &crate::diagnostics::Span)>> =
+            BTreeMap::new();
+        let mut call_names = BTreeMap::new();
+        let mut qualifiers = std::collections::HashSet::new();
+        let mut alias_tokens = std::collections::HashSet::new();
+        for (path, ts) in tokens {
+            for (i, token) in ts.iter().enumerate() {
+                work.tokens_indexed += 1;
+                if let TokenKind::Ident(name) = &token.kind {
+                    if i > 0 && ts[i - 1].kind == TokenKind::As {
+                        alias_tokens.insert((Path::new(path), token.span.start, token.span.end));
+                    }
+                    if ts
+                        .get(i + 1)
+                        .is_some_and(|t| t.kind == TokenKind::ColonColon)
+                    {
+                        qualifiers.insert((path.as_str(), token.span.start, token.span.end));
+                    }
+                    identifiers
+                        .entry(name)
+                        .or_default()
+                        .push((path, &token.span));
+                    if ts.get(i + 1).is_some_and(|t| t.kind == TokenKind::LParen) {
+                        let mut first = i;
+                        while first >= 2
+                            && ts[first - 1].kind == TokenKind::ColonColon
+                            && matches!(ts[first - 2].kind, TokenKind::Ident(_))
+                        {
+                            first -= 2;
+                        }
+                        call_names.insert(
+                            (path.as_str(), ts[first].span.start),
+                            (name.as_str(), token.span.start),
+                        );
+                        call_names.insert(
+                            (path.as_str(), token.span.start),
+                            (name.as_str(), token.span.start),
+                        );
+                    }
+                }
+            }
+        }
+        Self {
+            identifiers,
+            call_names,
+            qualifiers,
+            alias_tokens,
+        }
+    }
+}
+
+struct StructuredIndex<'a> {
+    snapshot: &'a Snapshot,
+    root: &'a Path,
+    tokens: &'a BTreeMap<String, Vec<crate::lexer::token::Token>>,
+    functions: BTreeMap<&'a str, &'a super::Function>,
+    identifiers: BTreeMap<&'a str, Vec<(&'a str, &'a crate::diagnostics::Span)>>,
+    call_names: BTreeMap<(&'a str, usize), (&'a str, usize)>,
+    qualifiers: std::collections::HashSet<(&'a str, usize, usize)>,
+    references: BTreeMap<&'a str, Vec<&'a super::semantic::Expression>>,
+    dispatch: BTreeMap<&'a str, Vec<&'a str>>,
+    local_ids: std::collections::HashSet<&'a str>,
+    value_targets:
+        std::collections::HashMap<(&'a Path, usize, usize), std::collections::HashSet<&'a str>>,
+    alias_points: std::collections::HashSet<(&'a Path, usize, usize)>,
+    has_member_rename: bool,
+}
+
+impl<'a> StructuredIndex<'a> {
+    fn new(
+        snapshot: &'a Snapshot,
+        root: &'a Path,
+        tokens: &'a BTreeMap<String, Vec<crate::lexer::token::Token>>,
+        operations: &[Operation],
+        work: &mut EditWork,
+    ) -> Result<Self> {
+        let functions: BTreeMap<_, _> = snapshot
+            .functions
+            .iter()
+            .map(|f| (f.id.as_str(), f))
+            .collect();
+        let TokenIndex {
+            identifiers,
+            call_names,
+            qualifiers,
+            alias_tokens,
+        } = TokenIndex::new(tokens, work);
+        let mut references: BTreeMap<&str, Vec<_>> = BTreeMap::new();
+        for expression in &snapshot.semantic.expressions {
+            work.expressions_indexed += 1;
+            if let Some(target) = &expression.target {
+                references.entry(target).or_default().push(expression);
+            }
+        }
+        // Synthetic dispatch unions connect implementations sharing a dispatch
+        // contract. Follow only those edges, never ordinary caller/callee edges.
+        let mut dispatch: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for f in &snapshot.functions {
+            if f.synthetic && f.name.starts_with("$dispatch$") {
+                for callee in &f.callees {
+                    dispatch.entry(&f.id).or_default().push(callee);
+                    dispatch.entry(callee).or_default().push(&f.id);
+                }
+            }
+        }
+        let requested_renames: std::collections::HashSet<_> = operations
+            .iter()
+            .filter_map(|op| {
+                if let Operation::Rename { function, .. } = op {
+                    Some(function.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let has_member_rename = snapshot.semantic.symbols.iter().any(|symbol| {
+            requested_renames.contains(symbol.id.as_str())
+                && matches!(
+                    symbol.kind.as_str(),
+                    "method" | "field" | "static-field" | "variant" | "binding" | "parameter"
+                )
+        });
+        let local_ids: std::collections::HashSet<_> = snapshot
+            .semantic
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind.as_str(), "binding" | "parameter"))
+            .map(|s| s.id.as_str())
+            .collect();
+        if requested_renames.iter().any(|id| local_ids.contains(id)) {
+            let mut destinations = std::collections::HashSet::new();
+            for operation in operations {
+                if let Operation::Rename { name, .. } = operation {
+                    ensure!(
+                        destinations.insert(name),
+                        "batch rename with local bindings requires distinct destination names to prevent capture"
+                    );
+                }
+            }
+        }
+        // Exact checker-owned identifier ranges, indexed once for all operations.
+        // Unlike expression ranges these cover values as well as calls.
+        let mut value_targets: std::collections::HashMap<_, std::collections::HashSet<&str>> =
+            std::collections::HashMap::new();
+        let mut explicit_aliases = std::collections::HashSet::new();
+        let mut alias_points = std::collections::HashSet::new();
+        for symbol in &snapshot.semantic.symbols {
+            if symbol.kind == "import"
+                && let Some(l) = &symbol.location
+                && let Ok(path) = Path::new(&l.path).strip_prefix(root)
+                && alias_tokens.contains(&(path, l.start, l.end))
+            {
+                explicit_aliases.insert(symbol.id.as_str());
+                alias_points.insert((path, l.start, l.end));
+            }
+            work.value_facts_indexed += 1;
+            if local_ids.contains(symbol.id.as_str())
+                && let Some(l) = &symbol.location
+                && let Ok(path) = Path::new(&l.path).strip_prefix(root)
+            {
+                value_targets
+                    .entry((path, l.start, l.end))
+                    .or_default()
+                    .insert(symbol.id.as_str());
+            }
+        }
+        for reference in &snapshot.semantic.references {
+            work.value_facts_indexed += 1;
+            let l = &reference.location;
+            let Ok(path) = Path::new(&l.path).strip_prefix(root) else {
+                continue;
+            };
+            // Import provenance accompanies the actual resolved value target. An
+            // explicit alias owns its own spelling and must survive target renames.
+            if reference.role == "import" {
+                if explicit_aliases.contains(reference.target.as_str()) {
+                    alias_points.insert((path, l.start, l.end));
+                }
+                continue;
+            }
+            // Import-target facts select a spelling within the whole import and
+            // may point at a repeated module name. The dedicated rename_imports
+            // path below proves the final item token, excluding qualifiers/aliases.
+            if reference.role == "import-target" {
+                continue;
+            }
+            value_targets
+                .entry((path, l.start, l.end))
+                .or_default()
+                .insert(reference.target.as_str());
+        }
+        Ok(Self {
+            snapshot,
+            root,
+            tokens,
+            functions,
+            identifiers,
+            call_names,
+            qualifiers,
+            references,
+            dispatch,
+            local_ids,
+            value_targets,
+            alias_points,
+            has_member_rename,
+        })
+    }
+
+    fn check_destination(&self, name: &str) -> Result<()> {
+        let Self {
+            snapshot,
+            root,
+            identifiers,
+            ..
+        } = self;
+        if let Some(occurrences) = identifiers.get(name) {
+            // Cite the conflicting declaration rather than an import or a
+            // use of it: source declarations rank before import aliases,
+            // then the first occurrence. Error path only: one scan of the
+            // symbols spelled `name` plus that spelling's occurrences.
+            let declarations: std::collections::HashMap<_, _> = snapshot
+                .semantic
+                .symbols
+                .iter()
+                .filter(|s| QualifiedName::new(&s.name).last_segment() == name)
+                .filter_map(|s| {
+                    let l = s.location.as_ref()?;
+                    let path = Path::new(&l.path).strip_prefix(root).ok()?;
+                    Some(((path, l.start), usize::from(s.kind == "import")))
+                })
+                .collect();
+            let declaration = occurrences
+                .iter()
+                .filter_map(|occurrence @ (path, span)| {
+                    Some((
+                        declarations.get(&(Path::new(path), span.start))?,
+                        occurrence,
+                    ))
+                })
+                .min_by_key(|(rank, _)| **rank);
+            let (message, &(path, span)) = match declaration {
+                Some((_, found)) => (
+                    "rename destination conflicts with an existing declaration",
+                    found,
+                ),
+                None => (
+                    "rename destination already occurs in workspace",
+                    &occurrences[0],
+                ),
+            };
+            return Err(Rejection {
+                message: message.into(),
+                location: RejectionLocation {
+                    path: path.into(),
+                    start: span.start,
+                    end: span.end,
+                    line: span.line,
+                    column: span.col,
+                },
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn allowed_family_occurrences(
+        &self,
+        family: &std::collections::BTreeSet<&str>,
+        old: &str,
+        work: &mut EditWork,
+    ) -> Result<BTreeMap<String, std::collections::BTreeSet<usize>>> {
+        use crate::lexer::token::TokenKind;
+        let Self {
+            functions,
+            root,
+            tokens,
+            call_names,
+            references,
+            ..
+        } = self;
+        let mut allowed: BTreeMap<String, std::collections::BTreeSet<usize>> = BTreeMap::new();
+        for id in family {
+            let member = functions[id];
+            for location in &member.rename_calls {
+                let p = Path::new(&location.path)
+                    .strip_prefix(root)?
+                    .to_str()
+                    .context("non UTF-8 path")?;
+                if let Some(&(name, start)) = call_names.get(&(p, location.start))
+                    && name == old
+                {
+                    allowed.entry(p.into()).or_default().insert(start);
+                }
+            }
+            if !member.synthetic {
+                for location in &member.locations {
+                    let p = Path::new(&location.path)
+                        .strip_prefix(root)?
+                        .to_str()
+                        .context("non UTF-8 path")?;
+                    let ts = &tokens[p];
+                    let a = ts.partition_point(|t| t.span.start < location.start);
+                    let b = ts.partition_point(|t| t.span.end <= location.end);
+                    let marker = ts[a..b]
+                        .iter()
+                        .position(|t| matches!(t.kind, TokenKind::Fn | TokenKind::Const))
+                        .context("unsupported rename declaration")?
+                        + a;
+                    let t = ts
+                        .get(marker + 1)
+                        .context("missing declaration identifier")?;
+                    ensure!(
+                        matches!(&t.kind, TokenKind::Ident(s) if s == old),
+                        "inconsistent dispatch declaration"
+                    );
+                    if allowed.entry(p.into()).or_default().insert(t.span.start) {
+                        work.declarations += 1;
+                    }
+                }
+            }
+            // Item imports (`import m::{f}` / `import m::f as g`) name the
+            // target by its declared spelling: the final path segment.
+            for location in &member.rename_imports {
+                let p = Path::new(&location.path)
+                    .strip_prefix(root)?
+                    .to_str()
+                    .context("non UTF-8 path")?;
+                let ts = &tokens[p];
+                let a = ts.partition_point(|t| t.span.start < location.start);
+                let b = ts.partition_point(|t| t.span.end <= location.end);
+                for i in a..b {
+                    if matches!(&ts[i].kind, TokenKind::Ident(s) if s == old)
+                        && ts
+                            .get(i + 1)
+                            .is_none_or(|t| t.kind != TokenKind::ColonColon)
+                        && (i == 0 || ts[i - 1].kind != TokenKind::As)
+                    {
+                        allowed
+                            .entry(p.into())
+                            .or_default()
+                            .insert(ts[i].span.start);
+                    }
+                }
+            }
+            for expression in references.get(id).into_iter().flatten() {
+                work.references_visited += 1;
+                let p = Path::new(&expression.location.path)
+                    .strip_prefix(root)?
+                    .to_str()
+                    .context("non UTF-8 path")?;
+                if let Some(&(name, start)) = call_names.get(&(p, expression.location.start))
+                    && name == old
+                {
+                    allowed.entry(p.into()).or_default().insert(start);
+                }
+            }
+        }
+        Ok(allowed)
+    }
+
+    fn plan_function_rename(
+        &self,
+        function: &super::Function,
+        declaration: &[crate::lexer::token::Token],
+        name: String,
+        state: &mut FunctionEdits<'a>,
+    ) -> Result<()> {
+        use crate::lexer::token::TokenKind;
+        let Self {
+            snapshot,
+            root,
+            tokens,
+            identifiers,
+            dispatch,
+            qualifiers,
+            alias_points,
+            value_targets,
+            local_ids,
+            ..
+        } = self;
+        let FunctionEdits {
+            patches,
+            work,
+            renamed,
+            builtin_members,
+        } = state;
+        ensure!(
+            !renamed.contains(&function.id),
+            "duplicate rename of dispatch family"
+        );
+        super::rename::validate_name(&name)?;
+        let marker = declaration
+            .iter()
+            .position(|t| matches!(t.kind, TokenKind::Fn | TokenKind::Const))
+            .context("unsupported declaration")?;
+        let old = match &declaration
+            .get(marker + 1)
+            .context("missing declaration name")?
+            .kind
+        {
+            TokenKind::Ident(s) => s,
+            _ => anyhow::bail!("unsupported declaration name"),
+        };
+        ensure!(name != *old, "rename has no effect");
+        self.check_destination(&name)?;
+        // Conservative closed-world rename: every same-spelled token
+        // must be proven to belong to the target or a local binding.
+        // Unknown or conflicting semantic targets still fail closed.
+        let mut family = std::collections::BTreeSet::new();
+        let mut pending = vec![function.id.as_str()];
+        while let Some(id) = pending.pop() {
+            if family.insert(id)
+                && let Some(edges) = dispatch.get(id)
+            {
+                pending.extend(edges);
+            }
+        }
+        renamed.extend(family.iter().map(|id| (*id).to_owned()));
+        let allowed = self.allowed_family_occurrences(&family, old, work)?;
+        for &(p, span) in identifiers.get(old.as_str()).into_iter().flatten() {
+            work.value_probes += 1;
+            // Functions and constants cannot own a namespace. A
+            // same-spelled path qualifier is not a use of this target.
+            if qualifiers.contains(&(p, span.start, span.end)) {
+                continue;
+            }
+            let point = (Path::new(p), span.start, span.end);
+            if alias_points.contains(&point) {
+                continue;
+            }
+            let mut proven_value = false;
+            if let Some(targets) = value_targets.get(&point) {
+                if targets.iter().all(|target| local_ids.contains(target)) {
+                    continue;
+                }
+                if targets.iter().all(|target| family.contains(target)) {
+                    proven_value = true;
+                } else if targets.iter().any(|target| family.contains(target)) {
+                    anyhow::bail!(
+                        "rename occurrence has conflicting semantic targets at {p}:{}:{}",
+                        span.line,
+                        span.col
+                    );
+                }
+            }
+            if !proven_value && !allowed.get(p).is_some_and(|a| a.contains(&span.start)) {
+                if builtin_members
+                    .get_or_insert_with(|| builtin_member_points(snapshot, root))
+                    .contains(&(Path::new(p), span.start))
+                {
+                    continue;
+                }
+                let ts = &tokens[p];
+                let index = ts.partition_point(|t| t.span.start < span.start);
+                let reason = match index
+                    .checked_sub(1)
+                    .and_then(|i| ts.get(i))
+                    .map(|t| &t.kind)
+                {
+                    Some(TokenKind::Fn) => {
+                        "function/method declaration outside the supported dispatch family; interface contract declarations are not covered"
+                    }
+                    Some(TokenKind::Dot) => {
+                        "member reference without a proven target in the supported dispatch family"
+                    }
+                    Some(TokenKind::ColonColon) => {
+                        "qualified reference without a proven target in the supported dispatch family"
+                    }
+                    _ => "same-name identifier outside the proven declaration/reference set",
+                };
+                return Err(Rejection {
+                    message: format!(
+                        "rename coverage incomplete or ambiguous: `{old}` is a {reason}. Inspect this occurrence with `willow symbol {p}:{}:{}` and `willow refs`; no files changed",
+                        span.line, span.col
+                    ),
+                    location: RejectionLocation {
+                        path: p.into(),
+                        start: span.start,
+                        end: span.end,
+                        line: span.line,
+                        column: span.col,
+                    },
+                }
+                .into());
+            }
+            patches.entry(p.into()).or_default().push(Patch {
+                start: span.start,
+                end: span.end,
+                text: name.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn plan_body_replacement(
+    function: &super::Function,
+    path: &str,
+    body: String,
+    patches: &mut BTreeMap<String, Vec<Patch>>,
+) -> Result<()> {
+    use crate::lexer::{Lexer, token::TokenKind};
+    let location = &function.locations[0];
+    let ts = Lexer::new(&body)
+        .tokenize()
+        .map_err(|_| anyhow::anyhow!("invalid replacement body"))?;
+    ensure!(
+        ts.first().is_some_and(|t| t.kind == TokenKind::LBrace),
+        "replacement must be one block"
+    );
+    let mut depth = 0usize;
+    for (i, t) in ts.iter().enumerate().take(ts.len() - 1) {
+        match t.kind {
+            TokenKind::LBrace => depth += 1,
+            TokenKind::RBrace => {
+                depth = depth.checked_sub(1).context("unbalanced replacement")?;
+                ensure!(
+                    depth != 0 || i == ts.len() - 2,
+                    "replacement contains trailing declarations"
+                );
+            }
+            _ => {}
+        }
+    }
+    ensure!(depth == 0, "unbalanced replacement");
+    let body_location = function
+        .body_location
+        .as_ref()
+        .context("missing compiler body range")?;
+    ensure!(
+        body_location.path == location.path,
+        "body is in a different source"
+    );
+    patches.entry(path.into()).or_default().push(Patch {
+        start: body_location.start,
+        end: body_location.end,
+        text: body,
+    });
+    Ok(())
+}
+
+fn apply_structured_patches(
+    sources: &BTreeMap<String, String>,
+    patches: BTreeMap<String, Vec<Patch>>,
+    work: &mut EditWork,
+) -> Result<Vec<Change>> {
     let mut changes = Vec::new();
     for (path, mut edits) in patches {
         edits.sort_by_key(|e| (e.start, e.end));
@@ -1762,7 +1920,7 @@ fn structured_changes(
             });
         }
     }
-    Ok((changes, work))
+    Ok(changes)
 }
 
 fn verified_bundled_source(path: &str, expected: &str) -> Result<bool> {

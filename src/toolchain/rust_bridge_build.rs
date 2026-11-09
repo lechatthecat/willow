@@ -309,6 +309,218 @@ enum BridgeAction<'a> {
     },
 }
 
+fn prepare_bridge_lock(
+    root: &Path,
+    directory: &Path,
+    options: &BridgeOptions,
+    action: BridgeAction<'_>,
+    input_hash: &str,
+) -> Result<Option<crate::package::lock::RustLock>> {
+    let persisted = root.join(".willow/rust/Cargo.lock");
+    let previous = crate::package::lock::read_rust_lock(root)
+        .context("rust_lockfile_stale: invalid project.lock")?;
+    if options.locked {
+        let valid = previous.as_ref().is_some_and(|lock| {
+            lock.bridge_input_hash == input_hash
+                && hash_file(&persisted).ok().as_ref() == Some(&lock.cargo_lock_hash)
+        });
+        if !valid {
+            bail!("rust_lockfile_stale: missing or inconsistent Rust lock fingerprints");
+        }
+    }
+    let cached_lock = directory.join("Cargo.lock");
+    if let BridgeAction::Edit {
+        lock: EditLock::Candidate(bytes),
+        ..
+    } = action
+    {
+        write_changed(&cached_lock, bytes)?;
+    } else if matches!(
+        action,
+        BridgeAction::Edit {
+            lock: EditLock::Fresh,
+            ..
+        }
+    ) {
+        if cached_lock.exists() {
+            fs::remove_file(&cached_lock)?;
+        }
+    } else {
+        match fs::read(&persisted) {
+            Ok(bytes) => write_changed(&cached_lock, &bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if cached_lock.exists() {
+                    fs::remove_file(&cached_lock)?;
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(previous)
+}
+
+struct BridgeCargo<'a> {
+    root: &'a Path,
+    toolchain: &'a RustToolchain,
+    directory: &'a Path,
+    manifest_path: &'a Path,
+    lib_path: &'a Path,
+    target: &'a str,
+    profile: &'a str,
+}
+
+impl BridgeCargo<'_> {
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(&self.toolchain.cargo);
+        cmd.current_dir(self.root)
+            .env("RUSTC", &self.toolchain.rustc);
+        if let Some(home) = std::env::var_os("WILLOW_CARGO_HOME") {
+            cmd.env("CARGO_HOME", home);
+        }
+        cmd
+    }
+    fn metadata(&self, options: &BridgeOptions, action: BridgeAction<'_>) -> Result<Value> {
+        if let BridgeAction::Edit {
+            update: Some(package),
+            ..
+        } = action
+        {
+            let mut update = self.command();
+            update
+                .args(["update", "--manifest-path"])
+                .arg(self.manifest_path);
+            if let Some(package) = package {
+                update.args(["--package", package]);
+            }
+            if options.offline {
+                update.arg("--offline");
+            }
+            run(&mut update)?;
+        }
+        let mut metadata_command = self.command();
+        metadata_command
+            .args(["metadata", "--format-version=1", "--manifest-path"])
+            .arg(self.manifest_path)
+            .arg("--filter-platform")
+            .arg(self.target);
+        if options.offline {
+            metadata_command.arg("--offline");
+        }
+        if options.locked {
+            metadata_command.arg("--locked");
+        }
+        let metadata_output = run(&mut metadata_command).with_context(|| {
+            if options.locked {
+                "rust_lockfile_stale: Cargo rejected locked resolution"
+            } else {
+                "Rust dependency resolution failed"
+            }
+        })?;
+        Ok(serde_json::from_slice(&metadata_output.stdout)?)
+    }
+    fn compile(
+        &self,
+        options: &BridgeOptions,
+        check: bool,
+    ) -> Result<(CargoMessages, Option<PathBuf>)> {
+        let mut cargo = self.command();
+        cargo
+            .arg(if check { "check" } else { "rustc" })
+            .args(["--lib", "--message-format=json", "--manifest-path"])
+            .arg(self.manifest_path)
+            .arg("--target-dir")
+            .arg(self.directory.join("target"))
+            .arg("--target")
+            .arg(self.target)
+            .arg("--profile")
+            .arg(self.profile);
+        if options.offline {
+            cargo.arg("--offline");
+        }
+        cargo.arg("--locked");
+        if !check {
+            cargo.args(["--", "--print=native-static-libs"]);
+        }
+        let output = cargo
+            .output()
+            .context("cargo_missing: cannot execute Cargo")?;
+        let messages = parse_cargo_messages(&output.stdout, self.manifest_path)?;
+        if !output.status.success() || !messages.success {
+            let adapter_error = |codes: &[&str]| {
+                !options.symbols.is_empty()
+                    && messages.diagnostics.iter().any(|diagnostic| {
+                        let message = &diagnostic["message"];
+                        message["code"]["code"]
+                            .as_str()
+                            .is_some_and(|code| codes.contains(&code))
+                            && message["spans"].as_array().is_some_and(|spans| {
+                                spans.iter().any(|span| {
+                                    span["is_primary"] == true
+                                        && span["file_name"].as_str().is_some_and(|name| {
+                                            let path = Path::new(name);
+                                            path == self.lib_path || path == Path::new("src/lib.rs")
+                                        })
+                                })
+                            })
+                    })
+            };
+            let mut error = crate::package::CommandError::new(
+                if adapter_error(&["E0425", "E0603"]) {
+                    "rust_bridge_symbol_missing"
+                } else if adapter_error(&["E0308", "E0277", "E0283"]) {
+                    "rust_bridge_signature_mismatch"
+                } else {
+                    "rust_bridge_compile_error"
+                },
+                "Rust bridge compilation failed",
+            );
+            error.fields.insert(
+                "diagnostics".into(),
+                serde_json::to_value(&messages.diagnostics)?,
+            );
+            error.fields.insert(
+                "cargo_stderr".into(),
+                String::from_utf8_lossy(&output.stderr).into_owned().into(),
+            );
+            return Err(error.into());
+        }
+        let staticlib = if check {
+            None
+        } else {
+            let artifact = messages
+                .artifacts
+                .iter()
+                .find(|artifact| {
+                    artifact.target["name"] == BRIDGE_NAME
+                        && artifact.target["src_path"].as_str().map(Path::new)
+                            == Some(self.lib_path)
+                        && artifact.target["crate_types"]
+                            .as_array()
+                            .is_some_and(|types| types.iter().any(|ty| ty == "staticlib"))
+                })
+                .context("Cargo did not report the bridge staticlib artifact")?;
+            let path = artifact
+                .filenames
+                .iter()
+                .find(|path| {
+                    matches!(
+                        path.extension().and_then(|ext| ext.to_str()),
+                        Some("a" | "lib")
+                    )
+                })
+                .context("Cargo staticlib artifact has no archive")?;
+            if !path.is_file() {
+                bail!("Cargo staticlib does not exist: {}", path.display());
+            }
+            if messages.native_static_libs.is_none() {
+                bail!("Cargo did not report native-static-libs");
+            }
+            Some(path.clone())
+        };
+        Ok((messages, staticlib))
+    }
+}
+
 fn prepare_bridge(
     project: &ProjectManifest,
     root: &Path,
@@ -390,46 +602,7 @@ fn prepare_bridge(
         &options.wrapper_schema,
         &options.abi_revision,
     )?;
-    let persisted = root.join(".willow/rust/Cargo.lock");
-    let previous = crate::package::lock::read_rust_lock(&root)
-        .context("rust_lockfile_stale: invalid project.lock")?;
-    if options.locked {
-        let valid = previous.as_ref().is_some_and(|lock| {
-            lock.bridge_input_hash == input_hash
-                && hash_file(&persisted).ok().as_ref() == Some(&lock.cargo_lock_hash)
-        });
-        if !valid {
-            bail!("rust_lockfile_stale: missing or inconsistent Rust lock fingerprints");
-        }
-    }
-    let cached_lock = directory.join("Cargo.lock");
-    if let BridgeAction::Edit {
-        lock: EditLock::Candidate(bytes),
-        ..
-    } = action
-    {
-        write_changed(&cached_lock, bytes)?;
-    } else if matches!(
-        action,
-        BridgeAction::Edit {
-            lock: EditLock::Fresh,
-            ..
-        }
-    ) {
-        if cached_lock.exists() {
-            fs::remove_file(&cached_lock)?;
-        }
-    } else {
-        match fs::read(&persisted) {
-            Ok(bytes) => write_changed(&cached_lock, &bytes)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if cached_lock.exists() {
-                    fs::remove_file(&cached_lock)?;
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
+    let previous = prepare_bridge_lock(&root, &directory, options, action, &input_hash)?;
     write_changed(&manifest_path, manifest.as_bytes())?;
     let mut source = format!(
         "#[path = {:?}]\npub mod bridge;\n",
@@ -451,51 +624,16 @@ fn prepare_bridge(
     if !lib_path.exists() {
         write_changed(&lib_path, source.as_bytes())?;
     }
-    let command = || {
-        let mut cmd = Command::new(&toolchain.cargo);
-        cmd.current_dir(&root).env("RUSTC", &toolchain.rustc);
-        if let Some(home) = std::env::var_os("WILLOW_CARGO_HOME") {
-            cmd.env("CARGO_HOME", home);
-        }
-        cmd
+    let cargo = BridgeCargo {
+        root: &root,
+        toolchain: &toolchain,
+        directory: &directory,
+        manifest_path: &manifest_path,
+        lib_path: &lib_path,
+        target,
+        profile,
     };
-    if let BridgeAction::Edit {
-        update: Some(package),
-        ..
-    } = action
-    {
-        let mut update = command();
-        update
-            .args(["update", "--manifest-path"])
-            .arg(&manifest_path);
-        if let Some(package) = package {
-            update.args(["--package", package]);
-        }
-        if options.offline {
-            update.arg("--offline");
-        }
-        run(&mut update)?;
-    }
-    let mut metadata_command = command();
-    metadata_command
-        .args(["metadata", "--format-version=1", "--manifest-path"])
-        .arg(&manifest_path)
-        .arg("--filter-platform")
-        .arg(target);
-    if options.offline {
-        metadata_command.arg("--offline");
-    }
-    if options.locked {
-        metadata_command.arg("--locked");
-    }
-    let metadata_output = run(&mut metadata_command).with_context(|| {
-        if options.locked {
-            "rust_lockfile_stale: Cargo rejected locked resolution"
-        } else {
-            "Rust dependency resolution failed"
-        }
-    })?;
-    let metadata: Value = serde_json::from_slice(&metadata_output.stdout)?;
+    let metadata = cargo.metadata(options, action)?;
     let lock_hash = hash_file(&directory.join("Cargo.lock"))?;
     let direct_dependencies = direct_dependency_metadata(
         &metadata,
@@ -552,101 +690,7 @@ fn prepare_bridge(
     if !options.locked && !options.read_only {
         persist_resolution(&root, &directory, options, &rust_lock)?;
     }
-    let check = action == BridgeAction::Check;
-    let mut cargo = command();
-    cargo
-        .arg(if check { "check" } else { "rustc" })
-        .args(["--lib", "--message-format=json", "--manifest-path"])
-        .arg(&manifest_path)
-        .arg("--target-dir")
-        .arg(directory.join("target"))
-        .arg("--target")
-        .arg(target)
-        .arg("--profile")
-        .arg(profile);
-    if options.offline {
-        cargo.arg("--offline");
-    }
-    cargo.arg("--locked");
-    if !check {
-        cargo.args(["--", "--print=native-static-libs"]);
-    }
-    let output = cargo
-        .output()
-        .context("cargo_missing: cannot execute Cargo")?;
-    let messages = parse_cargo_messages(&output.stdout, &manifest_path)?;
-    if !output.status.success() || !messages.success {
-        let adapter_error = |codes: &[&str]| {
-            !options.symbols.is_empty()
-                && messages.diagnostics.iter().any(|diagnostic| {
-                    let message = &diagnostic["message"];
-                    message["code"]["code"]
-                        .as_str()
-                        .is_some_and(|code| codes.contains(&code))
-                        && message["spans"].as_array().is_some_and(|spans| {
-                            spans.iter().any(|span| {
-                                span["is_primary"] == true
-                                    && span["file_name"].as_str().is_some_and(|name| {
-                                        let path = Path::new(name);
-                                        path == lib_path || path == Path::new("src/lib.rs")
-                                    })
-                            })
-                        })
-                })
-        };
-        let mut error = crate::package::CommandError::new(
-            if adapter_error(&["E0425", "E0603"]) {
-                "rust_bridge_symbol_missing"
-            } else if adapter_error(&["E0308", "E0277", "E0283"]) {
-                "rust_bridge_signature_mismatch"
-            } else {
-                "rust_bridge_compile_error"
-            },
-            "Rust bridge compilation failed",
-        );
-        error.fields.insert(
-            "diagnostics".into(),
-            serde_json::to_value(&messages.diagnostics)?,
-        );
-        error.fields.insert(
-            "cargo_stderr".into(),
-            String::from_utf8_lossy(&output.stderr).into_owned().into(),
-        );
-        return Err(error.into());
-    }
-    let staticlib = if check {
-        None
-    } else {
-        let artifact = messages
-            .artifacts
-            .iter()
-            .find(|artifact| {
-                artifact.target["name"] == BRIDGE_NAME
-                    && artifact.target["src_path"].as_str().map(Path::new)
-                        == Some(lib_path.as_path())
-                    && artifact.target["crate_types"]
-                        .as_array()
-                        .is_some_and(|types| types.iter().any(|ty| ty == "staticlib"))
-            })
-            .context("Cargo did not report the bridge staticlib artifact")?;
-        let path = artifact
-            .filenames
-            .iter()
-            .find(|path| {
-                matches!(
-                    path.extension().and_then(|ext| ext.to_str()),
-                    Some("a" | "lib")
-                )
-            })
-            .context("Cargo staticlib artifact has no archive")?;
-        if !path.is_file() {
-            bail!("Cargo staticlib does not exist: {}", path.display());
-        }
-        if messages.native_static_libs.is_none() {
-            bail!("Cargo did not report native-static-libs");
-        }
-        Some(path.clone())
-    };
+    let (messages, staticlib) = cargo.compile(options, action == BridgeAction::Check)?;
     Ok(Some(BridgeBuild {
         directory,
         cache_key,

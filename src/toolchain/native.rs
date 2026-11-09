@@ -225,6 +225,251 @@ fn hash_tree(root: &Path, cache: &mut HashMap<PathBuf, String>, bytes: &mut u64)
     Ok(cache[root].clone())
 }
 
+#[derive(Default)]
+struct NativeCache {
+    checked_files: HashMap<PathBuf, (usize, Linkage)>,
+    source_digests: HashMap<PathBuf, String>,
+    fetched_artifacts: HashMap<String, PathBuf>,
+    shared_exports: HashMap<PathBuf, std::collections::HashSet<String>>,
+    symbols: HashMap<String, (usize, payload::Definition)>,
+}
+
+struct NativeContext<'a> {
+    root: &'a Path,
+    manifest: &'a NativeManifest,
+    target: &'a str,
+    offline: bool,
+    arch: &'a str,
+    abi: &'a str,
+    linker: &'a str,
+    graph: &'a graph::Graph<'a>,
+}
+
+struct NativeInput<'a> {
+    artifact: &'a Artifact,
+    name: &'a str,
+    index: usize,
+    source_root: Option<&'a Path>,
+}
+
+impl NativeContext<'_> {
+    fn resolve_source(
+        &self,
+        a: &Artifact,
+        name: &str,
+        i: usize,
+        cache: &mut NativeCache,
+        work: &mut Work,
+        notices: &mut Vec<String>,
+    ) -> Result<Option<PathBuf>> {
+        let source_root = match &a.source {
+            Source::Local { path } => {
+                let dir = rooted(self.root, path)?;
+                let actual = hash_tree(&dir, &mut cache.source_digests, &mut work.bytes)?;
+                ensure!(
+                    actual == a.digest,
+                    "native_digest_mismatch: {}",
+                    self.graph.path(i)
+                );
+                Some(dir)
+            }
+            Source::Artifact { url } => {
+                ensure!(
+                    url.starts_with("https://"),
+                    "native_unpinned_source: HTTPS required"
+                );
+                ensure!(
+                    a.header_roots.is_empty() && a.adapter_roots.is_empty(),
+                    "native_raw_artifact_roots"
+                );
+                if !cache.fetched_artifacts.contains_key(&a.digest) {
+                    let file = payload::fetch(self.root, url, &a.digest, self.offline)?;
+                    work.bytes += std::fs::metadata(&file)?.len();
+                    cache.source_digests.insert(file.clone(), a.digest.clone());
+                    cache.fetched_artifacts.insert(a.digest.clone(), file);
+                }
+                let file = &cache.fetched_artifacts[&a.digest];
+                // The single downloaded file is addressed as `artifact`.
+                Some(file.parent().unwrap().to_path_buf())
+            }
+            Source::System { provider, version } => {
+                ensure!(!self.manifest.reproducible, "native_non_hermetic: {name}");
+                ensure!(
+                    !provider.is_empty()
+                        && !version.is_empty()
+                        && a.linkage == Linkage::System
+                        && a.header_roots.is_empty()
+                        && a.adapter_roots.is_empty(),
+                    "native_system_identity_invalid"
+                );
+                ensure!(
+                    a.digest == digest(&serde_json::to_vec(&(provider, version, self.target))?),
+                    "native_digest_mismatch: system {name}"
+                );
+                notices.push(format!(
+                    "native_non_hermetic: {name}: {provider} {version} ({})",
+                    self.target
+                ));
+                None
+            }
+        };
+        if let Some(dir) = &source_root {
+            ensure!(
+                a.linkage != Linkage::System,
+                "native_linkage_mismatch: {name}"
+            );
+            for path in a.header_roots.iter().chain(&a.adapter_roots) {
+                ensure!(
+                    rooted(dir, path)?.is_dir(),
+                    "native_root_not_directory: {path}"
+                );
+            }
+        }
+        Ok(source_root)
+    }
+
+    fn resolve_inputs(
+        &self,
+        input: NativeInput<'_>,
+        cache: &mut NativeCache,
+        work: &mut Work,
+        shared_input: &mut Option<distribution::SharedArtifact>,
+    ) -> Result<Vec<String>> {
+        let NativeInput {
+            artifact: a,
+            name,
+            index: i,
+            source_root,
+        } = input;
+        let mut args = Vec::new();
+        let mut has_payload = false;
+        ensure!(!a.inputs.is_empty(), "native_link_inputs_empty: {name}");
+        for input in &a.inputs {
+            work.inputs += 1;
+            match input {
+                LinkInput::File(path) => {
+                    has_payload = true;
+                    let dir = source_root.context("native_system_file_forbidden")?;
+                    if matches!(a.source, Source::Artifact { .. }) {
+                        ensure!(path == "artifact", "native_raw_artifact_path");
+                    }
+                    let path = rooted(dir, path)?;
+                    if a.linkage == Linkage::Shared {
+                        let loader = a.loader.as_ref().unwrap();
+                        if !cache.shared_exports.contains_key(&path) {
+                            let mut exports = std::collections::HashSet::new();
+                            payload::validate(
+                                &path,
+                                self.arch,
+                                self.abi,
+                                a.linkage,
+                                |symbol, _| {
+                                    exports.insert(
+                                        if self.abi == "c-darwin" {
+                                            symbol.strip_prefix('_').unwrap_or(symbol)
+                                        } else {
+                                            symbol
+                                        }
+                                        .to_owned(),
+                                    );
+                                    Ok(())
+                                },
+                            )?;
+                            cache.shared_exports.insert(path.clone(), exports);
+                            work.payloads += 1;
+                        }
+                        let exports = &cache.shared_exports[&path];
+                        ensure!(
+                            exports.contains(&loader.abi_symbol)
+                                && loader.symbols.iter().all(|s| exports.contains(s)),
+                            "native_shared_export_missing: {name}"
+                        );
+                        let hash = match cache.source_digests.get(&path) {
+                            Some(hash) => hash.clone(),
+                            None => digest_file(&path)?,
+                        };
+                        *shared_input = Some(distribution::SharedArtifact {
+                            source: path,
+                            library: willow_abi::native::Library {
+                                name: name.into(),
+                                digest: hash,
+                                policy: loader.clone(),
+                            },
+                        });
+                        continue;
+                    }
+                    if let Some((previous, linkage)) = cache.checked_files.get(&path) {
+                        ensure!(*linkage == a.linkage, "native_linkage_mismatch: {name}");
+                        // Identical payload referenced by two identities must not
+                        // silently acquire incompatible ABI metadata.
+                        ensure!(
+                            *previous == i,
+                            "native_duplicate_artifact_identity: {} and {}",
+                            self.graph.path(*previous),
+                            self.graph.path(i)
+                        );
+                    } else {
+                        work.payloads += 1;
+                        payload::validate(
+                            &path,
+                            self.arch,
+                            self.abi,
+                            a.linkage,
+                            |symbol, definition| {
+                                if let Some((other, previous)) = cache.symbols.get(symbol) {
+                                    ensure!(
+                                        previous.compatible(&definition),
+                                        "native_symbol_conflict: {symbol}: {} and {}",
+                                        self.graph.path(*other),
+                                        self.graph.path(i)
+                                    );
+                                } else {
+                                    cache.symbols.insert(symbol.to_owned(), (i, definition));
+                                }
+                                Ok(())
+                            },
+                        )?;
+                        cache.checked_files.insert(path.clone(), (i, a.linkage));
+                    }
+                    args.push(path.to_str().context("native_non_utf8_path")?.to_owned());
+                }
+                LinkInput::Search(path) => {
+                    let dir = source_root.context("native_system_search_forbidden")?;
+                    let path = rooted(dir, path)?;
+                    ensure!(path.is_dir(), "native_search_not_directory");
+                    args.push(format!(
+                        "{}{}",
+                        if self.linker == "msvc" {
+                            "/LIBPATH:"
+                        } else {
+                            "-L"
+                        },
+                        path.to_str().context("native_non_utf8_path")?
+                    ));
+                }
+                LinkInput::System(name) => {
+                    ensure!(
+                        matches!(a.source, Source::System { .. })
+                            && !name.is_empty()
+                            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                        "native_ambient_lookup_forbidden"
+                    );
+                    args.push(if self.linker == "msvc" {
+                        format!("{name}.lib")
+                    } else {
+                        format!("-l{name}")
+                    });
+                }
+            }
+        }
+        ensure!(
+            a.linkage == Linkage::System || has_payload,
+            "native_artifact_missing: {name}"
+        );
+        Ok(args)
+    }
+}
+
 /// Resolve without publishing locks. Callers publish only after all graphs pass.
 pub fn resolve(
     root: &Path,
@@ -271,12 +516,18 @@ pub fn resolve(
     let mut shared_inputs = vec![None; graph.names.len()];
     let mut distribution_names = std::collections::HashSet::new();
     let mut notices = Vec::new();
-    let mut symbols: HashMap<String, (usize, payload::Definition)> = HashMap::new();
     let mut versions: HashMap<&str, (usize, &str)> = HashMap::new();
-    let mut checked_files = HashMap::new();
-    let mut source_digests = HashMap::new();
-    let mut fetched_artifacts = HashMap::new();
-    let mut shared_exports = HashMap::new();
+    let mut cache = NativeCache::default();
+    let context = NativeContext {
+        root,
+        manifest,
+        target,
+        offline,
+        arch: &arch,
+        abi,
+        linker,
+        graph: &graph,
+    };
     for (i, name) in graph.names.iter().enumerate() {
         let lib = &manifest.libraries[*name];
         ensure!(
@@ -335,181 +586,19 @@ pub fn resolve(
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
             "native_digest_invalid: {name}"
         );
-        let source_root = match &a.source {
-            Source::Local { path } => {
-                let dir = rooted(root, path)?;
-                let actual = hash_tree(&dir, &mut source_digests, &mut work.bytes)?;
-                ensure!(
-                    actual == a.digest,
-                    "native_digest_mismatch: {}",
-                    graph.path(i)
-                );
-                Some(dir)
-            }
-            Source::Artifact { url } => {
-                ensure!(
-                    url.starts_with("https://"),
-                    "native_unpinned_source: HTTPS required"
-                );
-                ensure!(
-                    a.header_roots.is_empty() && a.adapter_roots.is_empty(),
-                    "native_raw_artifact_roots"
-                );
-                if !fetched_artifacts.contains_key(&a.digest) {
-                    let file = payload::fetch(root, url, &a.digest, offline)?;
-                    work.bytes += std::fs::metadata(&file)?.len();
-                    source_digests.insert(file.clone(), a.digest.clone());
-                    fetched_artifacts.insert(a.digest.clone(), file);
-                }
-                let file = &fetched_artifacts[&a.digest];
-                // The single downloaded file is addressed as `artifact`.
-                Some(file.parent().unwrap().to_path_buf())
-            }
-            Source::System { provider, version } => {
-                ensure!(!manifest.reproducible, "native_non_hermetic: {name}");
-                ensure!(
-                    !provider.is_empty()
-                        && !version.is_empty()
-                        && a.linkage == Linkage::System
-                        && a.header_roots.is_empty()
-                        && a.adapter_roots.is_empty(),
-                    "native_system_identity_invalid"
-                );
-                ensure!(
-                    a.digest == digest(&serde_json::to_vec(&(provider, version, target))?),
-                    "native_digest_mismatch: system {name}"
-                );
-                notices.push(format!(
-                    "native_non_hermetic: {name}: {provider} {version} ({target})"
-                ));
-                None
-            }
-        };
-        if let Some(dir) = &source_root {
-            ensure!(
-                a.linkage != Linkage::System,
-                "native_linkage_mismatch: {name}"
-            );
-            for path in a.header_roots.iter().chain(&a.adapter_roots) {
-                ensure!(
-                    rooted(dir, path)?.is_dir(),
-                    "native_root_not_directory: {path}"
-                );
-            }
-        }
-        let mut args = Vec::new();
-        let mut has_payload = false;
-        ensure!(!a.inputs.is_empty(), "native_link_inputs_empty: {name}");
-        for input in &a.inputs {
-            work.inputs += 1;
-            match input {
-                LinkInput::File(path) => {
-                    has_payload = true;
-                    let dir = source_root
-                        .as_ref()
-                        .context("native_system_file_forbidden")?;
-                    if matches!(a.source, Source::Artifact { .. }) {
-                        ensure!(path == "artifact", "native_raw_artifact_path");
-                    }
-                    let path = rooted(dir, path)?;
-                    if a.linkage == Linkage::Shared {
-                        let loader = a.loader.as_ref().unwrap();
-                        if !shared_exports.contains_key(&path) {
-                            let mut exports = std::collections::HashSet::new();
-                            payload::validate(&path, &arch, abi, a.linkage, |symbol, _| {
-                                exports.insert(
-                                    if abi == "c-darwin" {
-                                        symbol.strip_prefix('_').unwrap_or(symbol)
-                                    } else {
-                                        symbol
-                                    }
-                                    .to_owned(),
-                                );
-                                Ok(())
-                            })?;
-                            shared_exports.insert(path.clone(), exports);
-                            work.payloads += 1;
-                        }
-                        let exports = &shared_exports[&path];
-                        ensure!(
-                            exports.contains(&loader.abi_symbol)
-                                && loader.symbols.iter().all(|s| exports.contains(s)),
-                            "native_shared_export_missing: {name}"
-                        );
-                        let hash = match source_digests.get(&path) {
-                            Some(hash) => hash.clone(),
-                            None => digest_file(&path)?,
-                        };
-                        shared_inputs[i] = Some(distribution::SharedArtifact {
-                            source: path,
-                            library: willow_abi::native::Library {
-                                name: (*name).into(),
-                                digest: hash,
-                                policy: loader.clone(),
-                            },
-                        });
-                        continue;
-                    }
-                    if let Some((previous, linkage)) = checked_files.get(&path) {
-                        ensure!(*linkage == a.linkage, "native_linkage_mismatch: {name}");
-                        // Identical payload referenced by two identities must not
-                        // silently acquire incompatible ABI metadata.
-                        ensure!(
-                            *previous == i,
-                            "native_duplicate_artifact_identity: {} and {}",
-                            graph.path(*previous),
-                            graph.path(i)
-                        );
-                    } else {
-                        work.payloads += 1;
-                        payload::validate(&path, &arch, abi, a.linkage, |symbol, definition| {
-                            if let Some((other, previous)) = symbols.get(symbol) {
-                                ensure!(
-                                    previous.compatible(&definition),
-                                    "native_symbol_conflict: {symbol}: {} and {}",
-                                    graph.path(*other),
-                                    graph.path(i)
-                                );
-                            } else {
-                                symbols.insert(symbol.to_owned(), (i, definition));
-                            }
-                            Ok(())
-                        })?;
-                        checked_files.insert(path.clone(), (i, a.linkage));
-                    }
-                    args.push(path.to_str().context("native_non_utf8_path")?.to_owned());
-                }
-                LinkInput::Search(path) => {
-                    let dir = source_root
-                        .as_ref()
-                        .context("native_system_search_forbidden")?;
-                    let path = rooted(dir, path)?;
-                    ensure!(path.is_dir(), "native_search_not_directory");
-                    args.push(format!(
-                        "{}{}",
-                        if linker == "msvc" { "/LIBPATH:" } else { "-L" },
-                        path.to_str().context("native_non_utf8_path")?
-                    ));
-                }
-                LinkInput::System(name) => {
-                    ensure!(
-                        matches!(a.source, Source::System { .. })
-                            && !name.is_empty()
-                            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
-                        "native_ambient_lookup_forbidden"
-                    );
-                    args.push(if linker == "msvc" {
-                        format!("{name}.lib")
-                    } else {
-                        format!("-l{name}")
-                    });
-                }
-            }
-        }
-        ensure!(
-            a.linkage == Linkage::System || has_payload,
-            "native_artifact_missing: {name}"
-        );
+        let source_root =
+            context.resolve_source(a, name, i, &mut cache, &mut work, &mut notices)?;
+        let args = context.resolve_inputs(
+            NativeInput {
+                artifact: a,
+                name,
+                index: i,
+                source_root: source_root.as_deref(),
+            },
+            &mut cache,
+            &mut work,
+            &mut shared_inputs[i],
+        )?;
         identities.insert(
             (*name).to_owned(),
             digest(&serde_json::to_vec(&(lib, target))?),

@@ -133,135 +133,15 @@ pub fn mutate_packages_report(
         matches!(mutation, PackageMutation::Add { .. }),
     )?;
     let mut sources = HashMap::new();
-    let mut descriptions = Vec::new();
-    let mut manifest_changed = false;
-    match mutation {
-        PackageMutation::Add {
-            alias,
-            git,
-            path,
-            version,
-        } => {
-            ensure!(
-                git.is_some() ^ path.is_some(),
-                "add requires exactly one --git or --path source"
-            );
-            ensure!(
-                path.is_none() || version.is_none(),
-                "--version requires --git"
-            );
-            manifest_changed = true;
-            let mut value = InlineTable::new();
-            let name;
-            if let Some(path) = path {
-                let dependency = PathSource::open(&source.root.join(&path), true)?;
-                name = dependency.manifest.project.name.clone();
-                value.insert("path", Value::from(path));
-            } else {
-                let url = CanonicalGitUrl::new(git.as_deref().unwrap());
-                let selector = GitSelector::Version(version.as_deref().unwrap_or("*").parse()?);
-                let metadata = git_metadata(&mut sources, &url, dry_run)?;
-                let identity = metadata.resolve(&selector)?;
-                name = identity.name;
-                let requirement = version.unwrap_or_else(|| format!("^{}", identity.version));
-                value.insert("git", Value::from(url.as_str()));
-                value.insert("version", Value::from(requirement));
-                if pins.contains_key(url.as_str()) {
-                    // Metadata discovery may examine newer tags. Resolve the
-                    // pinned instance separately with its locked checksum.
-                    sources.remove(url.as_str());
-                }
-            }
-            let alias = alias.unwrap_or_else(|| derived_alias(&name));
-            if source.manifest.dependencies.contains_key(&alias) {
-                return Err(super::CommandError::new(
-                    "dependency_alias_conflict",
-                    format!("dependency `{alias}` already exists"),
-                )
-                .with_field("alias", &alias)
-                .into());
-            }
-            dependency = Some(alias.clone());
-            value.fmt();
-            descriptions.push(format!("Add {alias} = {value}"));
-            let implicit_parent = doc
-                .get("dependencies")
-                .and_then(Item::as_table)
-                .is_some_and(|table| table.is_implicit() && !table.is_dotted());
-            let item = if implicit_parent {
-                Item::Table(value.into_table())
-            } else {
-                Item::Value(Value::InlineTable(value))
-            };
-            dependencies(&mut doc)?.insert(&alias, item);
-        }
-        PackageMutation::Remove { alias } => {
-            ensure!(
-                source.manifest.dependencies.contains_key(&alias),
-                "unknown dependency `{alias}`"
-            );
-            manifest_changed = true;
-            dependencies(&mut doc)?.remove(&alias);
-            if doc["dependencies"]
-                .as_table()
-                .is_some_and(|t| t.is_dotted() && t.is_empty())
-            {
-                doc.remove("dependencies");
-            }
-            descriptions.push(format!("Remove {alias}"));
-        }
-        PackageMutation::Update { alias, breaking } => {
-            if let Some(alias) = &alias {
-                ensure!(
-                    source.manifest.dependencies.contains_key(alias),
-                    "unknown dependency `{alias}`"
-                );
-            }
-            // One pass over root edges. Unselected sources keep their exact pins.
-            for (name, dependency) in &source.manifest.dependencies {
-                if alias.as_ref().is_some_and(|alias| alias != name) {
-                    continue;
-                }
-                if let DependencySource::Git { url, selector } = dependency {
-                    pins.remove(url.as_str());
-                    checksums.remove(url.as_str());
-                    if breaking && matches!(selector, GitSelector::Version(_)) {
-                        let metadata = git_metadata(&mut sources, url, dry_run)?;
-                        let identity =
-                            metadata.resolve(&GitSelector::Version(semver::VersionReq::STAR))?;
-                        let requirement = format!("^{}", identity.version);
-                        let item = dependencies(&mut doc)?
-                            .get_mut(name)
-                            .context("missing dependency")?;
-                        let table = item
-                            .as_table_like_mut()
-                            .context("dependency must be a table")?;
-                        let old = table
-                            .get("version")
-                            .and_then(Item::as_str)
-                            .unwrap_or("*")
-                            .to_owned();
-                        if old == requirement {
-                            continue;
-                        }
-                        manifest_changed = true;
-                        if let Some(value) = table.get_mut("version").and_then(Item::as_value_mut) {
-                            let decor = value.decor().clone();
-                            *value = Value::from(requirement.clone());
-                            *value.decor_mut() = decor;
-                        } else {
-                            table.insert("version", toml_edit::value(requirement.clone()));
-                        }
-                        descriptions.push(format!("Requirement {name}: {old} -> {requirement}"));
-                    }
-                }
-            }
-            descriptions.push(format!(
-                "Update {}",
-                alias.as_deref().unwrap_or("all dependencies")
-            ));
-        }
-    }
+    let (manifest_changed, descriptions) = plan_manifest_mutation(
+        &source,
+        mutation,
+        &mut doc,
+        (&mut pins, &mut checksums),
+        &mut sources,
+        &mut dependency,
+        dry_run,
+    )?;
     let after = if manifest_changed {
         render_manifest(&doc, &before)
     } else {
@@ -389,6 +269,150 @@ pub fn mutate_packages_report(
         ),
     ])?;
     Ok(report)
+}
+
+fn plan_manifest_mutation(
+    source: &PathSource,
+    mutation: PackageMutation,
+    doc: &mut DocumentMut,
+    (pins, checksums): (
+        &mut HashMap<String, super::solve::GitPin>,
+        &mut HashMap<String, String>,
+    ),
+    sources: &mut HashMap<String, GitSource>,
+    dependency: &mut Option<String>,
+    dry_run: bool,
+) -> Result<(bool, Vec<String>)> {
+    let mut descriptions = Vec::new();
+    let mut manifest_changed = false;
+    match mutation {
+        PackageMutation::Add {
+            alias,
+            git,
+            path,
+            version,
+        } => {
+            ensure!(
+                git.is_some() ^ path.is_some(),
+                "add requires exactly one --git or --path source"
+            );
+            ensure!(
+                path.is_none() || version.is_none(),
+                "--version requires --git"
+            );
+            manifest_changed = true;
+            let mut value = InlineTable::new();
+            let name;
+            if let Some(path) = path {
+                let dependency = PathSource::open(&source.root.join(&path), true)?;
+                name = dependency.manifest.project.name.clone();
+                value.insert("path", Value::from(path));
+            } else {
+                let url = CanonicalGitUrl::new(git.as_deref().unwrap());
+                let selector = GitSelector::Version(version.as_deref().unwrap_or("*").parse()?);
+                let metadata = git_metadata(sources, &url, dry_run)?;
+                let identity = metadata.resolve(&selector)?;
+                name = identity.name;
+                let requirement = version.unwrap_or_else(|| format!("^{}", identity.version));
+                value.insert("git", Value::from(url.as_str()));
+                value.insert("version", Value::from(requirement));
+                if pins.contains_key(url.as_str()) {
+                    // Metadata discovery may examine newer tags. Resolve the
+                    // pinned instance separately with its locked checksum.
+                    sources.remove(url.as_str());
+                }
+            }
+            let alias = alias.unwrap_or_else(|| derived_alias(&name));
+            if source.manifest.dependencies.contains_key(&alias) {
+                return Err(super::CommandError::new(
+                    "dependency_alias_conflict",
+                    format!("dependency `{alias}` already exists"),
+                )
+                .with_field("alias", &alias)
+                .into());
+            }
+            *dependency = Some(alias.clone());
+            value.fmt();
+            descriptions.push(format!("Add {alias} = {value}"));
+            let implicit_parent = doc
+                .get("dependencies")
+                .and_then(Item::as_table)
+                .is_some_and(|table| table.is_implicit() && !table.is_dotted());
+            let item = if implicit_parent {
+                Item::Table(value.into_table())
+            } else {
+                Item::Value(Value::InlineTable(value))
+            };
+            dependencies(doc)?.insert(&alias, item);
+        }
+        PackageMutation::Remove { alias } => {
+            ensure!(
+                source.manifest.dependencies.contains_key(&alias),
+                "unknown dependency `{alias}`"
+            );
+            manifest_changed = true;
+            dependencies(doc)?.remove(&alias);
+            if doc["dependencies"]
+                .as_table()
+                .is_some_and(|t| t.is_dotted() && t.is_empty())
+            {
+                doc.remove("dependencies");
+            }
+            descriptions.push(format!("Remove {alias}"));
+        }
+        PackageMutation::Update { alias, breaking } => {
+            if let Some(alias) = &alias {
+                ensure!(
+                    source.manifest.dependencies.contains_key(alias),
+                    "unknown dependency `{alias}`"
+                );
+            }
+            // One pass over root edges. Unselected sources keep their exact pins.
+            for (name, dependency) in &source.manifest.dependencies {
+                if alias.as_ref().is_some_and(|alias| alias != name) {
+                    continue;
+                }
+                if let DependencySource::Git { url, selector } = dependency {
+                    pins.remove(url.as_str());
+                    checksums.remove(url.as_str());
+                    if breaking && matches!(selector, GitSelector::Version(_)) {
+                        let metadata = git_metadata(sources, url, dry_run)?;
+                        let identity =
+                            metadata.resolve(&GitSelector::Version(semver::VersionReq::STAR))?;
+                        let requirement = format!("^{}", identity.version);
+                        let item = dependencies(doc)?
+                            .get_mut(name)
+                            .context("missing dependency")?;
+                        let table = item
+                            .as_table_like_mut()
+                            .context("dependency must be a table")?;
+                        let old = table
+                            .get("version")
+                            .and_then(Item::as_str)
+                            .unwrap_or("*")
+                            .to_owned();
+                        if old == requirement {
+                            continue;
+                        }
+                        manifest_changed = true;
+                        if let Some(value) = table.get_mut("version").and_then(Item::as_value_mut) {
+                            let decor = value.decor().clone();
+                            *value = Value::from(requirement.clone());
+                            *value.decor_mut() = decor;
+                        } else {
+                            table.insert("version", toml_edit::value(requirement.clone()));
+                        }
+                        descriptions.push(format!("Requirement {name}: {old} -> {requirement}"));
+                    }
+                }
+            }
+            descriptions.push(format!(
+                "Update {}",
+                alias.as_deref().unwrap_or("all dependencies")
+            ));
+        }
+    }
+    Ok((manifest_changed, descriptions))
 }
 
 pub(crate) fn render_manifest(doc: &DocumentMut, original: &str) -> String {

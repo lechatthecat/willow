@@ -546,159 +546,11 @@ fn resolve_one(
         return;
     }
 
-    #[cfg(test)]
-    {
-        graph.source_loads += 1;
-    }
-    let source = match crate::compiler_db::captured::FileInput::read(module_path.clone()) {
-        Ok(input) => input.source,
-        Err(e) => {
-            errors.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0401,
-                    format!("cannot read module `{}`: {}", path, e),
-                )
-                .with_label(Label::primary(span, "failed to read")),
-            );
-            graph.end_key_visit(key);
-            return;
-        }
-    };
-
-    let module_id = graph.reserve_source_key(key.clone(), &module_path);
-    let tracked = graph
-        .artifacts
-        .as_ref()
-        .and_then(|a| a.syntax_queries.as_ref())
-        .map(|queries| {
-            queries
-                .borrow_mut()
-                .parse(&module_path, module_id.file_id(), &source)
-        });
-    let tracked = match tracked.transpose() {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            errors.push(Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E0700,
-                format!("cannot evaluate parsed unit: {error:#}"),
-            ));
-            graph.end_key_visit(key);
-            return;
-        }
-    };
-    let cached = if tracked.is_some() {
-        None
-    } else {
-        match graph
-            .artifacts
-            .as_ref()
-            .map(|a| a.cached_parse(module_id.file_id(), &source))
-            .transpose()
-        {
-            Ok(program) => program.flatten(),
-            Err(error) => {
-                errors.push(Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0700,
-                    format!("cannot read parsed unit: {error:#}"),
-                ));
-                graph.end_key_visit(key);
-                return;
-            }
-        }
-    };
-    let (mut program, parse_errs) = if let Some((program, diagnostics, _lexer_failed)) = tracked {
-        // Both lexer and parser failures preserve a diagnostic-addressable
-        // recovery unit below; neither reaches semantic checking.
-        (program, diagnostics)
-    } else {
-        match cached {
-            Some(program) => (program, Vec::new()),
-            None => {
-                let tokens = match Lexer::with_file_id(&source, module_id.file_id()).tokenize() {
-                    Ok(t) => t,
-                    Err(errs) => {
-                        graph.has_syntax_errors = true;
-                        errors.extend(errs);
-                        // Keep the imported file addressable by lexer diagnostic FileIds,
-                        // just as parse-error recovery below does.
-                        let mut source = source;
-                        if let Some(artifacts) = &mut graph.artifacts {
-                            match artifacts.snapshot_source(module_id.file_id(), &source) {
-                                Ok(()) => source.clear(),
-                                Err(error) => errors.push(Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0700,
-                                    format!("cannot store compiler unit: {error:#}"),
-                                )),
-                            }
-                        }
-                        let name = alias
-                            .unwrap_or_else(|| module_access_name(path))
-                            .to_string();
-                        graph.add_package_file(
-                            name,
-                            key.clone(),
-                            module_path,
-                            source,
-                            Program {
-                                instantiation_types: Vec::new(),
-                                type_uses: Vec::new(),
-                                module: None,
-                                imports: vec![],
-                                items: vec![],
-                            },
-                        );
-                        graph.end_key_visit(key);
-                        return;
-                    }
-                };
-
-                Parser::new(tokens).parse()
-            }
-        }
-    };
-    if parse_errs.is_empty()
-        && let Some(artifacts) = &mut graph.artifacts
-        && artifacts.revision_enabled
-        && let Err(error) =
-            artifacts.retain_parse(module_id.file_id(), &module_path, &source, &mut program)
-    {
-        errors.push(Diagnostic::new(
-            Severity::Error,
-            ErrorCode::E0700,
-            format!("cannot retain parsed unit: {error:#}"),
-        ));
-        graph.end_key_visit(key);
+    let Some((module_path, source, program)) =
+        load_module_program(key, module_path, site, graph, errors)
+    else {
         return;
-    }
-    // Release the current source/body before descending into dependencies.
-    // Only declaration shells and import paths survive on the resolver stack.
-    let mut source = source;
-    if let Some(artifacts) = &mut graph.artifacts {
-        let snapshot = artifacts
-            .snapshot_source(module_id.file_id(), &source)
-            .and_then(|()| artifacts.offload(&mut program));
-        if let Err(error) = snapshot {
-            errors.push(Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E0700,
-                format!("cannot store compiler unit: {error:#}"),
-            ));
-            graph.end_key_visit(key);
-            return;
-        }
-        source = String::new();
-    }
-
-    if !parse_errs.is_empty() {
-        graph.has_syntax_errors = true;
-        errors.extend(parse_errs);
-        // Keep import discovery and source locations available. The frontend
-        // stops before semantic checking when any loaded syntax is incomplete.
-    }
+    };
 
     // An imported file's declared module identity must match the import path
     // that reached it (both canonical `::`-normalized). Files without a `module`
@@ -748,6 +600,173 @@ fn resolve_one(
         .map(str::to_string)
         .unwrap_or_else(|| module_access_name(path).to_string());
     graph.add_package_file(name, key.clone(), module_path, source, program);
+}
+
+/// Load, recover and offload one unit before the resolver descends into imports.
+fn load_module_program(
+    key: &ModuleKey,
+    module_path: PathBuf,
+    site: (Option<&str>, crate::diagnostics::Span),
+    graph: &mut ModuleGraph,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<(PathBuf, String, Program)> {
+    let (alias, span) = site;
+    let path = key.path.0.as_str();
+    #[cfg(test)]
+    {
+        graph.source_loads += 1;
+    }
+    let source = match crate::compiler_db::captured::FileInput::read(module_path.clone()) {
+        Ok(input) => input.source,
+        Err(e) => {
+            errors.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0401,
+                    format!("cannot read module `{}`: {}", path, e),
+                )
+                .with_label(Label::primary(span, "failed to read")),
+            );
+            graph.end_key_visit(key);
+            return None;
+        }
+    };
+
+    let module_id = graph.reserve_source_key(key.clone(), &module_path);
+    let tracked = graph
+        .artifacts
+        .as_ref()
+        .and_then(|a| a.syntax_queries.as_ref())
+        .map(|queries| {
+            queries
+                .borrow_mut()
+                .parse(&module_path, module_id.file_id(), &source)
+        });
+    let tracked = match tracked.transpose() {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            errors.push(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0700,
+                format!("cannot evaluate parsed unit: {error:#}"),
+            ));
+            graph.end_key_visit(key);
+            return None;
+        }
+    };
+    let cached = if tracked.is_some() {
+        None
+    } else {
+        match graph
+            .artifacts
+            .as_ref()
+            .map(|a| a.cached_parse(module_id.file_id(), &source))
+            .transpose()
+        {
+            Ok(program) => program.flatten(),
+            Err(error) => {
+                errors.push(Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0700,
+                    format!("cannot read parsed unit: {error:#}"),
+                ));
+                graph.end_key_visit(key);
+                return None;
+            }
+        }
+    };
+    let (mut program, parse_errs) = if let Some((program, diagnostics, _lexer_failed)) = tracked {
+        // Both lexer and parser failures preserve a diagnostic-addressable
+        // recovery unit below; neither reaches semantic checking.
+        (program, diagnostics)
+    } else {
+        match cached {
+            Some(program) => (program, Vec::new()),
+            None => {
+                let tokens = match Lexer::with_file_id(&source, module_id.file_id()).tokenize() {
+                    Ok(t) => t,
+                    Err(errs) => {
+                        graph.has_syntax_errors = true;
+                        errors.extend(errs);
+                        // Keep the imported file addressable by lexer diagnostic FileIds,
+                        // just as parse-error recovery below does.
+                        let mut source = source;
+                        if let Some(artifacts) = &mut graph.artifacts {
+                            match artifacts.snapshot_source(module_id.file_id(), &source) {
+                                Ok(()) => source.clear(),
+                                Err(error) => errors.push(Diagnostic::new(
+                                    Severity::Error,
+                                    ErrorCode::E0700,
+                                    format!("cannot store compiler unit: {error:#}"),
+                                )),
+                            }
+                        }
+                        let name = alias
+                            .unwrap_or_else(|| module_access_name(path))
+                            .to_string();
+                        graph.add_package_file(
+                            name,
+                            key.clone(),
+                            module_path,
+                            source,
+                            Program {
+                                instantiation_types: Vec::new(),
+                                type_uses: Vec::new(),
+                                module: None,
+                                imports: vec![],
+                                items: vec![],
+                            },
+                        );
+                        graph.end_key_visit(key);
+                        return None;
+                    }
+                };
+
+                Parser::new(tokens).parse()
+            }
+        }
+    };
+    if parse_errs.is_empty()
+        && let Some(artifacts) = &mut graph.artifacts
+        && artifacts.revision_enabled
+        && let Err(error) =
+            artifacts.retain_parse(module_id.file_id(), &module_path, &source, &mut program)
+    {
+        errors.push(Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0700,
+            format!("cannot retain parsed unit: {error:#}"),
+        ));
+        graph.end_key_visit(key);
+        return None;
+    }
+    // Release the current source/body before descending into dependencies.
+    // Only declaration shells and import paths survive on the resolver stack.
+    let mut source = source;
+    if let Some(artifacts) = &mut graph.artifacts {
+        let snapshot = artifacts
+            .snapshot_source(module_id.file_id(), &source)
+            .and_then(|()| artifacts.offload(&mut program));
+        if let Err(error) = snapshot {
+            errors.push(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0700,
+                format!("cannot store compiler unit: {error:#}"),
+            ));
+            graph.end_key_visit(key);
+            return None;
+        }
+        source = String::new();
+    }
+
+    if !parse_errs.is_empty() {
+        graph.has_syntax_errors = true;
+        errors.extend(parse_errs);
+        // Keep import discovery and source locations available. The frontend
+        // stops before semantic checking when any loaded syntax is incomplete.
+    }
+
+    Some((module_path, source, program))
 }
 
 /// The existing module source file for `path`, if any.
