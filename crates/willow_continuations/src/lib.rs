@@ -329,6 +329,15 @@ pub fn checker(_: TokenStream, input: TokenStream) -> TokenStream {
     )
 }
 
+/// Shared continuation boundary for the HIR eligibility call graph.
+#[proc_macro_attribute]
+pub fn lir_validation(_: TokenStream, input: TokenStream) -> TokenStream {
+    function(
+        "minimal_unsupported_expr, minimal_unsupported_scoped_expr, supported_body_stmt, supported_branch_body, supported_divergent_body, supported_divergent_expr, supported_effect_body, supported_expr, supported_expr_node, supported_match, supported_panic, supported_select, validate_expr".parse().expect("static continuation names"),
+        input,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     //! Guard the continuation name lists against the call graphs they lower.
