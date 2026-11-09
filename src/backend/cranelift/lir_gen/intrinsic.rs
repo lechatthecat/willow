@@ -1,6 +1,7 @@
 //! Runtime intrinsic and builtin emission.
 
 use super::*;
+use willow_abi::runtime_symbols::names as rt;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_atomic_intrinsic(
@@ -197,46 +198,49 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_pair(tag, payload)
             }
             StringConcatArray => {
-                self.emit_value_runtime_call("willow_string_concat_array", &[receiver])
+                self.emit_value_runtime_call(rt::willow_string_concat_array, &[receiver])
             }
             StringLen => self.emit_string_length(receiver),
             StringByteAt => {
-                self.emit_value_runtime_call("willow_string_byte_at", &[receiver, args[0]])
+                self.emit_value_runtime_call(rt::willow_string_byte_at, &[receiver, args[0]])
             }
-            StringSubstring => self
-                .emit_value_runtime_call("willow_string_substring", &[receiver, args[0], args[1]]),
+            StringSubstring => self.emit_value_runtime_call(
+                rt::willow_string_substring,
+                &[receiver, args[0], args[1]],
+            ),
             StringSplit => {
-                self.emit_value_runtime_call("willow_string_split", &[receiver, args[0]])
+                self.emit_value_runtime_call(rt::willow_string_split, &[receiver, args[0]])
             }
-            StringFind => self.emit_value_runtime_call("willow_string_find", &[receiver, args[0]]),
+            StringFind => {
+                self.emit_value_runtime_call(rt::willow_string_find, &[receiver, args[0]])
+            }
             StringRepeat => {
-                self.emit_value_runtime_call("willow_string_repeat", &[receiver, args[0]])
+                self.emit_value_runtime_call(rt::willow_string_repeat, &[receiver, args[0]])
             }
-            StringReplace => {
-                self.emit_value_runtime_call("willow_string_replace", &[receiver, args[0], args[1]])
-            }
+            StringReplace => self
+                .emit_value_runtime_call(rt::willow_string_replace, &[receiver, args[0], args[1]]),
             StringTrimStart => {
-                self.emit_value_runtime_call("willow_string_trim_start", &[receiver])
+                self.emit_value_runtime_call(rt::willow_string_trim_start, &[receiver])
             }
-            StringTrimEnd => self.emit_value_runtime_call("willow_string_trim_end", &[receiver]),
-            StringToLower => self.emit_value_runtime_call("willow_string_to_lower", &[receiver]),
-            StringToUpper => self.emit_value_runtime_call("willow_string_to_upper", &[receiver]),
-            StringTrim => self.emit_value_runtime_call("willow_string_trim", &[receiver]),
+            StringTrimEnd => self.emit_value_runtime_call(rt::willow_string_trim_end, &[receiver]),
+            StringToLower => self.emit_value_runtime_call(rt::willow_string_to_lower, &[receiver]),
+            StringToUpper => self.emit_value_runtime_call(rt::willow_string_to_upper, &[receiver]),
+            StringTrim => self.emit_value_runtime_call(rt::willow_string_trim, &[receiver]),
             StringContains | StringStartsWith | StringEndsWith => {
                 let symbol = if intrinsic == StringContains {
-                    "willow_string_contains"
+                    rt::willow_string_contains
                 } else if intrinsic == StringEndsWith {
-                    "willow_string_ends_with"
+                    rt::willow_string_ends_with
                 } else {
-                    "willow_string_starts_with"
+                    rt::willow_string_starts_with
                 };
                 let value = self.emit_value_runtime_call(symbol, &[receiver, args[0]]);
                 self.builder.ins().ireduce(types::I8, value)
             }
 
-            I64ToString => self.emit_value_runtime_call("willow_i64_to_string", &[receiver]),
-            F64ToString => self.emit_value_runtime_call("willow_f64_to_string", &[receiver]),
-            BoolToString => self.emit_value_runtime_call("willow_bool_to_string", &[receiver]),
+            I64ToString => self.emit_value_runtime_call(rt::willow_i64_to_string, &[receiver]),
+            F64ToString => self.emit_value_runtime_call(rt::willow_f64_to_string, &[receiver]),
+            BoolToString => self.emit_value_runtime_call(rt::willow_bool_to_string, &[receiver]),
             TaskCancel => {
                 let id = self.builder.ins().load(
                     types::I64,
@@ -247,30 +251,31 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         reference_type(self.module.target_config()).bytes(),
                     ),
                 );
-                self.emit_void_runtime_call("willow_sched_cancel", &[id]);
+                self.emit_void_runtime_call(rt::willow_sched_cancel, &[id]);
                 self.builder.ins().iconst(types::I8, 0)
             }
             TaskIsCancelled => {
-                let raw = self.emit_value_runtime_call("willow_frame_is_cancelled", &[receiver]);
+                let raw = self.emit_value_runtime_call(rt::willow_frame_is_cancelled, &[receiver]);
                 self.builder.ins().ireduce(types::I8, raw)
             }
             TokenIsCancelled | ScopeIsCancelled | TokenCancel | ScopeCancel | TokenChild
             | ScopeChild | TokenAttach | ScopeAdd | ScopeFinish => {
-                let handle =
-                    cancellation_handle(receiver_ty).expect("validated cancellation intrinsic");
-                let suffix = match intrinsic {
-                    TokenIsCancelled | ScopeIsCancelled => "is_cancelled",
-                    TokenCancel | ScopeCancel => "cancel",
-                    TokenChild | ScopeChild => "child",
-                    TokenAttach => "attach",
-                    ScopeAdd => "add",
-                    ScopeFinish => "finish",
+                cancellation_handle(receiver_ty).expect("validated cancellation intrinsic");
+                let symbol = match intrinsic {
+                    TokenIsCancelled => rt::willow_cancellation_token_is_cancelled,
+                    ScopeIsCancelled => rt::willow_task_scope_is_cancelled,
+                    TokenCancel => rt::willow_cancellation_token_cancel,
+                    ScopeCancel => rt::willow_task_scope_cancel,
+                    TokenChild => rt::willow_cancellation_token_child,
+                    ScopeChild => rt::willow_task_scope_child,
+                    TokenAttach => rt::willow_cancellation_token_attach,
+                    ScopeAdd => rt::willow_task_scope_add,
+                    ScopeFinish => rt::willow_task_scope_finish,
                     _ => unreachable!(),
                 };
                 let mut values = vec![receiver];
                 values.extend_from_slice(args);
-                let symbol = format!("{}_{suffix}", handle.prefix());
-                let value = self.emit_runtime_call_with_cleanup(&symbol, &values, |_| {});
+                let value = self.emit_runtime_call_with_cleanup(symbol, &values, |_| {});
                 match intrinsic {
                     TokenIsCancelled | ScopeIsCancelled => {
                         self.builder.ins().ireduce(types::I8, value.unwrap())
@@ -287,12 +292,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 unreachable!("atomic operations use the non-allocating fast path")
             }
             CellGet | CellSet | RwCellRead | RwCellWrite => {
-                let (kind, element) = blocking_cell(receiver_ty).expect("validated cell intrinsic");
-                let operation = match intrinsic {
-                    CellGet => "get",
-                    CellSet => "set",
-                    RwCellRead => "read",
-                    RwCellWrite => "write",
+                let (_, element) = blocking_cell(receiver_ty).expect("validated cell intrinsic");
+                let symbol = match intrinsic {
+                    CellGet => rt::willow_blocking_cell_get,
+                    CellSet => rt::willow_blocking_cell_set,
+                    RwCellRead => rt::willow_blocking_rw_cell_read,
+                    RwCellWrite => rt::willow_blocking_rw_cell_write,
                     _ => unreachable!(),
                 };
                 let mut values = vec![receiver];
@@ -304,11 +309,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                     values.push(word);
                 }
-                match self.emit_runtime_call_with_cleanup(
-                    &format!("{}_{operation}", kind.prefix()),
-                    &values,
-                    |_| {},
-                ) {
+                match self.emit_runtime_call_with_cleanup(symbol, &values, |_| {}) {
                     Some(value) => self.emit_from_storage_word(value, element),
                     None => self.builder.ins().iconst(types::I8, 0),
                 }
@@ -322,9 +323,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let element = builtin_types::unary_arg(receiver_ty, B::Channel)
                     .expect("validated channel intrinsic");
                 let symbol = if intrinsic == ChannelClose {
-                    "willow_channel_close".to_string()
+                    rt::willow_channel_close
                 } else {
-                    format!("willow_channel_send_{}", channel_runtime_suffix(element))
+                    channel_runtime_symbol(
+                        element,
+                        [
+                            rt::willow_channel_send_i64,
+                            rt::willow_channel_send_bool,
+                            rt::willow_channel_send_f64,
+                            rt::willow_channel_send_ptr,
+                        ],
+                    )
                 };
                 let mut values = vec![receiver];
                 if let Some(&value) = args.first() {
@@ -339,7 +348,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     };
                     values.push(value);
                 }
-                self.emit_runtime_call_with_cleanup(&symbol, &values, |_| {});
+                self.emit_runtime_call_with_cleanup(symbol, &values, |_| {});
                 self.builder.ins().iconst(types::I8, 0)
             }
             ArrayLen | FrozenArrayLen => self.emit_array_access(receiver, None, None),
@@ -353,21 +362,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     -1
                 };
                 let mask = self.builder.ins().iconst(types::I64, mask);
-                self.emit_void_runtime_call("willow_array_resize", &[receiver, args[0], mask]);
+                self.emit_void_runtime_call(rt::willow_array_resize, &[receiver, args[0], mask]);
                 self.builder.ins().iconst(types::I8, 0)
             }
-            StringDebug => self.emit_value_runtime_call("willow_string_debug", &[receiver]),
+            StringDebug => self.emit_value_runtime_call(rt::willow_string_debug, &[receiver]),
             ArrayCopy => {
                 let runtime = if self.is_inline_pair(&array_element_type(receiver_ty)) {
-                    "willow_array_copy_scalar_pairs"
+                    rt::willow_array_copy_scalar_pairs
                 } else {
-                    "willow_array_copy"
+                    rt::willow_array_copy
                 };
                 self.emit_value_runtime_call(runtime, &[receiver])
             }
-            MapLen | FrozenMapLen => self.emit_value_runtime_call("willow_map_len", &[receiver]),
-            MapToString => self.emit_value_runtime_call("willow_map_to_string", &[receiver]),
-            MapFreeze => self.emit_value_runtime_call("willow_map_copy", &[receiver]),
+            MapLen | FrozenMapLen => self.emit_value_runtime_call(rt::willow_map_len, &[receiver]),
+            MapToString => self.emit_value_runtime_call(rt::willow_map_to_string, &[receiver]),
+            MapFreeze => self.emit_value_runtime_call(rt::willow_map_copy, &[receiver]),
             MapKeys | MapValues | MapEntries => {
                 let mode = self.builder.ins().iconst(
                     types::I64,
@@ -384,7 +393,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     i64::from(self.is_inline_pair(&parameters[1]))
                 };
                 let pair = self.builder.ins().iconst(types::I64, pair_kind);
-                self.emit_value_runtime_call("willow_map_snapshot", &[receiver, mode, pair])
+                self.emit_value_runtime_call(rt::willow_map_snapshot, &[receiver, mode, pair])
             }
             MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapRemove | MapInsert => {
                 let (_, parameters) = lir_collection(receiver_ty).expect("validated map intrinsic");
@@ -399,7 +408,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 match intrinsic {
                     MapContains | FrozenMapContains => {
                         let value = self.emit_value_runtime_call(
-                            "willow_map_contains",
+                            rt::willow_map_contains,
                             &[receiver, key, key_ref],
                         );
                         self.builder.ins().ireduce(types::I8, value)
@@ -431,7 +440,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         };
                         let value_ref = self.map_is_ref_flag(value_ty);
                         self.emit_void_runtime_call(
-                            "willow_map_insert",
+                            rt::willow_map_insert,
                             &[receiver, key, key_ref, word, value_ref],
                         );
                         self.builder.ins().iconst(types::I8, 0)
@@ -573,9 +582,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         match ty {
             Type::String => value,
-            Type::I64 => self.emit_value_runtime_call("willow_i64_to_string", &[value]),
-            Type::F64 => self.emit_value_runtime_call("willow_f64_to_string", &[value]),
-            Type::Bool => self.emit_value_runtime_call("willow_bool_to_string", &[value]),
+            Type::I64 => self.emit_value_runtime_call(rt::willow_i64_to_string, &[value]),
+            Type::F64 => self.emit_value_runtime_call(rt::willow_f64_to_string, &[value]),
+            Type::Bool => self.emit_value_runtime_call(rt::willow_bool_to_string, &[value]),
             _ => unreachable!("validated display format operand"),
         }
     }

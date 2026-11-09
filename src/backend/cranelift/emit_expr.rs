@@ -1,5 +1,6 @@
 use cranelift_codegen::ir::{InstBuilder, condcodes::IntCC, types};
 use cranelift_module::Module;
+use willow_abi::runtime_symbols::names as rt;
 
 use super::*;
 
@@ -77,7 +78,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .declare_data_in_func(data_id.bytes, self.builder.func);
             let bytes_ptr = self.builder.ins().symbol_value(ptr_ty, gv);
             let len_val = self.builder.ins().iconst(types::I64, value.len() as i64);
-            let fid = self.func_id("willow_string_literal_slot");
+            let fid = self.func_id(rt::willow_string_literal_slot);
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let call = self
                 .builder
@@ -137,7 +138,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .ins()
                 .iconst(reference_type(self.module.target_config()), 0);
             self.emit_runtime_call_with_cleanup(
-                "willow_panic_raise",
+                rt::willow_panic_raise,
                 &[msg, file_ptr, line, col],
                 |this| {
                     this.emit_pop_roots_n(1);
@@ -163,7 +164,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.emit_alloc_option_none(&panic_info_ty);
         }
 
-        let recover_id = self.func_id("willow_panic_recover");
+        let recover_id = self.func_id(rt::willow_panic_recover);
         let recover_ref = self
             .module
             .declare_func_in_func(recover_id, self.builder.func);
@@ -191,7 +192,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let some = self.emit_alloc_option_some(&panic_info_ty, info);
         // The Option payload is now GC-visible; release the runtime's temporary
         // handoff root exactly once.
-        let release_id = self.func_id("willow_panic_release_recovered");
+        let release_id = self.func_id(rt::willow_panic_release_recovered);
         let release_ref = self
             .module
             .declare_func_in_func(release_id, self.builder.func);
@@ -208,7 +209,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if self.diagnostics.build_mode != BuildMode::Debug {
             return;
         }
-        let push_id = self.func_id("willow_debug_reference_call_scope_push");
+        let push_id = self.func_id(rt::willow_debug_reference_call_scope_push);
         let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
         self.builder.ins().call(push_ref, &[]);
     }
@@ -217,7 +218,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if self.diagnostics.build_mode != BuildMode::Debug {
             return;
         }
-        self.emit_void_runtime_call("willow_debug_reference_call_clear", &[]);
+        self.emit_void_runtime_call(rt::willow_debug_reference_call_clear, &[]);
     }
 
     /// Address + length of a declared string literal's raw static UTF-8 bytes,
@@ -284,7 +285,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let file_ptr = self.emit_string_literal(&source_file);
         let line_val = self.builder.ins().iconst(types::I32, span.line as i64);
         let col_val = self.builder.ins().iconst(types::I32, span.col as i64);
-        self.emit_void_runtime_call("willow_int_div_panic", &[kind, file_ptr, line_val, col_val]);
+        self.emit_void_runtime_call(
+            rt::willow_int_div_panic,
+            &[kind, file_ptr, line_val, col_val],
+        );
         // Runtime returning without raising would otherwise reach the unsafe
         // arithmetic. Treat that as an ABI violation.
         self.builder.ins().trap(TrapCode::unwrap_user(1));
@@ -399,7 +403,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let line_val = self.builder.ins().iconst(types::I32, span.line as i64);
         let col_val = self.builder.ins().iconst(types::I32, span.col as i64);
         self.emit_void_runtime_call(
-            "willow_int_overflow_panic",
+            rt::willow_int_overflow_panic,
             &[kind, file_ptr, line_val, col_val],
         );
         // Runtime returning without raising is an ABI violation.
@@ -411,7 +415,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// Reserve a caller frame while a method's arguments are evaluated.
     pub(super) fn emit_callstack_reserve(&mut self, span: crate::diagnostics::Span) -> bool {
-        self.emit_caller_frame(span, "willow_callstack_push_pending")
+        self.emit_caller_frame(span, rt::willow_callstack_push_pending)
     }
 
     pub(super) fn emit_callstack_push(
@@ -419,7 +423,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         _callee: &str,
         span: crate::diagnostics::Span,
     ) -> bool {
-        self.emit_caller_frame(span, "willow_callstack_push")
+        self.emit_caller_frame(span, rt::willow_callstack_push)
     }
 
     fn emit_caller_frame(&mut self, span: crate::diagnostics::Span, runtime: &str) -> bool {
@@ -465,7 +469,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .callstack_frame_depth
             .checked_sub(1)
             .expect("compiler call-stack frame underflow");
-        self.emit_void_runtime_call("willow_callstack_pop", &[]);
+        self.emit_void_runtime_call(rt::willow_callstack_pop, &[]);
     }
 
     pub(super) fn emit_replay_reference_scopes(&mut self) {

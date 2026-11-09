@@ -13,6 +13,7 @@
 use cranelift_codegen::ir::{FuncRef, MemFlagsData, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
+use willow_abi::runtime_symbols::names as rt;
 pub(super) use willow_abi::{GcObjectKind, GcStoreDestination};
 
 use super::*;
@@ -301,7 +302,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// call the runtime slow path.
     pub(super) fn emit_gc_alloc(&mut self, layout: GcLayoutMetadata) -> Value {
         if !layout.bitmap.is_empty() {
-            let alloc = self.func_id("willow_gc_alloc_bitmap");
+            let alloc = self.func_id(rt::willow_gc_alloc_bitmap);
             return emit_bitmap_alloc(
                 self.module,
                 self.gc_bitmap_descriptors,
@@ -459,7 +460,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let Some(buffer_size) =
             buffer_size.filter(|size| *size <= GC_TLAB_MAX_OBJECT_SIZE - header_size)
         else {
-            return self.emit_value_runtime_call("willow_array_new_literal", &[length, refs]);
+            return self.emit_value_runtime_call(rt::willow_array_new_literal, &[length, refs]);
         };
         let handle = GcLayoutMetadata::new(
             GcObjectKind::ArrayHandle,
@@ -547,7 +548,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().jump(done, &[payload.into()]);
         self.builder.switch_to_block(slow);
         self.builder.seal_block(slow);
-        let result = self.emit_value_runtime_call("willow_array_new_literal", &[length, refs]);
+        let result = self.emit_value_runtime_call(rt::willow_array_new_literal, &[length, refs]);
         self.builder.ins().jump(done, &[result.into()]);
         self.builder.switch_to_block(done);
         self.builder.seal_block(done);
@@ -578,7 +579,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .iconst(types::I64, layout.gc_ref_mask as i64);
-        let alloc_id = self.func_id("willow_gc_alloc_slow");
+        let alloc_id = self.func_id(rt::willow_gc_alloc_slow);
         let alloc_ref = self
             .module
             .declare_func_in_func(alloc_id, self.builder.func);
@@ -712,7 +713,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             return;
         }
-        let barrier_id = self.func_id("willow_gc_write_barrier");
+        let barrier_id = self.func_id(rt::willow_gc_write_barrier);
         let barrier = self
             .module
             .declare_func_in_func(barrier_id, self.builder.func);
@@ -867,7 +868,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if is_array_element {
             // Pass the element slot so a large old buffer is remembered per
             // card and a minor scans only the written cards.
-            let barrier_id = self.func_id("willow_gc_array_write_barrier");
+            let barrier_id = self.func_id(rt::willow_gc_array_write_barrier);
             let barrier_ref = self
                 .module
                 .declare_func_in_func(barrier_id, self.builder.func);
@@ -875,7 +876,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .ins()
                 .call(barrier_ref, &[owner, slot, previous, word, destination]);
         } else {
-            let barrier_id = self.func_id("willow_gc_write_barrier");
+            let barrier_id = self.func_id(rt::willow_gc_write_barrier);
             let barrier_ref = self
                 .module
                 .declare_func_in_func(barrier_id, self.builder.func);
@@ -1031,7 +1032,7 @@ mod tests {
             builder.seal_block(entry);
             let owner = builder.block_params(entry)[0];
             let value = builder.block_params(entry)[1];
-            let barrier_id = codegen.func_id("willow_gc_write_barrier");
+            let barrier_id = codegen.func_id(rt::willow_gc_write_barrier);
             let barrier = codegen
                 .output
                 .module
@@ -1090,7 +1091,7 @@ mod tests {
             let object = builder.block_params(entry)[1];
             let vtable = builder.ins().iconst(types::I64, 1234);
             let value = builder.ins().iconcat(object, vtable);
-            let barrier_id = codegen.func_id("willow_gc_write_barrier");
+            let barrier_id = codegen.func_id(rt::willow_gc_write_barrier);
             let barrier = codegen
                 .output
                 .module

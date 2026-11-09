@@ -1,5 +1,6 @@
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC};
 use cranelift_module::Module;
+use willow_abi::runtime_symbols::names as rt;
 
 use super::*;
 
@@ -385,7 +386,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let line_val = self.builder.ins().iconst(types::I32, span.line as i64);
         let col_val = self.builder.ins().iconst(types::I32, span.col as i64);
 
-        self.emit_void_runtime_call("willow_nil_deref", &[file_ptr, line_val, col_val, ctx_ptr]);
+        self.emit_void_runtime_call(
+            rt::willow_nil_deref,
+            &[file_ptr, line_val, col_val, ctx_ptr],
+        );
         // The runtime helper raises and returns a neutral continuation. Reaching
         // this trap means its panic contract was violated.
         self.builder.ins().trap(TrapCode::unwrap_user(1));
@@ -1569,7 +1573,7 @@ fn main() {}
                 file.symbol_by_index(index)
                     .ok()
                     .and_then(|symbol| symbol.name().ok())
-                    .is_some_and(|name| matches_name(name, "willow_nil_deref"))
+                    .is_some_and(|name| matches_name(name, rt::willow_nil_deref))
             })
             .count()
     }

@@ -6,6 +6,7 @@ use crate::diagnostics::Span;
 use crate::ir::lowered::{LirFunction, LirOperand};
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, types};
 use cranelift_module::Module;
+use willow_abi::runtime_symbols::names as rt;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     fn flat_operand_type(function: &LirFunction, operand: &LirOperand) -> Type {
@@ -22,7 +23,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> Value {
         let array = self.emit_lir_operand(function, array);
         let index = self.emit_lir_operand(function, index);
-        self.emit_value_runtime_call("willow_array_reference_owner", &[array, index])
+        self.emit_value_runtime_call(rt::willow_array_reference_owner, &[array, index])
     }
 
     pub(super) fn emit_flat_array_alloc(&mut self, len: usize, element_ty: &Type) -> Value {
@@ -55,7 +56,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let value = self.emit_lir_operand(function, value);
             let value = self.coerce_to_target(value, &source_ty, element_ty);
             let array_root = self.emit_push_relocatable_root(array);
-            let existing = self.emit_value_runtime_call("willow_array_get", &[array, index]);
+            let existing = self.emit_value_runtime_call(rt::willow_array_get, &[array, index]);
             let update = self.builder.create_block();
             let initialize = self.builder.create_block();
             let done = self.builder.create_block();
@@ -172,7 +173,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(slow);
         self.builder.seal_block(slow);
-        self.emit_void_runtime_call("willow_array_set", &[array, index, word]);
+        self.emit_void_runtime_call(rt::willow_array_set, &[array, index, word]);
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);
         self.builder.seal_block(done);
@@ -319,9 +320,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .stack_store(ptr_ty, param, spill, 8 * k as i32);
         }
         let name = match params.len() {
-            3 => "willow_array_set",
-            2 => "willow_array_get",
-            1 => "willow_array_len",
+            3 => rt::willow_array_set,
+            2 => rt::willow_array_get,
+            1 => rt::willow_array_len,
             _ => unreachable!("array access takes one to three operands"),
         };
         let reload = move |this: &mut Self| {
@@ -435,7 +436,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // nothing uses `array` after the call.
         self.emit_push_call_root(array);
         let mask = self.builder.ins().iconst(types::I64, -1);
-        self.emit_void_runtime_call("willow_array_resize", &[array, length, mask]);
+        self.emit_void_runtime_call(rt::willow_array_resize, &[array, length, mask]);
         self.emit_pop_roots_n(1);
         self.roots.gc_root_count -= 1;
         self.builder.ins().jump(done, &[]);

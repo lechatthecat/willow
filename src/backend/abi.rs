@@ -11,6 +11,8 @@
 //! of the ABI lives in exactly one place.
 
 use cranelift_codegen::ir::{AbiParam, Type, types};
+#[cfg(test)]
+use willow_abi::runtime_symbols::names as rt;
 pub use willow_abi::{AbiTy, RuntimeEffects, RuntimeSymbol, runtime_symbol};
 pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = willow_abi::RUNTIME_ABI.symbols;
 
@@ -57,6 +59,37 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn runtime_calls_use_schema_constants() {
+        // Scan the backend and its shared intrinsic dispatch table, including
+        // inactive target code. Exact exported names belong only to the schema.
+        let names: std::collections::HashSet<_> =
+            RUNTIME_SYMBOLS.iter().map(|symbol| symbol.name).collect();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut pending = vec![
+            root.join("src/backend"),
+            root.join("src/semantic/intrinsics.rs"),
+        ];
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                for text in source.split('"') {
+                    assert!(
+                        !names.contains(text),
+                        "{} repeats runtime export {text}; use the schema constant",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn abity_lowers_pointer_to_module_pointer_type() {
         // On the supported 64-bit targets the pointer type is I64; the lowering
         // must route Ptr through the supplied pointer type, not a hard-coded one.
@@ -73,37 +106,37 @@ mod tests {
         use cranelift_codegen::isa::CallConv;
         let cases = [
             (
-                "willow_array_get",
+                rt::willow_array_get,
                 vec![types::I32, types::I64],
                 Some(types::I64),
             ),
             (
-                "willow_array_set",
+                rt::willow_array_set,
                 vec![types::I32, types::I64, types::I64],
                 None,
             ),
             (
-                "willow_map_get",
+                rt::willow_map_get,
                 vec![types::I32, types::I64, types::I64, types::I64],
                 Some(types::I32),
             ),
             (
-                "willow_async_mutex_commit",
+                rt::willow_async_mutex_commit,
                 vec![types::I32, types::I64, types::I64],
                 Some(types::I32),
             ),
             (
-                "willow_async_mutex_commit_release",
+                rt::willow_async_mutex_commit_release,
                 vec![types::I32, types::I64, types::I64],
                 Some(types::I32),
             ),
             (
-                "willow_channel_send_ptr",
+                rt::willow_channel_send_ptr,
                 vec![types::I32, types::I32],
                 None,
             ),
             (
-                "willow_sched_spawn",
+                rt::willow_sched_spawn,
                 vec![types::I32, types::I32],
                 Some(types::I64),
             ),
@@ -201,65 +234,65 @@ mod tests {
         };
 
         assert_eq!(
-            effects("willow_array_new_literal"),
+            effects(rt::willow_array_new_literal),
             RuntimeEffects::MAY_ALLOCATE
         );
         assert_eq!(
-            effects("willow_array_new"),
+            effects(rt::willow_array_new),
             RuntimeEffects::MAY_ALLOCATE.union(RuntimeEffects::MAY_PANIC)
         );
-        assert!(effects("willow_alloc").contains(RuntimeEffects::MAY_ALLOCATE));
-        for name in ["willow_string_concat", "willow_string_concat_n"] {
+        assert!(effects(rt::willow_alloc).contains(RuntimeEffects::MAY_ALLOCATE));
+        for name in [rt::willow_string_concat, rt::willow_string_concat_n] {
             assert!(
                 effects(name)
                     .contains(RuntimeEffects::MAY_ALLOCATE.union(RuntimeEffects::MAY_PANIC))
             );
         }
         assert!(
-            effects("willow_fs_read_to_string")
+            effects(rt::willow_fs_read_to_string)
                 .contains(RuntimeEffects::MAY_BLOCK.union(RuntimeEffects::MAY_ALLOCATE))
         );
-        assert!(effects("willow_fs_read_to_string_async").contains(RuntimeEffects::MAY_ALLOCATE));
-        assert!(!effects("willow_fs_read_to_string_async").contains(RuntimeEffects::MAY_SUSPEND));
-        assert!(effects("willow_sched_await").contains(RuntimeEffects::MAY_SUSPEND));
-        assert!(effects("willow_blocking_cell_get").contains(RuntimeEffects::MAY_BLOCK));
-        assert!(effects("willow_blocking_rw_cell_write").contains(RuntimeEffects::MAY_BLOCK));
-        assert!(effects("willow_gc_safepoint").contains(RuntimeEffects::MAY_PREEMPT));
+        assert!(effects(rt::willow_fs_read_to_string_async).contains(RuntimeEffects::MAY_ALLOCATE));
+        assert!(!effects(rt::willow_fs_read_to_string_async).contains(RuntimeEffects::MAY_SUSPEND));
+        assert!(effects(rt::willow_sched_await).contains(RuntimeEffects::MAY_SUSPEND));
+        assert!(effects(rt::willow_blocking_cell_get).contains(RuntimeEffects::MAY_BLOCK));
+        assert!(effects(rt::willow_blocking_rw_cell_write).contains(RuntimeEffects::MAY_BLOCK));
+        assert!(effects(rt::willow_gc_safepoint).contains(RuntimeEffects::MAY_PREEMPT));
         assert!(
-            effects("willow_array_get")
+            effects(rt::willow_array_get)
                 .contains(RuntimeEffects::MAY_ALLOCATE.union(RuntimeEffects::MAY_PANIC))
         );
-        assert!(effects("willow_frame_await_check").contains(RuntimeEffects::MAY_PANIC));
+        assert!(effects(rt::willow_frame_await_check).contains(RuntimeEffects::MAY_PANIC));
         assert!(
-            effects("willow_select_idle_wait")
+            effects(rt::willow_select_idle_wait)
                 .contains(RuntimeEffects::MAY_BLOCK.union(RuntimeEffects::MAY_PANIC))
         );
         assert!(
-            !effects("willow_panic").contains(RuntimeEffects::MAY_PANIC),
+            !effects(rt::willow_panic).contains(RuntimeEffects::MAY_PANIC),
             "legacy fatal ABI must not be mistaken for recoverable propagation"
         );
         assert!(
-            !effects("willow_gc_collect").contains(RuntimeEffects::MAY_PANIC),
+            !effects(rt::willow_gc_collect).contains(RuntimeEffects::MAY_PANIC),
             "GC integrity failures bypass language recovery"
         );
         assert!(
-            !effects("willow_channel_unregister_waiter")
+            !effects(rt::willow_channel_unregister_waiter)
                 .contains(RuntimeEffects::NO_PREEMPT_REGION)
         );
-        assert_eq!(effects("willow_print_i64"), RuntimeEffects::MAY_BLOCK);
+        assert_eq!(effects(rt::willow_print_i64), RuntimeEffects::MAY_BLOCK);
     }
 
     #[test]
     fn every_stdout_export_is_blocking_without_gc_or_scheduler_effects() {
         for name in [
-            "willow_print_i64",
-            "willow_println_i64",
-            "willow_print_bool",
-            "willow_println_bool",
-            "willow_print_f64",
-            "willow_println_f64",
-            "willow_print_string",
-            "willow_println_string",
+            rt::willow_print_i64,
+            rt::willow_println_i64,
+            rt::willow_print_bool,
+            rt::willow_println_bool,
+            rt::willow_print_f64,
+            rt::willow_println_f64,
+            rt::willow_print_string,
+            rt::willow_println_string,
         ] {
             let symbol = runtime_symbol(name).expect("stdout ABI export");
             assert_eq!(symbol.effects(), RuntimeEffects::MAY_BLOCK, "{name}");
@@ -268,7 +301,7 @@ mod tests {
 
     #[test]
     fn legacy_future_await_distinguishes_blocking_timer_from_scalar_reads() {
-        let symbol = runtime_symbol("willow_future_await_void").expect("void future await ABI");
+        let symbol = runtime_symbol(rt::willow_future_await_void).expect("void future await ABI");
         assert_eq!(symbol.effects(), RuntimeEffects::MAY_BLOCK);
         assert_eq!(symbol.params, &[AbiTy::Ptr]);
         assert_eq!(symbol.ret, Some(AbiTy::I8));
@@ -276,17 +309,17 @@ mod tests {
         // Creating a timer only stores its deadline. Native Box allocation
         // does not collect the Willow heap, and scalar awaits only read state.
         for name in [
-            "willow_runtime_sleep",
-            "willow_runtime_yield",
-            "willow_future_ready_void",
-            "willow_future_ready_i64",
-            "willow_future_ready_bool",
-            "willow_future_ready_f64",
-            "willow_future_ready_ptr",
-            "willow_future_await_i64",
-            "willow_future_await_bool",
-            "willow_future_await_f64",
-            "willow_future_await_ptr",
+            rt::willow_runtime_sleep,
+            rt::willow_runtime_yield,
+            rt::willow_future_ready_void,
+            rt::willow_future_ready_i64,
+            rt::willow_future_ready_bool,
+            rt::willow_future_ready_f64,
+            rt::willow_future_ready_ptr,
+            rt::willow_future_await_i64,
+            rt::willow_future_await_bool,
+            rt::willow_future_await_f64,
+            rt::willow_future_await_ptr,
         ] {
             assert_eq!(
                 runtime_symbol(name).expect("legacy future ABI").effects(),
@@ -300,32 +333,32 @@ mod tests {
     fn no_preempt_runtime_policy_avoids_double_bracketing_runtime_owned_guards() {
         let effects = |name| runtime_symbol(name).expect("known ABI symbol").effects();
         assert!(
-            effects("willow_sched_spawn").contains(RuntimeEffects::NO_PREEMPT_REGION),
+            effects(rt::willow_sched_spawn).contains(RuntimeEffects::NO_PREEMPT_REGION),
             "willow_sched_spawn must be bracketed by the central runtime-call emitter"
         );
         for name in [
-            "willow_async_mutex_acquire",
-            "willow_async_mutex_acquire_load",
-            "willow_async_mutex_poll_load",
-            "willow_async_mutex_commit_release",
-            "willow_async_mutex_poll",
-            "willow_async_mutex_release",
-            "willow_async_mutex_cancel",
-            "willow_channel_unregister_waiter",
-            "willow_push_root",
-            "willow_pop_roots",
+            rt::willow_async_mutex_acquire,
+            rt::willow_async_mutex_acquire_load,
+            rt::willow_async_mutex_poll_load,
+            rt::willow_async_mutex_commit_release,
+            rt::willow_async_mutex_poll,
+            rt::willow_async_mutex_release,
+            rt::willow_async_mutex_cancel,
+            rt::willow_channel_unregister_waiter,
+            rt::willow_push_root,
+            rt::willow_pop_roots,
         ] {
             assert!(
                 !effects(name).contains(RuntimeEffects::NO_PREEMPT_REGION),
                 "{name} owns its runtime-side NoPreemptGuard and must not be double-bracketed"
             );
         }
-        assert!(!effects("willow_print_i64").contains(RuntimeEffects::NO_PREEMPT_REGION));
+        assert!(!effects(rt::willow_print_i64).contains(RuntimeEffects::NO_PREEMPT_REGION));
     }
 
     #[test]
     fn runtime_symbol_lookup_uses_the_schema_without_a_default() {
-        let array_get = runtime_symbol("willow_array_get").expect("known ABI symbol");
+        let array_get = runtime_symbol(rt::willow_array_get).expect("known ABI symbol");
         // The array is a native pointer; its generic element remains a
         // 64-bit payload, and the index is a fixed-width integer.
         assert_eq!(array_get.params, &[AbiTy::Ptr, AbiTy::I64]);
@@ -338,16 +371,16 @@ mod tests {
     fn eager_task_constructors_allocate_but_do_not_suspend_the_caller() {
         let effects = |name| runtime_symbol(name).expect("known ABI symbol").effects();
         for name in [
-            "willow_fs_read_to_string_async",
-            "willow_fs_write_string_async",
-            "willow_fs_exists_async",
-            "willow_fs_remove_file_async",
-            "willow_net_connect_async",
-            "willow_net_accept_async",
-            "willow_net_read_async",
-            "willow_net_write_async",
-            "willow_task_scope_finish",
-            "willow_parallel_map_i64",
+            rt::willow_fs_read_to_string_async,
+            rt::willow_fs_write_string_async,
+            rt::willow_fs_exists_async,
+            rt::willow_fs_remove_file_async,
+            rt::willow_net_connect_async,
+            rt::willow_net_accept_async,
+            rt::willow_net_read_async,
+            rt::willow_net_write_async,
+            rt::willow_task_scope_finish,
+            rt::willow_parallel_map_i64,
         ] {
             assert!(
                 effects(name).contains(RuntimeEffects::MAY_ALLOCATE),
@@ -362,7 +395,7 @@ mod tests {
 
     #[test]
     fn parallel_mapper_abi_is_a_native_function_pointer() {
-        let symbol = runtime_symbol("willow_parallel_map_i64").expect("parallel ABI");
+        let symbol = runtime_symbol(rt::willow_parallel_map_i64).expect("parallel ABI");
         assert_eq!(symbol.params, &[AbiTy::Ptr, AbiTy::Ptr]);
         assert_eq!(symbol.ret, Some(AbiTy::Ptr));
     }
@@ -376,37 +409,37 @@ mod tests {
 
         // Reference-only handles follow the target pointer width.
         assert_eq!(
-            signature("willow_channel_try_send_ptr"),
+            signature(rt::willow_channel_try_send_ptr),
             (&[AbiTy::Ptr, AbiTy::Ptr][..], Some(AbiTy::I32))
         );
         assert_eq!(
-            signature("willow_frame_await"),
+            signature(rt::willow_frame_await),
             (&[AbiTy::Ptr, AbiTy::I64][..], Some(AbiTy::I32))
         );
 
         // Slot addresses and callbacks are native pointers.
         assert_eq!(
-            signature("willow_async_mutex_acquire"),
+            signature(rt::willow_async_mutex_acquire),
             (&[AbiTy::Ptr, AbiTy::Ptr][..], Some(AbiTy::I32))
         );
         assert_eq!(
-            signature("willow_sched_spawn"),
+            signature(rt::willow_sched_spawn),
             (&[AbiTy::Ptr, AbiTy::Ptr][..], Some(AbiTy::I64))
         );
 
         assert_eq!(
-            signature("willow_async_mutex_acquire_load"),
+            signature(rt::willow_async_mutex_acquire_load),
             (&[AbiTy::Ptr, AbiTy::Ptr, AbiTy::Ptr][..], Some(AbiTy::I32))
         );
         assert_eq!(
-            signature("willow_async_mutex_poll_load"),
+            signature(rt::willow_async_mutex_poll_load),
             (&[AbiTy::Ptr, AbiTy::I64, AbiTy::Ptr][..], Some(AbiTy::I32))
         );
         // Task ids and netpoll's cross-platform native-handle integer are
         // explicitly 64-bit numbers, not dereferenceable pointers.
-        assert_eq!(signature("willow_sched_wake"), (&[AbiTy::I64][..], None));
+        assert_eq!(signature(rt::willow_sched_wake), (&[AbiTy::I64][..], None));
         assert_eq!(
-            signature("willow_netpoll_register"),
+            signature(rt::willow_netpoll_register),
             (&[AbiTy::I64, AbiTy::I32][..], Some(AbiTy::I32))
         );
     }
@@ -463,130 +496,130 @@ mod alloc_effects_tests {
     /// therefore every symbol this column must mark. Adding a runtime ABI that
     /// builds a GC object means adding it here too; `a18` fails otherwise.
     const ALLOCATING: &[&str] = &[
-        "willow_pow_negative_exponent",
-        "willow_i64_abs",
-        "willow_i64_clamp",
-        "willow_f64_clamp",
-        "willow_contract_i64",
-        "willow_contract_check",
-        "willow_f64_to_string",
-        "willow_i64_to_string",
-        "willow_bool_to_string",
-        "willow_f64_parse",
-        "willow_i64_parse",
-        "willow_format_f64_17g",
-        "willow_format_f64_16f",
-        "willow_format_f64_6f",
-        "willow_string_concat",
-        "willow_string_concat_n",
-        "willow_string_concat_array",
-        "willow_string_debug",
-        "willow_string_alloc",
-        "willow_string_literal_slot",
-        "willow_array_join",
-        "willow_string_repeat",
-        "willow_string_split",
-        "willow_string_substring",
-        "willow_string_byte_at",
-        "willow_string_trim",
-        "willow_string_trim_start",
-        "willow_string_trim_end",
-        "willow_string_to_lower",
-        "willow_string_to_upper",
-        "willow_string_replace",
-        "willow_runtime_arg",
-        "willow_runtime_program_name",
-        "willow_runtime_args_array",
-        "willow_rust_bridge_buffer",
-        "willow_rust_bridge_enum",
-        "willow_alloc",
-        "willow_alloc_typed",
-        "willow_gc_alloc_layout",
-        "willow_gc_alloc_slow",
-        "willow_gc_alloc_bitmap",
-        "willow_array_new",
-        "willow_array_new_literal",
-        "willow_array_copy",
-        "willow_array_copy_scalar_pairs",
-        "willow_array_len",
-        "willow_array_get",
-        "willow_array_set",
-        "willow_array_push",
-        "willow_array_push_scalar_pairs",
-        "willow_array_push_owned_pair",
-        "willow_array_pop",
-        "willow_array_pop_scalar_pair_into",
-        "willow_array_to_string",
-        "willow_map_to_string",
-        "willow_array_element_addr",
-        "willow_array_reference_owner",
-        "willow_array_resize",
-        "willow_map_new",
-        "willow_map_new_local",
-        "willow_map_contains",
-        "willow_map_copy",
-        "willow_map_get",
-        "willow_map_get_into",
-        "willow_map_remove_into",
-        "willow_map_snapshot",
-        "willow_map_insert",
-        "willow_atomic_i64_new",
-        "willow_atomic_bool_new",
-        "willow_async_mutex_new",
-        "willow_async_mutex_recursive_panic",
-        "willow_async_rwlock_new",
-        "willow_async_rwlock_recursive_panic",
-        "willow_blocking_cell_new",
-        "willow_blocking_rw_cell_new",
-        "willow_channel_new",
-        "willow_channel_unregister_waiter",
-        "willow_channel_select_cleanup",
-        "willow_channel_send_i64",
-        "willow_channel_send_bool",
-        "willow_channel_send_f64",
-        "willow_channel_send_ptr",
-        "willow_channel_recv_i64",
-        "willow_channel_recv_bool",
-        "willow_channel_recv_f64",
-        "willow_channel_recv_ptr",
-        "willow_channel_recv_opt_into",
-        "willow_channel_new_bounded",
-        "willow_nil_deref",
-        "willow_int_div_panic",
-        "willow_int_overflow_panic",
-        "willow_panic_raise",
-        "willow_async_frame_alloc",
-        "willow_select_idle_wait",
-        "willow_fs_temp_path",
-        "willow_fs_read_to_string",
-        "willow_fs_write_string",
-        "willow_fs_exists",
-        "willow_fs_remove_file",
-        "willow_fs_read_to_string_async",
-        "willow_fs_write_string_async",
-        "willow_fs_exists_async",
-        "willow_fs_remove_file_async",
-        "willow_net_bind",
-        "willow_net_local_addr",
-        "willow_net_peer_addr",
-        "willow_net_shutdown",
-        "willow_net_connect_async",
-        "willow_net_accept_async",
-        "willow_net_read_async",
-        "willow_net_write_async",
-        "willow_cancellation_token_new",
-        "willow_cancellation_token_child",
-        "willow_cancellation_token_attach",
-        "willow_cancellation_token_cancel",
-        "willow_task_scope_new",
-        "willow_task_stack_enter",
-        "willow_task_stack_enter_generated",
-        "willow_task_scope_child",
-        "willow_task_scope_add",
-        "willow_task_scope_cancel",
-        "willow_task_scope_finish",
-        "willow_parallel_map_i64",
-        "willow_frame_await_check",
+        rt::willow_pow_negative_exponent,
+        rt::willow_i64_abs,
+        rt::willow_i64_clamp,
+        rt::willow_f64_clamp,
+        rt::willow_contract_i64,
+        rt::willow_contract_check,
+        rt::willow_f64_to_string,
+        rt::willow_i64_to_string,
+        rt::willow_bool_to_string,
+        rt::willow_f64_parse,
+        rt::willow_i64_parse,
+        rt::willow_format_f64_17g,
+        rt::willow_format_f64_16f,
+        rt::willow_format_f64_6f,
+        rt::willow_string_concat,
+        rt::willow_string_concat_n,
+        rt::willow_string_concat_array,
+        rt::willow_string_debug,
+        rt::willow_string_alloc,
+        rt::willow_string_literal_slot,
+        rt::willow_array_join,
+        rt::willow_string_repeat,
+        rt::willow_string_split,
+        rt::willow_string_substring,
+        rt::willow_string_byte_at,
+        rt::willow_string_trim,
+        rt::willow_string_trim_start,
+        rt::willow_string_trim_end,
+        rt::willow_string_to_lower,
+        rt::willow_string_to_upper,
+        rt::willow_string_replace,
+        rt::willow_runtime_arg,
+        rt::willow_runtime_program_name,
+        rt::willow_runtime_args_array,
+        rt::willow_rust_bridge_buffer,
+        rt::willow_rust_bridge_enum,
+        rt::willow_alloc,
+        rt::willow_alloc_typed,
+        rt::willow_gc_alloc_layout,
+        rt::willow_gc_alloc_slow,
+        rt::willow_gc_alloc_bitmap,
+        rt::willow_array_new,
+        rt::willow_array_new_literal,
+        rt::willow_array_copy,
+        rt::willow_array_copy_scalar_pairs,
+        rt::willow_array_len,
+        rt::willow_array_get,
+        rt::willow_array_set,
+        rt::willow_array_push,
+        rt::willow_array_push_scalar_pairs,
+        rt::willow_array_push_owned_pair,
+        rt::willow_array_pop,
+        rt::willow_array_pop_scalar_pair_into,
+        rt::willow_array_to_string,
+        rt::willow_map_to_string,
+        rt::willow_array_element_addr,
+        rt::willow_array_reference_owner,
+        rt::willow_array_resize,
+        rt::willow_map_new,
+        rt::willow_map_new_local,
+        rt::willow_map_contains,
+        rt::willow_map_copy,
+        rt::willow_map_get,
+        rt::willow_map_get_into,
+        rt::willow_map_remove_into,
+        rt::willow_map_snapshot,
+        rt::willow_map_insert,
+        rt::willow_atomic_i64_new,
+        rt::willow_atomic_bool_new,
+        rt::willow_async_mutex_new,
+        rt::willow_async_mutex_recursive_panic,
+        rt::willow_async_rwlock_new,
+        rt::willow_async_rwlock_recursive_panic,
+        rt::willow_blocking_cell_new,
+        rt::willow_blocking_rw_cell_new,
+        rt::willow_channel_new,
+        rt::willow_channel_unregister_waiter,
+        rt::willow_channel_select_cleanup,
+        rt::willow_channel_send_i64,
+        rt::willow_channel_send_bool,
+        rt::willow_channel_send_f64,
+        rt::willow_channel_send_ptr,
+        rt::willow_channel_recv_i64,
+        rt::willow_channel_recv_bool,
+        rt::willow_channel_recv_f64,
+        rt::willow_channel_recv_ptr,
+        rt::willow_channel_recv_opt_into,
+        rt::willow_channel_new_bounded,
+        rt::willow_nil_deref,
+        rt::willow_int_div_panic,
+        rt::willow_int_overflow_panic,
+        rt::willow_panic_raise,
+        rt::willow_async_frame_alloc,
+        rt::willow_select_idle_wait,
+        rt::willow_fs_temp_path,
+        rt::willow_fs_read_to_string,
+        rt::willow_fs_write_string,
+        rt::willow_fs_exists,
+        rt::willow_fs_remove_file,
+        rt::willow_fs_read_to_string_async,
+        rt::willow_fs_write_string_async,
+        rt::willow_fs_exists_async,
+        rt::willow_fs_remove_file_async,
+        rt::willow_net_bind,
+        rt::willow_net_local_addr,
+        rt::willow_net_peer_addr,
+        rt::willow_net_shutdown,
+        rt::willow_net_connect_async,
+        rt::willow_net_accept_async,
+        rt::willow_net_read_async,
+        rt::willow_net_write_async,
+        rt::willow_cancellation_token_new,
+        rt::willow_cancellation_token_child,
+        rt::willow_cancellation_token_attach,
+        rt::willow_cancellation_token_cancel,
+        rt::willow_task_scope_new,
+        rt::willow_task_stack_enter,
+        rt::willow_task_stack_enter_generated,
+        rt::willow_task_scope_child,
+        rt::willow_task_scope_add,
+        rt::willow_task_scope_cancel,
+        rt::willow_task_scope_finish,
+        rt::willow_parallel_map_i64,
+        rt::willow_frame_await_check,
     ];
 
     #[test]
@@ -594,9 +627,9 @@ mod alloc_effects_tests {
         // Each is `willow_string_from_str` of a formatted scalar, and that is
         // `willow_string_alloc` -> `willow_alloc_with_layout`.
         for name in [
-            "willow_f64_to_string",
-            "willow_i64_to_string",
-            "willow_bool_to_string",
+            rt::willow_f64_to_string,
+            rt::willow_i64_to_string,
+            rt::willow_bool_to_string,
         ] {
             assert!(allocates(name), "{name} builds a WillowString");
         }
@@ -605,9 +638,9 @@ mod alloc_effects_tests {
     #[test]
     fn a02_fixed_precision_float_formatters_allocate() {
         for name in [
-            "willow_format_f64_17g",
-            "willow_format_f64_16f",
-            "willow_format_f64_6f",
+            rt::willow_format_f64_17g,
+            rt::willow_format_f64_16f,
+            rt::willow_format_f64_6f,
         ] {
             assert!(allocates(name), "{name} builds a WillowString");
         }
@@ -618,7 +651,7 @@ mod alloc_effects_tests {
         // `willow_f64_parse` returns `Result<f64, String>`: the Ok path is one
         // `willow_alloc_enum_variant`, the Err path a message string plus a
         // second variant allocation. Two chances to collect, not zero.
-        assert!(allocates("willow_f64_parse"));
+        assert!(allocates(rt::willow_f64_parse));
     }
 
     #[test]
@@ -627,19 +660,23 @@ mod alloc_effects_tests {
         // strings precisely because each one can collect; the ABI row has to
         // say the same thing about the call as a whole.
         for name in [
-            "willow_runtime_arg",
-            "willow_runtime_program_name",
-            "willow_runtime_args_array",
+            rt::willow_runtime_arg,
+            rt::willow_runtime_program_name,
+            rt::willow_runtime_args_array,
         ] {
             assert!(allocates(name), "{name} returns a GC value it built");
         }
         // Reading the count builds nothing.
-        assert!(!allocates("willow_runtime_args_len"));
+        assert!(!allocates(rt::willow_runtime_args_len));
     }
 
     #[test]
     fn a05_map_constructors_and_display_allocate() {
-        for name in ["willow_map_new", "willow_map_to_string", "willow_map_get"] {
+        for name in [
+            rt::willow_map_new,
+            rt::willow_map_to_string,
+            rt::willow_map_get,
+        ] {
             assert!(allocates(name), "{name}");
         }
     }
@@ -649,23 +686,23 @@ mod alloc_effects_tests {
         // The effect is transitive: `willow_map_copy` allocates nothing
         // directly, it calls `willow_map_new`. A row classified by what its
         // own body spells would miss this.
-        assert!(allocates("willow_map_copy"));
+        assert!(allocates(rt::willow_map_copy));
     }
 
     #[test]
     fn a07_atomic_cell_constructors_allocate() {
-        for name in ["willow_atomic_i64_new", "willow_atomic_bool_new"] {
+        for name in [rt::willow_atomic_i64_new, rt::willow_atomic_bool_new] {
             assert!(allocates(name), "{name} allocates a GC-resident cell");
         }
         // Load/store/swap touch the cell already handed to them.
         for name in [
-            "willow_atomic_i64_load",
-            "willow_atomic_i64_store",
-            "willow_atomic_i64_add",
-            "willow_atomic_bool_load",
-            "willow_atomic_bool_swap",
-            "willow_atomic_i64_compare_exchange",
-            "willow_atomic_bool_compare_exchange",
+            rt::willow_atomic_i64_load,
+            rt::willow_atomic_i64_store,
+            rt::willow_atomic_i64_add,
+            rt::willow_atomic_bool_load,
+            rt::willow_atomic_bool_swap,
+            rt::willow_atomic_i64_compare_exchange,
+            rt::willow_atomic_bool_compare_exchange,
         ] {
             assert!(!allocates(name), "{name} only touches an existing cell");
         }
@@ -673,17 +710,17 @@ mod alloc_effects_tests {
 
     #[test]
     fn a08_channel_construction_allocates_but_closing_does_not() {
-        assert!(allocates("willow_channel_new"));
-        assert!(allocates("willow_channel_new_bounded"));
-        assert!(!allocates("willow_channel_close"));
+        assert!(allocates(rt::willow_channel_new));
+        assert!(allocates(rt::willow_channel_new_bounded));
+        assert!(!allocates(rt::willow_channel_close));
         // Losing-case compensation may allocate a traced deferred-wake frame.
-        assert!(allocates("willow_channel_unregister_waiter"));
-        assert!(allocates("willow_channel_select_cleanup"));
+        assert!(allocates(rt::willow_channel_unregister_waiter));
+        assert!(allocates(rt::willow_channel_select_cleanup));
     }
 
     #[test]
     fn a09_temp_path_allocates_the_string_it_returns() {
-        assert!(allocates("willow_fs_temp_path"));
+        assert!(allocates(rt::willow_fs_temp_path));
     }
 
     #[test]
@@ -692,12 +729,12 @@ mod alloc_effects_tests {
         // collection, nothing for a caller to root against — the bit would be
         // a lie in the other direction.
         for name in [
-            "willow_future_ready_void",
-            "willow_future_ready_i64",
-            "willow_future_ready_bool",
-            "willow_future_ready_f64",
-            "willow_future_ready_ptr",
-            "willow_preempt_flag_new",
+            rt::willow_future_ready_void,
+            rt::willow_future_ready_i64,
+            rt::willow_future_ready_bool,
+            rt::willow_future_ready_f64,
+            rt::willow_future_ready_ptr,
+            rt::willow_preempt_flag_new,
         ] {
             assert!(!allocates(name), "{name} allocates native, not GC, memory");
         }
@@ -707,11 +744,11 @@ mod alloc_effects_tests {
     fn a11_reading_a_runtime_string_is_not_an_allocation() {
         // `willow_debug_reference_call` copies its arguments into a Rust
         // `String` for a thread-local; it never asks the GC for anything.
-        assert!(!allocates("willow_debug_reference_call_scope_push"));
-        assert!(!allocates("willow_debug_reference_call"));
-        assert!(!allocates("willow_debug_reference_call_clear"));
-        assert!(!allocates("willow_string_eq"));
-        assert!(!allocates("willow_string_cmp"));
+        assert!(!allocates(rt::willow_debug_reference_call_scope_push));
+        assert!(!allocates(rt::willow_debug_reference_call));
+        assert!(!allocates(rt::willow_debug_reference_call_clear));
+        assert!(!allocates(rt::willow_string_eq));
+        assert!(!allocates(rt::willow_string_cmp));
     }
 
     #[test]
@@ -720,22 +757,22 @@ mod alloc_effects_tests {
         // it just constructed. Listed by name rather than inferred from the
         // signature, because plenty of rows return a word they were given.
         for name in [
-            "willow_string_concat",
-            "willow_string_concat_n",
-            "willow_array_new",
-            "willow_array_new_literal",
-            "willow_array_to_string",
-            "willow_map_new",
-            "willow_map_new_local",
-            "willow_i64_to_string",
-            "willow_runtime_args_array",
-            "willow_channel_new",
-            "willow_async_mutex_new",
-            "willow_blocking_cell_new",
-            "willow_blocking_rw_cell_new",
-            "willow_cancellation_token_new",
-            "willow_task_scope_new",
-            "willow_async_frame_alloc",
+            rt::willow_string_concat,
+            rt::willow_string_concat_n,
+            rt::willow_array_new,
+            rt::willow_array_new_literal,
+            rt::willow_array_to_string,
+            rt::willow_map_new,
+            rt::willow_map_new_local,
+            rt::willow_i64_to_string,
+            rt::willow_runtime_args_array,
+            rt::willow_channel_new,
+            rt::willow_async_mutex_new,
+            rt::willow_blocking_cell_new,
+            rt::willow_blocking_rw_cell_new,
+            rt::willow_cancellation_token_new,
+            rt::willow_task_scope_new,
+            rt::willow_async_frame_alloc,
         ] {
             assert!(allocates(name), "{name}");
         }
@@ -744,11 +781,11 @@ mod alloc_effects_tests {
     #[test]
     fn map_key_operations_include_nan_fault_effects() {
         for name in [
-            "willow_map_insert",
-            "willow_map_get",
-            "willow_map_contains",
-            "willow_map_remove_into",
-            "willow_map_snapshot",
+            rt::willow_map_insert,
+            rt::willow_map_get,
+            rt::willow_map_contains,
+            rt::willow_map_remove_into,
+            rt::willow_map_snapshot,
         ] {
             assert!(
                 effects(name)
@@ -760,15 +797,15 @@ mod alloc_effects_tests {
     #[test]
     fn a13_pure_readers_and_stores_stay_none() {
         for name in [
-            "willow_map_len",
-            "willow_gc_write_barrier",
-            "willow_gc_array_write_barrier",
-            "willow_push_root",
-            "willow_pop_roots",
-            "willow_root_depth",
-            "willow_monotonic_millis",
-            "willow_cancellation_token_is_cancelled",
-            "willow_task_scope_is_cancelled",
+            rt::willow_map_len,
+            rt::willow_gc_write_barrier,
+            rt::willow_gc_array_write_barrier,
+            rt::willow_push_root,
+            rt::willow_pop_roots,
+            rt::willow_root_depth,
+            rt::willow_monotonic_millis,
+            rt::willow_cancellation_token_is_cancelled,
+            rt::willow_task_scope_is_cancelled,
         ] {
             assert_eq!(effects(name), RuntimeEffects::NONE, "{name}");
         }
@@ -776,7 +813,7 @@ mod alloc_effects_tests {
 
     #[test]
     fn task_frame_diagnostics_signature_and_output_effect_match_runtime() {
-        let symbol = runtime_symbol("willow_gc_task_frame_diagnostics").unwrap();
+        let symbol = runtime_symbol(rt::willow_gc_task_frame_diagnostics).unwrap();
         assert!(symbol.params.is_empty());
         assert_eq!(symbol.ret, None);
         assert_eq!(symbol.effects, RuntimeEffects::MAY_BLOCK);
@@ -784,7 +821,7 @@ mod alloc_effects_tests {
 
     #[test]
     fn gc_stats_snapshot_signature_matches_runtime() {
-        let symbol = runtime_symbol("willow_gc_stats_snapshot_v1").unwrap();
+        let symbol = runtime_symbol(rt::willow_gc_stats_snapshot_v1).unwrap();
         assert_eq!(symbol.params, &[AbiTy::Ptr]);
         assert_eq!(symbol.ret, Some(AbiTy::I32));
         assert_eq!(symbol.effects, RuntimeEffects::NONE);
@@ -793,9 +830,9 @@ mod alloc_effects_tests {
     #[test]
     fn gc_stats_negotiation_signatures_match_runtime() {
         for (name, params) in [
-            ("willow_gc_stats_size", &[AbiTy::I64][..]),
+            (rt::willow_gc_stats_size, &[AbiTy::I64][..]),
             (
-                "willow_gc_stats_snapshot",
+                rt::willow_gc_stats_snapshot,
                 &[AbiTy::I64, AbiTy::Ptr, AbiTy::I64][..],
             ),
         ] {
@@ -810,24 +847,24 @@ mod alloc_effects_tests {
     fn a14_gc_statistic_readers_stay_none() {
         // They report on the heap; they do not touch it.
         for name in [
-            "willow_gc_allocated_bytes",
-            "willow_gc_total_allocated_bytes",
-            "willow_gc_minor_collections",
-            "willow_gc_major_collections",
-            "willow_gc_promoted_objects",
-            "willow_gc_moved_objects",
-            "willow_gc_pause_count",
-            "willow_gc_pause_total_ns",
-            "willow_gc_pause_max_ns",
-            "willow_gc_survivor_copies",
-            "willow_gc_survivor_bytes",
-            "willow_gc_tenured_objects",
-            "willow_gc_tenured_bytes",
-            "willow_gc_pinned_promotions",
-            "willow_gc_survivor_space_reserved",
-            "willow_gc_survivor_space_live",
-            "willow_gc_remembered_set_size",
-            "willow_gc_write_barrier_hits",
+            rt::willow_gc_allocated_bytes,
+            rt::willow_gc_total_allocated_bytes,
+            rt::willow_gc_minor_collections,
+            rt::willow_gc_major_collections,
+            rt::willow_gc_promoted_objects,
+            rt::willow_gc_moved_objects,
+            rt::willow_gc_pause_count,
+            rt::willow_gc_pause_total_ns,
+            rt::willow_gc_pause_max_ns,
+            rt::willow_gc_survivor_copies,
+            rt::willow_gc_survivor_bytes,
+            rt::willow_gc_tenured_objects,
+            rt::willow_gc_tenured_bytes,
+            rt::willow_gc_pinned_promotions,
+            rt::willow_gc_survivor_space_reserved,
+            rt::willow_gc_survivor_space_live,
+            rt::willow_gc_remembered_set_size,
+            rt::willow_gc_write_barrier_hits,
         ] {
             assert_eq!(effects(name), RuntimeEffects::NONE, "{name}");
         }
@@ -835,8 +872,8 @@ mod alloc_effects_tests {
 
     #[test]
     fn i64_parse_signature_and_allocation_effect() {
-        assert!(allocates("willow_i64_parse"));
-        let symbol = runtime_symbol("willow_i64_parse").unwrap();
+        assert!(allocates(rt::willow_i64_parse));
+        let symbol = runtime_symbol(rt::willow_i64_parse).unwrap();
         assert_eq!(
             (symbol.params, symbol.ret),
             (&[AbiTy::Ptr][..], Some(AbiTy::Ptr))
@@ -850,23 +887,23 @@ mod alloc_effects_tests {
             (symbol.params, symbol.ret)
         };
         assert_eq!(
-            signature("willow_i64_to_string"),
+            signature(rt::willow_i64_to_string),
             (&[AbiTy::I64][..], Some(AbiTy::Ptr))
         );
         assert_eq!(
-            signature("willow_f64_parse"),
+            signature(rt::willow_f64_parse),
             (&[AbiTy::Ptr][..], Some(AbiTy::Ptr))
         );
         assert_eq!(
-            signature("willow_map_new"),
+            signature(rt::willow_map_new),
             (&[AbiTy::I64, AbiTy::I64, AbiTy::I64][..], Some(AbiTy::Ptr))
         );
         assert_eq!(
-            signature("willow_channel_new"),
+            signature(rt::willow_channel_new),
             (&[AbiTy::I64][..], Some(AbiTy::Ptr))
         );
         assert_eq!(
-            signature("willow_runtime_program_name"),
+            signature(rt::willow_runtime_program_name),
             (&[][..], Some(AbiTy::Ptr))
         );
     }
@@ -874,20 +911,20 @@ mod alloc_effects_tests {
     #[test]
     fn a16_an_allocating_row_keeps_whatever_else_it_already_declared() {
         // The sweep added one bit; it must not have replaced a combination.
-        assert!(effects("willow_array_get").contains(RuntimeEffects::MAY_PANIC));
-        assert!(effects("willow_fs_read_to_string").contains(RuntimeEffects::MAY_BLOCK));
-        assert!(effects("willow_select_idle_wait").contains(RuntimeEffects::MAY_BLOCK));
-        assert!(effects("willow_select_idle_wait").contains(RuntimeEffects::MAY_PANIC));
+        assert!(effects(rt::willow_array_get).contains(RuntimeEffects::MAY_PANIC));
+        assert!(effects(rt::willow_fs_read_to_string).contains(RuntimeEffects::MAY_BLOCK));
+        assert!(effects(rt::willow_select_idle_wait).contains(RuntimeEffects::MAY_BLOCK));
+        assert!(effects(rt::willow_select_idle_wait).contains(RuntimeEffects::MAY_PANIC));
     }
 
     #[test]
     fn a17_allocation_and_suspension_are_independent_columns() {
         // An eager async constructor allocates its Task without suspending its
         // caller; a suspension point need not allocate at all.
-        assert!(allocates("willow_net_read_async"));
-        assert!(!effects("willow_net_read_async").contains(RuntimeEffects::MAY_SUSPEND));
-        assert!(effects("willow_sched_await").contains(RuntimeEffects::MAY_SUSPEND));
-        assert!(!allocates("willow_sched_await"));
+        assert!(allocates(rt::willow_net_read_async));
+        assert!(!effects(rt::willow_net_read_async).contains(RuntimeEffects::MAY_SUSPEND));
+        assert!(effects(rt::willow_sched_await).contains(RuntimeEffects::MAY_SUSPEND));
+        assert!(!allocates(rt::willow_sched_await));
     }
 
     #[test]

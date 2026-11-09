@@ -1,4 +1,5 @@
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
+use willow_abi::runtime_symbols::names as rt;
 
 use super::*;
 
@@ -160,7 +161,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let err_is_string = self.locals.main_result_err_ty.as_ref() == Some(&Type::String);
 
-        let fail_id = self.func_id("willow_main_fail");
+        let fail_id = self.func_id(rt::willow_main_fail);
         emit_main_result_exit_raw(
             self.builder,
             self.module,

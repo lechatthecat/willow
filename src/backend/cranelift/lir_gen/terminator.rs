@@ -1,6 +1,7 @@
 //! Block, suspension, cleanup and return emission.
 
 use super::*;
+use willow_abi::runtime_symbols::names as rt;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_lir_select_instruction(&mut self, function: &LirFunction, inst: &LirInst) {
@@ -9,7 +10,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 for operation in operations {
                     if let LirSelectOp::Timeout { millis, deadline } = operation {
                         let millis = self.load_lir_local(function, *millis);
-                        let now = self.emit_value_runtime_call("willow_monotonic_millis", &[]);
+                        let now = self.emit_value_runtime_call(rt::willow_monotonic_millis, &[]);
                         let deadline_value = self.builder.ins().iadd(now, millis);
                         self.store_lir_local(function, *deadline, deadline_value);
                     }
@@ -24,13 +25,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         LirSelectOp::Recv { channel, .. } => {
                             let channel = self.load_lir_local(function, *channel);
                             let raw = self
-                                .emit_value_runtime_call("willow_channel_recv_ready", &[channel]);
+                                .emit_value_runtime_call(rt::willow_channel_recv_ready, &[channel]);
                             self.builder.ins().icmp_imm_s(IntCC::NotEqual, raw, 0)
                         }
                         LirSelectOp::Send { channel, .. } => {
                             let channel = self.load_lir_local(function, *channel);
                             let raw = self
-                                .emit_value_runtime_call("willow_channel_send_ready", &[channel]);
+                                .emit_value_runtime_call(rt::willow_channel_send_ready, &[channel]);
                             self.builder.ins().icmp_imm_s(IntCC::NotEqual, raw, 0)
                         }
                         LirSelectOp::Join { task, .. } => {
@@ -45,12 +46,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                                 ),
                             );
                             let raw =
-                                self.emit_value_runtime_call("willow_frame_await", &[task, id]);
+                                self.emit_value_runtime_call(rt::willow_frame_await, &[task, id]);
                             self.builder.ins().icmp_imm_s(IntCC::NotEqual, raw, 0)
                         }
                         LirSelectOp::Timeout { deadline, .. } => {
                             let deadline = self.load_lir_local(function, *deadline);
-                            let now = self.emit_value_runtime_call("willow_monotonic_millis", &[]);
+                            let now =
+                                self.emit_value_runtime_call(rt::willow_monotonic_millis, &[]);
                             self.builder
                                 .ins()
                                 .icmp(IntCC::SignedGreaterThanOrEqual, now, deadline)
@@ -89,7 +91,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
                 self.builder.switch_to_block(pick);
                 self.builder.seal_block(pick);
-                let rotation = self.emit_value_runtime_call("willow_select_rotation", &[]);
+                let rotation = self.emit_value_runtime_call(rt::willow_select_rotation, &[]);
                 let rank = self.builder.ins().urem(rotation, total);
                 let mut accumulated = self.builder.ins().iconst(types::I64, 0);
                 let mut selected = self.builder.ins().iconst(types::I64, -1);
@@ -163,7 +165,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                                 done
                             });
                             self.emit_void_runtime_call(
-                                "willow_channel_select_cleanup",
+                                rt::willow_channel_select_cleanup,
                                 &[channel, winner_raw, direction],
                             );
                             if let Some(done) = done {
@@ -184,7 +186,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                                 ),
                             );
                             self.emit_void_runtime_call(
-                                "willow_sched_unregister_task_waiter",
+                                rt::willow_sched_unregister_task_waiter,
                                 &[id],
                             );
                         }
@@ -218,9 +220,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         let raw = self.load_lir_local(function, *value);
                         let from_ty = &function.locals[value.0 as usize].ty;
                         let value = self.coerce_to_target(raw, from_ty, elem_ty);
-                        let runtime = format!(
-                            "willow_channel_try_send_{}",
-                            channel_runtime_suffix(elem_ty)
+                        let runtime = channel_runtime_symbol(
+                            elem_ty,
+                            [
+                                rt::willow_channel_try_send_i64,
+                                rt::willow_channel_try_send_bool,
+                                rt::willow_channel_try_send_f64,
+                                rt::willow_channel_try_send_ptr,
+                            ],
                         );
                         let before = self.roots.gc_root_count;
                         let (channel, value) = if self.is_inline_pair(elem_ty) {
@@ -231,7 +238,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         } else {
                             (channel, value)
                         };
-                        let sent = self.emit_value_runtime_call(&runtime, &[channel, value]);
+                        let sent = self.emit_value_runtime_call(runtime, &[channel, value]);
                         self.emit_pop_roots_n(self.roots.gc_root_count - before);
                         self.roots.gc_root_count = before;
                         let sent = self.builder.ins().icmp_imm_s(IntCC::NotEqual, sent, 0);
@@ -341,7 +348,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.switch_to_block(check);
                 let channel_value = self.load_lir_local(function, *channel);
                 let ready =
-                    self.emit_value_runtime_call("willow_channel_recv_ready", &[channel_value]);
+                    self.emit_value_runtime_call(rt::willow_channel_recv_ready, &[channel_value]);
                 let receive = self.builder.create_block();
                 let park = self.builder.create_block();
                 let ready = self.builder.ins().icmp_imm_s(IntCC::NotEqual, ready, 0);
@@ -398,11 +405,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let from_ty = &function.locals[value.0 as usize].ty;
                     self.coerce_to_target(raw, from_ty, elem_ty)
                 };
-                let runtime = format!(
-                    "willow_channel_try_send_{}",
-                    channel_runtime_suffix(elem_ty)
+                let runtime = channel_runtime_symbol(
+                    elem_ty,
+                    [
+                        rt::willow_channel_try_send_i64,
+                        rt::willow_channel_try_send_bool,
+                        rt::willow_channel_try_send_f64,
+                        rt::willow_channel_try_send_ptr,
+                    ],
                 );
-                let sent = self.emit_value_runtime_call(&runtime, &[channel_value, sent_value]);
+                let sent = self.emit_value_runtime_call(runtime, &[channel_value, sent_value]);
                 let done = self.builder.create_block();
                 let park = self.builder.create_block();
                 let sent = self.builder.ins().icmp_imm_s(IntCC::NotEqual, sent, 0);
@@ -449,7 +461,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                 }
                 if let Some(deadline) = minimum {
-                    let now = self.emit_value_runtime_call("willow_monotonic_millis", &[]);
+                    let now = self.emit_value_runtime_call(rt::willow_monotonic_millis, &[]);
                     let remaining = self.builder.ins().isub(deadline, now);
                     let zero = self.builder.ins().iconst(types::I64, 0);
                     let negative = self
@@ -457,7 +469,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         .ins()
                         .icmp(IntCC::SignedLessThan, remaining, zero);
                     let remaining = self.builder.ins().select(negative, zero, remaining);
-                    self.emit_void_runtime_call("willow_sched_sleep", &[remaining]);
+                    self.emit_void_runtime_call(rt::willow_sched_sleep, &[remaining]);
                 }
                 let state = (suspends.len() + 1) as i64;
                 let state = self.builder.ins().iconst(types::I64, state);
@@ -547,7 +559,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     if let crate::backend::cranelift::RootDepth::Variable(var) =
                         scope.root_depth_at_entry
                     {
-                        let depth = self.emit_value_runtime_call("willow_root_depth", &[]);
+                        let depth = self.emit_value_runtime_call(rt::willow_root_depth, &[]);
                         self.builder.def_var(var, depth);
                         for (site, _) in sites {
                             let zero = self.builder.ins().iconst(types::I64, 0);

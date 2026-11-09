@@ -8,6 +8,8 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::ObjectBuilder;
+#[cfg(test)]
+use willow_abi::runtime_symbols::names as rt;
 mod cleanup_stack;
 mod runtime_names;
 use cleanup_stack::Chain;
@@ -2340,13 +2342,13 @@ fn reference_index_name(expr: &Expr) -> String {
     }
 }
 
-fn channel_runtime_suffix(ty: &Type) -> &'static str {
-    match ty {
-        Type::I64 => "i64",
-        Type::Bool => "bool",
-        Type::F64 => "f64",
-        _ => "ptr",
-    }
+fn channel_runtime_symbol(ty: &Type, symbols: [&'static str; 4]) -> &'static str {
+    symbols[match ty {
+        Type::I64 => 0,
+        Type::Bool => 1,
+        Type::F64 => 2,
+        _ => 3,
+    }]
 }
 
 fn param_abi_type(
@@ -2638,8 +2640,8 @@ mod symbol_namespace_tests {
     /// bare name is what an entry-file free function actually produces.
     #[test]
     fn unit_symbols_52_bare_runtime_names_are_still_reserved() {
-        assert!(is_reserved_symbol("willow_array_new"));
-        assert!(is_reserved_symbol("willow_gc_collect"));
+        assert!(is_reserved_symbol(rt::willow_array_new));
+        assert!(is_reserved_symbol(rt::willow_gc_collect));
         assert!(is_reserved_symbol("willow_box"));
         assert!(is_reserved_symbol("__willow_static_init"));
     }
@@ -3126,7 +3128,7 @@ mod tests {
     fn unit_async_codegen_02_sleep_builtin_lowers_to_runtime_sleep() {
         assert_eq!(
             builtin_call_runtime_name("sleep"),
-            Some("willow_timer_value_sleep")
+            Some(rt::willow_timer_value_sleep)
         );
     }
 
@@ -3134,7 +3136,7 @@ mod tests {
     fn unit_async_codegen_02c_yield_builtin_lowers_to_runtime_yield() {
         assert_eq!(
             builtin_call_runtime_name("yield"),
-            Some("willow_timer_value_yield")
+            Some(rt::willow_timer_value_yield)
         );
     }
 
@@ -3151,13 +3153,28 @@ mod tests {
     }
 
     #[test]
-    fn unit_async_codegen_05_channel_runtime_suffix_selects_primitive_or_pointer_abi() {
-        assert_eq!(channel_runtime_suffix(&Type::I64), "i64");
-        assert_eq!(channel_runtime_suffix(&Type::Bool), "bool");
-        assert_eq!(channel_runtime_suffix(&Type::F64), "f64");
-        assert_eq!(channel_runtime_suffix(&Type::String), "ptr");
+    fn unit_async_codegen_05_channel_runtime_symbol_selects_primitive_or_pointer_abi() {
         assert_eq!(
-            channel_runtime_suffix(&Type::Named("Node".to_string().into())),
+            channel_runtime_symbol(&Type::I64, ["i64", "bool", "f64", "ptr"]),
+            "i64"
+        );
+        assert_eq!(
+            channel_runtime_symbol(&Type::Bool, ["i64", "bool", "f64", "ptr"]),
+            "bool"
+        );
+        assert_eq!(
+            channel_runtime_symbol(&Type::F64, ["i64", "bool", "f64", "ptr"]),
+            "f64"
+        );
+        assert_eq!(
+            channel_runtime_symbol(&Type::String, ["i64", "bool", "f64", "ptr"]),
+            "ptr"
+        );
+        assert_eq!(
+            channel_runtime_symbol(
+                &Type::Named("Node".to_string().into()),
+                ["i64", "bool", "f64", "ptr"]
+            ),
             "ptr"
         );
     }
@@ -3504,23 +3521,23 @@ mod tests {
     fn unit_async_codegen_10_future_await_runtime_selects_by_output_type() {
         assert_eq!(
             future_await_runtime_name(&Type::Void),
-            "willow_timer_value_await"
+            rt::willow_timer_value_await
         );
         assert_eq!(
             future_await_runtime_name(&Type::I64),
-            "willow_future_await_i64"
+            rt::willow_future_await_i64
         );
         assert_eq!(
             future_await_runtime_name(&Type::Bool),
-            "willow_future_await_bool"
+            rt::willow_future_await_bool
         );
         assert_eq!(
             future_await_runtime_name(&Type::F64),
-            "willow_future_await_f64"
+            rt::willow_future_await_f64
         );
         assert_eq!(
             future_await_runtime_name(&Type::Named("Node".to_string().into())),
-            "willow_future_await_ptr"
+            rt::willow_future_await_ptr
         );
     }
 }

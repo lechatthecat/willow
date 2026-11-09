@@ -3,6 +3,7 @@ use cranelift_codegen::ir::{
     InstBuilder, MemFlagsData, StackSlot, StackSlotData, StackSlotKind, Value, condcodes::IntCC,
     types,
 };
+use willow_abi::runtime_symbols::names as rt;
 
 use super::*;
 
@@ -240,8 +241,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // released/re-handed.  A held owner has no reverse link, so this is
             // a no-op before the phase-sensitive commit below.
             let cancel = match mode {
-                LockMode::Mutex => "willow_async_mutex_cancel",
-                LockMode::Read | LockMode::Write => "willow_async_rwlock_cancel",
+                LockMode::Mutex => rt::willow_async_mutex_cancel,
+                LockMode::Read | LockMode::Write => rt::willow_async_rwlock_cancel,
                 LockMode::Group => unreachable!("group cleanup dispatched separately"),
             };
             self.emit_value_runtime_call(cancel, &[]);
@@ -283,11 +284,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Runtime commit captures the protected old value under its ownership
         // check and performs the fused SATB/generational barrier.
         let commit = match mode {
-            LockMode::Mutex => "willow_async_mutex_commit_release",
+            LockMode::Mutex => rt::willow_async_mutex_commit_release,
             // The read-mode commit block has no predecessor, but Cranelift
             // still emits it structurally. Point it at the ownership-checking
             // RwLock ABI; it is unreachable at run time and cannot publish.
-            LockMode::Read | LockMode::Write => "willow_async_rwlock_commit",
+            LockMode::Read | LockMode::Write => rt::willow_async_rwlock_commit,
             LockMode::Group => unreachable!("group cleanup dispatched separately"),
         };
         self.emit_value_runtime_call(commit, &[handle, token, word]);
@@ -303,8 +304,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(release_b);
         self.builder.seal_block(release_b);
         let release = match mode {
-            LockMode::Mutex => "willow_async_mutex_release",
-            LockMode::Read | LockMode::Write => "willow_async_rwlock_release",
+            LockMode::Mutex => rt::willow_async_mutex_release,
+            LockMode::Read | LockMode::Write => rt::willow_async_rwlock_release,
             LockMode::Group => unreachable!("group cleanup dispatched separately"),
         };
         let handle = self.builder.ins().load(
@@ -422,7 +423,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .ins()
                     .load(types::I64, MemFlagsData::new(), frame, handle_offset);
             let index = self.builder.ins().iconst(types::I64, index as i64);
-            self.emit_value_runtime_call("willow_lock_group_commit", &[group, index, word]);
+            self.emit_value_runtime_call(rt::willow_lock_group_commit, &[group, index, word]);
         }
         if cancel_wait {
             self.builder.ins().jump(cancel_b, &[]);
@@ -435,7 +436,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder
                     .ins()
                     .load(types::I64, MemFlagsData::new(), frame, token_offset);
-            self.emit_value_runtime_call("willow_lock_group_release", &[group, token]);
+            self.emit_value_runtime_call(rt::willow_lock_group_release, &[group, token]);
             self.builder.ins().jump(cleared_b, &[]);
         }
 
@@ -445,7 +446,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .load(types::I64, MemFlagsData::new(), frame, handle_offset);
-        self.emit_void_runtime_call("willow_lock_group_cancel", &[group]);
+        self.emit_void_runtime_call(rt::willow_lock_group_cancel, &[group]);
         self.builder.ins().jump(cleared_b, &[]);
 
         self.builder.switch_to_block(cleared_b);
@@ -626,7 +627,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let full = self.builder.ins().iconst(types::I32, i64::from(i32::MAX));
             self.stack_store(full, spare);
         }
-        let cancelled = self.emit_value_runtime_call("willow_sync_safepoint", &[]);
+        let cancelled = self.emit_value_runtime_call(rt::willow_sync_safepoint, &[]);
         self.emit_sync_cancel_branch(cancelled);
         self.builder
             .set_cold_block(self.builder.current_block().expect("poll continuation"));
@@ -651,7 +652,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.seal_block(check);
             resume
         });
-        let reason = self.emit_value_runtime_call("willow_unwind_reason", &[]);
+        let reason = self.emit_value_runtime_call(rt::willow_unwind_reason, &[]);
         // Cancellation remains sticky even if a cleanup panic was recovered.
         // Panic propagation still compares depth, so an outer panic does not
         // abort a harmless helper called from a defer.
@@ -733,7 +734,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let prepared_frames_before = std::mem::take(&mut self.diagnostics.lir_call_frames);
         let reference_scopes_before = std::mem::take(&mut self.diagnostics.lir_reference_scopes);
         for _ in 0..defer_depth_before {
-            self.emit_void_runtime_call("willow_panic_leave_defer", &[]);
+            self.emit_void_runtime_call(rt::willow_panic_leave_defer, &[]);
         }
         for _ in 0..callstack_depth_before {
             self.emit_callstack_pop();
@@ -744,19 +745,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.cleanup.panic_defer_codegen_depth = 0;
         self.cleanup.recover_eligible_depth = 0;
         self.cleanup.emitting_sync_cancel_cleanup = true;
-        self.emit_void_runtime_call("willow_sync_cleanup_enter", &[]);
+        self.emit_void_runtime_call(rt::willow_sync_cleanup_enter, &[]);
         if self.suspension.coop_frame.is_some() {
             // The runtime invokes this poll's collected cleanup entry, whose
             // frame flags cover every registration on the actual runtime path.
-            self.emit_void_runtime_call("willow_sync_poll_cancel_cleanup", &[]);
-            self.emit_void_runtime_call("willow_sync_cleanup_leave", &[]);
+            self.emit_void_runtime_call(rt::willow_sync_poll_cancel_cleanup, &[]);
+            self.emit_void_runtime_call(rt::willow_sync_cleanup_leave, &[]);
             // Cancellation abandons this poll rather than resuming at a LIR
             // suspension point. Constructor/call temporaries can still be
             // rooted here; pop them together with lexical binding roots.
             self.emit_pop_roots_n(self.roots.gc_root_count);
             // Cleanup can raise a panic even while cancellation is sticky.
             // Publish that outcome before the scheduler wakes any awaiter.
-            let active = self.emit_value_runtime_call("willow_panic_active", &[]);
+            let active = self.emit_value_runtime_call(rt::willow_panic_active, &[]);
             let ready = self.builder.ins().iconst(types::I32, 1);
             let panicked = self.builder.ins().iconst(types::I32, COOP_POLL_PANICKED);
             let outcome = self.builder.ins().select(active, panicked, ready);
@@ -764,13 +765,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else if let Some(return_block) = self.cleanup.panic_return_block {
             self.emit_flush_defers_from(0);
             if !self.locals.terminated {
-                self.emit_void_runtime_call("willow_sync_cleanup_leave", &[]);
+                self.emit_void_runtime_call(rt::willow_sync_cleanup_leave, &[]);
                 self.builder.ins().jump(return_block, &[]);
             }
         } else {
             // Compiler-owned init/cleanup entries cannot originate a native
             // task safepoint. They only execute under their caller's cleanup.
-            self.emit_void_runtime_call("willow_sync_cleanup_leave", &[]);
+            self.emit_void_runtime_call(rt::willow_sync_cleanup_leave, &[]);
             self.builder.ins().jump(resume, &[]);
         }
         self.cleanup.emitting_sync_cancel_cleanup = false;
@@ -793,13 +794,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if self.cleanup.emitting_sync_cancel_cleanup {
             // A panic exits the cancellation cleanup path before its normal
             // epilogue. Balance suppression even if a defer later recovers it.
-            self.emit_void_runtime_call("willow_sync_cleanup_leave", &[]);
+            self.emit_void_runtime_call(rt::willow_sync_cleanup_leave, &[]);
         }
         let codegen_depth_before = self.cleanup.panic_defer_codegen_depth;
         let eligible_depth_before = self.cleanup.recover_eligible_depth;
         let callstack_depth_before = self.diagnostics.callstack_frame_depth;
         for _ in 0..codegen_depth_before {
-            self.emit_void_runtime_call("willow_panic_leave_defer", &[]);
+            self.emit_void_runtime_call(rt::willow_panic_leave_defer, &[]);
         }
         // The raise-time diagnostic already owns a snapshot. Balance every
         // caller-owned debug frame before recovery can resume normal code.
@@ -905,13 +906,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         for (name, storage) in entry.bindings.iter() {
                             self.locals.vars.insert(name.clone(), storage.clone());
                         }
-                        self.emit_void_runtime_call("willow_panic_enter_defer", &[]);
+                        self.emit_void_runtime_call(rt::willow_panic_enter_defer, &[]);
                         self.cleanup.panic_defer_codegen_depth = 1;
                         self.cleanup.recover_eligible_depth =
                             eligible_depth_before + usize::from(entry.recovery_capable);
                         self.emit_deferred_action(&entry.action, entry.flag_offset);
                         if !self.locals.terminated {
-                            self.emit_void_runtime_call("willow_panic_leave_defer", &[]);
+                            self.emit_void_runtime_call(rt::willow_panic_leave_defer, &[]);
                         }
                         self.cleanup.panic_defer_codegen_depth = 0;
                         self.cleanup.recover_eligible_depth = eligible_depth_before;
@@ -919,7 +920,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                     I::ReleaseLock(_) => self.emit_lock_release_at_depth(scope.defer_depth),
                     I::RestoreRoots(_) => {
-                        let current = self.emit_value_runtime_call("willow_root_depth", &[]);
+                        let current = self.emit_value_runtime_call(rt::willow_root_depth, &[]);
                         let base = match scope.root_depth_at_entry {
                             RootDepth::Value(value) => value,
                             RootDepth::Variable(var) => self.builder.use_var(var),
@@ -931,7 +932,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             base
                         };
                         let count = self.builder.ins().isub(current, target);
-                        self.emit_void_runtime_call("willow_pop_roots", &[count]);
+                        self.emit_void_runtime_call(rt::willow_pop_roots, &[count]);
                         self.locals.vars = (*scope.vars_before).clone();
                         if let Some(depth) = scope.coop_root_depth_at_entry {
                             self.roots.gc_root_count = depth;
@@ -975,7 +976,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 T::Dispatch { recovery, .. } => {
                     if recovery.is_some() && scope_can_recover {
-                        let active = self.emit_value_runtime_call("willow_panic_active", &[]);
+                        let active = self.emit_value_runtime_call(rt::willow_panic_active, &[]);
                         let propagate = self.builder.create_block();
                         let recovered = self.builder.create_block();
                         self.builder
@@ -990,7 +991,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             scope.reference_scopes_at_entry.clone();
                         self.emit_replay_reference_scopes();
                         for _ in 0..codegen_depth_before {
-                            self.emit_void_runtime_call("willow_panic_enter_defer", &[]);
+                            self.emit_void_runtime_call(rt::willow_panic_enter_defer, &[]);
                         }
                         self.builder.ins().jump(scope.resume, &[]);
                         self.diagnostics.callstack_frame_depth = 0;
@@ -1047,7 +1048,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let panicked = self.builder.ins().iconst(types::I32, COOP_POLL_PANICKED);
             self.builder.ins().return_(&[panicked]);
         } else {
-            self.emit_void_runtime_call("willow_panic_finish_unhandled", &[]);
+            self.emit_void_runtime_call(rt::willow_panic_finish_unhandled, &[]);
             self.builder.ins().trap(TrapCode::unwrap_user(1));
         }
     }
@@ -1057,7 +1058,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         name: &str,
         args: &[cranelift_codegen::ir::Value],
     ) {
-        if name == "willow_pop_roots" && self.roots.root_reservation.is_some() {
+        if name == rt::willow_pop_roots && self.roots.root_reservation.is_some() {
             if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
                 eprintln!("[inline-root-pop]");
             }
@@ -1092,7 +1093,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         name: &str,
         args: &[cranelift_codegen::ir::Value],
     ) -> cranelift_codegen::ir::Value {
-        if name == "willow_root_depth" && self.roots.root_reservation.is_some() {
+        if name == rt::willow_root_depth && self.roots.root_reservation.is_some() {
             if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
                 eprintln!("[inline-root-depth]");
             }
@@ -1109,7 +1110,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // These ABI queries are compiler intrinsics: the stable execution
         // context points at the Arc-owned atomic, never at worker TLS. Keep
         // the load atomic (also on AArch64) and preserve i32 saturation.
-        if name == "willow_panic_depth" || name == "willow_panic_active" {
+        if name == rt::willow_panic_depth || name == rt::willow_panic_active {
             let ptr_ty = reference_type(self.module.target_config());
             let context = self.builder.ins().get_pinned_reg(ptr_ty);
             let pointer = self.builder.ins().load(
@@ -1122,7 +1123,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .builder
                 .ins()
                 .atomic_load(ptr_ty, MemFlagsData::trusted(), pointer);
-            if name == "willow_panic_active" {
+            if name == rt::willow_panic_active {
                 let active = self.builder.ins().icmp_imm_u(IntCC::NotEqual, depth, 0);
                 return self.builder.ins().uextend(types::I32, active);
             }
@@ -1184,7 +1185,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // runtime-side NoPreemptGuard intentionally omit this effect, avoiding
         // a second enter/leave pair on their hot paths.
         if no_preempt {
-            self.emit_void_runtime_call("willow_preempt_enter_no_preempt", &[]);
+            self.emit_void_runtime_call(rt::willow_preempt_enter_no_preempt, &[]);
         }
 
         // Deliberately bypass `func_id`: that ordinary lookup rejects
@@ -1203,7 +1204,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // MAY_PANIC already publishes via
         // its pre-call bracket. Never recursively instrument the marker itself.
         if !may_panic
-            && name != "willow_stack_helper_set"
+            && name != rt::willow_stack_helper_set
             && !self.diagnostics.stack_helper_established
         {
             self.emit_stack_helper();
@@ -1218,7 +1219,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Restore the quantum state before both normal continuation and the
         // generated recoverable-panic branch.
         if no_preempt {
-            self.emit_void_runtime_call("willow_preempt_leave_no_preempt", &[]);
+            self.emit_void_runtime_call(rt::willow_preempt_leave_no_preempt, &[]);
         }
 
         after_call(self);
@@ -1261,7 +1262,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // proof before emitting this marker so debug metadata is not itself
         // an artificial invalidation at this call's snapshot point.
         self.emit_fault_site_for(enters_willow);
-        Some(reusable.unwrap_or_else(|| self.emit_value_runtime_call("willow_panic_depth", &[])))
+        Some(reusable.unwrap_or_else(|| self.emit_value_runtime_call(rt::willow_panic_depth, &[])))
     }
 
     /// Publish a synchronous helper in every build mode, independently of
@@ -1349,7 +1350,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 | (i64::from(enters_willow) << 2),
         );
         self.emit_void_runtime_call(
-            "willow_trace_site_set",
+            rt::willow_trace_site_set,
             &[
                 name_ptr,
                 name_len,
@@ -1386,7 +1387,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// to the unwind when the depth grew past `depth_before`, and continue in
     /// a fresh block otherwise.
     pub(super) fn emit_panic_depth_check(&mut self, depth_before: cranelift_codegen::ir::Value) {
-        let depth_after = self.emit_value_runtime_call("willow_panic_depth", &[]);
+        let depth_after = self.emit_value_runtime_call(rt::willow_panic_depth, &[]);
         let raised = self
             .builder
             .ins()
@@ -1403,7 +1404,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if self.suspension.coop_frame.is_some() {
             self.emit_sync_panic_unwind();
         } else if self.locals.is_async {
-            self.emit_void_runtime_call("willow_panic_finish_unhandled", &[]);
+            self.emit_void_runtime_call(rt::willow_panic_finish_unhandled, &[]);
             self.builder.ins().trap(TrapCode::unwrap_user(1));
             self.locals.terminated = true;
         } else {
@@ -1443,7 +1444,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .ins()
             .iconst(types::I64, span.map_or(0, |value| value.col) as i64);
         self.emit_runtime_call_with_cleanup(
-            "willow_panic_raise",
+            rt::willow_panic_raise,
             &[message, file, line, column],
             |this| {
                 this.emit_pop_roots_n(1);
@@ -1466,9 +1467,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(block);
         self.builder.seal_block(block);
         if let Some(entry_depth) = self.cleanup.panic_function_root_depth {
-            let current_depth = self.emit_value_runtime_call("willow_root_depth", &[]);
+            let current_depth = self.emit_value_runtime_call(rt::willow_root_depth, &[]);
             let roots_to_pop = self.builder.ins().isub(current_depth, entry_depth);
-            self.emit_void_runtime_call("willow_pop_roots", &[roots_to_pop]);
+            self.emit_void_runtime_call(rt::willow_pop_roots, &[roots_to_pop]);
         }
         if *return_ty == Type::Void || force_void {
             self.builder.ins().return_(&[]);

@@ -10,6 +10,7 @@ use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use anyhow::Result;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
 use cranelift_module::Module;
+use willow_abi::runtime_symbols::names as rt;
 
 use super::*;
 
@@ -87,7 +88,7 @@ impl UnitCodegenContext<'_> {
         bitmap: &[u64],
     ) -> cranelift_codegen::ir::Value {
         if bitmap.iter().skip(1).any(|word| *word != 0) {
-            let alloc = self.func_id("willow_gc_alloc_bitmap");
+            let alloc = self.func_id(rt::willow_gc_alloc_bitmap);
             let payload_size = willow_abi::async_frame::data_slot_offset(
                 slot_count as u32,
                 reference_type(self.output.module.target_config()).bytes(),
@@ -102,7 +103,7 @@ impl UnitCodegenContext<'_> {
                 bitmap,
             );
         }
-        let alloc = self.func_id("willow_async_frame_alloc");
+        let alloc = self.func_id(rt::willow_async_frame_alloc);
         let alloc = self.output.module.declare_func_in_func(alloc, builder.func);
         let count = builder.ins().iconst(types::I64, slot_count);
         let mask = builder.ins().iconst(types::I64, mask);
@@ -565,7 +566,7 @@ impl UnitCodegenContext<'_> {
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
         builder.seal_block(entry);
-        let barrier_fid = self.func_id("willow_gc_write_barrier");
+        let barrier_fid = self.func_id(rt::willow_gc_write_barrier);
         let barrier_ref = self
             .output
             .module
@@ -618,7 +619,7 @@ impl UnitCodegenContext<'_> {
         let poll_addr = builder
             .ins()
             .func_addr(reference_type(self.output.module.target_config()), poll_ref);
-        let spawn_fid = self.func_id("willow_sched_spawn_cooperative");
+        let spawn_fid = self.func_id(rt::willow_sched_spawn_cooperative);
         let spawn_ref = self
             .output
             .module
@@ -656,7 +657,7 @@ impl UnitCodegenContext<'_> {
             let native_cleanup = lir.blocks.iter().flat_map(|block| &block.instrs).any(|inst|
                 matches!(inst, LirInst::Defer { body, .. } if super::lir_gen::cleanup_needs_task_stack(&body.function)));
             let needs_stack = builder.ins().iconst(types::I32, i64::from(native_cleanup));
-            let set_fid = self.func_id("willow_sched_set_cancel_fn_cooperative");
+            let set_fid = self.func_id(rt::willow_sched_set_cancel_fn_cooperative);
             let set_ref = self
                 .output
                 .module
@@ -846,7 +847,7 @@ impl UnitCodegenContext<'_> {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
-        let barrier_fid = self.func_id("willow_gc_write_barrier");
+        let barrier_fid = self.func_id(rt::willow_gc_write_barrier);
         let barrier_ref = self
             .output
             .module
@@ -910,7 +911,7 @@ impl UnitCodegenContext<'_> {
         let poll_addr = builder
             .ins()
             .func_addr(reference_type(self.output.module.target_config()), poll_ref);
-        let spawn_fid = self.func_id("willow_sched_spawn_cooperative");
+        let spawn_fid = self.func_id(rt::willow_sched_spawn_cooperative);
         let spawn_ref = self
             .output
             .module
@@ -946,7 +947,7 @@ impl UnitCodegenContext<'_> {
             let native_cleanup = lir.blocks.iter().flat_map(|block| &block.instrs).any(|inst|
                 matches!(inst, LirInst::Defer { body, .. } if super::lir_gen::cleanup_needs_task_stack(&body.function)));
             let needs_stack = builder.ins().iconst(types::I32, i64::from(native_cleanup));
-            let set_fid = self.func_id("willow_sched_set_cancel_fn_cooperative");
+            let set_fid = self.func_id(rt::willow_sched_set_cancel_fn_cooperative);
             let set_ref = self
                 .output
                 .module
@@ -1034,7 +1035,7 @@ impl UnitCodegenContext<'_> {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
-        let barrier_fid = self.func_id("willow_gc_write_barrier");
+        let barrier_fid = self.func_id(rt::willow_gc_write_barrier);
         let barrier_ref = self
             .output
             .module
@@ -1045,7 +1046,7 @@ impl UnitCodegenContext<'_> {
         let ptr_ty = reference_type(self.output.module.target_config());
         let args_array = if let Some(param) = params.first() {
             debug_assert_eq!(param.name, "args");
-            let arr_id = self.func_id("willow_runtime_args_array");
+            let arr_id = self.func_id(rt::willow_runtime_args_array);
             let arr_ref = self
                 .output
                 .module
@@ -1059,7 +1060,7 @@ impl UnitCodegenContext<'_> {
             ));
             builder.ins().stack_store(ptr_ty, arr, slot, 0);
             let addr = builder.ins().stack_addr(ptr_ty, slot, 0);
-            let push_fid = self.func_id("willow_push_root");
+            let push_fid = self.func_id(rt::willow_push_root);
             let push_ref = self
                 .output
                 .module
@@ -1077,7 +1078,7 @@ impl UnitCodegenContext<'_> {
         );
         if let Some(slot) = args_array {
             let arr = builder.ins().stack_load(ptr_ty, ptr_ty, slot, 0);
-            let pop_fid = self.func_id("willow_pop_roots");
+            let pop_fid = self.func_id(rt::willow_pop_roots);
             let pop_ref = self
                 .output
                 .module
@@ -1112,7 +1113,7 @@ impl UnitCodegenContext<'_> {
             );
             let ptr_ty = reference_type(self.output.module.target_config());
             let addr = builder.ins().stack_addr(ptr_ty, slot, 0);
-            let push_fid = self.func_id("willow_push_root");
+            let push_fid = self.func_id(rt::willow_push_root);
             let push_ref = self
                 .output
                 .module
@@ -1129,7 +1130,7 @@ impl UnitCodegenContext<'_> {
         let poll_addr = builder
             .ins()
             .func_addr(reference_type(self.output.module.target_config()), poll_ref);
-        let spawn_fid = self.func_id("willow_sched_spawn_cooperative");
+        let spawn_fid = self.func_id(rt::willow_sched_spawn_cooperative);
         let spawn_ref = self
             .output
             .module
@@ -1142,7 +1143,7 @@ impl UnitCodegenContext<'_> {
         // unawaited task to quiescence (which could hang on a non-terminating
         // background task). Programs that need a result await their tasks before main
         // returns, so nothing is left to run anyway.
-        let run_fid = self.func_id("willow_sched_run_until");
+        let run_fid = self.func_id(rt::willow_sched_run_until);
         let run_ref = self
             .output
             .module
@@ -1174,14 +1175,14 @@ impl UnitCodegenContext<'_> {
                     result_offset,
                 )
             };
-            let pop_fid = self.func_id("willow_pop_roots");
+            let pop_fid = self.func_id(rt::willow_pop_roots);
             let pop_ref = self
                 .output
                 .module
                 .declare_func_in_func(pop_fid, builder.func);
             let one = builder.ins().iconst(types::I32, 1);
             builder.ins().call(pop_ref, &[one]);
-            let fail_id = self.func_id("willow_main_fail");
+            let fail_id = self.func_id(rt::willow_main_fail);
             super::emit_match::emit_main_result_exit_raw(
                 &mut builder,
                 &mut self.output.module,
@@ -1366,7 +1367,7 @@ impl UnitCodegenContext<'_> {
                 .declare_data_in_func(data_id.bytes, builder.func);
             let name_ptr = builder.ins().symbol_value(ptr_ty, gv);
             let name_len = builder.ins().iconst(types::I64, name.len() as i64);
-            let tag_id = self.func_id("willow_sched_tag_current_task");
+            let tag_id = self.func_id(rt::willow_sched_tag_current_task);
             let tag_ref = self
                 .output
                 .module
@@ -1377,14 +1378,14 @@ impl UnitCodegenContext<'_> {
         // first-entry and resume dispatch. Cooperative panic scopes express
         // their lexical root depth relative to it; a value captured inside the
         // body would not dominate resume edges that jump past that capture.
-        let root_depth_id = self.func_id("willow_root_depth");
+        let root_depth_id = self.func_id(rt::willow_root_depth);
         let root_depth_ref = self
             .output
             .module
             .declare_func_in_func(root_depth_id, builder.func);
         let root_depth_call = builder.ins().call(root_depth_ref, &[]);
         let poll_root_depth = builder.inst_results(root_depth_call)[0];
-        let counter_id = self.func_id("willow_async_poll_counter");
+        let counter_id = self.func_id(rt::willow_async_poll_counter);
         let counter_ref = self
             .output
             .module
@@ -1480,7 +1481,7 @@ impl UnitCodegenContext<'_> {
             let next = builder.create_block();
             builder.ins().brif(is_k, restore, &[], next, &[]);
             builder.switch_to_block(restore);
-            let push_id = self.func_id("willow_push_root");
+            let push_id = self.func_id(rt::willow_push_root);
             let push_ref = self
                 .output
                 .module
@@ -1517,7 +1518,7 @@ impl UnitCodegenContext<'_> {
                     .iconst(types::I64, self.source_file.len() as i64);
                 let line = builder.ins().iconst(types::I32, span.line as i64);
                 let col = builder.ins().iconst(types::I32, span.col as i64);
-                let push = self.func_id("willow_callstack_push_pending");
+                let push = self.func_id(rt::willow_callstack_push_pending);
                 let push = self.output.module.declare_func_in_func(push, builder.func);
                 builder
                     .ins()
@@ -1586,7 +1587,7 @@ impl UnitCodegenContext<'_> {
             // Cleanup runs without a poll entry, which is where the task's name
             // is otherwise published; tag it so a cleanup panic names the task.
             if let Some((name_ptr, name_len)) = fg.emit_static_str_bytes(diagnostic_function) {
-                fg.emit_void_runtime_call("willow_sched_tag_current_task", &[name_ptr, name_len]);
+                fg.emit_void_runtime_call(rt::willow_sched_tag_current_task, &[name_ptr, name_len]);
             }
             let mut cleanup_events = Vec::with_capacity(sites.len() + lock_sites.len());
             cleanup_events.extend(
@@ -1642,15 +1643,15 @@ impl UnitCodegenContext<'_> {
                     .ins()
                     .store(MemFlagsData::new(), zero, frame, site.flag_offset);
                 let roots_before = fg.roots.gc_root_count;
-                let root_depth = fg.emit_value_runtime_call("willow_root_depth", &[]);
+                let root_depth = fg.emit_value_runtime_call(rt::willow_root_depth, &[]);
                 let panic_next = fg.builder.create_block();
                 fg.cleanup.panic_return_block = Some(panic_next);
-                fg.emit_void_runtime_call("willow_panic_enter_defer", &[]);
+                fg.emit_void_runtime_call(rt::willow_panic_enter_defer, &[]);
                 fg.cleanup.panic_defer_codegen_depth = 1;
                 fg.cleanup.recover_eligible_depth = usize::from(site.recovery_capable);
                 fg.emit_deferred_action(&site.action, Some(site.flag_offset));
                 if !fg.locals.terminated {
-                    fg.emit_void_runtime_call("willow_panic_leave_defer", &[]);
+                    fg.emit_void_runtime_call(rt::willow_panic_leave_defer, &[]);
                     fg.builder.ins().jump(panic_next, &[]);
                 }
                 fg.builder.switch_to_block(panic_next);
@@ -1659,9 +1660,9 @@ impl UnitCodegenContext<'_> {
                 // A panic can bypass the action's normal local/temporary root
                 // pops. Restore its entry depth before another action runs or
                 // this native cleanup frame returns, on both exit paths.
-                let current_depth = fg.emit_value_runtime_call("willow_root_depth", &[]);
+                let current_depth = fg.emit_value_runtime_call(rt::willow_root_depth, &[]);
                 let roots_to_pop = fg.builder.ins().isub(current_depth, root_depth);
-                fg.emit_void_runtime_call("willow_pop_roots", &[roots_to_pop]);
+                fg.emit_void_runtime_call(rt::willow_pop_roots, &[roots_to_pop]);
                 fg.roots.gc_root_count = roots_before;
                 fg.cleanup.panic_return_block = None;
                 fg.cleanup.panic_defer_codegen_depth = 0;
@@ -1808,7 +1809,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Only the runtime call can report a fault. Publishing the trace on
         // the fast edge would retain an out-of-line call on every iteration.
         self.emit_fault_site();
-        let check_id = self.func_id("willow_preempt_check");
+        let check_id = self.func_id(rt::willow_preempt_check);
         let check_ref = self
             .module
             .declare_func_in_func(check_id, self.builder.func);
@@ -1877,7 +1878,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         suspends: &mut CoopSuspendPoints,
         frame: cranelift_codegen::ir::Value,
     ) {
-        let now = self.emit_value_runtime_call("willow_monotonic_millis", &[]);
+        let now = self.emit_value_runtime_call(rt::willow_monotonic_millis, &[]);
         let zero = self.builder.ins().iconst(types::I64, 0);
         let positive = self
             .builder
@@ -1900,7 +1901,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().jump(park, &[duration.into()]);
         self.builder.switch_to_block(park);
         let remaining = self.builder.block_params(park)[0];
-        self.emit_void_runtime_call("willow_sched_sleep", &[remaining]);
+        self.emit_void_runtime_call(rt::willow_sched_sleep, &[remaining]);
         let state = self
             .builder
             .ins()
@@ -1919,7 +1920,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder
                 .ins()
                 .load(types::I64, MemFlagsData::new(), frame, deadline_slot);
-        let now = self.emit_value_runtime_call("willow_monotonic_millis", &[]);
+        let now = self.emit_value_runtime_call(rt::willow_monotonic_millis, &[]);
         let remaining = self.builder.ins().isub(deadline, now);
         let waiting = self
             .builder
@@ -1937,7 +1938,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         suspends: &mut CoopSuspendPoints,
         frame: cranelift_codegen::ir::Value,
     ) {
-        let yield_fid = self.func_id("willow_sched_yield");
+        let yield_fid = self.func_id(rt::willow_sched_yield);
         let yield_ref = self
             .module
             .declare_func_in_func(yield_fid, self.builder.func);
@@ -1965,7 +1966,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let source_file = self.diagnostics.source_file.to_string();
         let file_ptr = self.emit_string_literal(&source_file);
         let line_val = self.builder.ins().iconst(types::I64, line as i64);
-        let fid = self.func_id("willow_sched_set_spawn_site");
+        let fid = self.func_id(rt::willow_sched_set_spawn_site);
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         self.builder
             .ins()
@@ -2005,7 +2006,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // 0 = registered as a waiter. The frame's own header answers "already
         // terminal?" without a scheduler lookup (willow-ezs.1.3); the id is
         // still needed to register this task when it is not.
-        let await_fid = self.func_id("willow_frame_await");
+        let await_fid = self.func_id(rt::willow_frame_await);
         let await_ref = self
             .module
             .declare_func_in_func(await_fid, self.builder.func);
@@ -2096,37 +2097,37 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let fused_scalar = mode == LockMode::Mutex && matches!(value_ty, Type::I64 | Type::F64);
         let (acquire_fn, poll_fn, load_fn, recursive_fn, invalid_fn) = match mode {
             LockMode::Group => (
-                "willow_lock_group_acquire",
-                "willow_lock_group_poll",
-                "willow_lock_group_load",
-                "willow_async_mutex_recursive_panic",
-                "willow_async_mutex_invalid_status",
+                rt::willow_lock_group_acquire,
+                rt::willow_lock_group_poll,
+                rt::willow_lock_group_load,
+                rt::willow_async_mutex_recursive_panic,
+                rt::willow_async_mutex_invalid_status,
             ),
             LockMode::Mutex => (
                 if fused_scalar {
-                    "willow_async_mutex_acquire_load"
+                    rt::willow_async_mutex_acquire_load
                 } else {
-                    "willow_async_mutex_acquire"
+                    rt::willow_async_mutex_acquire
                 },
                 if fused_scalar {
-                    "willow_async_mutex_poll_load"
+                    rt::willow_async_mutex_poll_load
                 } else {
-                    "willow_async_mutex_poll"
+                    rt::willow_async_mutex_poll
                 },
-                "willow_async_mutex_load",
-                "willow_async_mutex_recursive_panic",
-                "willow_async_mutex_invalid_status",
+                rt::willow_async_mutex_load,
+                rt::willow_async_mutex_recursive_panic,
+                rt::willow_async_mutex_invalid_status,
             ),
             LockMode::Read | LockMode::Write => (
-                "willow_async_rwlock_acquire",
-                "willow_async_rwlock_poll",
-                "willow_async_rwlock_load",
-                "willow_async_rwlock_recursive_panic",
-                "willow_async_rwlock_invalid_status",
+                rt::willow_async_rwlock_acquire,
+                rt::willow_async_rwlock_poll,
+                rt::willow_async_rwlock_load,
+                rt::willow_async_rwlock_recursive_panic,
+                rt::willow_async_rwlock_invalid_status,
             ),
         };
         if mode == LockMode::Group {
-            let group = self.emit_value_runtime_call("willow_lock_group_new", &[]);
+            let group = self.emit_value_runtime_call(rt::willow_lock_group_new, &[]);
             self.builder
                 .ins()
                 .store(MemFlagsData::new(), group, frame, handle_offset);
@@ -2146,7 +2147,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         LockMode::Group => unreachable!(),
                     },
                 );
-                self.emit_void_runtime_call("willow_lock_group_add", &[group, handle, access]);
+                self.emit_void_runtime_call(rt::willow_lock_group_add, &[group, handle, access]);
             }
         }
         let phase_idle = self.builder.ins().iconst(types::I64, 0);
@@ -2257,7 +2258,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 frame,
                 handle_offset,
             );
-            self.emit_void_runtime_call("willow_lock_group_cancel", &[group]);
+            self.emit_void_runtime_call(rt::willow_lock_group_cancel, &[group]);
             let zero = self.builder.ins().iconst(types::I64, 0);
             self.builder
                 .ins()
@@ -2389,7 +2390,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 handle_offset,
             );
             let index = self.builder.ins().iconst(types::I64, index as i64);
-            let word = self.emit_value_runtime_call("willow_lock_group_load", &[group, index]);
+            let word = self.emit_value_runtime_call(rt::willow_lock_group_load, &[group, index]);
             let value = self.emit_from_storage_word(word, &member.value_ty);
             self.emit_gc_heap_store(
                 frame,
@@ -2457,7 +2458,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         cancel_aware: bool,
     ) -> Option<cranelift_codegen::ir::Value> {
         if !cancel_aware {
-            self.emit_void_runtime_call("willow_frame_await_check", &[task_frame, task_id]);
+            self.emit_void_runtime_call(rt::willow_frame_await_check, &[task_frame, task_id]);
             if *result_ty == Type::Void {
                 return None;
             }
@@ -2474,7 +2475,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         task_frame: cranelift_codegen::ir::Value,
         result_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let status_id = self.func_id("willow_frame_status");
+        let status_id = self.func_id(rt::willow_frame_status);
         let status_ref = self
             .module
             .declare_func_in_func(status_id, self.builder.func);

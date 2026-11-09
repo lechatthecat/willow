@@ -1,6 +1,7 @@
 //! Operand and rvalue emission.
 
 use super::*;
+use willow_abi::runtime_symbols::names as rt;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_lir_operand_store(
@@ -202,7 +203,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ));
         let ptr_ty = reference_type(self.module.target_config());
         self.emit_runtime_call_late_args(
-            "willow_string_concat_n",
+            rt::willow_string_concat_n,
             |this| {
                 for (index, (part, ty)) in parts.iter().zip(part_types).enumerate() {
                     let kind = if *ty == Type::I64 {
@@ -491,9 +492,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if callee.is_free_named("$contract_i64") || callee.is_free_named("$contract_check")
                 {
                     let runtime = if callee.is_free_named("$contract_i64") {
-                        "willow_contract_i64"
+                        rt::willow_contract_i64
                     } else {
-                        "willow_contract_check"
+                        rt::willow_contract_check
                     };
                     let mut args = args;
                     if callee.is_free_named("$contract_check") {
@@ -639,14 +640,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             LirRvalue::Print { value, ty, newline } => {
                 let value = self.emit_lir_operand(function, value);
                 let name = match (ty, newline) {
-                    (Type::I64, false) => "willow_print_i64",
-                    (Type::I64, true) => "willow_println_i64",
-                    (Type::F64, false) => "willow_print_f64",
-                    (Type::F64, true) => "willow_println_f64",
-                    (Type::Bool, false) => "willow_print_bool",
-                    (Type::Bool, true) => "willow_println_bool",
-                    (Type::String, false) => "willow_print_string",
-                    (Type::String, true) => "willow_println_string",
+                    (Type::I64, false) => rt::willow_print_i64,
+                    (Type::I64, true) => rt::willow_println_i64,
+                    (Type::F64, false) => rt::willow_print_f64,
+                    (Type::F64, true) => rt::willow_println_f64,
+                    (Type::Bool, false) => rt::willow_print_bool,
+                    (Type::Bool, true) => rt::willow_println_bool,
+                    (Type::String, false) => rt::willow_print_string,
+                    (Type::String, true) => rt::willow_println_string,
                     _ => unreachable!("print type validated"),
                 };
                 self.emit_void_runtime_call(name, &[value]);
@@ -796,11 +797,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let rhs = self.emit_lir_operand(function, rhs);
                 if *operand_ty == Type::String {
                     let name = if matches!(op, BinOp::Add) {
-                        "willow_string_concat"
+                        rt::willow_string_concat
                     } else if matches!(op, BinOp::Eq | BinOp::Ne) {
-                        "willow_string_eq"
+                        rt::willow_string_eq
                     } else {
-                        "willow_string_cmp"
+                        rt::willow_string_cmp
                     };
                     self.emit_push_call_root(lhs);
                     self.emit_push_call_root(rhs);
@@ -990,7 +991,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let panic_depth = match unchecked {
             None => self.emit_pre_willow_call_panic_depth(),
             Some(unchecked) => {
-                let depth = crate::backend::abi::runtime_symbol("willow_panic_depth")
+                let depth = crate::backend::abi::runtime_symbol(rt::willow_panic_depth)
                     .and_then(|symbol| symbol.ret)
                     .expect("willow_panic_depth returns the depth");
                 let pointer = reference_type(self.module.target_config());
@@ -1085,28 +1086,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 ),
             );
             if method == "new" {
-                return self.emit_value_runtime_call("willow_channel_new", &[is_ref]);
+                return self.emit_value_runtime_call(rt::willow_channel_new, &[is_ref]);
             }
             if method == "with_capacity" {
                 let capacity = args[0];
                 return self
-                    .emit_value_runtime_call("willow_channel_new_bounded", &[is_ref, capacity]);
+                    .emit_value_runtime_call(rt::willow_channel_new_bounded, &[is_ref, capacity]);
             }
         }
         if let Some(handle) = cancellation_handle(ret_ty)
             && method == "new"
             && builtin_class == Some(handle.type_id())
         {
-            let runtime = format!("{}_new", handle.prefix());
-            return self.emit_value_runtime_call(&runtime, &[]);
+            let runtime = handle.constructor();
+            return self.emit_value_runtime_call(runtime, &[]);
         }
         if let Some(cell) = atomic_cell(ret_ty)
             && method == "new"
             && builtin_class == Some(cell.type_id())
         {
             let initial = args[0];
-            let runtime = format!("willow_atomic_{}_new", cell.suffix());
-            return self.emit_value_runtime_call(&runtime, &[initial]);
+            let runtime = cell.constructor();
+            return self.emit_value_runtime_call(runtime, &[initial]);
         }
         if let Some((kind, elem)) = blocking_cell(ret_ty)
             && method == "new"
@@ -1123,10 +1124,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.enum_infos,
             );
             let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
-            let runtime = format!("{}_new", kind.prefix());
-            return self.emit_value_runtime_call(&runtime, &[word, flag]);
+            let runtime = kind.constructor();
+            return self.emit_value_runtime_call(runtime, &[word, flag]);
         }
-        if let Some((prefix, protected)) = scheduler_lock(ret_ty)
+        if let Some((runtime, protected)) = scheduler_lock(ret_ty)
             && method == "new"
             && matches!(builtin_class, Some(B::Mutex | B::RwLock))
         {
@@ -1142,8 +1143,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             let word = initial;
             let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
-            let runtime = format!("{prefix}_new");
-            let handle = self.emit_value_runtime_call(&runtime, &[word, flag]);
+            let handle = self.emit_value_runtime_call(runtime, &[word, flag]);
             if is_ref {
                 self.emit_pop_roots_n(1);
                 self.roots.gc_root_count -= 1;

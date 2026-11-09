@@ -28,6 +28,7 @@ use cranelift_codegen::ir::{
     InstBuilder, InstructionData, Opcode, TrapCode, Value, ValueDef, types,
 };
 use cranelift_frontend::FunctionBuilder;
+use willow_abi::runtime_symbols::names as rt;
 
 use super::FuncGen;
 use crate::diagnostics::Span;
@@ -241,7 +242,7 @@ impl FuncGen<'_, '_> {
         let line = self.builder.ins().iconst(types::I32, span.line as i64);
         let column = self.builder.ins().iconst(types::I32, span.col as i64);
         self.emit_void_runtime_call(
-            "willow_pow_negative_exponent",
+            rt::willow_pow_negative_exponent,
             &[exponent, file_ptr, line, column],
         );
         self.builder.ins().trap(TrapCode::unwrap_user(1));

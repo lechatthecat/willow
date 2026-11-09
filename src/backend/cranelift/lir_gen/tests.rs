@@ -3,6 +3,7 @@ use crate::backend::cranelift::symbols::{backend_symbol_component, class_member_
 use crate::backend::cranelift::type_index::TypeMap;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
+use willow_abi::runtime_symbols::names as rt;
 
 #[test]
 fn cleanup_stack_classifier_handles_deep_defer_trees_on_a_small_stack() {
@@ -2519,7 +2520,7 @@ fn na6_f64_is_answered_before_the_alias_map() {
     aliases.insert("f64".to_string(), "fs".to_string());
     let entry = namespace_builtin_call(&ModuleSymbols::default(), &aliases, "f64", "to_string")
         .expect("f64::to_string has an entry");
-    assert_eq!(entry.runtime, "willow_f64_to_string");
+    assert_eq!(entry.runtime, rt::willow_f64_to_string);
     assert!(namespace_builtin_call(&ModuleSymbols::default(), &aliases, "f64", "exists").is_none());
 }
 

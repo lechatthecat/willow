@@ -1,4 +1,5 @@
 //! HIR eligibility helpers and test-only expression validation.
+use willow_abi::runtime_symbols::names as rt;
 
 use super::*;
 
@@ -698,9 +699,13 @@ impl AtomicCell {
         if self.is_i64 { Type::I64 } else { Type::Bool }
     }
 
-    /// The runtime symbol suffix — `willow_atomic_{suffix}_{op}`.
-    pub(super) fn suffix(self) -> &'static str {
-        if self.is_i64 { "i64" } else { "bool" }
+    /// The constructor export for this cell.
+    pub(super) fn constructor(self) -> &'static str {
+        if self.is_i64 {
+            rt::willow_atomic_i64_new
+        } else {
+            rt::willow_atomic_bool_new
+        }
     }
 
     /// The builtin identity this cell is constructed through.
@@ -755,7 +760,7 @@ fn atomic_method(recv: &Type, method: &str, arity: usize) -> Option<(Intrinsic, 
 /// or a `TaskScope`.
 ///
 /// The two expose the same four operations over different runtime objects, so
-/// what differs is the runtime symbol PREFIX rather than the operation. A scope
+/// the constructor export depends on the handle kind. A scope
 /// additionally has `finish`.
 #[derive(Clone, Copy)]
 pub(super) struct CancelHandle {
@@ -763,12 +768,12 @@ pub(super) struct CancelHandle {
 }
 
 impl CancelHandle {
-    /// The runtime symbol prefix — `{prefix}_{op}`.
-    pub(super) fn prefix(self) -> &'static str {
+    /// The constructor export for this handle.
+    pub(super) fn constructor(self) -> &'static str {
         if self.is_token {
-            "willow_cancellation_token"
+            rt::willow_cancellation_token_new
         } else {
-            "willow_task_scope"
+            rt::willow_task_scope_new
         }
     }
 
@@ -805,7 +810,7 @@ pub(super) fn cancellation_handle(ty: &Type) -> Option<CancelHandle> {
 /// no critical section: each accessor is one runtime call that blocks the OS
 /// thread on contention rather than parking the task, which is why they are
 /// callable from a synchronous function. What differs between them is the
-/// runtime symbol PREFIX and the method names, and the method names come from
+/// constructor export and the method names, and the method names come from
 /// the resolver rather than from here.
 #[derive(Clone, Copy)]
 pub(super) struct BlockingCellKind {
@@ -813,12 +818,12 @@ pub(super) struct BlockingCellKind {
 }
 
 impl BlockingCellKind {
-    /// The runtime symbol prefix — `{prefix}_{op}`.
-    pub(super) fn prefix(self) -> &'static str {
+    /// The constructor export for this handle.
+    pub(super) fn constructor(self) -> &'static str {
         if self.is_rw {
-            "willow_blocking_rw_cell"
+            rt::willow_blocking_rw_cell_new
         } else {
-            "willow_blocking_cell"
+            rt::willow_blocking_cell_new
         }
     }
 
@@ -856,9 +861,7 @@ pub(super) fn blocking_cell(ty: &Type) -> Option<(BlockingCellKind, &Type)> {
 ///
 /// The resolved head keeps the existing terminal-name matching policy.
 ///
-/// The `&'static str` is the runtime symbol PREFIX, which is what distinguishes
-/// the two state machines: `Mutex<T>` has one owner, `RwLock<T>` has readers and
-/// a writer, and their acquire/poll/load/release entry points are separate.
+/// The `&'static str` is the constructor export for the resolved lock kind.
 pub(super) fn scheduler_lock(ty: &Type) -> Option<(&'static str, &Type)> {
     let Type::Generic(name, args) = ty else {
         return None;
@@ -867,8 +870,8 @@ pub(super) fn scheduler_lock(ty: &Type) -> Option<(&'static str, &Type)> {
         return None;
     };
     match B::from_name(name.name().as_ref()) {
-        Some(B::Mutex) => Some(("willow_async_mutex", protected)),
-        Some(B::RwLock) => Some(("willow_async_rwlock", protected)),
+        Some(B::Mutex) => Some((rt::willow_async_mutex_new, protected)),
+        Some(B::RwLock) => Some((rt::willow_async_rwlock_new, protected)),
         _ => None,
     }
 }

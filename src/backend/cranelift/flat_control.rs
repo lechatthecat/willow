@@ -1,6 +1,7 @@
 //! Runtime leaf operations used by the explicit LIR control-flow graph.
 use super::*;
 use cranelift_codegen::ir::{InstBuilder, Value, types};
+use willow_abi::runtime_symbols::names as rt;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_flat_start_task(
@@ -55,9 +56,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         });
         let completed = match minimum {
             Some(deadline) => {
-                self.emit_value_runtime_call("willow_sched_run_until_deadline", &[deadline])
+                self.emit_value_runtime_call(rt::willow_sched_run_until_deadline, &[deadline])
             }
-            None => self.emit_value_runtime_call("willow_sched_run", &[]),
+            None => self.emit_value_runtime_call(rt::willow_sched_run, &[]),
         };
         let progressed = self.builder.ins().icmp_imm_s(IntCC::NotEqual, completed, 0);
         let wait = self.builder.create_block();
@@ -67,9 +68,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.seal_block(wait);
         match minimum {
             Some(deadline) => {
-                self.emit_void_runtime_call("willow_sleep_until_monotonic", &[deadline])
+                self.emit_void_runtime_call(rt::willow_sleep_until_monotonic, &[deadline])
             }
-            None => self.emit_void_runtime_call("willow_select_idle_wait", &[]),
+            None => self.emit_void_runtime_call(rt::willow_select_idle_wait, &[]),
         }
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);

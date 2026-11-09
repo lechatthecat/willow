@@ -35,6 +35,8 @@
 
 use super::ModuleSymbols;
 use crate::qualified_name::QualifiedName;
+#[cfg(test)]
+use willow_abi::runtime_symbols::names as rt;
 
 use crate::parser::ast::*;
 
@@ -624,7 +626,7 @@ mod mangling_tests {
                 "`{symbol}` must read as mangled"
             );
         }
-        for symbol in ["main", "add", "willow_array_new", "my_helper", ""] {
+        for symbol in ["main", "add", rt::willow_array_new, "my_helper", ""] {
             assert!(!is_mangled_symbol(symbol), "`{symbol}` must read as bare");
         }
     }

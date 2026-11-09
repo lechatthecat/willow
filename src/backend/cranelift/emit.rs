@@ -4,6 +4,7 @@
 
 use cranelift_codegen::ir::{InstBuilder, StackSlotData, StackSlotKind, types};
 use cranelift_module::Module;
+use willow_abi::runtime_symbols::names as rt;
 
 use super::*;
 
@@ -82,7 +83,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().brif(fits, ready, &[], cold, &[]);
         self.builder.switch_to_block(cold);
         self.builder.seal_block(cold);
-        let id = self.func_id("willow_reserve_roots");
+        let id = self.func_id(rt::willow_reserve_roots);
         let callee = self.module.declare_func_in_func(id, self.builder.func);
         self.builder.ins().call(callee, &[count]);
         self.builder.ins().jump(ready, &[]);
@@ -197,7 +198,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// it from `slot`: a minor collection may move the referent and rewrite
     /// the slot at any call that can reach a GC point.
     pub(super) fn emit_push_root_slot(&mut self, slot: cranelift_codegen::ir::StackSlot) {
-        self.emit_push_root_entry(slot, "willow_push_root");
+        self.emit_push_root_entry(slot, rt::willow_push_root);
     }
 
     fn emit_push_root_entry(&mut self, slot: cranelift_codegen::ir::StackSlot, symbol: &str) {
@@ -247,7 +248,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return;
         }
         let n_val = self.builder.ins().iconst(types::I32, n as i64);
-        self.emit_void_runtime_call("willow_pop_roots", &[n_val]);
+        self.emit_void_runtime_call(rt::willow_pop_roots, &[n_val]);
     }
 
     /// Form an inline `[object (GC ref) | vtable (raw)]` interface value.

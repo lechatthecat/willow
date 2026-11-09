@@ -32,6 +32,7 @@ use crate::qualified_name::QualifiedName;
 use crate::semantic::ids::SemanticType as Type;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use willow_abi::runtime_symbols::names as rt;
 
 use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind,
@@ -70,7 +71,7 @@ use super::type_helpers::{
 };
 use super::{
     CoopSuspendPoints, FRAME_SLOT_TASK_ID, FuncGen, VarStorage, array_element_type,
-    async_frame_slot_offset, channel_runtime_suffix,
+    async_frame_slot_offset, channel_runtime_symbol,
 };
 
 mod cleanup_emission;
@@ -1336,13 +1337,13 @@ impl FuncGen<'_, '_> {
             self.builder.ins().return_(&[ready]);
         }
         self.builder.switch_to_block(panic_exit);
-        let depth = self.emit_value_runtime_call("willow_root_depth", &[]);
+        let depth = self.emit_value_runtime_call(rt::willow_root_depth, &[]);
         let baseline = self
             .cleanup
             .panic_function_root_depth
             .expect("cleanup root baseline");
         let count = self.builder.ins().isub(depth, baseline);
-        self.emit_void_runtime_call("willow_pop_roots", &[count]);
+        self.emit_void_runtime_call(rt::willow_pop_roots, &[count]);
         let panicked = self
             .builder
             .ins()
@@ -1400,13 +1401,13 @@ impl FuncGen<'_, '_> {
             self.builder.ins().return_(&[ready]);
         }
         self.builder.switch_to_block(panic_exit);
-        let depth = self.emit_value_runtime_call("willow_root_depth", &[]);
+        let depth = self.emit_value_runtime_call(rt::willow_root_depth, &[]);
         let baseline = self
             .cleanup
             .panic_function_root_depth
             .expect("boundary root baseline");
         let count = self.builder.ins().isub(depth, baseline);
-        self.emit_void_runtime_call("willow_pop_roots", &[count]);
+        self.emit_void_runtime_call(rt::willow_pop_roots, &[count]);
         let ready = self
             .builder
             .ins()
@@ -1436,11 +1437,11 @@ impl FuncGen<'_, '_> {
         // Explicitly handle suspension before panic propagation or observing
         // the result slot. Runtime-call wrappers cannot express this split.
         self.emit_fault_site();
-        let enter = self.func_ids["willow_task_stack_enter_generated"];
+        let enter = self.func_ids[rt::willow_task_stack_enter_generated];
         let enter = self.module.declare_func_in_func(enter, self.builder.func);
         let call = self.builder.ins().call(enter, &[address, frame]);
         let status = self.builder.inst_results(call)[0];
-        self.emit_void_runtime_call("willow_task_stack_leave", &[]);
+        self.emit_void_runtime_call(rt::willow_task_stack_leave, &[]);
         let ready = self.builder.create_block();
         let pending = self.builder.create_block();
         let ready_status = self.builder.ins().icmp_imm_s(IntCC::Equal, status, 1);

@@ -4,6 +4,7 @@
 //! none of them touch codegen state.
 
 use super::type_index::TypeMap;
+use willow_abi::runtime_symbols::names as rt;
 
 use cranelift_codegen::ir::types;
 
@@ -87,11 +88,11 @@ pub(crate) fn debug_type_name<N: std::fmt::Display>(ty: &crate::parser::ast::Typ
 
 pub(crate) fn future_await_runtime_name(ty: &Type) -> &'static str {
     match ty {
-        Type::Void => "willow_timer_value_await",
-        Type::I64 => "willow_future_await_i64",
-        Type::Bool => "willow_future_await_bool",
-        Type::F64 => "willow_future_await_f64",
-        _ => "willow_future_await_ptr",
+        Type::Void => rt::willow_timer_value_await,
+        Type::I64 => rt::willow_future_await_i64,
+        Type::Bool => rt::willow_future_await_bool,
+        Type::F64 => rt::willow_future_await_f64,
+        _ => rt::willow_future_await_ptr,
     }
 }
 

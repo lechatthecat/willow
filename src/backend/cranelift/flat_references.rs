@@ -4,6 +4,7 @@ use crate::ir::lowered::{LirFunction, LirOperand, LirPlace};
 use crate::qualified_name::QualifiedName;
 use cranelift_codegen::ir::{InstBuilder, StackSlotData, StackSlotKind, Value, types};
 use cranelift_module::Module;
+use willow_abi::runtime_symbols::names as rt;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_flat_reference_call_end(&mut self) {
@@ -240,7 +241,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mode = self.emit_string_literal(&mode);
         let kind = self.emit_string_literal(kind);
         let display = self.emit_string_literal(display);
-        let id = self.func_id("willow_debug_reference_call");
+        let id = self.func_id(rt::willow_debug_reference_call);
         let function = self.module.declare_func_in_func(id, self.builder.func);
         self.builder.ins().call(
             function,

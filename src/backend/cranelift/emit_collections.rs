@@ -2,6 +2,7 @@ use super::emit_interface::collection_elem_kind;
 use super::*;
 use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use cranelift_codegen::ir::{InstBuilder, types};
+use willow_abi::runtime_symbols::names as rt;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_map_get_value(
@@ -21,9 +22,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let address = self.builder.ins().stack_addr(ptr_ty, slot, 0);
         let tag = self.emit_value_runtime_call(
             if remove {
-                "willow_map_remove_into"
+                rt::willow_map_remove_into
             } else {
-                "willow_map_get_into"
+                rt::willow_map_get_into
             },
             &[receiver, key, key_ref, address],
         );
@@ -49,12 +50,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let ptr_ty = reference_type(self.module.target_config());
             let address = self.builder.ins().stack_addr(ptr_ty, slot, 0);
             let tag =
-                self.emit_value_runtime_call("willow_channel_recv_opt_into", &[channel, address]);
+                self.emit_value_runtime_call(rt::willow_channel_recv_opt_into, &[channel, address]);
             let payload = self.stack_load(types::I64, slot);
             return self.emit_option_from_tag_payload(tag, payload, elem_ty);
         }
-        let runtime = format!("willow_channel_recv_{}", channel_runtime_suffix(elem_ty));
-        let value = self.emit_value_runtime_call(&runtime, &[channel]);
+        let runtime = channel_runtime_symbol(
+            elem_ty,
+            [
+                rt::willow_channel_recv_i64,
+                rt::willow_channel_recv_bool,
+                rt::willow_channel_recv_f64,
+                rt::willow_channel_recv_ptr,
+            ],
+        );
+        let value = self.emit_value_runtime_call(runtime, &[channel]);
         if self.is_inline_pair(elem_ty) {
             self.emit_from_storage_word(value, elem_ty)
         } else {
@@ -118,9 +127,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             )),
         );
         let constructor = if self.suspension.lir_confined_maps {
-            "willow_map_new_local"
+            rt::willow_map_new_local
         } else {
-            "willow_map_new"
+            rt::willow_map_new
         };
         self.emit_value_runtime_call(constructor, &[key_kind, value_kind, value_is_ref])
     }

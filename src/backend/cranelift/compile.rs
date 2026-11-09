@@ -8,6 +8,7 @@ use anyhow::Result;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{Linkage, Module};
+use willow_abi::runtime_symbols::names as rt;
 
 use super::*;
 use anyhow::Context;
@@ -1955,7 +1956,7 @@ impl UnitCodegenContext<'_> {
             && super::root_effect::may_push_gc_roots(&lir_fn)
         {
             fg.cleanup.panic_function_root_depth =
-                Some(fg.emit_value_runtime_call("willow_root_depth", &[]));
+                Some(fg.emit_value_runtime_call(rt::willow_root_depth, &[]));
         }
 
         // Bind params
@@ -1963,7 +1964,7 @@ impl UnitCodegenContext<'_> {
             // Bind a declared `args: Array<String>` parameter from the process
             // arguments. `willow_user_main` itself takes no parameters.
             if let Some(param) = f.params.first() {
-                let arr_id = fg.func_id("willow_runtime_args_array");
+                let arr_id = fg.func_id(rt::willow_runtime_args_array);
                 let arr_ref = fg.module.declare_func_in_func(arr_id, fg.builder.func);
                 let call = fg.builder.ins().call(arr_ref, &[]);
                 let arr = fg.builder.inst_results(call)[0];
@@ -2302,7 +2303,7 @@ impl UnitCodegenContext<'_> {
         let check = self
             .output
             .module
-            .declare_func_in_func(self.func_ids["willow_runtime_check_abi"], builder.func);
+            .declare_func_in_func(self.func_ids[rt::willow_runtime_check_abi], builder.func);
         let expected = builder
             .ins()
             .iconst(types::I64, willow_abi::fingerprint::ABI_HASH_64 as i64);
@@ -2313,7 +2314,7 @@ impl UnitCodegenContext<'_> {
         // Register before ANY initializer can drive tasks, including initializers
         // in other modules that precede the mutable property's own initializer.
         if items.iter().any(|item| item.is_mut) {
-            let id = fg.func_id("willow_sched_require_single_worker_statics");
+            let id = fg.func_id(rt::willow_sched_require_single_worker_statics);
             let callee = fg.module.declare_func_in_func(id, fg.builder.func);
             fg.builder.ins().call(callee, &[]);
         }
@@ -2344,7 +2345,7 @@ impl UnitCodegenContext<'_> {
             // GC-managed statics: root the slot permanently so the collector
             // traces the current value (also correct for `static mut`).
             if is_gc_managed(&item.ty, fg.enum_infos) {
-                let push_id = fg.func_id("willow_push_root");
+                let push_id = fg.func_id(rt::willow_push_root);
                 let push_ref = fg.module.declare_func_in_func(push_id, fg.builder.func);
                 fg.builder.ins().call(push_ref, &[addr]);
             }
@@ -2847,7 +2848,7 @@ impl UnitCodegenContext<'_> {
             && (!m.is_static || super::root_effect::may_push_gc_roots(&lir_fn))
         {
             fg.cleanup.panic_function_root_depth =
-                Some(fg.emit_value_runtime_call("willow_root_depth", &[]));
+                Some(fg.emit_value_runtime_call(rt::willow_root_depth, &[]));
         }
 
         // Bind `self` as the first parameter for INSTANCE methods only.

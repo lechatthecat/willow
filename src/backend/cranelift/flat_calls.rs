@@ -3,6 +3,7 @@
 use super::*;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Value, types};
 use cranelift_module::Module;
+use willow_abi::runtime_symbols::names as rt;
 
 /// Resolved class dispatch metadata for one already-evaluated call.
 pub(super) struct FlatClassCall<'a> {
@@ -94,7 +95,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         let pushed = if frame_prepared {
             if self.flat_method_frame_enabled(method) {
-                self.emit_void_runtime_call("willow_callstack_activate", &[]);
+                self.emit_void_runtime_call(rt::willow_callstack_activate, &[]);
             }
             self.flat_method_frame_enabled(method)
         } else {
@@ -256,7 +257,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // invalid receiver retains the method context in its diagnostic.
         let pushed = if frame_prepared {
             if self.flat_method_frame_enabled(method) {
-                self.emit_void_runtime_call("willow_callstack_activate", &[]);
+                self.emit_void_runtime_call(rt::willow_callstack_activate, &[]);
             }
             self.flat_method_frame_enabled(method)
         } else {
