@@ -115,6 +115,10 @@ fn rust_bridge_json_schema_package_identity_and_unknown_selector() {
             .starts_with("__willow_rust_")
     );
     assert_eq!(b["signature"], json!({"inputs":["I64"],"output":"Bool"}));
+    assert!(
+        b.get("records").is_none(),
+        "legacy signatures keep the existing response shape"
+    );
     assert_eq!(b["identity"]["package"]["name"], "r6");
     assert_eq!(b["identity"]["symbol"], "regex_is_match");
     assert_eq!(f.files(), before);

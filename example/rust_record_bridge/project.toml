@@ -1,0 +1,7 @@
+[project]
+name = "rust_record_bridge"
+version = "0.1.0"
+[rust-dependencies]
+value_native = { path = "../rust_value_bridge/native" }
+[rust]
+bridge = "bridge.rs"

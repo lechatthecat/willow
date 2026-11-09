@@ -1592,6 +1592,9 @@ impl UnitCodegenContext<'_> {
         {
             sig.params
                 .extend([AbiParam::new(ptr_ty), AbiParam::new(ptr_ty)]);
+            if !f.rust_bridge.as_ref().unwrap().records.is_empty() {
+                sig.params.push(AbiParam::new(ptr_ty));
+            }
         } else if let Some(bridge) = &f.rust_bridge {
             for ty in &bridge.input_types {
                 sig.params.push(crate::backend::abi::clif_abi_param(
@@ -1741,6 +1744,47 @@ impl UnitCodegenContext<'_> {
         symbol: &str,
         target: cranelift_module::FuncId,
     ) -> Result<cranelift_module::FuncId> {
+        let bridge = f.rust_bridge.as_ref().unwrap();
+        // Record declarations are source-local. Signature qualification supplies
+        // their module prefix; an extern function namespace does not own types.
+        let mut namespace = "";
+        let mut pending: Vec<_> = bridge
+            .input_types
+            .iter()
+            .zip(f.params.iter().map(|p| &p.ty))
+            .chain([(&bridge.output_type, &f.return_type)])
+            .collect();
+        while let Some((boundary, ty)) = pending.pop() {
+            use crate::rust_bridge_ir::Scalar;
+            match (boundary, ty) {
+                (Scalar::Record(name), crate::parser::ast::Type::Named(actual)) => {
+                    namespace = actual
+                        .strip_suffix(name)
+                        .context("record signature identity mismatch")?;
+                    break;
+                }
+                (Scalar::Option(child), crate::parser::ast::Type::Generic(_, args)) => {
+                    pending.push((child, &args[0]))
+                }
+                (Scalar::Result(a, b), crate::parser::ast::Type::Generic(_, args)) => {
+                    pending.push((a, &args[0]));
+                    pending.push((b, &args[1]));
+                }
+                _ => {}
+            }
+        }
+        let mut descriptors = Vec::new();
+        for record in &bridge.records {
+            let name = &record.name;
+            let name = format!("{namespace}{name}");
+            self.declare_one_class_descriptor(&name, f.span)?;
+            descriptors.push(
+                *self
+                    .class_descriptor_ids
+                    .get(&name)
+                    .context("missing Rust bridge record descriptor")?,
+            );
+        }
         let ptr = reference_type(self.output.module.target_config());
         let mut signature = self.output.module.make_signature();
         for parameter in &f.params {
@@ -1809,7 +1853,22 @@ impl UnitCodegenContext<'_> {
             let input_address = b.ins().stack_addr(ptr, inputs, 0);
             let output_address = b.ins().stack_addr(ptr, output, 0);
             let callee = self.output.module.declare_func_in_func(target, b.func);
-            b.ins().call(callee, &[input_address, output_address]);
+            let mut call_args = vec![input_address, output_address];
+            if !descriptors.is_empty() {
+                let metadata = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    u32::try_from(descriptors.len() * 8)?,
+                    3,
+                ));
+                for (i, descriptor) in descriptors.iter().enumerate() {
+                    let global = self.output.module.declare_data_in_func(*descriptor, b.func);
+                    let address = b.ins().symbol_value(ptr, global);
+                    b.ins()
+                        .stack_store(ptr, address, metadata, i32::try_from(i * 8)?);
+                }
+                call_args.push(b.ins().stack_addr(ptr, metadata, 0));
+            }
+            b.ins().call(callee, &call_args);
             if return_type == Type::Void {
                 b.ins().return_(&[]);
             } else {

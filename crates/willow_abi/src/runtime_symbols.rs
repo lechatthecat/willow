@@ -501,6 +501,12 @@ runtime_abi_schema! {
     NONE; willow_rust_bridge_bytes_len => ([I64] -> Some(I64));
     NONE; willow_rust_bridge_bytes_copy => ([I64, Ptr, I64] -> None);
     ALLOC; willow_rust_bridge_buffer => ([Ptr, Ptr, I64, I32] -> Some(I64));
+    ALLOC; willow_rust_bridge_array_new => ([Ptr, I64, I32] -> Some(I64));
+    ALLOC; willow_rust_bridge_array_get => ([I64, I64] -> Some(I64));
+    ALLOC; willow_rust_bridge_array_set => ([I64, I64, I64] -> None);
+    ALLOC; willow_rust_bridge_record_new => ([Ptr, Ptr, I64, Ptr, I64] -> Some(I64));
+    NONE; willow_rust_bridge_record_get => ([I64, I64, I32, Ptr] -> None);
+    NONE; willow_rust_bridge_record_set => ([I64, I64, Ptr, I32, I32] -> None);
     NONE; willow_rust_bridge_tag => ([I64] -> Some(I64));
     NONE; willow_rust_bridge_payload => ([I64, I32, Ptr] -> None);
     ALLOC; willow_rust_bridge_enum => ([Ptr, I64, Ptr, I32, I32] -> Some(I64));

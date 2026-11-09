@@ -176,7 +176,7 @@ fn unsupported_signatures_duplicate_and_malformed_declarations_fail() {
         ("object_parameter", "extern rust { fn bad(x: Object); }"),
         (
             "array_parameter",
-            "extern rust { fn bad(x: Array<String>); }",
+            "extern rust { fn bad(x: Array<Option<i64>>); }",
         ),
         ("void_parameter", "extern rust { fn bad(x: void); }"),
         ("reference_parameter", "extern rust { fn bad(x: &i64); }"),
@@ -1701,4 +1701,372 @@ fn nonblocking_regex_example_review_is_portable() {
         String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
         "true\nfalse\n"
     );
+}
+
+#[test]
+fn widened_bridge_values_roundtrip() {
+    let f = Fixture::new();
+    f.sources(
+        include_str!("../example/rust_record_bridge/src/main.wi"),
+        include_str!("../example/rust_record_bridge/bridge.rs"),
+    );
+    for args in [
+        &["run", "--offline"][..],
+        &["run", "--offline", "--release"][..],
+    ] {
+        let output = f.successful(args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n".repeat(22));
+    }
+    let output = f.command_env(
+        &["run", "--offline"],
+        &[("WILLOW_GC_STRESS", "alloc,relocate")],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n".repeat(22));
+}
+
+#[test]
+fn widened_bridge_schema_fingerprint_and_diagnostics() {
+    use willow_compiler::{lexer::Lexer, parser::Parser};
+    for declaration in [
+        "class R { x: i64; }",
+        "class R { pub x: void; }",
+        "class R { pub x: Array<Option<i64>>; }",
+        "class R { pub x: R; }",
+        "class R { pub x: i64; pub x: bool; }",
+        "class R<T> { pub x: T; }",
+        "class R { pub fn value(self) -> i64 { return 1; } }",
+        "class String {}",
+        "class R {} class R {}",
+    ] {
+        let tokens = Lexer::new(&format!("extern rust {{ {declaration} }}"))
+            .tokenize()
+            .unwrap();
+        let (_, errors) = Parser::new(tokens).parse();
+        assert!(!errors.is_empty(), "{declaration}");
+    }
+    let f = Fixture::new();
+    f.sources(
+        include_str!("../example/rust_record_bridge/src/main.wi"),
+        include_str!("../example/rust_record_bridge/bridge.rs"),
+    );
+    let query = f.successful(&["query", "rust-bridge", "--offline", "--format", "json"]);
+    let query: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+    let text = query.to_string();
+    assert!(text.contains("Record"), "{text}");
+    assert!(text.contains("\"Array\":\"String\""), "{text}");
+    let record = willow_compiler::rust_bridge_ir::Record {
+        name: "R".into(),
+        fields: vec![("x".into(), Scalar::String)],
+    };
+    let mut original = RustBridgeSymbol::new(
+        "echo".into(),
+        vec![Scalar::Record("R".into())],
+        Scalar::Record("R".into()),
+    );
+    original.records.push(record);
+    let mut changed = original.clone();
+    changed.records[0].fields[0].1 = Scalar::Bytes;
+    let original = original.bind("package");
+    let changed = changed.bind("package");
+    assert_ne!(original.abi_symbol, changed.abi_symbol);
+    assert_eq!(serde_json::to_string(&Scalar::Bytes).unwrap(), "\"Bytes\"");
+    for n in [1, 8, 64, 256] {
+        let record = willow_compiler::rust_bridge_ir::Record {
+            name: "Wide".into(),
+            fields: (0..n).map(|i| (format!("f{i}"), Scalar::String)).collect(),
+        };
+        let mut symbol = RustBridgeSymbol::new(
+            "wide".into(),
+            vec![Scalar::Record("Wide".into())],
+            Scalar::Record("Wide".into()),
+        );
+        symbol.records.push(record);
+        let source = wrappers(
+            &[symbol],
+            Path::new("abi.rs"),
+            willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION,
+        );
+        assert_eq!(source.matches(" = frame.record_get(").count(), n);
+        assert_eq!(source.matches("frame.record_set(object,").count(), n);
+        assert_eq!(source.matches("pub struct r#Wide").count(), 1);
+        eprintln!(
+            "record_fields={n} reads={n} writes={n} source_bytes={}",
+            source.len()
+        );
+    }
+}
+
+#[test]
+fn widened_bridge_imported_record() {
+    let f = Fixture::new();
+    f.sources(
+        "import foreign; fn main() { let p = foreign::make(); println(p.value == 42); }",
+        "use crate::records::Packet; pub fn make() -> Packet<i64> { Packet { value: 42 } }",
+    );
+    fs::write(
+        f.root.join("src/foreign.wi"),
+        "extern rust { class Packet { pub value: i64; } fn make() -> Packet; }",
+    )
+    .unwrap();
+    let output = f.successful(&["run", "--offline"]);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n");
+}
+
+#[test]
+fn widened_bridge_nested_records_pairs_handles_and_empty() {
+    let f = Fixture::new();
+    f.sources(r#"
+        import std::collections::Array;
+        extern rust {
+            class Leaf { pub label: String; pub choice: Result<i64, bool>; }
+            class Node { pub first: Leaf; pub second: Option<Leaf>; }
+            class Empty {}
+            class Vec { pub values: Array<String>; }
+            fn echo_vec(v: Vec) -> Vec;
+            class WithHandle { pub handle: Handle; }
+            opaque Handle;
+            fn echo(v: Node) -> Node;
+            fn empty(v: Empty) -> Empty;
+            fn make() -> WithHandle;
+            fn read(v: WithHandle) -> i64;
+        }
+        fn main() {
+            let leaf = new Leaf("雪", Ok(-42));
+            let output = echo(new Node(leaf, Some(new Leaf("other", Err(false)))));
+            println(output.first.label == "雪");
+            println(output.first.choice.unwrap() == -42);
+            println(output.second.unwrap().choice.unwrap_err() == false);
+            println(echo(new Node(leaf, None)).second.is_none());
+            println(echo_vec(new Vec(["value"])).values[0] == "value");
+            let e = empty(new Empty());
+            empty(e);
+            let h = make();
+            println(read(h) == 42);
+            Handle_close(h.handle);
+        }
+    "#, r#"
+        use crate::{records::*, record_inputs as input, record_outputs as output};
+        fn leaf(v: input::Leaf<'_>) -> output::Leaf { Leaf {label: v.label.into(), choice:v.choice} }
+        pub fn echo(v: input::Node<'_>) -> output::Node {
+            unsafe extern "C" { fn willow_gc_collect(); }
+            unsafe { willow_gc_collect(); }
+            Node {first:leaf(v.first), second:v.second.map(leaf)}
+        }
+        pub fn echo_vec(v: input::Vec<'_>) -> output::Vec { Vec { values: v.values.into_iter().map(str::to_owned).collect() } }
+        pub fn empty(v: Empty) -> Empty { v }
+        pub struct Handle(i64);
+        pub fn make() -> output::WithHandle { WithHandle {handle:Box::new(Handle(42))} }
+        pub fn read(v: input::WithHandle<'_>) -> i64 { v.handle.0 }
+    "#);
+    let output = f.command_env(
+        &["run", "--offline"],
+        &[("WILLOW_GC_STRESS", "alloc,relocate")],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n".repeat(6));
+}
+
+#[test]
+fn widened_bridge_shared_record_generation_is_linear() {
+    use willow_compiler::{
+        lexer::Lexer,
+        parser::{Parser, ast::Item},
+    };
+    for n in [1, 8, 32, 64] {
+        let mut source = String::from("extern rust { class R0 { pub text: String; }");
+        for i in 1..=n {
+            source.push_str(&format!(
+                "class R{i} {{ pub left: R{}; pub right: R{}; }}",
+                i - 1,
+                i - 1
+            ));
+        }
+        source.push_str(&format!("fn echo(v: R{n}) -> R{n}; }}"));
+        let (program, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let symbol = program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Function(f) => f.rust_bridge.as_deref().cloned(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(symbol.records.len(), n + 1);
+        let source = wrappers(
+            std::slice::from_ref(&symbol),
+            Path::new("abi.rs"),
+            willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION,
+        );
+        assert_eq!(source.matches("fn decode_record_").count(), n + 1);
+        assert_eq!(source.matches("fn encode_record_").count(), n + 1);
+        assert_eq!(source.matches(" = frame.record_get(").count(), 2 * n + 1);
+        assert_eq!(
+            source.matches("frame.record_set(object,").count(),
+            2 * n + 1
+        );
+        let metadata = serde_json::to_string(&symbol).unwrap();
+        assert!(metadata.len() < 500 * (n + 1));
+        eprintln!(
+            "fanout_depth={n} helpers={} reads={} writes={} metadata_bytes={} source_bytes={}",
+            2 * (n + 1),
+            2 * n + 1,
+            2 * n + 1,
+            metadata.len(),
+            source.len()
+        );
+    }
+}
+
+#[test]
+fn widened_bridge_wide_record_and_array_variants() {
+    let f = Fixture::new();
+    let fields = (0..70)
+        .map(|i| format!("pub field_{i}: String;"))
+        .collect::<String>();
+    let args = (0..70)
+        .map(|i| format!("\"value{i}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let rust_fields = (0..70)
+        .map(|i| format!("field_{i}: v.field_{i}.into(),"))
+        .collect::<String>();
+    f.sources(&format!(r#"
+        import std::collections::Array;
+        extern rust {{
+            class Wide {{ {fields} }}
+            fn wide(v: Wide) -> Wide;
+            fn floats(v: Option<Array<f64>>) -> Option<Array<f64>>;
+            fn bits(v: Result<Array<bool>, Array<f64>>) -> Result<Array<bool>, Array<f64>>;
+        }}
+        fn main() {{
+            let v = wide(new Wide({args}));
+            println(v.field_0 == "value0" && v.field_63 == "value63" && v.field_69 == "value69");
+            println(floats(None).is_none());
+            println(floats(Some([-0.0, -2.5])).unwrap()[1] == -2.5);
+            println(bits(Ok([false, true])).unwrap()[1]);
+            println(bits(Err([2.5])).unwrap_err()[0] == 2.5);
+            let empty: Array<bool> = [];
+            println(bits(Ok(empty)).unwrap().len() == 0);
+        }}
+    "#), &format!(r#"
+        pub fn wide(v: crate::record_inputs::Wide<'_>) -> crate::record_outputs::Wide {{ crate::records::Wide {{ {rust_fields} }} }}
+        pub fn floats(v: Option<Vec<f64>>) -> Option<Vec<f64>> {{
+            if let Some(v) = &v {{ assert_eq!(v[0].to_bits(), (-0.0f64).to_bits()); }}
+            v
+        }}
+        pub fn bits(v: Result<Vec<bool>, Vec<f64>>) -> Result<Vec<bool>, Vec<f64>> {{v}}
+    "#));
+    let output = f.command_env(
+        &["run", "--offline"],
+        &[("WILLOW_GC_STRESS", "alloc,relocate")],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n".repeat(6));
+}
+
+#[test]
+fn widened_bridge_rejects_adapter_field_mismatch() {
+    let f = Fixture::new();
+    f.sources("extern rust { class Packet { pub value: String; } fn packet(v: Packet) -> Packet; } fn main() {}", "pub fn packet(v: crate::records::Packet<i64>) -> crate::records::Packet<i64> {v}");
+    let output = f.command(&["rust", "check", "--offline"]);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("rust_bridge_signature_mismatch"), "{error}");
+}
+
+#[test]
+fn widened_bridge_primitive_named_records_roundtrip() {
+    let f = Fixture::new();
+    f.sources(r#"
+        import std::collections::Array;
+        extern rust {
+            class str { pub text: String; }
+            class u8 { pub data: Array<i64>; }
+            fn text(v: str) -> str;
+            fn bytes(v: u8) -> u8;
+            fn maybe(v: Option<str>) -> Option<str>;
+            fn checked(v: Result<u8, str>) -> Result<u8, str>;
+        }
+        fn main() {
+            println(text(new str("雪🙂")).text == "雪🙂");
+            println(text(new str("")).text == "");
+            let output = bytes(new u8([0, 128, 255]));
+            println(output.data[0] == 0 && output.data[1] == 128 && output.data[2] == 255);
+            println(bytes(new u8([])).data.len() == 0);
+            println(maybe(Some(new str("nested"))).unwrap().text == "nested");
+            println(maybe(None).is_none());
+            println(checked(Ok(new u8([255]))).unwrap().data[0] == 255);
+            println(checked(Err(new str("error"))).unwrap_err().text == "error");
+        }
+    "#, r#"
+        use crate::{record_inputs as input, record_outputs as output, records};
+        pub fn text(v: input::str<'_>) -> output::str { records::str { text: v.text.into() } }
+        pub fn bytes(v: input::u8<'_>) -> output::u8 { records::u8 { data: v.data.to_vec() } }
+        pub fn maybe(v: Option<input::str<'_>>) -> Option<output::str> { v.map(text) }
+        pub fn checked(v: Result<input::u8<'_>, input::str<'_>>) -> Result<output::u8, output::str> { v.map(bytes).map_err(text) }
+    "#);
+    for args in [
+        &["run", "--offline"][..],
+        &["run", "--offline", "--release"][..],
+    ] {
+        let output = f.command_env(args, &[("WILLOW_GC_STRESS", "alloc,relocate")]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n".repeat(8));
+    }
+}
+
+#[test]
+fn widened_bridge_raw_identifier_diagnostics() {
+    use willow_compiler::{lexer::Lexer, parser::Parser};
+    for name in ["crate", "super", "Self", "_"] {
+        for (role, declaration) in [
+            ("record", format!("class {name} {{ pub value: i64; }}")),
+            ("field", format!("class Packet {{ pub {name}: i64; }}")),
+        ] {
+            let source = format!("extern rust {{ {declaration} }}");
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            let (_, errors) = Parser::new(tokens).parse();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.message.contains("rust_bridge_signature_mismatch")
+                        && e.message.contains(role)
+                        && e.message.contains(name)
+                        && e.message.contains("raw identifier")),
+                "{source}: {errors:?}"
+            );
+        }
+    }
+    // `self` is already a reserved Willow token, before bridge validation.
+    for source in [
+        "extern rust { class self {} }",
+        "extern rust { class Packet { pub self: i64; } }",
+    ] {
+        let (_, errors) = Parser::new(Lexer::new(source).tokenize().unwrap()).parse();
+        assert!(!errors.is_empty(), "{source}");
+    }
+    // Rust keywords with legal raw spellings must still round-trip.
+    let f = Fixture::new();
+    f.sources("extern rust { class type { pub mod: i64; } fn echo(v: type) -> type; } fn main() { println(echo(new type(42)).mod == 42); }",
+        "pub fn echo(v: crate::record_inputs::r#type<'_>) -> crate::record_outputs::r#type { crate::records::r#type { r#mod: v.r#mod } }");
+    let output = f.successful(&["run", "--offline"]);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n");
 }

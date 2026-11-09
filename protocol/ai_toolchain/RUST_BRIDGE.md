@@ -17,6 +17,15 @@ same-named declarations. Each record contains `schema`, `kind`, `symbol`, `crate
 `rust_adapter`, `abi_symbol`, `signature`, `identity`, declaration spans, and the
 original `declaration_text`. The response schema is
 [`rust-bridge-v1.schema.json`](rust-bridge-v1.schema.json).
+Boundary signatures encode scalar types as strings, `Array` with its element type,
+and `Record` with its declared name. Each bridge's optional `records` array defines
+reachable record names and ordered `[field_name, value_type]` pairs. Nested records
+refer to this table by name, keeping repeated type references compact. Existing
+responses without `records` remain valid. `Bytes` retains the legacy checked
+`Array<i64>` representation. See
+[`rust_record_bridge`](../../example/rust_record_bridge/README.md) for the adapter
+mapping, ownership rules, supported subset, and an executable example.
+
 The example uses a tiny offline path crate named `regex`, not the crates.io regex
 implementation; its scalar predicate accepts 42.
 

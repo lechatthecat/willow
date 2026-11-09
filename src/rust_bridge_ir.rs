@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
-pub(crate) const WRAPPER_SCHEMA: &str = "6";
+pub(crate) const WRAPPER_SCHEMA: &str = "7";
 
 pub type RustBridgeSymbols = Vec<((u32, String), RustBridgeSymbol)>;
 
@@ -19,6 +19,8 @@ pub enum Scalar {
     Void,
     String,
     Bytes,
+    Array(Box<Scalar>),
+    Record(String),
     Opaque(String),
     Option(Box<Scalar>),
     Result(Box<Scalar>, Box<Scalar>),
@@ -41,7 +43,15 @@ impl Scalar {
         ty: &Type,
         names: &std::collections::HashSet<String>,
     ) -> Option<Self> {
+        Self::from_type_with_records(ty, names, &Default::default())
+    }
+    pub fn from_type_with_records(
+        ty: &Type,
+        names: &std::collections::HashSet<String>,
+        records: &std::collections::HashMap<String, Record>,
+    ) -> Option<Self> {
         Some(match ty {
+            Type::Named(name) if records.contains_key(name) => Self::Record(name.clone()),
             Type::Named(name) if names.contains(name) => Self::Opaque(name.clone()),
             Type::I64 => Self::I64,
             Type::F64 => Self::F64,
@@ -49,6 +59,7 @@ impl Scalar {
             Type::Void => Self::Void,
             Type::String => Self::String,
             Type::Array(inner) if **inner == Type::I64 => Self::Bytes,
+            Type::Array(inner) => Self::array(inner)?,
             // `Array` is a source-defined class, so the parser keeps
             // `Array<i64>` as a plain generic application.
             Type::Generic(name, args)
@@ -58,20 +69,36 @@ impl Scalar {
                 Self::Bytes
             }
             Type::Generic(name, args)
+                if Builtin::from_name(name) == Some(Builtin::Array) && args.len() == 1 =>
+            {
+                Self::array(&args[0])?
+            }
+            Type::Generic(name, args)
                 if Builtin::from_name(name) == Some(Builtin::Option) && args.len() == 1 =>
             {
-                Self::Option(Box::new(Self::from_type_with_opaque(&args[0], names)?))
+                Self::Option(Box::new(Self::from_type_with_records(
+                    &args[0], names, records,
+                )?))
             }
             Type::Generic(name, args)
                 if Builtin::from_name(name) == Some(Builtin::Result) && args.len() == 2 =>
             {
                 Self::Result(
-                    Box::new(Self::from_type_with_opaque(&args[0], names)?),
-                    Box::new(Self::from_type_with_opaque(&args[1], names)?),
+                    Box::new(Self::from_type_with_records(&args[0], names, records)?),
+                    Box::new(Self::from_type_with_records(&args[1], names, records)?),
                 )
             }
             _ => return None,
         })
+    }
+    fn array(inner: &Type) -> Option<Self> {
+        let element = match inner {
+            Type::String => Self::String,
+            Type::F64 => Self::F64,
+            Type::Bool => Self::Bool,
+            _ => return None,
+        };
+        Some(Self::Array(Box::new(element)))
     }
     fn rust(&self) -> &'static str {
         match self {
@@ -89,12 +116,20 @@ pub struct NonblockingReview {
     pub fingerprint: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Record {
+    pub name: String,
+    pub fields: Vec<(String, Scalar)>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RustBridgeSymbol {
     pub rust_crate: String,
     pub willow_function: String,
     pub abi_symbol: String,
     pub input_types: Vec<Scalar>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub records: Vec<Record>,
     pub output_type: Scalar,
     pub effects: u8,
     #[serde(default)]
@@ -104,6 +139,27 @@ pub struct RustBridgeSymbol {
     pub nonblocking: Option<Box<NonblockingReview>>,
 }
 impl RustBridgeSymbol {
+    pub fn resolve_records(&mut self, definitions: &std::collections::HashMap<String, Record>) {
+        let mut seen = std::collections::HashSet::new();
+        let mut pending: Vec<_> = self.input_types.iter().chain([&self.output_type]).collect();
+        let mut records = Vec::new();
+        while let Some(ty) = pending.pop() {
+            match ty {
+                Scalar::Record(name) if seen.insert(name) => {
+                    let record = &definitions[name];
+                    records.push(record.clone());
+                    pending.extend(record.fields.iter().map(|(_, ty)| ty));
+                }
+                Scalar::Option(t) | Scalar::Array(t) => pending.push(t),
+                Scalar::Result(a, b) => {
+                    pending.push(a);
+                    pending.push(b);
+                }
+                _ => {}
+            }
+        }
+        self.records = records;
+    }
     pub fn aggregate(&self) -> bool {
         self.input_types
             .iter()
@@ -122,6 +178,7 @@ impl RustBridgeSymbol {
             abi_symbol: name.clone(),
             willow_function: name,
             input_types: inputs,
+            records: Vec::new(),
             output_type: output,
             effects: effects.bits() | willow_abi::ffi::FOREIGN_CALL,
         }
@@ -142,9 +199,17 @@ impl RustBridgeSymbol {
     pub fn bind(&self, identity: &str) -> Self {
         let mut bound = self.clone();
         bound.rust_crate = identity.into();
-        let bytes =
+        let bytes = if self.records.is_empty() {
             serde_json::to_vec(&(&self.willow_function, &self.input_types, &self.output_type))
-                .unwrap();
+        } else {
+            serde_json::to_vec(&(
+                &self.willow_function,
+                &self.input_types,
+                &self.output_type,
+                &self.records,
+            ))
+        }
+        .unwrap();
         // Package identity is a separate component, shared by this bridge's
         // exports. The symbol component keeps its readable leaf name plus a
         // digest of the full Willow name/signature, avoiding namespace and
@@ -177,14 +242,25 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
     let mut names = std::collections::HashSet::new();
     let mut pending: Vec<_> = symbols
         .iter()
-        .flat_map(|symbol| symbol.input_types.iter().chain([&symbol.output_type]))
+        .flat_map(|symbol| {
+            symbol
+                .input_types
+                .iter()
+                .chain([&symbol.output_type])
+                .chain(
+                    symbol
+                        .records
+                        .iter()
+                        .flat_map(|r| r.fields.iter().map(|(_, ty)| ty)),
+                )
+        })
         .collect();
     while let Some(ty) = pending.pop() {
         match ty {
             Scalar::Opaque(name) if names.insert(name) => {
                 writeln!(source, "pub struct r#{name};").unwrap();
             }
-            Scalar::Option(child) => pending.push(child),
+            Scalar::Option(child) | Scalar::Array(child) => pending.push(child),
             Scalar::Result(a, b) => {
                 pending.push(a);
                 pending.push(b);
@@ -196,6 +272,7 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
     if symbols.iter().any(RustBridgeSymbol::aggregate) {
         source.push_str(include_str!("rust_bridge_ir/support.rs"));
     }
+    aggregate::record_structs(&mut source, symbols);
     for symbol in symbols {
         if symbol.aggregate() {
             aggregate_wrapper(&mut source, symbol, revision);

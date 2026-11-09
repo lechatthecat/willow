@@ -8,6 +8,12 @@ unsafe extern "C" {
     fn willow_rust_bridge_bytes_len(object: u64) -> usize;
     fn willow_rust_bridge_bytes_copy(object: u64, out: *mut u8, len: usize);
     fn willow_rust_bridge_buffer(frame: *mut u8, bytes: *const u8, len: usize, string: u32) -> u64;
+    fn willow_rust_bridge_array_new(frame: *mut u8, len: usize, reference: u32) -> u64;
+    fn willow_rust_bridge_array_get(object: u64, index: usize) -> u64;
+    fn willow_rust_bridge_array_set(object: u64, index: usize, value: u64);
+    fn willow_rust_bridge_record_new(frame: *mut u8, descriptor: *const u64, words: usize, bitmap: *const u64, digest: u64) -> u64;
+    fn willow_rust_bridge_record_get(object: u64, offset: usize, pair: u32, out: *mut BridgeValue);
+    fn willow_rust_bridge_record_set(object: u64, offset: usize, value: *const BridgeValue, pair: u32, reference: u32);
     fn willow_rust_bridge_tag(object: u64) -> u64;
     fn willow_rust_bridge_payload(object: u64, pair: u32, out: *mut BridgeValue);
     fn willow_rust_bridge_enum(
@@ -20,6 +26,7 @@ unsafe extern "C" {
 }
 struct BridgeFrame {
     raw: *mut u8,
+    descriptors: std::collections::HashMap<&'static str, *const u64>,
     handles: std::cell::RefCell<Vec<handles::Lease>>,
     // Each inner allocation remains stable when the outer vector grows.
     bytes: std::cell::RefCell<Vec<Vec<u8>>>,
@@ -28,6 +35,7 @@ impl BridgeFrame {
     fn new() -> Self {
         Self {
             raw: unsafe { willow_rust_bridge_frame_new() },
+            descriptors: Default::default(),
             bytes: Default::default(),
             handles: Default::default(),
         }
@@ -87,6 +95,29 @@ impl BridgeFrame {
             },
             high: 0,
         }
+    }
+    fn array_len(&self, object: u64) -> usize {
+        unsafe { willow_rust_bridge_bytes_len(object) }
+    }
+    fn array_get(&self, object: u64, index: usize) -> BridgeValue {
+        BridgeValue { low: unsafe { willow_rust_bridge_array_get(object, index) }, high: 0 }
+    }
+    fn array_new(&self, len: usize, reference: bool) -> BridgeValue {
+        BridgeValue { low: unsafe { willow_rust_bridge_array_new(self.raw, len, u32::from(reference)) }, high: 0 }
+    }
+    fn array_set(&self, object: BridgeValue, index: usize, value: BridgeValue) {
+        unsafe { willow_rust_bridge_array_set(object.low, index, value.low) }
+    }
+    fn record_new(&self, descriptor: *const u64, words: usize, bitmap: &'static [u64], digest: u64) -> BridgeValue {
+        BridgeValue { low: unsafe { willow_rust_bridge_record_new(self.raw, descriptor, words, bitmap.as_ptr(), digest) }, high: 0 }
+    }
+    fn record_get(&self, object: u64, offset: usize, pair: bool) -> BridgeValue {
+        let mut value = BridgeValue::default();
+        unsafe { willow_rust_bridge_record_get(object, offset, u32::from(pair), &mut value) };
+        value
+    }
+    fn record_set(&self, object: BridgeValue, offset: usize, value: BridgeValue, pair: bool, reference: bool) {
+        unsafe { willow_rust_bridge_record_set(object.low, offset, &value, u32::from(pair), u32::from(reference)) }
     }
     fn tag(&self, value: BridgeValue) -> u64 {
         unsafe { willow_rust_bridge_tag(value.low) }

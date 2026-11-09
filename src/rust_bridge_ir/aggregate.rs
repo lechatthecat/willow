@@ -24,37 +24,93 @@ impl Scalar {
     }
     fn rust_type(&self, input: bool) -> String {
         let mut result = String::new();
-        self.append_rust_type(&mut result, input);
+        self.append_rust_type(&mut result, input, None);
         result
     }
     // Append each type node once; never rebuild every prefix of a deep chain.
-    fn append_rust_type(&self, output: &mut String, input: bool) {
+    fn append_rust_type(&self, output: &mut String, input: bool, lifetime: Option<&str>) {
         #[cfg(test)]
         TYPE_NODE_VISITS.set(TYPE_NODE_VISITS.get() + 1);
         match self {
             Self::Opaque(name) => {
                 if input {
-                    output.push_str("&bridge::r#");
+                    output.push('&');
+                    if let Some(lifetime) = lifetime {
+                        write!(output, "{lifetime} crate::").unwrap();
+                    }
+                    output.push_str("bridge::r#");
                 } else {
-                    output.push_str("Box<bridge::r#");
+                    output.push_str(if lifetime.is_some() {
+                        "::std::boxed::Box<crate::bridge::r#"
+                    } else {
+                        "Box<bridge::r#"
+                    });
                 }
                 output.push_str(name);
                 if !input {
                     output.push('>');
                 }
             }
-            Self::String => output.push_str(if input { "&str" } else { "String" }),
-            Self::Bytes => output.push_str(if input { "&[u8]" } else { "Vec<u8>" }),
+            Self::String | Self::Bytes if input => {
+                output.push('&');
+                if let Some(lifetime) = lifetime {
+                    write!(output, "{lifetime} ").unwrap();
+                }
+                output.push_str(match (*self == Self::String, lifetime.is_some()) {
+                    (true, true) => "::std::primitive::str",
+                    (false, true) => "[::std::primitive::u8]",
+                    (true, false) => "str",
+                    (false, false) => "[u8]",
+                });
+            }
+            Self::String => output.push_str(if lifetime.is_some() {
+                "::std::string::String"
+            } else {
+                "String"
+            }),
+            Self::Bytes => output.push_str(if lifetime.is_some() {
+                "::std::vec::Vec<::std::primitive::u8>"
+            } else {
+                "Vec<u8>"
+            }),
+            Self::Record(name) => {
+                let module = if input {
+                    "record_inputs"
+                } else {
+                    "record_outputs"
+                };
+                write!(output, "crate::{module}::r#{name}").unwrap();
+                if input {
+                    write!(output, "<{}>", lifetime.unwrap_or("'_")).unwrap();
+                }
+            }
+            Self::Array(t) => {
+                output.push_str(if lifetime.is_some() {
+                    "::std::vec::Vec<"
+                } else {
+                    "Vec<"
+                });
+                t.append_rust_type(output, input, lifetime);
+                output.push('>');
+            }
             Self::Option(t) => {
-                output.push_str("Option<");
-                t.append_rust_type(output, input);
+                output.push_str(if lifetime.is_some() {
+                    "::std::option::Option<"
+                } else {
+                    "Option<"
+                });
+                t.append_rust_type(output, input, lifetime);
                 output.push('>');
             }
             Self::Result(a, b) => {
-                output.push_str("Result<");
-                a.append_rust_type(output, input);
+                output.push_str(if lifetime.is_some() {
+                    "::std::result::Result<"
+                } else {
+                    "Result<"
+                });
+                a.append_rust_type(output, input, lifetime);
                 output.push(',');
-                b.append_rust_type(output, input);
+                b.append_rust_type(output, input, lifetime);
                 output.push('>');
             }
             _ => output.push_str(self.rust()),
@@ -72,6 +128,12 @@ impl Scalar {
             Self::Void => writeln!(source, "let {out} = ();").unwrap(),
             Self::String => writeln!(source, "let {out} = frame.string({value}.low);").unwrap(),
             Self::Bytes => writeln!(source, "let {out} = frame.bytes({value}.low);").unwrap(),
+            Self::Record(name) => writeln!(source, "let {out} = decode_record_{name}(&frame, {value});").unwrap(),
+            Self::Array(t) => {
+                writeln!(source, "frame.root({value}.low);\nlet mut {out} = Vec::with_capacity(frame.array_len({value}.low));\nfor i{n} in 0..frame.array_len({value}.low) {{\nlet e{n} = frame.array_get({value}.low, i{n});").unwrap();
+                let child = t.decode(source, &format!("e{n}"), serial);
+                writeln!(source, "{out}.push({child}); }}").unwrap();
+            }
             Self::Option(t) => {
                 let tag = if self.niche() {
                     format!("u64::from({value}.low == 0)")
@@ -150,6 +212,14 @@ impl Scalar {
                     };
                     writeln!(source, "let {out} = frame.{method}(&{value});").unwrap();
                 }
+                Self::Record(name) => {
+                    writeln!(source, "let {out} = encode_record_{name}(&frame, {value});").unwrap()
+                }
+                Self::Array(t) => {
+                    writeln!(source, "let {out} = frame.array_new({value}.len(), {});\nfor (i{n}, x{n}) in {value}.into_iter().enumerate() {{", t.reference()).unwrap();
+                    let child = t.encode(source, &format!("x{n}"), serial);
+                    writeln!(source, "frame.array_set({out}, i{n}, {child}); }}").unwrap();
+                }
                 Self::Option(t) => {
                     writeln!(source, "let {out} = match {value} {{ Some(x{n}) => {{").unwrap();
                     let child = t.encode(source, &format!("x{n}"), serial);
@@ -195,8 +265,22 @@ impl Scalar {
 pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, revision: u32) {
     let target = QualifiedName::new(&symbol.willow_function).last_segment();
     let guard = symbol.entry_guard();
+    let records = &symbol.records;
+    let metadata = if records.is_empty() {
+        ""
+    } else {
+        ", records: *const *const u64"
+    };
     let mutable = if symbol.close_handle { "" } else { "mut " };
-    writeln!(source, "#[unsafe(no_mangle)] pub unsafe extern \"C\" fn {}(input: *const BridgeValue, output: *mut BridgeValue) {{\nunsafe {{ {guard}({revision}); }}\nlet outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\nlet {mutable}frame = BridgeFrame::new();",symbol.abi_symbol).unwrap();
+    writeln!(source, "#[unsafe(no_mangle)] pub unsafe extern \"C\" fn {}(input: *const BridgeValue, output: *mut BridgeValue{metadata}) {{\nunsafe {{ {guard}({revision}); }}\nlet outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\nlet {mutable}frame = BridgeFrame::new();",symbol.abi_symbol).unwrap();
+    for (i, record) in records.iter().enumerate() {
+        let name = &record.name;
+        writeln!(
+            source,
+            "frame.descriptors.insert({name:?}, unsafe {{ *records.add({i}) }});"
+        )
+        .unwrap();
+    }
     for (i, ty) in symbol.input_types.iter().enumerate() {
         writeln!(source, "let a{i} = unsafe {{ *input.add({i}) }};").unwrap();
         if ty.reference() {
@@ -228,6 +312,119 @@ pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, 
     .unwrap();
     let encoded = symbol.output_type.encode(source, "result", &mut serial);
     writeln!(source,"unsafe {{ *output = {encoded}; }}\n}}));\nif let Err(payload) = outcome {{ bridge_panic(payload); }}\n}}").unwrap();
+}
+
+// Adapter structs have ordinary Rust layout. Only generated field conversions
+// cross the ABI, so a Rust repr attribute or layout agreement is unnecessary.
+pub(super) fn record_structs(source: &mut String, symbols: &[RustBridgeSymbol]) {
+    let mut seen = std::collections::HashMap::new();
+    let mut records = Vec::new();
+    for record in symbols.iter().flat_map(|s| &s.records) {
+        if let Some(previous) = seen.insert(&record.name, record) {
+            if previous != record {
+                writeln!(
+                    source,
+                    "compile_error!({:?});",
+                    format!(
+                        "rust_bridge_signature_mismatch: conflicting record declarations for {}",
+                        record.name
+                    )
+                )
+                .unwrap();
+            }
+        } else {
+            records.push(record);
+        }
+    }
+    source.push_str("#[allow(dead_code)] pub mod records {\n");
+    for record in &records {
+        let super::Record { name, fields } = record;
+        write!(source, "pub struct r#{name}").unwrap();
+        if !fields.is_empty() {
+            source.push('<');
+            for i in 0..fields.len() {
+                write!(source, "T{i},").unwrap();
+            }
+            source.push('>');
+        }
+        source.push_str(" { ");
+        for (i, (field, _)) in fields.iter().enumerate() {
+            write!(source, "pub r#{field}: T{i},").unwrap();
+        }
+        source.push_str(" }\n");
+    }
+    source.push_str("}\n");
+    for input in [true, false] {
+        let module = if input {
+            "record_inputs"
+        } else {
+            "record_outputs"
+        };
+        writeln!(source, "#[allow(dead_code)] pub mod {module} {{").unwrap();
+        for record in &records {
+            let super::Record { name, fields } = record;
+            write!(
+                source,
+                "pub type r#{name}{} = crate::records::r#{name}",
+                if input { "<'a>" } else { "" }
+            )
+            .unwrap();
+            if !fields.is_empty() {
+                source.push('<');
+                for (_, ty) in fields {
+                    ty.append_rust_type(source, input, Some("'a"));
+                    source.push(',');
+                }
+                source.push('>');
+            }
+            source.push_str(";\n");
+        }
+        source.push_str("}\n");
+    }
+    for record in &records {
+        let super::Record { name, fields } = record;
+        writeln!(source, "#[allow(non_snake_case, dead_code)] fn decode_record_{name}(frame: &BridgeFrame, value: BridgeValue) -> record_inputs::r#{name}<'_> {{ frame.root(value.low);").unwrap();
+        let mut serial = 0;
+        let mut offset = 1usize;
+        let mut values = Vec::new();
+        for (field, ty) in fields {
+            writeln!(
+                source,
+                "let p{offset} = frame.record_get(value.low, {offset}, {});",
+                ty.pair()
+            )
+            .unwrap();
+            let child = ty.decode(source, &format!("p{offset}"), &mut serial);
+            values.push(format!("r#{field}: {child}"));
+            offset += if ty.pair() { 2 } else { 1 };
+        }
+        writeln!(source, "records::r#{name} {{ {} }} }}", values.join(",")).unwrap();
+        let words = offset;
+        let mut bitmap = vec![0u64; words.div_ceil(64) + 1];
+        bitmap[0] = (bitmap.len() - 1) as u64;
+        offset = 1;
+        for (_, ty) in fields {
+            if ty.reference() {
+                bitmap[1 + offset / 64] |= 1 << (offset % 64);
+            }
+            offset += if ty.pair() { 2 } else { 1 };
+        }
+        let digest = willow_abi::gc_bitmap_fingerprint(&bitmap[1..]);
+        writeln!(source, "#[allow(non_snake_case, dead_code)] fn encode_record_{name}(frame: &BridgeFrame, value: record_outputs::r#{name}) -> BridgeValue {{ let object = frame.record_new(frame.descriptors[{name:?}], {words}, &{bitmap:?}, {digest});").unwrap();
+        offset = 1;
+        for (field, ty) in fields {
+            let child = ty.encode(source, &format!("value.r#{field}"), &mut serial);
+            writeln!(
+                source,
+                "frame.record_set(object, {offset}, {child}, {}, {});",
+                ty.pair(),
+                ty.reference()
+            )
+            .unwrap();
+            offset += if ty.pair() { 2 } else { 1 };
+        }
+        source.push_str("object }\n");
+    }
 }
 
 #[cfg(test)]

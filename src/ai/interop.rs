@@ -26,7 +26,8 @@ impl InteropGraph {
             .iter()
             .filter(|b| selector.is_none_or(|s| s == b.function || s == b.symbol.willow_function))
             .collect();
-        let records: Vec<_> = bridges.iter().map(|b| json!({
+        let records: Vec<_> = bridges.iter().map(|b| {
+            let mut record = json!({
             "schema":1,"kind":"rust-bridge","symbol":b.symbol.willow_function,
             "function":b.function,"identity":b.identity,
             "crate": if self.crates.len() == 1 { json!(self.crates[0]) } else { Value::Null },
@@ -39,7 +40,12 @@ impl InteropGraph {
             "signature":{"inputs":b.symbol.input_types,"output":b.symbol.output_type},
             "declaration":b.declaration,"declaration_text":b.declaration_text,
             "coverage":"conservative adapter dependency set; Rust internals are opaque"
-        })).collect();
+            });
+            if !b.symbol.records.is_empty() {
+                record["records"] = json!(b.symbol.records);
+            }
+            record
+        }).collect();
         json!({"schema":1,"kind":"rust-bridge","status":if selector.is_some() && records.is_empty() {"unknown"} else {"ok"},"bridges":records,"crate_candidates":self.crates})
     }
 

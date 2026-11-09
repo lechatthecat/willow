@@ -192,6 +192,12 @@
         },
         "review_current": {
           "type": "boolean"
+        },
+        "records": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/record"
+          }
         }
       }
     },
@@ -247,8 +253,66 @@
               "type": "string"
             }
           }
+        },
+        {
+          "type": "object",
+          "required": [
+            "Array"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "Array": {
+              "enum": [
+                "String",
+                "F64",
+                "Bool"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "Record"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "Record": {
+              "type": "string"
+            }
+          }
         }
       ]
+    },
+    "record": {
+      "type": "object",
+      "required": [
+        "name",
+        "fields"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/value_type"
+              }
+            ],
+            "items": false
+          }
+        }
+      }
     }
   }
 }

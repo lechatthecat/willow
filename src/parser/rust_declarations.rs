@@ -6,6 +6,17 @@ use crate::{
     rust_bridge_ir::{RustBridgeSymbol, Scalar},
 };
 impl Parser {
+    fn validate_rust_record_identifier(&self, name: &str, role: &str) -> Result<(), Diagnostic> {
+        // These spellings cannot use Rust's r# escape. Other Rust keywords can.
+        if matches!(name, "crate" | "self" | "Self" | "super" | "_") {
+            return Err(self.err(
+                ErrorCode::E0102,
+                format!("rust_bridge_signature_mismatch: {role} name `{name}` cannot be a Rust raw identifier"),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn parse_rust_bridge(&mut self) -> Result<Vec<Item>, Diagnostic> {
         self.advance();
         if self.expect_ident()? != "rust" {
@@ -24,6 +35,63 @@ impl Parser {
         let mut opaque = std::collections::HashSet::new();
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
             let span = self.current_span();
+            if self.check(TokenKind::Class) {
+                let record = self.parse_class(true, false)?;
+                self.validate_rust_record_identifier(&record.name, "record")?;
+                if !record.type_params.is_empty()
+                    || record.base_class.is_some()
+                    || !record.implements.is_empty()
+                    || !record.methods.is_empty()
+                    || !record.constructors.is_empty()
+                    || record
+                        .fields
+                        .iter()
+                        .any(|f| !f.public || f.is_static || f.initializer.is_some())
+                {
+                    return Err(self.err(
+                        ErrorCode::E0102,
+                        "rust_bridge_signature_mismatch: records require public value fields only",
+                    ));
+                }
+                if self.rust_opaque_names.contains(&record.name)
+                    || self.rust_records.contains_key(&record.name)
+                    || matches!(
+                        record.name.as_str(),
+                        "String" | "i64" | "f64" | "bool" | "void"
+                    )
+                    || crate::semantic::builtin_types::BuiltinTypeId::from_name(&record.name)
+                        .is_some()
+                {
+                    return Err(self.err(
+                        ErrorCode::E0102,
+                        "rust_bridge_signature_mismatch: duplicate or reserved record name",
+                    ));
+                }
+                let mut fields = Vec::new();
+                let mut names = std::collections::HashSet::new();
+                for field in &record.fields {
+                    self.validate_rust_record_identifier(&field.name, "record field")?;
+                    let ty = Scalar::from_type_with_records(&field.ty, &self.rust_opaque_names, &self.rust_records)
+                        .filter(|ty| *ty != Scalar::Void)
+                        .ok_or_else(|| self.err(ErrorCode::E0102, "rust_bridge_signature_mismatch: unsupported record field (declare nested records first)"))?;
+                    if !names.insert(&field.name) {
+                        return Err(self.err(
+                            ErrorCode::E0102,
+                            "rust_bridge_signature_mismatch: duplicate record field",
+                        ));
+                    }
+                    fields.push((field.name.clone(), ty));
+                }
+                self.rust_records.insert(
+                    record.name.clone(),
+                    crate::rust_bridge_ir::Record {
+                        name: record.name.clone(),
+                        fields,
+                    },
+                );
+                items.push(Item::Class(record));
+                continue;
+            }
             if matches!(self.peek_kind(), TokenKind::Ident(word) if word == "opaque") {
                 self.advance();
                 let name = self.expect_ident()?;
@@ -87,7 +155,7 @@ impl Parser {
                     },
                     span,
                     constant: None,
-                    rust_bridge: Some(symbol),
+                    rust_bridge: Some(Box::new(symbol)),
                 }));
                 continue;
             }
@@ -130,10 +198,14 @@ impl Parser {
             let mut inputs = Vec::new();
             while !self.check(TokenKind::RParen) && !self.at_eof() {
                 let param = self.parse_param()?;
-                let ty = Scalar::from_type_with_opaque(&param.ty, &self.rust_opaque_names)
-                    .filter(|ty| *ty != Scalar::Void);
+                let ty = Scalar::from_type_with_records(
+                    &param.ty,
+                    &self.rust_opaque_names,
+                    &self.rust_records,
+                )
+                .filter(|ty| *ty != Scalar::Void);
                 if ty.is_none() || !matches!(param.mode, ParamMode::Value) {
-                    return Err(self.err(ErrorCode::E0102, "rust_bridge_signature_mismatch: unsupported value parameter (expected scalar, String, Array<i64>, opaque, Option or Result)"));
+                    return Err(self.err(ErrorCode::E0102, "rust_bridge_signature_mismatch: unsupported value parameter (expected scalar, String, scalar/String Array, declared record, opaque, Option or Result)"));
                 }
                 inputs.push(ty.unwrap());
                 params.push(param);
@@ -147,15 +219,16 @@ impl Parser {
             } else {
                 Type::Void
             };
-            let output = Scalar::from_type_with_opaque(&return_type, &self.rust_opaque_names).ok_or_else(|| {
+            let output = Scalar::from_type_with_records(&return_type, &self.rust_opaque_names, &self.rust_records).ok_or_else(|| {
                 self.err(
                     ErrorCode::E0102,
-                    "rust_bridge_signature_mismatch: unsupported return type (expected scalar, String, Array<i64>, opaque, Option or Result)",
+                    "rust_bridge_signature_mismatch: unsupported return type (expected scalar, String, scalar/String Array, declared record, opaque, Option or Result)",
                 )
             })?;
             self.expect(TokenKind::Semicolon)?;
             let span = span.to(self.previous_span());
             let mut symbol = RustBridgeSymbol::new(name.clone(), inputs, output);
+            symbol.resolve_records(&self.rust_records);
             if let Some(fingerprint) = nonblocking {
                 symbol.declare_nonblocking(fingerprint);
             }
@@ -165,7 +238,7 @@ impl Parser {
                 effect_contracts: Vec::new(),
                 return_type_span: None,
                 type_params: Vec::new(),
-                rust_bridge: Some(symbol),
+                rust_bridge: Some(Box::new(symbol)),
                 name,
                 public: true,
                 is_async: false,
@@ -191,16 +264,23 @@ pub(super) fn opaque_names(
     tokens: &[crate::lexer::token::Token],
 ) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
-    let mut in_rust = false;
+    let mut rust_depth = None;
+    let mut depth = 0usize;
     for window in tokens.windows(3) {
         if matches!((&window[0].kind, &window[1].kind), (TokenKind::Ident(a), TokenKind::Ident(b)) if a == "extern" && b == "rust")
         {
-            in_rust = true;
+            rust_depth = Some(depth + 1);
+        }
+        if matches!(window[0].kind, TokenKind::LBrace) {
+            depth += 1;
         }
         if matches!(window[0].kind, TokenKind::RBrace) {
-            in_rust = false;
+            if rust_depth == Some(depth) {
+                rust_depth = None;
+            }
+            depth = depth.saturating_sub(1);
         }
-        if in_rust
+        if rust_depth == Some(depth)
             && let (TokenKind::Ident(keyword), TokenKind::Ident(name), TokenKind::Semicolon) =
                 (&window[0].kind, &window[1].kind, &window[2].kind)
             && keyword == "opaque"

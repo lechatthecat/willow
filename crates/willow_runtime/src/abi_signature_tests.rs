@@ -616,6 +616,14 @@ fn aggregate_bridge_runtime_abi_matches_schema() {
     let _: extern "C" fn(u64) -> usize = willow_rust_bridge_bytes_len;
     let _: extern "C" fn(u64, *mut u8, usize) = willow_rust_bridge_bytes_copy;
     let _: extern "C" fn(*mut u8, *const u8, usize, u32) -> u64 = willow_rust_bridge_buffer;
+    let _: extern "C" fn(*mut u8, usize, u32) -> u64 = willow_rust_bridge_array_new;
+    let _: extern "C" fn(u64, usize) -> u64 = willow_rust_bridge_array_get;
+    let _: extern "C" fn(u64, usize, u64) = willow_rust_bridge_array_set;
+    let _: extern "C" fn(*mut u8, *const u64, usize, *const u64, u64) -> u64 =
+        willow_rust_bridge_record_new;
+    let _: extern "C" fn(u64, usize, u32, *mut WillowBridgeValue) = willow_rust_bridge_record_get;
+    let _: extern "C" fn(u64, usize, *const WillowBridgeValue, u32, u32) =
+        willow_rust_bridge_record_set;
     let _: extern "C" fn(u64) -> u64 = willow_rust_bridge_tag;
     let _: extern "C" fn(u64, u32, *mut WillowBridgeValue) = willow_rust_bridge_payload;
     let _: extern "C" fn(*mut u8, u64, *const WillowBridgeValue, u32, u32) -> u64 =
@@ -632,6 +640,28 @@ fn aggregate_bridge_runtime_abi_matches_schema() {
             "willow_rust_bridge_buffer",
             &[Ptr, Ptr, I64, I32][..],
             Some(I64),
+        ),
+        (
+            "willow_rust_bridge_array_new",
+            &[Ptr, I64, I32][..],
+            Some(I64),
+        ),
+        ("willow_rust_bridge_array_get", &[I64, I64][..], Some(I64)),
+        ("willow_rust_bridge_array_set", &[I64, I64, I64][..], None),
+        (
+            "willow_rust_bridge_record_new",
+            &[Ptr, Ptr, I64, Ptr, I64][..],
+            Some(I64),
+        ),
+        (
+            "willow_rust_bridge_record_get",
+            &[I64, I64, I32, Ptr][..],
+            None,
+        ),
+        (
+            "willow_rust_bridge_record_set",
+            &[I64, I64, Ptr, I32, I32][..],
+            None,
         ),
         ("willow_rust_bridge_tag", &[I64][..], Some(I64)),
         ("willow_rust_bridge_payload", &[I64, I32, Ptr][..], None),

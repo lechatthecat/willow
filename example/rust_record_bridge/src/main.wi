@@ -1,0 +1,46 @@
+import std::collections::Array;
+extern rust {
+    class Packet {
+        pub body: Array<i64>;
+        pub labels: Array<String>;
+        pub ratio: f64;
+        pub active: bool;
+        pub code: Option<i64>;
+    }
+    fn packet(value: Packet) -> Packet;
+    fn optional(value: Option<Packet>) -> Option<Packet>;
+    fn result(value: Result<Packet, Array<String>>) -> Result<Packet, Array<String>>;
+    fn labels(value: Array<String>) -> Array<String>;
+    fn flags(value: Array<bool>) -> Array<bool>;
+    fn ratios(value: Array<f64>) -> Array<f64>;
+    fn maybe_labels(value: Option<Array<String>>) -> Option<Array<String>>;
+}
+fn main() {
+    let p = new Packet([0, 128, 255], ["", "日本語🙂"], -2.5, true, Some(-42));
+    let q = packet(p);
+    println(q.body[2] == 255);
+    println(q.labels[1] == "日本語🙂");
+    println(q.ratio == -2.5);
+    println(q.active);
+    println(q.code.unwrap() == -42);
+    println(p.body[1] == 128);
+    let indirect = packet;
+    println(indirect(q).labels[0] == "");
+    println(optional(None).is_none());
+    println(optional(Some(p)).unwrap().body[0] == 0);
+    println(result(Ok(p)).unwrap().code.unwrap() == -42);
+    println(result(Err(["failure"])).unwrap_err()[0] == "failure");
+    let empty: Array<String> = [];
+    println(labels(empty).len() == 0);
+    println(labels(["a", "b"])[1] == "b");
+    println(flags([false, true])[0] == false);
+    println(flags([false, true])[1]);
+    println(ratios([-1.25, 2.5])[0] == -1.25);
+    println(ratios([-1.25, 2.5])[1] == 2.5);
+    println(maybe_labels(None).is_none());
+    println(maybe_labels(Some(empty)).unwrap().len() == 0);
+    println(maybe_labels(Some(["nested"])).unwrap()[0] == "nested");
+    let zero = new Packet([], [], 0.0, false, None);
+    println(packet(zero).code.is_none());
+    println(packet(zero).body.len() == 0);
+}
