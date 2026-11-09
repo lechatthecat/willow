@@ -1008,6 +1008,18 @@ use crate::id_hash::IdHasher as TaskIdHasher;
 
 type TaskShard = HashMap<RuntimeTaskId, RuntimeTask, BuildHasherDefault<TaskIdHasher>>;
 
+// Independent task locks must not invalidate a neighbour's lock/map metadata.
+// Use the same conservative cache-line separation as the worker queues.
+#[derive(Debug)]
+#[repr(align(128))]
+struct PaddedTaskShard(Mutex<TaskShard>);
+
+// Completion writes must not invalidate the shard directory read by every
+// task operation (or the unrelated blocked-syscall counter).
+#[derive(Debug)]
+#[repr(align(128))]
+struct TerminalEpoch(AtomicU64);
+
 /// Task records partitioned by task id.
 ///
 /// A one-task operation takes one shard. A relationship transaction takes the
@@ -1016,7 +1028,7 @@ type TaskShard = HashMap<RuntimeTaskId, RuntimeTask, BuildHasherDefault<TaskIdHa
 /// table's ownership lock.
 #[derive(Debug)]
 struct ShardedTaskTable {
-    shards: Vec<Mutex<TaskShard>>,
+    shards: Vec<PaddedTaskShard>,
     /// Exact O(1) summary of tasks in `BlockedSyscall`.
     ///
     /// This lives beside the sharded task states instead of in
@@ -1034,26 +1046,26 @@ struct ShardedTaskTable {
     /// a watcher reads the epoch, then the state. Either the watcher's state
     /// read sees the transition, or its epoch read precedes the advance and
     /// the next iteration looks again.
-    terminal_epoch: AtomicU64,
+    terminal_epoch: TerminalEpoch,
 }
 
 impl ShardedTaskTable {
     fn new() -> Self {
         Self {
             shards: (0..TASK_TABLE_SHARDS)
-                .map(|_| Mutex::new(TaskShard::default()))
+                .map(|_| PaddedTaskShard(Mutex::new(TaskShard::default())))
                 .collect(),
             blocked_syscall: AtomicUsize::new(0),
-            terminal_epoch: AtomicU64::new(0),
+            terminal_epoch: TerminalEpoch(AtomicU64::new(0)),
         }
     }
 
     fn terminal_epoch(&self) -> u64 {
-        self.terminal_epoch.load(Ordering::Acquire)
+        self.terminal_epoch.0.load(Ordering::Acquire)
     }
 
     fn advance_terminal_epoch(&self) {
-        self.terminal_epoch.fetch_add(1, Ordering::Release);
+        self.terminal_epoch.0.fetch_add(1, Ordering::Release);
     }
 
     fn shard_index(&self, id: RuntimeTaskId) -> usize {
@@ -1062,6 +1074,7 @@ impl ShardedTaskTable {
 
     fn lock_shard(&self, index: usize) -> std::sync::MutexGuard<'_, TaskShard> {
         self.shards[index]
+            .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }

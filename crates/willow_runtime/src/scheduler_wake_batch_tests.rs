@@ -216,10 +216,10 @@ fn batch_keeps_blocked_count_until_queue_publication() {
         // Wait for the waker to own the shard: it must retain it while the queue
         // mutex prevents publication. Timeout bounds a failed regression.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while tasks.shards[1].try_lock().is_ok() && Instant::now() < deadline {
+        while tasks.shards[1].0.try_lock().is_ok() && Instant::now() < deadline {
             std::thread::yield_now();
         }
-        let retained = tasks.shards[1].try_lock().is_err();
+        let retained = tasks.shards[1].0.try_lock().is_err();
         let blocked = tasks.blocked_syscall_count();
         drop(guard);
         wake.join().unwrap();

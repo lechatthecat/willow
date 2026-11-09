@@ -2667,9 +2667,7 @@ fn t8hq4_19_pending_drain_still_takes_the_list() {
     let _guard = runtime_test_guard();
     reset_global_scheduler_for_test();
     complete_executable_without_drain();
-    let held = GLOBAL_SCHEDULER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let held = global_components().retirements.hold_cleanup_list_for_test();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let drainer = std::thread::spawn(move || {
         drain_terminal_cleanups();
@@ -2746,6 +2744,24 @@ fn t8hq4_19_cleanups_published_during_drains_are_never_lost() {
 
 fn terminal_epoch() -> u64 {
     global_task_table().terminal_epoch()
+}
+
+#[test]
+fn task_table_locks_and_completion_epoch_have_separate_cache_lines() {
+    let table = ShardedTaskTable::new();
+    let epoch = &table.terminal_epoch as *const _ as usize;
+    let directory = &table.shards as *const _ as usize;
+    let blocked = &table.blocked_syscall as *const _ as usize;
+    assert_eq!(epoch % 128, 0);
+    assert_ne!(epoch / 128, directory / 128);
+    assert_ne!(epoch / 128, blocked / 128);
+    for pair in table.shards.windows(2) {
+        let first = &pair[0].0 as *const _ as usize;
+        let second = &pair[1].0 as *const _ as usize;
+        assert_eq!(first % 128, 0);
+        assert!(second - first >= 128);
+        assert!((first + size_of::<Mutex<TaskShard>>() - 1) / 128 < second / 128);
+    }
 }
 
 /// Run `f` on another thread while this thread holds `id`'s task shard, and
@@ -2915,12 +2931,10 @@ fn t8hq4_19_a_draining_worker_holds_a_claim_in_flight() {
     complete_executable_without_drain();
     let before = claim_word();
     let state = ParallelRunState::default();
-    let held = GLOBAL_SCHEDULER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let held = global_components().retirements.hold_cleanup_list_for_test();
     let drainer = std::thread::spawn(drain_terminal_cleanups);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !claims_in_flight() && Instant::now() < deadline {
+    while terminal_cleanups_pending() && Instant::now() < deadline {
         std::thread::yield_now();
     }
     let visible = claims_in_flight();

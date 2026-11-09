@@ -66,6 +66,13 @@ impl TerminalRetirements {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    #[cfg(test)]
+    pub(super) fn hold_cleanup_list_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Vec<TerminalCleanup>> {
+        self.lock_cleanups()
+    }
+
     pub(super) fn retire_frame(&self, frame: usize) {
         let mut shard = Self::lock(&self.shards[current_worker() % RETIREMENT_SHARDS]);
         let tag = crate::frame_reclaim::retire_tag();
