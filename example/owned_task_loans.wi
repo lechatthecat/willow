@@ -1,0 +1,31 @@
+import std::collections::Array;
+import std::collections::Map;
+
+async fn add(values: Array<i64>, amount: i64) {
+    await sleep(1);
+    values[0] = values[0] + amount;
+}
+
+async fn put(values: Map<String, i64>) {
+    await sleep(1);
+    values.insert("answer", 42);
+}
+
+async fn main() {
+    let first = [10];
+    let alias = first;
+    await add(first, 1);
+    println(alias[0]);
+
+    let second = [20];
+    let left = add(first, 2);
+    let right = add(second, 3);
+    await left;
+    println(first[0]);
+    await right;
+    println(second[0]);
+
+    let values: Map<String, i64> = Map::new();
+    await put(values);
+    println(values.len());
+}

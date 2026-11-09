@@ -36,7 +36,8 @@ fn test_dgwo4_map_arg_rejected() {
         r#"
 import std::collections::Map;
 async fn use_m(m: Map<String, i64>) -> i64 { await sleep(1); return 0; }
-async fn main() { let m: Map<String, i64> = Map::new(); println(await use_m(m)); }
+async fn forward(m: Map<String, i64>) { println(await use_m(m)); }
+async fn main() {}
 "#,
     );
     assert!(!ok);
@@ -49,20 +50,11 @@ async fn main() { let m: Map<String, i64> = Map::new(); println(await use_m(m));
 }
 
 #[test]
-fn test_immediate_await_fresh_array_still_requires_sync() {
+fn test_immediate_await_fresh_array_is_exclusively_owned() {
     let (ok, stderr) = compile_with_data_race_check(
         "import std::collections::Array; async fn take(xs: Array<i64>) {} async fn main() { await take([1, 2]); }",
     );
-    assert!(!ok, "{stderr}");
-    for text in [
-        "error[E2402]",
-        "immediately awaited",
-        "exclusive access",
-        "FrozenArray",
-        "Mutex<Array",
-    ] {
-        assert!(stderr.contains(text), "{stderr}");
-    }
+    assert!(ok, "{stderr}");
 }
 
 #[test]
@@ -72,7 +64,8 @@ fn test_immediate_await_sheet_reports_field_and_remedies() {
 import std::collections::Map;
 class Sheet { pub cells: Map<i64, i64>; }
 async fn evaluate(sheet: Sheet) -> i64 { return sheet.cells.len(); }
-async fn main() { let sheet = new Sheet(Map<i64, i64>::new()); println(await evaluate(sheet)); }
+async fn forward(sheet: Sheet) { println(await evaluate(sheet)); }
+async fn main() {}
 "#,
     );
     assert!(!ok, "{stderr}");
@@ -120,7 +113,7 @@ async fn main() {
 }
 
 #[test]
-fn test_dgwo4_class_with_array_field_rejected() {
+fn owned_class_with_array_field_accepted() {
     // A class with a (non-Sync) Array field is not Sync.
     let (ok, _stderr) = compile_with_data_race_check(
         r#"
@@ -130,7 +123,10 @@ async fn use_b(b: Bag) -> i64 { await sleep(1); return 0; }
 async fn main() { let b = new Bag([1, 2]); println(await use_b(b)); }
 "#,
     );
-    assert!(!ok, "class with Array field is not Sync");
+    assert!(
+        ok,
+        "a fresh class can be exclusively lent despite being non-Sync"
+    );
 }
 
 #[test]
@@ -229,12 +225,11 @@ fn test_dgwo4_only_offending_args_flagged() {
         r#"
 import std::collections::Array;
 async fn f(a: i64, xs: Array<i64>, m: Mutex<i64>, ys: Array<i64>) -> i64 { await sleep(1); return a; }
-async fn main() {
-    let xs: Array<i64> = [1];
-    let ys: Array<i64> = [2];
+async fn forward(xs: Array<i64>, ys: Array<i64>) {
     let m = Mutex::new(0);
     println(await f(9, xs, m, ys));
 }
+async fn main() {}
 "#,
     );
     assert!(!ok);
@@ -279,4 +274,128 @@ fn test_fn_pointer_send_sync_return_and_field_gc_release() {
         assert!(ok, "{out}");
         assert_eq!(out, "14\n42\n");
     }
+}
+
+#[test]
+fn owned_task_loans_run_with_relocation_and_preemption() {
+    let source = include_str!("../../../example/owned_task_loans.wi");
+    for workers in ["1", "4"] {
+        let (output, ok) = compile_and_run_with_runtime_env(
+            source,
+            &[
+                ("WILLOW_WORKERS", workers),
+                ("WILLOW_TASK_BUDGET", "1"),
+                ("WILLOW_GC_STRESS", "relocate"),
+            ],
+            std::time::Duration::from_secs(30),
+        );
+        assert!(ok, "{output}");
+        assert_eq!(output, "11\n13\n23\n1\n");
+    }
+    let (output, ok) = compile_and_run_release(source);
+    assert!(ok, "{output}");
+    assert_eq!(output, "11\n13\n23\n1\n");
+}
+
+#[test]
+fn owned_task_loans_resolved_call_forms() {
+    let source = r#"
+import std::collections::Array;
+class Worker {
+    pub async fn add(self, a: Array<i64>) { a[0] = a[0] + 1; }
+    pub static async fn twice(a: Array<i64>) { a[0] = a[0] * 2; }
+}
+async fn main() {
+    let a = [20];
+    let worker = new Worker();
+    await worker.add(a);
+    let t = Worker::twice(a);
+    await t;
+    println(a[0]);
+}
+"#;
+    let (output, ok) = compile_and_run(source);
+    assert!(ok, "{output}");
+    assert_eq!(output, "42\n");
+}
+
+#[test]
+fn owned_task_loans_imported_callee_and_escape_contract() {
+    let worker = "import std::collections::Array; pub async fn add(a: Array<i64>) { await sleep(0); a[0] = a[0] + 1; }";
+    let (output, ok) = compile_temp_project_and_run(
+        &[
+            ("worker.wi", worker),
+            (
+                "main.wi",
+                "import worker; async fn main() { let a = [41]; await worker::add(a); println(a[0]); }",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "{output}");
+    assert_eq!(output, "42\n");
+    let errors = compile_temp_project_error_stderr(
+        &[
+            (
+                "worker.wi",
+                "import std::collections::Array; pub async fn add(a: Array<i64>) { let m = Mutex::new(a); }",
+            ),
+            (
+                "main.wi",
+                "import worker; async fn main() { let a = [41]; await worker::add(a); println(a[0]); }",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(errors.contains("E2402"), "{errors}");
+}
+
+#[test]
+fn owned_task_loans_reject_later_argument_mutex_race() {
+    let source = r#"
+import std::collections::Array;
+async fn mutate(m: Mutex<Array<i64>>) {
+    lock m as values { values[0] = 2; }
+}
+async fn take(a: Array<i64>, m: Mutex<Array<i64>>) {
+    let child = mutate(m);
+    a[0] = 3;
+    await child;
+}
+async fn main() {
+    let a = [1];
+    let t = take(a, Mutex::new(a));
+    await t;
+}
+"#;
+    let (ok, errors) = compile_with_data_race_check(source);
+    assert!(
+        !ok && errors.contains("E2402") && errors.contains("after permanent transfer"),
+        "{errors}"
+    );
+    // The same callee is valid when the mutex owns an independent collection.
+    let independent = source.replace("take(a, Mutex::new(a))", "take(a, Mutex::new([9]))");
+    let (ok, errors) = compile_with_data_race_check(&independent);
+    assert!(ok, "{errors}");
+}
+
+#[test]
+fn owned_class_task_loans_run_with_relocation_and_preemption() {
+    let source = include_str!("../../../example/owned_class_task_loans.wi");
+    for workers in ["1", "4"] {
+        let (output, ok) = compile_and_run_with_runtime_env(
+            source,
+            &[
+                ("WILLOW_WORKERS", workers),
+                ("WILLOW_TASK_BUDGET", "1"),
+                ("WILLOW_GC_STRESS", "relocate"),
+            ],
+            std::time::Duration::from_secs(30),
+        );
+        assert!(ok, "{output}");
+        assert_eq!(output, "11\n13\n23\n14\n");
+    }
+    let (output, ok) = compile_and_run_release(source);
+    assert!(ok, "{output}");
+    assert_eq!(output, "11\n13\n23\n14\n");
 }

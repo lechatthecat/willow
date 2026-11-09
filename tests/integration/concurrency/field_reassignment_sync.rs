@@ -1,5 +1,7 @@
 use super::*;
 
+// Non-Sync negative controls forward borrowed values: fresh owned values can
+// now be lent exclusively without becoming Sync.
 // ── Reassigned fields break `Sync` ──────────────────────────
 //
 // Willow fields have no readonly spelling, so a class is `Sync` only when all
@@ -117,7 +119,8 @@ fn test_field_write_sync_method_compound_write_rejected() {
         r#"
 class C { pub n: i64; pub fn bump(self) { self.n += 1; } }
 async fn read(c: C) -> i64 { await sleep(1); return c.n; }
-async fn main() { let c = new C(3); println(await read(c)); }
+async fn forward(c: C) { println(await read(c)); }
+async fn main() { await forward(new C(3)); }
 "#,
         &["error[E2402]", REASSIGNED],
     );
@@ -143,7 +146,8 @@ fn test_field_write_sync_subclass_write_to_inherited_field_rejected() {
 open class Base { pub n: i64; }
 class Sub extends Base { pub fn bump(self) { self.n = self.n + 1; } }
 async fn read(b: Base) -> i64 { await sleep(1); return b.n; }
-async fn main() { let b = new Base(3); println(await read(b)); }
+async fn forward(b: Base) { println(await read(b)); }
+async fn main() { await forward(new Base(3)); }
 "#,
         &["cannot pass `Base`", REASSIGNED],
     );
@@ -156,7 +160,8 @@ fn test_field_write_sync_reference_argument_counts_as_write() {
 class C { pub n: i64; }
 fn inc(x: &mut i64) { x = x + 1; }
 async fn read(c: C) -> i64 { await sleep(1); return c.n; }
-async fn main() { let c = new C(1); inc(&c.n); println(await read(c)); }
+async fn forward(c: C) { inc(&c.n); println(await read(c)); }
+async fn main() { await forward(new C(1)); }
 "#,
         &["error[E2402]", REASSIGNED],
     );
@@ -180,7 +185,7 @@ fn poke(o: Outer) { o.inner.v = 2; }
     );
     assert_not_sync(
         &format!(
-            "{decls}async fn read(i: Inner) -> i64 {{ await sleep(1); return i.v; }}\nasync fn main() {{ println(await read(new Inner(1))); }}"
+            "{decls}async fn read(i: Inner) -> i64 {{ await sleep(1); return i.v; }}\nasync fn forward(i: Inner) {{ println(await read(i)); }} async fn main() {{ await forward(new Inner(1)); }}"
         ),
         &["cannot pass `Inner`", REASSIGNED],
     );
@@ -310,7 +315,8 @@ fn test_field_write_sync_reassigned_mutex_field_rejected() {
         r#"
 class Shared { pub m: Mutex<i64>; pub fn reset(self) { self.m = Mutex::new(0); } }
 async fn work(s: Shared) -> i64 { await sleep(1); return 0; }
-async fn main() { await work(new Shared(Mutex::new(0))); }
+async fn forward(s: Shared) { await work(s); }
+async fn main() { await forward(new Shared(Mutex::new(0))); }
 "#,
         &["field `m: Mutex<i64>` is reassigned"],
     );
@@ -364,7 +370,8 @@ fn test_field_write_sync_generic_class_setter_rejected() {
         r#"
 class Box<T> { pub v: T; pub fn set(self, v: T) { self.v = v; } }
 async fn read(b: Box<i64>) -> i64 { await sleep(1); return b.v; }
-async fn main() { println(await read(new Box<i64>(1))); }
+async fn forward(b: Box<i64>) { println(await read(b)); }
+async fn main() { await forward(new Box<i64>(1)); }
 "#,
         &["error[E2402]", "field `v: i64` is reassigned"],
     );
@@ -404,7 +411,8 @@ class A { pub n: i64; }
 class B { pub n: i64; }
 async fn read(a: A) -> i64 { await sleep(1); return a.n; }
 fn make() -> B { return new B(1); }
-async fn main() { let b = make(); b.n = 2; println(await read(new A(1))); }
+async fn forward(a: A) { let b = make(); b.n = 2; println(await read(a)); }
+async fn main() { await forward(new A(1)); }
 "#,
         &["cannot pass `A`", REASSIGNED],
     );
@@ -451,7 +459,8 @@ fn test_field_write_sync_write_in_entry_rejects_imported_class() {
     let main = r#"
 import counter::Counter;
 async fn read(c: Counter) -> i64 { await sleep(1); return c.n; }
-async fn main() { let c = new Counter(1); c.n = 5; println(await read(c)); }
+async fn forward(c: Counter) { c.n = 5; println(await read(c)); }
+async fn main() { await forward(new Counter(1)); }
 "#;
     let stderr = compile_temp_project_error_stderr(
         &[("counter.wi", COUNTER_MODULE), ("main.wi", main)],
@@ -595,7 +604,7 @@ fn test_sync_receiver_sync_receiver_matrix() {
     for (name, mutation) in cases {
         for (reader, accepted) in [("A", true), ("B", false)] {
             let source = format!(
-                "class A {{ pub cell: i64; }} class B {{ pub cell: i64; }} {mutation} async fn read(x: {reader}) -> i64 {{ return x.cell; }} async fn main() {{ println(await read(new {reader}(7))); }}"
+                "class A {{ pub cell: i64; }} class B {{ pub cell: i64; }} {mutation} async fn read(x: {reader}) -> i64 {{ return x.cell; }} async fn forward(x: {reader}) -> i64 {{ return await read(x); }} async fn main() {{ println(await forward(new {reader}(7))); }}"
             );
             let project = TestProject::new(
                 "sync_receiver_matrix",
@@ -631,7 +640,7 @@ fn test_sync_receiver_sync_module_declarations() {
         for (reader, accepted) in [("readonly", true), ("mutable", false)] {
             let writer = format!("{import} pub fn mutate(x: {ty}) {{ x.cell = 9; }}");
             let main = format!(
-                "import readonly; import mutable; import writer; async fn read(x: {reader}::Record) -> i64 {{ return x.cell; }} async fn main() {{ println(await read(new {reader}::Record(7))); }}"
+                "import readonly; import mutable; import writer; async fn read(x: {reader}::Record) -> i64 {{ return x.cell; }} async fn forward(x: {reader}::Record) -> i64 {{ return await read(x); }} async fn main() {{ println(await forward(new {reader}::Record(7))); }}"
             );
             let project = TestProject::new(
                 "sync_module_identity",
@@ -757,7 +766,7 @@ fn test_sync_receiver_sync_genuine_shared_stats_rejected() {
 fn test_sync_receiver_sync_inherited_import_alias() {
     for (reader, accepted) in [("Unrelated", true), ("Base", false)] {
         let main = format!(
-            "import base::{{Base, Unrelated}}; import sub; async fn read(x: {reader}) -> i64 {{ return x.cell; }} async fn main() {{ println(await read(new {reader}(7))); }}"
+            "import base::{{Base, Unrelated}}; import sub; async fn read(x: {reader}) -> i64 {{ return x.cell; }} async fn forward(x: {reader}) -> i64 {{ return await read(x); }} async fn main() {{ println(await forward(new {reader}(7))); }}"
         );
         let project = TestProject::new(
             "sync_inherited_alias",
@@ -790,7 +799,7 @@ fn test_sync_receiver_sync_inherited_import_alias() {
 fn test_sync_receiver_sync_same_module_path_in_distinct_packages() {
     for (reader, accepted) in [("b", true), ("a", false)] {
         let main = format!(
-            "import a::types::Record as Written; import {reader}::types::Record as Read; fn mutate(x: Written) {{ x.cell = 1; }} async fn read(x: Read) -> i64 {{ return x.cell; }} async fn main() {{ println(await read(new Read(7))); }}"
+            "import a::types::Record as Written; import {reader}::types::Record as Read; fn mutate(x: Written) {{ x.cell = 1; }} async fn read(x: Read) -> i64 {{ return x.cell; }} async fn forward(x: Read) -> i64 {{ return await read(x); }} async fn main() {{ println(await forward(new Read(7))); }}"
         );
         let project = TestProject::new(
             "sync_package_identity",

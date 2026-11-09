@@ -22,6 +22,8 @@ pub(super) struct BodyState {
     /// temporaries. Each occurrence has its own slot, independent of source
     /// spans; callable checking drains its slots after checking Send.
     pub(super) async_local_types: Vec<Type>,
+    /// Capture arguments awaiting the body-local exclusive-loan proof.
+    pub(super) task_loan_args: HashSet<ExprId>,
     /// Coverage facts reused by source retention, scoped to the current body.
     pub(super) exhaustive_matches: std::collections::HashSet<ExprId>,
     /// Source/synthetic bindings keyed by frame slot for task-mobility labels.
@@ -93,6 +95,7 @@ impl Default for BodyState {
             lock_depth: 0,
             lexical_block_depth: 0,
             async_local_types: Vec::new(),
+            task_loan_args: HashSet::new(),
             exhaustive_matches: std::collections::HashSet::new(),
             async_local_bindings: HashMap::new(),
             declared_type_params: Vec::new(),

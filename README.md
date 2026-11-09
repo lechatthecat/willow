@@ -15,7 +15,7 @@ Its premise is simple: **when a person or an AI agent changes a program, the com
 
 **Readable first, proven where it matters.** Willow code is meant to be read, by people and by AI agents alike. Its syntax is deliberately familiar, so anyone who knows Rust or Kotlin can follow it and agents can apply what they already know. Concurrency checks run in the compiler without adding concepts to everyday code, and proof is opt-in: mark the functions that matter with [`@verified`](#verified-prove-a-contract-with-z3) and leave the rest as ordinary code.
 
-**Status:** Experimental research/engineering project. **Not production-ready.** The compiler rejects specific classes of concurrency mistakes—non-`Sync` references passed to async calls (E2402), modeled waits inside Willow lexical locks (E2604), and unsafe lock nesting or acquisition cycles (E2605)—but this is not a proof that arbitrary Willow programs are free of deadlocks, races, or other bugs. See [Current boundaries](#current-boundaries).
+**Status:** Experimental research/engineering project. **Not production-ready.** The compiler rejects specific classes of concurrency mistakes—non-`Sync` references shared without exclusive access across async calls (E2402), modeled waits inside Willow lexical locks (E2604), and unsafe lock nesting or acquisition cycles (E2605)—but this is not a proof that arbitrary Willow programs are free of deadlocks, races, or other bugs. See [Current boundaries](#current-boundaries).
 
 This README describes the current `main` branch. Some features are newer than the latest prebuilt release; see [Try Willow](#try-willow).
 
@@ -74,7 +74,7 @@ async fn main() {
 
 A few things to notice:
 
-- **No ownership or lifetimes.** The garbage collector manages memory; sharing values across tasks is constrained by the compiler's inferred `Send`/`Sync` rules.
+- **No ownership or lifetime annotations.** The garbage collector manages memory; the compiler infers `Send`/`Sync` and checks exclusive local collection loans across tasks.
 - **No null.** Absence is `Option<T>`, and `T?` is sugar for it. Recoverable errors use `Result<T, E>` and the `?` operator.
 - **Classes are closed by default.** Inheritance needs `open`, and replacing a method needs `override`. A class without an `init` constructor can be created with its fields in declaration order.
 - **`async fn` returns a Task.** Calling one creates the Task; `await` waits for its result.
@@ -125,9 +125,22 @@ cargo build --release
 
 Willow infers `Send` and `Sync` structurally; user code cannot implement these
 markers manually. Calling an `async fn` captures its arguments into a Task.
-Shared reference arguments must be `Sync` even when the Task is immediately
-awaited. Mutable `Array` and `Map` values are not `Sync`, and neither is a class
-containing one:
+Shared reference arguments must be `Sync`. Fresh, unescaped local `Array`,
+`Map`, and class values whose contents are `Send` can instead be lent exclusively: after
+`let t = change(values)`, neither `values` nor its aliases can be used until
+`await t` completes. `await change(values)` restores access immediately afterward.
+Independent collections can run in parallel tasks. Async collection parameters
+cannot escape into another task, shared storage, or an opaque helper.
+
+This proof supports unconditional body-level calls and awaits, including fresh
+class values, class-field collections, and statically resolved async methods.
+Lending a field also restricts access through the containing object and its aliases.
+Control-flow loans and opaque ownership remain conservatively rejected.
+See [the loan rules and transfer paths](docs/decisions/0009-immediately-awaited-async-captures.md)
+and the runnable [collection](example/owned_task_loans.wi) and
+[class](example/owned_class_task_loans.wi) examples.
+
+Mutable collections and classes containing them remain non-`Sync`:
 
 ```willow
 import std::collections::Array;
@@ -141,7 +154,10 @@ async fn add(inbox: Inbox, n: i64) {
 async fn main() {
     let items: Array<i64> = [];
     let inbox = new Inbox(items);
-    await add(inbox, 1); // error[E2402]: `Inbox` is not `Sync`
+    let task = add(inbox, 1);
+    // inbox and items are unavailable until this task completes.
+    await task;
+    println(items.len());
 }
 ```
 

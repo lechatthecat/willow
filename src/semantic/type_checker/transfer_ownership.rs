@@ -20,6 +20,10 @@ struct Graph {
     borrowed: Vec<bool>,
     escaped: Vec<bool>,
     origins: Vec<usize>,
+    loan_unsupported: Vec<bool>,
+    loan_payload: Vec<bool>,
+    loan_borrowed: Vec<bool>,
+    external: Vec<bool>,
     locks: Vec<Option<(usize, usize)>>,
     values: HashMap<ExprId, usize>,
     names: HashMap<String, Vec<usize>>,
@@ -45,6 +49,10 @@ impl Graph {
         self.borrowed.push(borrowed);
         self.escaped.push(false);
         self.origins.push(self.loop_id);
+        self.loan_unsupported.push(false);
+        self.loan_payload.push(false);
+        self.loan_borrowed.push(false);
+        self.external.push(false);
         self.locks.push(None);
         id
     }
@@ -73,6 +81,9 @@ impl Graph {
         self.ranks[a] += u8::from(self.ranks[a] == self.ranks[b]);
         self.borrowed[a] |= self.borrowed[b];
         self.escaped[a] |= self.escaped[b];
+        self.loan_unsupported[a] |= self.loan_unsupported[b];
+        self.loan_payload[a] |= self.loan_payload[b];
+        self.loan_borrowed[a] |= self.loan_borrowed[b];
         if self.origins[a] != self.origins[b] {
             self.origins[a] = 0;
         }
@@ -88,6 +99,7 @@ impl Graph {
         }
         // Parameters, captures and globals are borrowed, never fresh locals.
         let id = self.node(true);
+        self.external[id] = true;
         self.names.entry(name.into()).or_default().push(id);
         id
     }
@@ -189,9 +201,26 @@ impl TypeChecker {
         let mut select_sends = HashSet::new();
         let mut select_receives = HashSet::new();
         let mut deferred = 0;
+        let mut conditional = 0usize;
+        let mut loans = Vec::new();
+        let mut loan_exprs = HashMap::new();
+        let mut task_methods = HashMap::new();
+        let mut waits = Vec::new();
+        let mut loan_errors = Vec::new();
         let mut walk = AstWalk::new(root);
         while let Some(event) = walk.next() {
             graph.ticks += 1;
+            match event {
+                AstEvent::Stmt(Stmt::If(_) | Stmt::While(_) | Stmt::For(_))
+                | AstEvent::Expr(
+                    Expr::Match(_) | Expr::Select(_) | Expr::Ternary(_) | Expr::Binary(_),
+                ) => conditional += 1,
+                AstEvent::ExitStmt(Stmt::If(_) | Stmt::While(_) | Stmt::For(_))
+                | AstEvent::ExitExpr(
+                    Expr::Match(_) | Expr::Select(_) | Expr::Ternary(_) | Expr::Binary(_),
+                ) => conditional -= 1,
+                _ => {}
+            }
             match event {
                 AstEvent::EnterScope => graph.scopes.push(Vec::new()),
                 AstEvent::ExitScope => {
@@ -273,6 +302,8 @@ impl TypeChecker {
                         let borrowed =
                             matches!(expr, Expr::StaticField(_) | Expr::Call(_) | Expr::Await(_));
                         let id = graph.node(borrowed);
+                        graph.loan_payload[id] = self.task_loan_type(ty, &mut sync);
+                        graph.loan_unsupported[id] = !graph.loan_payload[id];
                         graph.values.insert(expr.id(), id);
                     }
                     if let Expr::Lambda(lambda) = expr {
@@ -280,6 +311,10 @@ impl TypeChecker {
                         let result = graph.values.get(&expr.id()).copied();
                         for capture in self.lambda_captures.get(&lambda.id).into_iter().flatten() {
                             let id = graph.lookup(&capture.name);
+                            let root = graph.root(id);
+                            let payload = self.task_loan_type(&capture.ty, &mut sync);
+                            graph.loan_payload[root] |= payload;
+                            graph.loan_borrowed[root] |= graph.external[id] && payload;
                             if let Some(result) = result {
                                 graph.join(result, id);
                             }
@@ -292,10 +327,78 @@ impl TypeChecker {
                 }
                 AstEvent::ExitExpr(expr) => {
                     let result = graph.values.get(&expr.id()).copied();
+                    let args = match expr {
+                        Expr::Call(call) => Some(&call.args),
+                        Expr::MethodCall(call) => Some(&call.args),
+                        Expr::StaticCall(call) => Some(&call.args),
+                        _ => None,
+                    };
+                    let mut loan_values: Vec<&Expr> = args
+                        .into_iter()
+                        .flatten()
+                        .filter(|arg| self.local.task_loan_args.contains(&arg.expr.id()))
+                        .map(|arg| &arg.expr)
+                        .collect();
+                    if let Expr::MethodCall(call) = expr {
+                        let (is_async, is_open) = match self.expr_types.get(&call.object.id()) {
+                            Some(Type::Named(class)) => *task_methods
+                                .entry((class.clone(), call.method.clone()))
+                                .or_insert_with(|| {
+                                    self.lookup_method_in_hierarchy(class, &call.method)
+                                        .map_or((false, true), |(_, method)| {
+                                            (method.is_async, method.is_open)
+                                        })
+                                }),
+                            _ => (false, true),
+                        };
+                        if is_async && graph.values.contains_key(&call.object.id()) {
+                            loan_values.push(&call.object);
+                        }
+                        if !loan_values.is_empty() && (!is_async || is_open) {
+                            loan_errors.push((
+                                call.span,
+                                "non-Sync task loans require a statically known async method",
+                            ));
+                        }
+                    }
+                    if !loan_values.is_empty() {
+                        for value in loan_values {
+                            loan_exprs.insert(value.span(), value.id());
+                            if let (Some(value_id), Some(task)) =
+                                (graph.values.get(&value.id()).copied(), result)
+                            {
+                                loans.push((value_id, task, graph.ticks, value.span()));
+                                if conditional > 0 || deferred > 0 || graph.scopes.len() > 2 {
+                                    loan_errors.push((value.span(), "non-Sync task loans require an unconditional body-level call"));
+                                }
+                            } else {
+                                loan_errors.push((
+                                    value.span(),
+                                    "cannot establish the task loan identity",
+                                ));
+                            }
+                        }
+                        if let Some(task) = result {
+                            graph.borrowed[task] = false;
+                        }
+                        // The Task handle is not an alias of its captured payload.
+                        continue;
+                    }
                     match expr {
+                        Expr::Await(wait) => {
+                            if conditional == 0
+                                && deferred == 0
+                                && graph.scopes.len() <= 2
+                                && let Some(task) = graph.values.get(&wait.expr.id()).copied()
+                            {
+                                waits.push((task, graph.ticks));
+                            }
+                        }
                         Expr::Var(name, span, _) => {
                             if let Some(result) = result {
                                 let binding = graph.lookup(name);
+                                graph.loan_borrowed[result] |=
+                                    graph.external[binding] && graph.loan_payload[result];
                                 graph.join(result, binding);
                                 graph.uses.push((result, graph.ticks, *span));
                                 if deferred > 0 {
@@ -341,10 +444,13 @@ impl TypeChecker {
                             graph.alias(result, &ternary.else_expr);
                         }
                         Expr::New(new) => {
-                            let implicit =
-                                self.symbols.lookup_class(&new.class_name).is_some_and(|c| {
-                                    c.constructor.as_ref().is_none_or(|ctor| ctor.isolated_body)
-                                });
+                            let class = match self.expr_types.get(&expr.id()) {
+                                Some(Type::Named(class)) => class,
+                                _ => &new.class_name,
+                            };
+                            let implicit = self.symbols.lookup_class(class).is_some_and(|c| {
+                                c.constructor.as_ref().is_none_or(|ctor| ctor.isolated_body)
+                            });
                             if !implicit && let Some(id) = result {
                                 let root = graph.root(id);
                                 graph.borrowed[root] = true;
@@ -558,10 +664,19 @@ impl TypeChecker {
                 _ => {}
             }
         }
+        // Reduce permanent transfers first: a payload can be read as an early
+        // argument, then moved by a later argument before its task is scheduled.
+        // Reuse this component index for both loan starts and later value uses.
         let mut diagnostics = Vec::new();
         let mut moved = HashMap::new();
         for (id, tick, loop_id, span) in std::mem::take(&mut graph.transfers) {
             let root = graph.root(id);
+            if self.local.current_async_context && graph.loan_borrowed[root] {
+                loan_errors.push((
+                    span,
+                    "borrowed non-Sync argument cannot transfer out of its async call",
+                ));
+            }
             let reason = if graph.borrowed[root] {
                 Some("cannot transfer a borrowed non-Sync value")
             } else if graph.escaped[root] {
@@ -578,9 +693,82 @@ impl TypeChecker {
             }
             moved.entry(root).or_insert(tick);
         }
+        // Resolve aliases once, then scan each payload's ordered loan intervals.
+        // No per-use scan over all tasks or all aliases is needed.
+        let mut task_counts = HashMap::new();
+        let mut task_origins = HashSet::new();
+        for (_, task, _, _) in &loans {
+            if task_origins.insert(*task) {
+                *task_counts.entry(graph.root(*task)).or_insert(0usize) += 1;
+            }
+        }
+        let mut completed = HashMap::new();
+        for (task, tick) in waits {
+            let task = graph.root(task);
+            if !graph.borrowed[task] && !graph.escaped[task] {
+                completed.entry(task).or_insert(tick);
+            }
+        }
+        let mut intervals: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+        for (value, task, start, span) in loans {
+            let value = graph.root(value);
+            let task = graph.root(task);
+            if moved.get(&value).is_some_and(|tick| *tick < start) {
+                loan_errors.push((
+                    span,
+                    "cannot lend a non-Sync value after permanent transfer",
+                ));
+            }
+            let end = completed
+                .get(&task)
+                .copied()
+                .filter(|end| *end > start && task_counts[&task] == 1)
+                .unwrap_or(usize::MAX);
+            if graph.borrowed[value]
+                || graph.escaped[value]
+                || graph.loan_unsupported[value]
+                || graph.locks[value].is_some()
+            {
+                loan_errors.push((
+                    span,
+                    "cannot lend a borrowed, escaped, or unsupported non-Sync value to a task",
+                ));
+            }
+            let ranges = intervals.entry(value).or_default();
+            // Multiple aliases captured by this one task share a single loan.
+            if ranges.last() == Some(&(start, end)) {
+                continue;
+            }
+            if ranges.last().is_some_and(|(_, end)| start < *end) {
+                loan_errors.push((span, "non-Sync value already has an outstanding task loan"));
+            }
+            ranges.push((start, end));
+        }
+        let mut positions = HashMap::<usize, usize>::new();
         for (id, tick, span) in std::mem::take(&mut graph.uses) {
             let root = graph.root(id);
+            if let Some(ranges) = intervals.get(&root) {
+                let pos = positions.entry(root).or_default();
+                while *pos < ranges.len() && ranges[*pos].1 <= tick {
+                    *pos += 1;
+                }
+                if ranges
+                    .get(*pos)
+                    .is_some_and(|(start, end)| *start < tick && tick < *end)
+                {
+                    loan_errors.push((
+                        span,
+                        "non-Sync value is unavailable until its task has been awaited",
+                    ));
+                }
+            }
             if moved.get(&root).is_some_and(|moved| tick > *moved) {
+                if intervals.contains_key(&root) {
+                    loan_errors.push((
+                        span,
+                        "cannot access or lend a non-Sync value after permanent transfer",
+                    ));
+                }
                 diagnostics.push((span, "use of a non-Sync value after ownership transfer"));
             }
             if let Some((start, end_key)) = graph.locks[root]
@@ -600,6 +788,9 @@ impl TypeChecker {
         }
         for (id, span) in std::mem::take(&mut graph.escapes) {
             let root = graph.root(id);
+            if self.local.current_async_context && graph.loan_borrowed[root] {
+                loan_errors.push((span, "borrowed non-Sync argument may escape its async call"));
+            }
             if graph.locks[root].is_some() {
                 diagnostics.push((
                     span,
@@ -607,8 +798,31 @@ impl TypeChecker {
                 ));
             }
         }
+        for (span, reason) in loan_errors {
+            if let Some(ty @ Type::Named(_)) =
+                loan_exprs.get(&span).and_then(|id| self.expr_types.get(id))
+            {
+                let diagnostic = self.task_loan_failure(ty, span, reason);
+                self.push(diagnostic);
+                continue;
+            }
+            self.push(Diagnostic::new(Severity::Error, ErrorCode::E2402, reason)
+                .with_label(Label::primary(span, "exclusive task access cannot be established"))
+                .with_note("this value is not `Sync`; even immediately awaited calls require proof of exclusive access")
+                .with_help("use a fresh local Array/Map and await its task before reusing aliases; use FrozenArray/FrozenMap for snapshots or Mutex<Array<T>>/Mutex<Map<K, V>> for shared mutation"));
+        }
         #[cfg(test)]
-        COUNTS.with(|counts| counts.set((graph.ticks, graph.parents.len(), graph.root_steps)));
+        {
+            COUNTS.with(|counts| counts.set((graph.ticks, graph.parents.len(), graph.root_steps)));
+            TOTAL_COUNTS.with(|counts| {
+                let (ticks, nodes, roots) = counts.get();
+                counts.set((
+                    ticks + graph.ticks,
+                    nodes + graph.parents.len(),
+                    roots + graph.root_steps,
+                ));
+            });
+        }
         let mut reported = HashSet::new();
         for (span, reason) in diagnostics {
             if reported.insert(span) {
@@ -619,6 +833,9 @@ impl TypeChecker {
         }
     }
 }
+
+#[cfg(test)]
+thread_local! { static TOTAL_COUNTS: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) }; }
 
 #[cfg(test)]
 thread_local! { static COUNTS: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) }; }
@@ -642,6 +859,364 @@ mod tests {
             .into_iter()
             .filter(|d| d.severity == Severity::Error)
             .collect()
+    }
+
+    #[test]
+    fn task_loans_accept_owned_and_reject_alias_hazards() {
+        let extra = "async fn take(a: Array<i64>) { a[0] = 7; await sleep(0); } async fn pair(a: Array<i64>, b: Array<i64>) { a[0] = b[0]; } fn opaque(a: Array<i64>) {} class Holder { pub a: Array<i64>; }";
+        for (name, body, bad) in [
+            (
+                "immediate",
+                "let a = [1]; await take(a); println(a[0]);",
+                false,
+            ),
+            ("temporary", "await take([1]);", false),
+            (
+                "multiple arguments",
+                "let a = [1]; let b = [2]; await pair(a, b); println(a[0]); println(b[0]);",
+                false,
+            ),
+            (
+                "same task aliases",
+                "let a = [1]; await pair(a, a); println(a[0]);",
+                false,
+            ),
+            (
+                "parallel",
+                "let a = [1]; let b = [2]; let t = take(a); let u = take(b); await t; println(a[0]); await u; println(b[0]);",
+                false,
+            ),
+            (
+                "alias restored",
+                "let a = [1]; let b = a; let t = take(a); await t; println(b[0]);",
+                false,
+            ),
+            (
+                "task alias",
+                "let a = [1]; let t = take(a); let u = t; await u; println(a[0]);",
+                false,
+            ),
+            (
+                "repeat",
+                "let a = [1]; await take(a); await take(a); println(a[0]);",
+                false,
+            ),
+            ("detached move", "let a = [1]; let t = take(a);", false),
+            (
+                "early read",
+                "let a = [1]; let t = take(a); println(a[0]); await t;",
+                true,
+            ),
+            (
+                "early write",
+                "let a = [1]; let t = take(a); a[0] = 2; await t;",
+                true,
+            ),
+            (
+                "early alias",
+                "let a = [1]; let b = a; let t = take(a); println(b[0]); await t;",
+                true,
+            ),
+            (
+                "second task",
+                "let a = [1]; let t = take(a); let u = take(a); await t; await u;",
+                true,
+            ),
+            (
+                "wrong await",
+                "let a = [1]; let b = [2]; let t = take(a); let u = take(b); await u; println(a[0]); await t;",
+                true,
+            ),
+            (
+                "escaped before",
+                "let a = [1]; opaque(a); await take(a);",
+                true,
+            ),
+            (
+                "opaque during",
+                "let a = [1]; let t = take(a); opaque(a); await t;",
+                true,
+            ),
+            (
+                "mutex before",
+                "let a = [1]; let m = Mutex::new(a); await take(a);",
+                true,
+            ),
+            (
+                "mutex during",
+                "let a = [1]; let t = take(a); let m = Mutex::new(a); await t;",
+                true,
+            ),
+            ("field", "let h = new Holder([1]); await take(h.a);", false),
+            (
+                "contained alias",
+                "let a = [1]; let h = new Holder(a); await take(a);",
+                false,
+            ),
+            (
+                "conditional await",
+                "let a = [1]; let t = take(a); if true { await t; } println(a[0]);",
+                true,
+            ),
+            (
+                "conditional loan",
+                "let a = [1]; if true { await take(a); }",
+                true,
+            ),
+            (
+                "loop loan",
+                "let a = [1]; while false { await take(a); }",
+                true,
+            ),
+            (
+                "deferred alias",
+                "let a = [1]; defer { println(a[0]); } let t = take(a); await t;",
+                true,
+            ),
+            (
+                "captured alias",
+                "let a = [1]; let f: closure() -> i64 = || a[0]; await take(a);",
+                true,
+            ),
+            (
+                "task reassigned",
+                "let a = [1]; let mut t = take(a); t = take([2]); await t; println(a[0]);",
+                true,
+            ),
+        ] {
+            let errors = check(body, extra);
+            assert_eq!(!errors.is_empty(), bad, "{name}: {errors:?}");
+            if bad {
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| matches!(e.code, ErrorCode::E2402 | ErrorCode::E2408)),
+                    "{name}: {errors:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn task_loans_borrowed_arguments_cannot_escape() {
+        for body in [
+            "await take(a);",
+            "let m = Mutex::new(a);",
+            "let c: Channel<Array<i64>> = Channel::new(); c.send(a);",
+            "let c = BlockingCell::new(a);",
+            "opaque(a);",
+            "let h = new Holder(a); opaque(h.a);",
+            "let f: closure() -> i64 = || a[0];",
+            "return a;",
+        ] {
+            let extra = format!(
+                "class Holder {{ pub a: Array<i64>; }} fn opaque(a: Array<i64>) {{}} async fn take(a: Array<i64>) {{}} async fn leak(a: Array<i64>) -> Array<i64> {{ {body} return [1]; }}"
+            );
+            let errors = check("", &extra);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e.code, ErrorCode::E2402 | ErrorCode::E2408)),
+                "{body}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_loans_later_argument_permanent_transfer() {
+        let extra =
+            "async fn take(a: Array<i64>, m: Mutex<Array<i64>>) {} async fn one(a: Array<i64>) {}";
+        for body in [
+            "let a = [1]; let t = take(a, Mutex::new(a)); await t;",
+            "let a = [1]; let alias = a; await take(alias, Mutex::new(a));",
+            "let a = [1]; let alias = a; await take(a, Mutex::new(alias));",
+        ] {
+            let errors = check(body, extra);
+            assert!(
+                errors.iter().any(|e| e.code == ErrorCode::E2402
+                    && e.message.contains("after permanent transfer")),
+                "{body}: {errors:?}"
+            );
+        }
+        for body in [
+            "let a = [1]; let b = [2]; await take(a, Mutex::new(b)); println(a[0]);",
+            "let a = [1]; await one(a); let m = Mutex::new(a);",
+        ] {
+            let errors = check(body, extra);
+            assert!(errors.is_empty(), "{body}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn task_loans_owned_classes_and_field_aliases() {
+        let extra = "class Buffer { pub a: Array<i64>; pub async fn change(self) { self.a[0] = 2; await sleep(0); } } class Outer { pub b: Buffer; } async fn change(b: Buffer) { b.a[0] = 2; await sleep(0); } async fn array(a: Array<i64>) { a[0] = 3; } fn opaque(b: Buffer) {}";
+        for (body, bad) in [
+            (
+                "let b = new Buffer([1]); await change(b); println(b.a[0]);",
+                false,
+            ),
+            ("await change(new Buffer([1]));", false),
+            (
+                "let b = new Buffer([1]); let a = b.a; await change(b); println(a[0]);",
+                false,
+            ),
+            (
+                "let b = new Buffer([1]); await array(b.a); println(b.a[0]);",
+                false,
+            ),
+            (
+                "let b = new Buffer([1]); await b.change(); println(b.a[0]);",
+                false,
+            ),
+            (
+                "let b = new Buffer([1]); let c = new Buffer([2]); let t = b.change(); let u = change(c); await t; println(b.a[0]); await u; println(c.a[0]);",
+                false,
+            ),
+            (
+                "let o = new Outer(new Buffer([1])); await array(o.b.a); println(o.b.a[0]);",
+                false,
+            ),
+            (
+                "let b = new Buffer([1]); let a = b.a; let t = change(b); println(a[0]); await t;",
+                true,
+            ),
+            (
+                "let b = new Buffer([1]); let t = array(b.a); println(b.a[0]); await t;",
+                true,
+            ),
+            (
+                "let b = new Buffer([1]); let t = b.change(); println(b.a[0]); await t;",
+                true,
+            ),
+            (
+                "let b = new Buffer([1]); let c = b; let t = change(b); let u = change(c); await t; await u;",
+                true,
+            ),
+            (
+                "let a = [1]; let b = new Buffer(a); let c = new Buffer(a); let t = change(b); let u = change(c); await t; await u;",
+                true,
+            ),
+            ("let b = new Buffer([1]); opaque(b); await change(b);", true),
+            (
+                "let b = new Buffer([1]); let m = Mutex::new(b); await change(b);",
+                true,
+            ),
+            (
+                "let b = new Buffer([1]); let t = change(b); let m = Mutex::new(b.a); await t;",
+                true,
+            ),
+        ] {
+            let errors = check(body, extra);
+            assert_eq!(!errors.is_empty(), bad, "{body}: {errors:?}");
+            if bad {
+                assert!(
+                    errors.iter().any(|e| e.code == ErrorCode::E2402),
+                    "{errors:?}"
+                );
+            }
+        }
+        for body in [
+            "await change(b);",
+            "await b.change();",
+            "await array(b.a);",
+            "let m = Mutex::new(b);",
+            "let m = Mutex::new(b.a);",
+            "opaque(b);",
+            "let c: Channel<Buffer> = Channel::new(); c.send(b);",
+            "let f: closure() -> i64 = || b.a[0];",
+        ] {
+            let errors = check(
+                "",
+                &format!("{extra} async fn borrowed(b: Buffer) {{ {body} }}"),
+            );
+            assert!(
+                errors.iter().any(|e| e.code == ErrorCode::E2402),
+                "{body}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_loans_generic_class_and_nested_collections() {
+        let errors = check(
+            "let b = new Generic<i64>(1); await change_generic(b); println(b.v); let arrays = [[1]]; await nested(arrays); println(arrays[0][0]);",
+            "class Generic<T> { pub v: T; pub fn set(self, v: T) { self.v = v; } } async fn change_generic(b: Generic<i64>) { b.v = 3; } async fn nested(a: Array<Array<i64>>) { a[0][0] = 2; }",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn task_loans_linear_operation_counts() {
+        for shape in [
+            "functions",
+            "aliases",
+            "tasks",
+            "class_tasks",
+            "field_aliases",
+        ] {
+            for size in [16, 64, 256] {
+                let mut body = String::new();
+                let mut extra = String::from("async fn take(a: Array<i64>) { println(a[0]); }");
+                if matches!(shape, "class_tasks" | "field_aliases") {
+                    extra.push_str("class LoanBuffer { pub a: Array<i64>; pub async fn change(self) { self.a[0] = 2; } }");
+                }
+                match shape {
+                    "class_tasks" => {
+                        for i in 0..size {
+                            body.push_str(&format!(
+                                "let b{i} = new LoanBuffer([1]); let t{i} = b{i}.change();"
+                            ));
+                        }
+                        for i in 0..size {
+                            body.push_str(&format!("await t{i}; println(b{i}.a[0]);"));
+                        }
+                    }
+                    "field_aliases" => {
+                        body.push_str("let b = new LoanBuffer([1]); let a0 = b.a;");
+                        for i in 1..size {
+                            body.push_str(&format!("let a{i} = a{};", i - 1));
+                        }
+                        body.push_str("let t = b.change(); await t;");
+                        for i in 0..size {
+                            body.push_str(&format!("println(a{i}[0]);"));
+                        }
+                    }
+                    "functions" => {
+                        for i in 0..size {
+                            extra.push_str(&format!("async fn work{i}() {{ let a = [1]; await take(a); println(a[0]); }}"));
+                        }
+                    }
+                    "aliases" => {
+                        body.push_str("let a = [1]; let b0 = a;");
+                        for i in 1..size {
+                            body.push_str(&format!("let b{i} = b{};", i - 1));
+                        }
+                        body.push_str("let t = take(a); await t;");
+                        for i in 0..size {
+                            body.push_str(&format!("println(b{i}[0]);"));
+                        }
+                    }
+                    _ => {
+                        for i in 0..size {
+                            body.push_str(&format!("let a{i} = [1]; let t{i} = take(a{i});"));
+                        }
+                        for i in 0..size {
+                            body.push_str(&format!("await t{i}; println(a{i}[0]);"));
+                        }
+                    }
+                }
+                TOTAL_COUNTS.with(|c| c.set((0, 0, 0)));
+                let errors = check(&body, &extra);
+                assert!(errors.is_empty(), "{errors:?}");
+                let (ticks, nodes, roots) = TOTAL_COUNTS.with(|c| c.get());
+                eprintln!(
+                    "task loans {shape} n={size}: events={ticks} nodes={nodes} root_steps={roots}"
+                );
+                assert!(
+                    ticks <= 80 * size + 100 && nodes <= 20 * size + 20 && roots <= 80 * size + 100
+                );
+            }
+        }
     }
 
     #[test]

@@ -64,10 +64,14 @@ impl TypeChecker {
     /// Negative facts are unconditional. Positive facts discovered through an
     /// optimistic recursive edge are committed only when the root succeeds.
     pub(super) fn is_sync_cached(&self, ty: &Type, cache: &mut MarkerCache) -> bool {
+        self.marker_cached(ty, Marker::Sync, cache)
+    }
+
+    fn marker_cached(&self, ty: &Type, marker: Marker, cache: &mut MarkerCache) -> bool {
         let walk = &mut cache.0;
         walk.cache_failures = true;
         walk.saw_cycle = false;
-        let result = self.marker_holds(ty, Marker::Sync, walk);
+        let result = self.marker_holds(ty, marker, walk);
         if !result && walk.saw_cycle {
             for key in walk.newly_proven.drain(..) {
                 walk.proven.remove(&key);
@@ -80,8 +84,8 @@ impl TypeChecker {
 
     /// Check the arguments passed to an async fn call: each value is captured
     /// into a `Task` that may run on another worker, so a GC-reference argument
-    /// must be `Sync` and a scalar/value argument must be `Send` (spawn argument checking,
-    /// spec §8). Reports E2402 per offending argument.
+    /// must be `Sync` or pass the deferred exclusive collection-loan proof.
+    /// A scalar/value argument must be `Send`. Reports E2402 per offending argument.
     ///
     /// Only enforced when `enforce_send_sync` is set. Normal compilation sets
     /// it because Willow runs at least five workers.
@@ -89,6 +93,7 @@ impl TypeChecker {
         if !self.enforce_send_sync {
             return;
         }
+        let mut markers = MarkerCache::default();
         for (param, arg) in params.iter().zip(args.iter()) {
             let ty = &param.ty;
             // Scalars are copied into the task (need Send, always satisfied);
@@ -96,9 +101,16 @@ impl TypeChecker {
             let (ok, marker) = if is_value_type(ty) {
                 (self.is_send(ty), "Send")
             } else {
-                (self.is_sync(ty), "Sync")
+                (self.is_sync_cached(ty, &mut markers), "Sync")
             };
             if ok {
+                continue;
+            }
+            // Defer collection-content classification too: the body proof shares
+            // its marker cache across all loans and aliases, avoiding repeated
+            // walks of the same structural element types at each call.
+            if self.task_loan_candidate(ty) && matches!(param.mode, ParamMode::Value) {
+                self.local.task_loan_args.insert(arg.expr.id());
                 continue;
             }
             // An interface value follows the interface contract, so give the
@@ -169,6 +181,40 @@ impl TypeChecker {
                     .with_help(help),
             );
         }
+    }
+
+    pub(super) fn task_loan_candidate(&self, ty: &Type) -> bool {
+        crate::semantic::builtin_types::resolve(ty)
+            .is_some_and(|ty| matches!(ty.id, Builtin::Array | Builtin::Map))
+            || matches!(ty, Type::Named(name) if self.symbols.lookup_class(name).is_some())
+    }
+
+    pub(super) fn task_loan_type(&self, ty: &Type, markers: &mut MarkerCache) -> bool {
+        self.task_loan_candidate(ty) && self.marker_cached(ty, Marker::Send, markers)
+    }
+
+    pub(super) fn task_loan_failure(&self, ty: &Type, span: Span, reason: &str) -> Diagnostic {
+        let (note, help, field) = self.marker_failure_with_field(ty, Marker::Sync);
+        let mut diagnostic = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E2402,
+            format!(
+                "cannot pass `{}` to an async call: it is not `Sync`",
+                self.diagnostic_type_name(ty)
+            ),
+        )
+        .with_label(Label::primary(span, reason))
+        .with_note(note)
+        .with_note(reason)
+        .with_note(ASYNC_CAPTURE_SHARING_NOTE)
+        .with_help(help);
+        if let Some(field) = field.filter(|field| field.file_id == span.file_id) {
+            diagnostic = diagnostic.with_label(Label::secondary(
+                field,
+                "this field is reassigned after construction",
+            ));
+        }
+        diagnostic
     }
 
     fn is_interface_type(&self, ty: &Type) -> bool {
@@ -982,11 +1028,11 @@ mod tests {
                 .errors
                 .iter()
                 .flat_map(|d| &d.notes)
-                .filter(|n| n.as_str() == ASYNC_CAPTURE_SHARING_NOTE)
+                .filter(|n| n.contains("exclusive access"))
                 .count();
             let visits = REASON_VISITS.with(|n| n.get());
             assert_eq!(notes, calls);
-            assert_eq!(visits, calls);
+            assert_eq!(visits, 0);
             eprintln!("immediate-await calls={calls} notes={notes} reason_visits={visits}");
         }
     }

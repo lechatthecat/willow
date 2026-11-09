@@ -1,0 +1,35 @@
+import std::collections::Array;
+
+class Buffer {
+    pub values: Array<i64>;
+    pub async fn add(self, amount: i64) {
+        await sleep(1);
+        self.values[0] = self.values[0] + amount;
+    }
+}
+
+async fn add(buffer: Buffer, amount: i64) {
+    await sleep(1);
+    buffer.values[0] = buffer.values[0] + amount;
+}
+
+async fn increment(values: Array<i64>) {
+    await sleep(1);
+    values[0] = values[0] + 1;
+}
+
+async fn main() {
+    let first = new Buffer([10]);
+    let alias = first.values;
+    await add(first, 1);
+    println(alias[0]);
+    let second = new Buffer([20]);
+    let left = first.add(2);
+    let right = add(second, 3);
+    await left;
+    println(first.values[0]);
+    await right;
+    println(second.values[0]);
+    await increment(first.values);
+    println(alias[0]);
+}

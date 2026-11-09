@@ -47,7 +47,8 @@ async fn main() {
 const NONSYNC_ARG_SRC: &str = r#"
 import std::collections::Array;
 async fn use_xs(xs: Array<i64>) -> i64 { await sleep(1); return xs[0]; }
-async fn main() { let xs: Array<i64> = [1, 2, 3]; println(await use_xs(xs)); }
+async fn forward(xs: Array<i64>) { println(await use_xs(xs)); }
+async fn main() { await forward([1, 2, 3]); }
 "#;
 
 // ── Multi-worker capstone ─────────────────────────────────────
