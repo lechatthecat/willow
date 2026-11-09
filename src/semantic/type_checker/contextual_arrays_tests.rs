@@ -686,3 +686,56 @@ fn static_frozen_array_freeze_hint_scales_per_initializer() {
         eprintln!("initializers={count} diagnostics={count} hints={count}");
     }
 }
+
+#[test]
+fn enum_array_payload_contexts() {
+    let declarations = "import std::collections::Array; enum Bag { Items(Array<i64>), None } enum Tree { Leaf(Array<i64>), Split(Tree) } enum Generic<T> { Items(Array<T>), None }";
+    let cases = [
+        ("direct", "let x = Bag::Items([]);"),
+        ("nonempty", "let x = Bag::Items([1]);"),
+        ("annotated", "let x: Bag = Bag::Items([]);"),
+        ("nested", "let x = Tree::Split(Tree::Leaf([]));"),
+        ("deep", "let x = Tree::Split(Tree::Split(Tree::Leaf([])));"),
+        ("explicit generic", "let x = Generic<i64>::Items([]);"),
+        (
+            "context generic",
+            "let x: Generic<i64> = Generic::Items([]);",
+        ),
+        ("generic nonempty", "let x = Generic::Items([1]);"),
+        ("string", "let x = Generic<String>::Items([]);"),
+        ("bool", "let x = Generic<bool>::Items([]);"),
+        ("float", "let x = Generic<f64>::Items([]);"),
+        ("nested arrays", "let x = Generic<Array<i64>>::Items([[]]);"),
+        ("ternary", "let x = Bag::Items(true ? [] : []);"),
+        (
+            "match",
+            "let x = Bag::Items(match true { true => [], false => [] });",
+        ),
+        ("parenthesized", "let x = Bag::Items(([]));"),
+        ("variable", "let a: Array<i64> = []; let x = Bag::Items(a);"),
+    ];
+    for (name, body) in cases {
+        let errors = check_source(&format!("{declarations} fn main() {{ {body} }}"));
+        assert!(
+            !errors.iter().any(|d| d.severity == Severity::Error),
+            "{name}: {errors:?}"
+        );
+    }
+    for body in [
+        "let x = Generic::Items([]);",
+        "let x = Bag::Items([true]);",
+        "let x = Generic<i64>::Items([true]);",
+        "let x = Bag::Items();",
+        "let x = Bag::Items([], []);",
+    ] {
+        let errors = check_source(&format!("{declarations} fn main() {{ {body} }}"));
+        assert!(
+            errors.iter().any(|d| d.severity == Severity::Error),
+            "{body}: {errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|d| d.code == ErrorCode::E0800),
+            "{body}: {errors:?}"
+        );
+    }
+}

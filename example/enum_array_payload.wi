@@ -1,0 +1,24 @@
+import std::collections::Array;
+
+enum Bag { Items(Array<i64>), None }
+enum Tree { Leaf(Array<i64>), Split(Tree) }
+enum Generic<T> { Items(Array<T>), None }
+
+fn size(b: Bag) -> i64 {
+    return match b { Bag::Items(xs) => xs.len(), Bag::None => -1 };
+}
+fn leaves(t: Tree) -> i64 {
+    return match t { Tree::Leaf(xs) => xs.len(), Tree::Split(child) => leaves(child) };
+}
+fn make() -> Generic<i64> { return Generic::Items([]); }
+fn main() {
+    println(size(Bag::Items([])));
+    println(size(Bag::Items([7])));
+    println(leaves(Tree::Split(Tree::Split(Tree::Leaf([])))));
+    let g = Generic<String>::Items([]);
+    match g { Generic::Items(xs) => println(xs.len()), Generic::None => println(-1) }
+    let h = make();
+    match h { Generic::Items(xs) => println(xs.len()), Generic::None => println(-1) }
+    println(size(Bag::Items(true ? [] : [])));
+    println(size(Bag::Items(match false { true => [], false => [] })));
+}

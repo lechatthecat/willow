@@ -2385,7 +2385,7 @@ impl TypeChecker {
             );
         }
         for (param_ty, arg) in variant.payload_types.iter().zip(args.iter()) {
-            let arg_ty = self.check_expr(&arg.expr);
+            let arg_ty = self.check_expr_expecting(&arg.expr, param_ty);
             if !self.types_compatible(param_ty, &arg_ty) {
                 self.push_type_mismatch_with_code(
                     ErrorCode::E0201,

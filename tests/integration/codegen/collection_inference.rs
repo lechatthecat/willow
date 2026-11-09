@@ -268,3 +268,78 @@ fn array_literal_tlab_size_boundary_preserves_elements() {
         }
     }
 }
+
+#[test]
+fn enum_array_payload_native() {
+    let source = include_str!("../../../example/enum_array_payload.wi");
+    for run in [compile_and_run, compile_and_run_release] {
+        let (out, ok) = run(source);
+        assert!(ok, "{out}");
+        assert_eq!(out, "0\n1\n0\n0\n0\n0\n0\n");
+    }
+}
+
+#[test]
+fn enum_array_payload_module() {
+    let files = [
+        (
+            "bags.wi",
+            "module bags; import std::collections::Array; pub enum Bag { Items(Array<i64>), None } pub fn make() -> Bag { let b = Bag::Items([]); return b; }",
+        ),
+        (
+            "main.wi",
+            "import bags; fn main() { let b = bags::make(); match b { bags::Bag::Items(xs) => println(xs.len()), bags::Bag::None => println(-1) } let c = bags::Bag::Items([]); match c { bags::Bag::Items(xs) => println(xs.len()), bags::Bag::None => println(-1) } }",
+        ),
+    ];
+    let (out, ok) = compile_temp_project_and_run(&files, "main.wi");
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n0\n");
+}
+
+#[test]
+fn enum_array_payload_uninferred_diagnostic() {
+    assert_compile_error_contains(
+        "import std::collections::Array; enum Bag<T> { Items(Array<T>) } fn main() { let x = Bag::Items([]); }",
+        &["error[E0201]", "type argument for `T` must be a value type"],
+    );
+}
+
+#[test]
+fn enum_array_payload_allocation_scaling() {
+    let mut library_sites = None;
+    for sites in [1, 8, 32, 128] {
+        let mut source = String::from(
+            "import std::collections::Array; enum Bag { Items(Array<i64>) } fn main() {",
+        );
+        for index in 0..sites {
+            source.push_str(&format!("let b{index} = Bag::Items([]);"));
+        }
+        source.push('}');
+        let names = compile_and_collect_relocation_targets_all(&source, &[]);
+        let allocations = names
+            .iter()
+            .filter(|name| *name == "willow_array_new_literal")
+            .count();
+        let library = *library_sites.get_or_insert(allocations - sites);
+        assert_eq!(allocations, sites + library);
+        println!("enum sites={sites} array allocations={allocations}");
+    }
+}
+
+#[test]
+fn enum_array_payload_deep_scaling() {
+    for depth in [1, 8, 32, 128] {
+        let source = format!(
+            "import std::collections::Array; enum Tree {{ Leaf(Array<i64>), Split(Tree) }} fn main() {{ let t = {}Tree::Leaf([]){}; }}",
+            "Tree::Split(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let names = compile_and_collect_relocation_targets_all(&source, &[]);
+        let allocations = names
+            .iter()
+            .filter(|name| *name == "willow_array_new_literal")
+            .count();
+        assert_eq!(allocations, 1);
+        println!("enum depth={depth} array allocations={allocations}");
+    }
+}
