@@ -460,6 +460,64 @@ impl UnitCodegenContext<'_> {
         f: &FunctionDecl,
         lir: LirFunction,
     ) -> Result<()> {
+        self.compile_cooperative_task(name, f, lir, None, &f.name)
+    }
+
+    /// Cooperative async method lowering: compile the method symbol itself as a
+    /// task constructor with normal method ABI (`self`, params...) -> `Task<T>`,
+    /// then compile a poll fn that binds `self`/params from the async frame.
+    pub(super) fn compile_cooperative_method(
+        &mut self,
+        class_name: &str,
+        mangled: &str,
+        m: &MethodDecl,
+        lir: LirFunction,
+    ) -> Result<()> {
+        let poll_decl = FunctionDecl {
+            requires: Vec::new(),
+            ensures: Vec::new(),
+            effect_contracts: Vec::new(),
+            return_type_span: None,
+            type_params: Vec::new(),
+            name: QualifiedName::join(
+                QualifiedName::new(class_name)
+                    .strip_qualifier(crate::semantic::ids::LOCAL_NAMESPACE)
+                    .unwrap_or(class_name),
+                &m.name,
+            ),
+            public: m.public,
+            is_async: true,
+            params: m.params.clone(),
+            return_type: m.return_type.clone(),
+            body: Block {
+                id: crate::parser::ast::BodyId::fresh(),
+                stmts: Vec::new(),
+                span: m.span,
+            },
+            span: m.span,
+            rust_bridge: None,
+            constant: None,
+        };
+        self.compile_cooperative_task(
+            mangled,
+            &poll_decl,
+            lir,
+            Some((class_name, m.is_static)),
+            &QualifiedName::join(class_name, &m.name),
+        )
+    }
+
+    /// Shared constructor, poll and cancellation lowering. `method` supplies
+    /// the class context and static flag; methods always reserve an ABI receiver
+    /// argument, but only instance methods store a receiver in the frame.
+    fn compile_cooperative_task(
+        &mut self,
+        name: &str,
+        f: &FunctionDecl,
+        lir: LirFunction,
+        method: Option<(&str, bool)>,
+        warning_name: &str,
+    ) -> Result<()> {
         let poll_symbol = coop_poll_symbol(name);
         let mut poll_sig = self.output.module.make_signature();
         poll_sig.params.push(AbiParam::new(reference_type(
@@ -501,6 +559,17 @@ impl UnitCodegenContext<'_> {
                 ty: Type::I64,
             },
         ];
+        let receiver_class = method
+            .filter(|(_, is_static)| !is_static)
+            .map(|(class, _)| class);
+        if let Some(class_name) = receiver_class {
+            slots.push(AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
+                source_span: None,
+                name: "self".to_string(),
+                ty: Type::Named(class_name.to_string().into()),
+            });
+        }
         for p in &f.params {
             slots.push(AsyncFrameSlot {
                 storage_kind: crate::ir::lowered::LirStorageKind::Value,
@@ -509,8 +578,9 @@ impl UnitCodegenContext<'_> {
                 ty: p.ty.clone().into(),
             });
         }
-        // Locals after the params: frame-backed so they survive the task's own
-        // suspensions, keyed by LirLocalId.
+        // Lowered parameters always start at slot 2: instance methods include
+        // the receiver as their first lowered parameter. Locals follow the
+        // parameters, frame-backed across suspensions and keyed by LirLocalId.
         let (layout, lir_offsets, lir_defer_offsets, lir_send_offsets) =
             self.lir_async_layout(&lir, slots, 2)?;
         let parameter_offsets: Vec<_> = lir
@@ -519,7 +589,7 @@ impl UnitCodegenContext<'_> {
             .filter(|local| local.parameter)
             .map(|local| lir_offsets[&local.id])
             .collect();
-        self.record_async_frame_size_warning(&f.name, f.span, &layout);
+        self.record_async_frame_size_warning(warning_name, f.span, &layout);
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
         let result_offset = async_frame_slot_offset(
@@ -530,6 +600,9 @@ impl UnitCodegenContext<'_> {
             FRAME_SLOT_TASK_ID,
             reference_type(self.output.module.target_config()).bytes(),
         );
+        let self_offset = receiver_class.map(|_| parameter_offsets[0]);
+        let param_base = usize::from(receiver_class.is_some());
+        let abi_param_base = usize::from(method.is_some());
         let param_bindings: Vec<_> = lir
             .locals
             .iter()
@@ -548,6 +621,12 @@ impl UnitCodegenContext<'_> {
         let ctor_fid = self.func_ids[name];
         let mut ctx = self.output.module.make_context();
         let mut sig = self.output.module.make_signature();
+        if method.is_some() {
+            // Static methods retain the dummy receiver in their public ABI.
+            sig.params.push(AbiParam::new(reference_type(
+                self.output.module.target_config(),
+            )));
+        }
         for p in &f.params {
             sig.params.push(AbiParam::new(param_abi_type(
                 p,
@@ -576,9 +655,21 @@ impl UnitCodegenContext<'_> {
         // Store args into their param slots (slots 2..) before spawning (no
         // allocation happens between alloc and spawn, so the unrooted frame is
         // safe).
+        if let Some(offset) = self_offset {
+            let self_arg = builder.block_params(entry)[0];
+            emit_gc_heap_store_raw(
+                &mut builder,
+                Some(barrier_ref),
+                frame,
+                offset,
+                self_arg,
+                GcStoreDestination::AsyncFrameSlot,
+                MemFlagsData::trusted(),
+            );
+        }
         for (i, p) in f.params.iter().enumerate() {
-            let arg = builder.block_params(entry)[i];
-            let off = parameter_offsets[i];
+            let arg = builder.block_params(entry)[abi_param_base + i];
+            let off = parameter_offsets[param_base + i];
             if matches!(p.mode, ParamMode::Reference { .. }) {
                 let ptr_ty = reference_type(self.output.module.target_config());
                 let base = builder.ins().load(ptr_ty, MemFlagsData::new(), arg, 0);
@@ -690,7 +781,7 @@ impl UnitCodegenContext<'_> {
             CoopPollBody {
                 boundary: None,
                 cleanup: None,
-                current_class: None,
+                current_class: method.map(|(class, _)| class),
                 lir: &lir,
                 result_offset: Some(result_offset),
                 lir_defer_offsets,
@@ -698,319 +789,6 @@ impl UnitCodegenContext<'_> {
             },
         )?;
         let diagnostic_function = self.runtime_name(&f.name);
-        self.compile_async_cancel_fn(cancel_fid, &diagnostic_function, &sites, &lock_sites)?;
-        Ok(())
-    }
-
-    /// Cooperative async method lowering: compile the method symbol itself as a
-    /// task constructor with normal method ABI (`self`, params...) -> `Task<T>`,
-    /// then compile a poll fn that binds `self`/params from the async frame.
-    pub(super) fn compile_cooperative_method(
-        &mut self,
-        class_name: &str,
-        mangled: &str,
-        m: &MethodDecl,
-        lir: LirFunction,
-    ) -> Result<()> {
-        let poll_symbol = coop_poll_symbol(mangled);
-        let mut poll_sig = self.output.module.make_signature();
-        poll_sig.params.push(AbiParam::new(reference_type(
-            self.output.module.target_config(),
-        )));
-        poll_sig.returns.push(AbiParam::new(types::I32));
-        let poll_fid =
-            self.output
-                .module
-                .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
-        self.func_ids.insert(poll_symbol.clone(), poll_fid);
-        // Cancellation cleanup entry.
-        let cancel_symbol = coop_cancel_symbol(mangled);
-        let mut cancel_sig = self.output.module.make_signature();
-        cancel_sig.params.push(AbiParam::new(reference_type(
-            self.output.module.target_config(),
-        )));
-        let cancel_fid =
-            self.output
-                .module
-                .declare_function(&cancel_symbol, Linkage::Local, &cancel_sig)?;
-
-        let mut slots = vec![
-            AsyncFrameSlot {
-                storage_kind: crate::ir::lowered::LirStorageKind::Value,
-                source_span: Some(m.span),
-                name: "__result".to_string(),
-                ty: m.return_type.clone().into(),
-            },
-            AsyncFrameSlot {
-                storage_kind: crate::ir::lowered::LirStorageKind::Value,
-                source_span: None,
-                name: "__task_id".to_string(),
-                ty: Type::I64,
-            },
-        ];
-        let self_offset = if m.is_static {
-            None
-        } else {
-            let offset = async_frame_slot_offset(
-                slots.len(),
-                reference_type(self.output.module.target_config()).bytes(),
-            );
-            slots.push(AsyncFrameSlot {
-                storage_kind: crate::ir::lowered::LirStorageKind::Value,
-                source_span: None,
-                name: "self".to_string(),
-                ty: Type::Named(class_name.to_string().into()),
-            });
-            Some(offset)
-        };
-        let first_param_slot = slots.len();
-        for p in &m.params {
-            slots.push(AsyncFrameSlot {
-                storage_kind: crate::ir::lowered::LirStorageKind::Value,
-                source_span: Some(p.span),
-                name: p.name.clone(),
-                ty: p.ty.clone().into(),
-            });
-        }
-
-        // The LOWERED parameter list of an instance method starts with the
-        // `self` receiver (`lower_method` pushes it first), and that receiver
-        // already owns the frame slot just before the declared parameters -- so
-        // the lowered parameters start one slot earlier than `m.params` does.
-        // Handing `first_param_slot` straight to the LIR layout would map `self`
-        // onto the first declared parameter's slot and shift every parameter by
-        // one.
-        let lir_first_param_slot = if m.is_static {
-            first_param_slot
-        } else {
-            first_param_slot - 1
-        };
-        let (layout, lir_offsets, lir_defer_offsets, lir_send_offsets) =
-            self.lir_async_layout(&lir, slots, lir_first_param_slot)?;
-        let parameter_offsets: Vec<_> = lir
-            .locals
-            .iter()
-            .filter(|local| local.parameter)
-            .map(|local| lir_offsets[&local.id])
-            .collect();
-        self.record_async_frame_size_warning(
-            &QualifiedName::join(class_name, &m.name),
-            m.span,
-            &layout,
-        );
-        let slot_count = layout.slot_count() as i64;
-        let mask = layout.gc_slot_mask as i64;
-        let result_offset = async_frame_slot_offset(
-            FRAME_SLOT_RESULT,
-            reference_type(self.output.module.target_config()).bytes(),
-        );
-        let task_id_offset = async_frame_slot_offset(
-            FRAME_SLOT_TASK_ID,
-            reference_type(self.output.module.target_config()).bytes(),
-        );
-
-        let self_offset = self_offset.map(|_| parameter_offsets[0]);
-        let param_base = usize::from(!m.is_static);
-        let param_bindings: Vec<_> = lir
-            .locals
-            .iter()
-            .filter(|local| local.parameter)
-            .enumerate()
-            .map(|(i, local)| {
-                (
-                    local.name.clone(),
-                    VarStorage::async_local(local, parameter_offsets[i]),
-                )
-            })
-            .collect();
-
-        let ctor_fid = self.func_ids[mangled];
-        let mut ctx = self.output.module.make_context();
-        let mut sig = self.output.module.make_signature();
-        let ptr_ty = reference_type(self.output.module.target_config());
-        sig.params.push(AbiParam::new(reference_type(
-            self.output.module.target_config(),
-        ))); // self/dummy method ABI slot
-        for p in &m.params {
-            sig.params
-                .push(AbiParam::new(param_abi_type(p, ptr_ty, self.classes())));
-        }
-        sig.returns.push(AbiParam::new(reference_type(
-            self.output.module.target_config(),
-        )));
-        ctx.func.signature = sig;
-        ctx.func.name = UserFuncName::user(0, ctor_fid.as_u32());
-        let mut fn_ctx = FunctionBuilderContext::new();
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
-        let entry = builder.create_block();
-        builder.append_block_params_for_function_params(entry);
-        builder.switch_to_block(entry);
-        builder.seal_block(entry);
-
-        let barrier_fid = self.func_id(rt::willow_gc_write_barrier);
-        let barrier_ref = self
-            .output
-            .module
-            .declare_func_in_func(barrier_fid, builder.func);
-        let frame =
-            self.emit_async_frame_alloc(&mut builder, slot_count, mask, &layout.gc_payload_bitmap);
-
-        if let Some(offset) = self_offset {
-            let self_arg = builder.block_params(entry)[0];
-            emit_gc_heap_store_raw(
-                &mut builder,
-                Some(barrier_ref),
-                frame,
-                offset,
-                self_arg,
-                GcStoreDestination::AsyncFrameSlot,
-                MemFlagsData::trusted(),
-            );
-        }
-        for (i, p) in m.params.iter().enumerate() {
-            let arg = builder.block_params(entry)[i + 1];
-            let off = parameter_offsets[param_base + i];
-            if matches!(p.mode, ParamMode::Reference { .. }) {
-                let ptr_ty = reference_type(self.output.module.target_config());
-                let base = builder.ins().load(ptr_ty, MemFlagsData::new(), arg, 0);
-                let offset = builder.ins().load(ptr_ty, MemFlagsData::new(), arg, 8);
-                emit_gc_heap_store_raw(
-                    &mut builder,
-                    Some(barrier_ref),
-                    frame,
-                    off,
-                    base,
-                    GcStoreDestination::AsyncFrameSlot,
-                    MemFlagsData::trusted(),
-                );
-                builder
-                    .ins()
-                    .store(MemFlagsData::trusted(), offset, frame, off + 8);
-                continue;
-            }
-            emit_gc_heap_store_raw(
-                &mut builder,
-                (!super::option_repr::is_scalar_pair(&p.ty)
-                    && is_gc_managed(
-                        &crate::semantic::ids::SemanticType::from(&p.ty),
-                        &self.enum_infos,
-                    ))
-                .then_some(barrier_ref),
-                frame,
-                off,
-                arg,
-                GcStoreDestination::AsyncFrameSlot,
-                MemFlagsData::trusted(),
-            );
-        }
-
-        let poll_ref = self
-            .output
-            .module
-            .declare_func_in_func(poll_fid, builder.func);
-        let poll_addr = builder
-            .ins()
-            .func_addr(reference_type(self.output.module.target_config()), poll_ref);
-        let spawn_fid = self.func_id(rt::willow_sched_spawn_cooperative);
-        let spawn_ref = self
-            .output
-            .module
-            .declare_func_in_func(spawn_fid, builder.func);
-        let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);
-        let task_id = builder.inst_results(spawn_call)[0];
-        builder
-            .ins()
-            .store(MemFlagsData::trusted(), task_id, frame, task_id_offset);
-        // No cleanup callback is needed for a task without deferred actions
-        // or lexical locks; cancellation must not allocate a native stack just
-        // to invoke an empty callback.
-        if lir
-            .blocks
-            .iter()
-            .flat_map(|block| &block.instrs)
-            .any(|inst| {
-                matches!(
-                    inst,
-                    LirInst::Defer { .. } | LirInst::EnterDeferScope { lock: Some(_), .. }
-                )
-            })
-        {
-            // Attach the cancellation cleanup entry.
-            let cancel_ref = self
-                .output
-                .module
-                .declare_func_in_func(cancel_fid, builder.func);
-            let cancel_addr = builder.ins().func_addr(
-                reference_type(self.output.module.target_config()),
-                cancel_ref,
-            );
-            let native_cleanup = lir.blocks.iter().flat_map(|block| &block.instrs).any(|inst|
-                matches!(inst, LirInst::Defer { body, .. } if super::lir_gen::cleanup_needs_task_stack(&body.function)));
-            let needs_stack = builder.ins().iconst(types::I32, i64::from(native_cleanup));
-            let set_fid = self.func_id(rt::willow_sched_set_cancel_fn_cooperative);
-            let set_ref = self
-                .output
-                .module
-                .declare_func_in_func(set_fid, builder.func);
-            builder
-                .ins()
-                .call(set_ref, &[task_id, cancel_addr, needs_stack]);
-        }
-        builder.ins().return_(&[frame]);
-        builder.finalize(self.output.module.target_config());
-        self.output
-            .module
-            .define_function(ctor_fid, &mut ctx)
-            .map_err(|e| {
-                if *crate::diagnostic_settings::VERIFY_DEBUG {
-                    eprintln!("[verify] {e:?}");
-                }
-                e
-            })?;
-        self.output.module.clear_context(&mut ctx);
-
-        let poll_decl = FunctionDecl {
-            requires: Vec::new(),
-            ensures: Vec::new(),
-            effect_contracts: Vec::new(),
-            return_type_span: None,
-            type_params: Vec::new(),
-            name: QualifiedName::join(
-                QualifiedName::new(class_name)
-                    .strip_qualifier(crate::semantic::ids::LOCAL_NAMESPACE)
-                    .unwrap_or(class_name),
-                &m.name,
-            ),
-            public: m.public,
-            is_async: true,
-            params: m.params.clone(),
-            return_type: m.return_type.clone(),
-            body: Block {
-                id: crate::parser::ast::BodyId::fresh(),
-                stmts: Vec::new(),
-                span: m.span,
-            },
-            span: m.span,
-            rust_bridge: None,
-            constant: None,
-        };
-        let (sites, lock_sites) = self.compile_coop_main_poll(
-            &poll_symbol,
-            &poll_decl,
-            HashMap::new(),
-            lir_offsets,
-            &param_bindings,
-            CoopPollBody {
-                boundary: None,
-                cleanup: None,
-                current_class: Some(class_name),
-                lir: &lir,
-                result_offset: Some(result_offset),
-                lir_defer_offsets,
-                lir_send_offsets,
-            },
-        )?;
-        let diagnostic_function = self.runtime_name(&poll_decl.name);
         self.compile_async_cancel_fn(cancel_fid, &diagnostic_function, &sites, &lock_sites)?;
         Ok(())
     }
