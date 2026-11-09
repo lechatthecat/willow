@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
-pub(crate) const WRAPPER_SCHEMA: &str = "5";
+pub(crate) const WRAPPER_SCHEMA: &str = "6";
 
 pub type RustBridgeSymbols = Vec<((u32, String), RustBridgeSymbol)>;
 
@@ -84,6 +84,12 @@ impl Scalar {
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NonblockingReview {
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RustBridgeSymbol {
     pub rust_crate: String,
     pub willow_function: String,
@@ -93,6 +99,9 @@ pub struct RustBridgeSymbol {
     pub effects: u8,
     #[serde(default)]
     pub close_handle: bool,
+    /// Developer assertion, bound to the resolved lock and bridge source.
+    #[serde(default)]
+    pub nonblocking: Option<Box<NonblockingReview>>,
 }
 impl RustBridgeSymbol {
     pub fn aggregate(&self) -> bool {
@@ -109,6 +118,7 @@ impl RustBridgeSymbol {
         Self {
             rust_crate: String::new(),
             close_handle: false,
+            nonblocking: None,
             abi_symbol: name.clone(),
             willow_function: name,
             input_types: inputs,
@@ -116,6 +126,19 @@ impl RustBridgeSymbol {
             effects: effects.bits() | willow_abi::ffi::FOREIGN_CALL,
         }
     }
+    pub fn declare_nonblocking(&mut self, fingerprint: String) {
+        self.nonblocking = Some(Box::new(NonblockingReview { fingerprint }));
+        self.effects &= !willow_abi::RuntimeEffects::MAY_BLOCK.bits();
+    }
+
+    pub fn entry_guard(&self) -> &'static str {
+        if self.nonblocking.is_some() {
+            "willow_rust_bridge_enter_nonblocking"
+        } else {
+            "willow_rust_bridge_enter"
+        }
+    }
+
     pub fn bind(&self, identity: &str) -> Self {
         let mut bound = self.clone();
         bound.rust_crate = identity.into();
@@ -139,7 +162,7 @@ impl RustBridgeSymbol {
 /// Exactly one adapter per declaration; O(declarations + parameters + output).
 pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revision: u32) -> String {
     let mut source = format!(
-        "#[allow(dead_code)] #[path = {abi_path:?}] mod willow_bridge_abi;\nconst _: () = assert!(willow_bridge_abi::WILLOW_RUST_BRIDGE_ABI_REVISION == {revision});\nunsafe extern \"C\" {{ fn willow_rust_bridge_enter(revision: u32); fn willow_rust_bridge_panic() -> !; }}\n"
+        "#[allow(dead_code)] #[path = {abi_path:?}] mod willow_bridge_abi;\nconst _: () = assert!(willow_bridge_abi::WILLOW_RUST_BRIDGE_ABI_REVISION == {revision});\nunsafe extern \"C\" {{ fn willow_rust_bridge_enter(revision: u32); fn willow_rust_bridge_enter_nonblocking(revision: u32); fn willow_rust_bridge_panic() -> !; }}\n"
     );
     source.push_str(
         "#[cfg(panic = \"abort\")] compile_error!(\"Rust bridge requires panic=unwind\");\n",
@@ -188,7 +211,8 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
         for (i, ty) in symbol.input_types.iter().enumerate() {
             write!(source, "a{i}: {},", ty.rust()).unwrap();
         }
-        write!(source, ") -> {} {{\nunsafe {{ willow_rust_bridge_enter({revision}); }}\nmatch std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\nlet adapter: fn(", symbol.output_type.rust()).unwrap();
+        let guard = symbol.entry_guard();
+        write!(source, ") -> {} {{\nunsafe {{ {guard}({revision}); }}\nmatch std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\nlet adapter: fn(", symbol.output_type.rust()).unwrap();
         for ty in &symbol.input_types {
             write!(source, "{},", ty.rust()).unwrap();
         }

@@ -156,6 +156,7 @@ pub struct VarInfo {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FuncInfo {
     #[serde(default)]
+    /// Foreign call without a bounded, nonblocking developer declaration.
     pub foreign: bool,
     pub params: Vec<Type>,
     pub param_infos: Vec<ParamInfo>,

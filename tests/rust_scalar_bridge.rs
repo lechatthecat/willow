@@ -1387,3 +1387,318 @@ fn opaque_last_lease_destructor_precedes_output_conversion() {
         "42\n"
     );
 }
+
+impl Fixture {
+    fn reviewed_sources(&self, willow: &str, rust: &str) -> String {
+        let placeholder = "0".repeat(64);
+        self.sources(&willow.replace("REVIEW", &placeholder), rust);
+        let output = self.successful(&["query", "rust-bridge", "--offline", "--format", "json"]);
+        let query: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let fingerprint = query["review_fingerprint"].as_str().unwrap();
+        let source = willow.replace("REVIEW", fingerprint);
+        self.sources(&source, rust);
+        source
+    }
+}
+
+#[test]
+fn nonblocking_task_scalar_aggregate_indirect_lock_and_no_wait() {
+    let f = Fixture::new();
+    let rust = "pub fn add(a:i64,b:i64)->i64 {a+b} pub fn echo(s:&str)->String {s.into()} pub fn maybe()->Option<i64> {Some(7)}";
+    f.reviewed_sources(
+        r#"
+        extern rust native {
+            nonblocking("REVIEW") fn add(a:i64,b:i64)->i64;
+            nonblocking("REVIEW") fn echo(s:String)->String;
+            nonblocking("REVIEW") fn maybe()->Option<i64>;
+        }
+        @effects(no_wait) fn helper()->i64 { return native::add(20,22); }
+        async fn main() {
+            println(helper());
+            let f = native::add; println(f(-2, 3));
+            println(native::echo("task string"));
+            match native::maybe() { Some(x)=>{println(x);} None=>{println(0);} }
+            let m = Mutex::new(0);
+            lock m as value { println(native::add(1,2)); }
+        }
+    "#,
+        rust,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
+        "42\n1\ntask string\n7\n3\n"
+    );
+    let output = f.successful(&[
+        "query",
+        "rust-bridge",
+        "native::add",
+        "--offline",
+        "--format",
+        "json",
+    ]);
+    let q: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let bridge = &q["bridges"][0];
+    assert_eq!(bridge["trust"], "developer_declared");
+    assert_eq!(bridge["official_verified"], false);
+    assert_eq!(bridge["review_current"], true);
+    let effects = bridge["effects"].as_u64().unwrap() as u8;
+    assert_eq!(effects & willow_abi::RuntimeEffects::MAY_BLOCK.bits(), 0);
+    assert_ne!(effects & willow_abi::RuntimeEffects::MAY_ALLOCATE.bits(), 0);
+    assert_ne!(effects & willow_abi::RuntimeEffects::MAY_PANIC.bits(), 0);
+    assert_ne!(effects & willow_abi::ffi::FOREIGN_CALL, 0);
+}
+
+#[test]
+fn nonblocking_reviews_expire_on_source_manifest_and_dependency_changes() {
+    let f = Fixture::new();
+    let template = r#"extern rust { nonblocking("REVIEW") fn add(a:i64,b:i64)->i64; } async fn main() {println(add(20,22));}"#;
+    let source = f.reviewed_sources(template, ADD);
+    f.successful(&["check", "--offline"]);
+    // Bridge edits, dependency version updates, and feature changes all require review.
+    for change in ["bridge", "version", "manifest"] {
+        match change {
+            "bridge" => fs::write(f.root.join("bridge.rs"), format!("{ADD} // revised")).unwrap(),
+            "version" => {
+                let path = f.root.join("native/Cargo.toml");
+                let text = fs::read_to_string(&path).unwrap().replace("1.2.3", "1.2.4");
+                fs::write(path, text).unwrap();
+            }
+            _ => {
+                let path = f.root.join("project.toml");
+                let text = fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("default-features = false", "default-features = true");
+                fs::write(path, text).unwrap();
+            }
+        }
+        let output = f.command(&["check", "--offline"]);
+        assert!(!output.status.success(), "{change}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("rust_nonblocking_review_required"),
+            "{change}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let current_rust = fs::read_to_string(f.root.join("bridge.rs")).unwrap();
+        f.reviewed_sources(template, &current_rust);
+        f.successful(&["check", "--offline"]);
+    }
+    f.sources(&source, ADD);
+    assert!(!f.command(&["check", "--offline"]).status.success());
+}
+
+#[test]
+fn nonblocking_malformed_and_pure_assertions_fail_closed() {
+    let f = Fixture::new();
+    for modifier in [
+        "nonblocking",
+        "nonblocking(1)",
+        "nonblocking(\"short\")",
+        "nonblocking(\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\")",
+        "official_verified",
+        "pure",
+    ] {
+        f.sources(
+            &format!("extern rust {{ {modifier} fn touch(); }} fn main() {{}}"),
+            "pub fn touch() {}",
+        );
+        assert!(
+            !f.command(&["check", "--offline"]).status.success(),
+            "{modifier}"
+        );
+    }
+    f.sources(&r#"extern rust { nonblocking("REVIEW") fn touch(); } @pure fn claim() {touch();} fn main() {}"#.replace("REVIEW", &"0".repeat(64)), "pub fn touch() {}");
+    assert!(!f.command(&["check", "--offline"]).status.success());
+}
+
+#[test]
+fn nonblocking_task_panic_is_contained() {
+    let f = Fixture::new();
+    f.reviewed_sources(r#"extern rust { nonblocking("REVIEW") fn fail(); } async fn main() {fail(); println(987654321);}"#, "pub fn fail() {panic!(\"task bridge panic\");}");
+    let output = f.command(&["run", "--offline"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("RustPanic"), "{stderr}");
+    assert!(
+        !stderr.contains("panic in a function that cannot unwind"),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("987654321"));
+}
+
+#[test]
+fn nonblocking_adapter_admission_counts_are_constant_per_call() {
+    for count in [1, 16, 256, 1024] {
+        let symbols: Vec<_> = (0..count)
+            .map(|_| {
+                let mut symbol = RustBridgeSymbol::new("f".into(), vec![Scalar::I64], Scalar::I64);
+                symbol.declare_nonblocking("0".repeat(64));
+                symbol
+            })
+            .collect();
+        let source = wrappers(&symbols, Path::new("ffi.rs"), 1);
+        assert_eq!(
+            source
+                .matches("willow_rust_bridge_enter_nonblocking(1)")
+                .count(),
+            count
+        );
+        assert_eq!(
+            source
+                .matches("let _region = BridgeRegion::enter()")
+                .count(),
+            count
+        );
+        assert_eq!(source.matches("std::panic::catch_unwind").count(), count);
+        assert!(!source.contains("willow_rust_bridge_enter(1)"));
+        eprintln!("declarations={count} admission={count} region={count} panic_boundary={count}");
+    }
+}
+
+#[test]
+fn nonblocking_many_tasks_gc_and_native_stack() {
+    let f = Fixture::new();
+    let rust = format!(
+        r#"
+        {WAIT_FOR_COLLECTION}
+        #[inline(never)]
+        pub fn work(value:i64)->i64 {{
+            let mut stack = [0u8; 256 * 1024];
+            for (i, byte) in stack.iter_mut().enumerate() {{ *byte = i as u8; }}
+            std::hint::black_box(&mut stack);
+            value + i64::from(stack[42])
+        }}
+        pub fn collect_during_call(text:&str)->String {{
+            wait_for_collection();
+            text.to_owned()
+        }}
+    "#
+    );
+    f.reviewed_sources(
+        r#"
+        import std::collections::Array;
+        extern rust {
+            nonblocking("REVIEW") fn work(value:i64)->i64;
+            nonblocking("REVIEW") fn collect_during_call(text:String)->String;
+        }
+        async fn worker(value:i64)->i64 { return work(value); }
+        async fn heartbeat()->i64 { await sleep(1); return 99; }
+        async fn main() {
+            let beat = heartbeat();
+            let tasks: Array<Task<i64>> = [];
+            let mut i = 0;
+            while i < 128 { tasks.push(worker(i)); i = i + 1; }
+            let mut total = 0;
+            let mut j = 0;
+            while j < tasks.len() { total = total + await tasks[j]; j = j + 1; }
+            println(total);
+            println(await beat);
+            println(collect_during_call("root survives collection"));
+        }
+    "#,
+        &rust,
+    );
+    let output = f.command_env(&["run", "--offline"], &[("WILLOW_WORKERS", "4")]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "13504\n99\nroot survives collection\n"
+    );
+}
+
+#[test]
+fn nonblocking_does_not_disable_undeclared_runtime_guard() {
+    let f = Fixture::new();
+    f.reviewed_sources(r#"extern rust { nonblocking("REVIEW") fn attempt(); } async fn main() {attempt();}"#,
+        &format!("pub fn attempt() {{ unsafe extern \"C\" {{ fn willow_rust_bridge_enter(revision:u32); }} unsafe {{ willow_rust_bridge_enter({}); }} println!(\"UNDECLARED_BODY\"); }}", willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION));
+    let output = f.command(&["run", "--offline"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("rust_bridge_worker_blocking"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("UNDECLARED_BODY"));
+}
+
+#[test]
+fn nonblocking_imported_declaration_under_lock_and_no_wait() {
+    let f = Fixture::new();
+    let declaration = f.reviewed_sources(
+        r#"extern rust { nonblocking("REVIEW") fn add(a:i64,b:i64)->i64; } fn main() {}"#,
+        ADD,
+    );
+    fs::write(
+        f.root.join("src/foreign.wi"),
+        declaration.replace("fn main() {}", ""),
+    )
+    .unwrap();
+    f.sources("import foreign; @effects(no_wait) fn invoke()->i64 { return foreign::add(20,22); } async fn main() { let m = Mutex::new(0); lock m as value { println(invoke()); } }", ADD);
+    assert_eq!(
+        String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
+        "42\n"
+    );
+}
+
+#[test]
+fn nonblocking_foreign_body_allows_other_worker_and_gc_progress() {
+    let f = Fixture::new();
+    // An intentionally prolonged native body probes GC/scheduler isolation,
+    // rather than claiming that busy waiting is a valid production declaration.
+    let rust = format!(
+        r#"
+        {WAIT_FOR_COLLECTION}
+        use std::sync::atomic::{{AtomicBool, Ordering}};
+        static STARTED:AtomicBool = AtomicBool::new(false);
+        static NOTIFIED:AtomicBool = AtomicBool::new(false);
+        pub fn started()->bool {{STARTED.load(Ordering::SeqCst)}}
+        pub fn notify() {{NOTIFIED.store(true,Ordering::SeqCst);}}
+        pub fn hold()->i64 {{
+            STARTED.store(true, Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !NOTIFIED.load(Ordering::SeqCst) {{
+                if std::time::Instant::now() >= deadline {{ panic!("OTHER_TASK_STALLED"); }}
+                std::hint::spin_loop();
+            }}
+            wait_for_collection();
+            42
+        }}
+    "#
+    );
+    f.reviewed_sources(
+        r#"
+        extern rust {
+            nonblocking("REVIEW") fn started()->bool;
+            nonblocking("REVIEW") fn notify();
+            nonblocking("REVIEW") fn hold()->i64;
+        }
+        async fn held()->i64 { return hold(); }
+        async fn other() { while !started() { await sleep(1); } notify(); }
+        async fn main() { let h = held(); let o = other(); await o; println(await h); }
+    "#,
+        &rust,
+    );
+    let output = f.command_env(&["run", "--offline"], &[("WILLOW_WORKERS", "2")]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+}
+
+#[test]
+fn nonblocking_regex_example_review_is_portable() {
+    let f = Fixture::new();
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/rust_task_bridge");
+    for file in ["project.toml", "bridge.rs", "src/main.wi"] {
+        fs::copy(example.join(file), f.root.join(file)).unwrap();
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
+        "true\nfalse\n"
+    );
+}

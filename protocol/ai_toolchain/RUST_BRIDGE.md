@@ -99,3 +99,44 @@ manager and cannot silently rewrite code during resolution. Cargo check may run
 build scripts/procedural macros, as in the existing Rust check workflow. Native
 runtime auto-build, adapter ABI generation, and linking remain owned by their
 existing build paths.
+
+
+## Bounded synchronous calls from tasks
+
+A function can declare `nonblocking("<review_fingerprint>")` before `fn` inside
+`extern rust`. Obtain the current fingerprint with `willow query rust-bridge`.
+Review the adapter and its resolved dependencies before copying the fingerprint
+into each function declaration. `check`, `build`, and `run` reject stale reviews.
+The fingerprint binds the resolved Cargo.lock (including crate versions), root
+bridge source, and Rust manifest configuration. Dependency updates require a new
+review; local path dependencies and bridge submodules still require developer
+review when their implementation changes without changing those inputs.
+
+This is a developer assertion that the complete call, including conversion and
+native destructors, is short and bounded, fits the available native stack, and
+never calls back into Willow. It permits direct execution on a scheduler worker;
+it does not move work to a blocking pool or add preemption inside Rust. Task
+native stacks reserve 8 MiB with platform guard protection; this is a total stack
+budget, not a promise that all 8 MiB remain at a particular call site. Long or
+blocking operations must remain undeclared. Foreign bodies retain GC idle regions,
+pinned inputs and panic containment. Aggregate conversion still costs time
+proportional to the values copied. Native Rust panic terminates with `RustPanic`
+without unwinding through the C ABI.
+
+The declaration removes MAY_BLOCK, permitting `no_wait` and lock contexts, while
+retaining MAY_ALLOCATE, MAY_PANIC and FOREIGN_CALL. It never establishes purity.
+Undeclared functions retain static task rejection and the runtime task guard.
+Generated opaque close functions remain undeclared because arbitrary native
+Drop implementations can block.
+
+Records expose `effects`, `nonblocking`, `trust`, and `official_verified`.
+`trust` distinguishes `undeclared`, `developer_declared`, and the reserved
+`official_verified` category. There are currently no officially verified adapters;
+source syntax cannot claim that status. Standalone Cargo-backed queries also
+return `review_fingerprint` and per-record `review_current`; snapshot-only queries
+do not claim that a review matches the current dependency resolution.
+
+`example/rust_task_bridge` runs the crates.io regex implementation from two Tasks
+with a fixed pattern and a 64-byte input limit. Run `willow run
+example/rust_task_bridge`. If dependency resolution has changed, inspect the
+query, review the new resolved graph and refresh the declaration before running.

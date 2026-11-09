@@ -32,6 +32,10 @@ impl InteropGraph {
             "crate": if self.crates.len() == 1 { json!(self.crates[0]) } else { Value::Null },
             "rust_adapter":self.rust_adapter,
             "abi_symbol":b.symbol.abi_symbol,
+            "effects":b.symbol.effects,
+            "nonblocking":b.symbol.nonblocking,
+            "trust":if b.symbol.nonblocking.is_some() {"developer_declared"} else {"undeclared"},
+            "official_verified":false,
             "signature":{"inputs":b.symbol.input_types,"output":b.symbol.output_type},
             "declaration":b.declaration,"declaration_text":b.declaration_text,
             "coverage":"conservative adapter dependency set; Rust internals are opaque"

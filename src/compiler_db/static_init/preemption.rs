@@ -31,6 +31,13 @@ impl StaticInitQueries {
                 Item::Function(f) if f.is_async => {
                     tasks.push((FunctionId::free_from_source_name(&f.name), f.span));
                 }
+                Item::Function(f)
+                    if f.rust_bridge
+                        .as_ref()
+                        .is_some_and(|bridge| bridge.nonblocking.is_some()) =>
+                {
+                    leaves.insert(FunctionId::free_from_source_name(&f.name));
+                }
                 Item::Class(c) => {
                     let owner = TypeId::local(&c.name);
                     if c.constructors.is_empty() {
@@ -78,7 +85,11 @@ impl StaticInitQueries {
                 .items
                 .iter()
                 .filter_map(|item| match item {
-                    Item::Function(f) if f.rust_bridge.is_some() => {
+                    Item::Function(f)
+                        if f.rust_bridge
+                            .as_ref()
+                            .is_some_and(|bridge| bridge.nonblocking.is_none()) =>
+                    {
                         Some(FunctionId::free_from_source_name(&f.name))
                     }
                     _ => None,

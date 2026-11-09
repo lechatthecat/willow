@@ -1,0 +1,10 @@
+extern rust {
+    nonblocking("7781c20f601fc9762ee316a1d6c845ba67a8e5166ff763613661c62be5cf67ab") fn is_identifier(text:String)->bool;
+}
+async fn validate(text:String)->bool { return is_identifier(text); }
+async fn main() {
+    let first = validate("hello_42");
+    let second = validate("42hello");
+    println(await first);
+    println(await second);
+}

@@ -1375,7 +1375,7 @@ struct UnitInventory<'a> {
     contract_spans: HashMap<BodyId, crate::diagnostics::Span>,
     pending: Vec<(FunctionId, BodyId, &'a Block)>,
     helpers: HashMap<FunctionId, crate::diagnostics::Span>,
-    foreign: Vec<(FunctionId, crate::diagnostics::Span)>,
+    foreign: Vec<(FunctionId, crate::diagnostics::Span, bool)>,
     value_constructors: Vec<FunctionId>,
     /// Injected default copies the checker skipped: they have no typed body in
     /// this unit and reuse their declaring interface's check.
@@ -1401,10 +1401,12 @@ impl<'a> UnitInventory<'a> {
                     if let Some(clause) = f.requires.first().or(f.ensures.first()) {
                         inventory.contract_spans.insert(f.body.id, clause.span());
                     }
-                    if f.rust_bridge.is_some() {
-                        inventory
-                            .foreign
-                            .push((FunctionId::free_from_source_name(&f.name), f.span));
+                    if let Some(bridge) = &f.rust_bridge {
+                        inventory.foreign.push((
+                            FunctionId::free_from_source_name(&f.name),
+                            f.span,
+                            bridge.nonblocking.is_some(),
+                        ));
                         continue;
                     }
                     inventory.pending.push((id, f.body.id, &f.body));
@@ -1556,7 +1558,7 @@ impl<'a> ColdUnitSolve<'a> {
     fn seed_declarations(
         &mut self,
         value_constructors: Vec<FunctionId>,
-        foreign: Vec<(FunctionId, crate::diagnostics::Span)>,
+        foreign: Vec<(FunctionId, crate::diagnostics::Span, bool)>,
     ) -> usize {
         // Memberwise and enum initialization only store already-evaluated arguments.
         // Publish its empty summary even when no body in this unit constructs the
@@ -1567,26 +1569,28 @@ impl<'a> ColdUnitSolve<'a> {
             self.own.insert(id);
             self.seed(id, RuntimeEffects::NONE, None);
         }
-        for (id, span) in foreign {
+        for (id, span, nonblocking) in foreign {
             self.seed(
                 id,
                 PANIC.union(RuntimeEffects::MAY_ALLOCATE),
                 Some(EffectWitness::External(id)),
             );
-            self.seed(
-                id,
-                RuntimeEffects::MAY_BLOCK,
-                Some(EffectWitness::Lock(LockEffectWitness {
-                    owner: id,
-                    cause: LockEffectCause {
-                        is_conservative: false,
-                        span,
-                        operation: "extern rust".into(),
-                        kind: LockEffectKind::Block,
-                        lock: None,
-                    },
-                })),
-            );
+            if !nonblocking {
+                self.seed(
+                    id,
+                    RuntimeEffects::MAY_BLOCK,
+                    Some(EffectWitness::Lock(LockEffectWitness {
+                        owner: id,
+                        cause: LockEffectCause {
+                            is_conservative: false,
+                            span,
+                            operation: "extern rust".into(),
+                            kind: LockEffectKind::Block,
+                            lock: None,
+                        },
+                    })),
+                );
+            }
             self.may_io.insert(id);
         }
         visits

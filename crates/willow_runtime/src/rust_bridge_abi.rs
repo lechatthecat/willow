@@ -1,4 +1,4 @@
-//! R2 permits synchronous foreign calls only, outside scheduler task execution.
+//! Foreign-call admission; only explicitly reviewed bounded calls admit tasks.
 pub(crate) mod aggregate;
 #[cfg(test)]
 mod handles;
@@ -14,6 +14,17 @@ pub extern "C" fn willow_rust_bridge_enter(revision: u32) {
         );
     }
 }
+/// Generated only for declarations whose review fingerprint the build checked.
+/// The assertion covers bounded running time, native stack use, and no callbacks
+/// into Willow. The body retains its GC idle region and panic boundary.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_rust_bridge_enter_nonblocking(revision: u32) {
+    if revision != willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION {
+        crate::failure::fatal_invariant("rust_bridge_abi_mismatch");
+    }
+}
+
 /// Enter the GC safe region around user Rust code, which can block for any
 /// length of time. Adapters decode arguments first and encode results after:
 /// the foreign body sees only native values, pinned strings and handle leases.
@@ -44,23 +55,30 @@ mod tests {
     #[test]
     fn incompatible_revision_stops_before_foreign_execution() {
         const KEY: &str = "WILLOW_TEST_RUST_BRIDGE_REVISION";
-        if std::env::var_os(KEY).is_some() {
-            willow_rust_bridge_enter(willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION + 1);
+        if let Ok(kind) = std::env::var(KEY) {
+            let enter = if kind == "bounded" {
+                willow_rust_bridge_enter_nonblocking
+            } else {
+                willow_rust_bridge_enter
+            };
+            enter(willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION + 1);
             panic!("REVISION_GATE_RETURNED");
         }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "rust_bridge_abi::tests::incompatible_revision_stops_before_foreign_execution",
-                "--nocapture",
-            ])
-            .env(KEY, "1")
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("rust_bridge_abi_mismatch"), "{stderr}");
-        assert!(!stderr.contains("REVISION_GATE_RETURNED"), "{stderr}");
+        for kind in ["legacy", "bounded"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rust_bridge_abi::tests::incompatible_revision_stops_before_foreign_execution",
+                    "--nocapture",
+                ])
+                .env(KEY, kind)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("rust_bridge_abi_mismatch"), "{stderr}");
+            assert!(!stderr.contains("REVISION_GATE_RETURNED"), "{stderr}");
+        }
     }
     #[test]
     fn synchronous_current_revision_enters_without_side_effects() {

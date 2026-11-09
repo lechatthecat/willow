@@ -197,7 +197,10 @@ impl TypeChecker {
             f.return_type_span.as_deref().copied().unwrap_or(f.span),
         );
         let info = FuncInfo {
-            foreign: f.rust_bridge.is_some(),
+            foreign: f
+                .rust_bridge
+                .as_ref()
+                .is_some_and(|bridge| bridge.nonblocking.is_none()),
             param_infos,
             params,
             return_type,

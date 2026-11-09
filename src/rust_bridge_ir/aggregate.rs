@@ -194,8 +194,9 @@ impl Scalar {
 
 pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, revision: u32) {
     let target = QualifiedName::new(&symbol.willow_function).last_segment();
+    let guard = symbol.entry_guard();
     let mutable = if symbol.close_handle { "" } else { "mut " };
-    writeln!(source, "#[unsafe(no_mangle)] pub unsafe extern \"C\" fn {}(input: *const BridgeValue, output: *mut BridgeValue) {{\nunsafe {{ willow_rust_bridge_enter({revision}); }}\nlet outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\nlet {mutable}frame = BridgeFrame::new();",symbol.abi_symbol).unwrap();
+    writeln!(source, "#[unsafe(no_mangle)] pub unsafe extern \"C\" fn {}(input: *const BridgeValue, output: *mut BridgeValue) {{\nunsafe {{ {guard}({revision}); }}\nlet outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\nlet {mutable}frame = BridgeFrame::new();",symbol.abi_symbol).unwrap();
     for (i, ty) in symbol.input_types.iter().enumerate() {
         writeln!(source, "let a{i} = unsafe {{ *input.add({i}) }};").unwrap();
         if ty.reference() {

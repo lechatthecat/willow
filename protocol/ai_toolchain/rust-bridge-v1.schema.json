@@ -34,6 +34,12 @@
       "items": {
         "$ref": "#/$defs/crate"
       }
+    },
+    "review_fingerprint": {
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "$defs": {
@@ -162,6 +168,30 @@
         },
         "coverage": {
           "type": "string"
+        },
+        "effects": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "nonblocking": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trust": {
+          "enum": [
+            "undeclared",
+            "developer_declared",
+            "official_verified"
+          ]
+        },
+        "official_verified": {
+          "type": "boolean"
+        },
+        "review_current": {
+          "type": "boolean"
         }
       }
     },

@@ -175,6 +175,7 @@ pub struct BridgeBuild {
     pub toolchain: RustToolchain,
     pub directory: PathBuf,
     pub cache_key: String,
+    pub review_fingerprint: String,
     pub target: String,
     pub staticlib: Option<PathBuf>,
     pub messages: CargoMessages,
@@ -647,10 +648,27 @@ fn prepare_bridge(
     if options.locked && previous.as_ref() != Some(&rust_lock) {
         bail!("rust_lockfile_stale: Cargo resolution or direct version summary changed");
     }
-    let source_hash = hash(&serde_json::to_vec(&(
-        hash_file(&bridge)?,
-        &options.symbols,
+    // Compute once for all declarations. Source and manifest changes require
+    // review even when Cargo's resolved package versions have not changed.
+    let bridge_hash = hash_file(&bridge)?;
+    let review = hash(&serde_json::to_vec(&(
+        &lock_hash,
+        &bridge_hash,
+        &rust_lock.bridge_input_hash,
     ))?);
+    for symbol in &options.symbols {
+        if let Some(declared) = &symbol.nonblocking
+            && declared.fingerprint != review
+            && !matches!(action, BridgeAction::Metadata | BridgeAction::Edit { .. })
+        {
+            bail!(
+                "rust_nonblocking_review_required: {}: review current bridge and dependencies, then use nonblocking(\"{}\")",
+                symbol.willow_function,
+                review
+            );
+        }
+    }
+    let source_hash = hash(&serde_json::to_vec(&(&bridge_hash, &options.symbols))?);
     let manifest_hash = hash(manifest.as_bytes());
     let cache_key = BridgeCacheKey {
         target,
@@ -672,6 +690,7 @@ fn prepare_bridge(
         let build = BridgeBuild {
             directory,
             cache_key,
+            review_fingerprint: review,
             target: target.to_owned(),
             staticlib: None,
             messages: CargoMessages::default(),
@@ -694,6 +713,7 @@ fn prepare_bridge(
     Ok(Some(BridgeBuild {
         directory,
         cache_key,
+        review_fingerprint: review,
         target: target.to_owned(),
         staticlib,
         messages,

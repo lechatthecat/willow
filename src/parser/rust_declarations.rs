@@ -91,6 +91,32 @@ impl Parser {
                 }));
                 continue;
             }
+            let nonblocking = if matches!(self.peek_kind(), TokenKind::Ident(word) if word == "nonblocking")
+            {
+                self.advance();
+                self.expect(TokenKind::LParen)?;
+                let TokenKind::StringLiteral(fingerprint) = self.peek_kind().clone() else {
+                    return Err(self.err(
+                        ErrorCode::E0102,
+                        "nonblocking requires a review fingerprint string",
+                    ));
+                };
+                if fingerprint.len() != 64
+                    || !fingerprint
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                {
+                    return Err(self.err(
+                        ErrorCode::E0102,
+                        "nonblocking requires a lowercase SHA-256 review fingerprint",
+                    ));
+                }
+                self.advance();
+                self.expect(TokenKind::RParen)?;
+                Some(fingerprint)
+            } else {
+                None
+            };
             self.expect(TokenKind::Fn)?;
             let name = self.expect_ident()?;
             if name == "main" {
@@ -129,13 +155,17 @@ impl Parser {
             })?;
             self.expect(TokenKind::Semicolon)?;
             let span = span.to(self.previous_span());
+            let mut symbol = RustBridgeSymbol::new(name.clone(), inputs, output);
+            if let Some(fingerprint) = nonblocking {
+                symbol.declare_nonblocking(fingerprint);
+            }
             items.push(Item::Function(FunctionDecl {
                 requires: Vec::new(),
                 ensures: Vec::new(),
                 effect_contracts: Vec::new(),
                 return_type_span: None,
                 type_params: Vec::new(),
-                rust_bridge: Some(RustBridgeSymbol::new(name.clone(), inputs, output)),
+                rust_bridge: Some(symbol),
                 name,
                 public: true,
                 is_async: false,

@@ -193,12 +193,22 @@ impl RustCommand {
                 .context("query rust-bridge requires Willow sources")?
                 .semantic
                 .interop;
+            let mut review = None;
             if enabled {
                 let build = inspect_bridge(&project, &root, &self.options)?
                     .context("Rust bridge missing")?;
                 graph.resolved_crates(&build.direct_dependencies)?;
+                review = Some(build.review_fingerprint);
             }
-            let value = graph.query(self.selector.as_deref());
+            let mut value = graph.query(self.selector.as_deref());
+            value["review_fingerprint"] = serde_json::json!(review);
+            for bridge in value["bridges"].as_array_mut().unwrap() {
+                bridge["review_current"] = serde_json::json!(
+                    review
+                        .as_ref()
+                        .is_some_and(|r| bridge["nonblocking"].as_str() == Some(r))
+                );
+            }
             super::write_machine_output(&value)?;
             return Ok(());
         }
