@@ -223,6 +223,7 @@ error_codes! {
     E2404, // interface value crossing a task boundary is not Send
     E2405, // interface value crossing a task boundary is not Sync
     E2406, // implementing class violates an inherited Send/Sync interface contract
+    E2408, // non-Sync ownership transfer or protected-value escape
     W2407, // static mut restricts task execution to a single worker
     // Standard library import warnings W20xx
     W2002, // duplicate import

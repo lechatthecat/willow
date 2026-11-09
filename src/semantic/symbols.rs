@@ -196,6 +196,9 @@ pub struct FieldInfo {
 /// most one constructor per class.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ConstructorInfo {
+    /// Source body has no calls or stores outside the new receiver.
+    #[serde(default)]
+    pub isolated_body: bool,
     pub params: Vec<Type>,
     pub param_infos: Vec<ParamInfo>,
     pub public: bool,
@@ -222,6 +225,10 @@ pub struct StaticPropInfo {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MethodInfo {
+    /// Source body has no calls or stores outside its receiver. This fact is
+    /// part of declaration fingerprints used by incremental body checking.
+    #[serde(default)]
+    pub isolated_body: bool,
     #[serde(default)]
     pub effect_contracts: Vec<crate::parser::ast::EffectContract>,
     #[serde(default)]

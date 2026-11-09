@@ -60,6 +60,24 @@ impl TypeChecker {
         self.marker_holds(ty, Marker::Sync, &mut MarkerWalk::default())
     }
 
+    /// Reuse structural marker facts within one immutable body environment.
+    /// Negative facts are unconditional. Positive facts discovered through an
+    /// optimistic recursive edge are committed only when the root succeeds.
+    pub(super) fn is_sync_cached(&self, ty: &Type, cache: &mut MarkerCache) -> bool {
+        let walk = &mut cache.0;
+        walk.cache_failures = true;
+        walk.saw_cycle = false;
+        let result = self.marker_holds(ty, Marker::Sync, walk);
+        if !result && walk.saw_cycle {
+            for key in walk.newly_proven.drain(..) {
+                walk.proven.remove(&key);
+            }
+        } else {
+            walk.newly_proven.clear();
+        }
+        result
+    }
+
     /// Check the arguments passed to an async fn call: each value is captured
     /// into a `Task` that may run on another worker, so a GC-reference argument
     /// must be `Sync` and a scalar/value argument must be `Send` (spawn argument checking,
@@ -447,6 +465,10 @@ impl TypeChecker {
         visiting: &mut MarkerWalk,
         reasons: &mut Option<MarkerFailure>,
     ) -> bool {
+        #[cfg(test)]
+        {
+            visiting.visits += 1;
+        }
         if Self::is_error_type(ty)
             || matches!(ty, Type::Named(name) | Type::Generic(name, _)
                 if self.invalid_type_names.borrow().contains(name))
@@ -465,6 +487,9 @@ impl TypeChecker {
             return true;
         }
         let key = (ty.clone(), marker);
+        if visiting.cache_failures && visiting.failed.contains(&key) {
+            return false;
+        }
         if visiting.proven.contains(&key) || self.marker_contract_proven.contains(&key) {
             return true;
         }
@@ -588,7 +613,11 @@ impl TypeChecker {
             ));
         }
         if result {
-            visiting.proven.insert(key);
+            if visiting.proven.insert(key.clone()) && visiting.cache_failures {
+                visiting.newly_proven.push(key);
+            }
+        } else if visiting.cache_failures {
+            visiting.failed.insert(key);
         }
         result
     }
@@ -704,11 +733,19 @@ struct MarkerFailure {
 
 #[derive(Default)]
 struct MarkerWalk {
+    #[cfg(test)]
+    visits: usize,
+    cache_failures: bool,
+    failed: HashSet<(Type, Marker)>,
+    newly_proven: Vec<(Type, Marker)>,
     saw_cycle: bool,
     active: HashSet<(String, Marker)>,
     // Scoped to one root query: a false result short-circuits the entire walk.
     proven: HashSet<(Type, Marker)>,
 }
+
+#[derive(Default)]
+pub(super) struct MarkerCache(MarkerWalk);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) enum Marker {
@@ -1104,6 +1141,45 @@ mod tests {
                     for d in diagnostics {
                         assert!(!d.helps.iter().any(|h| h.contains("interface")), "{d:?}");
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ownership_marker_cache_preserves_cycles_and_scales() {
+        for size in [16, 64, 256] {
+            let mut source = String::from("class Leaf { pub bad: Array<i64>; }");
+            for i in 0..size {
+                let child = if i == 0 {
+                    "Leaf".into()
+                } else {
+                    format!("Node{}", i - 1)
+                };
+                source.push_str(&format!("class Node{i} {{ pub child: {child}; }}"));
+            }
+            let c = checker(&source);
+            let mut cache = MarkerCache::default();
+            for i in (0..size).rev() {
+                assert!(!c.is_sync_cached(&named(&format!("Node{i}")), &mut cache));
+            }
+            eprintln!("ownership marker chain n={size}: visits={}", cache.0.visits);
+            assert!(cache.0.visits <= 3 * size + 3);
+        }
+        for source in [
+            "class A { b: B; bad: Array<i64>; } class B { a: A; }",
+            "class A { b: B; } class B { a: A; bad: Array<i64>; }",
+            "class A { b: B; } class B { a: A; }",
+        ] {
+            let c = checker(source);
+            for order in [["A", "B", "A"], ["B", "A", "B"]] {
+                let mut cache = MarkerCache::default();
+                for name in order {
+                    assert_eq!(
+                        c.is_sync_cached(&named(name), &mut cache),
+                        c.is_sync(&named(name)),
+                        "{source}: {name}"
+                    );
                 }
             }
         }

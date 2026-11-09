@@ -375,6 +375,7 @@ impl TypeChecker {
         }
         let previous_effect_callable =
             std::mem::replace(&mut self.local.current_effect_callable, lambda_callable);
+        let saved_lexical = std::mem::take(&mut self.local.lexical_block_depth);
         let saved_loop = std::mem::take(&mut self.local.loop_depth);
         let saved_lock = std::mem::take(&mut self.local.lock_depth);
         let saved_async = std::mem::replace(&mut self.local.current_async_context, false);
@@ -387,6 +388,10 @@ impl TypeChecker {
             expected_return,
             expected_closure,
         );
+        if let LambdaBody::Expr(expr) = &l.body {
+            self.check_transfer_ownership(crate::parser::iter::AstEvent::Expr(expr));
+        }
+        self.local.lexical_block_depth = saved_lexical;
         self.local.loop_depth = saved_loop;
         self.local.lock_depth = saved_lock;
         self.local.current_async_context = saved_async;

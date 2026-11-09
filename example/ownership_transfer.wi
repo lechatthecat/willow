@@ -1,0 +1,25 @@
+// A non-Sync value belongs to its mutex or channel after transfer.
+// Keep protected references inside lock; copy scalar results out.
+class Parcel {
+    pub count: i64;
+    pub fn add(self, amount: i64) { self.count += amount; }
+}
+
+async fn main() {
+    let parcel = new Parcel(40);
+    parcel.add(1);
+    let shared = Mutex::new(parcel);
+    let mut count = 0;
+    lock shared as value {
+        value.add(1);
+        count = value.count;
+    }
+    println(count);
+
+    let channel: Channel<Parcel> = Channel::new();
+    let outgoing = new Parcel(7);
+    channel.send(outgoing);
+    let incoming = channel.recv();
+    let received = Mutex::new(incoming);
+    lock received as value { println(value.count); }
+}

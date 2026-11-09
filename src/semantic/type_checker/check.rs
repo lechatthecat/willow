@@ -1460,6 +1460,9 @@ impl TypeChecker {
         }
         self.symbols.pop_scope();
         self.local.lexical_block_depth -= u32::from(lexical);
+        if self.local.lexical_block_depth == 0 {
+            self.check_transfer_ownership(crate::parser::iter::AstEvent::Block(block));
+        }
     }
 
     /// Type-check `lock <target> as [mut] <binding> { .. }`.

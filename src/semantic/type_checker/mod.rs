@@ -48,6 +48,7 @@ mod string_find_tests;
 mod subclass_constructor_tests;
 #[cfg(test)]
 mod super_call_tests;
+mod transfer_ownership;
 #[cfg(test)]
 mod type_arity_tests;
 pub(crate) mod types;
@@ -913,6 +914,11 @@ impl TypeChecker {
                 .map(|p| self.normalize_decl_type(&p.ty, p.type_span, module_prefix))
                 .collect();
             crate::semantic::symbols::ConstructorInfo {
+                isolated_body: transfer_ownership::isolated_body(&ctor.body)
+                    && ctor
+                        .params
+                        .iter()
+                        .all(|p| !matches!(p.mode, ParamMode::Reference { .. })),
                 param_infos: self.normalize_decl_param_infos(&ctor.params, module_prefix),
                 params,
                 public: ctor.public,
@@ -931,6 +937,7 @@ impl TypeChecker {
             methods.insert(
                 method.name.clone(),
                 MethodInfo {
+                    isolated_body: transfer_ownership::isolated_body(&method.body),
                     effect_contracts: method.effect_contracts.clone(),
                     array_body_optimization: method.array_body_optimization,
                     param_infos: self.normalize_decl_param_infos(&method.params, module_prefix),
@@ -2250,6 +2257,11 @@ fn imported_class_info_from_decl(
     let constructor = class.constructors.first().map(|ctor| {
         let params = ctor.params.iter().map(|p| qualify(&p.ty)).collect();
         crate::semantic::symbols::ConstructorInfo {
+            isolated_body: transfer_ownership::isolated_body(&ctor.body)
+                && ctor
+                    .params
+                    .iter()
+                    .all(|p| !matches!(p.mode, ParamMode::Reference { .. })),
             param_infos: qualify_params(&ctor.params),
             params,
             public: ctor.public,
@@ -2266,6 +2278,7 @@ fn imported_class_info_from_decl(
         methods.insert(
             method.name.clone(),
             MethodInfo {
+                isolated_body: transfer_ownership::isolated_body(&method.body),
                 effect_contracts: method.effect_contracts.clone(),
                 array_body_optimization: method.array_body_optimization,
                 param_infos: qualify_params(&method.params),

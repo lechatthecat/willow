@@ -1186,6 +1186,7 @@ impl TypeChecker {
         let previous_init_ctx = self.local.in_static_initializer;
         self.local.in_static_initializer = true;
         let init_ty = self.check_expr_expecting(init, &declared);
+        self.check_transfer_ownership(crate::parser::iter::AstEvent::Expr(init));
         self.local.in_static_initializer = previous_init_ctx;
         self.local.current_effect_callable = previous_callable;
 

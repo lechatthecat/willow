@@ -290,3 +290,6 @@ mod async_retention;
 
 #[path = "concurrency/ordered_locks.rs"]
 mod ordered_locks;
+
+#[path = "concurrency/ownership_transfer.rs"]
+mod ownership_transfer;
