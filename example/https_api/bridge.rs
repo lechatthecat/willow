@@ -90,12 +90,15 @@ pub fn tls_ready(tls: &Tls) -> Result<bool, String> {
     Ok(!tls.0.try_lock().map_err(error)?.is_handshaking())
 }
 pub fn tls_send(tls: &Tls, text: &str) -> Result<Vec<u8>, String> {
-    if text.len() > LIMIT {
+    tls_send_bytes(tls, text.as_bytes())
+}
+pub fn tls_send_bytes(tls: &Tls, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if bytes.len() > LIMIT {
         return Err("message too large".into());
     }
     let mut tls = tls.0.try_lock().map_err(error)?;
     tls.set_buffer_limit(Some(LIMIT + 65536));
-    tls.writer().write_all(text.as_bytes()).map_err(error)?;
+    tls.writer().write_all(bytes).map_err(error)?;
     let mut output = Vec::new();
     while tls.wants_write() {
         tls.write_tls(&mut output).map_err(error)?;

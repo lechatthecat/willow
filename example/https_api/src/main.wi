@@ -4,21 +4,21 @@ import std::env;
 import std::json;
 import std::collections::Array;
 extern rust {
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_created() -> i64;
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_drops() -> i64;
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") opaque Tls;
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") opaque Http;
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_server(cert: String, key: String) -> Result<Tls, String>;
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_client(cert: String, name: String) -> Result<Tls, String>;
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_step(tls: Tls, input: Array<i64>) -> Result<Array<i64>, String>;
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_ready(tls: Tls) -> Result<bool, String>;
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_send(tls: Tls, text: String) -> Result<Array<i64>, String>;
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_plain(tls: Tls) -> Result<Array<i64>, String>;
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn http_new() -> Http;
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn http_feed(http: Http, input: Array<i64>, response: bool) -> Result<bool, String>;
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn http_body(http: Http) -> Result<String, String>;
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn http_route(http: Http) -> Result<String, String>;
-    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn http_encode(body: String, response: bool) -> Result<String, String>;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") fn tls_created() -> i64;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") fn tls_drops() -> i64;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") opaque Tls;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") opaque Http;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") fn tls_server(cert: String, key: String) -> Result<Tls, String>;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") fn tls_client(cert: String, name: String) -> Result<Tls, String>;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") fn tls_step(tls: Tls, input: Array<i64>) -> Result<Array<i64>, String>;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") fn tls_ready(tls: Tls) -> Result<bool, String>;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") fn tls_send(tls: Tls, text: String) -> Result<Array<i64>, String>;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") fn tls_plain(tls: Tls) -> Result<Array<i64>, String>;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") fn http_new() -> Http;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") fn http_feed(http: Http, input: Array<i64>, response: bool) -> Result<bool, String>;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") fn http_body(http: Http) -> Result<String, String>;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") fn http_route(http: Http) -> Result<String, String>;
+    nonblocking("f52113745096262d317e22f40714b522f11cfee7a23905da5fa68e2dff35e605") fn http_encode(body: String, response: bool) -> Result<String, String>;
 }
 async fn receive(stream: TcpStream, tls: Tls) -> Result<bool, String> {
     let bytes = match await net::read_bytes_async(stream, 16384) {

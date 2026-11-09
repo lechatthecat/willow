@@ -1,0 +1,212 @@
+import std::net;
+import std::fs;
+import std::env;
+import std::collections::Array;
+extern rust {
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn pg_queries() -> i64;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn param_drops() -> i64;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn pg_drops() -> i64;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn tls_created() -> i64;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn tls_drops() -> i64;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") opaque Tls;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") opaque Http;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn tls_server(cert: String, key: String) -> Result<Tls, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn tls_client(cert: String, name: String) -> Result<Tls, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn tls_step(tls: Tls, input: Array<i64>) -> Result<Array<i64>, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn tls_ready(tls: Tls) -> Result<bool, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn tls_send(tls: Tls, text: String) -> Result<Array<i64>, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn tls_plain(tls: Tls) -> Result<Array<i64>, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn http_new() -> Http;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn http_feed(http: Http, input: Array<i64>, response: bool) -> Result<bool, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn http_body(http: Http) -> Result<String, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn http_route(http: Http) -> Result<String, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn http_encode(body: String, response: bool) -> Result<String, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") opaque Pg;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") opaque Params;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn pg_new() -> Pg;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn params_new() -> Params;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn param_add(params: Params, value: Option<String>) -> Result<bool, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn pg_ssl_request() -> Array<i64>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn pg_start(user: String, database: String) -> Result<Array<i64>, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn pg_query(pg: Pg, sql: String, params: Params) -> Result<Array<i64>, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn pg_feed(pg: Pg, input: Array<i64>, user: String, password: String) -> Result<Array<i64>, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn pg_ready(pg: Pg) -> Result<bool, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn pg_result(pg: Pg) -> Result<i64, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn pg_cell(pg: Pg, row: i64, column: i64) -> Result<Option<String>, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn pg_status(pg: Pg) -> Result<i64, String>;
+    nonblocking("77e1e4d5381003f87cc44e8888eff02931cebc1b5d479726cb81d045a715219a") fn tls_send_bytes(tls: Tls, bytes: Array<i64>) -> Result<Array<i64>, String>;
+}
+async fn receive(stream: TcpStream, tls: Tls) -> Result<bool, String> {
+    let bytes = match await net::read_bytes_async(stream, 16384) {
+        Ok(value) => value, Err(_) => return Err("socket read failed"),
+    };
+    if bytes.len() == 0 { return Err("connection ended before application message completed"); }
+    let output = tls_step(tls, bytes)?;
+    match await net::write_bytes_async(stream, output) { Ok(_) => {}, Err(_) => return Err("socket write failed"), }
+    return Ok(true);
+}
+async fn handshake(stream: TcpStream, tls: Tls) -> Result<bool, String> {
+    let empty: Array<i64> = [];
+    let output = tls_step(tls, empty)?;
+    match await net::write_bytes_async(stream, output) { Ok(_) => {}, Err(_) => return Err("socket write failed"), }
+    while !tls_ready(tls)? { (await receive(stream, tls))?; }
+    return Ok(true);
+}
+async fn read_http(stream: TcpStream, tls: Tls, http: Http, response: bool) -> Result<String, String> {
+    while true {
+        let bytes = tls_plain(tls)?;
+        if http_feed(http, bytes, response)? { return http_body(http); }
+        (await receive(stream, tls))?;
+    }
+    return Err("unreachable");
+}
+async fn pump_db(stream: TcpStream, tls: Tls, pg: Pg, user: String, password: String) -> Result<i64, String> {
+    while !pg_ready(pg)? {
+        let bytes = tls_plain(tls)?;
+        if bytes.len() == 0 { (await receive(stream, tls))?; }
+        else {
+            let reply = pg_feed(pg, bytes, user, password)?;
+            let wire = tls_send_bytes(tls, reply)?;
+            match await net::write_bytes_async(stream, wire) { Ok(_) => {}, Err(_) => return Err("database write failed"), }
+        }
+    }
+    return pg_result(pg);
+}
+async fn query_db(stream: TcpStream, tls: Tls, pg: Pg, sql: String, params: Params) -> Result<i64, String> {
+    let wire = tls_send_bytes(tls, pg_query(pg, sql, params)?)?;
+    match await net::write_bytes_async(stream, wire) { Ok(_) => {}, Err(_) => return Err("database write failed"), }
+    return await pump_db(stream, tls, pg, "", "");
+}
+// One Task owns one connection and its complete transaction. No session escapes
+// this scope: errors and Task cancellation close TLS, codec and socket together.
+async fn database(address: String, cert: String, user: String, password: String, db: String, value: String, mode: String) -> Result<String, String> {
+    let stream = match await net::connect_async(address) { Ok(s) => s, Err(_) => return Err("database connect failed"), };
+    defer { net::shutdown(stream); }
+    match await net::write_bytes_async(stream, pg_ssl_request()) { Ok(_) => {}, Err(_) => return Err("SSLRequest write failed"), }
+    let ssl = match await net::read_bytes_async(stream, 1) { Ok(b) => b, Err(_) => return Err("SSLRequest read failed"), };
+    if ssl.len() != 1 { return Err("database disconnected during SSLRequest"); }
+    if ssl[0] != 83 { return Err("database refused TLS"); }
+    let name = if mode == "tls-failure" { "wrong.example" } else { "localhost" };
+    let tls = tls_client(cert, name)?;
+    defer Tls_close(tls);
+    (await handshake(stream, tls))?;
+    let pg = pg_new();
+    defer Pg_close(pg);
+    let wire = tls_send_bytes(tls, pg_start(user, db)?)?;
+    match await net::write_bytes_async(stream, wire) { Ok(_) => {}, Err(_) => return Err("database write failed"), }
+    (await pump_db(stream, tls, pg, user, password))?;
+    let empty = params_new();
+    defer Params_close(empty);
+    (await query_db(stream, tls, pg, "BEGIN", empty))?;
+    if pg_status(pg)? != 84 { return Err("BEGIN did not enter transaction"); }
+    if mode == "cancel" { (await query_db(stream, tls, pg, "SELECT pg_sleep(60)", empty))?; }
+    if mode == "sql-error" {
+        let failure = await query_db(stream, tls, pg, "SELECT 1 / 0", empty);
+        if !failure.is_err() { return Err("expected SQL error"); }
+        if pg_status(pg)? != 69 { return Err("expected failed transaction"); }
+        (await query_db(stream, tls, pg, "ROLLBACK", empty))?;
+        (await query_db(stream, tls, pg, "SELECT 42", empty))?;
+        return Ok(pg_cell(pg, 0, 0)?.unwrap_or("NULL"));
+    }
+    let params = params_new();
+    defer Params_close(params);
+    param_add(params, Some(value))?;
+    if mode == "transactions" {
+        (await query_db(stream, tls, pg, "CREATE TEMP TABLE willow_items (value text)", empty))?;
+        (await query_db(stream, tls, pg, "COMMIT", empty))?;
+        (await query_db(stream, tls, pg, "BEGIN", empty))?;
+        (await query_db(stream, tls, pg, "INSERT INTO willow_items VALUES ($1)", params))?;
+        (await query_db(stream, tls, pg, "ROLLBACK", empty))?;
+        (await query_db(stream, tls, pg, "SELECT count(*) FROM willow_items", empty))?;
+        if pg_cell(pg, 0, 0)?.unwrap_or("") != "0" { return Err("rollback retained row"); }
+        (await query_db(stream, tls, pg, "BEGIN", empty))?;
+        (await query_db(stream, tls, pg, "INSERT INTO willow_items VALUES ($1)", params))?;
+        (await query_db(stream, tls, pg, "COMMIT", empty))?;
+        (await query_db(stream, tls, pg, "SELECT value FROM willow_items", empty))?;
+        if pg_cell(pg, 0, 0)?.unwrap_or("") != value { return Err("commit lost row"); }
+        let nulls = params_new();
+        defer Params_close(nulls);
+        param_add(nulls, None)?;
+        (await query_db(stream, tls, pg, "SELECT $1::text", nulls))?;
+        if pg_cell(pg, 0, 0)?.is_some() { return Err("NULL changed"); }
+        let rows = (await query_db(stream, tls, pg, "SELECT n FROM generate_series(1, 2048) AS n", empty))?;
+        if rows != 2048 { return Err("missing result rows"); }
+        if pg_cell(pg, 2047, 0)?.unwrap_or("") != "2048" { return Err("wrong final row"); }
+        return Ok("commit rollback NULL 2048 rows verified");
+    }
+    let count = (await query_db(stream, tls, pg, "SELECT $1::text", params))?;
+    if count != 1 { return Err("expected one row"); }
+    let result = pg_cell(pg, 0, 0)?.unwrap_or("NULL");
+    (await query_db(stream, tls, pg, "COMMIT", empty))?;
+    if pg_status(pg)? != 73 { return Err("COMMIT did not leave transaction"); }
+    return Ok(result);
+}
+async fn serve_db(listener: TcpListener, cert: String, key: String, address: String, user: String, password: String, db: String) -> Result<String, String> {
+    let stream = match await net::accept_async(listener) { Ok(s) => s, Err(_) => return Err("accept failed"), };
+    defer { net::shutdown(stream); }
+    let tls = tls_server(cert, key)?;
+    defer Tls_close(tls);
+    (await handshake(stream, tls))?;
+    let http = http_new();
+    defer Http_close(http);
+    let body = (await read_http(stream, tls, http, false))?;
+    if http_route(http)? != "POST /echo" { return Err("route not found"); }
+    let result = (await database(address, cert, user, password, db, body, ""))?;
+    let output = tls_send(tls, http_encode(result, true)?)?;
+    match await net::write_bytes_async(stream, output) { Ok(_) => {}, Err(_) => return Err("HTTP write failed"), }
+    return Ok("served PostgreSQL result over HTTPS");
+}
+async fn client(address: String, cert: String, value: String) -> Result<String, String> {
+    let stream = match await net::connect_async(address) { Ok(s) => s, Err(_) => return Err("connect failed"), };
+    defer { net::shutdown(stream); }
+    let tls = tls_client(cert, "localhost")?;
+    defer Tls_close(tls);
+    (await handshake(stream, tls))?;
+    let output = tls_send(tls, http_encode(value, false)?)?;
+    match await net::write_bytes_async(stream, output) { Ok(_) => {}, Err(_) => return Err("HTTP write failed"), }
+    let http = http_new();
+    defer Http_close(http);
+    return await read_http(stream, tls, http, true);
+}
+async fn main() {
+    let cert = (await fs::read_to_string_async(env::arg(0).unwrap())).unwrap();
+    let key = (await fs::read_to_string_async(env::arg(1).unwrap())).unwrap();
+    let address = env::arg(2).unwrap();
+    let user = env::arg(3).unwrap();
+    let password = (await fs::read_to_string_async(env::arg(4).unwrap())).unwrap();
+    let db = env::arg(5).unwrap();
+    let mode = env::arg(6).unwrap_or("");
+    if mode == "cancel" {
+        let before = tls_drops();
+        let pg_before = pg_drops();
+        let params_before = param_drops();
+        let queries_before = pg_queries();
+        let task = database(address, cert, user, password, db, "", mode);
+        let mut attempts = 0;
+        while pg_queries() < queries_before + 2 {
+            attempts = attempts + 1;
+            if attempts > 5000 { task.cancel(); await task.result(); println("database did not reach cancellable query"); return; }
+            await sleep(1);
+        }
+        await sleep(20);
+        println("other task progressed during database wait");
+        task.cancel();
+        println((await task.result()).is_err());
+        println(tls_drops() == before + 1);
+        println(pg_drops() == pg_before + 1);
+        println(param_drops() == params_before + 1);
+        println((await database(address, cert, user, password, db, "after cancel", "")).unwrap());
+        return;
+    }
+    if mode != "" {
+        let result = await database(address, cert, user, password, db, "hello", mode);
+        if mode == "sql-error" || mode == "transactions" { println(result.unwrap()); }
+        else { println(result.is_err()); }
+        return;
+    }
+    let listener = net::bind("127.0.0.1:0").unwrap();
+    let server = serve_db(listener, cert, key, address, user, password, db);
+    let value = "{\"message\":\"quote: '; DROP TABLE users; -- 日本語\"}";
+    println((await client(net::local_addr(listener).unwrap(), cert, value)).unwrap());
+    println((await server).unwrap());
+}

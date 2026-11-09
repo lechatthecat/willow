@@ -1,0 +1,10 @@
+[project]
+name = "postgres_api"
+version = "0.1.0"
+[rust]
+bridge = "bridge.rs"
+[rust-dependencies]
+postgres-protocol = "=0.6.12"
+bytes = "=1.12.1"
+fallible-iterator = "=0.2.0"
+https-api-bridge-tests = { path = "../https_api" }

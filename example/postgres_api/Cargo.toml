@@ -1,0 +1,13 @@
+[package]
+name = "postgres-api-bridge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+[workspace]
+[lib]
+path = "bridge.rs"
+[dependencies]
+postgres-protocol = "=0.6.12"
+bytes = "=1.12.1"
+fallible-iterator = "=0.2.0"
+https-api-bridge-tests = { path = "../https_api" }
