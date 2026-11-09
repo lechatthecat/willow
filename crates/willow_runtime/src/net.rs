@@ -185,6 +185,7 @@ enum NetOperation {
     Accept,
     Read {
         max_bytes: usize,
+        binary: bool,
         bytes: Vec<u8>,
     },
     Write {
@@ -366,7 +367,12 @@ unsafe fn poll_accept(frame: *mut c_void) -> i32 {
     }
 }
 
-unsafe fn poll_read(frame: *mut c_void, max_bytes: usize, buffered: &mut Vec<u8>) -> i32 {
+unsafe fn poll_read(
+    frame: *mut c_void,
+    max_bytes: usize,
+    binary: bool,
+    buffered: &mut Vec<u8>,
+) -> i32 {
     let handle_ptr = unsafe { task_handle(frame) };
     let Some(NetworkHandle::Stream(stream)) = (unsafe { handle(handle_ptr) }) else {
         return unsafe { finish_error(frame, "net::read_async: invalid TcpStream", None) };
@@ -378,6 +384,16 @@ unsafe fn poll_read(frame: *mut c_void, max_bytes: usize, buffered: &mut Vec<u8>
     let mut stream_ref = stream;
     match stream_ref.read(&mut bytes) {
         Ok(read) => {
+            if binary {
+                let mut array = crate::array::willow_array_new(read as i64, 0);
+                willow_push_root(&mut array);
+                for (index, byte) in bytes[..read].iter().enumerate() {
+                    crate::array::willow_array_set(array, index as i64, i64::from(*byte));
+                }
+                let result = crate::fs::alloc_ok(array as i64, true);
+                willow_pop_roots(1);
+                return unsafe { finish(frame, result, Some(fd)) };
+            }
             buffered.extend_from_slice(&bytes[..read]);
             match std::str::from_utf8(buffered) {
                 Ok(text) => {
@@ -467,7 +483,11 @@ unsafe extern "C" fn poll_net_operation(frame: *mut c_void) -> i32 {
     let status = match operation.as_mut() {
         NetOperation::Connect { .. } => unsafe { poll_connect(frame, &mut operation) },
         NetOperation::Accept => unsafe { poll_accept(frame) },
-        NetOperation::Read { max_bytes, bytes } => unsafe { poll_read(frame, *max_bytes, bytes) },
+        NetOperation::Read {
+            max_bytes,
+            binary,
+            bytes,
+        } => unsafe { poll_read(frame, *max_bytes, *binary, bytes) },
         NetOperation::Write { bytes, offset } => unsafe { poll_write(frame, bytes, offset) },
         NetOperation::ImmediateError(message) => {
             let message = std::mem::take(message);
@@ -580,6 +600,7 @@ pub extern "C" fn willow_net_read_async(stream: *mut u8, max_bytes: i64) -> *mut
     let operation = match usize::try_from(max_bytes) {
         Ok(max_bytes) if (1..=MAX_READ_BYTES).contains(&max_bytes) => NetOperation::Read {
             max_bytes,
+            binary: false,
             bytes: Vec::new(),
         },
         _ => NetOperation::ImmediateError(format!(
@@ -649,4 +670,39 @@ mod tests {
 
         reset_internal_for_test();
     }
+}
+
+/// Read arbitrary bytes through the same readiness and cancellation path as text.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_net_read_bytes_async(stream: *mut u8, max_bytes: i64) -> *mut c_void {
+    let operation = match usize::try_from(max_bytes) {
+        Ok(max_bytes) if (1..=MAX_READ_BYTES).contains(&max_bytes) => NetOperation::Read {
+            max_bytes,
+            binary: true,
+            bytes: Vec::new(),
+        },
+        _ => NetOperation::ImmediateError(format!(
+            "net::read_bytes_async: max_bytes must be between 1 and {MAX_READ_BYTES}"
+        )),
+    };
+    spawn_operation(stream, operation)
+}
+
+/// Snapshot and validate bytes before handing ownership to the scheduler.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_net_write_bytes_async(stream: *mut u8, contents: *mut u8) -> *mut c_void {
+    let len = crate::array::willow_array_len(contents);
+    let mut bytes = Vec::with_capacity(len as usize);
+    for index in 0..len {
+        let Ok(byte) = u8::try_from(crate::array::willow_array_get(contents, index)) else {
+            return spawn_operation(
+                stream,
+                NetOperation::ImmediateError("net::write_bytes_async: byte outside 0..255".into()),
+            );
+        };
+        bytes.push(byte);
+    }
+    spawn_operation(stream, NetOperation::Write { bytes, offset: 0 })
 }

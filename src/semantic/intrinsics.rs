@@ -2364,6 +2364,8 @@ pub(crate) fn namespace_builtin(class: &str, method: &str) -> Option<NamespaceBu
         ("net", "shutdown") => rt::willow_net_shutdown,
         ("net", "connect_async") => rt::willow_net_connect_async,
         ("net", "accept_async") => rt::willow_net_accept_async,
+        ("net", "read_bytes_async") => rt::willow_net_read_bytes_async,
+        ("net", "write_bytes_async") => rt::willow_net_write_bytes_async,
         ("net", "read_async") => rt::willow_net_read_async,
         ("net", "write_async") => rt::willow_net_write_async,
         _ => return None,

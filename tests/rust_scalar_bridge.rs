@@ -2070,3 +2070,112 @@ fn widened_bridge_raw_identifier_diagnostics() {
     let output = f.successful(&["run", "--offline"]);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n");
 }
+
+#[test]
+fn nonblocking_opaque_close_runs_on_task_cancel() {
+    let f = Fixture::new();
+    f.reviewed_sources(
+        r#"
+extern rust {
+    nonblocking("REVIEW") opaque Resource;
+    nonblocking("REVIEW") fn resource() -> Resource;
+    nonblocking("REVIEW") fn drops() -> i64;
+    nonblocking("REVIEW") fn created() -> bool;
+}
+async fn hold() {
+    let resource = resource();
+    defer Resource_close(resource);
+    await sleep(100000);
+}
+async fn main() {
+    let task = hold();
+    while !created() { await sleep(1); }
+    task.cancel();
+    await task.result();
+    println(drops());
+}
+"#,
+        r#"
+use std::sync::atomic::{AtomicI64, Ordering};
+static CREATED: AtomicI64 = AtomicI64::new(0);
+static DROPS: AtomicI64 = AtomicI64::new(0);
+pub struct Resource;
+impl Drop for Resource { fn drop(&mut self) { DROPS.fetch_add(1, Ordering::SeqCst); } }
+pub fn resource() -> Box<Resource> { CREATED.store(1, Ordering::SeqCst); Box::new(Resource) }
+pub fn created() -> bool { CREATED.load(Ordering::SeqCst) != 0 }
+pub fn drops() -> i64 { DROPS.load(Ordering::SeqCst) }
+"#,
+    );
+    let output = f.successful(&["run", "--offline"]);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n");
+}
+
+#[test]
+fn nonblocking_opaque_review_does_not_allow_socket_wait_under_lock() {
+    let f = Fixture::new();
+    f.reviewed_sources(
+        r#"
+import std::net;
+extern rust {
+    nonblocking("REVIEW") opaque Resource;
+    nonblocking("REVIEW") fn resource() -> Resource;
+}
+fn main() { let resource = resource(); Resource_close(resource); }
+"#,
+        "pub struct Resource; pub fn resource() -> Box<Resource> {Box::new(Resource)}",
+    );
+    let source = fs::read_to_string(f.root.join("src/main.wi")).unwrap();
+    let source = source.replace(
+        "fn main() { let resource = resource(); Resource_close(resource); }",
+        r#"
+async fn wait(listener: TcpListener) { await net::accept_async(listener); }
+async fn main() {
+    let m = Mutex::new(0);
+    let listener = net::bind("127.0.0.1:0").unwrap();
+    lock m as value { await wait(listener); }
+}
+"#,
+    );
+    fs::write(f.root.join("src/main.wi"), source).unwrap();
+    let output = f.command(&["check", "."]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("E2604"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn nonblocking_opaque_close_requires_its_own_review() {
+    let f = Fixture::new();
+    let rust = "pub struct Resource; pub fn resource() -> Box<Resource> {Box::new(Resource)}";
+    let template = r#"extern rust {
+        nonblocking("REVIEW") opaque Resource;
+        nonblocking("REVIEW") fn resource() -> Resource;
+    }
+    async fn main() { let r = resource(); defer Resource_close(r); }
+    "#;
+    let reviewed = f.reviewed_sources(template, rust);
+    let fingerprint = reviewed
+        .split("nonblocking(\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    f.sources(
+        &reviewed.replace(&format!("nonblocking(\"{fingerprint}\") opaque"), "opaque"),
+        rust,
+    );
+    let output = f.command(&["check", "."]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("E0810"));
+    f.sources(
+        &reviewed,
+        &format!("{rust}\n// changed destructor review input"),
+    );
+    let output = f.command(&["build", "--offline"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rust_nonblocking_review_required"));
+}

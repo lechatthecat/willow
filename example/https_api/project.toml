@@ -1,0 +1,8 @@
+[project]
+name = "https_api"
+version = "0.1.0"
+[rust]
+bridge = "bridge.rs"
+[rust-dependencies]
+rustls = { version = "=0.23.45", default-features = false, features = ["std", "ring", "tls12"] }
+httparse = "=1.10.1"

@@ -202,6 +202,7 @@ const ENV: &[StdItemSchema] = &[
 // Addresses are numeric `IP:port` strings in v1, so no hidden DNS lookup can
 // block a scheduler worker. Socket readiness operations return Tasks and are
 // driven by the platform netpoll backend.
+const BYTES_IO: T = T::Result(&T::Array(&T::I64), &T::Named("IoError"));
 const NET: &[StdItemSchema] = &[
     std_type!("TcpListener", 0, "TcpListener"),
     std_type!("TcpStream", 0, "TcpStream"),
@@ -211,6 +212,8 @@ const NET: &[StdItemSchema] = &[
     std_function!("shutdown", [TCP_STREAM] -> VOID_IO),
     std_function!("connect_async", [T::String] -> T::Task(&STREAM_IO)),
     std_function!("accept_async", [TCP_LISTENER] -> T::Task(&STREAM_IO)),
+    std_function!("read_bytes_async", [TCP_STREAM, T::I64] -> T::Task(&BYTES_IO)),
+    std_function!("write_bytes_async", [TCP_STREAM, T::Array(&T::I64)] -> T::Task(&VOID_IO)),
     std_function!("read_async", [TCP_STREAM, T::I64] -> T::Task(&STRING_IO)),
     std_function!("write_async", [TCP_STREAM, T::String] -> T::Task(&VOID_IO)),
 ];

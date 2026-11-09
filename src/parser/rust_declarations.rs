@@ -92,6 +92,32 @@ impl Parser {
                 items.push(Item::Class(record));
                 continue;
             }
+            let nonblocking = if matches!(self.peek_kind(), TokenKind::Ident(word) if word == "nonblocking")
+            {
+                self.advance();
+                self.expect(TokenKind::LParen)?;
+                let TokenKind::StringLiteral(fingerprint) = self.peek_kind().clone() else {
+                    return Err(self.err(
+                        ErrorCode::E0102,
+                        "nonblocking requires a review fingerprint string",
+                    ));
+                };
+                if fingerprint.len() != 64
+                    || !fingerprint
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                {
+                    return Err(self.err(
+                        ErrorCode::E0102,
+                        "nonblocking requires a lowercase SHA-256 review fingerprint",
+                    ));
+                }
+                self.advance();
+                self.expect(TokenKind::RParen)?;
+                Some(fingerprint)
+            } else {
+                None
+            };
             if matches!(self.peek_kind(), TokenKind::Ident(word) if word == "opaque") {
                 self.advance();
                 let name = self.expect_ident()?;
@@ -131,6 +157,9 @@ impl Parser {
                     Scalar::Void,
                 );
                 symbol.close_handle = true;
+                if let Some(fingerprint) = nonblocking {
+                    symbol.declare_nonblocking(fingerprint);
+                }
                 items.push(Item::Function(FunctionDecl {
                     requires: Vec::new(),
                     ensures: Vec::new(),
@@ -159,32 +188,6 @@ impl Parser {
                 }));
                 continue;
             }
-            let nonblocking = if matches!(self.peek_kind(), TokenKind::Ident(word) if word == "nonblocking")
-            {
-                self.advance();
-                self.expect(TokenKind::LParen)?;
-                let TokenKind::StringLiteral(fingerprint) = self.peek_kind().clone() else {
-                    return Err(self.err(
-                        ErrorCode::E0102,
-                        "nonblocking requires a review fingerprint string",
-                    ));
-                };
-                if fingerprint.len() != 64
-                    || !fingerprint
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                {
-                    return Err(self.err(
-                        ErrorCode::E0102,
-                        "nonblocking requires a lowercase SHA-256 review fingerprint",
-                    ));
-                }
-                self.advance();
-                self.expect(TokenKind::RParen)?;
-                Some(fingerprint)
-            } else {
-                None
-            };
             self.expect(TokenKind::Fn)?;
             let name = self.expect_ident()?;
             if name == "main" {

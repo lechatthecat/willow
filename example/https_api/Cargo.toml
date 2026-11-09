@@ -1,0 +1,12 @@
+# Standalone bridge tests; Willow's bridge build uses project.toml.
+[package]
+name = "https-api-bridge-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+[workspace]
+[lib]
+path = "bridge.rs"
+[dependencies]
+rustls = { version = "=0.23.45", default-features = false, features = ["std", "ring", "tls12"] }
+httparse = "=1.10.1"

@@ -202,3 +202,38 @@ fn net_11_utf8_payload_roundtrips() {
     assert!(ok, "{out}");
     assert_eq!(out, "日本語🌱\n");
 }
+
+#[test]
+fn net_binary_roundtrip_and_validation() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+import std::net;
+async fn main() {
+    let listener = net::bind("127.0.0.1:0").unwrap();
+    let accepting = net::accept_async(listener);
+    let client = (await net::connect_async(net::local_addr(listener).unwrap())).unwrap();
+    let server = (await accepting).unwrap();
+    match await net::write_bytes_async(client, [0, 128, 255, 13, 10]) { Ok(_) => {}, Err(_) => println("write failed"), }
+    let expected = [0, 128, 255, 13, 10];
+    let mut index = 0;
+    let mut equal = true;
+    while index < 5 {
+        let bytes = (await net::read_bytes_async(server, 1)).unwrap();
+        equal = equal && bytes.len() == 1 && bytes[0] == expected[index];
+        index = index + 1;
+    }
+    println(equal);
+    println((await net::write_bytes_async(client, [-1])).is_err());
+    println((await net::write_bytes_async(client, [256])).is_err());
+    println((await net::read_bytes_async(server, 0)).is_err());
+    println((await net::read_bytes_async(server, 16777217)).is_err());
+    match await net::write_bytes_async(client, []) { Ok(_) => {}, Err(_) => println("empty write failed"), }
+    net::shutdown(client);
+    println((await net::read_bytes_async(server, 4)).unwrap().len() == 0);
+}
+"#,
+        &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_WORKERS", "1")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\ntrue\ntrue\ntrue\ntrue\ntrue\n");
+}

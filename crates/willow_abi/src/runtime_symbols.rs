@@ -460,6 +460,8 @@ runtime_abi_schema! {
     ALLOC; willow_net_shutdown => ([Ptr] -> Some(Ptr));
     ALLOC; willow_net_connect_async => ([Ptr] -> Some(Ptr));
     ALLOC; willow_net_accept_async => ([Ptr] -> Some(Ptr));
+    ALLOC; willow_net_read_bytes_async => ([Ptr, I64] -> Some(Ptr));
+    ALLOC; willow_net_write_bytes_async => ([Ptr, Ptr] -> Some(Ptr));
     ALLOC; willow_net_read_async => ([Ptr, I64] -> Some(Ptr));
     ALLOC; willow_net_write_async => ([Ptr, Ptr] -> Some(Ptr));
     // --- cancellation tokens and structured scopes ---

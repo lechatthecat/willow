@@ -1,0 +1,121 @@
+import std::net;
+import std::fs;
+import std::env;
+import std::json;
+import std::collections::Array;
+extern rust {
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_created() -> i64;
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_drops() -> i64;
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") opaque Tls;
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") opaque Http;
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_server(cert: String, key: String) -> Result<Tls, String>;
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_client(cert: String, name: String) -> Result<Tls, String>;
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_step(tls: Tls, input: Array<i64>) -> Result<Array<i64>, String>;
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_ready(tls: Tls) -> Result<bool, String>;
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_send(tls: Tls, text: String) -> Result<Array<i64>, String>;
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn tls_plain(tls: Tls) -> Result<Array<i64>, String>;
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn http_new() -> Http;
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn http_feed(http: Http, input: Array<i64>, response: bool) -> Result<bool, String>;
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn http_body(http: Http) -> Result<String, String>;
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn http_route(http: Http) -> Result<String, String>;
+    nonblocking("ebb0065482ccd3e86dbc3673f07946976925695e66f2f111e830596185b0f9b4") fn http_encode(body: String, response: bool) -> Result<String, String>;
+}
+async fn receive(stream: TcpStream, tls: Tls) -> Result<bool, String> {
+    let bytes = match await net::read_bytes_async(stream, 16384) {
+        Ok(value) => value, Err(_) => return Err("socket read failed"),
+    };
+    if bytes.len() == 0 { return Err("connection ended before HTTP message completed"); }
+    let output = tls_step(tls, bytes)?;
+    match await net::write_bytes_async(stream, output) { Ok(_) => {}, Err(_) => return Err("socket write failed"), }
+    return Ok(true);
+}
+async fn handshake(stream: TcpStream, tls: Tls) -> Result<bool, String> {
+    let empty: Array<i64> = [];
+    let output = tls_step(tls, empty)?;
+    match await net::write_bytes_async(stream, output) { Ok(_) => {}, Err(_) => return Err("socket write failed"), }
+    while !tls_ready(tls)? { (await receive(stream, tls))?; }
+    return Ok(true);
+}
+async fn read_http(stream: TcpStream, tls: Tls, http: Http, response: bool) -> Result<String, String> {
+    while true {
+        let bytes = tls_plain(tls)?;
+        if http_feed(http, bytes, response)? { return http_body(http); }
+        (await receive(stream, tls))?;
+    }
+    return Err("unreachable");
+}
+async fn serve(listener: TcpListener, cert: String, key: String) -> Result<String, String> {
+    let stream = match await net::accept_async(listener) {
+        Ok(value) => value, Err(_) => return Err("accept failed"),
+    };
+    defer { net::shutdown(stream); }
+    let tls = tls_server(cert, key)?;
+    defer Tls_close(tls);
+    (await handshake(stream, tls))?;
+    let http = http_new();
+    defer Http_close(http);
+    let body = (await read_http(stream, tls, http, false))?;
+    if http_route(http)? != "POST /echo" { return Err("route not found"); }
+    let value = match json::parse(body) {
+        Ok(value) => value, Err(_) => return Err("invalid JSON request"),
+    };
+    let response = match json::serialize(value) {
+        Ok(value) => value, Err(_) => return Err("JSON serialization failed"),
+    };
+    let output = tls_send(tls, http_encode(response, true)?)?;
+    match await net::write_bytes_async(stream, output) { Ok(_) => {}, Err(_) => return Err("socket write failed"), }
+    return Ok("served POST /echo");
+}
+async fn request(address: String, cert: String, mode: String) -> Result<String, String> {
+    let stream = match await net::connect_async(address) {
+        Ok(value) => value, Err(_) => return Err("connect failed"),
+    };
+    defer { net::shutdown(stream); }
+    let name = if mode == "tls-failure" { "wrong.example" } else { "localhost" };
+    let tls = tls_client(cert, name)?;
+    defer Tls_close(tls);
+    (await handshake(stream, tls))?;
+    let request_body = if mode == "invalid-json" { "{" } else { "{\"message\":\"hello Willow\"}" };
+    let message = if mode == "partial" { "POST /echo HTTP/1.1\r\nContent-Length: 20\r\n\r\nx" }
+        else if mode == "malformed" { "not HTTP\r\n\r\n" }
+        else { http_encode(request_body, false)? };
+    let output = tls_send(tls, message)?;
+    match await net::write_bytes_async(stream, output) { Ok(_) => {}, Err(_) => return Err("socket write failed"), }
+    if mode == "partial" { return Err("intentional partial request"); }
+    let http = http_new();
+    defer Http_close(http);
+    let body = (await read_http(stream, tls, http, true))?;
+    match json::parse(body) {
+        Ok(_) => return Ok(body), Err(_) => return Err("invalid JSON response"),
+    }
+}
+async fn main() {
+    let cert = (await fs::read_to_string_async(env::arg(0).unwrap())).unwrap();
+    let key = (await fs::read_to_string_async(env::arg(1).unwrap())).unwrap();
+    let listener = net::bind("127.0.0.1:0").unwrap();
+    if env::arg(2).unwrap_or("") == "cancel" {
+        let before = tls_drops();
+        let created = tls_created();
+        let server = serve(listener, cert, key);
+        let client = (await net::connect_async(net::local_addr(listener).unwrap())).unwrap();
+        while tls_created() == created { await sleep(1); }
+        await sleep(1);
+        println("other task progressed during TLS wait");
+        server.cancel();
+        await server.result();
+        println(tls_drops() == before + 1);
+        let eof = (await net::read_bytes_async(client, 1)).unwrap();
+        println(eof.len() == 0);
+        return;
+    }
+    let server = serve(listener, cert, key);
+    let mode = env::arg(2).unwrap_or("");
+    let client = request(net::local_addr(listener).unwrap(), cert, mode);
+    if mode != "" {
+        println((await client).is_err());
+        println((await server).is_err());
+        return;
+    }
+    println((await client).unwrap());
+    println((await server).unwrap());
+}
