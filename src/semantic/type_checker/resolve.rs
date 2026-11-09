@@ -11,6 +11,18 @@ use crate::semantic::symbols::*;
 
 use super::*;
 
+/// The inputs of one `Type::method(..)` call, shared by its resolvers.
+#[derive(Clone, Copy)]
+struct StaticCall<'a> {
+    class_name: &'a str,
+    type_args: &'a [Type],
+    method_name: &'a str,
+    args: &'a [CallArg],
+    span: Span,
+    method_span: Span,
+    expected: Option<&'a Type>,
+}
+
 #[cfg(test)]
 thread_local! {
     static ENUM_IDENTITY_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2129,7 +2141,7 @@ impl TypeChecker {
     ) -> Type {
         let references = self.analysis_symbols.references.len();
         let errors = self.error_generation;
-        let result = self.resolve_static_call_inner(
+        let result = self.resolve_static_call_inner(&StaticCall {
             class_name,
             type_args,
             method_name,
@@ -2137,7 +2149,7 @@ impl TypeChecker {
             span,
             method_span,
             expected,
-        );
+        });
         if self.capture_call_sites
             && self.error_generation == errors
             && !Self::contains_error_type(&result)
@@ -2157,18 +2169,15 @@ impl TypeChecker {
         result
     }
 
-    // Keep the existing resolver inputs together; the wrapper only captures metadata.
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_static_call_inner(
-        &mut self,
-        class_name: &str,
-        type_args: &[Type],
-        method_name: &str,
-        args: &[CallArg],
-        span: Span,
-        method_span: Span,
-        expected: Option<&Type>,
-    ) -> Type {
+    fn resolve_static_call_inner(&mut self, call: &StaticCall<'_>) -> Type {
+        let StaticCall {
+            class_name,
+            type_args,
+            method_name,
+            args,
+            span,
+            ..
+        } = *call;
         if let Some(ty) =
             self.resolve_fully_qualified_std_module_call(class_name, method_name, args, span)
         {
@@ -2190,19 +2199,19 @@ impl TypeChecker {
         }
         // Reject a static call on a private module type from another module.
         self.check_type_visibility(class_name, span);
-        // Constructors are not directly callable as `Type::init(...)` — use `new`
-        // (willow-scq2 §10). Check args first so their errors still surface.
+        // Constructors are not directly callable as `Type::init(...)` — use `new`.
+        // Check args first so their errors still surface.
         if method_name == "init" && self.symbols.lookup_class(class_name).is_some() {
             for arg in args {
                 self.check_expr(&arg.expr);
             }
             self.push(
-                Diagnostic::new(
-                    Severity::Error,
+                Self::error_at(
                     ErrorCode::E0843,
                     "constructor `init` can only be called with `new`",
+                    span,
+                    "`init` called directly",
                 )
-                .with_label(Label::primary(span, "`init` called directly"))
                 .with_help(format!("write `new {}(...)` instead", class_name)),
             );
             return Type::Named(class_name.to_string());
@@ -2211,768 +2220,829 @@ impl TypeChecker {
             .iter()
             .map(|ty| self.normalize_type(ty, span))
             .collect::<Vec<_>>();
-        let type_args = type_args.as_slice();
+        let call = StaticCall {
+            class_name,
+            type_args: &type_args,
+            ..*call
+        };
 
         // Built-in `Map<K, V>` constructor. The type parameters are resolved
         // from the binding's annotation (Map<Void, Void> is a placeholder, like
         // an empty array literal).
         if class_name == "Map" && method_name == "new" {
-            self.check_collection_type_imported("Map", span);
-            if !args.is_empty() {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        "`Map::new` takes no arguments",
-                    )
-                    .with_label(Label::primary(span, "unexpected arguments")),
-                );
-            }
-            return match type_args {
-                [] => Type::Generic("Map".to_string(), vec![Type::Void, Type::Void]),
-                [key, value] => Type::Generic("Map".to_string(), vec![key.clone(), value.clone()]),
-                _ => {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "`Map::new` expects 2 type arguments, got {}",
-                                type_args.len()
-                            ),
-                        )
-                        .with_label(Label::primary(span, "wrong number of type arguments")),
-                    );
-                    Type::Generic("Map".to_string(), vec![Type::Void, Type::Void])
-                }
-            };
+            return self.resolve_map_new(&call);
         }
 
-        // Check if class_name refers to an enum — handle variant construction.
-        // Generic enums (with type_params) are handled separately below.
+        // An enum receiver constructs a variant. Every enum path returns here.
         if let Some(enum_info) = self.symbols.lookup_enum(class_name).cloned() {
-            if !enum_info.type_params.is_empty() {
-                // Handled by the generic enum block further down.
-            } else if let Some(variant) = enum_info.variants.iter().find(|v| v.name == method_name)
-            {
-                self.record_variant_use(&enum_info.name, method_name, method_span);
-                if variant.payload_types.is_empty() {
-                    // Fieldless variant: no args expected
-                    if !args.is_empty() {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!(
-                                    "enum variant `{}::{}` takes no arguments, got {}",
-                                    class_name,
-                                    method_name,
-                                    args.len()
-                                ),
-                            )
-                            .with_label(Label::primary(span, "unexpected arguments")),
-                        );
-                    }
-                    return Type::Named(enum_info.name.clone());
-                } else {
-                    // Payload variant: check arg count and types
-                    let expected = variant.payload_types.len();
-                    if args.len() != expected {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!(
-                                    "enum variant `{}::{}` takes {} argument(s), got {}",
-                                    class_name,
-                                    method_name,
-                                    expected,
-                                    args.len()
-                                ),
-                            )
-                            .with_label(Label::primary(span, "wrong number of arguments")),
-                        );
-                    }
-                    let payload_types = variant.payload_types.clone();
-                    for (param_ty, arg) in payload_types.iter().zip(args.iter()) {
-                        let arg_ty = self.check_expr(&arg.expr);
-                        if !self.types_compatible(param_ty, &arg_ty) {
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "mismatched types: expected `{}`, found `{}`",
-                                        self.diagnostic_type_name(param_ty),
-                                        self.diagnostic_type_name(&arg_ty)
-                                    ),
-                                )
-                                .with_label(Label::primary(
-                                    arg.expr.span(),
-                                    format!("expected `{}`", self.diagnostic_type_name(param_ty)),
-                                )),
-                            );
-                        }
-                    }
-                    return Type::Named(enum_info.name.clone());
-                }
+            return if enum_info.type_params.is_empty() {
+                self.resolve_enum_variant_call(&call, &enum_info)
             } else {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E1208,
-                        format!("no variant `{}` in enum `{}`", method_name, class_name),
-                    )
-                    .with_label(Label::primary(span, "unknown enum variant")),
-                );
-                return Type::Named(enum_info.name.clone());
-            }
+                self.resolve_generic_enum_variant_call(&call, &enum_info)
+            };
         }
 
-        // ── Generic enum constructors ────────────────────────────────────────
-        // Handles any enum with type parameters, including Option<T> and Result<T,E>
-        // defined in the prelude.
-        if let Some(enum_info) = self.symbols.lookup_enum(class_name).cloned()
-            && !enum_info.type_params.is_empty()
-        {
-            if let Some(variant) = enum_info.variants.iter().find(|v| v.name == method_name) {
-                self.record_variant_use(&enum_info.name, method_name, method_span);
-                // Validate arg count.
-                if args.len() != variant.payload_types.len() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "`{}::{}` expects {} argument(s), got {}",
-                                class_name,
-                                method_name,
-                                variant.payload_types.len(),
-                                args.len()
-                            ),
-                        )
-                        .with_label(Label::primary(span, "wrong number of arguments")),
-                    );
-                    let void_args = vec![Type::Void; enum_info.type_params.len()];
-                    return Type::Generic(enum_info.name.clone(), void_args);
+        if method_name == "new" {
+            match class_name {
+                "Mutex" | "RwLock" | "BlockingCell" | "BlockingRwCell" => {
+                    return self.resolve_lock_new(&call);
                 }
-                let explicit: Vec<_> = type_args
-                    .iter()
-                    .map(|t| self.normalize_type(t, span))
-                    .collect();
-                for ty in &explicit {
-                    self.validate_type(ty, span);
-                }
-                let bindings: HashMap<_, _> = enum_info
-                    .type_params
-                    .iter()
-                    .cloned()
-                    .zip(explicit.iter().cloned())
-                    .collect();
-                let checked_args: Vec<Type> = args
-                    .iter()
-                    .zip(&variant.payload_types)
-                    .map(|(arg, param)| {
-                        if explicit.is_empty() {
-                            self.check_expr(&arg.expr)
-                        } else {
-                            let expected = param.substitute_names(|n| bindings.get(n).cloned());
-                            self.check_expr_expecting(&arg.expr, &expected)
-                        }
-                    })
-                    .collect();
-
-                if crate::parser::tuples::is_tuple(&enum_info.name) {
-                    return Type::Generic(enum_info.name.clone(), checked_args);
-                }
-                let bindings = match crate::semantic::generic_inference::infer_partial(
-                    &enum_info.type_params,
-                    &variant.payload_types,
-                    &checked_args,
-                    &explicit,
-                ) {
-                    Ok(bindings) => bindings,
-                    Err(message) => {
-                        self.generic_error(span, message);
-                        return Self::error_type();
-                    }
-                };
-                let type_args = enum_info
-                    .type_params
-                    .iter()
-                    .map(|p| bindings[p].clone())
-                    .collect();
-                return Type::Generic(enum_info.name.clone(), type_args);
-            } else {
-                // Unknown variant in generic enum
-                let valid: Vec<&str> = enum_info.variants.iter().map(|v| v.name.as_str()).collect();
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E1801,
-                        format!(
-                            "unknown variant `{}` in `{}`; expected one of: {}",
-                            method_name,
-                            class_name,
-                            valid.join(", ")
-                        ),
-                    )
-                    .with_label(Label::primary(span, "unknown variant")),
-                );
-                return Type::Void;
+                "AtomicI64" | "AtomicBool" => return self.resolve_atomic_new(&call),
+                "CancellationToken" | "TaskScope" => return self.resolve_no_arg_new(&call),
+                _ => {}
             }
-        }
-
-        // Lock primitives (willow-dgwo.3): `Mutex::new(v)` / `RwLock::new(v)` /
-        // native compatibility-cell constructors infer their element type too.
-        // argument, e.g. `Mutex<i64>::new(0)`).
-        if matches!(
-            class_name,
-            "Mutex" | "RwLock" | "BlockingCell" | "BlockingRwCell"
-        ) && method_name == "new"
-        {
-            self.reject_reference_args(&QualifiedName::join(class_name, "new"), args);
-            if args.len() != 1 {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "function `{class_name}::new` expects 1 argument, got {}",
-                            args.len()
-                        ),
-                    )
-                    .with_label(Label::primary(span, "wrong number of arguments")),
-                );
-                return Type::Generic(class_name.to_string(), vec![Type::Void]);
-            }
-            // The written type argument, else the expected lock's element, is
-            // the argument's context: `Mutex::new([])` expected as
-            // `Mutex<Array<i64>>` types `[]` as `Array<i64>` (willow-jz15.96).
-            let context = match (type_args, expected) {
-                ([t], _) => Some(t),
-                ([], Some(Type::Generic(name, elem))) if name == class_name && elem.len() == 1 => {
-                    Some(&elem[0])
-                }
-                _ => None,
-            };
-            let arg_ty = match context {
-                Some(context) => self.check_expr_expecting(&args[0].expr, context),
-                None => self.check_expr(&args[0].expr),
-            };
-            let elem = match type_args {
-                [] => arg_ty.clone(),
-                [t] => {
-                    if arg_ty != *t && arg_ty != Type::Never {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!(
-                                    "`{class_name}<{}>::new` expects `{}`, got `{}`",
-                                    self.diagnostic_type_name(t),
-                                    self.diagnostic_type_name(t),
-                                    self.diagnostic_type_name(&arg_ty)
-                                ),
-                            )
-                            .with_label(Label::primary(args[0].expr.span(), "wrong argument type")),
-                        );
-                    }
-                    t.clone()
-                }
-                _ => {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!("`{class_name}::new` expects 1 type argument"),
-                        )
-                        .with_label(Label::primary(span, "too many type arguments")),
-                    );
-                    arg_ty.clone()
-                }
-            };
-            return Type::Generic(class_name.to_string(), vec![elem]);
-        }
-
-        // Atomic primitives (willow-dgwo.3): `AtomicI64::new(i64)` /
-        // `AtomicBool::new(bool)` return the (non-generic) atomic type.
-        if (class_name == "AtomicI64" || class_name == "AtomicBool") && method_name == "new" {
-            self.reject_reference_args(&QualifiedName::join(class_name, "new"), args);
-            let expected = if class_name == "AtomicI64" {
-                Type::I64
-            } else {
-                Type::Bool
-            };
-            if args.len() != 1 {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "function `{class_name}::new` expects 1 argument, got {}",
-                            args.len()
-                        ),
-                    )
-                    .with_label(Label::primary(span, "wrong number of arguments")),
-                );
-            } else {
-                let arg_ty = self.check_expr(&args[0].expr);
-                if arg_ty != expected && arg_ty != Type::Never {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "`{class_name}::new` expects `{}`, got `{}`",
-                                self.diagnostic_type_name(&expected),
-                                self.diagnostic_type_name(&arg_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(args[0].expr.span(), "wrong argument type")),
-                    );
-                }
-            }
-            return Type::Named(class_name.to_string());
-        }
-
-        if matches!(class_name, "CancellationToken" | "TaskScope") && method_name == "new" {
-            self.reject_reference_args(&QualifiedName::join(class_name, "new"), args);
-            if !type_args.is_empty() || !args.is_empty() {
-                for arg in args {
-                    self.check_expr(&arg.expr);
-                }
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!("function `{class_name}::new` expects no arguments"),
-                    )
-                    .with_label(Label::primary(span, "wrong constructor arguments")),
-                );
-            }
-            return Type::Named(class_name.to_string());
         }
 
         if class_name == "Channel" && method_name == "with_capacity" {
-            // Bounded channel (willow-o038): one i64 capacity argument.
-            self.reject_reference_args("Channel::with_capacity", args);
-            if args.len() != 1 {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "function `Channel::with_capacity` expects 1 argument, got {}",
-                            args.len()
-                        ),
-                    )
-                    .with_label(Label::primary(span, "wrong number of arguments")),
-                );
-            } else {
-                let cap_ty = self.check_expr(&args[0].expr);
-                if cap_ty != Type::I64 {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "channel capacity must be `i64`, found `{}`",
-                                self.diagnostic_type_name(&cap_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(args[0].expr.span(), "expected `i64`")),
-                    );
-                }
-            }
-            return match type_args {
-                [] => Type::Generic("Channel".to_string(), vec![Type::Void]),
-                [element_ty] => Type::Generic("Channel".to_string(), vec![element_ty.clone()]),
-                _ => {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "function `Channel::with_capacity` expects 1 type argument, got {}",
-                                type_args.len()
-                            ),
-                        )
-                        .with_label(Label::primary(span, "wrong number of type arguments")),
-                    );
-                    Type::Generic("Channel".to_string(), vec![Type::Void])
-                }
-            };
+            return self.resolve_channel_with_capacity(&call);
         }
 
         if class_name == "Channel" && method_name == "new" {
-            if !args.is_empty() {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "function `Channel::new` expects 0 arguments, got {}",
-                            args.len()
-                        ),
-                    )
-                    .with_label(Label::primary(span, "wrong number of arguments"))
-                    .with_help("use `Channel::with_capacity(n)` to create a bounded channel"),
-                );
-            }
-            return match type_args {
-                [] => Type::Generic("Channel".to_string(), vec![Type::Void]),
-                [element_ty] => Type::Generic("Channel".to_string(), vec![element_ty.clone()]),
-                _ => {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "function `Channel::new` expects 1 type argument, got {}",
-                                type_args.len()
-                            ),
-                        )
-                        .with_label(Label::primary(span, "wrong number of type arguments")),
-                    );
-                    Type::Void
-                }
-            };
+            return self.resolve_channel_new(&call);
         }
 
         if let Some(entry) =
             crate::semantic::intrinsics::math_namespace_builtin(class_name, method_name)
         {
-            if !type_args.is_empty() {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!("function `{class_name}::{method_name}` expects no type arguments"),
-                    )
-                    .with_label(Label::primary(span, "unexpected type arguments")),
-                );
-            }
-            if args.len() != entry.params.len() {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "function `{class_name}::{method_name}` expects {} arguments, got {}",
-                            entry.params.len(),
-                            args.len()
-                        ),
-                    )
-                    .with_label(Label::primary(span, "wrong number of arguments")),
-                );
-            }
-            let params: Vec<_> = entry.params.iter().map(|ty| ty.to_source()).collect();
-            self.check_value_call_args(&params, args);
-            return entry.ret.to_source();
+            return self.resolve_math_namespace_call(&call, entry);
         }
 
-        if class_name == "f64" && matches!(method_name, "from_i64" | "trunc_to_i64") {
-            if !type_args.is_empty() {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!("function `f64::{method_name}` expects no type arguments"),
-                    )
-                    .with_label(Label::primary(span, "unexpected type arguments")),
-                );
-            }
-            if args.len() != 1 {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "function `f64::{method_name}` expects 1 argument, got {}",
-                            args.len()
-                        ),
-                    )
-                    .with_label(Label::primary(span, "wrong number of arguments")),
-                );
-            }
-            let (param, ret) = if method_name == "from_i64" {
-                (Type::I64, Type::F64)
-            } else {
-                (Type::F64, Type::I64)
-            };
-            self.check_value_call_args(&[param], args);
-            return ret;
-        }
-
-        if class_name == "f64" && method_name == "to_string" {
-            if args.len() != 1 {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "function `f64::to_string` expects 1 argument, got {}",
-                            args.len()
-                        ),
-                    )
-                    .with_label(Label::primary(span, "wrong number of arguments")),
-                );
-            }
-            let params = [Type::F64];
-            self.check_value_call_args(&params, args);
-            return Type::String;
-        }
-
-        if matches!(class_name, "f64" | "i64") && method_name == "parse" {
-            if args.len() != 1 {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "function `{class_name}::parse` expects 1 argument, got {}",
-                            args.len()
-                        ),
-                    )
-                    .with_label(Label::primary(span, "wrong number of arguments")),
-                );
-            }
-            let params = [Type::String];
-            self.check_value_call_args(&params, args);
-            return Type::Generic(
-                "Result".to_string(),
-                if class_name == "i64" {
-                    vec![Type::I64, Type::Named("ParseIntError".to_string())]
-                } else {
-                    vec![Type::F64, Type::Named("ParseFloatError".to_string())]
-                },
-            );
+        if let Some(ty) = self.resolve_number_static_call(&call) {
+            return ty;
         }
 
         // Check if `class_name` refers to an imported module (e.g. `math::add`).
         if self.symbols.lookup_module(class_name).is_some() {
-            return match self
-                .symbols
-                .lookup_module_func(class_name, method_name)
-                .cloned()
-            {
-                None => {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0350,
-                            format!(
-                                "function `{}` not found in module `{}`",
-                                method_name, class_name
-                            ),
-                        )
-                        .with_label(Label::primary(span, "not found in module")),
-                    );
-                    Type::Void
-                }
-                Some(fi) if fi.constant.is_some() => {
-                    let qualified = QualifiedName::join(class_name, method_name);
-                    self.reject_constant_call(&qualified, &fi, args, span)
-                }
-                Some(fi) => {
-                    if fi.foreign {
-                        self.record_direct_lock_effect(span, "extern rust", LockEffectKind::Block);
-                    }
-                    self.record_method_use(
-                        method_name,
-                        "function",
-                        span,
-                        fi.declaration_span,
-                        args,
-                    );
-                    // `m::f(..)` is a call, unlike a `m::CONST` member read.
-                    self.mark_last_member_use_call();
-                    if !fi.public {
-                        let defined_at = fi
-                            .module_path
-                            .as_deref()
-                            .map(|path| {
-                                format!(
-                                    "`{}` is defined at {}:{}:{}",
-                                    method_name,
-                                    path,
-                                    fi.declaration_span.line,
-                                    fi.declaration_span.col
-                                )
-                            })
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "`{}` is defined at line {}, column {}",
-                                    method_name, fi.declaration_span.line, fi.declaration_span.col
-                                )
-                            });
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0402,
-                                format!("function `{}` is private", method_name),
-                            )
-                            .with_label(Label::primary(span, "private function"))
-                            .with_note(defined_at)
-                            .with_help(format!("make it public with `pub fn {}`", method_name)),
-                        );
-                    }
-                    if args.len() != fi.params.len() {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0203,
-                                format!(
-                                    "function `{}::{}` expects {} argument(s), got {}",
-                                    class_name,
-                                    method_name,
-                                    fi.params.len(),
-                                    args.len()
-                                ),
-                            )
-                            .with_label(Label::primary(span, "wrong number of arguments")),
-                        );
-                    }
-                    self.check_call_args_against_param_infos(&fi.param_infos, args);
-                    self.check_async_call_captures(&fi.param_infos, args, fi.is_async);
-                    // A module-qualified call to an async fn yields `Task<T>`,
-                    // just like a local async call — without this the call site
-                    // types as the bare `T` and `await` rejects it
-                    // (willow-887c).
-                    function_call_return_type(&fi)
-                }
-            };
+            return self.resolve_module_function_call(&call);
         }
 
-        let class = match self.symbols.lookup_class(class_name).cloned() {
-            Some(c) => c,
-            None => {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0350,
-                        format!("unknown name `{}` (not a module or class)", class_name),
-                    )
-                    .with_label(Label::primary(span, "unknown module or class")),
+        self.resolve_class_static_method_call(&call)
+    }
+
+    /// The error for a call whose argument count does not match its signature.
+    fn push_wrong_argument_count(&mut self, code: ErrorCode, message: String, span: Span) {
+        self.push_error(code, message, span, "wrong number of arguments");
+    }
+
+    fn resolve_map_new(&mut self, call: &StaticCall<'_>) -> Type {
+        let StaticCall {
+            type_args,
+            args,
+            span,
+            ..
+        } = *call;
+        self.check_collection_type_imported("Map", span);
+        if !args.is_empty() {
+            self.push_error(
+                ErrorCode::E0201,
+                "`Map::new` takes no arguments",
+                span,
+                "unexpected arguments",
+            );
+        }
+        match type_args {
+            [] => Type::Generic("Map".to_string(), vec![Type::Void, Type::Void]),
+            [key, value] => Type::Generic("Map".to_string(), vec![key.clone(), value.clone()]),
+            _ => {
+                self.push_error(
+                    ErrorCode::E0201,
+                    format!(
+                        "`Map::new` expects 2 type arguments, got {}",
+                        type_args.len()
+                    ),
+                    span,
+                    "wrong number of type arguments",
                 );
-                return Type::Void;
+                Type::Generic("Map".to_string(), vec![Type::Void, Type::Void])
+            }
+        }
+    }
+
+    /// A variant of a non-generic enum.
+    fn resolve_enum_variant_call(&mut self, call: &StaticCall<'_>, enum_info: &EnumInfo) -> Type {
+        let StaticCall {
+            class_name,
+            method_name,
+            args,
+            span,
+            method_span,
+            ..
+        } = *call;
+        let Some(variant) = enum_info.variants.iter().find(|v| v.name == method_name) else {
+            self.push_error(
+                ErrorCode::E1208,
+                format!("no variant `{}` in enum `{}`", method_name, class_name),
+                span,
+                "unknown enum variant",
+            );
+            return Type::Named(enum_info.name.clone());
+        };
+        self.record_variant_use(&enum_info.name, method_name, method_span);
+        if variant.payload_types.is_empty() {
+            // Fieldless variant: no args expected
+            if !args.is_empty() {
+                self.push_error(
+                    ErrorCode::E0201,
+                    format!(
+                        "enum variant `{}::{}` takes no arguments, got {}",
+                        class_name,
+                        method_name,
+                        args.len()
+                    ),
+                    span,
+                    "unexpected arguments",
+                );
+            }
+            return Type::Named(enum_info.name.clone());
+        }
+        // Payload variant: check arg count and types
+        let expected = variant.payload_types.len();
+        if args.len() != expected {
+            self.push_wrong_argument_count(
+                ErrorCode::E0201,
+                format!(
+                    "enum variant `{}::{}` takes {} argument(s), got {}",
+                    class_name,
+                    method_name,
+                    expected,
+                    args.len()
+                ),
+                span,
+            );
+        }
+        for (param_ty, arg) in variant.payload_types.iter().zip(args.iter()) {
+            let arg_ty = self.check_expr(&arg.expr);
+            if !self.types_compatible(param_ty, &arg_ty) {
+                self.push_type_mismatch_with_code(
+                    ErrorCode::E0201,
+                    param_ty,
+                    &arg_ty,
+                    arg.expr.span(),
+                );
+            }
+        }
+        Type::Named(enum_info.name.clone())
+    }
+
+    /// A variant of a generic enum, including Option<T>, Result<T, E> and
+    /// tuples defined in the prelude.
+    fn resolve_generic_enum_variant_call(
+        &mut self,
+        call: &StaticCall<'_>,
+        enum_info: &EnumInfo,
+    ) -> Type {
+        let StaticCall {
+            class_name,
+            type_args,
+            method_name,
+            args,
+            span,
+            method_span,
+            ..
+        } = *call;
+        let Some(variant) = enum_info.variants.iter().find(|v| v.name == method_name) else {
+            // Unknown variant in generic enum
+            let valid: Vec<&str> = enum_info.variants.iter().map(|v| v.name.as_str()).collect();
+            self.push_error(
+                ErrorCode::E1801,
+                format!(
+                    "unknown variant `{}` in `{}`; expected one of: {}",
+                    method_name,
+                    class_name,
+                    valid.join(", ")
+                ),
+                span,
+                "unknown variant",
+            );
+            return Type::Void;
+        };
+        self.record_variant_use(&enum_info.name, method_name, method_span);
+        // Validate arg count.
+        if args.len() != variant.payload_types.len() {
+            self.push_wrong_argument_count(
+                ErrorCode::E0201,
+                format!(
+                    "`{}::{}` expects {} argument(s), got {}",
+                    class_name,
+                    method_name,
+                    variant.payload_types.len(),
+                    args.len()
+                ),
+                span,
+            );
+            let void_args = vec![Type::Void; enum_info.type_params.len()];
+            return Type::Generic(enum_info.name.clone(), void_args);
+        }
+        let explicit: Vec<_> = type_args
+            .iter()
+            .map(|t| self.normalize_type(t, span))
+            .collect();
+        for ty in &explicit {
+            self.validate_type(ty, span);
+        }
+        let bindings: HashMap<_, _> = enum_info
+            .type_params
+            .iter()
+            .cloned()
+            .zip(explicit.iter().cloned())
+            .collect();
+        let checked_args: Vec<Type> = args
+            .iter()
+            .zip(&variant.payload_types)
+            .map(|(arg, param)| {
+                if explicit.is_empty() {
+                    self.check_expr(&arg.expr)
+                } else {
+                    let expected = param.substitute_names(|n| bindings.get(n).cloned());
+                    self.check_expr_expecting(&arg.expr, &expected)
+                }
+            })
+            .collect();
+
+        if crate::parser::tuples::is_tuple(&enum_info.name) {
+            return Type::Generic(enum_info.name.clone(), checked_args);
+        }
+        let bindings = match crate::semantic::generic_inference::infer_partial(
+            &enum_info.type_params,
+            &variant.payload_types,
+            &checked_args,
+            &explicit,
+        ) {
+            Ok(bindings) => bindings,
+            Err(message) => {
+                self.generic_error(span, message);
+                return Self::error_type();
             }
         };
-        match class.methods.get(method_name).cloned() {
-            None => {
-                let mut diagnostic = Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0502,
+        let type_args = enum_info
+            .type_params
+            .iter()
+            .map(|p| bindings[p].clone())
+            .collect();
+        Type::Generic(enum_info.name.clone(), type_args)
+    }
+
+    /// Lock primitives: `Mutex::new(v)` / `RwLock::new(v)` / native
+    /// compatibility-cell constructors infer their element type from the
+    /// argument, e.g. `Mutex<i64>::new(0)`.
+    fn resolve_lock_new(&mut self, call: &StaticCall<'_>) -> Type {
+        let StaticCall {
+            class_name,
+            type_args,
+            args,
+            span,
+            expected,
+            ..
+        } = *call;
+        self.reject_reference_args(&QualifiedName::join(class_name, "new"), args);
+        if args.len() != 1 {
+            self.push_wrong_argument_count(
+                ErrorCode::E0201,
+                format!(
+                    "function `{class_name}::new` expects 1 argument, got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return Type::Generic(class_name.to_string(), vec![Type::Void]);
+        }
+        // The written type argument, else the expected lock's element, is
+        // the argument's context: `Mutex::new([])` expected as
+        // `Mutex<Array<i64>>` types `[]` as `Array<i64>`.
+        let context = match (type_args, expected) {
+            ([t], _) => Some(t),
+            ([], Some(Type::Generic(name, elem))) if name == class_name && elem.len() == 1 => {
+                Some(&elem[0])
+            }
+            _ => None,
+        };
+        let arg_ty = match context {
+            Some(context) => self.check_expr_expecting(&args[0].expr, context),
+            None => self.check_expr(&args[0].expr),
+        };
+        let elem = match type_args {
+            [] => arg_ty.clone(),
+            [t] => {
+                if arg_ty != *t && arg_ty != Type::Never {
+                    self.push_error(
+                        ErrorCode::E0201,
+                        format!(
+                            "`{class_name}<{}>::new` expects `{}`, got `{}`",
+                            self.diagnostic_type_name(t),
+                            self.diagnostic_type_name(t),
+                            self.diagnostic_type_name(&arg_ty)
+                        ),
+                        args[0].expr.span(),
+                        "wrong argument type",
+                    );
+                }
+                t.clone()
+            }
+            _ => {
+                self.push_error(
+                    ErrorCode::E0201,
+                    format!("`{class_name}::new` expects 1 type argument"),
+                    span,
+                    "too many type arguments",
+                );
+                arg_ty.clone()
+            }
+        };
+        Type::Generic(class_name.to_string(), vec![elem])
+    }
+
+    /// Atomic primitives: `AtomicI64::new(i64)` / `AtomicBool::new(bool)`
+    /// return the (non-generic) atomic type.
+    fn resolve_atomic_new(&mut self, call: &StaticCall<'_>) -> Type {
+        let StaticCall {
+            class_name,
+            args,
+            span,
+            ..
+        } = *call;
+        self.reject_reference_args(&QualifiedName::join(class_name, "new"), args);
+        let expected = if class_name == "AtomicI64" {
+            Type::I64
+        } else {
+            Type::Bool
+        };
+        if args.len() != 1 {
+            self.push_wrong_argument_count(
+                ErrorCode::E0201,
+                format!(
+                    "function `{class_name}::new` expects 1 argument, got {}",
+                    args.len()
+                ),
+                span,
+            );
+        } else {
+            let arg_ty = self.check_expr(&args[0].expr);
+            if arg_ty != expected && arg_ty != Type::Never {
+                self.push_error(
+                    ErrorCode::E0201,
                     format!(
-                        "no method `{}` on class `{}`",
+                        "`{class_name}::new` expects `{}`, got `{}`",
+                        self.diagnostic_type_name(&expected),
+                        self.diagnostic_type_name(&arg_ty)
+                    ),
+                    args[0].expr.span(),
+                    "wrong argument type",
+                );
+            }
+        }
+        Type::Named(class_name.to_string())
+    }
+
+    /// `CancellationToken::new()` / `TaskScope::new()`.
+    fn resolve_no_arg_new(&mut self, call: &StaticCall<'_>) -> Type {
+        let StaticCall {
+            class_name,
+            type_args,
+            args,
+            span,
+            ..
+        } = *call;
+        self.reject_reference_args(&QualifiedName::join(class_name, "new"), args);
+        if !type_args.is_empty() || !args.is_empty() {
+            for arg in args {
+                self.check_expr(&arg.expr);
+            }
+            self.push_error(
+                ErrorCode::E0201,
+                format!("function `{class_name}::new` expects no arguments"),
+                span,
+                "wrong constructor arguments",
+            );
+        }
+        Type::Named(class_name.to_string())
+    }
+
+    /// Bounded channel: one i64 capacity argument.
+    fn resolve_channel_with_capacity(&mut self, call: &StaticCall<'_>) -> Type {
+        let StaticCall {
+            type_args,
+            args,
+            span,
+            ..
+        } = *call;
+        self.reject_reference_args("Channel::with_capacity", args);
+        if args.len() != 1 {
+            self.push_wrong_argument_count(
+                ErrorCode::E0201,
+                format!(
+                    "function `Channel::with_capacity` expects 1 argument, got {}",
+                    args.len()
+                ),
+                span,
+            );
+        } else {
+            let cap_ty = self.check_expr(&args[0].expr);
+            if cap_ty != Type::I64 {
+                self.push_error(
+                    ErrorCode::E0201,
+                    format!(
+                        "channel capacity must be `i64`, found `{}`",
+                        self.diagnostic_type_name(&cap_ty)
+                    ),
+                    args[0].expr.span(),
+                    "expected `i64`",
+                );
+            }
+        }
+        match type_args {
+            [] => Type::Generic("Channel".to_string(), vec![Type::Void]),
+            [element_ty] => Type::Generic("Channel".to_string(), vec![element_ty.clone()]),
+            _ => {
+                self.push_error(
+                    ErrorCode::E0201,
+                    format!(
+                        "function `Channel::with_capacity` expects 1 type argument, got {}",
+                        type_args.len()
+                    ),
+                    span,
+                    "wrong number of type arguments",
+                );
+                Type::Generic("Channel".to_string(), vec![Type::Void])
+            }
+        }
+    }
+
+    fn resolve_channel_new(&mut self, call: &StaticCall<'_>) -> Type {
+        let StaticCall {
+            type_args,
+            args,
+            span,
+            ..
+        } = *call;
+        if !args.is_empty() {
+            self.push(
+                Self::error_at(
+                    ErrorCode::E0201,
+                    format!(
+                        "function `Channel::new` expects 0 arguments, got {}",
+                        args.len()
+                    ),
+                    span,
+                    "wrong number of arguments",
+                )
+                .with_help("use `Channel::with_capacity(n)` to create a bounded channel"),
+            );
+        }
+        match type_args {
+            [] => Type::Generic("Channel".to_string(), vec![Type::Void]),
+            [element_ty] => Type::Generic("Channel".to_string(), vec![element_ty.clone()]),
+            _ => {
+                self.push_error(
+                    ErrorCode::E0201,
+                    format!(
+                        "function `Channel::new` expects 1 type argument, got {}",
+                        type_args.len()
+                    ),
+                    span,
+                    "wrong number of type arguments",
+                );
+                Type::Void
+            }
+        }
+    }
+
+    /// The type-argument error shared by non-generic builtin functions.
+    fn reject_static_call_type_args(&mut self, call: &StaticCall<'_>) {
+        if !call.type_args.is_empty() {
+            self.push_error(
+                ErrorCode::E0201,
+                format!(
+                    "function `{}::{}` expects no type arguments",
+                    call.class_name, call.method_name
+                ),
+                call.span,
+                "unexpected type arguments",
+            );
+        }
+    }
+
+    fn resolve_math_namespace_call(
+        &mut self,
+        call: &StaticCall<'_>,
+        entry: crate::semantic::intrinsics::NamespaceBuiltin,
+    ) -> Type {
+        let StaticCall {
+            class_name,
+            method_name,
+            args,
+            span,
+            ..
+        } = *call;
+        self.reject_static_call_type_args(call);
+        if args.len() != entry.params.len() {
+            self.push_wrong_argument_count(
+                ErrorCode::E0201,
+                format!(
+                    "function `{class_name}::{method_name}` expects {} arguments, got {}",
+                    entry.params.len(),
+                    args.len()
+                ),
+                span,
+            );
+        }
+        let params: Vec<_> = entry.params.iter().map(|ty| ty.to_source()).collect();
+        self.check_value_call_args(&params, args);
+        entry.ret.to_source()
+    }
+
+    /// `f64::from_i64`, `f64::trunc_to_i64`, `f64::to_string` and
+    /// `f64::parse` / `i64::parse`; `None` for any other call.
+    fn resolve_number_static_call(&mut self, call: &StaticCall<'_>) -> Option<Type> {
+        let StaticCall {
+            class_name,
+            method_name,
+            args,
+            span,
+            ..
+        } = *call;
+        let (param, ret) = match (class_name, method_name) {
+            ("f64", "from_i64") => (Type::I64, Type::F64),
+            ("f64", "trunc_to_i64") => (Type::F64, Type::I64),
+            ("f64", "to_string") => (Type::F64, Type::String),
+            ("f64", "parse") => (
+                Type::String,
+                Type::Generic(
+                    "Result".to_string(),
+                    vec![Type::F64, Type::Named("ParseFloatError".to_string())],
+                ),
+            ),
+            ("i64", "parse") => (
+                Type::String,
+                Type::Generic(
+                    "Result".to_string(),
+                    vec![Type::I64, Type::Named("ParseIntError".to_string())],
+                ),
+            ),
+            _ => return None,
+        };
+        // Only the conversions have always rejected type arguments.
+        if matches!(method_name, "from_i64" | "trunc_to_i64") {
+            self.reject_static_call_type_args(call);
+        }
+        if args.len() != 1 {
+            self.push_wrong_argument_count(
+                ErrorCode::E0201,
+                format!(
+                    "function `{class_name}::{method_name}` expects 1 argument, got {}",
+                    args.len()
+                ),
+                span,
+            );
+        }
+        self.check_value_call_args(&[param], args);
+        Some(ret)
+    }
+
+    /// A module-qualified function call, e.g. `math::add(..)`.
+    fn resolve_module_function_call(&mut self, call: &StaticCall<'_>) -> Type {
+        let StaticCall {
+            class_name,
+            method_name,
+            args,
+            span,
+            ..
+        } = *call;
+        let Some(fi) = self
+            .symbols
+            .lookup_module_func(class_name, method_name)
+            .cloned()
+        else {
+            self.push_error(
+                ErrorCode::E0350,
+                format!(
+                    "function `{}` not found in module `{}`",
+                    method_name, class_name
+                ),
+                span,
+                "not found in module",
+            );
+            return Type::Void;
+        };
+        if fi.constant.is_some() {
+            let qualified = QualifiedName::join(class_name, method_name);
+            return self.reject_constant_call(&qualified, &fi, args, span);
+        }
+        if fi.foreign {
+            self.record_direct_lock_effect(span, "extern rust", LockEffectKind::Block);
+        }
+        self.record_method_use(method_name, "function", span, fi.declaration_span, args);
+        // `m::f(..)` is a call, unlike a `m::CONST` member read.
+        self.mark_last_member_use_call();
+        if !fi.public {
+            self.push_private_module_function(method_name, &fi, span);
+        }
+        if args.len() != fi.params.len() {
+            self.push_wrong_argument_count(
+                ErrorCode::E0203,
+                format!(
+                    "function `{}::{}` expects {} argument(s), got {}",
+                    class_name,
+                    method_name,
+                    fi.params.len(),
+                    args.len()
+                ),
+                span,
+            );
+        }
+        self.check_call_args_against_param_infos(&fi.param_infos, args);
+        self.check_async_call_captures(&fi.param_infos, args, fi.is_async);
+        // A module-qualified call to an async fn yields `Task<T>`,
+        // just like a local async call — without this the call site
+        // types as the bare `T` and `await` rejects it.
+        function_call_return_type(&fi)
+    }
+
+    fn push_private_module_function(&mut self, method_name: &str, fi: &FuncInfo, span: Span) {
+        let defined_at = fi
+            .module_path
+            .as_deref()
+            .map(|path| {
+                format!(
+                    "`{}` is defined at {}:{}:{}",
+                    method_name, path, fi.declaration_span.line, fi.declaration_span.col
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "`{}` is defined at line {}, column {}",
+                    method_name, fi.declaration_span.line, fi.declaration_span.col
+                )
+            });
+        self.push(
+            Self::error_at(
+                ErrorCode::E0402,
+                format!("function `{}` is private", method_name),
+                span,
+                "private function",
+            )
+            .with_note(defined_at)
+            .with_help(format!("make it public with `pub fn {}`", method_name)),
+        );
+    }
+
+    /// A static method of a class, e.g. `Point::origin()`.
+    fn resolve_class_static_method_call(&mut self, call: &StaticCall<'_>) -> Type {
+        let StaticCall {
+            class_name,
+            method_name,
+            args,
+            span,
+            ..
+        } = *call;
+        let Some(class) = self.symbols.lookup_class(class_name).cloned() else {
+            self.push_error(
+                ErrorCode::E0350,
+                format!("unknown name `{}` (not a module or class)", class_name),
+                span,
+                "unknown module or class",
+            );
+            return Type::Void;
+        };
+        let Some(mi) = class.methods.get(method_name).cloned() else {
+            self.push_unknown_static_method(call, &class);
+            return Type::Void;
+        };
+        self.request_class_method(class_name, method_name);
+        self.record_method_use(method_name, "method", span, mi.declaration_span, args);
+        if !mi.is_static {
+            self.push_instance_method_static_call(call);
+            return method_call_return_type(&mi);
+        }
+        if !mi.public {
+            self.check_static_method_access(call, &mi);
+        }
+        if mi.params.len() != args.len() {
+            self.push_wrong_argument_count(
+                ErrorCode::E0201,
+                format!(
+                    "function `{}::{}` expects {} argument(s), got {}",
+                    class_name,
+                    method_name,
+                    mi.params.len(),
+                    args.len()
+                ),
+                span,
+            );
+        }
+        self.check_call_args_against_param_infos(&mi.param_infos, args);
+        self.check_async_call_captures(&mi.param_infos, args, mi.is_async);
+        method_call_return_type(&mi)
+    }
+
+    fn push_unknown_static_method(&mut self, call: &StaticCall<'_>, class: &ClassInfo) {
+        let StaticCall {
+            class_name,
+            method_name,
+            span,
+            ..
+        } = *call;
+        let mut diagnostic = Self::error_at(
+            ErrorCode::E0502,
+            format!(
+                "no method `{}` on class `{}`",
+                method_name,
+                self.diagnostic_class_name(class_name)
+            ),
+            span,
+            "method not found",
+        );
+
+        if let Some(suggestion) = suggest_similar_name(method_name, class.methods.keys()) {
+            diagnostic = diagnostic
+                .with_help(format!(
+                    "there is a method with a similar name: `{}`",
+                    suggestion
+                ))
+                .with_fix(FixSuggestion::new(
+                    span,
+                    suggestion,
+                    "replace with suggested method",
+                ));
+        }
+
+        self.push(diagnostic);
+    }
+
+    fn push_instance_method_static_call(&mut self, call: &StaticCall<'_>) {
+        let StaticCall {
+            class_name,
+            method_name,
+            span,
+            ..
+        } = *call;
+        let diagnostic = Self::error_at(
+            ErrorCode::E0835,
+            format!(
+                "instance method `{}::{}` requires an object",
+                class_name, method_name
+            ),
+            span,
+            "instance method called with `::`",
+        );
+
+        let diagnostic = if class_name == self.local.current_class.as_deref().unwrap_or("")
+            && self.symbols.lookup_var("self").is_some()
+        {
+            diagnostic.with_help(format!("write `self.{}` instead", method_name))
+        } else {
+            diagnostic.with_help("call it on an object value with `object.method(...)`")
+        };
+
+        self.push(diagnostic);
+    }
+
+    /// Protected and private static methods are reachable only from the
+    /// classes their visibility admits.
+    fn check_static_method_access(&mut self, call: &StaticCall<'_>, mi: &MethodInfo) {
+        let StaticCall {
+            class_name,
+            method_name,
+            span,
+            ..
+        } = *call;
+        if mi.protected {
+            if !self.can_access_protected_member(class_name) {
+                self.push(
+                    Self::error_at(
+                        ErrorCode::E0503,
+                        format!(
+                            "method `{}` of class `{}` is protected",
+                            method_name,
+                            self.diagnostic_class_name(class_name)
+                        ),
+                        span,
+                        "protected method",
+                    )
+                    .with_label(Label::secondary(mi.declaration_span, "method defined here"))
+                    .with_help(format!(
+                        "prot members are accessible only within `{}` and its subclasses",
+                        self.diagnostic_class_name(class_name)
+                    )),
+                );
+            }
+        } else if !self.can_access_private_member(class_name) {
+            self.push(
+                Self::error_at(
+                    ErrorCode::E0501,
+                    format!(
+                        "method `{}` of class `{}` is private",
                         method_name,
                         self.diagnostic_class_name(class_name)
                     ),
+                    span,
+                    "private method",
                 )
-                .with_label(Label::primary(span, "method not found"));
-
-                if let Some(suggestion) = suggest_similar_name(method_name, class.methods.keys()) {
-                    diagnostic = diagnostic
-                        .with_help(format!(
-                            "there is a method with a similar name: `{}`",
-                            suggestion
-                        ))
-                        .with_fix(FixSuggestion::new(
-                            span,
-                            suggestion,
-                            "replace with suggested method",
-                        ));
-                }
-
-                self.push(diagnostic);
-                Type::Void
-            }
-            Some(mi) => {
-                self.request_class_method(class_name, method_name);
-                self.record_method_use(method_name, "method", span, mi.declaration_span, args);
-                if !mi.is_static {
-                    let mut diagnostic = Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0835,
-                        format!(
-                            "instance method `{}::{}` requires an object",
-                            class_name, method_name
-                        ),
-                    )
-                    .with_label(Label::primary(span, "instance method called with `::`"));
-
-                    diagnostic = if class_name == self.local.current_class.as_deref().unwrap_or("")
-                        && self.symbols.lookup_var("self").is_some()
-                    {
-                        diagnostic.with_help(format!("write `self.{}` instead", method_name))
-                    } else {
-                        diagnostic.with_help("call it on an object value with `object.method(...)`")
-                    };
-
-                    self.push(diagnostic);
-                    return method_call_return_type(&mi);
-                }
-                if !mi.public {
-                    if mi.protected {
-                        if !self.can_access_protected_member(class_name) {
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0503,
-                                    format!(
-                                        "method `{}` of class `{}` is protected",
-                                        method_name, self.diagnostic_class_name(class_name)
-                                    ),
-                                )
-                                .with_label(Label::primary(span, "protected method"))
-                                .with_label(Label::secondary(mi.declaration_span, "method defined here"))
-                                .with_help(format!(
-                                    "prot members are accessible only within `{}` and its subclasses",
-                                    self.diagnostic_class_name(class_name)
-                                )),
-                            );
-                        }
-                    } else if !self.can_access_private_member(class_name) {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0501,
-                                format!(
-                                    "method `{}` of class `{}` is private",
-                                    method_name,
-                                    self.diagnostic_class_name(class_name)
-                                ),
-                            )
-                            .with_label(Label::primary(span, "private method"))
-                            .with_label(Label::secondary(
-                                mi.declaration_span,
-                                "method defined here",
-                            ))
-                            .with_help(format!("private members are accessible only within their declaring class, even in the same module; make it public with `pub fn {}`", method_name)),
-                        );
-                    }
-                }
-                if mi.params.len() != args.len() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "function `{}::{}` expects {} argument(s), got {}",
-                                class_name,
-                                method_name,
-                                mi.params.len(),
-                                args.len()
-                            ),
-                        )
-                        .with_label(Label::primary(span, "wrong number of arguments")),
-                    );
-                }
-                self.check_call_args_against_param_infos(&mi.param_infos, args);
-                self.check_async_call_captures(&mi.param_infos, args, mi.is_async);
-                method_call_return_type(&mi)
-            }
+                .with_label(Label::secondary(
+                    mi.declaration_span,
+                    "method defined here",
+                ))
+                .with_help(format!("private members are accessible only within their declaring class, even in the same module; make it public with `pub fn {}`", method_name)),
+            );
         }
     }
 

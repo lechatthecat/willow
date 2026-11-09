@@ -7,6 +7,15 @@ use std::collections::HashSet;
 
 use super::*;
 
+/// Which values the unguarded arms of a `match` cover so far.
+#[derive(Default)]
+struct MatchCoverage {
+    covered_variants: HashSet<String>,
+    has_wildcard: bool,
+    has_true: bool,
+    has_false: bool,
+}
+
 #[cfg(test)]
 thread_local! {
     pub(super) static INVALID_PATTERN_BINDINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -780,76 +789,28 @@ impl TypeChecker {
         let errors_before_match = self.error_generation;
         let scrutinee_ty = self.check_expr(&m.scrutinee);
         if Self::contains_error_type(&scrutinee_ty) {
-            // The failed scrutinee cannot constrain patterns. Keep checking arm
-            // bodies for independent errors with poisoned payload bindings.
-            for arm in &m.arms {
-                self.symbols.push_scope();
-                self.bind_invalid_pattern(&arm.pattern);
-                if let Some(guard) = &arm.guard {
-                    self.check_match_guard(guard);
-                }
-                self.check_match_body(&arm.body, expected.as_ref(), m.source);
-                self.symbols.pop_scope();
-            }
-            return Self::error_type();
+            return self.check_match_arms_without_scrutinee(m, expected.as_ref());
         }
 
         if m.arms.is_empty() {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E1202,
-                    "match expression has no arms",
-                )
-                .with_label(Label::primary(m.span, "no arms in match")),
+            self.push_error(
+                ErrorCode::E1202,
+                "match expression has no arms",
+                m.span,
+                "no arms in match",
             );
             return Type::Void;
         }
 
-        let mut covered_variants: HashSet<String> = HashSet::new();
-        let mut has_wildcard = false;
-        let mut has_true = false;
-        let mut has_false = false;
+        let mut coverage = MatchCoverage::default();
         let mut result_type: Option<Type> = None;
         let mut found_unreachable = false;
         let mut invalid_patterns = false;
 
         for arm in &m.arms {
             // Check if arm is unreachable (after a wildcard/binding)
-            if has_wildcard && !found_unreachable {
-                let diagnostic = match m.source {
-                    MatchSource::Match | MatchSource::TupleLet => Diagnostic::new(
-                        Severity::Warning,
-                        ErrorCode::W1201,
-                        "unreachable match arm",
-                    )
-                    .with_label(Label::primary(arm.span, "this arm is unreachable")),
-                    // The unreachable arm is the synthetic `_` (willow-jz15.6):
-                    // point at the pattern that made it so.
-                    MatchSource::IfLet | MatchSource::WhileLet => {
-                        let form = if m.source == MatchSource::IfLet {
-                            "if let"
-                        } else {
-                            "while let"
-                        };
-                        let mut diagnostic = Diagnostic::new(
-                            Severity::Warning,
-                            ErrorCode::W1201,
-                            format!("irrefutable `{form}` pattern"),
-                        )
-                        .with_label(Label::primary(
-                            m.arms[0].pattern.span(),
-                            "this pattern always matches",
-                        ));
-                        diagnostic = if m.source == MatchSource::IfLet {
-                            diagnostic.with_help("use `let` instead; the `else` branch never runs")
-                        } else {
-                            diagnostic.with_help("the loop only ends through `break` or `return`")
-                        };
-                        diagnostic
-                    }
-                };
-                self.push(diagnostic);
+            if coverage.has_wildcard && !found_unreachable {
+                self.push(Self::unreachable_arm_diagnostic(m, arm));
                 found_unreachable = true;
             }
             // A guarded arm may decline a value its pattern matches, so it
@@ -857,462 +818,16 @@ impl TypeChecker {
             let covers = arm.guard.is_none();
 
             let errors_before_pattern = self.error_generation;
-
-            // Reinterpret `Ok(v)` / `Closed` as enum-variant patterns when the
-            // scrutinee is an enum, and record the reinterpretation for the
-            // backend (willow-60o.1). Everything below uses `pattern`.
-            match &arm.pattern {
-                Pattern::EnumVariant {
-                    enum_name, span, ..
-                }
-                | Pattern::EnumVariantTuple {
-                    enum_name, span, ..
-                } => {
-                    self.check_source_type_name(enum_name, *span);
-                    // Preserve the source alias before normalization canonicalizes it.
-                    self.record_type_use(enum_name, &scrutinee_ty, *span);
-                }
-                Pattern::ClassDowncast {
-                    class_name, span, ..
-                } => {
-                    self.check_source_type_name(class_name, *span);
-                }
-                _ => {}
-            }
-            let reinterpreted = self.normalize_match_pattern(&arm.pattern, &scrutinee_ty);
-            if let Some(p) = &reinterpreted {
-                self.pattern_resolutions.insert(arm.pattern.id(), p.clone());
-            }
+            let reinterpreted = self.resolve_arm_pattern(arm, &scrutinee_ty);
             let pattern: &Pattern = reinterpreted.as_ref().unwrap_or(&arm.pattern);
-
-            if let Pattern::EnumVariant {
-                enum_name,
-                variant,
-                variant_span,
-                ..
-            }
-            | Pattern::EnumVariantTuple {
-                enum_name,
-                variant,
-                variant_span,
-                ..
-            } = pattern
-            {
-                self.record_variant_pattern(enum_name, variant, *variant_span);
-            }
-            if let Pattern::ClassDowncast {
-                class_name, span, ..
-            } = pattern
-            {
-                self.record_type_use(
-                    class_name,
-                    &Type::Named(self.canonical_type_name(class_name)),
-                    *span,
-                );
-            }
-            // Resolve real enum variants and classes before diagnosing the common
-            // Option spelling on a non-Option value. Do not steal user variants.
-            let option_pattern = match pattern {
-                Pattern::ClassDowncast { class_name, .. } => {
-                    class_name == "Some" && self.symbols.lookup_class(class_name).is_none()
-                }
-                Pattern::EnumVariant {
-                    enum_name, variant, ..
-                }
-                | Pattern::EnumVariantTuple {
-                    enum_name, variant, ..
-                } => {
-                    (enum_name == "Option" || enum_name.is_empty())
-                        && matches!(variant.as_str(), "Some" | "None")
-                }
-                _ => false,
-            };
-            // Validate pattern and track coverage
-            match pattern {
-                _ if option_pattern
-                    && builtin_types::unary_arg(&scrutinee_ty, B::Option).is_none() =>
-                {
-                    let mut diagnostic = Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E1205,
-                        format!(
-                            "pattern type mismatch: expected `Option`, found `{}`",
-                            self.diagnostic_type_name(&scrutinee_ty)
-                        ),
-                    )
-                    .with_label(Label::primary(
-                        pattern.span(),
-                        "expected an Option scrutinee",
-                    ));
-                    if let Expr::MethodCall(call) = &*m.scrutinee
-                        && call.method == "recv"
-                        && self
-                            .expr_types
-                            .get(&call.object.id())
-                            .is_some_and(|ty| builtin_types::unary_arg(ty, B::Channel).is_some())
-                    {
-                        diagnostic = diagnostic.with_help(
-                            "Channel::recv() returns T; use `recv_opt()` to receive an Option<T>",
-                        );
-                    }
-                    if scrutinee_ty == Type::I64 && diagnostic.helps.is_empty() {
-                        diagnostic = diagnostic.with_help(STRING_FIND_SENTINEL_HELP);
-                    }
-                    self.push(diagnostic);
-                }
-                Pattern::Wildcard(_, _) => {
-                    has_wildcard |= covers;
-                }
-                Pattern::Binding { name, span, .. } => {
-                    has_wildcard |= covers; // binding covers everything
-                    // Patterns do not compare against constants: the name
-                    // would silently bind a new variable instead.
-                    if self.symbols.lookup_var(name).is_none()
-                        && let Some(info) = self.symbols.lookup_func(name)
-                        && info.constant.is_some()
-                    {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E1205,
-                                format!("constant `{name}` cannot be used as a match pattern"),
-                            )
-                            .with_label(Label::primary(*span, "would bind a new variable"))
-                            .with_label(Label::secondary(
-                                info.declaration_span,
-                                "constant declared here",
-                            ))
-                            .with_help("write the literal value, or compare with `if`"),
-                        );
-                    }
-                }
-                Pattern::LiteralBool(b, span, _) => {
-                    if scrutinee_ty != Type::Bool {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E1205,
-                                format!(
-                                    "bool pattern cannot match scrutinee of type `{}`",
-                                    self.diagnostic_type_name(&scrutinee_ty)
-                                ),
-                            )
-                            .with_label(Label::primary(*span, "pattern type mismatch")),
-                        );
-                    }
-                    if *b {
-                        has_true |= covers;
-                    } else {
-                        has_false |= covers;
-                    }
-                }
-                Pattern::LiteralInt(_, span, _) => {
-                    if scrutinee_ty != Type::I64 {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E1205,
-                                format!(
-                                    "integer pattern cannot match scrutinee of type `{}`",
-                                    self.diagnostic_type_name(&scrutinee_ty)
-                                ),
-                            )
-                            .with_label(Label::primary(*span, "pattern type mismatch")),
-                        );
-                    }
-                }
-                Pattern::EnumVariant {
-                    enum_name,
-                    variant,
-                    span,
-                    ..
-                } => {
-                    // Generic enum variant patterns: the scrutinee may be
-                    // Generic(enum_name, type_args) rather than Named(enum_name).
-                    let is_builtin_match = matches!(&scrutinee_ty,
-                        Type::Generic(n, _) if n == enum_name
-                    );
-                    // Verify enum_name matches scrutinee type
-                    if !is_builtin_match {
-                        match &scrutinee_ty {
-                            Type::Named(sname) if sname == enum_name => {}
-                            _ => {
-                                self.push(
-                                    Diagnostic::new(
-                                        Severity::Error,
-                                        ErrorCode::E1205,
-                                        format!(
-                                            "enum pattern `{}::{}` cannot match scrutinee of type `{}`",
-                                            enum_name,
-                                            variant,
-                                            self.diagnostic_type_name(&scrutinee_ty)
-                                        ),
-                                    )
-                                    .with_label(Label::primary(*span, "pattern type mismatch")),
-                                );
-                            }
-                        }
-                        // Verify variant exists
-                        let variant_valid = self
-                            .symbols
-                            .lookup_enum(enum_name)
-                            .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
-                            .is_some();
-                        if !variant_valid {
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E1208,
-                                    format!("no variant `{}` in enum `{}`", variant, enum_name),
-                                )
-                                .with_label(Label::primary(*span, "unknown enum variant")),
-                            );
-                        }
-                    }
-                    if covers {
-                        covered_variants.insert(variant.clone());
-                    }
-                }
-                Pattern::EnumVariantTuple {
-                    enum_name,
-                    variant,
-                    bindings,
-                    span,
-                    ..
-                } => {
-                    // Generic enum variant: resolve concrete payload types from scrutinee.
-                    let builtin_payload: Option<Vec<Type>> =
-                        self.resolve_generic_variant_payload(enum_name, variant, &scrutinee_ty);
-
-                    if let Some(ref pts) = builtin_payload {
-                        // Built-in generic variant — validate binding count
-                        if bindings.len() != pts.len() {
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E1209,
-                                    format!(
-                                        "variant `{}::{}` expects {} field(s), found {}",
-                                        enum_name,
-                                        variant,
-                                        pts.len(),
-                                        bindings.len()
-                                    ),
-                                )
-                                .with_label(Label::primary(*span, "wrong number of bindings")),
-                            );
-                        }
-                    } else {
-                        // User-defined enum variant
-                        match &scrutinee_ty {
-                            Type::Named(sname) if sname == enum_name => {}
-                            _ => {
-                                self.push(Diagnostic::new(Severity::Error, ErrorCode::E1205,
-                                    format!("enum pattern `{}::{}(..)` cannot match scrutinee of type `{}`",
-                                        enum_name, variant, self.diagnostic_type_name(&scrutinee_ty)))
-                                    .with_label(Label::primary(*span, "pattern type mismatch")));
-                            }
-                        }
-                        let payload_types = self
-                            .symbols
-                            .lookup_enum(enum_name)
-                            .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
-                            .map(|v| v.payload_types.clone());
-                        match payload_types {
-                            None => {
-                                self.push(
-                                    Diagnostic::new(
-                                        Severity::Error,
-                                        ErrorCode::E1208,
-                                        format!("no variant `{}` in enum `{}`", variant, enum_name),
-                                    )
-                                    .with_label(Label::primary(*span, "unknown enum variant")),
-                                );
-                            }
-                            Some(ref pts) => {
-                                if pts.is_empty() {
-                                    self.push(
-                                        Diagnostic::new(
-                                            Severity::Error,
-                                            ErrorCode::E1209,
-                                            format!(
-                                                "variant `{}::{}` has no payload; remove `(..)`",
-                                                enum_name, variant
-                                            ),
-                                        )
-                                        .with_label(
-                                            Label::primary(
-                                                *span,
-                                                "fieldless variant used with payload pattern",
-                                            ),
-                                        ),
-                                    );
-                                } else if bindings.len() != pts.len() {
-                                    self.push(
-                                        Diagnostic::new(
-                                            Severity::Error,
-                                            ErrorCode::E1209,
-                                            format!(
-                                                "variant `{}::{}` expects {} field(s), found {}",
-                                                enum_name,
-                                                variant,
-                                                pts.len(),
-                                                bindings.len()
-                                            ),
-                                        )
-                                        .with_label(
-                                            Label::primary(*span, "wrong number of bindings"),
-                                        ),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    if covers {
-                        covered_variants.insert(variant.clone());
-                    }
-                }
-                Pattern::ClassDowncast {
-                    class_name, span, ..
-                } => {
-                    // `Dog(d)` downcasts an interface scrutinee to a concrete
-                    // class. The scrutinee must be an interface, and the class
-                    // must implement it (else the arm can never match).
-                    // Class patterns do not contribute to exhaustiveness, so a
-                    // wildcard arm is still required.
-                    let scrut_is_interface = matches!(&scrutinee_ty,
-                        Type::Named(n) | Type::Generic(n, _)
-                            if self.symbols.lookup_interface(n).is_some());
-                    if !scrut_is_interface {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E1205,
-                                format!(
-                                    "class pattern `{}(..)` requires an interface scrutinee, found `{}`",
-                                    class_name,
-                                    self.diagnostic_type_name(&scrutinee_ty)
-                                ),
-                            )
-                            .with_label(Label::primary(*span, "scrutinee is not an interface"))
-                            .with_help("match on a value of interface type to downcast to a class"),
-                        );
-                    } else if self.symbols.lookup_class(class_name).is_none() {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0350,
-                                format!("cannot find class `{class_name}`"),
-                            )
-                            .with_label(Label::primary(*span, "unknown class in pattern")),
-                        );
-                    } else if !self.class_implements_interface(class_name, &scrutinee_ty) {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0415,
-                                format!(
-                                    "class `{}` does not implement `{}`, so this pattern can never match",
-                                    class_name,
-                                    self.diagnostic_type_name(&scrutinee_ty)
-                                ),
-                            )
-                            .with_label(Label::primary(*span, "unrelated class")),
-                        );
-                    }
-                }
-            }
+            self.check_arm_pattern(m, pattern, &scrutinee_ty, covers, &mut coverage);
 
             let invalid_pattern = self.error_generation != errors_before_pattern;
             invalid_patterns |= invalid_pattern;
 
             // Check invalid arms too, but their bindings cannot constrain types.
             self.symbols.push_scope();
-            if invalid_pattern {
-                self.bind_invalid_pattern(pattern);
-            }
-
-            // For EnumVariantTuple: bind payload variables in arm scope
-            if let Pattern::EnumVariantTuple {
-                enum_name,
-                variant,
-                bindings,
-                ..
-            } = pattern
-                && !invalid_pattern
-            {
-                // Resolve payload types: first check built-in generic types
-                // Resolve concrete payload types: use generic instantiation when available.
-                let payload_types: Vec<Type> = self
-                    .resolve_generic_variant_payload(enum_name, variant, &scrutinee_ty)
-                    .unwrap_or_default();
-                for (binding, ty) in bindings.iter().zip(payload_types.iter()) {
-                    self.define_var(
-                        binding.clone(),
-                        VarInfo {
-                            ty: ty.clone(),
-                            mutable: false,
-                            is_param: false,
-                            declaration_span: pattern.span(),
-                        },
-                    );
-                }
-            }
-            // For a class downcast pattern, bind the downcast value as the
-            // concrete class (willow-1js.4). `_` does not bind.
-            if let Pattern::ClassDowncast {
-                class_name,
-                binding,
-                span: bspan,
-                ..
-            } = pattern
-                && !invalid_pattern
-                && binding != "_"
-            {
-                self.define_var(
-                    binding.clone(),
-                    VarInfo {
-                        ty: Type::Named(class_name.clone()),
-                        mutable: false,
-                        is_param: false,
-                        declaration_span: *bspan,
-                    },
-                );
-            }
-            // For binding patterns, define the variable
-            if let Pattern::Binding {
-                name, span: bspan, ..
-            } = pattern
-                && !invalid_pattern
-            {
-                self.define_var(
-                    name.clone(),
-                    VarInfo {
-                        ty: scrutinee_ty.clone(),
-                        mutable: false,
-                        is_param: false,
-                        declaration_span: *bspan,
-                    },
-                );
-            }
-            if self.local.current_async_context && !invalid_pattern {
-                // Use original AST name addresses, not normalized pattern clones.
-                for (source, resolved) in super::async_retention::pattern_bindings(&arm.pattern)
-                    .iter()
-                    .zip(super::async_retention::pattern_bindings(pattern))
-                {
-                    if resolved != "_"
-                        && let Some(info) = self.symbols.lookup_var(resolved)
-                    {
-                        self.record_async_local(
-                            info.ty.clone(),
-                            source,
-                            arm.pattern.span(),
-                            super::async_retention::Key::binding(source),
-                        );
-                    }
-                }
-            }
+            self.bind_arm_pattern(arm, pattern, &scrutinee_ty, invalid_pattern);
             if let Some(guard) = &arm.guard {
                 self.check_match_guard(guard);
             }
@@ -1335,140 +850,726 @@ impl TypeChecker {
             {
                 continue;
             }
+            self.merge_match_arm_type(
+                arm,
+                arm_ty,
+                &mut result_type,
+                expected.as_ref(),
+                partial_enum_context,
+            );
+        }
 
-            // Each arm contributes constraints, including complementary
-            // Result<T, void> and Result<void, E> constructors.
-            let arm_ty = if let Some(merged) = result_type.as_ref().and_then(|existing| {
-                if partial_enum_context {
-                    crate::semantic::generic_inference::merge_enum_holes(existing, &arm_ty)
-                } else {
-                    self.merge_inferred_enum_types(existing, &arm_ty)
-                }
-            }) {
-                result_type = Some(merged.clone());
-                merged
-            } else {
-                arm_ty
-            };
+        // Exhaustiveness check
+        if !invalid_patterns && !coverage.has_wildcard {
+            self.check_match_exhaustiveness(m, &scrutinee_ty, &coverage);
+        }
+        self.finish_match_expr(
+            m,
+            &scrutinee_ty,
+            &coverage,
+            result_type,
+            errors_before_match,
+        )
+    }
 
-            // An empty array arm contributes no element constraint, in either
-            // arm order. Keep the concrete sibling type for the whole match.
-            if let Some(existing) = &result_type
-                && array_placeholder_matches(existing, &arm_ty)
-            {
-                result_type = Some(arm_ty.clone());
+    /// The failed scrutinee cannot constrain patterns. Keep checking arm
+    /// bodies for independent errors with poisoned payload bindings.
+    fn check_match_arms_without_scrutinee(
+        &mut self,
+        m: &MatchExpr,
+        expected: Option<&Type>,
+    ) -> Type {
+        for arm in &m.arms {
+            self.symbols.push_scope();
+            self.bind_invalid_pattern(&arm.pattern);
+            if let Some(guard) = &arm.guard {
+                self.check_match_guard(guard);
             }
-            match &result_type {
-                None => result_type = Some(arm_ty),
-                // Same type, or a subtype of the arms so far: no change.
-                Some(existing)
-                    if existing == &arm_ty
-                        || (!partial_enum_context && self.types_compatible(existing, &arm_ty)) => {}
-                Some(existing) => {
-                    if !partial_enum_context
-                        && let Some(unified) =
-                            self.unify_to_expected(expected.as_ref(), existing, &arm_ty)
-                    {
-                        // Distinct arm types the destination accepts, e.g. two
-                        // classes implementing the returned interface
-                        // (willow-jz15.47).
-                        result_type = Some(unified);
-                    } else if !partial_enum_context && self.types_compatible(&arm_ty, existing) {
-                        // A later arm of a supertype widens the result, as a
-                        // ternary's branches do.
-                        result_type = Some(arm_ty);
-                    } else {
-                        let help = self.common_supertype_help(existing, &arm_ty);
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E1201,
-                                format!(
-                                    "match arms have incompatible types: `{}` and `{}`",
-                                    self.diagnostic_type_name(existing),
-                                    self.diagnostic_type_name(&arm_ty)
-                                ),
-                            )
-                            .with_label(Label::primary(
-                                arm.span,
-                                format!("found `{}`", self.diagnostic_type_name(&arm_ty)),
-                            ))
-                            .with_help(help),
+            self.check_match_body(&arm.body, expected, m.source);
+            self.symbols.pop_scope();
+        }
+        Self::error_type()
+    }
+
+    fn unreachable_arm_diagnostic(m: &MatchExpr, arm: &MatchArm) -> Diagnostic {
+        match m.source {
+            MatchSource::Match | MatchSource::TupleLet => {
+                Diagnostic::new(Severity::Warning, ErrorCode::W1201, "unreachable match arm")
+                    .with_label(Label::primary(arm.span, "this arm is unreachable"))
+            }
+            // The unreachable arm is the synthetic `_`:
+            // point at the pattern that made it so.
+            MatchSource::IfLet | MatchSource::WhileLet => {
+                let form = if m.source == MatchSource::IfLet {
+                    "if let"
+                } else {
+                    "while let"
+                };
+                let mut diagnostic = Diagnostic::new(
+                    Severity::Warning,
+                    ErrorCode::W1201,
+                    format!("irrefutable `{form}` pattern"),
+                )
+                .with_label(Label::primary(
+                    m.arms[0].pattern.span(),
+                    "this pattern always matches",
+                ));
+                diagnostic = if m.source == MatchSource::IfLet {
+                    diagnostic.with_help("use `let` instead; the `else` branch never runs")
+                } else {
+                    diagnostic.with_help("the loop only ends through `break` or `return`")
+                };
+                diagnostic
+            }
+        }
+    }
+
+    /// Record the source spelling of an arm pattern and return its
+    /// reinterpretation against the scrutinee type, if any.
+    fn resolve_arm_pattern(&mut self, arm: &MatchArm, scrutinee_ty: &Type) -> Option<Pattern> {
+        // Reinterpret `Ok(v)` / `Closed` as enum-variant patterns when the
+        // scrutinee is an enum, and record the reinterpretation for the
+        // backend. Everything below uses `pattern`.
+        match &arm.pattern {
+            Pattern::EnumVariant {
+                enum_name, span, ..
+            }
+            | Pattern::EnumVariantTuple {
+                enum_name, span, ..
+            } => {
+                self.check_source_type_name(enum_name, *span);
+                // Preserve the source alias before normalization canonicalizes it.
+                self.record_type_use(enum_name, scrutinee_ty, *span);
+            }
+            Pattern::ClassDowncast {
+                class_name, span, ..
+            } => {
+                self.check_source_type_name(class_name, *span);
+            }
+            _ => {}
+        }
+        let reinterpreted = self.normalize_match_pattern(&arm.pattern, scrutinee_ty);
+        if let Some(p) = &reinterpreted {
+            self.pattern_resolutions.insert(arm.pattern.id(), p.clone());
+        }
+        let pattern: &Pattern = reinterpreted.as_ref().unwrap_or(&arm.pattern);
+
+        if let Pattern::EnumVariant {
+            enum_name,
+            variant,
+            variant_span,
+            ..
+        }
+        | Pattern::EnumVariantTuple {
+            enum_name,
+            variant,
+            variant_span,
+            ..
+        } = pattern
+        {
+            self.record_variant_pattern(enum_name, variant, *variant_span);
+        }
+        if let Pattern::ClassDowncast {
+            class_name, span, ..
+        } = pattern
+        {
+            self.record_type_use(
+                class_name,
+                &Type::Named(self.canonical_type_name(class_name)),
+                *span,
+            );
+        }
+        reinterpreted
+    }
+
+    /// Validate one arm pattern against the scrutinee and track coverage.
+    fn check_arm_pattern(
+        &mut self,
+        m: &MatchExpr,
+        pattern: &Pattern,
+        scrutinee_ty: &Type,
+        covers: bool,
+        coverage: &mut MatchCoverage,
+    ) {
+        if self.is_option_spelling_pattern(pattern)
+            && builtin_types::unary_arg(scrutinee_ty, B::Option).is_none()
+        {
+            self.push_option_pattern_mismatch(m, pattern, scrutinee_ty);
+            return;
+        }
+        match pattern {
+            Pattern::Wildcard(_, _) => {
+                coverage.has_wildcard |= covers;
+            }
+            Pattern::Binding { name, span, .. } => {
+                coverage.has_wildcard |= covers; // binding covers everything
+                self.check_binding_pattern(name, *span);
+            }
+            Pattern::LiteralBool(b, span, _) => {
+                self.check_bool_pattern(*b, *span, scrutinee_ty, covers, coverage);
+            }
+            Pattern::LiteralInt(_, span, _) => {
+                self.check_int_pattern(*span, scrutinee_ty);
+            }
+            Pattern::EnumVariant {
+                enum_name,
+                variant,
+                span,
+                ..
+            } => {
+                self.check_enum_variant_pattern(enum_name, variant, *span, scrutinee_ty);
+                if covers {
+                    coverage.covered_variants.insert(variant.clone());
+                }
+            }
+            Pattern::EnumVariantTuple {
+                enum_name,
+                variant,
+                bindings,
+                span,
+                ..
+            } => {
+                self.check_enum_variant_tuple_pattern(
+                    enum_name,
+                    variant,
+                    bindings.len(),
+                    *span,
+                    scrutinee_ty,
+                );
+                if covers {
+                    coverage.covered_variants.insert(variant.clone());
+                }
+            }
+            Pattern::ClassDowncast {
+                class_name, span, ..
+            } => self.check_class_downcast_pattern(class_name, *span, scrutinee_ty),
+        }
+    }
+
+    fn check_bool_pattern(
+        &mut self,
+        value: bool,
+        span: Span,
+        scrutinee_ty: &Type,
+        covers: bool,
+        coverage: &mut MatchCoverage,
+    ) {
+        if *scrutinee_ty != Type::Bool {
+            self.push_pattern_type_mismatch(
+                format!(
+                    "bool pattern cannot match scrutinee of type `{}`",
+                    self.diagnostic_type_name(scrutinee_ty)
+                ),
+                span,
+            );
+        }
+        if value {
+            coverage.has_true |= covers;
+        } else {
+            coverage.has_false |= covers;
+        }
+    }
+
+    fn check_int_pattern(&mut self, span: Span, scrutinee_ty: &Type) {
+        if *scrutinee_ty != Type::I64 {
+            self.push_pattern_type_mismatch(
+                format!(
+                    "integer pattern cannot match scrutinee of type `{}`",
+                    self.diagnostic_type_name(scrutinee_ty)
+                ),
+                span,
+            );
+        }
+    }
+
+    /// Resolve real enum variants and classes before diagnosing the common
+    /// Option spelling on a non-Option value. Do not steal user variants.
+    fn is_option_spelling_pattern(&self, pattern: &Pattern) -> bool {
+        match pattern {
+            Pattern::ClassDowncast { class_name, .. } => {
+                class_name == "Some" && self.symbols.lookup_class(class_name).is_none()
+            }
+            Pattern::EnumVariant {
+                enum_name, variant, ..
+            }
+            | Pattern::EnumVariantTuple {
+                enum_name, variant, ..
+            } => {
+                (enum_name == "Option" || enum_name.is_empty())
+                    && matches!(variant.as_str(), "Some" | "None")
+            }
+            _ => false,
+        }
+    }
+
+    fn push_option_pattern_mismatch(
+        &mut self,
+        m: &MatchExpr,
+        pattern: &Pattern,
+        scrutinee_ty: &Type,
+    ) {
+        let mut diagnostic = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E1205,
+            format!(
+                "pattern type mismatch: expected `Option`, found `{}`",
+                self.diagnostic_type_name(scrutinee_ty)
+            ),
+        )
+        .with_label(Label::primary(
+            pattern.span(),
+            "expected an Option scrutinee",
+        ));
+        if let Expr::MethodCall(call) = &*m.scrutinee
+            && call.method == "recv"
+            && self
+                .expr_types
+                .get(&call.object.id())
+                .is_some_and(|ty| builtin_types::unary_arg(ty, B::Channel).is_some())
+        {
+            diagnostic = diagnostic
+                .with_help("Channel::recv() returns T; use `recv_opt()` to receive an Option<T>");
+        }
+        if *scrutinee_ty == Type::I64 && diagnostic.helps.is_empty() {
+            diagnostic = diagnostic.with_help(STRING_FIND_SENTINEL_HELP);
+        }
+        self.push(diagnostic);
+    }
+
+    /// Patterns do not compare against constants: the name would silently
+    /// bind a new variable instead.
+    fn check_binding_pattern(&mut self, name: &str, span: Span) {
+        if self.symbols.lookup_var(name).is_none()
+            && let Some(info) = self.symbols.lookup_func(name)
+            && info.constant.is_some()
+        {
+            self.push(
+                Self::error_at(
+                    ErrorCode::E1205,
+                    format!("constant `{name}` cannot be used as a match pattern"),
+                    span,
+                    "would bind a new variable",
+                )
+                .with_label(Label::secondary(
+                    info.declaration_span,
+                    "constant declared here",
+                ))
+                .with_help("write the literal value, or compare with `if`"),
+            );
+        }
+    }
+
+    fn check_enum_variant_pattern(
+        &mut self,
+        enum_name: &str,
+        variant: &str,
+        span: Span,
+        scrutinee_ty: &Type,
+    ) {
+        // Generic enum variant patterns: the scrutinee may be
+        // Generic(enum_name, type_args) rather than Named(enum_name).
+        let is_builtin_match = matches!(scrutinee_ty,
+            Type::Generic(n, _) if n == enum_name
+        );
+        // Verify enum_name matches scrutinee type
+        if !is_builtin_match {
+            match scrutinee_ty {
+                Type::Named(sname) if sname == enum_name => {}
+                _ => {
+                    self.push_pattern_type_mismatch(
+                        format!(
+                            "enum pattern `{}::{}` cannot match scrutinee of type `{}`",
+                            enum_name,
+                            variant,
+                            self.diagnostic_type_name(scrutinee_ty)
+                        ),
+                        span,
+                    );
+                }
+            }
+            // Verify variant exists
+            let variant_valid = self
+                .symbols
+                .lookup_enum(enum_name)
+                .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
+                .is_some();
+            if !variant_valid {
+                self.push_unknown_variant_pattern(enum_name, variant, span);
+            }
+        }
+    }
+
+    fn check_enum_variant_tuple_pattern(
+        &mut self,
+        enum_name: &str,
+        variant: &str,
+        binding_count: usize,
+        span: Span,
+        scrutinee_ty: &Type,
+    ) {
+        // Generic enum variant: resolve concrete payload types from scrutinee.
+        let builtin_payload: Option<Vec<Type>> =
+            self.resolve_generic_variant_payload(enum_name, variant, scrutinee_ty);
+
+        if let Some(ref pts) = builtin_payload {
+            // Built-in generic variant — validate binding count
+            if binding_count != pts.len() {
+                self.push_variant_binding_count(enum_name, variant, pts.len(), binding_count, span);
+            }
+        } else {
+            // User-defined enum variant
+            match scrutinee_ty {
+                Type::Named(sname) if sname == enum_name => {}
+                _ => {
+                    self.push_pattern_type_mismatch(
+                        format!(
+                            "enum pattern `{}::{}(..)` cannot match scrutinee of type `{}`",
+                            enum_name,
+                            variant,
+                            self.diagnostic_type_name(scrutinee_ty)
+                        ),
+                        span,
+                    );
+                }
+            }
+            let payload_types = self
+                .symbols
+                .lookup_enum(enum_name)
+                .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
+                .map(|v| v.payload_types.clone());
+            match payload_types {
+                None => {
+                    self.push_unknown_variant_pattern(enum_name, variant, span);
+                }
+                Some(ref pts) => {
+                    if pts.is_empty() {
+                        self.push_error(
+                            ErrorCode::E1209,
+                            format!(
+                                "variant `{}::{}` has no payload; remove `(..)`",
+                                enum_name, variant
+                            ),
+                            span,
+                            "fieldless variant used with payload pattern",
+                        );
+                    } else if binding_count != pts.len() {
+                        self.push_variant_binding_count(
+                            enum_name,
+                            variant,
+                            pts.len(),
+                            binding_count,
+                            span,
                         );
                     }
                 }
             }
         }
+    }
 
-        // Exhaustiveness check
-        if !invalid_patterns && !has_wildcard {
-            match &scrutinee_ty {
-                Type::Bool if (!has_true || !has_false) => {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E1207,
-                            "non-exhaustive match: missing bool patterns",
-                        )
-                        .with_label(Label::primary(m.span, "match is not exhaustive"))
-                        .with_help("add `true` and `false` patterns, or use a wildcard `_`"),
-                    );
-                }
-                Type::I64 => {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E1206,
-                            "non-exhaustive match on `i64`: add a wildcard arm `_ => ...`",
-                        )
-                        .with_label(Label::primary(m.span, "match is not exhaustive")),
-                    );
-                }
-                Type::Named(enum_name) => {
-                    if let Some(enum_info) = self.symbols.lookup_enum(enum_name).cloned() {
-                        for variant in &enum_info.variants {
-                            if !covered_variants.contains(&variant.name) {
-                                self.push(
-                                    Diagnostic::new(
-                                        Severity::Error,
-                                        ErrorCode::E1202,
-                                        format!(
-                                            "non-exhaustive match: variant `{}::{}` not covered",
-                                            enum_name, variant.name
-                                        ),
-                                    )
-                                    .with_label(Label::primary(m.span, "match is not exhaustive")),
-                                );
-                            }
-                        }
-                    }
-                }
-                // Generic enum: check all variants are covered.
-                // Uses registered enum info so any stdlib or user generic enum is handled.
-                Type::Generic(enum_name, _) => {
-                    if let Some(enum_info) = self.symbols.lookup_enum(enum_name).cloned() {
-                        for variant in &enum_info.variants {
-                            if !covered_variants.contains(&variant.name) {
-                                self.push(
-                                    Diagnostic::new(
-                                        Severity::Error,
-                                        ErrorCode::E1202,
-                                        format!(
-                                            "non-exhaustive match: variant `{}::{}` not covered",
-                                            enum_name, variant.name
-                                        ),
-                                    )
-                                    .with_label(Label::primary(m.span, "match is not exhaustive"))
-                                    .with_help("add the missing variant or use a wildcard `_` arm"),
-                                );
-                            }
-                        }
-                    }
-                }
-                _ => {}
+    fn check_class_downcast_pattern(&mut self, class_name: &str, span: Span, scrutinee_ty: &Type) {
+        // `Dog(d)` downcasts an interface scrutinee to a concrete
+        // class. The scrutinee must be an interface, and the class
+        // must implement it (else the arm can never match).
+        // Class patterns do not contribute to exhaustiveness, so a
+        // wildcard arm is still required.
+        let scrut_is_interface = matches!(scrutinee_ty,
+            Type::Named(n) | Type::Generic(n, _)
+                if self.symbols.lookup_interface(n).is_some());
+        if !scrut_is_interface {
+            self.push(
+                Self::error_at(
+                    ErrorCode::E1205,
+                    format!(
+                        "class pattern `{}(..)` requires an interface scrutinee, found `{}`",
+                        class_name,
+                        self.diagnostic_type_name(scrutinee_ty)
+                    ),
+                    span,
+                    "scrutinee is not an interface",
+                )
+                .with_help("match on a value of interface type to downcast to a class"),
+            );
+        } else if self.symbols.lookup_class(class_name).is_none() {
+            self.push_error(
+                ErrorCode::E0350,
+                format!("cannot find class `{class_name}`"),
+                span,
+                "unknown class in pattern",
+            );
+        } else if !self.class_implements_interface(class_name, scrutinee_ty) {
+            self.push_error(
+                ErrorCode::E0415,
+                format!(
+                    "class `{}` does not implement `{}`, so this pattern can never match",
+                    class_name,
+                    self.diagnostic_type_name(scrutinee_ty)
+                ),
+                span,
+                "unrelated class",
+            );
+        }
+    }
+
+    fn push_pattern_type_mismatch(&mut self, message: String, span: Span) {
+        self.push_error(ErrorCode::E1205, message, span, "pattern type mismatch");
+    }
+
+    fn push_unknown_variant_pattern(&mut self, enum_name: &str, variant: &str, span: Span) {
+        self.push_error(
+            ErrorCode::E1208,
+            format!("no variant `{}` in enum `{}`", variant, enum_name),
+            span,
+            "unknown enum variant",
+        );
+    }
+
+    fn push_variant_binding_count(
+        &mut self,
+        enum_name: &str,
+        variant: &str,
+        expected: usize,
+        found: usize,
+        span: Span,
+    ) {
+        self.push_error(
+            ErrorCode::E1209,
+            format!("variant `{enum_name}::{variant}` expects {expected} field(s), found {found}"),
+            span,
+            "wrong number of bindings",
+        );
+    }
+
+    /// Bind an arm's pattern variables in the arm scope. Bindings of an
+    /// invalid pattern are poisoned so they cannot constrain types.
+    fn bind_arm_pattern(
+        &mut self,
+        arm: &MatchArm,
+        pattern: &Pattern,
+        scrutinee_ty: &Type,
+        invalid_pattern: bool,
+    ) {
+        if invalid_pattern {
+            self.bind_invalid_pattern(pattern);
+            return;
+        }
+        // For EnumVariantTuple: bind payload variables in arm scope
+        if let Pattern::EnumVariantTuple {
+            enum_name,
+            variant,
+            bindings,
+            ..
+        } = pattern
+        {
+            // Resolve payload types: first check built-in generic types
+            // Resolve concrete payload types: use generic instantiation when available.
+            let payload_types: Vec<Type> = self
+                .resolve_generic_variant_payload(enum_name, variant, scrutinee_ty)
+                .unwrap_or_default();
+            for (binding, ty) in bindings.iter().zip(payload_types.iter()) {
+                self.define_var(
+                    binding.clone(),
+                    VarInfo {
+                        ty: ty.clone(),
+                        mutable: false,
+                        is_param: false,
+                        declaration_span: pattern.span(),
+                    },
+                );
             }
         }
+        // For a class downcast pattern, bind the downcast value as the
+        // concrete class. `_` does not bind.
+        if let Pattern::ClassDowncast {
+            class_name,
+            binding,
+            span: bspan,
+            ..
+        } = pattern
+            && binding != "_"
+        {
+            self.define_var(
+                binding.clone(),
+                VarInfo {
+                    ty: Type::Named(class_name.clone()),
+                    mutable: false,
+                    is_param: false,
+                    declaration_span: *bspan,
+                },
+            );
+        }
+        // For binding patterns, define the variable
+        if let Pattern::Binding {
+            name, span: bspan, ..
+        } = pattern
+        {
+            self.define_var(
+                name.clone(),
+                VarInfo {
+                    ty: scrutinee_ty.clone(),
+                    mutable: false,
+                    is_param: false,
+                    declaration_span: *bspan,
+                },
+            );
+        }
+        if self.local.current_async_context {
+            // Use original AST name addresses, not normalized pattern clones.
+            for (source, resolved) in super::async_retention::pattern_bindings(&arm.pattern)
+                .iter()
+                .zip(super::async_retention::pattern_bindings(pattern))
+            {
+                if resolved != "_"
+                    && let Some(info) = self.symbols.lookup_var(resolved)
+                {
+                    self.record_async_local(
+                        info.ty.clone(),
+                        source,
+                        arm.pattern.span(),
+                        super::async_retention::Key::binding(source),
+                    );
+                }
+            }
+        }
+    }
 
+    /// Fold one valid arm's type into the match result type.
+    fn merge_match_arm_type(
+        &mut self,
+        arm: &MatchArm,
+        arm_ty: Type,
+        result_type: &mut Option<Type>,
+        expected: Option<&Type>,
+        partial_enum_context: bool,
+    ) {
+        // Each arm contributes constraints, including complementary
+        // Result<T, void> and Result<void, E> constructors.
+        let arm_ty = if let Some(merged) = result_type.as_ref().and_then(|existing| {
+            if partial_enum_context {
+                crate::semantic::generic_inference::merge_enum_holes(existing, &arm_ty)
+            } else {
+                self.merge_inferred_enum_types(existing, &arm_ty)
+            }
+        }) {
+            *result_type = Some(merged.clone());
+            merged
+        } else {
+            arm_ty
+        };
+
+        // An empty array arm contributes no element constraint, in either
+        // arm order. Keep the concrete sibling type for the whole match.
+        if let Some(existing) = &*result_type
+            && array_placeholder_matches(existing, &arm_ty)
+        {
+            *result_type = Some(arm_ty.clone());
+        }
+        match &*result_type {
+            None => *result_type = Some(arm_ty),
+            // Same type, or a subtype of the arms so far: no change.
+            Some(existing)
+                if existing == &arm_ty
+                    || (!partial_enum_context && self.types_compatible(existing, &arm_ty)) => {}
+            Some(existing) => {
+                if !partial_enum_context
+                    && let Some(unified) = self.unify_to_expected(expected, existing, &arm_ty)
+                {
+                    // Distinct arm types the destination accepts, e.g. two
+                    // classes implementing the returned interface.
+                    *result_type = Some(unified);
+                } else if !partial_enum_context && self.types_compatible(&arm_ty, existing) {
+                    // A later arm of a supertype widens the result, as a
+                    // ternary's branches do.
+                    *result_type = Some(arm_ty);
+                } else {
+                    let help = self.common_supertype_help(existing, &arm_ty);
+                    self.push(
+                        Self::error_at(
+                            ErrorCode::E1201,
+                            format!(
+                                "match arms have incompatible types: `{}` and `{}`",
+                                self.diagnostic_type_name(existing),
+                                self.diagnostic_type_name(&arm_ty)
+                            ),
+                            arm.span,
+                            format!("found `{}`", self.diagnostic_type_name(&arm_ty)),
+                        )
+                        .with_help(help),
+                    );
+                }
+            }
+        }
+    }
+
+    fn check_match_exhaustiveness(
+        &mut self,
+        m: &MatchExpr,
+        scrutinee_ty: &Type,
+        coverage: &MatchCoverage,
+    ) {
+        match scrutinee_ty {
+            Type::Bool if (!coverage.has_true || !coverage.has_false) => {
+                self.push(
+                    Self::error_at(
+                        ErrorCode::E1207,
+                        "non-exhaustive match: missing bool patterns",
+                        m.span,
+                        "match is not exhaustive",
+                    )
+                    .with_help("add `true` and `false` patterns, or use a wildcard `_`"),
+                );
+            }
+            Type::I64 => {
+                self.push_error(
+                    ErrorCode::E1206,
+                    "non-exhaustive match on `i64`: add a wildcard arm `_ => ...`",
+                    m.span,
+                    "match is not exhaustive",
+                );
+            }
+            // Enum: check all variants are covered. Uses registered enum info
+            // so any stdlib or user enum, generic or not, is handled.
+            Type::Named(enum_name) | Type::Generic(enum_name, _) => {
+                // Only the generic form has always carried the help line.
+                let generic = matches!(scrutinee_ty, Type::Generic(..));
+                if let Some(enum_info) = self.symbols.lookup_enum(enum_name) {
+                    let missing: Vec<Diagnostic> = enum_info
+                        .variants
+                        .iter()
+                        .filter(|variant| !coverage.covered_variants.contains(&variant.name))
+                        .map(|variant| {
+                            let diag = Self::error_at(
+                                ErrorCode::E1202,
+                                format!(
+                                    "non-exhaustive match: variant `{}::{}` not covered",
+                                    enum_name, variant.name
+                                ),
+                                m.span,
+                                "match is not exhaustive",
+                            );
+                            if generic {
+                                diag.with_help("add the missing variant or use a wildcard `_` arm")
+                            } else {
+                                diag
+                            }
+                        })
+                        .collect();
+                    for diag in missing {
+                        self.push(diag);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_match_expr(
+        &mut self,
+        m: &MatchExpr,
+        scrutinee_ty: &Type,
+        coverage: &MatchCoverage,
+        result_type: Option<Type>,
+        errors_before_match: usize,
+    ) -> Type {
         // A surviving arm cannot supply the missing constraints of an invalid
         // sibling (e.g. Err alone leaves Result's success payload unresolved).
         // All arms have been checked, so independent diagnostics are retained.
@@ -1477,9 +1578,9 @@ impl TypeChecker {
         }
         // Reuse the coverage check above; guards only contribute when an
         // unguarded fallback covers the remaining values.
-        if has_wildcard
-            || scrutinee_ty == Type::Bool
-            || match &scrutinee_ty {
+        if coverage.has_wildcard
+            || *scrutinee_ty == Type::Bool
+            || match scrutinee_ty {
                 Type::Named(name) | Type::Generic(name, _) => {
                     self.symbols.lookup_enum(name).is_some()
                 }
@@ -1499,12 +1600,12 @@ impl TypeChecker {
         );
         if m.block_arm_tail && !matches!(result, Type::Void | Type::Never) {
             self.push(
-                Diagnostic::new(
-                    Severity::Error,
+                Self::error_at(
                     ErrorCode::E0101,
                     "block arms cannot yield a value",
+                    m.span,
+                    "value in a block arm",
                 )
-                .with_label(Label::primary(m.span, "value in a block arm"))
                 .with_help("move the block arm logic into a helper function and call it as an expression arm; add `;` if this is only a statement"),
             );
         }

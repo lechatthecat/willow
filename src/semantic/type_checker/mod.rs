@@ -2071,6 +2071,77 @@ impl TypeChecker {
         self.errors.push(d);
     }
 
+    /// An error with a single primary label, the most common diagnostic
+    /// shape in the checker; callers may add helps, notes or fixes.
+    fn error_at(
+        code: ErrorCode,
+        message: impl Into<String>,
+        span: Span,
+        label: impl Into<String>,
+    ) -> Diagnostic {
+        Diagnostic::new(Severity::Error, code, message).with_label(Label::primary(span, label))
+    }
+
+    /// Push [`Self::error_at`].
+    fn push_error(
+        &mut self,
+        code: ErrorCode,
+        message: impl Into<String>,
+        span: Span,
+        label: impl Into<String>,
+    ) {
+        self.push(Self::error_at(code, message, span, label));
+    }
+
+    /// Push "mismatched types: expected `E`, found `F`" labelled
+    /// "expected `E`" at `span`, using the given error code.
+    fn push_type_mismatch_with_code(
+        &mut self,
+        code: ErrorCode,
+        expected: &Type,
+        found: &Type,
+        span: Span,
+    ) {
+        let expected = self.diagnostic_type_name(expected);
+        let found = self.diagnostic_type_name(found);
+        self.push_error(
+            code,
+            format!("mismatched types: expected `{expected}`, found `{found}`"),
+            span,
+            format!("expected `{expected}`"),
+        );
+    }
+
+    /// [`Self::push_type_mismatch_with_code`] with the code chosen by
+    /// [`Self::type_mismatch_error_code`].
+    fn push_type_mismatch(&mut self, expected: &Type, found: &Type, span: Span) {
+        let code = self.type_mismatch_error_code(expected, found);
+        self.push_type_mismatch_with_code(code, expected, found, span);
+    }
+
+    /// Reject a non-`bool` `if`/`while` condition unless its expression
+    /// already reported an error or recovered to the error type.
+    fn check_condition_is_bool(&mut self, cond: &Expr, cond_ty: &Type, errors_before: usize) {
+        if *cond_ty != Type::Bool
+            && self.error_generation == errors_before
+            && !Self::contains_error_type(cond_ty)
+        {
+            let found = self.diagnostic_type_name(cond_ty);
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0203,
+                    format!("condition must be `bool`, found `{found}`"),
+                )
+                .with_label(Label::primary(
+                    cond.span(),
+                    format!("expected `bool`, found `{found}`"),
+                ))
+                .with_help("use an explicit comparison, e.g. `!= 0`"),
+            );
+        }
+    }
+
     fn push_legacy_this_error(&mut self, span: Span) {
         self.push(
             Diagnostic::new(

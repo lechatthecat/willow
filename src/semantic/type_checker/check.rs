@@ -1658,888 +1658,742 @@ impl TypeChecker {
 
     pub(super) fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let(s) => {
-                // The annotation is judged before the initializer so a
-                // malformed one (`let x: Option = ...`) is reported ahead of
-                // the mismatches it goes on to cause (willow-rlq9).
-                let annotation = s.ty.as_ref().map(|ty| {
-                    let errors_before = self.error_generation;
-                    let type_span = s.type_span.unwrap_or(s.span);
-                    let annotation = self.normalize_type(ty, type_span);
-                    self.validate_type(&annotation, type_span);
-                    if self.error_generation == errors_before {
-                        annotation
-                    } else {
-                        // Retain the binding without letting its rejected type
-                        // cause errors in the initializer or subsequent uses.
-                        Self::error_type()
-                    }
-                });
-                let reference_start = self.analysis_symbols.references.len();
-                let inferred = match &annotation {
-                    Some(ann) => self.check_expr_expecting(&s.init, ann),
-                    None => self.check_expr(&s.init),
-                };
-                if s.name.starts_with("$compound_array_") {
-                    self.record_element_write(&s.init, reference_start, true);
-                }
-                let ty = if let Some(ann) = &annotation {
-                    if !self.types_compatible(ann, &inferred) {
-                        let code = self.type_mismatch_error_code(ann, &inferred);
-                        let message = if code == ErrorCode::E0704 {
-                            format!(
-                                "cannot assign `{}` to variable `{}` of type `{}`",
-                                self.diagnostic_type_name(&inferred),
-                                s.name,
-                                self.diagnostic_type_name(ann)
-                            )
-                        } else {
-                            format!(
-                                "mismatched types: expected `{}`, found `{}`",
-                                self.diagnostic_type_name(ann),
-                                self.diagnostic_type_name(&inferred)
-                            )
-                        };
-                        let label = if code == ErrorCode::E0704 {
-                            format!(
-                                "expected `{}` because of this type annotation",
-                                self.diagnostic_type_name(ann)
-                            )
-                        } else {
-                            format!("expected `{}`", self.diagnostic_type_name(ann))
-                        };
-                        self.push(
-                            Diagnostic::new(Severity::Error, code, message)
-                                .with_label(Label::primary(s.span, label)),
-                        );
-                    }
-                    ann.clone()
-                } else {
-                    // Builtin constructor holes are finalized by check_expr,
-                    // including recovery from malformed payloads. Keep the
-                    // existing binding check for user-defined generic enums.
-                    if !matches!(&inferred, Type::Generic(name, _) if name == "Option" || name == "Result")
-                        && let Some(diag) = self.unresolved_generic_enum_diagnostic(
-                            &s.init,
-                            &inferred,
-                            s.init.span(),
-                            &s.name,
-                        )
-                    {
-                        self.push(diag);
-                    }
-                    if matches!(&inferred, Type::Array(element) if **element == Type::Void) {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E1801,
-                                "cannot infer array element type; annotate the binding",
-                            )
-                            .with_label(Label::primary(s.span, "element type annotation required"))
-                            .with_help(format!(
-                                "add an element type, e.g. `let {}: Array<i64> = [];`",
-                                s.name
-                            )),
-                        );
-                        // Poison the binding so push, iteration and await do not
-                        // turn an unresolved element into secondary diagnostics.
-                        Self::error_type()
-                    } else {
-                        inferred
-                    }
-                };
-                if annotation.is_none()
-                    && builtin_types::binary_args(&ty, B::Map)
-                        .is_some_and(|(key, value)| *key == Type::Void && *value == Type::Void)
-                {
-                    self.local.inferred_maps.insert(
-                        s.span,
-                        (
-                            vec![s.init.id()],
-                            self.local
-                                .current_async_context
-                                .then_some(self.local.async_local_types.len()),
-                        ),
-                    );
-                }
-                // Record the resolved type of locals inside async fns so the
-                // backend can frame-back unannotated live-across-await locals
-                // (willow-lpn.5c).
-                if self.local.current_async_context {
-                    self.local.async_local_bindings.insert(
-                        self.local.async_local_types.len(),
-                        (
-                            s.name.clone(),
-                            s.span,
-                            super::async_retention::Key::binding(&s.name),
-                        ),
-                    );
-                    self.local.async_local_types.push(ty.clone());
-                }
-                // `_` is a wildcard: evaluate the initializer for side effects but do
-                // not bind a variable (allows multiple `let _ = expr;` in the same scope).
-                if s.name == "_" {
-                    return;
-                }
-                // E0351: reject redeclaration in the same scope.
-                if let Some(_prev) = self.symbols.lookup_var_current_scope(&s.name) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0351,
-                            format!("variable `{}` is already defined in this scope", s.name),
-                        )
-                        .with_label(Label::primary(s.span, "previous definition here")),
-                    );
-                }
-                self.define_var(
-                    s.name.clone(),
-                    VarInfo {
-                        ty,
-                        mutable: s.mutable,
-                        is_param: false,
-                        declaration_span: s.span,
-                    },
-                );
-            }
-            Stmt::FieldAssign(s) => {
-                let obj_ty = self.check_expr(&s.object);
-                let field_ty = self.resolve_field(&obj_ty, &s.field, s.target_span, true, "write");
-                let val_ty = if field_ty == Type::Void {
-                    self.check_expr(&s.value)
-                } else {
-                    self.check_expr_expecting(&s.value, &field_ty)
-                };
-                if field_ty != Type::Void && !self.types_compatible(&field_ty, &val_ty) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            self.type_mismatch_error_code(&field_ty, &val_ty),
-                            format!(
-                                "mismatched types: expected `{}`, found `{}`",
-                                self.diagnostic_type_name(&field_ty),
-                                self.diagnostic_type_name(&val_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(
-                            s.span,
-                            format!("expected `{}`", self.diagnostic_type_name(&field_ty)),
-                        )),
-                    );
-                }
-                if obj_ty == Type::Named("PanicInfo".to_string()) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            "fields of `PanicInfo` are read-only",
-                        )
-                        .with_label(Label::primary(
-                            s.span,
-                            "runtime panic metadata cannot be modified",
-                        )),
-                    );
-                }
-            }
+            Stmt::Let(s) => self.check_let_stmt(s),
+            Stmt::FieldAssign(s) => self.check_field_assign(s),
             Stmt::StaticFieldAssign(s) => self.check_static_field_assign(s),
             Stmt::SuperInit(s) => self.check_super_init(s),
-            Stmt::IndexAssign(s) => {
-                let reference_start = self.analysis_symbols.references.len();
-                let arr_ty = self.check_expr(&s.array);
-                self.record_element_write(&s.array, reference_start, false);
-                let idx_ty = self.check_expr(&s.index);
-                if !matches!(idx_ty, Type::I64) && !Self::contains_error_type(&idx_ty) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "array index must be `i64`, found `{}`",
-                                self.diagnostic_type_name(&idx_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(s.index.span(), "index is not an `i64`")),
-                    );
-                }
-                match &arr_ty {
-                    Type::Array(elem) | Type::FixedArray(elem, _) => {
-                        let val_ty = self.check_expr_expecting(&s.value, elem);
-                        if !self.types_compatible(elem, &val_ty) {
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    self.type_mismatch_error_code(elem, &val_ty),
-                                    format!(
-                                        "cannot assign `{}` to an element of `Array<{}>`",
-                                        self.diagnostic_type_name(&val_ty),
-                                        self.diagnostic_type_name(elem)
-                                    ),
-                                )
-                                .with_label(Label::primary(
-                                    s.span,
-                                    format!("expected `{}`", self.diagnostic_type_name(elem)),
-                                )),
-                            );
-                        }
-                    }
-                    // A known array still provides element context even if a
-                    // component is erroneous. Other recovery receivers cannot
-                    // support a not-an-array diagnostic; always check the value.
-                    ty if *ty == Type::Void || Self::contains_error_type(ty) => {
-                        self.check_expr(&s.value);
-                    }
-                    other => {
-                        self.check_expr(&s.value);
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!(
-                                    "cannot index a value of type `{}`",
-                                    self.diagnostic_type_name(other)
-                                ),
-                            )
-                            .with_label(Label::primary(s.span, "not an array")),
-                        );
-                    }
-                }
-            }
-            Stmt::Assign(s) => {
-                self.record_binding_use(&s.name, s.span, "write");
-                if s.name == "this" {
-                    self.push_legacy_this_error(s.span);
-                    return;
-                }
-                // Reject direct assignment to `self`.
-                if s.name == "self" {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0552,
-                            format!("cannot assign to `{}`", s.name),
-                        )
-                        .with_label(Label::primary(s.span, "cannot assign to receiver"))
-                        .with_help(format!("to mutate fields, use `{}.field = value`", s.name)),
-                    );
-                    return;
-                }
-                let info = self.symbols.lookup_var(&s.name).cloned();
-                let constant = info
-                    .is_none()
-                    .then(|| self.symbols.lookup_func(&s.name))
-                    .flatten()
-                    .filter(|f| f.constant.is_some())
-                    .map(|f| f.declaration_span);
-                match info {
-                    None if constant.is_some() => self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0301,
-                            format!("cannot assign to constant `{}`", s.name),
-                        )
-                        .with_label(Label::primary(s.span, "cannot assign"))
-                        .with_label(Label::secondary(
-                            constant.unwrap_or(s.span),
-                            "declared as a constant here",
-                        ))
-                        .with_help(format!(
-                            "declare a mutable local instead: `let mut {} = ...`",
-                            s.name.to_lowercase()
-                        )),
-                    ),
-                    None => self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0350,
-                            format!("cannot find variable `{}`", s.name),
-                        )
-                        .with_label(Label::primary(s.span, "not found in this scope")),
-                    ),
-                    Some(info) => {
-                        // A write to a capture was already reported against the
-                        // capture (willow-0g8j.2.12); reporting the enclosing
-                        // local's mutability on top of it would point at a fix
-                        // that does not exist.
-                        if !info.mutable && !self.local.capture_writes.contains(&s.span) {
-                            if info.is_param {
-                                self.push(
-                                    Diagnostic::new(
-                                        Severity::Error,
-                                        ErrorCode::E0302,
-                                        format!(
-                                            "cannot assign to immutable parameter `{}`",
-                                            s.name
-                                        ),
-                                    )
-                                    .with_label(Label::primary(
-                                        s.span,
-                                        "cannot assign to parameter",
-                                    ))
-                                    .with_help(format!(
-                                        "introduce a mutable local variable: `let mut {} = {};`",
-                                        s.name, s.name
-                                    )),
-                                );
-                            } else {
-                                // Build an insertion span just after "let " in the declaration.
-                                let decl = info.declaration_span;
-                                let insert_span = Span::in_file(
-                                    decl.file_id,
-                                    decl.start + 4,
-                                    decl.start + 4,
-                                    decl.line,
-                                    decl.col + 4,
-                                );
-                                self.push(
-                                    Diagnostic::new(
-                                        Severity::Error,
-                                        ErrorCode::E0301,
-                                        format!("cannot assign to immutable variable `{}`", s.name),
-                                    )
-                                    .with_label(Label::primary(s.span, "cannot assign"))
-                                    .with_label(Label::secondary(
-                                        info.declaration_span,
-                                        "declared immutable here",
-                                    ))
-                                    .with_help(format!(
-                                        "declare it as mutable: `let mut {} = ...`",
-                                        s.name
-                                    ))
-                                    .with_fix(
-                                        FixSuggestion::insertion(
-                                            insert_span,
-                                            "mut ",
-                                            "add `mut` here",
-                                        ),
-                                    ),
-                                );
-                            }
-                        }
-                        let got = self.check_expr_expecting(&s.value, &info.ty);
-                        if !self.types_compatible(&info.ty, &got) {
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    self.type_mismatch_error_code(&info.ty, &got),
-                                    format!(
-                                        "mismatched types: expected `{}`, found `{}`",
-                                        self.diagnostic_type_name(&info.ty),
-                                        self.diagnostic_type_name(&got)
-                                    ),
-                                )
-                                .with_label(Label::primary(
-                                    s.span,
-                                    format!("expected `{}`", self.diagnostic_type_name(&info.ty)),
-                                )),
-                            );
-                        }
-                    }
-                }
-            }
-            Stmt::If(s) => {
-                let errors_before = self.error_generation;
-                let cond_ty = self.check_expr(&s.cond);
-                if cond_ty != Type::Bool
-                    && self.error_generation == errors_before
-                    && !Self::contains_error_type(&cond_ty)
-                {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0203,
-                            format!(
-                                "condition must be `bool`, found `{}`",
-                                self.diagnostic_type_name(&cond_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(
-                            s.cond.span(),
-                            format!(
-                                "expected `bool`, found `{}`",
-                                self.diagnostic_type_name(&cond_ty)
-                            ),
-                        ))
-                        .with_help("use an explicit comparison, e.g. `!= 0`"),
-                    );
-                }
-                self.check_block(&s.then_block);
-                if let Some(else_b) = &s.else_block {
-                    self.check_block(else_b);
-                }
-            }
-            Stmt::While(s) => {
-                self.check_loop_contracts(s);
-                let errors_before = self.error_generation;
-                let cond_ty = self.check_expr(&s.cond);
-                if cond_ty != Type::Bool
-                    && self.error_generation == errors_before
-                    && !Self::contains_error_type(&cond_ty)
-                {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0203,
-                            format!(
-                                "condition must be `bool`, found `{}`",
-                                self.diagnostic_type_name(&cond_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(
-                            s.cond.span(),
-                            format!(
-                                "expected `bool`, found `{}`",
-                                self.diagnostic_type_name(&cond_ty)
-                            ),
-                        ))
-                        .with_help("use an explicit comparison, e.g. `!= 0`"),
-                    );
-                }
-                self.local.loop_depth += 1;
-                self.check_block(&s.body);
-                self.local.loop_depth -= 1;
-            }
-            Stmt::For(s) => {
-                let iterable_ty = self.check_expr(&s.iterable);
-                let elem_ty = match &iterable_ty {
-                    ty if Self::contains_error_type(ty) => Self::error_type(),
-                    Type::Array(elem) | Type::FixedArray(elem, _) => (**elem).clone(),
-                    ty if builtin_types::binary_args(ty, B::Map).is_some() => {
-                        let (key, value) = builtin_types::binary_args(ty, B::Map).unwrap();
-                        Type::Generic("$Tuple2".into(), vec![key.clone(), value.clone()])
-                    }
-                    ty if builtin_types::unary_arg(ty, B::FrozenArray).is_some() => {
-                        builtin_types::unary_arg(ty, B::FrozenArray)
-                            .unwrap()
-                            .clone()
-                    }
-                    Type::Generic(name, args)
-                        if name == "Range" && args.as_slice() == [Type::I64] =>
-                    {
-                        Type::I64
-                    }
-                    Type::Void => Type::Void,
-                    other => {
-                        let iterable_name = match &s.iterable {
-                            Expr::Var(name, ..) => Some(name.as_str()),
-                            _ => None,
-                        };
-                        let help = match builtin_types::resolve(other).map(|ty| ty.id) {
-                            Some(B::FrozenMap) => {
-                                if let Some(name) = iterable_name {
-                                    format!("`FrozenMap` has no iterator; keep keys in an array and retrieve entries with `{name}.get(key)`")
-                                } else {
-                                    "`FrozenMap` has no iterator; keep keys in an array and retrieve entries with `.get(key)`".into()
-                                }
-                            }
-                            _ => {
-                                "use `for item in array { ... }` with `Array<T>` / `FrozenArray<T>` or `for n in start..end { ... }`".into()
-                            }
-                        };
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!(
-                                    "cannot iterate over `{}`",
-                                    self.diagnostic_type_name(other)
-                                ),
-                            )
-                            .with_label(Label::primary(
-                                s.iterable.span(),
-                                "for-in requires an array, Map, or i64 range",
-                            ))
-                            .with_help(help),
-                        );
-                        Self::error_type()
-                    }
-                };
-
-                if self.local.current_async_context {
-                    let iter_slot_ty = if is_i64_range_type(&iterable_ty) {
-                        Type::I64
-                    } else {
-                        iterable_ty.clone()
-                    };
-                    self.record_async_local(
-                        iter_slot_ty,
-                        "for iterator",
-                        s.iterable.span(),
-                        super::async_retention::Key::Value(s.iterable.id()),
-                    );
-                    self.local.async_local_types.push(Type::I64);
-                    if s.name != "_" {
-                        self.record_async_local(
-                            elem_ty.clone(),
-                            &s.name,
-                            s.name_span,
-                            super::async_retention::Key::binding(&s.name),
-                        );
-                    }
-                }
-
-                self.symbols.push_scope();
-                if s.name != "_" {
-                    self.define_var(
-                        s.name.clone(),
-                        VarInfo {
-                            ty: elem_ty,
-                            mutable: false,
-                            is_param: false,
-                            declaration_span: s.name_span,
-                        },
-                    );
-                }
-                self.local.loop_depth += 1;
-                self.local.lexical_block_depth += 1;
-                for stmt in &s.body.stmts {
-                    self.check_stmt(stmt);
-                }
-                self.local.lexical_block_depth -= 1;
-                self.local.loop_depth -= 1;
-                self.symbols.pop_scope();
-            }
-            Stmt::Break(span) | Stmt::Continue(span) => {
-                if self.local.loop_depth == 0 {
-                    let kw = if matches!(stmt, Stmt::Break(_)) {
-                        "break"
-                    } else {
-                        "continue"
-                    };
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0904,
-                            format!("`{kw}` outside of a loop"),
-                        )
-                        .with_label(Label::primary(
-                            *span,
-                            format!("`{kw}` is only allowed inside `while` or `for`"),
-                        )),
-                    );
-                }
-            }
+            Stmt::IndexAssign(s) => self.check_index_assign(s),
+            Stmt::Assign(s) => self.check_assign_stmt(s),
+            Stmt::If(s) => self.check_if_stmt(s),
+            Stmt::While(s) => self.check_while_stmt(s),
+            Stmt::For(s) => self.check_for_stmt(s),
+            Stmt::Break(span) => self.check_loop_exit("break", *span),
+            Stmt::Continue(span) => self.check_loop_exit("continue", *span),
             Stmt::Lock(s) => self.check_lock_stmt(s),
-            Stmt::Defer(d) => {
-                // A direct call keeps the original defer contract: receiver
-                // and arguments are evaluated at registration. A match/block
-                // is evaluated at scope exit, allowing explicit Result
-                // handling without changing the parent's result/control flow.
-                let supported = matches!(
-                    &d.body,
-                    DeferBody::Expr(
-                        Expr::Call(_) | Expr::MethodCall(_) | Expr::Print(..) | Expr::Match(_)
-                    ) | DeferBody::Block(_)
+            Stmt::Defer(d) => self.check_defer_stmt(d),
+            Stmt::Return(s) => self.check_return_stmt(s),
+            Stmt::Expr(s) => self.check_expr_stmt(s),
+        }
+    }
+
+    fn check_loop_exit(&mut self, kw: &str, span: Span) {
+        if self.local.loop_depth == 0 {
+            self.push_error(
+                ErrorCode::E0904,
+                format!("`{kw}` outside of a loop"),
+                span,
+                format!("`{kw}` is only allowed inside `while` or `for`"),
+            );
+        }
+    }
+
+    fn check_let_stmt(&mut self, s: &LetStmt) {
+        // The annotation is judged before the initializer so a
+        // malformed one (`let x: Option = ...`) is reported ahead of
+        // the mismatches it goes on to cause.
+        let annotation = s.ty.as_ref().map(|ty| {
+            let errors_before = self.error_generation;
+            let type_span = s.type_span.unwrap_or(s.span);
+            let annotation = self.normalize_type(ty, type_span);
+            self.validate_type(&annotation, type_span);
+            if self.error_generation == errors_before {
+                annotation
+            } else {
+                // Retain the binding without letting its rejected type
+                // cause errors in the initializer or subsequent uses.
+                Self::error_type()
+            }
+        });
+        let reference_start = self.analysis_symbols.references.len();
+        let inferred = match &annotation {
+            Some(ann) => self.check_expr_expecting(&s.init, ann),
+            None => self.check_expr(&s.init),
+        };
+        if s.name.starts_with("$compound_array_") {
+            self.record_element_write(&s.init, reference_start, true);
+        }
+        let ty = if let Some(ann) = &annotation {
+            if !self.types_compatible(ann, &inferred) {
+                self.push_let_annotation_mismatch(s, ann, &inferred);
+            }
+            ann.clone()
+        } else {
+            // Builtin constructor holes are finalized by check_expr,
+            // including recovery from malformed payloads. Keep the
+            // existing binding check for user-defined generic enums.
+            if !matches!(&inferred, Type::Generic(name, _) if name == "Option" || name == "Result")
+                && let Some(diag) = self.unresolved_generic_enum_diagnostic(
+                    &s.init,
+                    &inferred,
+                    s.init.span(),
+                    &s.name,
+                )
+            {
+                self.push(diag);
+            }
+            if matches!(&inferred, Type::Array(element) if **element == Type::Void) {
+                self.push(
+                    Self::error_at(
+                        ErrorCode::E1801,
+                        "cannot infer array element type; annotate the binding",
+                        s.span,
+                        "element type annotation required",
+                    )
+                    .with_help(format!(
+                        "add an element type, e.g. `let {}: Array<i64> = [];`",
+                        s.name
+                    )),
                 );
-                if !supported {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0905,
-                            "`defer` expects a call, match expression, or block",
-                        )
-                        .with_label(Label::primary(
-                            d.body.span(),
-                            "use `defer f(args);`, `defer match value { ... }`, or `defer { ... }`",
-                        )),
-                    );
-                }
-                if matches!(
-                    &d.body,
-                    DeferBody::Expr(Expr::Call(call)) if call.callee == "recover"
-                ) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0905,
-                            "`defer recover();` discards the panic metadata",
-                        )
-                        .with_label(Label::primary(
-                            d.body.span(),
-                            "handle `recover()` explicitly in a deferred block or match",
-                        ))
-                        .with_help(
-                            "use `defer match recover() { Some(info) => { ... }, None => {} }`",
-                        ),
-                    );
-                }
-                let recovery_capable = defer_body_contains_direct_recover(&d.body);
-                if recovery_capable
-                    && self.local.lexical_block_depth == 1
-                    && self.local.current_return_type != Type::Void
-                {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0905,
-                            "an outermost recovery scope cannot complete a non-void function",
-                        )
-                        .with_label(Label::primary(
-                            d.body.span(),
-                            "recovery here would leave the function without a return value",
-                        ))
-                        .with_help(
-                            "put the recovery-capable defer in a nested block and return a value after that block",
-                        ),
-                    );
-                }
+                // Poison the binding so push, iteration and await do not
+                // turn an unresolved element into secondary diagnostics.
+                Self::error_type()
+            } else {
+                inferred
+            }
+        };
+        if annotation.is_none()
+            && builtin_types::binary_args(&ty, B::Map)
+                .is_some_and(|(key, value)| *key == Type::Void && *value == Type::Void)
+        {
+            self.local.inferred_maps.insert(
+                s.span,
+                (
+                    vec![s.init.id()],
+                    self.local
+                        .current_async_context
+                        .then_some(self.local.async_local_types.len()),
+                ),
+            );
+        }
+        // Record the resolved type of locals inside async fns so the
+        // backend can frame-back unannotated live-across-await locals.
+        if self.local.current_async_context {
+            self.local.async_local_bindings.insert(
+                self.local.async_local_types.len(),
+                (
+                    s.name.clone(),
+                    s.span,
+                    super::async_retention::Key::binding(&s.name),
+                ),
+            );
+            self.local.async_local_types.push(ty.clone());
+        }
+        // `_` is a wildcard: evaluate the initializer for side effects but do
+        // not bind a variable (allows multiple `let _ = expr;` in the same scope).
+        if s.name == "_" {
+            return;
+        }
+        // E0351: reject redeclaration in the same scope.
+        if let Some(_prev) = self.symbols.lookup_var_current_scope(&s.name) {
+            self.push_error(
+                ErrorCode::E0351,
+                format!("variable `{}` is already defined in this scope", s.name),
+                s.span,
+                "previous definition here",
+            );
+        }
+        self.define_var(
+            s.name.clone(),
+            VarInfo {
+                ty,
+                mutable: s.mutable,
+                is_param: false,
+                declaration_span: s.span,
+            },
+        );
+    }
 
-                for (span, keyword) in defer_control_flow_violations(&d.body) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0905,
-                            format!("`{keyword}` is not allowed inside a `defer`"),
-                        )
-                        .with_label(Label::primary(
-                            span,
-                            "a deferred body cannot change its enclosing function or loop",
-                        )),
-                    );
-                }
+    /// A `let` initializer incompatible with its annotation. Class-to-class
+    /// mismatches (E0704) name the variable and point at the annotation.
+    fn push_let_annotation_mismatch(&mut self, s: &LetStmt, ann: &Type, inferred: &Type) {
+        let code = self.type_mismatch_error_code(ann, inferred);
+        if code != ErrorCode::E0704 {
+            self.push_type_mismatch_with_code(code, ann, inferred, s.span);
+            return;
+        }
+        let expected = self.diagnostic_type_name(ann);
+        self.push_error(
+            code,
+            format!(
+                "cannot assign `{}` to variable `{}` of type `{expected}`",
+                self.diagnostic_type_name(inferred),
+                s.name,
+            ),
+            s.span,
+            format!("expected `{expected}` because of this type annotation"),
+        );
+    }
 
-                if defer_body_contains_suspend(&d.body) {
-                    // The registration happens at the defer statement; an
-                    // async operation inside the deferred body has no suspension point
-                    // to resume from at flush/cancel time (willow-vynv.3).
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0905,
-                            "`await` and `select` are not allowed inside a `defer`",
-                        )
-                        .with_label(Label::primary(
-                            d.body.span(),
-                            "deferred bodies run synchronously",
-                        )),
+    fn check_field_assign(&mut self, s: &FieldAssignStmt) {
+        let obj_ty = self.check_expr(&s.object);
+        let field_ty = self.resolve_field(&obj_ty, &s.field, s.target_span, true, "write");
+        let val_ty = if field_ty == Type::Void {
+            self.check_expr(&s.value)
+        } else {
+            self.check_expr_expecting(&s.value, &field_ty)
+        };
+        if field_ty != Type::Void && !self.types_compatible(&field_ty, &val_ty) {
+            self.push_type_mismatch(&field_ty, &val_ty, s.span);
+        }
+        if obj_ty == Type::Named("PanicInfo".to_string()) {
+            self.push_error(
+                ErrorCode::E0201,
+                "fields of `PanicInfo` are read-only",
+                s.span,
+                "runtime panic metadata cannot be modified",
+            );
+        }
+    }
+
+    fn check_index_assign(&mut self, s: &IndexAssignStmt) {
+        let reference_start = self.analysis_symbols.references.len();
+        let arr_ty = self.check_expr(&s.array);
+        self.record_element_write(&s.array, reference_start, false);
+        let idx_ty = self.check_expr(&s.index);
+        if !matches!(idx_ty, Type::I64) && !Self::contains_error_type(&idx_ty) {
+            self.push_error(
+                ErrorCode::E0201,
+                format!(
+                    "array index must be `i64`, found `{}`",
+                    self.diagnostic_type_name(&idx_ty)
+                ),
+                s.index.span(),
+                "index is not an `i64`",
+            );
+        }
+        match &arr_ty {
+            Type::Array(elem) | Type::FixedArray(elem, _) => {
+                let val_ty = self.check_expr_expecting(&s.value, elem);
+                if !self.types_compatible(elem, &val_ty) {
+                    let element = self.diagnostic_type_name(elem);
+                    self.push_error(
+                        self.type_mismatch_error_code(elem, &val_ty),
+                        format!(
+                            "cannot assign `{}` to an element of `Array<{element}>`",
+                            self.diagnostic_type_name(&val_ty),
+                        ),
+                        s.span,
+                        format!("expected `{element}`"),
                     );
                 }
-                // Reference arguments would act on a hidden COPY of the value
-                // (operands are stashed at registration), silently missing the
-                // caller's variable — reject them in v1 (review fix).
-                let ref_arg_span = match &d.body {
-                    DeferBody::Expr(Expr::Call(c)) => c
-                        .args
-                        .iter()
-                        .find(|a| !matches!(a.mode, CallArgMode::Value))
-                        .map(|a| a.span),
-                    DeferBody::Expr(Expr::MethodCall(m)) => m
-                        .args
-                        .iter()
-                        .find(|a| !matches!(a.mode, CallArgMode::Value))
-                        .map(|a| a.span),
+            }
+            // A known array still provides element context even if a
+            // component is erroneous. Other recovery receivers cannot
+            // support a not-an-array diagnostic; always check the value.
+            ty if *ty == Type::Void || Self::contains_error_type(ty) => {
+                self.check_expr(&s.value);
+            }
+            other => {
+                self.check_expr(&s.value);
+                self.push_error(
+                    ErrorCode::E0201,
+                    format!(
+                        "cannot index a value of type `{}`",
+                        self.diagnostic_type_name(other)
+                    ),
+                    s.span,
+                    "not an array",
+                );
+            }
+        }
+    }
+
+    fn check_assign_stmt(&mut self, s: &AssignStmt) {
+        self.record_binding_use(&s.name, s.span, "write");
+        if s.name == "this" {
+            self.push_legacy_this_error(s.span);
+            return;
+        }
+        // Reject direct assignment to `self`.
+        if s.name == "self" {
+            self.push(
+                Self::error_at(
+                    ErrorCode::E0552,
+                    format!("cannot assign to `{}`", s.name),
+                    s.span,
+                    "cannot assign to receiver",
+                )
+                .with_help(format!("to mutate fields, use `{}.field = value`", s.name)),
+            );
+            return;
+        }
+        let info = self.symbols.lookup_var(&s.name).cloned();
+        let constant = info
+            .is_none()
+            .then(|| self.symbols.lookup_func(&s.name))
+            .flatten()
+            .filter(|f| f.constant.is_some())
+            .map(|f| f.declaration_span);
+        match info {
+            None if constant.is_some() => self.push(
+                Self::error_at(
+                    ErrorCode::E0301,
+                    format!("cannot assign to constant `{}`", s.name),
+                    s.span,
+                    "cannot assign",
+                )
+                .with_label(Label::secondary(
+                    constant.unwrap_or(s.span),
+                    "declared as a constant here",
+                ))
+                .with_help(format!(
+                    "declare a mutable local instead: `let mut {} = ...`",
+                    s.name.to_lowercase()
+                )),
+            ),
+            None => self.push_error(
+                ErrorCode::E0350,
+                format!("cannot find variable `{}`", s.name),
+                s.span,
+                "not found in this scope",
+            ),
+            Some(info) => {
+                // A write to a capture was already reported against the
+                // capture; reporting the enclosing
+                // local's mutability on top of it would point at a fix
+                // that does not exist.
+                if !info.mutable && !self.local.capture_writes.contains(&s.span) {
+                    self.push_immutable_assignment(s, &info);
+                }
+                let got = self.check_expr_expecting(&s.value, &info.ty);
+                if !self.types_compatible(&info.ty, &got) {
+                    self.push_type_mismatch(&info.ty, &got, s.span);
+                }
+            }
+        }
+    }
+
+    /// A write to an immutable local or parameter.
+    fn push_immutable_assignment(&mut self, s: &AssignStmt, info: &VarInfo) {
+        if info.is_param {
+            self.push(
+                Self::error_at(
+                    ErrorCode::E0302,
+                    format!("cannot assign to immutable parameter `{}`", s.name),
+                    s.span,
+                    "cannot assign to parameter",
+                )
+                .with_help(format!(
+                    "introduce a mutable local variable: `let mut {} = {};`",
+                    s.name, s.name
+                )),
+            );
+        } else {
+            // Build an insertion span just after "let " in the declaration.
+            let decl = info.declaration_span;
+            let insert_span = Span::in_file(
+                decl.file_id,
+                decl.start + 4,
+                decl.start + 4,
+                decl.line,
+                decl.col + 4,
+            );
+            self.push(
+                Self::error_at(
+                    ErrorCode::E0301,
+                    format!("cannot assign to immutable variable `{}`", s.name),
+                    s.span,
+                    "cannot assign",
+                )
+                .with_label(Label::secondary(
+                    info.declaration_span,
+                    "declared immutable here",
+                ))
+                .with_help(format!("declare it as mutable: `let mut {} = ...`", s.name))
+                .with_fix(FixSuggestion::insertion(
+                    insert_span,
+                    "mut ",
+                    "add `mut` here",
+                )),
+            );
+        }
+    }
+
+    fn check_if_stmt(&mut self, s: &IfStmt) {
+        let errors_before = self.error_generation;
+        let cond_ty = self.check_expr(&s.cond);
+        self.check_condition_is_bool(&s.cond, &cond_ty, errors_before);
+        self.check_block(&s.then_block);
+        if let Some(else_b) = &s.else_block {
+            self.check_block(else_b);
+        }
+    }
+
+    fn check_while_stmt(&mut self, s: &WhileStmt) {
+        self.check_loop_contracts(s);
+        let errors_before = self.error_generation;
+        let cond_ty = self.check_expr(&s.cond);
+        self.check_condition_is_bool(&s.cond, &cond_ty, errors_before);
+        self.local.loop_depth += 1;
+        self.check_block(&s.body);
+        self.local.loop_depth -= 1;
+    }
+
+    fn check_for_stmt(&mut self, s: &ForStmt) {
+        let iterable_ty = self.check_expr(&s.iterable);
+        let elem_ty = match &iterable_ty {
+            ty if Self::contains_error_type(ty) => Self::error_type(),
+            Type::Array(elem) | Type::FixedArray(elem, _) => (**elem).clone(),
+            ty if builtin_types::binary_args(ty, B::Map).is_some() => {
+                let (key, value) = builtin_types::binary_args(ty, B::Map).unwrap();
+                Type::Generic("$Tuple2".into(), vec![key.clone(), value.clone()])
+            }
+            ty if builtin_types::unary_arg(ty, B::FrozenArray).is_some() => {
+                builtin_types::unary_arg(ty, B::FrozenArray)
+                    .unwrap()
+                    .clone()
+            }
+            Type::Generic(name, args) if name == "Range" && args.as_slice() == [Type::I64] => {
+                Type::I64
+            }
+            Type::Void => Type::Void,
+            other => {
+                let iterable_name = match &s.iterable {
+                    Expr::Var(name, ..) => Some(name.as_str()),
                     _ => None,
                 };
-                if let Some(span) = ref_arg_span {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0905,
-                            "reference arguments are not supported in `defer`",
-                        )
-                        .with_label(Label::primary(
-                            span,
-                            "the deferred call would mutate a hidden copy, not this variable",
-                        ))
-                        .with_help("wrap the mutation in a class method and defer that instead"),
-                    );
-                }
-                match &d.body {
-                    DeferBody::Expr(expr) => {
-                        self.check_expr(expr);
-                    }
-                    DeferBody::Block(block) => self.check_block(block),
-                }
-                if let Some((span, operation)) =
-                    defer_scheduler_drive_span(&d.body, &self.expr_types)
-                {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0905,
-                            "scheduler-driving operations are not allowed inside a `defer`",
-                        )
-                        .with_label(Label::primary(
-                            span,
-                            format!(
-                                "`{operation}` could run or suspend another task during cleanup"
-                            ),
-                        ))
-                        .with_help("perform the operation explicitly before leaving the scope"),
-                    );
-                }
-                // Async defer (willow-vynv.3): operands are stashed into the
-                // task frame at registration — record their types (keyed by
-                // operand span) so codegen can lay out + GC-mask the slots.
-                if self.local.current_async_context {
-                    let mut record = |expr: &Expr| {
-                        let ty = self
-                            .expr_types
-                            .get(&expr.id())
-                            .cloned()
-                            .unwrap_or(Type::I64);
-                        self.record_async_local(
-                            ty,
-                            "deferred operand",
-                            expr.span(),
-                            super::async_retention::Key::Value(expr.id()),
-                        );
-                    };
-                    match &d.body {
-                        DeferBody::Expr(Expr::Call(c)) => {
-                            c.args.iter().for_each(|a| record(&a.expr))
+                let help = match builtin_types::resolve(other).map(|ty| ty.id) {
+                    Some(B::FrozenMap) => {
+                        if let Some(name) = iterable_name {
+                            format!("`FrozenMap` has no iterator; keep keys in an array and retrieve entries with `{name}.get(key)`")
+                        } else {
+                            "`FrozenMap` has no iterator; keep keys in an array and retrieve entries with `.get(key)`".into()
                         }
-                        DeferBody::Expr(Expr::MethodCall(m)) => {
-                            record(&m.object);
-                            m.args.iter().for_each(|a| record(&a.expr));
-                        }
-                        DeferBody::Expr(Expr::Print(arg, ..)) => record(arg),
-                        _ => {}
                     }
-                }
-                if self.local.current_async_context
-                    && let DeferBody::Expr(Expr::Call(c)) = &d.body
-                    && let Some(info) = self.symbols.lookup_var(&c.callee)
-                {
-                    self.record_async_local(
-                        info.ty.clone(),
-                        "deferred callee",
-                        c.span,
-                        super::async_retention::Key::DeferredCallee(c.id),
-                    );
-                }
-                // An ASYNC callee would only SPAWN a task at scope exit — the
-                // cleanup body would never be driven to completion. Reject
-                // until async defer (Phase 3) defines this (review fix).
-                if let Some(span) = defer_async_call_span(&d.body, &self.expr_types) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0905,
-                            "cannot `defer` an async call",
-                        )
-                        .with_label(Label::primary(
-                            span,
-                            "this would only spawn a task at scope exit, not run it to completion",
-                        ))
-                        .with_help(
-                            "perform the async cleanup explicitly, or defer a synchronous helper",
-                        ),
-                    );
-                }
-            }
-            Stmt::Return(s) => {
-                // In a constructor, a bare `return;` is fine but `return <value>`
-                // is rejected (willow-scq2 §8 → E0841).
-                if self.local.in_constructor {
-                    if let Some(v) = &s.value {
-                        self.check_expr(v);
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0841,
-                                "constructor `init` cannot return a value",
-                            )
-                            .with_label(Label::primary(s.span, "remove the returned value"))
-                            .with_help("a constructor implicitly returns the new object"),
-                        );
+                    _ => {
+                        "use `for item in array { ... }` with `Array<T>` / `FrozenArray<T>` or `for n in start..end { ... }`".into()
                     }
-                    return;
-                }
-                // `return Result::Ok();` (zero-arg) is the success value of a
-                // `Result<void, E>` function: the Ok payload is void, so no
-                // argument is required (willow-exg).
-                if let Some(Expr::StaticCall(sc)) = &s.value {
-                    let returns_result_void =
-                        builtin_types::binary_args(&self.local.current_return_type, B::Result)
-                            .is_some_and(|(ok, _)| *ok == Type::Void);
-                    if returns_result_void
-                        && sc.class == "Result"
-                        && sc.method == "Ok"
-                        && sc.args.is_empty()
-                    {
-                        // Record the type anyway: nothing else visits this call,
-                        // and HIR lowering asks the checker for the type of any
-                        // static call it cannot resolve itself (willow-0g8j.2.14).
-                        self.expr_types
-                            .insert(sc.id, self.local.current_return_type.clone());
-                        self.static_call_classes.insert(
-                            sc.id,
-                            crate::semantic::ids::TypeId::from_source_name(&sc.class),
-                        );
-                        return;
-                    }
-                }
-                let ret_ty = match &s.value {
-                    // Resolve an unqualified variant in `return Ok(42)` against
-                    // the function's return type (willow-60o.1). Skipped inside a
-                    // lambda, where `current_return_type` is not the lambda's.
-                    Some(v) if self.local.lambda_return_stack.is_empty() => {
-                        let expected = self.local.current_return_type.clone();
-                        self.check_expr_expecting(v, &expected)
-                    }
-                    Some(v) => self.check_lambda_return_value(v),
-                    None => Type::Void,
                 };
-                // Inside a lambda with no annotation: record the return type for inference.
-                if let Some(slot) = self.local.lambda_return_stack.last_mut() {
-                    if slot.is_none() {
-                        *slot = Some(ret_ty.clone());
-                    }
-                    return; // don't validate against outer current_return_type
-                }
-                if !self.types_compatible(&self.local.current_return_type, &ret_ty) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            self.type_mismatch_error_code(&self.local.current_return_type, &ret_ty),
-                            format!(
-                                "mismatched types: expected `{}`, found `{}`",
-                                self.diagnostic_type_name(&self.local.current_return_type),
-                                self.diagnostic_type_name(&ret_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(
-                            s.span,
-                            format!(
-                                "expected `{}`",
-                                self.diagnostic_type_name(&self.local.current_return_type)
-                            ),
-                        )),
-                    );
-                }
+                self.push(
+                    Self::error_at(
+                        ErrorCode::E0201,
+                        format!("cannot iterate over `{}`", self.diagnostic_type_name(other)),
+                        s.iterable.span(),
+                        "for-in requires an array, Map, or i64 range",
+                    )
+                    .with_help(help),
+                );
+                Self::error_type()
             }
-            Stmt::Expr(s) => {
-                let errors_before = self.error_generation;
-                let ty = self.check_expr(&s.expr);
-                // Inspect the already computed outer type, without traversing or
-                // cloning its result type. Value-consuming contexts never enter
-                // this statement branch.
-                // Generic prechecking revisits these bodies in the final pass;
-                // emit this advisory only with the final resolved types.
-                // `scope.add(task)` hands the task to the scope, whose
-                // `finish()` joins it; its returned handle is optional.
-                let scope_owned = matches!(&s.expr, Expr::MethodCall(call)
-                    if call.method == "add"
-                        && self
-                            .expr_types
-                            .get(&call.object.id())
-                            .is_some_and(|ty| builtin_types::is(ty, B::TaskScope)));
-                if !self.template_precheck
-                    && self.error_generation == errors_before
-                    && !scope_owned
-                    && (is_task_handle_type(&ty) || builtin_types::is(&ty, B::TaskResult))
-                {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Warning,
-                            ErrorCode::W0802,
-                            "task or future value discarded without awaiting",
-                        )
-                        .with_label(Label::primary(s.expr.span(), "unused awaitable value"))
-                        .with_help("use `await ...` to wait for completion, or explicitly bind the value with `let task = ...;` (or `let _ = ...;`) to discard it intentionally"),
-                    );
-                }
+        };
+
+        if self.local.current_async_context {
+            let iter_slot_ty = if is_i64_range_type(&iterable_ty) {
+                Type::I64
+            } else {
+                iterable_ty.clone()
+            };
+            self.record_async_local(
+                iter_slot_ty,
+                "for iterator",
+                s.iterable.span(),
+                super::async_retention::Key::Value(s.iterable.id()),
+            );
+            self.local.async_local_types.push(Type::I64);
+            if s.name != "_" {
+                self.record_async_local(
+                    elem_ty.clone(),
+                    &s.name,
+                    s.name_span,
+                    super::async_retention::Key::binding(&s.name),
+                );
             }
+        }
+
+        self.symbols.push_scope();
+        if s.name != "_" {
+            self.define_var(
+                s.name.clone(),
+                VarInfo {
+                    ty: elem_ty,
+                    mutable: false,
+                    is_param: false,
+                    declaration_span: s.name_span,
+                },
+            );
+        }
+        self.local.loop_depth += 1;
+        self.local.lexical_block_depth += 1;
+        for stmt in &s.body.stmts {
+            self.check_stmt(stmt);
+        }
+        self.local.lexical_block_depth -= 1;
+        self.local.loop_depth -= 1;
+        self.symbols.pop_scope();
+    }
+
+    fn check_defer_stmt(&mut self, d: &DeferStmt) {
+        self.check_defer_body_shape(d);
+        match &d.body {
+            DeferBody::Expr(expr) => {
+                self.check_expr(expr);
+            }
+            DeferBody::Block(block) => self.check_block(block),
+        }
+        if let Some((span, operation)) = defer_scheduler_drive_span(&d.body, &self.expr_types) {
+            self.push(
+                Self::error_at(
+                    ErrorCode::E0905,
+                    "scheduler-driving operations are not allowed inside a `defer`",
+                    span,
+                    format!("`{operation}` could run or suspend another task during cleanup"),
+                )
+                .with_help("perform the operation explicitly before leaving the scope"),
+            );
+        }
+        if self.local.current_async_context {
+            self.record_defer_async_operands(d);
+        }
+        // An ASYNC callee would only SPAWN a task at scope exit — the
+        // cleanup body would never be driven to completion. Reject
+        // until async defer (Phase 3) defines this (review fix).
+        if let Some(span) = defer_async_call_span(&d.body, &self.expr_types) {
+            self.push(
+                Self::error_at(
+                    ErrorCode::E0905,
+                    "cannot `defer` an async call",
+                    span,
+                    "this would only spawn a task at scope exit, not run it to completion",
+                )
+                .with_help("perform the async cleanup explicitly, or defer a synchronous helper"),
+            );
+        }
+    }
+
+    /// Syntactic `defer` restrictions that need no types: the accepted
+    /// body forms, recovery placement, control flow, suspension and
+    /// reference arguments.
+    fn check_defer_body_shape(&mut self, d: &DeferStmt) {
+        // A direct call keeps the original defer contract: receiver
+        // and arguments are evaluated at registration. A match/block
+        // is evaluated at scope exit, allowing explicit Result
+        // handling without changing the parent's result/control flow.
+        let supported = matches!(
+            &d.body,
+            DeferBody::Expr(Expr::Call(_) | Expr::MethodCall(_) | Expr::Print(..) | Expr::Match(_))
+                | DeferBody::Block(_)
+        );
+        if !supported {
+            self.push_error(
+                ErrorCode::E0905,
+                "`defer` expects a call, match expression, or block",
+                d.body.span(),
+                "use `defer f(args);`, `defer match value { ... }`, or `defer { ... }`",
+            );
+        }
+        if matches!(
+            &d.body,
+            DeferBody::Expr(Expr::Call(call)) if call.callee == "recover"
+        ) {
+            self.push(
+                Self::error_at(
+                    ErrorCode::E0905,
+                    "`defer recover();` discards the panic metadata",
+                    d.body.span(),
+                    "handle `recover()` explicitly in a deferred block or match",
+                )
+                .with_help("use `defer match recover() { Some(info) => { ... }, None => {} }`"),
+            );
+        }
+        let recovery_capable = defer_body_contains_direct_recover(&d.body);
+        if recovery_capable
+            && self.local.lexical_block_depth == 1
+            && self.local.current_return_type != Type::Void
+        {
+            self.push(Self::error_at(ErrorCode::E0905, "an outermost recovery scope cannot complete a non-void function", d.body.span(), "recovery here would leave the function without a return value").with_help(
+                    "put the recovery-capable defer in a nested block and return a value after that block",
+                ));
+        }
+
+        for (span, keyword) in defer_control_flow_violations(&d.body) {
+            self.push_error(
+                ErrorCode::E0905,
+                format!("`{keyword}` is not allowed inside a `defer`"),
+                span,
+                "a deferred body cannot change its enclosing function or loop",
+            );
+        }
+
+        if defer_body_contains_suspend(&d.body) {
+            // The registration happens at the defer statement; an
+            // async operation inside the deferred body has no suspension point
+            // to resume from at flush/cancel time.
+            self.push_error(
+                ErrorCode::E0905,
+                "`await` and `select` are not allowed inside a `defer`",
+                d.body.span(),
+                "deferred bodies run synchronously",
+            );
+        }
+        // Reference arguments would act on a hidden COPY of the value
+        // (operands are stashed at registration), silently missing the
+        // caller's variable — reject them in v1 (review fix).
+        let ref_arg_span = match &d.body {
+            DeferBody::Expr(Expr::Call(c)) => c
+                .args
+                .iter()
+                .find(|a| !matches!(a.mode, CallArgMode::Value))
+                .map(|a| a.span),
+            DeferBody::Expr(Expr::MethodCall(m)) => m
+                .args
+                .iter()
+                .find(|a| !matches!(a.mode, CallArgMode::Value))
+                .map(|a| a.span),
+            _ => None,
+        };
+        if let Some(span) = ref_arg_span {
+            self.push(
+                Self::error_at(
+                    ErrorCode::E0905,
+                    "reference arguments are not supported in `defer`",
+                    span,
+                    "the deferred call would mutate a hidden copy, not this variable",
+                )
+                .with_help("wrap the mutation in a class method and defer that instead"),
+            );
+        }
+    }
+
+    /// Async defer: operands are stashed into the task frame at
+    /// registration, so record their types (keyed by operand) for codegen
+    /// to lay out and GC-mask the slots, plus a deferred local callee.
+    fn record_defer_async_operands(&mut self, d: &DeferStmt) {
+        let mut record = |expr: &Expr| {
+            let ty = self
+                .expr_types
+                .get(&expr.id())
+                .cloned()
+                .unwrap_or(Type::I64);
+            self.record_async_local(
+                ty,
+                "deferred operand",
+                expr.span(),
+                super::async_retention::Key::Value(expr.id()),
+            );
+        };
+        match &d.body {
+            DeferBody::Expr(Expr::Call(c)) => c.args.iter().for_each(|a| record(&a.expr)),
+            DeferBody::Expr(Expr::MethodCall(m)) => {
+                record(&m.object);
+                m.args.iter().for_each(|a| record(&a.expr));
+            }
+            DeferBody::Expr(Expr::Print(arg, ..)) => record(arg),
+            _ => {}
+        }
+        if let DeferBody::Expr(Expr::Call(c)) = &d.body
+            && let Some(info) = self.symbols.lookup_var(&c.callee)
+        {
+            self.record_async_local(
+                info.ty.clone(),
+                "deferred callee",
+                c.span,
+                super::async_retention::Key::DeferredCallee(c.id),
+            );
+        }
+    }
+
+    fn check_return_stmt(&mut self, s: &ReturnStmt) {
+        // In a constructor, a bare `return;` is fine but `return <value>`
+        // is rejected (E0841).
+        if self.local.in_constructor {
+            if let Some(v) = &s.value {
+                self.check_expr(v);
+                self.push(
+                    Self::error_at(
+                        ErrorCode::E0841,
+                        "constructor `init` cannot return a value",
+                        s.span,
+                        "remove the returned value",
+                    )
+                    .with_help("a constructor implicitly returns the new object"),
+                );
+            }
+            return;
+        }
+        // `return Result::Ok();` (zero-arg) is the success value of a
+        // `Result<void, E>` function: the Ok payload is void, so no
+        // argument is required.
+        if let Some(Expr::StaticCall(sc)) = &s.value {
+            let returns_result_void =
+                builtin_types::binary_args(&self.local.current_return_type, B::Result)
+                    .is_some_and(|(ok, _)| *ok == Type::Void);
+            if returns_result_void
+                && sc.class == "Result"
+                && sc.method == "Ok"
+                && sc.args.is_empty()
+            {
+                // Record the type anyway: nothing else visits this call,
+                // and HIR lowering asks the checker for the type of any
+                // static call it cannot resolve itself.
+                self.expr_types
+                    .insert(sc.id, self.local.current_return_type.clone());
+                self.static_call_classes.insert(
+                    sc.id,
+                    crate::semantic::ids::TypeId::from_source_name(&sc.class),
+                );
+                return;
+            }
+        }
+        let ret_ty = match &s.value {
+            // Resolve an unqualified variant in `return Ok(42)` against
+            // the function's return type. Skipped inside a
+            // lambda, where `current_return_type` is not the lambda's.
+            Some(v) if self.local.lambda_return_stack.is_empty() => {
+                let expected = self.local.current_return_type.clone();
+                self.check_expr_expecting(v, &expected)
+            }
+            Some(v) => self.check_lambda_return_value(v),
+            None => Type::Void,
+        };
+        // Inside a lambda with no annotation: record the return type for inference.
+        if let Some(slot) = self.local.lambda_return_stack.last_mut() {
+            if slot.is_none() {
+                *slot = Some(ret_ty.clone());
+            }
+            return; // don't validate against outer current_return_type
+        }
+        if !self.types_compatible(&self.local.current_return_type, &ret_ty) {
+            let expected = self.diagnostic_type_name(&self.local.current_return_type);
+            let found = self.diagnostic_type_name(&ret_ty);
+            self.push_error(
+                self.type_mismatch_error_code(&self.local.current_return_type, &ret_ty),
+                format!("mismatched types: expected `{expected}`, found `{found}`"),
+                s.span,
+                format!("expected `{expected}`"),
+            );
+        }
+    }
+
+    fn check_expr_stmt(&mut self, s: &ExprStmt) {
+        let errors_before = self.error_generation;
+        let ty = self.check_expr(&s.expr);
+        // Inspect the already computed outer type, without traversing or
+        // cloning its result type. Value-consuming contexts never enter
+        // this statement branch.
+        // Generic prechecking revisits these bodies in the final pass;
+        // emit this advisory only with the final resolved types.
+        // `scope.add(task)` hands the task to the scope, whose
+        // `finish()` joins it; its returned handle is optional.
+        let scope_owned = matches!(&s.expr, Expr::MethodCall(call)
+            if call.method == "add"
+                && self
+                    .expr_types
+                    .get(&call.object.id())
+                    .is_some_and(|ty| builtin_types::is(ty, B::TaskScope)));
+        if !self.template_precheck
+            && self.error_generation == errors_before
+            && !scope_owned
+            && (is_task_handle_type(&ty) || builtin_types::is(&ty, B::TaskResult))
+        {
+            self.push(
+                Diagnostic::new(
+                    Severity::Warning,
+                    ErrorCode::W0802,
+                    "task or future value discarded without awaiting",
+                )
+                .with_label(Label::primary(s.expr.span(), "unused awaitable value"))
+                .with_help("use `await ...` to wait for completion, or explicitly bind the value with `let task = ...;` (or `let _ = ...;`) to discard it intentionally"),
+            );
         }
     }
 
