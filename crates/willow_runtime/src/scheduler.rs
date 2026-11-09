@@ -5087,8 +5087,6 @@ fn scheduler_run_loop(
     completed
 }
 
-/// Test-only: reset the global scheduler between unit tests (the heap and
-/// scheduler are process-global, so tests must run single-threaded).
 /// Test-only: run `f` against the global scheduler (for cross-crate-module
 /// unit fixtures that must register real task ids, e.g. channel purge tests).
 #[cfg(test)]
@@ -5108,6 +5106,8 @@ pub fn with_current_task_for_test<R>(id: u64, f: impl FnOnce() -> R) -> R {
     result
 }
 
+/// Test-only: reset the global scheduler between unit tests. Callers must
+/// serialize access to the process-global scheduler and heap.
 #[cfg(test)]
 pub fn reset_global_scheduler_for_test() {
     // Drained tasks never run their cancel path, so drop their blocking-pool

@@ -20,6 +20,10 @@ pub(super) use crate::id_hash::IdHasher as AddressHasher;
 type AddressMap<V> = HashMap<usize, V, BuildHasherDefault<AddressHasher>>;
 type AddressSet = HashSet<usize, BuildHasherDefault<AddressHasher>>;
 
+// Bound each old-epoch publication batch after minor relocation. Keep the
+// initial scratch capacity and the flush threshold tied to the same policy.
+const PUBLICATION_BATCH_SIZE: usize = 32;
+
 #[cfg(test)]
 #[path = "minor_tests.rs"]
 mod tests;
@@ -1119,7 +1123,7 @@ impl<'a> MinorCollector<'a> {
             cycle.objects.refresh_stopped(self.state);
             // Publication must scan promoted black objects too; enqueue() would
             // suppress already-black destinations allocated in existing old regions.
-            let mut pending = Vec::with_capacity(32);
+            let mut pending = Vec::with_capacity(PUBLICATION_BATCH_SIZE);
             let mut scanned_work = crate::gc_telemetry::MarkWork::default();
             let publication_cpu_start = crate::gc_telemetry::workers::thread_cpu_ns();
             for address in self.published.drain(..) {
@@ -1136,7 +1140,7 @@ impl<'a> MinorCollector<'a> {
                     continue;
                 }
                 pending.push(crate::gc_mark_queue::ObjectRef::from_addr(address).unwrap());
-                if pending.len() == 32 {
+                if pending.len() == PUBLICATION_BATCH_SIZE {
                     cycle
                         .queue
                         .inject(crate::gc_mark_queue::MarkWork::new(
