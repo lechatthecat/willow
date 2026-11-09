@@ -1260,18 +1260,18 @@ impl<'a> MinorCollector<'a> {
         let chunk = self.state.tlab_chunks.swap_remove(chunk_index);
         runtime().root_tlabs.remove(chunk.base as usize);
         chunk_identities.swap_remove(chunk_index);
-        let layout = Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>())
-            .expect("TLAB chunk layout remains valid");
-        // SAFETY: every object in this retired chunk was reclaimed or moved.
-        unsafe { dealloc(chunk.base, layout) };
         self.state.released_bytes = self
             .state
             .released_bytes
             .saturating_add(chunk.capacity as u64);
-        self.state.tlab_reserved_bytes = self
-            .state
-            .tlab_reserved_bytes
-            .saturating_sub(chunk.capacity);
+        self.state.tlab_reserved_bytes -= chunk.capacity;
+        let budget = super::region_cache_budget(self.state);
+        // SAFETY: all source objects are dead or moved, and its extent was removed above.
+        if let Some(chunk) = unsafe { self.state.region_cache.retain_survivor(chunk, budget) } {
+            let layout =
+                Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>()).unwrap();
+            unsafe { dealloc(chunk.base, layout) };
+        }
     }
 }
 
@@ -1701,6 +1701,17 @@ fn admit_survivor_chunk(state: &mut GcState) -> bool {
     if !super::can_reserve(state, GC_TLAB_CHUNK_SIZE) {
         return false;
     }
+    if let Some(mut chunk) = state.region_cache.take_survivor() {
+        chunk
+            .header_offsets
+            .reserve(GC_TLAB_CHUNK_SIZE / GC_HEADER_SIZE);
+        state.survivor_reserve.push(chunk);
+        state.tlab_reserved_bytes += GC_TLAB_CHUNK_SIZE;
+        state.survivor_reserve_stats.admitted_bytes += GC_TLAB_CHUNK_SIZE as u64;
+        state.survivor_reserve_stats.available_bytes += GC_TLAB_CHUNK_SIZE as u64;
+        super::note_reservation_growth(state);
+        return true;
+    }
     let layout =
         Layout::from_size_align(GC_TLAB_CHUNK_SIZE, std::mem::align_of::<GcHeader>()).unwrap();
     // SAFETY: valid aligned region; release_survivor_reserve or the normal
@@ -1732,13 +1743,16 @@ fn admit_survivor_chunk(state: &mut GcState) -> bool {
 }
 
 pub(super) fn release_survivor_reserve(state: &mut GcState) {
-    for chunk in state.survivor_reserve.drain(..) {
-        let layout =
-            Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>()).unwrap();
-        // SAFETY: reserve chunks never contain objects and have a single owner.
-        unsafe { dealloc(chunk.base, layout) };
+    while let Some(chunk) = state.survivor_reserve.pop() {
         state.tlab_reserved_bytes -= chunk.capacity;
         state.released_bytes = state.released_bytes.saturating_add(chunk.capacity as u64);
+        let budget = super::region_cache_budget(state);
+        // SAFETY: unused reserve chunks never contained published objects.
+        if let Some(chunk) = unsafe { state.region_cache.retain_survivor(chunk, budget) } {
+            let layout =
+                Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>()).unwrap();
+            unsafe { dealloc(chunk.base, layout) };
+        }
     }
     state.survivor_reserve_active = false;
     state.survivor_reserve_stats.available_bytes = 0;

@@ -1239,32 +1239,36 @@ fn allocation_should_collect_with_sync(sync: bool) -> bool {
         return false;
     }
     let mut state = runtime().heap.lock().unwrap();
+    allocation_policy_due(&mut state, sync, stress)
+}
+
+fn allocation_policy_due(state: &mut GcState, sync: bool, stress: bool) -> bool {
     if !stress && (state.concurrent_cycle.is_some() || state.sweeping.is_some()) {
         return false;
     }
     if sync {
-        sync_tlab_bytes(&mut state);
+        sync_tlab_bytes(state);
     }
-    let bytes = policy_allocated_total(&state);
+    let bytes = policy_allocated_total(state);
     if state.pacer.sample_due(bytes) {
         state
             .pacer
             .allocation(crate::gc_telemetry::timestamp_ns(), bytes);
-        pacer::sample_threshold(&mut state);
+        pacer::sample_threshold(state);
     }
-    let hard_pressure = hard_reservation_pressure(&mut state);
+    let hard_pressure = hard_reservation_pressure(state);
     state.soft_memory.sample_process();
-    let memory_input = memory_inputs(&state);
+    let memory_input = memory_inputs(state);
     let memory = state.soft_memory.decide(memory_input);
     // The pacer trigger lives in the major-policy domain even when a soft
     // limit makes the memory inputs count every young byte.
     let paced = state.pacer.enabled()
-        && major_policy_managed_bytes(&state).saturating_add(external_bytes()) as u64
+        && major_policy_managed_bytes(state).saturating_add(external_bytes()) as u64
             >= state.pacer_trigger
         && memory.reason != memory_control::Reason::Relief;
     let collect = stress || hard_pressure || paced || memory.collect;
     if !collect {
-        POLICY_HEADROOM.store(policy_headroom(&state), Ordering::Release);
+        POLICY_HEADROOM.store(policy_headroom(state), Ordering::Release);
     }
     collect
 }
@@ -1472,7 +1476,7 @@ fn tlab_alloc_slow(
     };
     let stress = gc_stress_enabled("alloc");
     let small = total_size <= GC_TLAB_MAX_OBJECT_SIZE;
-    let (fast_bytes, minor_due) = {
+    let (fast_bytes, minor_due, cached, major_due) = {
         let mut state = runtime().heap.lock().unwrap();
         register_tlab_state(&mut state, state_address);
         let record = state.tlab_states.get_mut(&state_address).unwrap();
@@ -1487,8 +1491,20 @@ fn tlab_alloc_slow(
         }
         // The refilling record is current; other owners publish at their own
         // refill, bounding unobserved nursery bytes by one chunk per TLAB.
-        (fast_bytes, minor_allocation_due(&state))
+        let cached = if small && !stress {
+            state.region_cache.take_survivor()
+        } else {
+            None
+        };
+        let minor_due = minor_allocation_due(&state);
+        let major_due = if !stress && !minor_due && !minor_stress_enabled() {
+            Some(allocation_policy_due(&mut state, false, false))
+        } else {
+            None
+        };
+        (fast_bytes, minor_due, cached, major_due)
     };
+    let cached_storage = cached.map(tlab::ChunkStorage::from_cached);
     sweep::assist();
     assist_concurrent_mark(fast_bytes.saturating_add(total_size as u64));
 
@@ -1511,7 +1527,7 @@ fn tlab_alloc_slow(
         }
     }
 
-    if stress || allocation_should_collect_with_sync(false) {
+    if stress || major_due.unwrap_or_else(|| allocation_should_collect_with_sync(false)) {
         automatic_collect(stress);
     }
 
@@ -1519,7 +1535,7 @@ fn tlab_alloc_slow(
         return allocate_old(layout_id, type_id as u32, payload_size, gc_ref_mask);
     }
 
-    let mut storage = tlab::ChunkStorage::allocate();
+    let mut storage = cached_storage.or_else(tlab::ChunkStorage::allocate);
     let mut state = runtime().heap.lock().unwrap();
     register_tlab_state(&mut state, state_address);
     let mut base = tlab::install_tlab_chunk(&mut state, state_address, &mut storage);

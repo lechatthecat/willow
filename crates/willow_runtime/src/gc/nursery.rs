@@ -2,7 +2,7 @@
 
 const FLOOR: usize = 256 * 1024;
 const CAP: usize = 64 * 1024 * 1024;
-/// Allocators beyond this count do not raise the floor: 4 MiB already spreads
+/// Allocators beyond this count do not raise the floor: 16 MiB already spreads
 /// a stop over enough allocation, and RSS must stay bounded on wide machines.
 const MAX_FLOOR_ALLOCATORS: usize = 16;
 
@@ -103,7 +103,12 @@ impl Policy {
         // Every thread that allocated pays the rendezvous and resume of each
         // stop whatever its survivors, so the floor is per measured allocator:
         // otherwise each of them gets only one TLAB chunk between stops.
-        let floor = FLOOR * allocators.clamp(1, MAX_FLOOR_ALLOCATORS);
+        let allocators = allocators.clamp(1, MAX_FLOOR_ALLOCATORS);
+        let floor = if allocators == 1 {
+            FLOOR
+        } else {
+            1024 * 1024 * allocators
+        };
         self.bound(target.max(floor), memory_limit)
     }
 }
@@ -413,4 +418,22 @@ fn scheduler_capacity_preserves_compact_nursery_and_overrides() {
         }
     }
     reset_internal();
+}
+
+#[test]
+fn nursery_parallel_floor_uses_measured_allocators_and_preserves_limits() {
+    let policy = Policy::default();
+    for count in [0, 1, 2, 4, 8, 16, 64, usize::MAX] {
+        let expected = if count <= 1 {
+            FLOOR
+        } else {
+            count.min(16) * 1024 * 1024
+        };
+        assert_eq!(policy.next(FLOOR, 1024, 0, count, None), expected);
+        assert_eq!(policy.next(FLOOR, 1024, 0, count, Some(1000)), 1000);
+        assert_eq!(
+            Policy { fixed: Some(1234) }.next(FLOOR, 1024, 0, count, None),
+            1234
+        );
+    }
 }

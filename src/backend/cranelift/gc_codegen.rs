@@ -1407,7 +1407,7 @@ mod tests {
         assert_eq!(GC_TLAB_STATE_SIZE, 24);
         assert_eq!(GC_TLAB_MAX_OBJECT_SIZE, 4096);
         assert_eq!(willow_abi::tlab::start_bits_offset(8), 16);
-        assert_eq!(willow_abi::tlab::CHUNK_SIZE, 32768);
+        assert_eq!(willow_abi::tlab::CHUNK_SIZE, 65536);
         assert_eq!(willow_abi::tlab::MARK_GRANULE_BYTES, 8);
     }
 

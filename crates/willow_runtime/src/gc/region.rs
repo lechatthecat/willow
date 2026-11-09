@@ -132,6 +132,8 @@ impl BumpChunk {
 }
 
 pub(super) struct TlabStateRecord {
+    /// Last minor epoch in which this owner installed a chunk, even if retired.
+    pub(super) last_allocation_minor: Option<u64>,
     pub(super) address: usize,
     pub(super) owner: ThreadId,
     pub(super) current_chunk: Option<usize>,

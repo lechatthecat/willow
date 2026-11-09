@@ -28,7 +28,7 @@
 //!   merging; it must not eagerly build per-object indexes under initial STW.
 use super::*;
 
-/// Carve size: four generated TLAB chunks (half an old region). Runtime-heavy
+/// Carve size: four generated TLAB chunks (256 KiB, one old region). Runtime-heavy
 /// pipelines refill while the sweeper holds the heap mutex region by region,
 /// so a quarter of the refill rate measurably cuts blocking (GC allocation fast paths
 /// audit); an idle buffer pins at most this much per thread until retirement.

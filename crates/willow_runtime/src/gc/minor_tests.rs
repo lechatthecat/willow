@@ -1930,3 +1930,151 @@ fn pending_address_owner_reclamation_clears_obligations_in_both_major_sweeps() {
     }
     reset_internal();
 }
+
+#[test]
+fn unused_survivor_reserve_reuses_storage_and_metadata_with_bounded_retention() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    let _stress = GcStressTestScope::normal();
+    for count in [1, 4, 16, 64] {
+        reset_internal();
+        let mut tls = tlab_state_for_test();
+        fill_chunks(&mut tls, count, 8, |_| 0, 0);
+        let mut state = runtime().heap.lock().unwrap();
+        retire_all_tlabs_unindexed(&mut state);
+        STORAGE_ATTEMPTS.set(0);
+        super::prepare_survivor_reserve(&mut state);
+        assert_eq!(STORAGE_ATTEMPTS.get(), count);
+        let mut original: Vec<_> = state
+            .survivor_reserve
+            .iter()
+            .map(|c| (c.base as usize, c.header_offsets.as_ptr() as usize))
+            .collect();
+        original.sort_unstable();
+        super::release_survivor_reserve(&mut state);
+        assert_eq!(
+            state.region_cache.retained_bytes(),
+            count * GC_TLAB_CHUNK_SIZE
+        );
+        STORAGE_ATTEMPTS.set(0);
+        for _ in 0..8 {
+            super::prepare_survivor_reserve(&mut state);
+            let mut reused: Vec<_> = state
+                .survivor_reserve
+                .iter()
+                .map(|c| (c.base as usize, c.header_offsets.as_ptr() as usize))
+                .collect();
+            reused.sort_unstable();
+            assert_eq!(reused, original);
+            assert_eq!(state.region_cache.retained_bytes(), 0);
+            super::release_survivor_reserve(&mut state);
+        }
+        assert_eq!(STORAGE_ATTEMPTS.get(), 0);
+        eprintln!("sources={count} cycles=8 warm_storage_allocations=0 metadata_reallocations=0");
+        state.region_cache.shrink_to(GC_TLAB_CHUNK_SIZE);
+        assert_eq!(state.region_cache.retained_bytes(), GC_TLAB_CHUNK_SIZE);
+        for _ in 0..super::super::region_cache::GC_REGION_CACHE_IDLE_SWEEPS {
+            drop(state.region_cache.begin_sweep());
+            assert_eq!(state.region_cache.retained_bytes(), GC_TLAB_CHUNK_SIZE);
+        }
+        drop(state.region_cache.begin_sweep());
+        assert_eq!(state.region_cache.retained_bytes(), 0);
+        drop(state);
+        reset_internal();
+    }
+}
+
+#[test]
+fn empty_chunk_cache_preserves_epoch_readers_and_zeroes_reused_payloads() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    let _stress = GcStressTestScope::normal();
+    reset_internal();
+    let mut state = runtime().heap.lock().unwrap();
+    assert!(super::admit_survivor_chunk(&mut state));
+    let starts = state.survivor_reserve[0].mark_bitmap.bits.clone();
+    starts.set(0);
+    super::release_survivor_reserve(&mut state);
+    assert_eq!(state.region_cache.retained_bytes(), 0);
+    assert!(
+        starts.contains(0),
+        "cache rejection must not clear epoch-visible bits"
+    );
+    drop(starts);
+    assert!(super::admit_survivor_chunk(&mut state));
+    let marks = state.survivor_reserve[0].concurrent_marks.clone();
+    marks.set(0);
+    super::release_survivor_reserve(&mut state);
+    assert_eq!(state.region_cache.retained_bytes(), 0);
+    assert!(marks.contains(0));
+    drop(marks);
+    assert!(super::admit_survivor_chunk(&mut state));
+    let base = state.survivor_reserve[0].base;
+    unsafe { base.write_bytes(0xa5, GC_TLAB_CHUNK_SIZE) };
+    super::release_survivor_reserve(&mut state);
+    let chunk = state.region_cache.take_survivor().unwrap();
+    assert_eq!(chunk.base, base);
+    drop(state);
+    let storage = tlab::ChunkStorage::from_cached(chunk);
+    assert!(
+        unsafe { std::slice::from_raw_parts(base, GC_TLAB_CHUNK_SIZE) }
+            .iter()
+            .all(|b| *b == 0)
+    );
+    drop(storage);
+    reset_internal();
+}
+
+#[test]
+fn nursery_allocator_evidence_survives_refill_retirement_and_expires_after_minor() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    let _stress = GcStressTestScope::normal();
+    reset_internal();
+    let mut owners: Vec<_> = (0..8).map(|_| Box::new(tlab_state_for_test())).collect();
+    let mut state = runtime().heap.lock().unwrap();
+    for owner in &mut owners {
+        let address = &mut **owner as *mut GcTlabState as usize;
+        register_tlab_state(&mut state, address);
+        allocate_tlab_chunk(&mut state, address).unwrap();
+        // No object was installed: a zero cursor retires an empty extent.
+        retire_tlab_locked(&mut state, address);
+    }
+    retire_all_tlabs_unindexed(&mut state);
+    assert_eq!(state.young_allocators, 8);
+    state.young_allocators = 0;
+    state.minor_collections += 1;
+    retire_all_tlabs_unindexed(&mut state);
+    assert_eq!(state.young_allocators, 0);
+    drop(state);
+    reset_internal();
+}
+
+#[test]
+fn cached_empty_chunks_yield_to_hard_and_soft_memory_limits() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    let _stress = GcStressTestScope::normal();
+    reset_internal();
+    let mut state = runtime().heap.lock().unwrap();
+    for _ in 0..4 {
+        assert!(super::admit_survivor_chunk(&mut state));
+    }
+    super::release_survivor_reserve(&mut state);
+    assert_eq!(state.region_cache.retained_bytes(), 4 * GC_TLAB_CHUNK_SIZE);
+    state.memory_limit_bytes = Some(GC_TLAB_CHUNK_SIZE);
+    assert!(can_reserve(&mut state, GC_TLAB_CHUNK_SIZE));
+    assert_eq!(state.region_cache.retained_bytes(), 0);
+    assert!(super::admit_survivor_chunk(&mut state));
+    super::release_survivor_reserve(&mut state);
+    assert_eq!(state.region_cache.retained_bytes(), GC_TLAB_CHUNK_SIZE);
+    state.memory_limit_bytes = None;
+    state.soft_memory.set_limit(1);
+    evict_region_cache_for(&mut state, 0);
+    assert_eq!(state.region_cache.retained_bytes(), 0);
+    assert!(super::admit_survivor_chunk(&mut state));
+    super::release_survivor_reserve(&mut state);
+    assert_eq!(state.region_cache.retained_bytes(), 0);
+    drop(state);
+    reset_internal();
+}

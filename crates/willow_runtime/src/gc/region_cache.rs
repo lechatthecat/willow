@@ -1,4 +1,4 @@
-//! Retained storage of released old regions.
+//! Bounded reusable old-region and empty nursery/survivor storage.
 //!
 //! Releasing an empty region through `dealloc` lets the system allocator trim
 //! it back to the OS, so the next region of the same size refaults every page.
@@ -30,6 +30,8 @@ pub(super) const GC_REGION_CACHE_IDLE_SWEEPS: u64 = 4;
 pub(super) struct RegionStorageCache {
     /// Capacity -> (block, sweep generation when retained), oldest first.
     blocks: HashMap<usize, VecDeque<(*mut u8, u64)>>,
+    // Empty, unindexed chunks keep their bitmaps and offset capacity too.
+    survivors: VecDeque<(BumpChunk, u64)>,
     retained_bytes: usize,
     /// Sweeps started so far.
     generation: u64,
@@ -38,6 +40,48 @@ pub(super) struct RegionStorageCache {
 impl RegionStorageCache {
     pub(super) fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+
+    /// Transfer an empty chunk, including its exclusively owned metadata.
+    pub(super) fn take_survivor(&mut self) -> Option<BumpChunk> {
+        let (chunk, _) = self.survivors.pop_back()?;
+        self.retained_bytes -= chunk.capacity;
+        Some(chunk)
+    }
+
+    /// Retain only exclusive metadata: epoch readers must never observe cleared bits.
+    /// Cached payload storage shares the existing byte cap and eviction policy;
+    /// metadata is bounded per retained chunk.
+    ///
+    /// # Safety
+    /// Every object is dead or moved, the extent is unindexed, and no mutator
+    /// can access its storage. Ownership transfers to the cache on success.
+    pub(super) unsafe fn retain_survivor(
+        &mut self,
+        mut chunk: BumpChunk,
+        budget: usize,
+    ) -> Option<BumpChunk> {
+        if Arc::strong_count(&chunk.mark_bitmap.bits) != 1
+            || Arc::strong_count(&chunk.concurrent_marks) != 1
+            || self.retained_bytes.saturating_add(chunk.capacity)
+                > budget.min(GC_REGION_CACHE_MAX_BYTES)
+        {
+            return Some(chunk);
+        }
+        // Unused evacuation reserves already have empty maps. Only reclaimed
+        // source chunks need the fixed-size bitmap clearing pass.
+        if chunk.used != 0 {
+            chunk.mark_bitmap.clear();
+            chunk.concurrent_marks.clear();
+        }
+        chunk.used = 0;
+        chunk.owner_state = None;
+        chunk.kind = RegionKind::Survivor;
+        chunk.live_bytes = 0;
+        chunk.header_offsets.clear();
+        self.retained_bytes += chunk.capacity;
+        self.survivors.push_back((chunk, self.generation));
+        None
     }
 
     /// The most recently retained block of exactly `capacity` bytes. Its
@@ -93,6 +137,15 @@ impl RegionStorageCache {
             }
             !bucket.is_empty()
         });
+        while self
+            .survivors
+            .front()
+            .is_some_and(|(_, age)| generation - age > GC_REGION_CACHE_IDLE_SWEEPS)
+        {
+            let (chunk, _) = self.survivors.pop_front().unwrap();
+            self.retained_bytes -= chunk.capacity;
+            stale.push((chunk.base, chunk.capacity));
+        }
         StaleStorage(stale)
     }
 
@@ -102,6 +155,14 @@ impl RegionStorageCache {
     pub(super) fn shrink_to(&mut self, keep: usize) {
         if self.retained_bytes <= keep {
             return;
+        }
+        while self.retained_bytes > keep {
+            let Some((chunk, _)) = self.survivors.pop_front() else {
+                break;
+            };
+            self.retained_bytes -= chunk.capacity;
+            // SAFETY: cached chunks are unindexed and owned exclusively here.
+            unsafe { free_region_storage(chunk.base, chunk.capacity) };
         }
         let retained = &mut self.retained_bytes;
         self.blocks.retain(|&capacity, bucket| {

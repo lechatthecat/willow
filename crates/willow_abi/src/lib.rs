@@ -438,7 +438,7 @@ pub mod tlab {
     pub const LIMIT_OFFSET: u32 = limit_offset(8);
     pub const STATE_SIZE: u32 = state_size(8);
     pub const MAX_OBJECT_SIZE: u32 = 4 * 1024;
-    pub const CHUNK_SIZE: u32 = 32 * 1024;
+    pub const CHUNK_SIZE: u32 = 64 * 1024;
     pub const MARK_GRANULE_BYTES: u32 = 8;
 }
 

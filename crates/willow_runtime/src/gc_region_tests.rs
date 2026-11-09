@@ -920,7 +920,7 @@ fn pinned_region_05_one_survivor_retains_chunk_and_reports_sparse_liveness() {
     assert_eq!(
         willow_gc_old_region_reserved_bytes(),
         GC_TLAB_CHUNK_SIZE as i64,
-        "one live object pins the complete 32 KiB TLAB chunk"
+        "one live object pins the complete TLAB chunk"
     );
     assert_eq!(willow_gc_old_region_live_bytes(), object_size as i64);
     assert_eq!(

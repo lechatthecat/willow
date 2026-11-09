@@ -30,7 +30,7 @@ pub(super) fn fast_bytes_total(record: &TlabStateRecord) -> u64 {
 
 /// Fast-path objects this TLAB has allocated so far. The active chunk's start
 /// words hold one bit per published header, including the slow-path first
-/// object. O(chunk words), a constant 64 for the fixed chunk size.
+/// object. O(chunk words), a constant 128 for the fixed chunk size.
 fn fast_allocations_total(
     record: &TlabStateRecord,
     chunks: &[BumpChunk],
@@ -148,6 +148,7 @@ pub(super) fn register_tlab_state(state: &mut GcState, address: usize) {
             .or_default()
             .insert(address);
         TlabStateRecord {
+            last_allocation_minor: None,
             address,
             owner: std::thread::current().id(),
             current_chunk: None,
@@ -256,13 +257,13 @@ pub(super) fn retire_all_tlabs_unindexed_for_mark(state: &mut GcState) {
 }
 
 fn retire_all_tlab_cursors(state: &mut GcState) {
-    // Retirement empties every cursor, so a live chunk here means its owner
-    // allocated since the last retirement. Non-minor stops also retire; the
-    // maximum keeps their evidence until the next minor consumes it.
+    // An allocator may have sealed its exhausted chunk before joining this
+    // stop. Remember its minor epoch rather than counting only live cursors.
+    // Non-minor stops preserve the evidence until the next minor consumes it.
     let allocators = state
         .tlab_states
         .values()
-        .filter(|record| record.current_chunk.is_some())
+        .filter(|record| record.last_allocation_minor == Some(state.minor_collections))
         .count();
     state.young_allocators = state.young_allocators.max(allocators);
     let addresses: Vec<usize> = state.tlab_states.keys().copied().collect();
@@ -362,11 +363,12 @@ pub(super) fn retire_tlabs_for_thread(owner: ThreadId) {
 }
 
 /// Zeroed storage and start bitmaps for one TLAB chunk, prepared before the
-/// refill takes the heap lock. Zeroing 32 KiB and allocating both bitmaps
+/// refill takes the heap lock. Zeroing 64 KiB and allocating both bitmaps
 /// inside the critical section serialized every concurrent refill. Dropping an uninstalled
 /// value releases the storage.
 pub(super) struct ChunkStorage {
     block: StorageBlock,
+    header_offsets: Vec<u16>,
     mark_bitmap: RegionMarkBitmap,
     concurrent_marks: Arc<concurrent_bitmap::ConcurrentMarkBits>,
 }
@@ -395,6 +397,21 @@ impl Drop for StorageBlock {
 }
 
 impl ChunkStorage {
+    /// Reinitialize an empty cache-owned extent outside the heap lock. No old
+    /// payload byte may become visible through a new runtime container.
+    pub(super) fn from_cached(chunk: BumpChunk) -> Self {
+        debug_assert_eq!(chunk.used, 0);
+        debug_assert!(chunk.owner_state.is_none());
+        // SAFETY: the cache transferred exclusive ownership of this full extent.
+        unsafe { chunk.base.write_bytes(0, GC_TLAB_CHUNK_SIZE) };
+        Self {
+            block: StorageBlock(chunk.base),
+            header_offsets: chunk.header_offsets,
+            mark_bitmap: chunk.mark_bitmap,
+            concurrent_marks: chunk.concurrent_marks,
+        }
+    }
+
     /// `None` when the system allocator fails; no heap lock is needed.
     pub(super) fn allocate() -> Option<Self> {
         // SAFETY: the layout is nonzero and valid. Fresh zeroing makes every
@@ -402,6 +419,7 @@ impl ChunkStorage {
         let base = unsafe { allocate_region_storage(StorageBlock::layout()) };
         (!base.is_null()).then(|| Self {
             block: StorageBlock(base),
+            header_offsets: Vec::new(),
             mark_bitmap: RegionMarkBitmap::new(GC_TLAB_CHUNK_SIZE),
             concurrent_marks: Arc::new(concurrent_bitmap::ConcurrentMarkBits::new(
                 GC_TLAB_CHUNK_SIZE / GC_REGION_MARK_GRANULE,
@@ -427,6 +445,7 @@ pub(super) fn install_tlab_chunk(
     }
     let ChunkStorage {
         block,
+        header_offsets,
         mark_bitmap,
         concurrent_marks,
     } = storage.take().unwrap();
@@ -444,7 +463,7 @@ pub(super) fn install_tlab_chunk(
         live_bytes: 0,
         mark_bitmap,
         concurrent_marks,
-        header_offsets: Vec::new(),
+        header_offsets,
     });
     let chunk = state.tlab_chunks.last().unwrap();
     runtime().root_tlabs.insert(chunk);
@@ -457,10 +476,11 @@ pub(super) fn install_tlab_chunk(
     note_reservation_growth(state);
     state.tlab_refills = state.tlab_refills.saturating_add(1);
     super::minor::admit_refill_survivor(state);
-    state
+    let record = state
         .tlab_states
         .get_mut(&owner_state)
-        .expect("TLAB state is registered before refill")
-        .current_chunk = Some(base as usize);
+        .expect("TLAB state is registered before refill");
+    record.current_chunk = Some(base as usize);
+    record.last_allocation_minor = Some(state.minor_collections);
     Some(base)
 }
