@@ -168,9 +168,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
             segments.push(crate::interpolate::Segment::Literal(String::new()));
         }
         let name = self.builder.synthetic_name("format_result");
-        let local = self
-            .builder
-            .declare_local(name, Type::String, None, true, false);
+        let local = self.builder.declare_local(
+            name,
+            Type::String,
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.values.push(self.builder.local_expr(local, expr.span));
         let mut children = args[1..].iter();
         let mut actions = Vec::new();
@@ -208,9 +214,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
             && arguments_compatible(&self.builder.resolution, params, args)
         {
             let name = self.builder.synthetic_name("callable_snapshot");
-            let local = self
-                .builder
-                .declare_local(name, ty.clone(), None, true, false);
+            let local = self.builder.declare_local(
+                name,
+                ty.clone(),
+                None,
+                LocalOptions {
+                    synthetic: true,
+                    parameter: false,
+                },
+            );
             self.builder.push(SourceInst::Compute {
                 local,
                 value: LirRvalue::Use(LirOperand::Local(source)),
@@ -249,9 +261,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
             return None;
         };
         let name = self.builder.synthetic_name("array_shell");
-        let local = self
-            .builder
-            .declare_local(name, expr.ty.clone(), None, true, false);
+        let local = self.builder.declare_local(
+            name,
+            expr.ty.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.builder.push(SourceInst::Compute {
             local,
             value: LirRvalue::ArrayAlloc {
@@ -284,9 +302,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
         };
 
         let name = self.builder.synthetic_name("enum_shell");
-        let local = self
-            .builder
-            .declare_local(name, expr.ty.clone(), None, true, false);
+        let local = self.builder.declare_local(
+            name,
+            expr.ty.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.builder.push(SourceInst::Compute {
             local,
             value: LirRvalue::EnumAlloc {
@@ -317,9 +341,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
         };
 
         let name = self.builder.synthetic_name("object_shell");
-        let local = self
-            .builder
-            .declare_local(name, expr.ty.clone(), None, true, false);
+        let local = self.builder.declare_local(
+            name,
+            expr.ty.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.builder.push(SourceInst::Compute {
             local,
             value: LirRvalue::ObjectAlloc { class: *class },
@@ -358,9 +388,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
             return None;
         }
         let name = self.builder.synthetic_name("object_shell");
-        let local = self
-            .builder
-            .declare_local(name, expr.ty.clone(), None, true, false);
+        let local = self.builder.declare_local(
+            name,
+            expr.ty.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.builder.push(SourceInst::Compute {
             local,
             value: LirRvalue::ObjectAlloc { class: *class },
@@ -521,9 +557,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
         ) || (self.builder.is_async && expr_suspends_here(expr))
         {
             let name = self.builder.synthetic_name("expression");
-            let result = self
-                .builder
-                .declare_local(name, expr.ty.clone(), None, true, false);
+            let result = self.builder.declare_local(
+                name,
+                expr.ty.clone(),
+                None,
+                LocalOptions {
+                    synthetic: true,
+                    parameter: false,
+                },
+            );
             self.builder.lower_root_suspend(expr, Some(result))?;
             self.values.push(self.builder.local_expr(result, expr.span));
         } else if matches!(
@@ -552,9 +594,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
                 self.values.push(expr.clone());
             } else {
                 let name = self.builder.synthetic_name("expression_operand");
-                let local = self
-                    .builder
-                    .declare_local(name, expr.ty.clone(), None, true, false);
+                let local = self.builder.declare_local(
+                    name,
+                    expr.ty.clone(),
+                    None,
+                    LocalOptions {
+                        synthetic: true,
+                        parameter: false,
+                    },
+                );
                 self.builder.lower_value_into(local, expr);
                 self.values.push(self.builder.local_expr(local, expr.span));
             }
@@ -607,9 +655,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
             HirExprKind::FieldAccess { object, field } => {
                 let name = self.builder.synthetic_name("reference_object");
                 LirPlace::Field {
-                    object: self
-                        .builder
-                        .declare_local(name, object.ty.clone(), None, true, false),
+                    object: self.builder.declare_local(
+                        name,
+                        object.ty.clone(),
+                        None,
+                        LocalOptions {
+                            synthetic: true,
+                            parameter: false,
+                        },
+                    ),
                     object_ty: object.ty.clone(),
                     field: field.clone(),
                     ty: place.ty.clone(),
@@ -617,16 +671,28 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
             }
             HirExprKind::Index { .. } => {
                 let name = self.builder.synthetic_name("reference_owner");
-                let owner = self
-                    .builder
-                    .declare_local(name, Type::Void, None, true, false);
+                let owner = self.builder.declare_local(
+                    name,
+                    Type::Void,
+                    None,
+                    LocalOptions {
+                        synthetic: true,
+                        parameter: false,
+                    },
+                );
                 self.builder.locals[owner.0 as usize].storage_kind = LirStorageKind::GcOwner;
                 let name = self.builder.synthetic_name("reference_index");
                 LirPlace::ArrayElement {
                     owner,
-                    index: self
-                        .builder
-                        .declare_local(name, Type::I64, None, true, false),
+                    index: self.builder.declare_local(
+                        name,
+                        Type::I64,
+                        None,
+                        LocalOptions {
+                            synthetic: true,
+                            parameter: false,
+                        },
+                    ),
                     element: place.ty.clone(),
                 }
             }
@@ -791,9 +857,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
         span: Span,
     ) -> Option<()> {
         let name = self.builder.synthetic_name("format_literal");
-        let piece = self
-            .builder
-            .declare_local(name, Type::String, None, true, false);
+        let piece = self.builder.declare_local(
+            name,
+            Type::String,
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.builder.push(SourceInst::Compute {
             local: piece,
             value: LirRvalue::StringLiteral(text),
@@ -815,9 +887,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
         let child = self.values.pop().expect("format operand");
         let value = self.builder.flat_operand(&child);
         let name = self.builder.synthetic_name("format_piece");
-        let piece = self
-            .builder
-            .declare_local(name, Type::String, None, true, false);
+        let piece = self.builder.declare_local(
+            name,
+            Type::String,
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.builder.push(SourceInst::Compute {
             local: piece,
             value: LirRvalue::FormatScalar {
@@ -849,9 +927,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
             .map(|child| self.builder.flat_operand(child))
             .collect();
         let local_name = self.builder.synthetic_name("indirect_result");
-        let local = self
-            .builder
-            .declare_local(local_name, result.clone(), None, true, false);
+        let local = self.builder.declare_local(
+            local_name,
+            result.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.builder.push(SourceInst::Compute {
             local,
             value: LirRvalue::IndirectCall {
@@ -881,9 +965,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
         let receiver = self.values.pop().expect("method receiver");
         let receiver = self.builder.flat_operand(&receiver);
         let name = self.builder.synthetic_name("method_receiver");
-        let local = self
-            .builder
-            .declare_local(name, object.ty.clone(), None, true, false);
+        let local = self.builder.declare_local(
+            name,
+            object.ty.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.builder.push(SourceInst::Compute {
             local,
             value: LirRvalue::PrepareMethod {
@@ -945,9 +1035,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
             .collect();
         let arg_types = children.iter().map(|child| child.ty.clone()).collect();
         let name = self.builder.synthetic_name("method_result");
-        let local = self
-            .builder
-            .declare_local(name, expr.ty.clone(), None, true, false);
+        let local = self.builder.declare_local(
+            name,
+            expr.ty.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.builder.push(SourceInst::Compute {
             local,
             value: LirRvalue::MethodCall {
@@ -978,9 +1074,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
         let child = self.values.pop().expect("array element");
         let value = self.builder.flat_operand(&child);
         let name = self.builder.synthetic_name("array_store");
-        let local = self
-            .builder
-            .declare_local(name, Type::Void, None, true, false);
+        let local = self.builder.declare_local(
+            name,
+            Type::Void,
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.builder.push(SourceInst::Compute {
             local,
             value: LirRvalue::ArrayStore {
@@ -1005,9 +1107,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
         let child = self.values.pop().expect("field value");
         let value = self.builder.flat_operand(&child);
         let name = self.builder.synthetic_name("field_store");
-        let local = self
-            .builder
-            .declare_local(name, Type::Void, None, true, false);
+        let local = self.builder.declare_local(
+            name,
+            Type::Void,
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.builder.push(SourceInst::Compute {
             local,
             value: LirRvalue::FieldStore {
@@ -1087,9 +1195,15 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
             self.values.push(lowered);
         } else {
             let name = self.builder.synthetic_name("expression_operand");
-            let local = self
-                .builder
-                .declare_local(name, lowered.ty.clone(), None, true, false);
+            let local = self.builder.declare_local(
+                name,
+                lowered.ty.clone(),
+                None,
+                LocalOptions {
+                    synthetic: true,
+                    parameter: false,
+                },
+            );
             self.builder.lower_value_into(local, &lowered);
             self.values.push(self.builder.local_expr(local, expr.span));
         }

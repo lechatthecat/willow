@@ -1220,6 +1220,12 @@ impl LirScopeMark {
     }
 }
 
+/// Classification flags for a local declaration.
+struct LocalOptions {
+    synthetic: bool,
+    parameter: bool,
+}
+
 /// Block-graph builder: appends instructions to a current block and seals
 /// blocks with terminators as control flow branches and rejoins.
 struct Builder {
@@ -1549,8 +1555,10 @@ impl Builder {
                 param.name.clone(),
                 param.ty.clone(),
                 Some(param.span),
-                false,
-                true,
+                LocalOptions {
+                    synthetic: false,
+                    parameter: true,
+                },
             );
             if is_async && param.by_reference {
                 builder.locals.last_mut().unwrap().storage_kind = LirStorageKind::ReferenceCell;
@@ -1569,15 +1577,25 @@ impl Builder {
     fn new_lambda(params: &[HirParam], captures: &[HirCapture]) -> Self {
         let mut builder = Self::new(&[], false);
         for capture in captures {
-            builder.declare_local(capture.name.clone(), capture.ty.clone(), None, false, true);
+            builder.declare_local(
+                capture.name.clone(),
+                capture.ty.clone(),
+                None,
+                LocalOptions {
+                    synthetic: false,
+                    parameter: true,
+                },
+            );
         }
         for param in params {
             builder.declare_local(
                 param.name.clone(),
                 param.ty.clone(),
                 Some(param.span),
-                false,
-                true,
+                LocalOptions {
+                    synthetic: false,
+                    parameter: true,
+                },
             );
         }
         builder
@@ -1657,9 +1675,12 @@ impl Builder {
         name: String,
         ty: Type,
         source_span: Option<Span>,
-        synthetic: bool,
-        parameter: bool,
+        options: LocalOptions,
     ) -> LirLocalId {
+        let LocalOptions {
+            synthetic,
+            parameter,
+        } = options;
         let id = LirLocalId(self.locals.len() as u32);
         self.locals.push(LirLocal {
             storage_kind: LirStorageKind::Value,
@@ -1686,7 +1707,15 @@ impl Builder {
         source_span: Option<Span>,
         synthetic: bool,
     ) -> LirLocalId {
-        let local = self.declare_local(name.clone(), ty.clone(), source_span, synthetic, false);
+        let local = self.declare_local(
+            name.clone(),
+            ty.clone(),
+            source_span,
+            LocalOptions {
+                synthetic,
+                parameter: false,
+            },
+        );
         self.push_existing_let(local, name, mutable, ty, value, source_span);
         local
     }
@@ -1712,7 +1741,15 @@ impl Builder {
 
     fn push_synth_let(&mut self, name: &str, mutable: bool, value: HirExpr) -> LirLocalId {
         if expression_needs_cfg(&value) || (self.is_async && suspends_anywhere(&value)) {
-            let local = self.declare_local(name.to_string(), value.ty.clone(), None, true, false);
+            let local = self.declare_local(
+                name.to_string(),
+                value.ty.clone(),
+                None,
+                LocalOptions {
+                    synthetic: true,
+                    parameter: false,
+                },
+            );
             self.lower_value_into(local, &value);
             return local;
         }
@@ -1960,8 +1997,15 @@ impl Builder {
             self.scope_roots.len(),
         ));
         let scrutinee_name = self.synthetic_name("match_scrutinee");
-        let scrutinee_local =
-            self.declare_local(scrutinee_name, scrutinee.ty.clone(), None, true, false);
+        let scrutinee_local = self.declare_local(
+            scrutinee_name,
+            scrutinee.ty.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.scope_roots.push(scrutinee_local);
         self.lower_value_into(scrutinee_local, scrutinee);
 
@@ -1981,7 +2025,15 @@ impl Builder {
                 self.terminate(SourceTerminator::Jump(arm_block));
             } else {
                 let test_name = self.synthetic_name("match_test");
-                let test = self.declare_local(test_name, Type::Bool, None, true, false);
+                let test = self.declare_local(
+                    test_name,
+                    Type::Bool,
+                    None,
+                    LocalOptions {
+                        synthetic: true,
+                        parameter: false,
+                    },
+                );
                 self.push(SourceInst::MatchTest {
                     scrutinee: scrutinee_local,
                     pattern: arm.pattern.clone(),
@@ -2017,7 +2069,15 @@ impl Builder {
                     } else {
                         name
                     };
-                    self.declare_local(name, ty, Some(arm.span), false, false)
+                    self.declare_local(
+                        name,
+                        ty,
+                        Some(arm.span),
+                        LocalOptions {
+                            synthetic: false,
+                            parameter: false,
+                        },
+                    )
                 })
                 .collect();
             if !bindings.is_empty() {
@@ -2068,7 +2128,15 @@ impl Builder {
 
     fn push_compute(&mut self, value: LirRvalue, ty: Type, span: Span, label: &str) -> LirLocalId {
         let name = self.synthetic_name(label);
-        let local = self.declare_local(name, ty, None, true, false);
+        let local = self.declare_local(
+            name,
+            ty,
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.push(SourceInst::Compute { local, value, span });
         local
     }
@@ -2094,7 +2162,15 @@ impl Builder {
             .then(|| returning.args.get(1).cloned())
             .flatten();
         let name = self.synthetic_name("try_operand");
-        let operand = self.declare_local(name, inner.ty.clone(), None, true, false);
+        let operand = self.declare_local(
+            name,
+            inner.ty.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.lower_value_into(operand, inner);
         let receiver = LirOperand::Local(operand);
         let condition = self.push_compute(
@@ -2266,7 +2342,15 @@ impl Builder {
     /// whole.
     fn lower_suspending_operand(&mut self, operand: &HirExpr) -> Option<HirExpr> {
         let name = self.synthetic_name("operand");
-        let local = self.declare_local(name.clone(), operand.ty.clone(), None, true, false);
+        let local = self.declare_local(
+            name.clone(),
+            operand.ty.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         if self.lower_root_suspend(operand, Some(local)).is_none() {
             let value = self.lower_nested_suspend(operand)?;
             self.push_existing_let(local, name, false, operand.ty.clone(), value, None);
@@ -2320,7 +2404,15 @@ impl Builder {
                         | HirExprKind::FnRef(_)
                 ) {
                 let name = self.synthetic_name("operand");
-                let local = self.declare_local(name, operand.ty.clone(), None, true, false);
+                let local = self.declare_local(
+                    name,
+                    operand.ty.clone(),
+                    None,
+                    LocalOptions {
+                        synthetic: true,
+                        parameter: false,
+                    },
+                );
                 self.lower_value_into(local, operand);
                 self.local_expr(local, operand.span)
             } else {
@@ -2369,7 +2461,15 @@ impl Builder {
             }
             _ => {
                 let name = self.synthetic_name("operand");
-                let local = self.declare_local(name, value.ty.clone(), None, true, false);
+                let local = self.declare_local(
+                    name,
+                    value.ty.clone(),
+                    None,
+                    LocalOptions {
+                        synthetic: true,
+                        parameter: false,
+                    },
+                );
                 self.lower_value_into(local, value);
                 LirOperand::Local(local)
             }
@@ -2413,7 +2513,15 @@ impl Builder {
                 }
             }
             let name = self.synthetic_name("result");
-            let result = self.declare_local(name, target.ty.clone(), None, true, false);
+            let result = self.declare_local(
+                name,
+                target.ty.clone(),
+                None,
+                LocalOptions {
+                    synthetic: true,
+                    parameter: false,
+                },
+            );
             self.lower_root_suspend(&target, Some(result))?;
             let replacement = self.local_expr(result, target.span);
             lowered = replace_suspension(&lowered, target.span, &replacement);
@@ -2531,7 +2639,15 @@ impl Builder {
     ) -> Option<HirExpr> {
         let condition = self.lower_condition(condition);
         let result_name = self.synthetic_name("conditional");
-        let result = self.declare_local(result_name, whole.ty.clone(), None, true, false);
+        let result = self.declare_local(
+            result_name,
+            whole.ty.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         let then_block = self.new_block();
         let else_block = self.new_block();
         let merge = self.new_block();
@@ -2570,7 +2686,15 @@ impl Builder {
 
     fn lower_condition(&mut self, condition: &HirExpr) -> HirExpr {
         let name = self.synthetic_name("condition");
-        let local = self.declare_local(name, Type::Bool, None, true, false);
+        let local = self.declare_local(
+            name,
+            Type::Bool,
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         match self.lower_root_suspend(condition, Some(local)) {
             Some(Some(value)) => value,
             _ => self
@@ -2595,7 +2719,15 @@ impl Builder {
             HirExprKind::FieldAccess { object, field } => {
                 let name = self.synthetic_name("reference_object");
                 LirPlace::Field {
-                    object: self.declare_local(name, object.ty.clone(), None, true, false),
+                    object: self.declare_local(
+                        name,
+                        object.ty.clone(),
+                        None,
+                        LocalOptions {
+                            synthetic: true,
+                            parameter: false,
+                        },
+                    ),
                     object_ty: object.ty.clone(),
                     field: field.clone(),
                     ty: place.ty.clone(),
@@ -2603,12 +2735,28 @@ impl Builder {
             }
             HirExprKind::Index { .. } => {
                 let name = self.synthetic_name("reference_owner");
-                let owner = self.declare_local(name, Type::Void, None, true, false);
+                let owner = self.declare_local(
+                    name,
+                    Type::Void,
+                    None,
+                    LocalOptions {
+                        synthetic: true,
+                        parameter: false,
+                    },
+                );
                 self.locals[owner.0 as usize].storage_kind = LirStorageKind::GcOwner;
                 let name = self.synthetic_name("reference_index");
                 LirPlace::ArrayElement {
                     owner,
-                    index: self.declare_local(name, Type::I64, None, true, false),
+                    index: self.declare_local(
+                        name,
+                        Type::I64,
+                        None,
+                        LocalOptions {
+                            synthetic: true,
+                            parameter: false,
+                        },
+                    ),
                     element: place.ty.clone(),
                 }
             }
@@ -2698,7 +2846,15 @@ impl Builder {
         }
         let name = self.synthetic_name("base_receiver");
         let base_ty = Type::Named(base);
-        let base_local = self.declare_local(name, base_ty.clone(), None, true, false);
+        let base_local = self.declare_local(
+            name,
+            base_ty.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.push(SourceInst::Compute {
             local: base_local,
             value: LirRvalue::Coerce {
@@ -2736,7 +2892,15 @@ impl Builder {
             let name = self.synthetic_name("base_argument");
             let source = self.push_synth_let(&name, false, value);
             let name = self.synthetic_name("base_coerced");
-            let coerced = self.declare_local(name, target.clone(), None, true, false);
+            let coerced = self.declare_local(
+                name,
+                target.clone(),
+                None,
+                LocalOptions {
+                    synthetic: true,
+                    parameter: false,
+                },
+            );
             self.push(SourceInst::Compute {
                 local: coerced,
                 value: LirRvalue::Coerce {
@@ -2750,7 +2914,15 @@ impl Builder {
                 operands.push(LirOperand::Local(coerced));
             } else {
                 let name = self.synthetic_name("base_store");
-                let local = self.declare_local(name, Type::Void, None, true, false);
+                let local = self.declare_local(
+                    name,
+                    Type::Void,
+                    None,
+                    LocalOptions {
+                        synthetic: true,
+                        parameter: false,
+                    },
+                );
                 self.push(SourceInst::Compute {
                     local,
                     value: LirRvalue::FieldStore {
@@ -2765,7 +2937,15 @@ impl Builder {
         }
         if explicit {
             let name = self.synthetic_name("base_init");
-            let local = self.declare_local(name, Type::Void, None, true, false);
+            let local = self.declare_local(
+                name,
+                Type::Void,
+                None,
+                LocalOptions {
+                    synthetic: true,
+                    parameter: false,
+                },
+            );
             self.push(SourceInst::Compute {
                 local,
                 value: LirRvalue::ConstructorCall {
@@ -2806,8 +2986,10 @@ impl Builder {
                             binding.clone(),
                             binding_ty,
                             Some(case.span),
-                            false,
-                            false,
+                            LocalOptions {
+                                synthetic: false,
+                                parameter: false,
+                            },
                         )
                     });
                     LirSelectOp::Recv {
@@ -2829,7 +3011,15 @@ impl Builder {
                         value_local
                     } else {
                         let name = self.synthetic_name("select_stored_value");
-                        let stored = self.declare_local(name, elem_ty.clone(), None, true, false);
+                        let stored = self.declare_local(
+                            name,
+                            elem_ty.clone(),
+                            None,
+                            LocalOptions {
+                                synthetic: true,
+                                parameter: false,
+                            },
+                        );
                         self.push(SourceInst::Compute {
                             local: stored,
                             value: LirRvalue::Coerce {
@@ -2851,7 +3041,15 @@ impl Builder {
                     let millis_name = self.synthetic_name("select_millis");
                     let millis_local = self.push_synth_let(&millis_name, false, millis.clone());
                     let deadline_name = self.synthetic_name("select_deadline");
-                    let deadline = self.declare_local(deadline_name, Type::I64, None, true, false);
+                    let deadline = self.declare_local(
+                        deadline_name,
+                        Type::I64,
+                        None,
+                        LocalOptions {
+                            synthetic: true,
+                            parameter: false,
+                        },
+                    );
                     LirSelectOp::Timeout {
                         millis: millis_local,
                         deadline,
@@ -2873,8 +3071,10 @@ impl Builder {
                             binding.clone(),
                             binding_ty,
                             Some(case.span),
-                            false,
-                            false,
+                            LocalOptions {
+                                synthetic: false,
+                                parameter: false,
+                            },
                         )
                     });
                     LirSelectOp::Join {
@@ -2912,12 +3112,28 @@ impl Builder {
             .map(|operation| {
                 (!matches!(operation, LirSelectOp::Default)).then(|| {
                     let name = self.synthetic_name("select_ready");
-                    self.declare_local(name, Type::Bool, None, true, false)
+                    self.declare_local(
+                        name,
+                        Type::Bool,
+                        None,
+                        LocalOptions {
+                            synthetic: true,
+                            parameter: false,
+                        },
+                    )
                 })
             })
             .collect();
         let chosen_name = self.synthetic_name("select_chosen");
-        let chosen = self.declare_local(chosen_name, Type::I64, None, true, false);
+        let chosen = self.declare_local(
+            chosen_name,
+            Type::I64,
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         self.push(SourceInst::SelectProbe {
             operations: operations.clone(),
             ready: ready.clone(),
@@ -2957,7 +3173,15 @@ impl Builder {
             });
         } else {
             let name = self.synthetic_name("select_idle");
-            let local = self.declare_local(name, Type::Void, None, true, false);
+            let local = self.declare_local(
+                name,
+                Type::Void,
+                None,
+                LocalOptions {
+                    synthetic: true,
+                    parameter: false,
+                },
+            );
             let deadlines = operations
                 .iter()
                 .filter_map(|operation| match operation {
@@ -3022,7 +3246,15 @@ impl Builder {
         for (index, case) in cases.iter().enumerate() {
             self.switch_to(case_blocks[index]);
             let success_name = self.synthetic_name("select_success");
-            let success = self.declare_local(success_name, Type::Bool, None, true, false);
+            let success = self.declare_local(
+                success_name,
+                Type::Bool,
+                None,
+                LocalOptions {
+                    synthetic: true,
+                    parameter: false,
+                },
+            );
             self.push(SourceInst::SelectCommit {
                 operation: operations[index].clone(),
                 success,
@@ -3362,7 +3594,15 @@ impl Builder {
                 value,
                 span,
             } => {
-                let local = self.declare_local(name.clone(), ty.clone(), Some(*span), false, false);
+                let local = self.declare_local(
+                    name.clone(),
+                    ty.clone(),
+                    Some(*span),
+                    LocalOptions {
+                        synthetic: false,
+                        parameter: false,
+                    },
+                );
                 if self.lower_root_suspend(value, Some(local)).is_none() {
                     let value = self
                         .lower_nested_suspend(value)
@@ -3392,7 +3632,15 @@ impl Builder {
                          a binding form is missing from lowering",
                         span.line,
                     );
-                    self.declare_local(name.clone(), value.ty.clone(), Some(*span), false, false)
+                    self.declare_local(
+                        name.clone(),
+                        value.ty.clone(),
+                        Some(*span),
+                        LocalOptions {
+                            synthetic: false,
+                            parameter: false,
+                        },
+                    )
                 });
                 if self.lower_root_suspend(value, Some(local)).is_none() {
                     let value = self
@@ -3485,7 +3733,15 @@ impl Builder {
                                 None
                             } else {
                                 let name = self.synthetic_name("return");
-                                Some(self.declare_local(name, value.ty.clone(), None, true, false))
+                                Some(self.declare_local(
+                                    name,
+                                    value.ty.clone(),
+                                    None,
+                                    LocalOptions {
+                                        synthetic: true,
+                                        parameter: false,
+                                    },
+                                ))
                             };
                             match self.lower_root_suspend(value, destination) {
                                 Some(Some(value)) => Some(value),
@@ -3522,8 +3778,10 @@ impl Builder {
                                 name.clone(),
                                 value.ty.clone(),
                                 None,
-                                true,
-                                false,
+                                LocalOptions {
+                                    synthetic: true,
+                                    parameter: false,
+                                },
                             );
                             if self.lower_root_suspend(value, Some(destination)).is_none() {
                                 let evaluated = self
@@ -3732,12 +3990,22 @@ impl Builder {
             binding.to_string(),
             value_ty.clone(),
             Some(span),
-            false,
-            false,
+            LocalOptions {
+                synthetic: false,
+                parameter: false,
+            },
         );
 
         let handle_name = self.synthetic_name("lock_handle");
-        let handle = self.declare_local(handle_name.clone(), target.ty.clone(), None, true, false);
+        let handle = self.declare_local(
+            handle_name.clone(),
+            target.ty.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         if self.lower_root_suspend(target, Some(handle)).is_none() {
             let evaluated = self
                 .lower_nested_suspend(target)
@@ -3752,9 +4020,25 @@ impl Builder {
             );
         }
         let token_name = self.synthetic_name("lock_token");
-        let token = self.declare_local(token_name, Type::I64, None, true, false);
+        let token = self.declare_local(
+            token_name,
+            Type::I64,
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
         let phase_name = self.synthetic_name("lock_phase");
-        let phase = self.declare_local(phase_name, Type::I64, None, true, false);
+        let phase = self.declare_local(
+            phase_name,
+            Type::I64,
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
 
         LirLockSlots {
             members: Vec::new(),
@@ -3795,7 +4079,15 @@ impl Builder {
             }
             let mut local = |suffix: &str| {
                 let name = self.synthetic_name(suffix);
-                self.declare_local(name, Type::I64, None, true, false)
+                self.declare_local(
+                    name,
+                    Type::I64,
+                    None,
+                    LocalOptions {
+                        synthetic: true,
+                        parameter: false,
+                    },
+                )
             };
             LirLockSlots {
                 members,
@@ -6225,8 +6517,10 @@ impl Builder {
                 "$contract_result".into(),
                 f.return_type.clone(),
                 None,
-                true,
-                false,
+                LocalOptions {
+                    synthetic: true,
+                    parameter: false,
+                },
             )
         });
         let exit = self.new_block();
