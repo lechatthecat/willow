@@ -269,9 +269,11 @@ impl Checker<'_> {
                             stmt,
                             root,
                             &mut statement,
-                            callable,
-                            loops,
-                            block_span,
+                            ScopePosition {
+                                callable,
+                                loops,
+                                block: block_span,
+                            },
                         );
                     }
                     if let Some(Expr::Await(wait)) = root {
@@ -477,6 +479,12 @@ impl LoanSet {
     }
 }
 
+struct ScopePosition {
+    callable: usize,
+    loops: usize,
+    block: Span,
+}
+
 impl<'a> WalkState<'a> {
     fn scope_named(&self, name: &str) -> Option<usize> {
         let binding = self.names.get(name)?.last()?.0;
@@ -539,17 +547,19 @@ impl<'a> WalkState<'a> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn prepare_scope(
         &mut self,
         checker: &mut Checker<'_>,
         stmt: &'a Stmt,
         root: Option<&'a Expr>,
         statement: &mut StatementState<'a>,
-        callable: usize,
-        loops: usize,
-        block: Span,
+        position: ScopePosition,
     ) {
+        let ScopePosition {
+            callable,
+            loops,
+            block,
+        } = position;
         let binding = match stmt {
             Stmt::Let(s) => Some(s.name.as_str()),
             _ => None,

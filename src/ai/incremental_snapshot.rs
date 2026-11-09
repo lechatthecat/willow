@@ -743,11 +743,14 @@ fn imports(program: &Program) -> String {
     .expect("unit imports")
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct CaptureOrigin<'a> {
+    pub unit: UnitId,
+    pub bodies: Option<&'a BodyQueries>,
+    pub queries: &'a EffectQueries,
+}
+
 pub(crate) fn capture_incremental(
-    unit: UnitId,
-    bodies: Option<&BodyQueries>,
-    queries: &EffectQueries,
+    origin: CaptureOrigin<'_>,
     program: &Program,
     graph: &CallGraph,
     inputs: CaptureInputs<'_>,
@@ -755,6 +758,11 @@ pub(crate) fn capture_incremental(
     symbols: &crate::semantic::symbols::SymbolTable,
     index: Option<&crate::compiler_db::ids::BodyIndex>,
 ) -> CapturedUnit {
+    let CaptureOrigin {
+        unit,
+        bodies,
+        queries,
+    } = origin;
     let plan = PLAN.with(|slot| slot.borrow().clone());
     let Some(plan) = plan else {
         return capture(program, graph, inputs, facts, symbols, index);

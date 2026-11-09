@@ -330,8 +330,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let result = if matches!(receiver_ty, Type::Named(name) | Type::Generic(name, _) if self.classes.is_interface(name))
                 {
                     self.emit_flat_interface_call(
-                        receiver,
-                        receiver_ty,
+                        (receiver, receiver_ty),
                         method,
                         &args,
                         span,
@@ -342,11 +341,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_flat_class_method(
                         receiver,
                         receiver_ty,
-                        *super_class,
-                        method,
-                        &args,
-                        result,
-                        span,
+                        super::super::flat_calls::FlatClassCall {
+                            super_class: *super_class,
+                            method,
+                            args: &args,
+                            ret_ty: result,
+                            span,
+                        },
                         receiver_rooted,
                         true,
                     )
@@ -449,8 +450,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     &class.to_string(),
                     variant,
                     *index,
-                    value,
-                    source,
+                    (value, source),
                     enum_ty,
                 )
             }
@@ -563,8 +563,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .collect();
                 self.emit_flat_intrinsic(
                     *intrinsic,
-                    receiver,
-                    receiver_ty,
+                    (receiver, receiver_ty),
                     &args,
                     arg_types,
                     result,
@@ -747,7 +746,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let name = name.to_string();
                 if !closure {
                     return self.emit_promoted_fn_call(
-                        signature, target, &values, params, result, &name, span,
+                        signature,
+                        target,
+                        &values,
+                        (params, result),
+                        &name,
+                        span,
                     );
                 }
                 // A closure whose body cannot raise tags its code word
@@ -1423,15 +1427,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// next payload is evaluated. The returned representation is written back
     /// to the enum local (necessary for nullable Option::Some).
     // Keep explicit emission operands aligned with the LIR/runtime ABI.
-    #[allow(clippy::too_many_arguments)]
     fn emit_flat_enum_payload_store(
         &mut self,
         object: cranelift_codegen::ir::Value,
         class: &str,
         variant: &str,
         index: usize,
-        value: cranelift_codegen::ir::Value,
-        source_ty: &Type,
+        (value, source_ty): (cranelift_codegen::ir::Value, &Type),
         enum_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         if is_scalar_pair(enum_ty) {

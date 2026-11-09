@@ -2128,17 +2128,16 @@ impl TypeChecker {
         m.return_type.clone()
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve_static_call(
         &mut self,
         class_name: &str,
         type_args: &[Type],
         method_name: &str,
         args: &[CallArg],
-        span: Span,
-        method_span: Span,
+        spans: (Span, Span),
         expected: Option<&Type>,
     ) -> Type {
+        let (span, method_span) = spans;
         let references = self.analysis_symbols.references.len();
         let errors = self.error_generation;
         let result = self.resolve_static_call_inner(&StaticCall {

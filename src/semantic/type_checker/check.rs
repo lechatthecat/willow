@@ -1184,9 +1184,11 @@ impl TypeChecker {
             captured.insert(
                 *unit,
                 crate::ai::capture_incremental(
-                    *unit,
-                    self.body_queries.as_deref(),
-                    queries,
+                    crate::ai::incremental_snapshot::CaptureOrigin {
+                        unit: *unit,
+                        bodies: self.body_queries.as_deref(),
+                        queries,
+                    },
                     program,
                     &graph,
                     crate::ai::CaptureInputs {
@@ -2528,8 +2530,7 @@ impl TypeChecker {
                 &[],
                 &s.method,
                 &s.args,
-                s.span,
-                s.method_span,
+                (s.span, s.method_span),
                 expected,
             );
             if let Some((id, _)) = checked_argument {
@@ -2561,8 +2562,7 @@ impl TypeChecker {
             &s.type_args,
             &s.method,
             &s.args,
-            s.span,
-            s.method_span,
+            (s.span, s.method_span),
             expected,
         );
         if let Some(callee) = callee {
@@ -3315,8 +3315,7 @@ impl TypeChecker {
                         &[],
                         &c.callee,
                         &c.args,
-                        c.span,
-                        c.span,
+                        (c.span, c.span),
                         None,
                     );
                     self.enum_variant_resolutions.insert(c.id, name.to_string());

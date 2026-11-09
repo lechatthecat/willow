@@ -92,12 +92,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Operands are already evaluated, typed, and rooted by LIR. This emitter
     /// performs one resolved operation; it never walks executable syntax.
     // Keep explicit emission operands aligned with the LIR/runtime ABI.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn emit_flat_intrinsic(
         &mut self,
         intrinsic: Intrinsic,
-        receiver: cranelift_codegen::ir::Value,
-        receiver_ty: &Type,
+        (receiver, receiver_ty): (cranelift_codegen::ir::Value, &Type),
         args: &[cranelift_codegen::ir::Value],
         arg_types: &[Type],
         _result: &Type,
@@ -155,8 +153,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
         let value = self.emit_flat_intrinsic_inner(
             intrinsic,
-            receiver,
-            receiver_ty,
+            (receiver, receiver_ty),
             args,
             arg_types,
             &roots,
@@ -168,12 +165,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     // Keep explicit emission operands aligned with the LIR/runtime ABI.
-    #[allow(clippy::too_many_arguments)]
     fn emit_flat_intrinsic_inner(
         &mut self,
         intrinsic: Intrinsic,
-        receiver: cranelift_codegen::ir::Value,
-        receiver_ty: &Type,
+        (receiver, receiver_ty): (cranelift_codegen::ir::Value, &Type),
         args: &[cranelift_codegen::ir::Value],
         arg_types: &[Type],
         roots: &OperandRoots,

@@ -475,19 +475,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().jump(blocks[resume.0], &[]);
     }
 
-    // Keep explicit emission operands aligned with the LIR/runtime ABI.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn emit_lir_block(
         &mut self,
-        function: &LirFunction,
+        layout: LirBlockLayout<'_>,
         block: &LirBlock,
-        blocks: &[cranelift_codegen::ir::Block],
-        return_type: &Type,
         mut coop: Option<(&mut CoopSuspendPoints, cranelift_codegen::ir::Value)>,
         sync_poll: Option<(crate::backend::cranelift::emit_stmt::SyncPoll, bool)>,
         then_fallthrough: bool,
         defers: &mut LirBlockDeferCtx<'_>,
     ) {
+        let LirBlockLayout {
+            function,
+            blocks,
+            return_type,
+        } = layout;
         if let Some((poll, in_loop)) = sync_poll
             && (self.cleanup.lir_cleanup_exit.is_none() || block.id.0 != 0)
         {

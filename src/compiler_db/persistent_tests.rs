@@ -39,9 +39,8 @@ impl Fixture {
             &map,
             self.inputs(),
             &mut Diagnostics::default(),
-            None,
+            (None, old),
             Some(Rc::clone(&syntax)),
-            old,
         )
         .unwrap();
         (frontend, syntax)
@@ -352,9 +351,8 @@ fn semantic_verify_disk_named_and_generic_signatures_reuse_and_clean_parity() {
                     &map,
                     inputs,
                     &mut Diagnostics::default(),
-                    None,
+                    (None, old),
                     Some(Rc::clone(&syntax)),
-                    old,
                 )
                 .unwrap();
                 (frontend, syntax)

@@ -4,6 +4,15 @@ use super::*;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Value, types};
 use cranelift_module::Module;
 
+/// Resolved class dispatch metadata for one already-evaluated call.
+pub(super) struct FlatClassCall<'a> {
+    pub super_class: Option<crate::semantic::ids::TypeId>,
+    pub method: &'a str,
+    pub args: &'a [Value],
+    pub ret_ty: &'a Type,
+    pub span: crate::diagnostics::Span,
+}
+
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// Runs before argument evaluation. Its returned receiver is snapshotted in
     /// a rooted LIR local; the matching dispatch consumes the prepared frame.
@@ -54,20 +63,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         roots
     }
-    // Explicit receiver, ABI operands, and call-frame state are independent.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn emit_flat_class_method(
         &mut self,
         receiver: Value,
         receiver_ty: &Type,
-        super_class: Option<crate::semantic::ids::TypeId>,
-        method: &str,
-        args: &[Value],
-        ret_ty: &Type,
-        span: crate::diagnostics::Span,
+        call: FlatClassCall<'_>,
         receiver_rooted: bool,
         frame_prepared: bool,
     ) -> cranelift_codegen::ir::Value {
+        let FlatClassCall {
+            super_class,
+            method,
+            args,
+            ret_ty,
+            span,
+        } = call;
         let self_ptr = receiver;
         // `super.method()` names its implementation statically: a direct call
         // to what the base class resolves `method` to, never the vtable slot.
@@ -193,11 +203,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Root the concrete object directly across dispatch so a moving minor
     /// collection cannot invalidate the hidden receiver SSA value.
     // Explicit receiver, ABI operands, and call-frame state are independent.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn emit_flat_interface_call(
         &mut self,
-        receiver: Value,
-        receiver_ty: &Type,
+        (receiver, receiver_ty): (Value, &Type),
         method: &str,
         args: &[Value],
         span: crate::diagnostics::Span,

@@ -1245,7 +1245,17 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
     if let Some((index, queries)) = origins
         && let Some(unit) = queries.active_unit.get()
         && let Some(result) = solve_unit_delta(
-            program, graph, types, index, queries, unit, callables, direct, &external,
+            program,
+            graph,
+            types,
+            DeltaOrigin {
+                index,
+                queries,
+                unit,
+            },
+            callables,
+            direct,
+            &external,
         )
     {
         return result;
@@ -2138,18 +2148,26 @@ impl<'a> ColdUnitSolve<'a> {
 // A retained unit consumes changed typed owners directly. Structural declaration
 // invalidation still goes through the full producer so synthetic declarations and
 // copied defaults are never inferred from a stale source inventory.
-#[allow(clippy::too_many_arguments)]
+struct DeltaOrigin<'a> {
+    index: &'a super::ids::BodyIndex,
+    queries: &'a EffectQueries,
+    unit: UnitId,
+}
+
 fn solve_unit_delta<N: std::fmt::Display>(
     program: &Program,
     graph: &CallGraph,
     types: &HashMap<ExprId, Type<N>>,
-    index: &super::ids::BodyIndex,
-    queries: &EffectQueries,
-    unit: UnitId,
+    origin: DeltaOrigin<'_>,
     callables: &HashMap<FunctionId, bool>,
     direct: &HashMap<FunctionId, DirectLockEffects>,
     external: &impl Fn(&FunctionId) -> RuntimeEffects,
 ) -> Option<UnitEffects> {
+    let DeltaOrigin {
+        index,
+        queries,
+        unit,
+    } = origin;
     let tracking = queries.tracking.borrow().upgrade()?;
     let source_changes = tracking.borrow().effect_source_changes(unit)?;
     // Nominal declaration/dispatch changes rebuild the unit producer inventory.

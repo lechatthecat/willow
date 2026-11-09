@@ -264,9 +264,8 @@ impl<'a> CompilerSession<'a> {
         if build {
             run_backend(
                 frontend,
-                self.src,
+                (self.src, source),
                 self.out,
-                source,
                 &self.opts,
                 &map,
                 emitter,

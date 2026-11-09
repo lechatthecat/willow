@@ -265,9 +265,8 @@ pub(crate) fn run(
         map,
         inputs,
         emitter,
-        None,
+        (None, previous.as_ref()),
         Some(Rc::clone(&syntax)),
-        previous.as_ref(),
     )?;
     syntax.borrow_mut().finish()?;
     let frontend_us = frontend_start.elapsed().as_micros();

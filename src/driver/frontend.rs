@@ -143,24 +143,24 @@ pub(crate) fn run_frontend_revision(
         map,
         inputs,
         emitter,
-        previous,
+        (previous, None),
         syntax_queries,
-        None,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_frontend_revision_cached(
     source: &str,
     root: &std::path::Path,
     map: &diagnostics::SourceMap,
     inputs: compiler_db::inputs::CompilerInputs,
     emitter: &mut dyn diagnostics::DiagnosticEmitter,
-    previous: Option<&Frontend>,
+    (previous, disk): (
+        Option<&Frontend>,
+        Option<&compiler_db::persistent::DiskRevision>,
+    ),
     syntax_queries: Option<
         std::rc::Rc<std::cell::RefCell<compiler_db::incremental::SyntaxQueries>>,
     >,
-    disk: Option<&compiler_db::persistent::DiskRevision>,
 ) -> Result<Frontend> {
     let reuse = RevisionReuse { previous, disk };
     let mut artifacts = revision_artifacts(syntax_queries, reuse)?;

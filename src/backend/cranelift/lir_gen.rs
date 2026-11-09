@@ -84,6 +84,13 @@ mod intrinsic;
 mod rvalue;
 mod terminator;
 
+/// Immutable function layout shared by a block's emission.
+struct LirBlockLayout<'a> {
+    function: &'a LirFunction,
+    blocks: &'a [cranelift_codegen::ir::Block],
+    return_type: &'a Type,
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -792,10 +799,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 reuse.comparison = None;
             }
             self.emit_lir_block(
-                f,
+                LirBlockLayout {
+                    function: f,
+                    blocks: &blocks,
+                    return_type: &f.return_type,
+                },
                 block,
-                &blocks,
-                &f.return_type,
                 block_coop,
                 block_poll.map(|poll| (poll, loop_depths.all[i] > 0)),
                 super::block_layout::prefer_then_fallthrough(f, &loop_depths, i),

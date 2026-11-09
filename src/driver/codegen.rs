@@ -517,12 +517,10 @@ impl ForeignBatch {
 /// Back-end phases: drive Cranelift codegen over the modules and entry program,
 /// emit the object file, resolve the runtime library, link the native
 /// executable, and write debug/source-map artifacts.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn run_backend(
     frontend: Frontend,
-    src: &str,
+    (src, source): (&str, String),
     out: &str,
-    source: String,
     opts: &CompilerOptions,
     map: &diagnostics::SourceMap,
     emitter: &mut dyn diagnostics::DiagnosticEmitter,

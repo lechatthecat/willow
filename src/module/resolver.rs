@@ -149,7 +149,6 @@ pub(crate) fn resolve_imports_spooled(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_imports_spooled_entry(
     entry_program: &Program,
     src_root: &Path,
@@ -291,11 +290,9 @@ pub(crate) fn resolve_imports_in_graph(
         let item_count_before = item_imports.len();
         resolve_import(
             &import.path,
-            import.alias.as_deref(),
-            import.span,
-            src_root,
+            (import.alias.as_deref(), import.span),
             consumer,
-            routing.as_ref(),
+            (src_root, routing.as_ref()),
             &mut graph,
             &mut errors,
             Some(&mut item_imports),
@@ -365,8 +362,7 @@ pub(crate) fn resolve_imports_in_graph(
         resolve_one(
             &ModuleKey::new(consumer, name.clone()),
             path.clone(),
-            None,
-            crate::diagnostics::Span::dummy(),
+            (None, crate::diagnostics::Span::dummy()),
             src_root,
             routing.as_ref(),
             &mut graph,
@@ -384,19 +380,18 @@ pub(crate) fn resolve_imports_in_graph(
 /// Classify an import as `std`, a module import, or a single-item import, then
 /// dispatch to the right loader. Item imports load the *parent* module and (for
 /// the entry file) record an [`ItemImport`] binding via `item_sink`.
-#[allow(clippy::too_many_arguments)]
 #[willow_continuations::function(resolve_import, resolve_one)]
 fn resolve_import(
     path: &str,
-    alias: Option<&str>,
-    span: crate::diagnostics::Span,
-    src_root: &Path,
+    site: (Option<&str>, crate::diagnostics::Span),
     consumer: PackageId,
-    routing: Option<&PackageImports<'_>>,
+    location: (&Path, Option<&PackageImports<'_>>),
     graph: &mut ModuleGraph,
     errors: &mut Vec<Diagnostic>,
     item_sink: Option<&mut Vec<ItemImport>>,
 ) -> Option<ModuleKey> {
+    let (alias, span) = site;
+    let (src_root, routing) = location;
     // The reserved `std` namespace resolves against the built-in registry.
     if std_registry::is_std_path(path) {
         if graph.mark_import_seen(path)
@@ -475,8 +470,7 @@ fn resolve_import(
     resolve_one(
         &key,
         file,
-        module_alias,
-        span,
+        (module_alias, span),
         src_root,
         routing,
         graph,
@@ -498,18 +492,17 @@ fn resolve_import(
     graph.contains_key(&key).then_some(key)
 }
 
-#[allow(clippy::too_many_arguments)]
 #[willow_continuations::function(resolve_import, resolve_one)]
 fn resolve_one(
     key: &ModuleKey,
     module_path: PathBuf,
-    alias: Option<&str>,
-    span: crate::diagnostics::Span,
+    site: (Option<&str>, crate::diagnostics::Span),
     src_root: &Path,
     routing: Option<&PackageImports<'_>>,
     graph: &mut ModuleGraph,
     errors: &mut Vec<Diagnostic>,
 ) {
+    let (alias, span) = site;
     if graph.contains_key(key) {
         return;
     }
@@ -737,11 +730,9 @@ fn resolve_one(
     for sub_import in &program.imports {
         let dependency = resolve_import(
             &sub_import.path,
-            sub_import.alias.as_deref(),
-            sub_import.span,
-            src_root,
+            (sub_import.alias.as_deref(), sub_import.span),
             key.package,
-            routing,
+            (src_root, routing),
             graph,
             errors,
             None,

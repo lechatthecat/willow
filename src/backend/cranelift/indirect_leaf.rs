@@ -117,14 +117,12 @@ impl FuncGen<'_, '_> {
     }
 
     // Independent call signature, operands and diagnostic context.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn emit_promoted_fn_call(
         &mut self,
         signature: cranelift_codegen::ir::SigRef,
         target: Value,
         args: &[Value],
-        params: &[Type],
-        result: &Type,
+        (params, result): (&[Type], &Type),
         name: &str,
         span: Span,
     ) -> Value {
