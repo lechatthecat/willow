@@ -35,6 +35,15 @@ pub fn is_std_path(path: &str) -> bool {
     import_segments(path).first() == Some(&STD_ROOT)
 }
 
+/// Source-backed standard modules use ordinary module binding and checking.
+pub fn is_source_std_path(path: &str) -> bool {
+    path == "std::json" || path.starts_with("std::json::")
+}
+
+pub fn is_builtin_std_path(path: &str) -> bool {
+    is_std_path(path) && !is_source_std_path(path)
+}
+
 /// Render an import path in canonical form for diagnostics.
 pub fn display_path(path: &str) -> String {
     path.to_string()

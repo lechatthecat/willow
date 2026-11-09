@@ -14,8 +14,15 @@ pub(crate) struct ModulePaths<'a> {
 
 impl ModulePaths<'_> {
     pub(crate) fn get(&self, path: &str) -> Option<&usize> {
-        if module::std_registry::is_std_path(path) {
+        if module::std_registry::is_builtin_std_path(path) {
             return None;
+        }
+        if module::std_registry::is_source_std_path(path) {
+            return self
+                .dependencies
+                .by_package
+                .get(&crate::package::PackageId(0))?
+                .get(path);
         }
         let (first, rest) = QualifiedName::new(&path)
             .split_first()

@@ -647,3 +647,39 @@ fn package_loader_cycle_diagnostic_scaling() {
         );
     }
 }
+
+#[test]
+fn package_loader_json_is_shared_across_package_consumers() {
+    for spooled in [false, true] {
+        let f = Fixture::new();
+        f.file(
+            1,
+            "codec.wi",
+            "import std::json; pub fn read() { json::parse(\"null\"); }",
+        );
+        let graph = f.graph(&[&[("dependency", 1)], &[]]);
+        let result = f.resolve(
+            "import dependency::codec; import std::json;",
+            graph,
+            spooled,
+        );
+        success(&result);
+        let json = result
+            .graph
+            .files
+            .iter()
+            .filter(|m| m.canonical_path == "std::json")
+            .collect::<Vec<_>>();
+        assert_eq!(json.len(), 1);
+        assert_eq!(json[0].package, PackageId(0));
+        let codec = result
+            .graph
+            .files
+            .iter()
+            .find(|m| m.canonical_path == "codec")
+            .unwrap();
+        let imports = classify_unit_imports(&codec.program, &result.graph.files);
+        assert_eq!(imports.modules.len(), 1);
+        assert_eq!(imports.modules[0].unit, json[0].id);
+    }
+}

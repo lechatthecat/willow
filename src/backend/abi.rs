@@ -518,6 +518,7 @@ mod alloc_effects_tests {
         rt::willow_string_literal_slot,
         rt::willow_array_join,
         rt::willow_string_repeat,
+        rt::willow_string_from_scalar,
         rt::willow_string_split,
         rt::willow_string_substring,
         rt::willow_string_byte_at,

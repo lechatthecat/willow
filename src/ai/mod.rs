@@ -56,8 +56,13 @@ use std::{
 
 /// Compiler-owned source is queryable, but never a filesystem edit target.
 pub(crate) fn bundled_source(path: &str) -> Option<&'static str> {
-    (Path::new(path) == Path::new("<std>/collections.wi"))
-        .then_some(include_str!("../../std/collections.wi"))
+    if Path::new(path) == Path::new("<std>/collections.wi") {
+        Some(include_str!("../../std/collections.wi"))
+    } else if Path::new(path) == Path::new("<std>/json.wi") {
+        Some(include_str!("../../std/json.wi"))
+    } else {
+        None
+    }
 }
 pub(crate) fn source_path(path: &Path) -> Result<std::path::PathBuf> {
     if path

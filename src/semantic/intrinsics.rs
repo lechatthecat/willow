@@ -2334,6 +2334,7 @@ pub(crate) fn namespace_builtin(class: &str, method: &str) -> Option<NamespaceBu
         };
     }
     let runtime = match (class, method) {
+        ("text", "from_scalar") => rt::willow_string_from_scalar,
         ("time", "now_ns") => rt::willow_time_now_ns,
         ("env", "args_len") => rt::willow_runtime_args_len,
         ("env", "args") => rt::willow_runtime_args_array,

@@ -592,3 +592,16 @@ mod tests {
         willow_pop_roots(2);
     }
 }
+
+// Encode one Unicode scalar. Invalid scalars are programmer errors, like an
+// invalid substring boundary; JSON validates surrogate pairs before calling.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_string_from_scalar(value: i64) -> *mut u8 {
+    let Some(scalar) = u32::try_from(value).ok().and_then(char::from_u32) else {
+        return fail("invalid Unicode scalar");
+    };
+    let mut bytes = [0; 4];
+    let text = scalar.encode_utf8(&mut bytes);
+    super::willow_string_alloc(text.as_ptr(), text.len() as i64)
+}

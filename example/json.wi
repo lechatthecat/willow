@@ -1,0 +1,11 @@
+import std::json;
+import std::json::Value;
+
+fn main() {
+    let data = json::parse("{\"name\":\"Willow\",\"count\":18446744073709551615,\"tags\":[true,null]}").unwrap();
+    let name = json::get(data, "name").unwrap();
+    println(match name { Value::String(s) => s, _ => "missing" });
+    println(json::serialize(data).unwrap());
+    let invalid = json::parse("[1,]");
+    if let Err(error) = invalid { println(error.position); }
+}

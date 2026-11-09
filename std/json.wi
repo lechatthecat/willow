@@ -1,0 +1,328 @@
+import std::collections::Array;
+import std::text;
+
+// Numbers retain their exact JSON spelling, including arbitrarily large
+// integers/exponents. Convert explicitly with i64::parse or f64::parse.
+pub enum Value {
+    Null,
+    Bool(bool),
+    Number(String),
+    String(String),
+    Array(Array<Value>),
+    Object(Array<Member>),
+}
+
+pub class Member {
+    pub name: String;
+    pub value: Value;
+}
+
+// Zero-based UTF-8 byte offset. Serialization errors use position -1.
+pub class Error {
+    pub position: i64;
+    pub message: String;
+}
+
+// Duplicate members are preserved; lookup returns the last matching value.
+// Lookup is O(member count); parsing never performs repeated key searches.
+pub fn get(value: Value, key: String) -> Option<Value> {
+    if let Value::Object(members) = value {
+        let mut i = members.len();
+        while i > 0 {
+            i = i - 1;
+            if members[i].name == key { return Some(members[i].value); }
+        }
+    }
+    return None;
+}
+
+pub fn at(value: Value, index: i64) -> Option<Value> {
+    if let Value::Array(values) = value {
+        if index >= 0 && index < values.len() { return Some(values[index]); }
+    }
+    return None;
+}
+
+class Frame {
+    pub value: Value;
+    pub state: i64;
+    pub key: String;
+}
+
+class Parser {
+    pub input: String;
+    pub cursor: i64;
+    pub failure: String;
+
+    pub fn peek() -> i64 {
+        if self.cursor >= self.input.len() { return -1; }
+        return self.input.byte_at(self.cursor);
+    }
+    pub fn skip_space() {
+        let mut c = self.peek();
+        while c == 32 || c == 9 || c == 10 || c == 13 {
+            self.cursor = self.cursor + 1;
+            c = self.peek();
+        }
+    }
+    pub fn hex4() -> i64 {
+        let mut value = 0;
+        for unused in 0..4 {
+            let c = self.peek();
+            let mut digit = -1;
+            if c >= 48 && c <= 57 { digit = c - 48; }
+            if c >= 65 && c <= 70 { digit = c - 55; }
+            if c >= 97 && c <= 102 { digit = c - 87; }
+            if digit < 0 { self.failure = "expected four hexadecimal digits"; return 0; }
+            self.cursor = self.cursor + 1;
+            value = value * 16 + digit;
+        }
+        return value;
+    }
+    pub fn string() -> String {
+        self.cursor = self.cursor + 1;
+        let parts: Array<String> = [];
+        let mut start = self.cursor;
+        while self.failure == "" {
+            let c = self.peek();
+            if c < 32 { self.failure = "unterminated string or unescaped control"; return ""; }
+            if c == 34 {
+                parts.push(self.input.slice(start, self.cursor));
+                self.cursor = self.cursor + 1;
+                return parts.join("");
+            }
+            if c == 92 {
+                parts.push(self.input.slice(start, self.cursor));
+                self.cursor = self.cursor + 1;
+                let escaped = self.peek();
+                if escaped < 0 { self.failure = "unfinished escape"; return ""; }
+                self.cursor = self.cursor + 1;
+                if escaped == 34 { parts.push("\""); }
+                else if escaped == 92 { parts.push("\\"); }
+                else if escaped == 47 { parts.push("/"); }
+                else if escaped == 98 { parts.push(text::from_scalar(8)); }
+                else if escaped == 102 { parts.push(text::from_scalar(12)); }
+                else if escaped == 110 { parts.push("\n"); }
+                else if escaped == 114 { parts.push("\r"); }
+                else if escaped == 116 { parts.push("\t"); }
+                else if escaped == 117 {
+                    let mut scalar = self.hex4();
+                    if self.failure != "" { return ""; }
+                    if scalar >= 55296 && scalar <= 56319 {
+                        if self.peek() != 92 { self.failure = "expected low surrogate"; return ""; }
+                        self.cursor = self.cursor + 1;
+                        if self.peek() != 117 { self.failure = "expected low surrogate"; return ""; }
+                        self.cursor = self.cursor + 1;
+                        let low = self.hex4();
+                        if self.failure != "" { return ""; }
+                        if low < 56320 || low > 57343 { self.failure = "invalid low surrogate"; return ""; }
+                        scalar = 65536 + (scalar - 55296) * 1024 + low - 56320;
+                    } else if scalar >= 56320 && scalar <= 57343 {
+                        self.failure = "unpaired low surrogate"; return "";
+                    }
+                    parts.push(text::from_scalar(scalar));
+                } else { self.failure = "invalid escape"; return ""; }
+                start = self.cursor;
+            } else {
+                // Scan bytes, slicing only at ASCII delimiters (UTF-8 boundaries).
+                self.cursor = self.cursor + 1;
+            }
+        }
+        return "";
+    }
+    pub fn digits() {
+        let mut c = self.peek();
+        if c < 48 || c > 57 { self.failure = "expected digit"; return; }
+        while c >= 48 && c <= 57 {
+            self.cursor = self.cursor + 1;
+            c = self.peek();
+        }
+    }
+    pub fn number() -> String {
+        let start = self.cursor;
+        if self.peek() == 45 { self.cursor = self.cursor + 1; }
+        if self.peek() == 48 { self.cursor = self.cursor + 1; }
+        else { self.digits(); }
+        if self.failure != "" { return ""; }
+        if self.peek() == 46 {
+            self.cursor = self.cursor + 1;
+            self.digits();
+        }
+        if self.failure != "" { return ""; }
+        let e = self.peek();
+        if e == 101 || e == 69 {
+            self.cursor = self.cursor + 1;
+            let sign = self.peek();
+            if sign == 43 || sign == 45 { self.cursor = self.cursor + 1; }
+            self.digits();
+        }
+        return self.input.slice(start, self.cursor);
+    }
+    pub fn literal(expected: String) {
+        for i in 0..expected.len() {
+            if self.peek() != expected.byte_at(i) {
+                self.failure = "invalid literal"; return;
+            }
+            self.cursor = self.cursor + 1;
+        }
+    }
+    pub fn value() -> Value {
+        let c = self.peek();
+        if c == 34 { return Value::String(self.string()); }
+        if c == 91 { self.cursor = self.cursor + 1; return Value::Array([]); }
+        if c == 123 { self.cursor = self.cursor + 1; return Value::Object([]); }
+        if c == 116 { self.literal("true"); return Value::Bool(true); }
+        if c == 102 { self.literal("false"); return Value::Bool(false); }
+        if c == 110 { self.literal("null"); return Value::Null; }
+        if c == 45 || (c >= 48 && c <= 57) { return Value::Number(self.number()); }
+        self.failure = "expected JSON value";
+        return Value::Null;
+    }
+    pub fn run() -> Result<Value, Error> {
+        self.skip_space();
+        let root = self.value();
+        let stack: Array<Frame> = [];
+        if is_container(root) { stack.push(new Frame(root, 0, "")); }
+        while stack.len() > 0 && self.failure == "" {
+            let frame = stack[stack.len() - 1];
+            self.skip_space();
+            let c = self.peek();
+            let object = is_object(frame.value);
+            let mut close = 93;
+            if object { close = 125; }
+            // 0: first member; 1: after comma; 2: after value.
+            if c == close && frame.state != 1 {
+                self.cursor = self.cursor + 1;
+                stack.pop();
+            } else if frame.state == 2 {
+                if c != 44 { self.failure = "expected comma or closing delimiter"; }
+                else { self.cursor = self.cursor + 1; frame.state = 1; }
+            } else {
+                if object {
+                    if c != 34 { self.failure = "expected object key"; }
+                    else {
+                        frame.key = self.string();
+                        self.skip_space();
+                        if self.peek() != 58 { self.failure = "expected colon"; }
+                        else { self.cursor = self.cursor + 1; }
+                    }
+                }
+                if self.failure == "" {
+                    self.skip_space();
+                    let child = self.value();
+                    if let Value::Array(values) = frame.value { values.push(child); }
+                    if let Value::Object(members) = frame.value { members.push(new Member(frame.key, child)); }
+                    frame.state = 2;
+                    if is_container(child) {
+                        // A resource bound, enforced without native recursion.
+                        if stack.len() >= 256 { self.failure = "maximum JSON depth is 256"; }
+                        else { stack.push(new Frame(child, 0, "")); }
+                    }
+                }
+            }
+        }
+        if self.failure == "" {
+            self.skip_space();
+            if self.cursor != self.input.len() { self.failure = "trailing input"; }
+        }
+        if self.failure != "" { return Err(new Error(self.cursor, self.failure)); }
+        return Ok(root);
+    }
+}
+
+fn is_container(value: Value) -> bool {
+    return match value { Value::Array(a) => true, Value::Object(o) => true, _ => false };
+}
+fn is_object(value: Value) -> bool {
+    return match value { Value::Object(o) => true, _ => false };
+}
+
+// Accepts at most 256 nested containers; deeper input returns a positioned error.
+@effects(no_wait)
+pub fn parse(input: String) -> Result<Value, Error> {
+    return new Parser(input, 0, "").run();
+}
+
+fn quote(value: String, parts: Array<String>) {
+    parts.push("\"");
+    let mut start = 0;
+    for i in 0..value.len() {
+        let c = value.byte_at(i);
+        if c < 32 || c == 34 || c == 92 {
+            parts.push(value.slice(start, i));
+            if c == 34 { parts.push("\\\""); }
+            else if c == 92 { parts.push("\\\\"); }
+            else {
+                let digits = "0123456789abcdef";
+                parts.push("\\u00");
+                parts.push(digits.slice(c / 16, c / 16 + 1));
+                parts.push(digits.slice(c % 16, c % 16 + 1));
+            }
+            start = i + 1;
+        }
+    }
+    parts.push(value.slice(start, value.len()));
+    parts.push("\"");
+}
+
+class WriteFrame {
+    pub value: Value;
+    pub index: i64;
+}
+
+// Mutable arrays may form cycles. The same depth limit bounds cyclic input;
+// shared acyclic values are serialized once per occurrence.
+@effects(no_wait)
+pub fn serialize(value: Value) -> Result<String, Error> {
+    let parts: Array<String> = [];
+    let stack = [new WriteFrame(value, -1)];
+    let mut depth = 0;
+    while stack.len() > 0 {
+        let frame = stack[stack.len() - 1];
+        if frame.index == -1 {
+            if is_container(frame.value) {
+                depth = depth + 1;
+                if depth > 256 { return Err(new Error(-1, "maximum JSON depth is 256")); }
+                if is_object(frame.value) { parts.push("{"); } else { parts.push("["); }
+                frame.index = 0;
+            } else {
+                if let Value::Null = frame.value { parts.push("null"); }
+                if let Value::Bool(b) = frame.value { if b { parts.push("true"); } else { parts.push("false"); } }
+                if let Value::String(s) = frame.value { quote(s, parts); }
+                if let Value::Number(n) = frame.value {
+                    let parser = new Parser(n, 0, "");
+                    parser.number();
+                    if parser.failure != "" || parser.cursor != n.len() {
+                        return Err(new Error(-1, "invalid JSON number"));
+                    }
+                    parts.push(n);
+                }
+                stack.pop();
+            }
+        } else {
+            let mut length = 0;
+            if let Value::Array(a) = frame.value { length = a.len(); }
+            if let Value::Object(o) = frame.value { length = o.len(); }
+            if frame.index == length {
+                if is_object(frame.value) { parts.push("}"); } else { parts.push("]"); }
+                depth = depth - 1;
+                stack.pop();
+            } else {
+                if frame.index > 0 { parts.push(","); }
+                let child = match frame.value {
+                    Value::Array(a) => a[frame.index],
+                    Value::Object(o) => o[frame.index].value,
+                    other => other
+                };
+                if let Value::Object(o) = frame.value {
+                    let member = o[frame.index];
+                    quote(member.name, parts);
+                    parts.push(":");
+                }
+                frame.index = frame.index + 1;
+                stack.push(new WriteFrame(child, -1));
+            }
+        }
+    }
+    return Ok(parts.join(""));
+}

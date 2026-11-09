@@ -80,7 +80,7 @@ pub(crate) fn classify_unit_imports_with<'a>(
 ) -> UnitImports {
     let mut out = UnitImports::default();
     for import in &program.imports {
-        if std_registry::is_std_path(&import.path) {
+        if std_registry::is_builtin_std_path(&import.path) {
             continue;
         }
         if let Some(dependency) = find(&import.path) {
@@ -300,7 +300,7 @@ pub(crate) fn resolve_imports_in_graph(
 
         // Determine the local name this import introduced, then check for a
         // collision with an earlier import.
-        let bound_name = if std_registry::is_std_path(&import.path) {
+        let bound_name = if std_registry::is_builtin_std_path(&import.path) {
             std_import_bound_name(&import.path, import.alias.as_deref(), import.span)
         } else if item_imports.len() > item_count_before {
             item_imports.last().map(|i| i.local.clone())
@@ -393,7 +393,7 @@ fn resolve_import(
     let (alias, span) = site;
     let (src_root, routing) = location;
     // The reserved `std` namespace resolves against the built-in registry.
-    if std_registry::is_std_path(path) {
+    if std_registry::is_builtin_std_path(path) {
         if graph.mark_import_seen(path)
             && let Err(diag) = std_registry::resolve_std_import(path, span)
         {
@@ -406,7 +406,14 @@ fn resolve_import(
     {
         graph.import_routes += 1;
     }
-    let resolved = if let Some(routing) = routing {
+    let resolved = if std_registry::is_source_std_path(path) {
+        let item = path.strip_prefix("std::json::").map(str::to_owned);
+        Some((
+            ModuleKey::new(PackageId(0), "std::json"),
+            PathBuf::from("<std>/json.wi"),
+            item,
+        ))
+    } else if let Some(routing) = routing {
         match routing.resolve(consumer, path) {
             Ok(PackageImport::Module { key, file, item }) => Some((key, file, item)),
             Ok(PackageImport::Std) => unreachable!("std handled above"),
@@ -616,19 +623,23 @@ fn load_module_program(
     {
         graph.source_loads += 1;
     }
-    let source = match crate::compiler_db::captured::FileInput::read(module_path.clone()) {
-        Ok(input) => input.source,
-        Err(e) => {
-            errors.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0401,
-                    format!("cannot read module `{}`: {}", path, e),
-                )
-                .with_label(Label::primary(span, "failed to read")),
-            );
-            graph.end_key_visit(key);
-            return None;
+    let source = if path == "std::json" {
+        include_str!("../../std/json.wi").to_owned()
+    } else {
+        match crate::compiler_db::captured::FileInput::read(module_path.clone()) {
+            Ok(input) => input.source,
+            Err(e) => {
+                errors.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0401,
+                        format!("cannot read module `{}`: {}", path, e),
+                    )
+                    .with_label(Label::primary(span, "failed to read")),
+                );
+                graph.end_key_visit(key);
+                return None;
+            }
         }
     };
 
@@ -799,7 +810,7 @@ fn std_import_bound_name(
     alias: Option<&str>,
     span: crate::diagnostics::Span,
 ) -> Option<String> {
-    if !std_registry::is_std_path(path) {
+    if !std_registry::is_builtin_std_path(path) {
         return None;
     }
     if std_registry::resolve_std_import(path, span).is_err() {

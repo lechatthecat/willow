@@ -1036,3 +1036,40 @@ fn native_package_previews_warm_cache_verify_without_writes_or_network() {
     fs::write(entry, b"corrupt").unwrap();
     assert_native_previews_read_only(&f, Some("native_digest_mismatch"));
 }
+
+#[test]
+fn json_standard_module_is_shared_with_path_dependency() {
+    let f = Fixture::new();
+    f.package("lib", "codec", "1.0.0", "");
+    f.write(
+        "lib/src/codec.wi",
+        r#"
+import std::json;
+import std::json::Value;
+pub fn read() -> Value { return json::parse("{\"x\":42}").unwrap(); }
+"#,
+    );
+    f.package(
+        "app",
+        "app",
+        "1.0.0",
+        "[dependencies]\ncodec={path=\"../lib\"}\n",
+    );
+    f.write(
+        "app/src/main.wi",
+        r#"
+import codec::codec;
+import std::json;
+fn main() { println(json::serialize(codec::read()).unwrap()); }
+"#,
+    );
+    for _ in 0..2 {
+        let output = f.cli(&["run"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "{\"x\":42}\n");
+    }
+}

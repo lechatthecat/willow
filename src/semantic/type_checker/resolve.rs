@@ -359,7 +359,7 @@ impl TypeChecker {
     }
 
     pub(super) fn register_builtin_modules(&mut self) {
-        for module_name in ["time", "env", "fs", "net", "parallel"] {
+        for module_name in ["time", "env", "fs", "net", "parallel", "text"] {
             self.register_schema_module(module_name);
         }
     }
@@ -997,7 +997,7 @@ impl TypeChecker {
 
     pub(super) fn register_std_imports(&mut self, imports: &[ImportDecl]) {
         for import in imports {
-            if !std_registry::is_std_path(&import.path) {
+            if !std_registry::is_builtin_std_path(&import.path) {
                 continue;
             }
             if std_registry::resolve_std_import(&import.path, import.span).is_err() {
@@ -1067,7 +1067,7 @@ impl TypeChecker {
                     self.imported_names
                         .insert(local.to_string(), Some(import.span));
                     if import.alias.is_some()
-                        && matches!(*module, "time" | "env" | "fs" | "net" | "parallel")
+                        && matches!(*module, "time" | "env" | "fs" | "net" | "parallel" | "text")
                     {
                         self.register_schema_module_as(module, local);
                     }
@@ -1109,7 +1109,7 @@ impl TypeChecker {
         qualified_name: &str,
         span: Span,
     ) -> Option<(String, String)> {
-        if !std_registry::is_std_path(qualified_name) {
+        if !std_registry::is_builtin_std_path(qualified_name) {
             return None;
         }
         match std_registry::resolve_std_import(qualified_name, span) {
@@ -3101,7 +3101,7 @@ impl TypeChecker {
                 .map(|(_, builtin)| builtin.to_string())
                 .unwrap_or_else(|| QualifiedName::join(module, item))
         };
-        if std_registry::is_std_path(class_name)
+        if std_registry::is_builtin_std_path(class_name)
             && let Ok(std_registry::StdImport::Item { module, item }) =
                 std_registry::resolve_std_import(class_name, Span::dummy())
         {

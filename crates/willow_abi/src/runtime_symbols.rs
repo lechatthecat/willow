@@ -146,6 +146,7 @@ runtime_abi_schema! {
     ALLOC; willow_format_f64_16f => ([F64] -> Some(Ptr));
     ALLOC; willow_format_f64_6f => ([F64] -> Some(Ptr));
     // --- string ---
+    PANIC_ALLOC; willow_string_from_scalar => ([I64] -> Some(Ptr));
     PANIC_ALLOC; willow_string_concat => ([Ptr, Ptr] -> Some(Ptr));
     PANIC_ALLOC; willow_string_concat_n => ([Ptr, I64] -> Some(Ptr));
     NONE; willow_string_len => ([Ptr] -> Some(I64));

@@ -187,7 +187,7 @@ pub(crate) fn std_collection_imports(program: &Program) -> StdCollectionImports 
     let mut aliases = HashMap::new();
     let mut builtin_module_aliases = HashMap::new();
     for import in &program.imports {
-        if !std_registry::is_std_path(&import.path) {
+        if !std_registry::is_builtin_std_path(&import.path) {
             continue;
         }
         match std_registry::resolve_std_import(&import.path, import.span) {
@@ -197,7 +197,10 @@ pub(crate) fn std_collection_imports(program: &Program) -> StdCollectionImports 
                 modules.insert("collections".to_string());
             }
             Ok(std_registry::StdImport::Module { module })
-                if matches!(module.as_str(), "time" | "fs" | "env" | "net" | "parallel") =>
+                if matches!(
+                    module.as_str(),
+                    "time" | "fs" | "env" | "net" | "parallel" | "text"
+                ) =>
             {
                 if let Some(alias) = &import.alias {
                     builtin_module_aliases.insert(alias.clone(), module.clone());

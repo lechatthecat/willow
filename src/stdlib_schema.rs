@@ -224,6 +224,10 @@ const PARALLEL: &[StdItemSchema] = &[std_function!(
 /// Complete public `std` surface.
 pub const STDLIB_SCHEMA: &[StdModuleSchema] = &[
     StdModuleSchema {
+        name: "text",
+        items: &[std_function!("from_scalar", [T::I64] -> T::String)],
+    },
+    StdModuleSchema {
         name: "collections",
         items: COLLECTIONS,
     },
@@ -752,6 +756,7 @@ mod recursive_schema_tests {
         assert_eq!(
             names,
             vec![
+                "text",
                 "collections",
                 "option",
                 "result",
@@ -764,6 +769,7 @@ mod recursive_schema_tests {
             ]
         );
         for (name, count) in [
+            ("text", 1),
             ("collections", 4),
             ("option", 1),
             ("result", 1),

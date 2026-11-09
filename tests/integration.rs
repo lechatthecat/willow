@@ -404,3 +404,6 @@ mod runtime_contracts;
 
 #[path = "integration/static_verification.rs"]
 mod static_verification;
+
+#[path = "integration/json.rs"]
+mod json;
