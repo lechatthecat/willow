@@ -21,7 +21,7 @@ pub mod prelude;
 pub mod project;
 pub(crate) mod qualified_name;
 mod query_stats;
-pub mod rust_bridge;
+pub mod rust_bridge_ir;
 pub mod semantic;
 pub mod stdlib_schema;
 pub mod toolchain;

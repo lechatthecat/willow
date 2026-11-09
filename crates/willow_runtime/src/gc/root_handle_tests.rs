@@ -186,7 +186,7 @@ fn scoped_loan_native_old_retired_and_nested_lifetimes() {
 
 #[test]
 fn scoped_loan_bridge_deduplicates_and_preserves_foreign_string_data() {
-    use crate::rust_bridge::aggregate::*;
+    use crate::rust_bridge_abi::aggregate::*;
     let _guard = gc_test_guard();
     reset_gc();
     let mut tls = new_tlab_state();

@@ -195,7 +195,7 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "rust_bridge::aggregate::tests::aggregate_roundtrip_roots_and_linear_buffers",
+                    "rust_bridge_abi::aggregate::tests::aggregate_roundtrip_roots_and_linear_buffers",
                     "--nocapture",
                 ])
                 .env(KEY, "1")

@@ -1665,8 +1665,8 @@ impl UnitCodegenContext<'_> {
         } else if f.rust_bridge.as_ref().is_some_and(|bridge| {
             bridge
                 .input_types
-                .contains(&crate::rust_bridge::Scalar::Bool)
-                || bridge.output_type == crate::rust_bridge::Scalar::Bool
+                .contains(&crate::rust_bridge_ir::Scalar::Bool)
+                || bridge.output_type == crate::rust_bridge_ir::Scalar::Bool
         }) {
             let mut internal = sig.clone();
             for param in internal.params.iter_mut().chain(&mut internal.returns) {

@@ -51,7 +51,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "rust_bridge::tests::incompatible_revision_stops_before_foreign_execution",
+                "rust_bridge_abi::tests::incompatible_revision_stops_before_foreign_execution",
                 "--nocapture",
             ])
             .env(KEY, "1")

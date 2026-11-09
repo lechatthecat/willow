@@ -60,7 +60,7 @@ fn short_lived_string_churn_bounds_reservations_and_rss() {
             // Sampling heap counters does not allocate managed objects or GC.
             let mut state = runtime().heap.lock().unwrap();
             sync_tlab_accounting(&mut state);
-            let sample = telemetry::accounting_from_state(&state);
+            let sample = heap_snapshot::accounting_from_state(&state);
             let reserved = sample
                 .old_reserved_bytes
                 .saturating_add(sample.young_reserved_bytes);
@@ -112,7 +112,7 @@ fn short_lived_string_churn_bounds_reservations_and_rss() {
             .expect("VmHWM in /proc/self/status");
         crate::gc_telemetry::failure_record::assert_sample_below(
             "rss_memory_threshold",
-            telemetry::accounting_from_state(&runtime().heap.lock().unwrap()),
+            heap_snapshot::accounting_from_state(&runtime().heap.lock().unwrap()),
             peak_kib.saturating_mul(1024),
             64 * 1024 * 1024,
         );
@@ -334,7 +334,7 @@ fn unchanged_high_reservations_do_not_collect_per_managed_allocation() {
         let mut state = runtime().heap.lock().unwrap();
         assert_eq!(state.old_reserved_bytes, 256 * 1024);
         assert_eq!(state.tlab_reserved_bytes, 0);
-        let sample = telemetry::accounting_from_state(&state);
+        let sample = heap_snapshot::accounting_from_state(&state);
         crate::gc_telemetry::failure_record::assert_sample_below(
             "managed_memory_threshold",
             sample,
@@ -604,7 +604,7 @@ fn m0_threshold_locked_sample_reports_actual_limit_and_categories() {
         willow_alloc(8);
         charge_external(123);
         let state = runtime().heap.lock().unwrap();
-        let sample = telemetry::accounting_from_state(&state);
+        let sample = heap_snapshot::accounting_from_state(&state);
         // Equality must fail: the original bound is strict, not inclusive.
         crate::gc_telemetry::failure_record::assert_sample_below(
             "managed_memory_threshold",

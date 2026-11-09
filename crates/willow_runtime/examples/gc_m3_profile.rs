@@ -105,7 +105,7 @@ pub extern "C" fn willow_user_main() {
         "{{\"event\":\"application\",\"objects\":{n},\"fanout\":{fanout},\"elapsed_ns\":{elapsed},\"heap_after\":{}}}",
         gc::willow_gc_allocated_bytes()
     );
-    let s = gc_telemetry::m3::snapshot();
+    let s = gc_telemetry::collector_profile::snapshot();
     for (kind, h) in s.intervals.iter().enumerate() {
         println!(
             "{{\"event\":\"lock\",\"kind\":{kind},\"count\":{},\"total_ns\":{},\"max_ns\":{},\"p99_upper_ns\":{},\"collisions\":{}}}",
@@ -116,7 +116,7 @@ pub extern "C" fn willow_user_main() {
             s.collisions[kind]
         );
     }
-    for (index, w) in gc_telemetry::m3::workers()
+    for (index, w) in gc_telemetry::collector_profile::workers()
         .iter()
         .enumerate()
         .filter(|(_, w)| w.jobs != 0)

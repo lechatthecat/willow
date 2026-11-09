@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use willow_compiler::BuildMode;
 use willow_compiler::project::ProjectManifest;
-use willow_compiler::toolchain::rust_bridge::*;
+use willow_compiler::toolchain::rust_bridge_build::*;
 
 static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 struct Fixture {

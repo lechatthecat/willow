@@ -1,3 +1,6 @@
+//! Collector-owned heap accounting and snapshots consumed by `gc_telemetry`.
+//! Heap locking and access to private collector state stay in this module.
+
 use super::*;
 
 pub(crate) fn telemetry_wait_is_mutator() -> bool {
@@ -450,7 +453,7 @@ pub extern "C" fn willow_gc_major_collections() -> i64 {
 }
 
 /// Number of collections skipped because a foreign thread owned the root stack
-/// (willow-6fv.2). Lets a GC-stress test assert it is actually collecting rather
+/// Lets a GC-stress test assert it is actually collecting rather
 /// than silently skipping most of the time.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
@@ -460,7 +463,7 @@ pub extern "C" fn willow_gc_skipped_collections() -> i64 {
         .load(std::sync::atomic::Ordering::Relaxed) as i64
 }
 
-/// Test-only: number of currently registered GC mutators (willow-6fv.5.6).
+/// Test-only: number of currently registered GC mutators.
 #[cfg(test)]
 pub(crate) fn registered_mutator_count() -> usize {
     let (lock, _) = &runtime().coord;

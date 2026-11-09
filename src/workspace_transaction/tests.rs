@@ -84,16 +84,17 @@ fn worker() {
         }
         "rust" | "rust-remove" => {
             let mut options =
-                crate::toolchain::rust_bridge::BridgeOptions::new(crate::BuildMode::Debug).unwrap();
+                crate::toolchain::rust_bridge_build::BridgeOptions::new(crate::BuildMode::Debug)
+                    .unwrap();
             options.offline = true;
             options.cache_root = root.parent().unwrap().join("cache");
             let mutation =
                 if std::env::var("WILLOW_TRANSACTION_TEST_MODE").unwrap() == "rust-remove" {
-                    crate::toolchain::rust_bridge::commands::Mutation::Remove {
+                    crate::toolchain::rust_bridge_build::commands::Mutation::Remove {
                         name: "fixture".into(),
                     }
                 } else {
-                    crate::toolchain::rust_bridge::commands::Mutation::Add {
+                    crate::toolchain::rust_bridge_build::commands::Mutation::Add {
                         name: "fixture".into(),
                         spec: crate::project::RustDependencySpec {
                             path: Some("../rust-dep".into()),
@@ -101,7 +102,8 @@ fn worker() {
                         },
                     }
                 };
-            crate::toolchain::rust_bridge::commands::mutate(root, &options, mutation).unwrap();
+            crate::toolchain::rust_bridge_build::commands::mutate(root, &options, mutation)
+                .unwrap();
         }
         "relative-manifest" => {
             let manifest =
@@ -393,12 +395,13 @@ fn rust_removal_crash_restores_existing_cargo_lock_and_frozen_metadata() {
             assert_eq!(fs::read(f.root().join(path)).unwrap(), expected);
         }
         let mut options =
-            crate::toolchain::rust_bridge::BridgeOptions::new(crate::BuildMode::Debug).unwrap();
+            crate::toolchain::rust_bridge_build::BridgeOptions::new(crate::BuildMode::Debug)
+                .unwrap();
         options.locked = true;
         options.offline = true;
         options.cache_root = f.0.join("cache");
         assert!(
-            crate::toolchain::rust_bridge::inspect_bridge(&project, &f.root(), &options)
+            crate::toolchain::rust_bridge_build::inspect_bridge(&project, &f.root(), &options)
                 .unwrap()
                 .is_some()
         );
@@ -432,12 +435,12 @@ fn concurrent_rust_and_package_commands_preserve_both_graphs() {
     assert_eq!(project.rust_dependencies.len(), 1);
     crate::package::fetch_packages(&f.root(), true, true).unwrap();
     let mut options =
-        crate::toolchain::rust_bridge::BridgeOptions::new(crate::BuildMode::Debug).unwrap();
+        crate::toolchain::rust_bridge_build::BridgeOptions::new(crate::BuildMode::Debug).unwrap();
     options.locked = true;
     options.offline = true;
     options.cache_root = f.0.join("cache");
     assert!(
-        crate::toolchain::rust_bridge::inspect_bridge(&project, &f.root(), &options)
+        crate::toolchain::rust_bridge_build::inspect_bridge(&project, &f.root(), &options)
             .unwrap()
             .is_some()
     );

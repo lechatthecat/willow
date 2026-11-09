@@ -513,7 +513,7 @@ pub struct FunctionDecl {
     #[serde(default)]
     pub type_params: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rust_bridge: Option<crate::rust_bridge::RustBridgeSymbol>,
+    pub rust_bridge: Option<crate::rust_bridge_ir::RustBridgeSymbol>,
     pub name: String,
     pub public: bool,
     pub is_async: bool,

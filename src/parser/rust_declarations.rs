@@ -1,8 +1,9 @@
+//! Parsing and opaque-name discovery for `extern rust` declarations.
 use super::{Parser, ast::*};
 use crate::{
     diagnostics::{Diagnostic, ErrorCode},
     lexer::token::TokenKind,
-    rust_bridge::{RustBridgeSymbol, Scalar},
+    rust_bridge_ir::{RustBridgeSymbol, Scalar},
 };
 impl Parser {
     pub(super) fn parse_rust_bridge(&mut self) -> Result<Vec<Item>, Diagnostic> {

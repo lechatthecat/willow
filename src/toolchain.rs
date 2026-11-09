@@ -1,7 +1,7 @@
 //! Host object-file, runtime-library, linker, and sidecar artifact handling.
 
 pub mod native;
-pub mod rust_bridge;
+pub mod rust_bridge_build;
 
 use std::path::{Path, PathBuf};
 #[cfg(any(not(feature = "packaged"), not(all(windows, target_env = "msvc"))))]
@@ -379,7 +379,7 @@ impl HostToolchain {
         object: &Path,
         runtime: &Path,
         output: &str,
-        bridge: &rust_bridge::BridgeBuild,
+        bridge: &rust_bridge_build::BridgeBuild,
     ) -> Result<ExitStatus> {
         bridge.ensure_target(&target_lexicon::Triple::host().to_string())?;
         self.link_native(object, runtime, output, Some(bridge), &[])
@@ -390,7 +390,7 @@ impl HostToolchain {
         object: &Path,
         runtime: &Path,
         output: &str,
-        bridge: Option<&rust_bridge::BridgeBuild>,
+        bridge: Option<&rust_bridge_build::BridgeBuild>,
         native_args: &[String],
     ) -> Result<ExitStatus> {
         if let Some(bridge) = bridge {

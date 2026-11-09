@@ -8,7 +8,7 @@ pub(crate) mod import_usage;
 pub mod iter;
 pub(crate) mod ownership;
 mod pattern;
-mod rust_bridge;
+mod rust_declarations;
 mod stmt;
 pub(crate) mod tuples;
 mod types;
@@ -123,7 +123,7 @@ impl Parser {
             })
             .collect();
         Self {
-            rust_opaque_names: rust_bridge::opaque_names(&tokens),
+            rust_opaque_names: rust_declarations::opaque_names(&tokens),
             rust_namespaces,
             default_import_usage: Default::default(),
             tuple_arities: Default::default(),

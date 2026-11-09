@@ -1,7 +1,7 @@
 use crate::qualified_name::QualifiedName;
 use crate::{
     ai, backend, compiler_db, desugar, diagnostics, errors, ir, lexer, module, package, parser,
-    prelude, project, query_stats, rust_bridge, semantic, toolchain,
+    prelude, project, query_stats, rust_bridge_ir, semantic, toolchain,
 };
 use anyhow::{Context, Result};
 use compiler_db::dependencies::ModuleDependencies;
@@ -167,7 +167,7 @@ impl<'a> CompilerSession<'a> {
     pub fn rust_bridge_symbols_with_emitter(
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
-    ) -> Result<Vec<rust_bridge::RustBridgeSymbol>> {
+    ) -> Result<Vec<rust_bridge_ir::RustBridgeSymbol>> {
         let _symbols = self.symbols.enter();
         let _query_stats = query_stats::Session::enter();
         let _node_ids = parser::ast::NodeIdSession::enter();
@@ -240,19 +240,24 @@ impl<'a> CompilerSession<'a> {
                 None
             } else {
                 let mut options =
-                    toolchain::rust_bridge::BridgeOptions::new(self.opts.target.build_mode)?;
+                    toolchain::rust_bridge_build::BridgeOptions::new(self.opts.target.build_mode)?;
                 options.locked = self.opts.locked;
                 options.offline = self.opts.offline;
                 options.symbols = bound.iter().map(|(_, symbol)| symbol.clone()).collect();
                 if build && !bound.is_empty() {
-                    drop(toolchain::rust_bridge::build_bridge(
+                    drop(toolchain::rust_bridge_build::build_bridge(
                         &manifest,
                         project_root,
                         &options,
                         true,
                     )?);
                 }
-                toolchain::rust_bridge::build_bridge(&manifest, project_root, &options, !build)?
+                toolchain::rust_bridge_build::build_bridge(
+                    &manifest,
+                    project_root,
+                    &options,
+                    !build,
+                )?
             }
         } else {
             anyhow::ensure!(

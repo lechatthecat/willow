@@ -306,11 +306,11 @@ fn blocked_foreign_region_leaves_collections_running_and_parks_on_return() {
                 struct Region(u32);
                 impl Drop for Region {
                     fn drop(&mut self) {
-                        crate::rust_bridge::willow_rust_bridge_region_exit(self.0);
+                        crate::rust_bridge_abi::willow_rust_bridge_region_exit(self.0);
                     }
                 }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _region = Region(crate::rust_bridge::willow_rust_bridge_region_enter());
+                    let _region = Region(crate::rust_bridge_abi::willow_rust_bridge_region_enter());
                     release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
                     if unwind {
                         std::panic::resume_unwind(Box::new("foreign body"));
@@ -350,13 +350,13 @@ fn collection_requested_during_a_stop_keeps_the_foreign_region() {
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
             let _mutator = MutatorRegistration::new();
-            let region = crate::rust_bridge::willow_rust_bridge_region_enter();
+            let region = crate::rust_bridge_abi::willow_rust_bridge_region_enter();
             ready_tx.send(std::thread::current().id()).unwrap();
             collect_rx.recv_timeout(Duration::from_secs(30)).unwrap();
             collect();
             collected_tx.send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-            crate::rust_bridge::willow_rust_bridge_region_exit(region);
+            crate::rust_bridge_abi::willow_rust_bridge_region_exit(region);
         });
         let id = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         wait_until_parked(id);

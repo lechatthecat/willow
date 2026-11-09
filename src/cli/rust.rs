@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use willow_compiler::project::{self, ProjectManifest, RustDependencySpec};
-use willow_compiler::toolchain::rust_bridge::commands::{self, Mutation};
-use willow_compiler::toolchain::rust_bridge::{BridgeOptions, build_bridge, inspect_bridge};
+use willow_compiler::toolchain::rust_bridge_build::commands::{self, Mutation};
+use willow_compiler::toolchain::rust_bridge_build::{BridgeOptions, build_bridge, inspect_bridge};
 use willow_compiler::{BuildMode, CompilerOptions, toolchain::HostToolchain};
 
 #[derive(Debug)]

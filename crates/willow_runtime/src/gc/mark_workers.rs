@@ -221,7 +221,8 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>, index: usize) {
     let mut generation = 0;
     let mut children = Vec::new();
     loop {
-        let idle_start = crate::gc_telemetry::m3::enabled().then(std::time::Instant::now);
+        let idle_start =
+            crate::gc_telemetry::collector_profile::enabled().then(std::time::Instant::now);
         let mut state = lock.lock().unwrap();
         while !state.shutdown && state.generation == generation {
             state = cv.wait(state).unwrap();
@@ -233,7 +234,7 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>, index: usize) {
         let job = state.job.as_ref().unwrap().clone();
         let cycle = &job.cycle;
         drop(state);
-        let profile = crate::gc_telemetry::m3::WorkerJob::begin(
+        let profile = crate::gc_telemetry::collector_profile::WorkerJob::begin(
             index,
             idle_start.map_or(0, |s| s.elapsed().as_nanos().min(u64::MAX as u128) as u64),
         );

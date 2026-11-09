@@ -9,7 +9,7 @@ pub struct SemanticFacts {
     #[serde(default)]
     pub interop: interop::InteropGraph,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rust_bridges: Vec<crate::rust_bridge::RustBridgeSymbol>,
+    pub rust_bridges: Vec<crate::rust_bridge_ir::RustBridgeSymbol>,
     /// Live-only declaration relationships for atomic semantic rename.
     #[serde(skip)]
     pub(crate) rename_links: Vec<(String, String)>,

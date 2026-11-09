@@ -56,7 +56,7 @@ pub struct CompilerDb {
     /// Monomorph diagnostic spellings, moved into code generation once.
     pub(crate) runtime_names: std::collections::HashMap<String, String>,
     pub(crate) generic_sources: std::collections::HashMap<UnitId, crate::ai::generics::Source>,
-    pub rust_bridge_symbols: crate::rust_bridge::RustBridgeSymbols,
+    pub rust_bridge_symbols: crate::rust_bridge_ir::RustBridgeSymbols,
     _symbols: crate::semantic::ids::SymbolInterner,
     inputs: inputs::CompilerInputs,
     scopes: scope::ScopeQueries,

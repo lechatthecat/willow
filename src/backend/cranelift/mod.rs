@@ -3572,7 +3572,7 @@ pub(super) fn lir_address_taken_locals(
 mod class_layout_tests;
 
 impl Codegen {
-    pub fn set_rust_bridge_symbols(&mut self, symbols: &crate::rust_bridge::RustBridgeSymbols) {
+    pub fn set_rust_bridge_symbols(&mut self, symbols: &crate::rust_bridge_ir::RustBridgeSymbols) {
         self.output.rust_bridge_symbols = symbols
             .iter()
             .map(|(key, symbol)| (key.clone(), symbol.abi_symbol.clone()))

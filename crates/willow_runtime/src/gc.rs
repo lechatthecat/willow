@@ -44,8 +44,8 @@ mod barrier;
 pub use barrier::*;
 mod progress;
 pub use progress::{GcProgressV1, GcSkipReason, gc_progress, willow_gc_progress_v1};
-mod telemetry;
-pub use telemetry::*;
+mod heap_snapshot;
+pub use heap_snapshot::*;
 mod validation;
 use validation::*;
 
@@ -801,7 +801,7 @@ fn collect_for_budget() {
 
 fn allocation_failure(state: &GcState) -> *mut u8 {
     if let Some(limit) = state.memory_limit_bytes {
-        let memory = telemetry::accounting_from_state(state);
+        let memory = heap_snapshot::accounting_from_state(state);
         crate::gc_telemetry::failure_record::emit_with(
             "reservation_threshold",
             "reservation admission failed",

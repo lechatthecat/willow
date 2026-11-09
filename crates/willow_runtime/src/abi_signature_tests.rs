@@ -580,16 +580,16 @@ fn timer_value_abi_is_scalar_and_wait_may_block() {
 
 #[test]
 fn scalar_bridge_runtime_abi_matches_schema() {
-    let _: extern "C" fn(u32) = crate::rust_bridge::willow_rust_bridge_enter;
-    let _: extern "C" fn() -> ! = crate::rust_bridge::willow_rust_bridge_panic;
+    let _: extern "C" fn(u32) = crate::rust_bridge_abi::willow_rust_bridge_enter;
+    let _: extern "C" fn() -> ! = crate::rust_bridge_abi::willow_rust_bridge_panic;
     let enter = willow_abi::runtime_symbol("willow_rust_bridge_enter").unwrap();
     assert_eq!(enter.params, &[willow_abi::AbiTy::I32]);
     assert_eq!(enter.ret, None);
     let panic = willow_abi::runtime_symbol("willow_rust_bridge_panic").unwrap();
     assert!(panic.params.is_empty());
     assert_eq!(panic.ret, None);
-    let _: extern "C" fn() -> u32 = crate::rust_bridge::willow_rust_bridge_region_enter;
-    let _: extern "C" fn(u32) = crate::rust_bridge::willow_rust_bridge_region_exit;
+    let _: extern "C" fn() -> u32 = crate::rust_bridge_abi::willow_rust_bridge_region_enter;
+    let _: extern "C" fn(u32) = crate::rust_bridge_abi::willow_rust_bridge_region_exit;
     let enter = willow_abi::runtime_symbol("willow_rust_bridge_region_enter").unwrap();
     assert!(enter.params.is_empty());
     assert_eq!(enter.ret, Some(willow_abi::AbiTy::I32));
@@ -600,7 +600,7 @@ fn scalar_bridge_runtime_abi_matches_schema() {
 
 #[test]
 fn aggregate_bridge_runtime_abi_matches_schema() {
-    use crate::rust_bridge::aggregate::*;
+    use crate::rust_bridge_abi::aggregate::*;
     use willow_abi::{
         AbiTy::*,
         ffi::{WillowBridgeValue, WillowSliceU8},

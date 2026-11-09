@@ -5,8 +5,8 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use willow_compiler::BuildMode;
 use willow_compiler::project::ProjectManifest;
-use willow_compiler::rust_bridge::{RustBridgeSymbol, Scalar, wrappers};
-use willow_compiler::toolchain::rust_bridge::{BridgeOptions, build_bridge};
+use willow_compiler::rust_bridge_ir::{RustBridgeSymbol, Scalar, wrappers};
+use willow_compiler::toolchain::rust_bridge_build::{BridgeOptions, build_bridge};
 
 static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 struct Fixture {
@@ -514,7 +514,7 @@ fn independent_project_archives_keep_same_named_rust_functions_distinct() {
     options.offline = true;
     options.cache_root = first.temp.join("bridge-cache");
     options.symbols = vec![first_symbol.clone()];
-    let toolchain = willow_compiler::toolchain::rust_bridge::RustToolchain::detect(
+    let toolchain = willow_compiler::toolchain::rust_bridge_build::RustToolchain::detect(
         options.cargo.clone(),
         options.rustc.clone(),
         &first.root,

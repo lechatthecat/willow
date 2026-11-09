@@ -134,11 +134,11 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
     source.push_str(
         "#[cfg(panic = \"abort\")] compile_error!(\"Rust bridge requires panic=unwind\");\n",
     );
-    source.push_str(include_str!("rust_bridge/panic.rs"));
-    source.push_str(include_str!("rust_bridge/region.rs"));
+    source.push_str(include_str!("rust_bridge_ir/panic.rs"));
+    source.push_str(include_str!("rust_bridge_ir/region.rs"));
     source.push_str("#[allow(dead_code)] mod handles {\n");
     source.push_str(include_str!(
-        "../crates/willow_runtime/src/rust_bridge/handles.rs"
+        "../crates/willow_runtime/src/rust_bridge_abi/handles.rs"
     ));
     source.push_str("\n}\nmod opaque_tags {\n");
     let mut names = std::collections::HashSet::new();
@@ -161,7 +161,7 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
     }
     source.push_str("}\n");
     if symbols.iter().any(RustBridgeSymbol::aggregate) {
-        source.push_str(include_str!("rust_bridge/support.rs"));
+        source.push_str(include_str!("rust_bridge_ir/support.rs"));
     }
     for symbol in symbols {
         if symbol.aggregate() {

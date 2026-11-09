@@ -1,4 +1,4 @@
-//! Opt-in bounded M3 diagnostics. No I/O and no GC locks under this mutex.
+//! Opt-in bounded collector lock, worker, and graph profiling. No I/O and no GC locks under this mutex.
 //! Histograms use nanoseconds; bucket i bounds observations by 2^i ns.
 use std::sync::{LazyLock, Mutex, MutexGuard, TryLockError};
 use std::time::Instant;

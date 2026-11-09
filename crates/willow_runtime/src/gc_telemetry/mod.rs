@@ -1,3 +1,7 @@
+//! Public GC measurement aggregation, snapshot ABI, and trace publication.
+//! Collector-owned state is read through `gc::heap_snapshot`; this directory
+//! owns measurement storage and reporting, not collector state.
+//!
 //! Versioned measurements for the current collector and its global stops.
 //!
 //! Allocation counters reuse the collector's TLAB accounting. Collection work
@@ -11,9 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
+pub mod collector_profile;
 pub mod failure_record;
 pub mod footprint;
-pub mod m3;
 pub mod measurement;
 pub mod milestones;
 pub mod native_trace;
@@ -1107,7 +1111,6 @@ pub(crate) fn reset_for_test() {
 }
 
 #[cfg(test)]
-#[path = "gc_telemetry_tests.rs"]
 mod tests;
 
 /// Retained native owner capacity. Hash tables use conservative high-water

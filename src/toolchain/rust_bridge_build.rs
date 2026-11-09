@@ -86,7 +86,7 @@ impl BridgeCacheKey<'_> {
 pub struct BridgeOptions {
     /// Resolve only in the external cache, without project lock publication.
     pub read_only: bool,
-    pub symbols: Vec<crate::rust_bridge::RustBridgeSymbol>,
+    pub symbols: Vec<crate::rust_bridge_ir::RustBridgeSymbol>,
     /// Parent of the per-project hidden project; defaults to ~/.willow/build.
     pub cache_root: PathBuf,
     pub mode: BuildMode,
@@ -115,7 +115,7 @@ impl BridgeOptions {
             locked: false,
             cargo: "cargo".into(),
             rustc: "rustc".into(),
-            wrapper_schema: crate::rust_bridge::WRAPPER_SCHEMA.into(),
+            wrapper_schema: crate::rust_bridge_ir::WRAPPER_SCHEMA.into(),
             abi_revision: willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION.to_string(),
         })
     }
@@ -440,7 +440,7 @@ fn prepare_bridge(
             &directory.join("src/willow_bridge_abi.rs"),
             include_bytes!("../../crates/willow_abi/src/ffi.rs"),
         )?;
-        source.push_str(&crate::rust_bridge::wrappers(
+        source.push_str(&crate::rust_bridge_ir::wrappers(
             &options.symbols,
             &directory.join("src/willow_bridge_abi.rs"),
             willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION,

@@ -525,8 +525,8 @@ pub(super) fn run_backend(
     map: &diagnostics::SourceMap,
     emitter: &mut dyn diagnostics::DiagnosticEmitter,
     rust_bridge: Option<(
-        &toolchain::rust_bridge::BridgeBuild,
-        &crate::rust_bridge::RustBridgeSymbols,
+        &toolchain::rust_bridge_build::BridgeBuild,
+        &crate::rust_bridge_ir::RustBridgeSymbols,
     )>,
 ) -> Result<()> {
     // The entry file's item imports are not carried here: the back end gets
@@ -1414,7 +1414,7 @@ fn emit_bodies(
 
 struct NativeOutput<'a> {
     out: &'a str,
-    rust_bridge: Option<&'a toolchain::rust_bridge::BridgeBuild>,
+    rust_bridge: Option<&'a toolchain::rust_bridge_build::BridgeBuild>,
     shared: &'a [toolchain::native::distribution::SharedArtifact],
     args: &'a [String],
 }

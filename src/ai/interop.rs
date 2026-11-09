@@ -47,7 +47,7 @@ impl InteropGraph {
         self.rust_adapter = manifest.rust.as_ref().map(|r| r.bridge.clone());
         let input_hash = crate::package::lock::rust_input_hash(
             &manifest,
-            crate::rust_bridge::WRAPPER_SCHEMA,
+            crate::rust_bridge_ir::WRAPPER_SCHEMA,
             &willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION.to_string(),
         )?;
         let lock = crate::package::lock::read_rust_lock(root)?
@@ -123,7 +123,7 @@ pub struct Bridge {
     pub identity: Option<SymbolIdentity>,
     pub declaration: Vec<Location>,
     pub declaration_text: String,
-    pub symbol: crate::rust_bridge::RustBridgeSymbol,
+    pub symbol: crate::rust_bridge_ir::RustBridgeSymbol,
 }
 
 pub(super) fn attach(
@@ -261,10 +261,10 @@ mod tests {
                             identity: None,
                             declaration: vec![],
                             declaration_text: String::new(),
-                            symbol: crate::rust_bridge::RustBridgeSymbol::new(
+                            symbol: crate::rust_bridge_ir::RustBridgeSymbol::new(
                                 format!("f{i}"),
                                 vec![],
-                                crate::rust_bridge::Scalar::Void,
+                                crate::rust_bridge_ir::Scalar::Void,
                             ),
                         })
                         .collect(),

@@ -415,9 +415,9 @@ impl SatbShards {
         publish: impl FnOnce(&mut ShardBuffer<'_>) -> R,
     ) -> Option<R> {
         let buffer = {
-            let mut buffers = crate::gc_telemetry::m3::lock(
+            let mut buffers = crate::gc_telemetry::collector_profile::lock(
                 &self.shards[SHARD.with(|shard| *shard)].0,
-                crate::gc_telemetry::m3::Kind::SatbRegistry,
+                crate::gc_telemetry::collector_profile::Kind::SatbRegistry,
             );
             if self.sealed.load(Ordering::Acquire) {
                 return None;
@@ -437,8 +437,10 @@ impl SatbShards {
             }
             Arc::clone(buffers.get(&owner).unwrap())
         };
-        let mut entries =
-            crate::gc_telemetry::m3::lock(&buffer.0, crate::gc_telemetry::m3::Kind::SatbBuffer);
+        let mut entries = crate::gc_telemetry::collector_profile::lock(
+            &buffer.0,
+            crate::gc_telemetry::collector_profile::Kind::SatbBuffer,
+        );
         if self.sealed.load(Ordering::Acquire) || !valid() {
             return None;
         }
@@ -455,8 +457,10 @@ impl SatbShards {
             .unwrap_or_else(|error| error.into_inner());
         let owner = std::thread::current().id();
         if let Some(buffer) = buffers.get(&owner).cloned() {
-            let mut entries =
-                crate::gc_telemetry::m3::lock(&buffer.0, crate::gc_telemetry::m3::Kind::SatbBuffer);
+            let mut entries = crate::gc_telemetry::collector_profile::lock(
+                &buffer.0,
+                crate::gc_telemetry::collector_profile::Kind::SatbBuffer,
+            );
             entries.inline_limit.set(0);
             if !entries.is_empty() {
                 // Closure may have revoked private publication before this
@@ -493,7 +497,9 @@ impl SatbShards {
         budget: &mut super::old_cycle::RemarkBudget,
         mut publish: impl FnMut(&[usize]),
     ) -> bool {
-        let _profile = crate::gc_telemetry::m3::Span::new(crate::gc_telemetry::m3::Kind::SatbSeal);
+        let _profile = crate::gc_telemetry::collector_profile::Span::new(
+            crate::gc_telemetry::collector_profile::Kind::SatbSeal,
+        );
         self.seal_stopped_bounded_with_clock(
             coord,
             budget,
@@ -1589,7 +1595,7 @@ mod m3_measurements {
             let shards = Arc::new(SatbShards::new(256));
             let start = Arc::new(std::sync::Barrier::new(threads));
             let count = Arc::new(AtomicUsize::new(0));
-            let before = crate::gc_telemetry::m3::snapshot();
+            let before = crate::gc_telemetry::collector_profile::snapshot();
             let began = std::time::Instant::now();
             std::thread::scope(|scope| {
                 for _ in 0..threads {
@@ -1623,7 +1629,7 @@ mod m3_measurements {
             assert!(shards.is_drained());
             assert_eq!(count.load(Ordering::Relaxed), threads * 4096);
             assert!(shards.with_current(|| true, |_| ()).is_none());
-            let after = crate::gc_telemetry::m3::snapshot();
+            let after = crate::gc_telemetry::collector_profile::snapshot();
             println!(
                 "m3_satb threads={threads} stores={} elapsed_ns={} seal_ns={seal_ns} registry_wait_ns={} registry_collisions={} buffer_wait_ns={}",
                 threads * 4096,
