@@ -11,7 +11,7 @@ pub(crate) fn write_stdout<'a>(text: impl Into<std::borrow::Cow<'a, str>>) {
     // A stalled pipe must not stall collections, and a waiting caller's managed
     // string may move or die, so the wait owns a native copy of the bytes.
     let text = text.into().into_owned();
-    if let Some(result) = crate::blocking::run_sync_call(move || write_stdout_direct(&text)) {
+    if let Some(result) = crate::blocking::run_stdout_call(move || write_stdout_direct(&text)) {
         result.expect("failed to write Willow stdout");
     }
 }

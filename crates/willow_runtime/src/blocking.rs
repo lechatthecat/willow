@@ -1,5 +1,7 @@
 //! Bounded blocking-work pool used to isolate file I/O and conservative foreign
-//! calls from scheduler workers.
+//! calls from scheduler workers. Stdout uses a separate one-thread, one-slot
+//! pool so an undrained output pipe cannot starve unrelated file I/O. The
+//! exported blocking gauges describe the general pool only.
 //!
 //! The pool is bounded in BOTH dimensions:
 //!
@@ -94,6 +96,7 @@ struct BlockingPool {
     state: Mutex<PoolState>,
     work_ready: Condvar,
     capacity: usize,
+    metrics: PoolMetrics,
 }
 
 fn env_count(name: &str) -> Option<usize> {
@@ -105,20 +108,20 @@ fn env_count(name: &str) -> Option<usize> {
 
 // A caller-side FFI catch cannot observe a detached thread's panic. Cover
 // initialization, dequeue/wakeup, job execution and accounting on this thread.
-fn blocking_worker_entry(initialize: fn()) {
+fn blocking_worker_entry(pool: &'static LazyLock<BlockingPool>, initialize: fn()) {
     crate::failure::ffi_boundary("blocking worker", || {
         initialize();
         loop {
-            let (work, freed_slot_for) = BLOCKING_POOL.dequeue();
+            let (work, freed_slot_for) = pool.dequeue();
             // Waking takes scheduler locks and can trigger GC: keep it inside
             // the fatal boundary, but outside the pool lock.
             if let Some(task_id) = freed_slot_for {
                 crate::scheduler::willow_sched_wake(task_id);
             }
-            ACTIVE_JOBS.fetch_add(1, Ordering::AcqRel);
+            pool.metrics.active.fetch_add(1, Ordering::AcqRel);
             work();
-            ACTIVE_JOBS.fetch_sub(1, Ordering::AcqRel);
-            COMPLETED_JOBS.fetch_add(1, Ordering::AcqRel);
+            pool.metrics.active.fetch_sub(1, Ordering::AcqRel);
+            pool.metrics.completed.fetch_add(1, Ordering::AcqRel);
         }
     });
 }
@@ -128,6 +131,15 @@ impl BlockingPool {
         let threads = env_count("WILLOW_BLOCKING_THREADS").unwrap_or(DEFAULT_BLOCKING_THREADS);
         let capacity = env_count("WILLOW_BLOCKING_QUEUE")
             .unwrap_or_else(|| threads.saturating_mul(DEFAULT_BLOCKING_QUEUE_PER_THREAD));
+        Self::with_workers(threads, capacity, "willow-blocking", &BLOCKING_POOL)
+    }
+
+    fn with_workers(
+        threads: usize,
+        capacity: usize,
+        name: &str,
+        owner: &'static LazyLock<BlockingPool>,
+    ) -> Self {
         let pool = Self {
             state: Mutex::new(PoolState {
                 queue: VecDeque::with_capacity(capacity),
@@ -136,11 +148,14 @@ impl BlockingPool {
             }),
             work_ready: Condvar::new(),
             capacity,
+            metrics: PoolMetrics::default(),
         };
         for index in 0..threads {
             std::thread::Builder::new()
-                .name(format!("willow-blocking-{index}"))
-                .spawn(|| blocking_worker_entry(crate::stack_overflow::protect_current_thread))
+                .name(format!("{name}-{index}"))
+                .spawn(move || {
+                    blocking_worker_entry(owner, crate::stack_overflow::protect_current_thread)
+                })
                 .unwrap_or_else(|_| {
                     crate::failure::resource_exhausted(format_args!(
                         "cannot start Willow blocking worker"
@@ -163,7 +178,7 @@ impl BlockingPool {
         let mut state = self.lock();
         loop {
             if let Some(work) = state.queue.pop_front() {
-                QUEUED_JOBS.fetch_sub(1, Ordering::AcqRel);
+                self.metrics.queued.fetch_sub(1, Ordering::AcqRel);
                 return (work, state.reserve_next());
             }
             state = self
@@ -188,10 +203,12 @@ impl BlockingPool {
         }
         if let Some(id) = registered {
             state.reserved.remove(&id);
-            SLOT_WAITERS.store(state.waiter_count(), Ordering::Release);
+            self.metrics
+                .waiters
+                .store(state.waiter_count(), Ordering::Release);
         }
         state.queue.push_back(work);
-        QUEUED_JOBS.fetch_add(1, Ordering::AcqRel);
+        self.metrics.queued.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -218,7 +235,7 @@ impl BlockingPool {
                 if registered.is_none() {
                     state.waiters.register(task_id);
                     let waiters = state.waiter_count();
-                    SLOT_WAITERS.store(waiters, Ordering::Release);
+                    self.metrics.waiters.store(waiters, Ordering::Release);
                     drop(state);
                     crate::observability::record(
                         crate::observability::RuntimeEventKind::BlockingQueueFull,
@@ -239,7 +256,9 @@ impl BlockingPool {
             return;
         }
         let next = if reserved { state.reserve_next() } else { None };
-        SLOT_WAITERS.store(state.waiter_count(), Ordering::Release);
+        self.metrics
+            .waiters
+            .store(state.waiter_count(), Ordering::Release);
         drop(state);
         if let Some(next) = next {
             crate::scheduler::willow_sched_wake(next);
@@ -248,10 +267,19 @@ impl BlockingPool {
 }
 
 static BLOCKING_POOL: LazyLock<BlockingPool> = LazyLock::new(BlockingPool::new);
-static ACTIVE_JOBS: AtomicUsize = AtomicUsize::new(0);
-static QUEUED_JOBS: AtomicUsize = AtomicUsize::new(0);
-static SLOT_WAITERS: AtomicUsize = AtomicUsize::new(0);
-static COMPLETED_JOBS: AtomicU64 = AtomicU64::new(0);
+// Stdout can wait indefinitely for a consumer. It must not occupy any of
+// the general pool's workers. One writer and one queued job suffice because
+// stdout itself is serialized; excess writers retain their jobs on their tasks.
+static STDOUT_POOL: LazyLock<BlockingPool> =
+    LazyLock::new(|| BlockingPool::with_workers(1, 1, "willow-stdout", &STDOUT_POOL));
+
+#[derive(Default)]
+struct PoolMetrics {
+    active: AtomicUsize,
+    queued: AtomicUsize,
+    waiters: AtomicUsize,
+    completed: AtomicU64,
+}
 
 /// Run owned native work while parking the current task's native stack. No
 /// managed pointers may be captured by `work`: it can outlive cancellation.
@@ -268,6 +296,25 @@ static COMPLETED_JOBS: AtomicU64 = AtomicU64::new(0);
     all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 ))]
 pub(crate) fn run_owned<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    run_owned_on(&BLOCKING_POOL, work)
+}
+
+#[cfg(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+))]
+fn run_owned_on<T: Send + 'static>(
+    pool: &LazyLock<BlockingPool>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
     use std::sync::Arc;
     if !crate::native_stack::is_active() {
         return Some(work());
@@ -285,10 +332,10 @@ pub(crate) fn run_owned<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'st
     });
     loop {
         if crate::native_stack::cancelled() != 0 {
-            forget_waiter(task);
+            pool.forget_waiter(task);
             return None;
         }
-        match try_submit_or_wait(task, job) {
+        match pool.try_submit_or_wait(task, job) {
             Ok(()) => break,
             Err(returned) => job = returned,
         }
@@ -317,6 +364,20 @@ pub(crate) fn run_owned<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'st
 pub(crate) fn run_sync_call<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
+    run_sync_call_on(&BLOCKING_POOL, work)
+}
+
+/// Stdout has a separate bounded worker so a full pipe cannot starve file I/O.
+pub(crate) fn run_stdout_call<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    run_sync_call_on(&STDOUT_POOL, work)
+}
+
+fn run_sync_call_on<T: Send + 'static>(
+    pool: &LazyLock<BlockingPool>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
     #[cfg(any(
         all(
             target_os = "linux",
@@ -330,7 +391,7 @@ pub(crate) fn run_sync_call<T: Send + 'static>(
         all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
     if crate::native_stack::is_active() {
-        return run_owned(work);
+        return run_owned_on(pool, work);
     }
     // SAFETY: `work` is `'static + Send`, so it holds no thread-owned runtime
     // state, and its contract above excludes managed objects.
@@ -355,7 +416,11 @@ pub(crate) fn try_submit_or_wait(task_id: u64, work: BlockingWork) -> Result<(),
 /// Drop a Task's slot-waiter registration (cancel path). No-op for a Task that
 /// never had to wait.
 pub(crate) fn forget_waiter(task_id: u64) {
-    BLOCKING_POOL.forget_waiter(task_id)
+    for owner in [&BLOCKING_POOL, &STDOUT_POOL] {
+        if let Some(pool) = LazyLock::get(owner) {
+            pool.forget_waiter(task_id);
+        }
+    }
 }
 
 /// Forget every slot waiter. Test resets drop tasks without running their
@@ -363,27 +428,30 @@ pub(crate) fn forget_waiter(task_id: u64) {
 /// (which a reset scheduler even reuses) reserving slots forever.
 #[cfg(test)]
 pub(crate) fn reset_slot_waiters_for_test() {
-    let Some(pool) = LazyLock::get(&BLOCKING_POOL) else {
-        return;
-    };
-    let mut state = pool.lock();
-    state.waiters = WaitQueue::default();
-    state.reserved.clear();
-    SLOT_WAITERS.store(0, Ordering::Release);
+    for owner in [&BLOCKING_POOL, &STDOUT_POOL] {
+        if let Some(pool) = LazyLock::get(owner) {
+            let mut state = pool.lock();
+            state.waiters = WaitQueue::default();
+            state.reserved.clear();
+            pool.metrics.waiters.store(0, Ordering::Release);
+        }
+    }
 }
 
 /// Jobs currently running on pool threads.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_active_jobs() -> i64 {
-    ACTIVE_JOBS.load(Ordering::Acquire) as i64
+    LazyLock::get(&BLOCKING_POOL).map_or(0, |pool| pool.metrics.active.load(Ordering::Acquire))
+        as i64
 }
 
 /// Jobs that have finished running on pool threads (monotonic).
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_completed_jobs() -> i64 {
-    COMPLETED_JOBS.load(Ordering::Acquire) as i64
+    LazyLock::get(&BLOCKING_POOL).map_or(0, |pool| pool.metrics.completed.load(Ordering::Acquire))
+        as i64
 }
 
 /// Jobs admitted to the bounded queue but not yet started (depth gauge,
@@ -391,7 +459,8 @@ pub extern "C" fn willow_blocking_completed_jobs() -> i64 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_queued_jobs() -> i64 {
-    QUEUED_JOBS.load(Ordering::Acquire) as i64
+    LazyLock::get(&BLOCKING_POOL).map_or(0, |pool| pool.metrics.queued.load(Ordering::Acquire))
+        as i64
 }
 
 /// Tasks parked because no queue slot was available when they submitted
@@ -399,7 +468,8 @@ pub extern "C" fn willow_blocking_queued_jobs() -> i64 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_slot_waiters() -> i64 {
-    SLOT_WAITERS.load(Ordering::Acquire) as i64
+    LazyLock::get(&BLOCKING_POOL).map_or(0, |pool| pool.metrics.waiters.load(Ordering::Acquire))
+        as i64
 }
 
 /// Bounded queue capacity (`WILLOW_BLOCKING_QUEUE`).
@@ -592,6 +662,81 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         assert!(try_submit(Box::new(move || sender.send(42).unwrap())).is_ok());
         assert_eq!(receiver.recv_timeout(Duration::from_secs(2)), Ok(42));
+    }
+
+    #[test]
+    fn stdout_backpressure_cancellation_keeps_general_pool_available() {
+        use crate::scheduler::{willow_sched_cancel, willow_sched_run_until};
+        static RAN: AtomicUsize = AtomicUsize::new(0);
+        static DROPPED: AtomicUsize = AtomicUsize::new(0);
+        struct Owned;
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                DROPPED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        unsafe extern "C" fn writer(_: *mut c_void) -> i32 {
+            let owned = Owned;
+            assert!(
+                run_stdout_call(move || {
+                    RAN.fetch_add(1, Ordering::SeqCst);
+                    drop(owned);
+                })
+                .is_none()
+            );
+            crate::task::RUNTIME_POLL_READY
+        }
+        let _guard = runtime_test_guard();
+        for count in [1, 16, 64] {
+            reset_global_scheduler_for_test();
+            RAN.store(0, Ordering::SeqCst);
+            DROPPED.store(0, Ordering::SeqCst);
+            let (release, gate) = mpsc::channel::<()>();
+            let (started, running) = mpsc::channel();
+            assert!(
+                STDOUT_POOL
+                    .try_submit(Box::new(move || {
+                        started.send(()).unwrap();
+                        // Dropping release on assertion failure also unblocks the worker.
+                        let _ = gate.recv();
+                    }))
+                    .is_ok()
+            );
+            running.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(STDOUT_POOL.try_submit(Box::new(|| {})).is_ok());
+            let ids: Vec<_> = (0..count)
+                .map(|_| willow_sched_spawn(writer, std::ptr::null_mut()))
+                .collect();
+            willow_sched_run_until_deadline(willow_monotonic_millis() + 50);
+            assert_eq!(STDOUT_POOL.metrics.waiters.load(Ordering::Acquire), count);
+            assert_eq!(STDOUT_POOL.metrics.queued.load(Ordering::Acquire), 1);
+            assert_eq!(STDOUT_POOL.metrics.active.load(Ordering::Acquire), 1);
+            assert_eq!(willow_blocking_slot_waiters(), 0);
+            let (done, progress) = mpsc::channel();
+            assert!(
+                try_submit(Box::new(move || {
+                    done.send(()).unwrap();
+                }))
+                .is_ok()
+            );
+            progress.recv_timeout(Duration::from_secs(5)).unwrap();
+            for &id in ids.iter().rev() {
+                willow_sched_cancel(id);
+            }
+            for id in ids {
+                willow_sched_run_until(id);
+            }
+            assert_eq!(DROPPED.load(Ordering::SeqCst), count);
+            assert_eq!(RAN.load(Ordering::SeqCst), 0);
+            assert_eq!(STDOUT_POOL.metrics.waiters.load(Ordering::Acquire), 0);
+            println!("stdout tasks={count} drops={count} jobs_run=0 queued=1 active=1 waiters=0");
+            drop(release);
+            wait_until("stdout drains", || {
+                STDOUT_POOL.metrics.queued.load(Ordering::Acquire) == 0
+                    && STDOUT_POOL.metrics.active.load(Ordering::Acquire) == 0
+            });
+        }
+        reset_global_scheduler_for_test();
     }
 
     #[test]

@@ -9,11 +9,20 @@ fn detached_worker_panics_terminate_without_hanging() {
         match case.as_str() {
             "initialize" => {
                 std::thread::spawn(|| {
-                    blocking_worker_entry(|| panic!("injected worker initialization panic"));
+                    blocking_worker_entry(&BLOCKING_POOL, || {
+                        panic!("injected worker initialization panic")
+                    });
                 });
             }
             "job" => {
                 assert!(try_submit(Box::new(|| panic!("injected blocking job panic"))).is_ok());
+            }
+            "stdout-job" => {
+                assert!(
+                    STDOUT_POOL
+                        .try_submit(Box::new(|| panic!("injected stdout job panic")))
+                        .is_ok()
+                );
             }
             _ => panic!("unexpected child case"),
         }
@@ -26,6 +35,7 @@ fn detached_worker_panics_terminate_without_hanging() {
     for (case, original) in [
         ("initialize", "injected worker initialization panic"),
         ("job", "injected blocking job panic"),
+        ("stdout-job", "injected stdout job panic"),
     ] {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([

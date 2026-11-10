@@ -29,11 +29,26 @@ async fn main() { await worker(); }
 
 #[test]
 fn full_stdout_pipe_does_not_block_other_tasks() {
+    assert_full_stdout_progress(1);
+}
+
+#[test]
+fn full_stdout_pipe_with_many_writers_does_not_block_other_tasks() {
+    for writers in [8, 64] {
+        assert_full_stdout_progress(writers);
+    }
+}
+
+fn assert_full_stdout_progress(writers: usize) {
     let id = unique_test_id();
     let source_path = temp_path(format!("willow_stdout_{id}.wi"));
     let binary = temp_path(format!("willow_stdout_{id}"));
     let marker = temp_path(format!("willow_stdout_progress_{id}"));
     let marker_literal = format!("{marker:?}");
+    let starts: String = (0..writers)
+        .map(|i| format!("let w{i} = writer();"))
+        .collect();
+    let joins: String = (0..writers).map(|i| format!("await w{i};")).collect();
     let source = format!(
         r#"
 import std::fs;
@@ -46,7 +61,7 @@ async fn progress() {{
     gc_collect();
     match fs::write_string({}, "progress") {{ Ok(_) => {{}}, Err(_) => {{}} }}
 }}
-async fn main() {{ let w = writer(); let p = progress(); await p; await w; }}
+async fn main() {{ {starts} let p = progress(); await p; {joins} }}
 "#,
         "x".repeat(4096),
         marker_literal
@@ -86,9 +101,37 @@ async fn main() {{ let w = writer(); let p = progress(); await p; await w; }}
     assert!(output.stdout.len() >= 4096, "writer never reached stdout");
     assert!(
         progressed,
-        "worker stalled behind stdout: {}",
+        "worker stalled behind stdout ({writers} writers): {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn concurrent_stdout_writers_complete_without_losing_lines() {
+    let starts: String = (0..64)
+        .map(|i| format!("let w{i} = writer({i});"))
+        .collect();
+    let joins: String = (0..64).map(|i| format!("await w{i};")).collect();
+    let source = format!(
+        "async fn writer(n: i64) {{ let mut i = 0; while i < 8 {{ println(n); i = i + 1; }} }}
+         async fn main() {{ {starts} {joins} }}"
+    );
+    for workers in ["1", "5"] {
+        let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+            &source,
+            &[
+                ("WILLOW_WORKERS", workers),
+                ("WILLOW_BLOCKING_THREADS", "1"),
+                ("WILLOW_BLOCKING_QUEUE", "1"),
+            ],
+            Duration::from_secs(20),
+        );
+        assert!(!timed_out && ok, "workers={workers}: {out}");
+        let mut lines: Vec<usize> = out.lines().map(|line| line.parse().unwrap()).collect();
+        lines.sort_unstable();
+        let expected: Vec<usize> = (0..64).flat_map(|n| std::iter::repeat_n(n, 8)).collect();
+        assert_eq!(lines, expected, "workers={workers}");
+    }
 }
 
 #[test]
