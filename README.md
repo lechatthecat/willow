@@ -19,7 +19,7 @@ Its premise is simple: **when a person or an AI agent changes a program, the com
 
 This README describes the current `main` branch. Some features are newer than the latest prebuilt release; see [Try Willow](#try-willow).
 
-**Contents:** [A taste of Willow](#a-taste-of-willow) · [Try Willow](#try-willow) · [Concurrency guarantees](#concurrency-the-compiler-follows-the-wait) · [Proven contracts](#contracts-from-run-time-checks-to-proofs) · [Locks](#locks-designed-together-with-the-compiler-and-scheduler) · [Semantic tooling](#semantic-tooling-for-people-and-ai-agents) · [Related approaches](#how-this-relates-to-other-approaches) · [Measurements](#measurements) · [Current boundaries](#current-boundaries)
+**Contents:** [A taste of Willow](#a-taste-of-willow) · [Try Willow](#try-willow) · [Rust interop](#rust-interop) · [Concurrency guarantees](#concurrency-the-compiler-follows-the-wait) · [Proven contracts](#contracts-from-run-time-checks-to-proofs) · [Locks](#locks-designed-together-with-the-compiler-and-scheduler) · [Semantic tooling](#semantic-tooling-for-people-and-ai-agents) · [Related approaches](#how-this-relates-to-other-approaches) · [Measurements](#measurements) · [Current boundaries](#current-boundaries)
 
 ## A taste of Willow
 
@@ -118,6 +118,148 @@ cargo build --release
 **Release note:** v0.1.10, the latest prebuilt release, rejects all nested locks and has no group acquisition (`lock a as x, b as y`). Build from source to use the [lock rules below](#acquiring-multiple-locks).
 
 [`RELEASE_README.md`](RELEASE_README.md) covers installation, library layout, checksums and toolchain requirements.
+
+## Rust interop
+
+Use existing Rust crates through an explicit, **handwritten Rust adapter**.
+`[rust-dependencies]` lets Cargo resolve crates; it does not automatically expose
+all their APIs to Willow. The compiler generates the ABI wrappers around your
+adapter. Rust interop needs Cargo and a Rust toolchain in addition to the native
+linker, even when using a prebuilt Willow compiler.
+
+The runnable [regex example](example/rust_regex) uses the crates.io `regex` crate.
+Its `project.toml` declares the dependency and adapter file:
+
+```toml
+[project]
+name = "rust_regex"
+version = "0.1.0"
+
+[rust]
+bridge = "rust/bridge.rs"
+
+[rust-dependencies]
+regex = "1"
+```
+
+In `rust/bridge.rs`, wrap the crate API with a public Rust function:
+
+```rust
+pub fn regex_is_match(pattern: &str, text: &str) -> Result<bool, String> {
+    regex::Regex::new(pattern)
+        .map(|regex| regex.is_match(text))
+        .map_err(|error| error.to_string())
+}
+```
+
+Declare that adapter in `src/main.wi` and call it like a Willow function:
+
+```willow
+extern rust {
+    fn regex_is_match(pattern: String, text: String) -> Result<bool, String>;
+}
+
+fn main() {
+    match regex_is_match("^hello [a-z]+$", "hello willow") {
+        Result::Ok(matched) => println(matched),
+        Result::Err(error) => println(error),
+    };
+}
+```
+
+From the repository root, run `willow run example/rust_regex`. The checked-in
+example also tests an invalid pattern: its output is `true`, `Err`, `true`, each
+on its own line. The first run may download Rust dependencies.
+
+### Boundary types
+
+These are the supported **synchronous** adapter mappings:
+
+| Willow declaration | Rust adapter input | Rust adapter output |
+| --- | --- | --- |
+| `i64`, `f64`, `bool` | Same scalar | Same scalar |
+| Omitted return / `void` | Not a parameter type | `()` |
+| `String` | `&str` | `String` |
+| `Array<i64>` | `&[u8]` (checked bytes, 0–255) | `Vec<u8>` |
+| `Array<f64>`, `Array<bool>` | `Vec<f64>`, `Vec<bool>` | Same vector type |
+| `Array<String>` | `Vec<&str>` | `Vec<String>` |
+| `opaque Handle;` | `&Handle` | `Box<Handle>` |
+| Record declared inside `extern rust` | Generated borrowed input record | Generated owned output record |
+| `Option<T>`, `Result<T, E>` | Rust `Option` / `Result` of mapped inputs | Rust `Option` / `Result` of mapped outputs |
+
+Option and Result can nest supported boundary types. Arrays are limited to the
+four element types above: `Array<i64>` is a byte buffer, not a general integer
+vector. Arbitrary Willow classes, maps, tuples, function/closure values, raw
+pointers and arbitrary Rust structs are not boundary types. Records require
+public value fields, with no methods, inheritance, generic parameters or recursive
+layout; declare nested records first. See the [record mapping and ownership
+rules](example/rust_record_bridge/README.md) and [opaque handle example](example/rust_opaque_bridge).
+Synchronous adapters must not retain borrowed inputs beyond the call. Opaque
+values expose a generated `Handle_close` operation rather than native pointers.
+The native opaque payload must satisfy `Any + Send + Sync` (including a
+`'static` lifetime).
+
+There is no direct binding of generic functions or trait APIs: instantiate or
+wrap them in a concrete adapter signature. Rust-to-Willow callbacks and automatic
+crate-wide binding generation are not supported. The accepted signatures and
+diagnostics are defined by [the declaration parser](src/parser/rust_declarations.rs)
+and [boundary type mapping](src/rust_bridge_ir.rs).
+
+### Async calls: Willow Task awaits Rust Future
+
+Inside `extern rust`, `async fn` supports one-way calls from a Willow Task into
+an adapter returning a Rust Future. For example, the runnable
+[async pull example](example/rust_async_pull) declares
+`async fn respond(request: String) -> String;` and calls
+`await respond(request)` from `async fn main`. Its Rust adapter is:
+
+```rust
+pub async fn respond(request: String) -> String {
+    format!("handled {request}")
+}
+```
+
+Run `willow run example/rust_async_pull` from the repository root. Rust produces
+events and wakes a pending Future; Willow pulls each request and prints
+`handled request-0`, `handled request-1`, and `handled request-2`.
+This does not let Rust call a Willow function or await a Willow Task.
+See [remaining interop directions](protocol/ai_toolchain/RUST_BRIDGE.md#remaining-interop-directions)
+for the distinction between this support and broader integration.
+
+Async adapters take **owned** inputs: `String`, `Vec<u8>` and `Vec<String>`
+replace synchronous borrowed string/byte inputs. `Vec<f64>` and `Vec<bool>`
+remain owned vectors; records use generated
+`crate::record_owned::Name` types and opaque handles use
+`crate::AsyncHandle<Handle>`. Option and Result compose these mappings.
+The Future must be `Send + 'static`; borrowed inputs and non-`Send` Futures
+are rejected. Adapters remain concrete, handwritten functions.
+
+Calls must originate in an async context; using an async bridge as a function
+value is unsupported. Calls inside Willow lexical locks are rejected (E2604),
+and `async fn` cannot also declare `nonblocking`. Async bridges carry
+`MAY_SUSPEND` instead of `MAY_BLOCK`, retaining allocation, panic and foreign-call
+effects. Rust Future polling must return promptly: declaring an adapter async
+does not prove that its native body avoids blocking or make blocking Rust work
+preemptible. The bridge does not automatically provide a crate-specific async
+runtime such as Tokio; adapters must arrange any required runtime services.
+
+### Where the guarantees stop
+
+Willow does not analyze Rust adapter or dependency bodies. Ordinary synchronous
+foreign calls conservatively carry `MAY_BLOCK`, `MAY_ALLOCATE`, `MAY_PANIC` and
+`FOREIGN_CALL`; they are rejected in Willow lexical locks (E2604) and in tasks.
+This protects the modeled Willow boundary, but cannot prove that native code is
+free of blocking, races or deadlocks.
+
+A reviewed `nonblocking("<review_fingerprint>")` declaration permits a bounded
+synchronous call from tasks and lock contexts by removing `MAY_BLOCK`. This is a
+**developer assertion**, not a compiler proof of the Rust body or of purity.
+Conversions and native destructors are part of that assertion. See [bounded
+synchronous calls](protocol/ai_toolchain/RUST_BRIDGE.md#bounded-synchronous-calls-from-tasks)
+for review freshness, stack limits and remaining effects.
+
+For dependency inspection, update impact and adapter diagnostics, see the
+[Rust bridge guide](protocol/ai_toolchain/RUST_BRIDGE.md).
 
 ## Concurrency: the compiler follows the wait
 

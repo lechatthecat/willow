@@ -1,5 +1,8 @@
 # Rust bridge query, update impact, and repair
 
+Start with the [README Rust interop introduction](../../README.md#rust-interop)
+for a runnable crate adapter, boundary types and the scope of effect guarantees.
+
 The executable in this repository is `willow` (older design discussions call it
 `willowc`). Cargo owns Rust resolution and diagnostics. Compiler snapshots own
 Willow declarations, package-aware FunctionIds, and the call graph. The command
@@ -135,8 +138,10 @@ without unwinding through the C ABI.
 The declaration removes MAY_BLOCK, permitting `no_wait` and lock contexts, while
 retaining MAY_ALLOCATE, MAY_PANIC and FOREIGN_CALL. It never establishes purity.
 Undeclared functions retain static task rejection and the runtime task guard.
-Generated opaque close functions remain undeclared because arbitrary native
-Drop implementations can block.
+Generated opaque close functions remain blocking unless separately reviewed:
+place `nonblocking("<review_fingerprint>")` before the `opaque` declaration to
+review its generated close function. Reviewing another function does not review
+close; arbitrary native Drop implementations can block.
 
 Records expose `effects`, `nonblocking`, `trust`, and `official_verified`.
 `trust` distinguishes `undeclared`, `developer_declared`, and the reserved
@@ -149,3 +154,14 @@ do not claim that a review matches the current dependency resolution.
 with a fixed pattern and a 64-byte input limit. Run `willow run
 example/rust_task_bridge`. If dependency resolution has changed, inspect the
 query, review the new resolved graph and refresh the declaration before running.
+
+## Remaining interop directions
+
+The current [async bridge](../../README.md#async-calls-willow-task-awaits-rust-future)
+supports Willow Tasks awaiting Rust Futures through explicit adapters. Reverse
+Rust-to-Willow callbacks, Rust awaiting Willow Tasks, and automatic bindings for
+arbitrary generic or trait APIs remain unsupported. Callback integration and a
+restricted auto-binding subset are future directions, not available features or
+a delivery commitment. Keep using concrete handwritten adapters and the current
+boundary types; one-way Future support does not imply general bidirectional
+runtime integration.
