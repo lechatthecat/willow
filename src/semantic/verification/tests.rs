@@ -440,7 +440,7 @@ fn verification_diverging_helper_arguments_share_serialized_bodies() {
         let mut bytes = 0;
         let mut nodes = 0;
         for i in 0..n {
-            let s = encode(i, &fs, &names).unwrap();
+            let s = encode(i, &fs, &names, &DataTypes::default()).unwrap();
             bytes += s.definitions.len();
             nodes += s.nodes;
         }

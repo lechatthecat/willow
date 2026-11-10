@@ -141,6 +141,12 @@ fn push_stmt<'a>(pending: &mut Vec<AstEvent<'a>>, stmt: &'a Stmt) {
             pending.push(AstEvent::Expr(&stmt.iterable));
             pending.push(AstEvent::EnterScope);
             pending.push(AstEvent::Bind(&stmt.name));
+            pending.extend(
+                stmt.invariants
+                    .iter()
+                    .chain(stmt.variant.iter())
+                    .map(AstEvent::Expr),
+            );
             pending.push(AstEvent::Block(&stmt.body));
             pending.push(AstEvent::ExitScope);
         }
@@ -165,6 +171,26 @@ fn push_expr<'a>(pending: &mut Vec<AstEvent<'a>>, node: &'a Expr) {
             pending.push(AstEvent::Expr(&expr.rhs));
         }
         Expr::Unary(expr) => pending.push(AstEvent::Expr(&expr.expr)),
+        Expr::Call(call)
+            if matches!(call.callee.as_str(), "forall" | "exists")
+                && call.args.len() == 3
+                && matches!(call.args[2].expr, Expr::Lambda(_)) =>
+        {
+            // A quantifier binder is a lexical expression scope, not a callable
+            // body. All semantic inventories must agree on that distinction.
+            pending.push(AstEvent::Expr(&call.args[0].expr));
+            pending.push(AstEvent::Expr(&call.args[1].expr));
+            let Expr::Lambda(lambda) = &call.args[2].expr else {
+                unreachable!()
+            };
+            pending.push(AstEvent::EnterScope);
+            pending.extend(lambda.params.iter().map(|p| AstEvent::Bind(&p.name)));
+            match &lambda.body {
+                LambdaBody::Expr(e) => pending.push(AstEvent::Expr(e)),
+                LambdaBody::Block(b) => pending.push(AstEvent::Block(b)),
+            }
+            pending.push(AstEvent::ExitScope);
+        }
         Expr::Call(call) => {
             pending.push(AstEvent::CallArguments(node));
             push_args(pending, &call.args);

@@ -40,7 +40,7 @@ pub(super) fn identity(
         &serde_json::json!({
             "schema":"willow.proof-cache.v1", "typed_semantics":summary.definitions,
             "contracts":summary.contract_definitions, "dependencies":dependencies,
-            "signature":comparison::signature(f), "model":"checked-i64", "vc_generator":"3",
+            "signature":comparison::signature(f), "model":"checked-i64", "vc_generator":"4", "data_model":summary.data_digest,
             "compiler":crate::ai::compiler_identity(), "solver_version":solver::VERSION,
             "solver_executable":options.solver, "timeout_ms":options.timeout_ms,
             "resource_limit":options.resource_limit

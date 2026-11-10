@@ -11,39 +11,15 @@ impl TypeChecker {
         );
     }
 
-    pub(super) fn check_loop_contracts(&mut self, loop_: &WhileStmt) {
-        for (expr, expected) in loop_
-            .invariants
+    pub(super) fn check_loop_contracts(&mut self, invariants: &[Expr], variant: Option<&Expr>) {
+        let mut immutable = HashMap::new();
+        for (expr, expected) in invariants
             .iter()
             .map(|e| (e, Type::Bool))
-            .chain(loop_.variant.iter().map(|e| (e, Type::I64)))
+            .chain(variant.into_iter().map(|e| (e, Type::I64)))
         {
-            let mut walk = AstWalk::new(AstEvent::Expr(expr));
-            while let Some(event) = walk.next() {
-                let AstEvent::Expr(e) = event else { continue };
-                let allowed = match e {
-                    Expr::Integer(..)
-                    | Expr::Bool(..)
-                    | Expr::Binary(_)
-                    | Expr::Unary(_)
-                    | Expr::Ternary(_) => true,
-                    Expr::Var(name, ..) => {
-                        self.symbols
-                            .lookup_var(name)
-                            .is_some_and(|v| matches!(v.ty, Type::I64 | Type::Bool))
-                            || self.symbols.lookup_func(name).is_some_and(|f| {
-                                f.constant.is_some()
-                                    && matches!(f.return_type, Type::I64 | Type::Bool)
-                            })
-                    }
-                    _ => false,
-                };
-                if !allowed {
-                    self.contract_error(e.span(), "loop annotations allow only i64/bool bindings, constants and pure operators");
-                    walk.skip_children();
-                }
-            }
             let ty = self.check_expr(expr);
+            self.check_proof_expression(expr, None, false, &mut immutable);
             if ty != expected {
                 self.contract_error(
                     expr.span(),
@@ -57,6 +33,99 @@ impl TypeChecker {
         }
     }
 
+    fn check_proof_expression(
+        &mut self,
+        expression: &Expr,
+        params: Option<&HashMap<&str, &Param>>,
+        post: bool,
+        immutable: &mut HashMap<Type, bool>,
+    ) {
+        let mut bindings =
+            crate::semantic::scopes::Scopes::with_frame(std::iter::empty::<(String, bool)>());
+        let mut walk = AstWalk::new(AstEvent::Expr(expression));
+        while let Some(event) = walk.next() {
+            match event {
+                AstEvent::EnterScope => bindings.push(),
+                AstEvent::ExitScope => bindings.pop(),
+                AstEvent::Bind(name) => bindings.insert(name.to_owned(), true),
+                AstEvent::Expr(expr) => {
+                    let allowed = match expr {
+                        Expr::Integer(..)
+                        | Expr::Float(..)
+                        | Expr::Bool(..)
+                        | Expr::Binary(_)
+                        | Expr::Unary(_)
+                        | Expr::Ternary(_)
+                        | Expr::Index(..)
+                        | Expr::FieldAccess(..) => true,
+                        // Statement arms can mutate state or return from the enclosing
+                        // function; runtime contracts permit expression arms only.
+                        Expr::Match(m) => m
+                            .arms
+                            .iter()
+                            .all(|arm| matches!(arm.body, MatchBody::Expr(_))),
+                        Expr::MethodCall(c) => {
+                            c.method == "len"
+                                && c.args.is_empty()
+                                && self.expr_types.get(&c.object.id()).is_some_and(|ty| {
+                                    builtin_types::resolve(ty)
+                                        .is_some_and(|b| b.id == B::FrozenArray)
+                                        && self.verification_immutable_type(ty, immutable)
+                                })
+                        }
+                        Expr::Call(c) if matches!(c.callee.as_str(), "forall" | "exists") => true,
+                        Expr::Var(name, ..) => {
+                            if bindings.get(name).copied().unwrap_or(false) {
+                                true
+                            } else if name == "result" && params.is_some() && !post {
+                                false
+                            } else {
+                                let parameter = params.is_none_or(|params| {
+                                    name == "result"
+                                        || params
+                                            .get(name.as_str())
+                                            .is_some_and(|p| p.mode == ParamMode::Value)
+                                });
+                                (parameter
+                                    && self.symbols.lookup_var(name).is_some_and(|v| {
+                                        scalar(&v.ty)
+                                            || self.verification_immutable_type(&v.ty, immutable)
+                                    }))
+                                    || self.symbols.lookup_func(name).is_some_and(|f| {
+                                        f.constant.is_some() && scalar(&f.return_type)
+                                    })
+                            }
+                        }
+                        Expr::StaticField(s) => self
+                            .symbols
+                            .lookup_module_func(&s.class, &s.field)
+                            .is_some_and(|f| f.constant.is_some() && scalar(&f.return_type)),
+                        Expr::StaticCall(s) if s.args.is_empty() && s.type_args.is_empty() => self
+                            .symbols
+                            .lookup_module_func(&s.class, &s.method)
+                            .is_some_and(|f| f.constant.is_some() && scalar(&f.return_type)),
+                        _ => false,
+                    };
+                    if !allowed {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E2631,
+                                "unsupported or mutable contract expression",
+                            )
+                            .with_label(Label::primary(
+                                expr.span(),
+                                "immutable proof expression required",
+                            )),
+                        );
+                        walk.skip_children();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub(super) fn check_contracts(&mut self, f: &FunctionDecl, return_type: &Type) {
         if f.requires.is_empty() && f.ensures.is_empty() {
             return;
@@ -65,6 +134,9 @@ impl TypeChecker {
         if params.contains_key("result") {
             self.contract_error(f.span, "result is reserved in functions with contracts");
         }
+        // Keep the cache within this callable's dependency-observation epoch;
+        // sharing it across checked bodies would hide their symbol reads.
+        let mut immutable = HashMap::new();
         for (post, clauses) in [(false, &f.requires), (true, &f.ensures)] {
             self.symbols.push_scope();
             if post {
@@ -79,45 +151,8 @@ impl TypeChecker {
                 );
             }
             for clause in clauses {
-                let mut walk = AstWalk::new(AstEvent::Expr(clause));
-                while let Some(event) = walk.next() {
-                    let AstEvent::Expr(expr) = event else {
-                        continue;
-                    };
-                    let allowed = match expr {
-                        Expr::Integer(..)
-                        | Expr::Float(..)
-                        | Expr::Bool(..)
-                        | Expr::Binary(_)
-                        | Expr::Unary(_)
-                        | Expr::Ternary(_) => true,
-                        Expr::Var(name, ..) if name == "result" => post && scalar(return_type),
-                        Expr::Var(name, ..) => {
-                            if let Some(param) = params.get(name.as_str()) {
-                                matches!(param.mode, ParamMode::Value)
-                                    && self.symbols.lookup_var(name).is_some_and(|v| scalar(&v.ty))
-                            } else {
-                                self.symbols
-                                    .lookup_func(name)
-                                    .is_some_and(|f| f.constant.is_some() && scalar(&f.return_type))
-                            }
-                        }
-                        Expr::StaticField(s) => self
-                            .symbols
-                            .lookup_module_func(&s.class, &s.field)
-                            .is_some_and(|f| f.constant.is_some() && scalar(&f.return_type)),
-                        Expr::StaticCall(s) if s.args.is_empty() && s.type_args.is_empty() => self
-                            .symbols
-                            .lookup_module_func(&s.class, &s.method)
-                            .is_some_and(|f| f.constant.is_some() && scalar(&f.return_type)),
-                        _ => false,
-                    };
-                    if !allowed {
-                        self.contract_error(expr.span(), "contracts may reference only scalar value parameters, constants, pure operators, and result in ensures");
-                        walk.skip_children();
-                    }
-                }
                 let ty = self.check_expr(clause);
+                self.check_proof_expression(clause, Some(&params), post, &mut immutable);
                 if ty != Type::Bool {
                     self.contract_error(
                         clause.span(),

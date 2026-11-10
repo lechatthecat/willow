@@ -1372,7 +1372,7 @@ fn lock_cause_witness(owner: FunctionId, cause: &LockEffectCause) -> Option<Effe
 
 /// Declarations of one unit, collected by a single pass over its items.
 struct UnitInventory<'a> {
-    contract_spans: HashMap<BodyId, crate::diagnostics::Span>,
+    contract_spans: HashMap<BodyId, ContractRuntimeEffects>,
     pending: Vec<(FunctionId, BodyId, &'a Block)>,
     helpers: HashMap<FunctionId, crate::diagnostics::Span>,
     foreign: Vec<(FunctionId, crate::diagnostics::Span, bool, bool)>,
@@ -1398,8 +1398,8 @@ impl<'a> UnitInventory<'a> {
             match item {
                 Item::Function(f) => {
                     let id = FunctionId::free(&f.name);
-                    if let Some(clause) = f.requires.first().or(f.ensures.first()) {
-                        inventory.contract_spans.insert(f.body.id, clause.span());
+                    if let Some(contract) = contract_runtime_effects(f) {
+                        inventory.contract_spans.insert(f.body.id, contract);
                     }
                     if let Some(bridge) = &f.rust_bridge {
                         inventory.foreign.push((
@@ -1611,7 +1611,7 @@ impl<'a> ColdUnitSolve<'a> {
         &mut self,
         mut pending: Vec<(FunctionId, BodyId, &Block)>,
         types: &HashMap<ExprId, Type<N>>,
-        contract_spans: &HashMap<BodyId, crate::diagnostics::Span>,
+        contract_spans: &HashMap<BodyId, ContractRuntimeEffects>,
         reused: &HashSet<BodyId>,
     ) -> usize {
         let canonical_bodies: HashSet<_> = pending.iter().map(|(_, body, _)| *body).collect();
@@ -1741,7 +1741,7 @@ impl<'a> ColdUnitSolve<'a> {
         body_id: BodyId,
         body: &Block,
         types: &HashMap<ExprId, Type<N>>,
-        contract_span: Option<crate::diagnostics::Span>,
+        contract_span: Option<ContractRuntimeEffects>,
     ) {
         let (origins, index, overflow_checks) = (self.origins, self.index, self.overflow_checks);
         let scan = || {
@@ -2565,9 +2565,7 @@ impl DeltaSolve<'_> {
             queries.scanned.set(queries.scanned.get() + 1);
             let contract = match location {
                 EffectRootLocation::Function(item) => match program.items.get(item) {
-                    Some(Item::Function(f)) => {
-                        f.requires.first().or(f.ensures.first()).map(Expr::span)
-                    }
+                    Some(Item::Function(f)) => contract_runtime_effects(f),
                     _ => None,
                 },
                 _ => None,
@@ -3351,6 +3349,13 @@ fn scan_direct_effects<N: std::fmt::Display>(
                 }
                 AstEvent::ExitStmt(Stmt::Defer(_)) => defer_depth -= 1,
                 AstEvent::Expr(expr) => {
+                    if matches!(expr, Expr::Call(c) if matches!(c.callee.as_str(), "forall" | "exists"))
+                    {
+                        preemption_loop = true;
+                        if defer_depth == 0 {
+                            loop_span.get_or_insert(expr.span());
+                        }
+                    }
                     may_io |= matches!(expr, Expr::Print(..));
                     hazards.visit_expr(expr);
                 }
@@ -5251,15 +5256,72 @@ mod direct_wait_tests {
     }
 }
 
-/// Include generated guards in the persistent direct contribution, so both
-/// cold solving and incremental provider/caller updates retain the panic edge.
+#[derive(Clone, Copy)]
+struct ContractRuntimeEffects {
+    span: crate::diagnostics::Span,
+    loop_span: Option<crate::diagnostics::Span>,
+}
+fn contract_runtime_effects(
+    f: &crate::parser::ast::FunctionDecl,
+) -> Option<ContractRuntimeEffects> {
+    let span = f.requires.first().or(f.ensures.first())?.span();
+    let loop_span = f
+        .requires
+        .iter()
+        .chain(&f.ensures)
+        .flat_map(|e| AstWalk::new(AstEvent::Expr(e)))
+        .find_map(|event| {
+            if let AstEvent::Expr(Expr::Call(c)) = event
+                && matches!(c.callee.as_str(), "forall" | "exists")
+            {
+                Some(c.span)
+            } else {
+                None
+            }
+        });
+    Some(ContractRuntimeEffects { span, loop_span })
+}
+
+/// Include generated guards and quantified loops in the persistent direct
+/// contribution, including incremental provider/caller updates.
 fn with_contract_effects(
     mut direct: Vec<DirectBodyEffects>,
-    span: Option<crate::diagnostics::Span>,
+    contract: Option<ContractRuntimeEffects>,
 ) -> Vec<DirectBodyEffects> {
-    if let (Some(root), Some(span)) = (direct.first_mut(), span) {
+    if let (Some(root), Some(contract)) = (direct.first_mut(), contract) {
         root.panics = true;
-        root.panic_span.get_or_insert(span);
+        root.panic_span.get_or_insert(contract.span);
+        if let Some(span) = contract.loop_span {
+            root.preemption_loop = true;
+            root.loop_span.get_or_insert(span);
+        }
     }
     direct
+}
+
+#[cfg(test)]
+#[test]
+fn quantified_runtime_effect_inventory() {
+    let source = "fn pre(n:i64) requires forall(0,n,|i:i64|i>=0) {} fn post(n:i64) ensures exists(0,n,|i:i64|i==0) {} fn body(n:i64)->bool {return forall(0,n,|i:i64|i>=0);} fn scalar(n:i64) requires n>=0 {}";
+    let (program, errors) =
+        crate::parser::Parser::new(crate::lexer::Lexer::new(source).tokenize().unwrap()).parse();
+    assert!(errors.is_empty());
+    for item in &program.items {
+        let Item::Function(f) = item else { panic!() };
+        let effects = with_contract_effects(
+            scan_direct_effects(
+                FunctionId::free(&f.name),
+                f.body.id,
+                &f.body,
+                &HashMap::<ExprId, Type>::new(),
+                None,
+                true,
+            ),
+            contract_runtime_effects(f),
+        );
+        let loops = f.name != "scalar";
+        assert_eq!(effects[0].preemption_loop, loops, "{}", f.name);
+        assert_eq!(effects[0].loop_span.is_some(), loops, "{}", f.name);
+        assert_eq!(effects.len(), 1, "binders must not become callable bodies");
+    }
 }

@@ -1,6 +1,7 @@
-//! Versioned scalar contract comparison. Unknown evidence is never preservation.
+//! Versioned scalar and immutable-data contract comparison. Unknown evidence is never preservation.
 use super::*;
 use crate::parser::iter::{AstEvent, AstWalk};
+use crate::semantic::field_writes::FieldWrites;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 
@@ -37,7 +38,7 @@ fn normalize(v: &mut Json) {
         _ => {}
     }
 }
-fn canonical(v: impl Serialize) -> Json {
+pub(super) fn canonical(v: impl Serialize) -> Json {
     let mut v = serde_json::to_value(v).expect("AST serialization");
     normalize(&mut v);
     v
@@ -68,6 +69,34 @@ impl Lock {
 pub(super) fn contract_digest(f: &FunctionDecl) -> String {
     digest(&canonical(json!({"schema":"willow.typed-contract.v1","signature":signature(f),"attributes":f.effect_contracts,"requires":f.requires,"ensures":f.ensures})).to_string())
 }
+// Serialize declarations once per snapshot, not once for every function using them.
+// Their complete canonical definitions include constructor/method bodies and defaults.
+fn data_identity(program: &Program) -> (Option<String>, usize) {
+    let mut declarations: Vec<_> = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Class(c) => Some((c.name.as_str(), item)),
+            Item::Enum(e) => Some((e.name.as_str(), item)),
+            _ => None,
+        })
+        .collect();
+    if declarations.is_empty() {
+        return (None, 0);
+    }
+    declarations.sort_by(|a, b| a.0.cmp(b.0));
+    let serialized = canonical(declarations).to_string();
+    (Some(digest(&serialized)), serialized.len())
+}
+
+fn with_data_identity(identity: String, data: Option<&str>) -> String {
+    match data {
+        Some(data) => digest(&json!({"identity":identity,"data_declarations":data}).to_string()),
+        // Keep scalar-only lock identities compatible with the original normalization.
+        None => identity,
+    }
+}
+
 fn relevant(f: &FunctionDecl) -> bool {
     !f.requires.is_empty()
         || !f.ensures.is_empty()
@@ -83,6 +112,7 @@ pub struct Snapshot {
     pub semantic_identities: BTreeMap<String, String>,
     pub dependency_edges: usize,
     pub canonical_bytes: usize,
+    data_digest: Option<String>,
 }
 pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> Snapshot {
     let symbols = crate::semantic::ids::SymbolInterner::new();
@@ -130,10 +160,10 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
     if program
         .items
         .iter()
-        .any(|i| !matches!(i, Item::Function(_)))
+        .any(|i| !matches!(i, Item::Function(_) | Item::Class(_) | Item::Enum(_)))
     {
         errors.push(
-            "comparison currently requires top-level scalar declarations without imports".into(),
+            "comparison requires top-level functions and data declarations without imports".into(),
         );
     }
     let verification = verify_cached(&program, options, prior_error || !errors.is_empty(), cache);
@@ -159,12 +189,15 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
     let mut local = Vec::new();
     let mut contracts = Vec::new();
     let mut edges = Vec::new();
-    let mut bytes = 0;
+    let (data_digest, mut bytes) = data_identity(&program);
     for f in &fs {
         let body = canonical(f).to_string();
         bytes += body.len();
         local.push(digest(&body));
-        contracts.push(contract_digest(f));
+        contracts.push(with_data_identity(
+            contract_digest(f),
+            data_digest.as_deref(),
+        ));
         let mut deps = encode::edges(f, &names);
         for event in AstWalk::new(AstEvent::Block(&f.body)).chain(
             f.requires
@@ -195,7 +228,8 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
                     .iter()
                     .map(|&d| (&fs[d].name, &semantic[d]))
                     .collect();
-                dependency_digests[id] = digest(&json!(deps).to_string());
+                dependency_digests[id] =
+                    with_data_identity(digest(&json!(deps).to_string()), data_digest.as_deref());
                 semantic[id] = digest(
                     &json!({"local":local[id],"dependencies":dependency_digests[id]}).to_string(),
                 );
@@ -252,6 +286,7 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
         errors,
         dependency_edges: edges.iter().map(BTreeSet::len).sum(),
         canonical_bytes: bytes,
+        data_digest,
     }
 }
 
@@ -310,6 +345,11 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
         .enumerate()
         .map(|(i, f)| (f.name.as_str(), i + split))
         .collect();
+    let data_a = DataTypes::new(&a.program, &FieldWrites::from_program(&a.program));
+    let data_b = DataTypes::new(&b.program, &FieldWrites::from_program(&b.program));
+    // An identical spelling with a different representation cannot share solver sorts.
+    // Conservatively require unchanged data declarations and immutable type domains.
+    let data_changed = a.data_digest != b.data_digest || data_a.definitions != data_b.definitions;
     let mut engine = if !valid_budget(options) {
         Err("invalid verification timeout/resource budget".into())
     } else {
@@ -320,6 +360,8 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
             "{PRELUDE}(set-option :rlimit {})\n",
             options.resource_limit
         ))?;
+        // Both revisions use the same sort names. Declare the shared model only once.
+        s.exchange(&data_a.definitions)?;
         Ok(s)
     });
     let keys: BTreeSet<_> = old.keys().chain(new.keys()).copied().collect();
@@ -359,6 +401,9 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
             if signature(fa) != signature(fb) {
                 status = "NOT_PRESERVED";
                 reasons.push("signature changed".to_owned());
+            } else if data_changed {
+                status = "NOT_PRESERVED";
+                reasons.push("data declarations or immutable domains changed".into());
             } else if pure_a && (!pure_b || b.purity_losses.contains(key)) {
                 status = "NOT_PRESERVED";
                 reasons.push("purity guarantee lost".into());
@@ -367,8 +412,8 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
                     let i = names_a[key];
                     let j = names_b[key];
                     let s = engine.as_mut().map_err(|e| e.clone())?;
-                    let ca = contract_predicates(i, &functions, &names_a)?;
-                    let cb = contract_predicates(j, &functions, &names_b)?;
+                    let ca = contract_predicates(i, &functions, &names_a, &data_a)?;
+                    let cb = contract_predicates(j, &functions, &names_b, &data_b)?;
                     predicate_bytes += ca.len() + cb.len();
                     s.exchange(&ca)?;
                     s.exchange(&cb)?;
@@ -376,20 +421,20 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
                     let mut domain = vec!["true".into()];
                     for (n, p) in fa.params.iter().enumerate() {
                         let v = format!("cmp{i}_{n}");
+                        data_a.check(&p.ty)?;
+                        data_b.check(&p.ty)?;
                         let ty = sort(&p.ty)?;
                         s.exchange(&format!("(declare-const {v} {ty})\n"))?;
-                        if ty == "Int" {
-                            domain.push(bounds(&v));
-                        }
+                        domain.push(super::data::domain(&p.ty, &v));
                         input_symbols.insert(v.clone(), p.name.clone());
                         args.push(v);
                     }
                     let ret = format!("cmp{i}_return");
+                    data_a.check(&fa.return_type)?;
+                    data_b.check(&fa.return_type)?;
                     let ty = sort(&fa.return_type)?;
                     s.exchange(&format!("(declare-const {ret} {ty})\n"))?;
-                    if ty == "Int" {
-                        domain.push(bounds(&ret));
-                    }
+                    domain.push(super::data::domain(&fa.return_type, &ret));
                     let pre_a = application(&format!("c{i}_pre"), &args);
                     let pre_b = application(&format!("c{j}_pre"), &args);
                     let ps_a = application(&format!("c{i}_pre_safe"), &args);

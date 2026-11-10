@@ -228,6 +228,16 @@ impl TypeChecker {
                 Item::Enum(e) => (&e.name, e.span, "enum", !e.type_params.is_empty()),
                 Item::Interface(i) => (&i.name, i.span, "interface", !i.type_params.is_empty()),
             };
+            if matches!(name.as_str(), "forall" | "exists") {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E2631,
+                        "forall and exists are reserved quantifier names",
+                    )
+                    .with_label(Label::primary(span, "reserved declaration name")),
+                );
+            }
             if let Some(&(first_span, first_kind, first_generic)) = declarations.get(name) {
                 self.cached_duplicate_declaration(
                     name,
@@ -430,7 +440,11 @@ impl TypeChecker {
             }
         }
         if self.effect_graph_only.is_none() && !self.defer_static_verification {
-            let diagnostics = crate::semantic::verification::check(program, &self.errors);
+            let diagnostics = crate::semantic::verification::check(
+                program,
+                &self.errors,
+                self.field_writes.as_deref().expect("field write analysis"),
+            );
             for diagnostic in diagnostics {
                 self.push(diagnostic);
             }
@@ -2077,7 +2091,7 @@ impl TypeChecker {
     }
 
     fn check_while_stmt(&mut self, s: &WhileStmt) {
-        self.check_loop_contracts(s);
+        self.check_loop_contracts(&s.invariants, s.variant.as_ref());
         let errors_before = self.error_generation;
         let cond_ty = self.check_expr(&s.cond);
         self.check_condition_is_bool(&s.cond, &cond_ty, errors_before);
@@ -2171,6 +2185,20 @@ impl TypeChecker {
                 },
             );
         }
+        self.symbols.push_scope();
+        if !matches!(s.iterable, Expr::Range(_)) {
+            self.define_var(
+                "iteration".into(),
+                VarInfo {
+                    ty: Type::I64,
+                    mutable: false,
+                    is_param: false,
+                    declaration_span: s.span,
+                },
+            );
+        }
+        self.check_loop_contracts(&s.invariants, s.variant.as_ref());
+        self.symbols.pop_scope();
         self.local.loop_depth += 1;
         self.local.lexical_block_depth += 1;
         for stmt in &s.body.stmts {
@@ -2787,6 +2815,8 @@ impl TypeChecker {
             // A variant constructor (`Err(e)` inferred without context) is a
             // value, like the contextual form that never records a call.
             Expr::Call(call) if self.enum_variant_resolutions.contains_key(&call.id) => return,
+            // Quantifiers bind a predicate in this callable; there is no call or closure.
+            Expr::Call(call) if matches!(call.callee.as_str(), "forall" | "exists") => return,
             Expr::Call(call) => {
                 if self.symbols.lookup_var(&call.callee).is_some() {
                     Vec::new()
@@ -3231,6 +3261,100 @@ impl TypeChecker {
                 Self::error_type()
             }
             Expr::Binary(_) | Expr::Unary(_) => self.check_operator_tree(expr),
+            Expr::Call(c) if matches!(c.callee.as_str(), "forall" | "exists") => {
+                if c.args.len() != 3 || !c.type_args.is_empty() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E2631,
+                            "quantifiers require two i64 bounds and one predicate binder",
+                        )
+                        .with_label(Label::primary(c.span, "unsupported quantified expression")),
+                    );
+                    return Self::error_type();
+                }
+                self.reject_reference_args(&c.callee, &c.args);
+                for bound in &c.args[..2] {
+                    if self.check_expr(&bound.expr) != Type::I64 {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E2631,
+                                "quantifier bounds must have type i64",
+                            )
+                            .with_label(Label::primary(bound.span, "invalid bound")),
+                        );
+                    }
+                }
+                let Expr::Lambda(predicate) = &c.args[2].expr else {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E2631,
+                            "quantifier predicate must be an expression-bodied |index:i64| binder",
+                        )
+                        .with_label(Label::primary(c.args[2].span, "invalid predicate")),
+                    );
+                    return Self::error_type();
+                };
+                if predicate.params.len() != 1
+                    || predicate.params[0]
+                        .ty
+                        .as_ref()
+                        .is_some_and(|ty| *ty != Type::I64)
+                    || predicate
+                        .return_type
+                        .as_ref()
+                        .is_some_and(|ty| *ty != Type::Bool)
+                {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E2631,
+                            "quantifier predicate requires one i64 binder and a bool result",
+                        )
+                        .with_label(Label::primary(
+                            predicate.span,
+                            "invalid predicate signature",
+                        )),
+                    );
+                    return Self::error_type();
+                }
+                let LambdaBody::Expr(body) = &predicate.body else {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E2631,
+                            "quantifier predicates must be expression-bodied",
+                        )
+                        .with_label(Label::primary(predicate.span, "unsupported predicate body")),
+                    );
+                    return Self::error_type();
+                };
+                self.symbols.push_scope();
+                self.define_var(
+                    predicate.params[0].name.clone(),
+                    VarInfo {
+                        ty: Type::I64,
+                        mutable: false,
+                        is_param: false,
+                        declaration_span: predicate.params[0].span,
+                    },
+                );
+                let ty = self.check_expr(body);
+                self.symbols.pop_scope();
+                if ty != Type::Bool {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E2631,
+                            "quantifier predicate must have type bool",
+                        )
+                        .with_label(Label::primary(body.span(), "invalid predicate result")),
+                    );
+                }
+                Type::Bool
+            }
             Expr::Call(c) => {
                 // Lexical value bindings win over module/free-function names.
                 // Looking up the free function first silently compiled

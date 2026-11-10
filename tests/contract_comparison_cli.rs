@@ -317,3 +317,95 @@ fn contract_repair_cli_exposes_evidence_and_rechecks_fixed_source() {
             .any(|o| o["counterexample_candidate"].is_string())
     );
 }
+
+#[test]
+fn contract_comparison_cli_immutable_data_and_quantified_lock() {
+    let root = std::env::temp_dir().join(format!(
+        "willow-immutable-contract-cli-{}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "user.name", "Fixture"]);
+    git(&root, &["config", "user.email", "fixture@example.invalid"]);
+    let source = "class Limit {pub value:i64;} enum Value { Present(i64), Empty } @pure @verified fn first(a:FrozenArray<i64>, limit:Limit)->i64 requires a.len()>0 requires forall(0,a.len(),|i:i64| a[i]>=limit.value) ensures result>=limit.value {return a[0];} @pure @verified fn decode(v:Value)->i64 ensures result==match v {Value::Present(x)=>x,Value::Empty=>0} {return match v {Value::Present(x)=>x,Value::Empty=>0};} fn main() {}";
+    fs::write(root.join("main.wi"), source).unwrap();
+    git(&root, &["add", "main.wi"]);
+    git(
+        &root,
+        &["commit", "-qm", "Initial immutable contract fixture"],
+    );
+    let initial = git(&root, &["rev-parse", "HEAD"]);
+    let run = |base: &str, write: bool, expected: i32| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_willow"));
+        cmd.args(["verify-edit", "--root"]).arg(&root).args([
+            "--base",
+            base,
+            "--protected-base",
+            base,
+            "--schema",
+            "v2",
+            "--format",
+            "json",
+        ]);
+        if write {
+            cmd.arg("--write-contracts-lock");
+        }
+        let output = cmd.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let generated = run(&initial, true, 0);
+    assert!(
+        generated["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["contract_preserved"] == "PROVEN"),
+        "{generated}"
+    );
+    let lock = fs::read(root.join("contracts.lock")).unwrap();
+    git(&root, &["add", "contracts.lock"]);
+    git(&root, &["commit", "-qm", "Protect immutable contracts"]);
+    let protected = git(&root, &["rev-parse", "HEAD"]);
+    let unchanged = run(&protected, false, 0);
+    assert_eq!(unchanged["summary"]["lock_manifest"]["change"], "unchanged");
+    fs::write(
+        root.join("main.wi"),
+        source.replace("ensures result>=limit.value", "ensures true"),
+    )
+    .unwrap();
+    let changed = run(&protected, false, 3);
+    assert!(
+        changed["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["contract_preserved"] == "NOT_PRESERVED"),
+        "{changed}"
+    );
+    fs::write(
+        root.join("main.wi"),
+        source.replace("pub value:i64;", "pub value:i64; pub label:bool;"),
+    )
+    .unwrap();
+    let changed = run(&protected, false, 3);
+    assert_eq!(
+        changed["summary"]["approval"]["semantic_dependencies_changed"], true,
+        "{changed}"
+    );
+    assert_eq!(fs::read(root.join("contracts.lock")).unwrap(), lock);
+}

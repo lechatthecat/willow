@@ -6,12 +6,14 @@ use crate::qualified_name::QualifiedName;
 pub(super) struct Value {
     pub text: String,
     pub boolean: bool,
+    pub ty: Type,
 }
 impl Value {
     fn literal(text: impl Into<String>, boolean: bool) -> Self {
         Self {
             text: text.into(),
             boolean,
+            ty: if boolean { Type::Bool } else { Type::I64 },
         }
     }
 }
@@ -28,14 +30,10 @@ pub(super) fn bounds(v: &str) -> String {
 pub(super) fn has(f: &FunctionDecl, k: EffectContractKind) -> bool {
     f.effect_contracts.iter().any(|c| c.kind == k)
 }
-pub(super) fn sort(t: &Type) -> Result<&'static str, String> {
-    match t {
-        Type::I64 => Ok("Int"),
-        Type::Bool => Ok("Bool"),
-        _ => Err("V1 supports only i64/bool".into()),
-    }
-}
 pub(super) struct Summary {
+    #[cfg(test)]
+    pub assembly_bytes: usize,
+    pub data_digest: String,
     pub definitions: String,
     pub contract_definitions: String,
     pub nodes: usize,
@@ -53,6 +51,7 @@ struct State {
     returned: Value,
 }
 struct Encoder<'a> {
+    data: &'a DataTypes,
     functions: &'a [&'a FunctionDecl],
     names: &'a HashMap<&'a str, usize>,
     nodes: Vec<(Value, String)>,
@@ -65,10 +64,22 @@ struct Encoder<'a> {
     loop_symbols: std::collections::BTreeMap<String, String>,
     loop_writes: HashMap<BodyId, BTreeSet<String>>,
     verified: bool,
+    jumps: Vec<(Value, Value)>,
+    next_quantifier: usize,
+    scoped_nodes: usize,
+    fragments: Vec<String>,
 }
 impl Encoder<'_> {
+    fn typed_node(&mut self, expr: String, ty: &Type) -> Result<Value, String> {
+        self.data.check(ty)?;
+        let mut value = self.node(expr, *ty == Type::Bool)?;
+        value.ty = ty.clone();
+        self.nodes.last_mut().unwrap().0.ty = ty.clone();
+        Ok(value)
+    }
+
     fn node(&mut self, expr: String, boolean: bool) -> Result<Value, String> {
-        if self.nodes.len() >= 100_000 {
+        if self.nodes.len() + self.scoped_nodes >= 100_000 {
             return Err("VC node budget exceeded".into());
         }
         let value = Value::literal(format!("v{}", self.nodes.len()), boolean);
@@ -110,10 +121,59 @@ impl Encoder<'_> {
                     _ => Err(format!("unknown scalar binding `{n}`")),
                 }
             }
+            Expr::Index(array, index, ..) => {
+                let array = self.expr(array, state, gate)?;
+                let index = self.expr(index, state, gate)?;
+                let element = frozen_element(&array.ty)
+                    .ok_or("index requires immutable FrozenArray")?
+                    .clone();
+                if index.ty != Type::I64 {
+                    return Err("array index must be i64".into());
+                }
+                let key = type_key(&array.ty);
+                self.guard(
+                    gate,
+                    format!(
+                        "(and (<= 0 {}) (< {} (len_{key} {})))",
+                        index.text, index.text, array.text
+                    ),
+                )?;
+                self.typed_node(
+                    format!("(select (values_{key} {}) {})", array.text, index.text),
+                    &element,
+                )
+            }
+            Expr::FieldAccess(object, field, ..) => {
+                let object = self.expr(object, state, gate)?;
+                let fields = self
+                    .data
+                    .fields
+                    .get(&object.ty)
+                    .ok_or("field access requires an immutable record")?;
+                let (index, ty) = fields.get(field).ok_or("unknown record field")?;
+                let index = *index;
+                let ty = ty.clone();
+                self.typed_node(
+                    format!("({} {})", selector(&object.ty, 0, index), object.text),
+                    &ty,
+                )
+            }
+            Expr::MethodCall(c) if c.method == "len" && c.args.is_empty() => {
+                let object = self.expr(&c.object, state, gate)?;
+                frozen_element(&object.ty).ok_or("len requires immutable FrozenArray")?;
+                self.node(
+                    format!("(len_{} {})", type_key(&object.ty), object.text),
+                    false,
+                )
+            }
+            Expr::Match(m) => self.match_expr(m, state, gate),
+            Expr::Call(c) if matches!(c.callee.as_str(), "forall" | "exists") => {
+                self.quantifier(c, state, gate)
+            }
             Expr::Unary(u) => {
                 let v = self.expr(&u.expr, state, gate)?;
                 match u.op {
-                    UnaryOp::Neg if !v.boolean => {
+                    UnaryOp::Neg if v.ty == Type::I64 => {
                         let r = self.node(format!("(- {})", v.text), false)?;
                         self.guard(gate, bounds(&r.text))?;
                         Ok(r)
@@ -149,9 +209,9 @@ impl Encoder<'_> {
                     _ => return Err("unsupported binary operation".into()),
                 };
                 let valid = match b.op {
-                    BinOp::Eq | BinOp::Ne => l.boolean == r.boolean,
+                    BinOp::Eq | BinOp::Ne => l.ty == r.ty && matches!(l.ty, Type::I64 | Type::Bool),
                     BinOp::And | BinOp::Or => l.boolean && r.boolean,
-                    _ => !l.boolean && !r.boolean,
+                    _ => l.ty == Type::I64 && r.ty == Type::I64,
                 };
                 if !valid {
                     return Err("invalid operand types".into());
@@ -174,10 +234,10 @@ impl Encoder<'_> {
                 let no = self.node(format!("(and {} (not {}))", gate.text, c.text), true)?;
                 let a = self.expr(&t.then_expr, state, &yes)?;
                 let b = self.expr(&t.else_expr, state, &no)?;
-                if a.boolean != b.boolean {
+                if a.ty != b.ty {
                     return Err("branch type mismatch".into());
                 }
-                self.node(format!("(ite {} {} {})", c.text, a.text, b.text), a.boolean)
+                self.typed_node(format!("(ite {} {} {})", c.text, a.text, b.text), &a.ty)
             }
             Expr::Call(c) => {
                 if !c.type_args.is_empty() || state.env.contains_key(&c.callee) {
@@ -200,7 +260,7 @@ impl Encoder<'_> {
                         return Err("reference argument".into());
                     }
                     let v = self.expr(a, state, gate)?;
-                    if v.boolean != (sort(&p.ty)? == "Bool") {
+                    if v.ty != p.ty {
                         return Err("argument type mismatch".into());
                     }
                     args.push(v.text);
@@ -216,29 +276,23 @@ impl Encoder<'_> {
                     // It is an obligation, never an assumed axiom.
                     self.guard(gate, call("post"))?;
                 }
-                let result = self.node(
+                let result = self.typed_node(
                     call(if has(f, EffectContractKind::Verified) {
                         "contract"
                     } else {
                         "value"
                     }),
-                    sort(&f.return_type)? == "Bool",
+                    &f.return_type,
                 )?;
                 let assumption = if has(f, EffectContractKind::Verified) {
                     let mut domain = vec![gate.text.clone(), call("pre_safe"), call("pre")];
                     for (a, p) in args.iter().zip(&f.params) {
-                        if p.ty == Type::I64 {
-                            domain.push(bounds(a));
-                        }
+                        domain.push(data::domain(&p.ty, a));
                     }
                     let mut post_args = args.clone();
                     post_args.push(result.text.clone());
                     let post = application(&format!("f{id}_ensures"), &post_args);
-                    let range = if result.boolean {
-                        "true".into()
-                    } else {
-                        bounds(&result.text)
-                    };
+                    let range = data::domain(&result.ty, &result.text);
                     format!("(=> (and {}) (and {range} {post}))", domain.join(" "))
                 } else {
                     format!("(=> {} {})", gate.text, call("assume"))
@@ -250,6 +304,173 @@ impl Encoder<'_> {
             _ => Err("unsupported expression in i64/bool V1".into()),
         }
     }
+    fn quantifier(&mut self, c: &CallExpr, state: &State, gate: &Value) -> Result<Value, String> {
+        if c.args.len() != 3
+            || !c.type_args.is_empty()
+            || c.args.iter().any(|a| a.mode != CallArgMode::Value)
+        {
+            return Err("quantifier requires bounds and a predicate".into());
+        }
+        let low = self.expr(&c.args[0], state, gate)?;
+        let high = self.expr(&c.args[1], state, gate)?;
+        if low.ty != Type::I64 || high.ty != Type::I64 {
+            return Err("quantifier bounds must be i64".into());
+        }
+        let Expr::Lambda(lambda) = &c.args[2].expr else {
+            return Err("quantifier requires a lambda binder".into());
+        };
+        if lambda.params.len() != 1
+            || lambda.params[0]
+                .ty
+                .as_ref()
+                .is_some_and(|t| *t != Type::I64)
+        {
+            return Err("quantifier binder must be i64".into());
+        }
+        let LambdaBody::Expr(predicate) = &lambda.body else {
+            return Err("quantifier predicate must be an expression".into());
+        };
+        let first = self.nodes.len();
+        let safe_first = self.safety.len();
+        let assumption_first = self.assumptions.len();
+        let symbol = format!("q{}", self.next_quantifier);
+        self.next_quantifier += 1;
+        let mut bound = state.clone();
+        bound.env.insert(
+            lambda.params[0].name.clone(),
+            Value::literal(&symbol, false),
+        );
+        let range = format!(
+            "(and (<= {} {symbol}) (< {symbol} {}))",
+            low.text, high.text
+        );
+        let value = self.expr(predicate, &bound, &Value::literal(&range, true))?;
+        if value.ty != Type::Bool || self.assumptions.len() != assumption_first {
+            return Err("unsupported quantified predicate".into());
+        }
+        let safety = self.safety.split_off(safe_first);
+        let nodes = self.nodes.split_off(first);
+        self.scoped_nodes += nodes.len();
+        let wrap = |result: String| scoped_lets(&nodes, &result);
+        let safe = wrap(format!("(and true {})", safety.join(" ")));
+        let safe = self.fragment(format!("(forall (({symbol} Int)) {safe})"), first);
+        self.guard(gate, safe)?;
+        let formula = if c.callee == "forall" {
+            format!("(=> {range} {})", value.text)
+        } else {
+            format!("(and {range} {})", value.text)
+        };
+        let formula = wrap(formula);
+        let formula = self.fragment(format!("({} (({symbol} Int)) {formula})", c.callee), first);
+        self.node(formula, true)
+    }
+    fn match_expr(&mut self, m: &MatchExpr, state: &State, gate: &Value) -> Result<Value, String> {
+        let value = self.expr(&m.scrutinee, state, gate)?;
+        let mut remaining = gate.clone();
+        let mut result: Option<Value> = None;
+        for arm in &m.arms {
+            let mut branch = state.clone();
+            let condition = match &arm.pattern {
+                Pattern::Wildcard(..) => Value::literal("true", true),
+                Pattern::Binding { name, .. } => {
+                    branch.env.insert(name.clone(), value.clone());
+                    Value::literal("true", true)
+                }
+                Pattern::LiteralBool(b, ..) if value.ty == Type::Bool => {
+                    self.node(format!("(= {} {b})", value.text), true)?
+                }
+                Pattern::LiteralInt(n, ..) if value.ty == Type::I64 => {
+                    self.node(format!("(= {} {})", value.text, integer(*n)), true)?
+                }
+                Pattern::EnumVariant {
+                    enum_name, variant, ..
+                }
+                | Pattern::EnumVariantTuple {
+                    enum_name, variant, ..
+                } => {
+                    if value.ty != Type::Named(enum_name.clone()) {
+                        return Err("unsupported enum pattern type".into());
+                    }
+                    let ctors = self
+                        .data
+                        .constructors
+                        .get(&value.ty)
+                        .ok_or("unsupported enum")?;
+                    let i = *self
+                        .data
+                        .variants
+                        .get(&value.ty)
+                        .and_then(|variants| variants.get(variant))
+                        .ok_or("unknown enum variant")?;
+                    let ctor = &ctors[i];
+                    if let Pattern::EnumVariantTuple { bindings, .. } = &arm.pattern {
+                        if bindings.len() != ctor.fields.len() {
+                            return Err("enum pattern arity mismatch".into());
+                        }
+                        for (j, (binding, (_, ty))) in bindings.iter().zip(&ctor.fields).enumerate()
+                        {
+                            branch.env.insert(
+                                binding.clone(),
+                                Value {
+                                    text: format!("({} {})", selector(&value.ty, i, j), value.text),
+                                    boolean: *ty == Type::Bool,
+                                    ty: ty.clone(),
+                                },
+                            );
+                        }
+                    } else if !ctor.fields.is_empty() {
+                        return Err("enum payload required".into());
+                    }
+                    self.node(
+                        format!("((_ is {}) {})", constructor(&value.ty, i), value.text),
+                        true,
+                    )?
+                }
+                _ => return Err("unsupported match pattern".into()),
+            };
+            let mut selected = self.and(&remaining, &condition)?;
+            if let Some(guard) = &arm.guard {
+                let test = self.expr(guard, &branch, &selected)?;
+                if !test.boolean {
+                    return Err("non-boolean match guard".into());
+                }
+                selected = self.and(&selected, &test)?;
+            }
+            let MatchBody::Expr(expression) = &arm.body else {
+                return Err("proof match requires expression arms".into());
+            };
+            let branch_value = self.expr(expression, &branch, &selected)?;
+            result = Some(if let Some(previous) = result {
+                if previous.ty != branch_value.ty {
+                    return Err("match result type mismatch".into());
+                }
+                self.typed_node(
+                    format!(
+                        "(ite {} {} {})",
+                        selected.text, branch_value.text, previous.text
+                    ),
+                    &previous.ty,
+                )?
+            } else {
+                self.typed_node(
+                    format!(
+                        "(ite {} {} {})",
+                        selected.text,
+                        branch_value.text,
+                        default_value(&branch_value.ty)
+                    ),
+                    &branch_value.ty,
+                )?
+            });
+            remaining = self.node(
+                format!("(and {} (not {}))", remaining.text, selected.text),
+                true,
+            )?;
+        }
+        self.guard(gate, format!("(not {})", remaining.text))?;
+        result.ok_or_else(|| "empty match".into())
+    }
+
     fn block(&mut self, block: &Block, state: &mut State, depth: usize) -> Result<(), String> {
         if depth > 256 {
             return Err("block depth budget exceeded".into());
@@ -260,7 +481,7 @@ impl Encoder<'_> {
                 Stmt::Let(s) => {
                     let v = self.expr(&s.init, state, &state.alive.clone())?;
                     if let Some(t) = &s.ty
-                        && v.boolean != (sort(t)? == "Bool")
+                        && v.ty != *t
                     {
                         return Err("local type mismatch".into());
                     }
@@ -272,12 +493,12 @@ impl Encoder<'_> {
                 Stmt::Assign(s) => {
                     let old = state.env.get(&s.name).ok_or("unknown assignment")?.clone();
                     let v = self.expr(&s.value, state, &state.alive.clone())?;
-                    if old.boolean != v.boolean {
+                    if old.ty != v.ty {
                         return Err("assignment type mismatch".into());
                     }
-                    let merged = self.node(
+                    let merged = self.typed_node(
                         format!("(ite {} {} {})", state.alive.text, v.text, old.text),
-                        old.boolean,
+                        &old.ty,
                     )?;
                     state.env.insert(s.name.clone(), merged);
                 }
@@ -300,22 +521,47 @@ impl Encoder<'_> {
                         true,
                     )?;
                 }
-                Stmt::While(s) => self.while_loop(s, state, depth + 1)?,
+                Stmt::While(s) => self.loop_body(
+                    &s.cond,
+                    &s.invariants,
+                    s.variant.as_ref(),
+                    &s.body,
+                    s.span,
+                    state,
+                    depth + 1,
+                    None,
+                    None,
+                )?,
+                Stmt::For(s) => self.for_loop(s, state, depth + 1)?,
+                Stmt::Break(_) | Stmt::Continue(_) => {
+                    let (broken, continued) =
+                        self.jumps.last().cloned().ok_or("jump outside loop")?;
+                    let is_break = matches!(stmt, Stmt::Break(_));
+                    let old = if is_break { &broken } else { &continued };
+                    let merged =
+                        self.node(format!("(or {} {})", old.text, state.alive.text), true)?;
+                    *self.jumps.last_mut().unwrap() = if is_break {
+                        (merged, continued)
+                    } else {
+                        (broken, merged)
+                    };
+                    state.alive = Value::literal("false", true);
+                }
                 Stmt::Return(s) => {
                     let v = self.expr(
                         s.value.as_ref().ok_or("void return outside V1")?,
                         state,
                         &state.alive.clone(),
                     )?;
-                    if v.boolean != state.result.boolean {
+                    if v.ty != state.result.ty {
                         return Err("return type mismatch".into());
                     }
-                    state.result = self.node(
+                    state.result = self.typed_node(
                         format!(
                             "(ite {} {} {})",
                             state.alive.text, v.text, state.result.text
                         ),
-                        v.boolean,
+                        &v.ty,
                     )?;
                     state.returned = self.node(
                         format!("(or {} {})", state.returned.text, state.alive.text),
@@ -342,15 +588,33 @@ impl Encoder<'_> {
         }
         Ok(())
     }
-    fn loop_invariant(
+    fn loop_annotation(
         &mut self,
-        s: &WhileStmt,
+        expr: &Expr,
         state: &State,
         gate: &Value,
+        index: Option<&str>,
+    ) -> Result<Value, String> {
+        if let Some(index) = index {
+            let mut annotated = state.clone();
+            annotated
+                .env
+                .insert("iteration".into(), state.env[index].clone());
+            self.expr(expr, &annotated, gate)
+        } else {
+            self.expr(expr, state, gate)
+        }
+    }
+    fn loop_invariant(
+        &mut self,
+        invariants: &[Expr],
+        state: &State,
+        gate: &Value,
+        index: Option<&str>,
     ) -> Result<Value, String> {
         let mut result = gate.clone();
-        for expr in &s.invariants {
-            let value = self.expr(expr, state, &result)?;
+        for expr in invariants {
+            let value = self.loop_annotation(expr, state, &result, index)?;
             if !value.boolean {
                 return Err("loop invariant must have type bool".into());
             }
@@ -359,23 +623,38 @@ impl Encoder<'_> {
         Ok(result)
     }
 
-    fn while_loop(&mut self, s: &WhileStmt, state: &mut State, depth: usize) -> Result<(), String> {
+    #[allow(clippy::too_many_arguments)]
+    fn loop_body(
+        &mut self,
+        cond: &Expr,
+        invariants: &[Expr],
+        variant: Option<&Expr>,
+        body_block: &Block,
+        span: Span,
+        state: &mut State,
+        depth: usize,
+        step: Option<&str>,
+        element: Option<(&str, &Value)>,
+    ) -> Result<(), String> {
         if !self.verified {
             return Err("a helper containing loops must itself be @verified".into());
         }
-        let variant = s
-            .variant
-            .as_ref()
-            .filter(|_| !s.invariants.is_empty())
+        let variant = variant
+            .filter(|_| !invariants.is_empty())
             .ok_or("while verification requires both invariant and variant")?;
         let incoming = state.alive.clone();
-        let entry = self.loop_invariant(s, state, &incoming)?;
+        let annotation_index = element.and(step);
+        let entry = self.loop_invariant(invariants, state, &incoming, annotation_index)?;
         self.guard(&incoming, entry.text)?;
 
         // One arbitrary loop head represents every iteration. Only writes to
         // bindings visible at the head are forgotten; lexical locals stay local.
         let mut head = state.clone();
-        let writes = self.loop_writes.remove(&s.body.id).unwrap_or_default();
+        let mut writes = self.loop_writes.remove(&body_block.id).unwrap_or_default();
+        if let Some(name) = step {
+            writes.insert(name.to_owned());
+        }
+        let written = writes.clone();
         for name in writes {
             let Some(old) = head.env.get(&name) else {
                 continue;
@@ -386,37 +665,90 @@ impl Encoder<'_> {
             );
             self.loop_symbols.insert(
                 value.text.clone(),
-                QualifiedName::join(format_args!("loop@{}:{}", s.span.line, s.span.col), &name),
+                QualifiedName::join(
+                    format_args!("loop@{}:{}", span.line, span.col),
+                    if name.starts_with("$for_index_") {
+                        "iteration"
+                    } else {
+                        &name
+                    },
+                ),
             );
+            let mut value = value;
+            value.ty = old.ty.clone();
             self.havoc.push(value.clone());
-            if !value.boolean {
-                let domain = self.node(bounds(&value.text), true)?;
+            if value.ty != Type::Bool {
+                let domain = self.node(domain(&value.ty, &value.text), true)?;
                 head.alive = self.and(&head.alive, &domain)?;
             }
             let previous = head.env.get(&name).unwrap();
-            let merged = self.node(
+            let merged = self.typed_node(
                 format!("(ite {} {} {})", incoming.text, value.text, previous.text),
-                value.boolean,
+                &value.ty,
             )?;
             head.env.insert(name, merged);
         }
-        head.alive = self.loop_invariant(s, &head, &head.alive.clone())?;
-        let condition = self.expr(&s.cond, &head, &head.alive.clone())?;
+        if let Some((_, array)) = element {
+            let index = &head.env[step.expect("array iteration index")];
+            let valid = self.node(
+                format!(
+                    "(and (<= 0 {}) (<= {} (len_{} {})))",
+                    index.text,
+                    index.text,
+                    type_key(&array.ty),
+                    array.text
+                ),
+                true,
+            )?;
+            head.alive = self.and(&head.alive, &valid)?;
+        }
+        head.alive =
+            self.loop_invariant(invariants, &head, &head.alive.clone(), annotation_index)?;
+        let condition = self.expr(cond, &head, &head.alive.clone())?;
         if !condition.boolean {
             return Err("non-boolean loop condition".into());
         }
         let mut body = head.clone();
         body.alive = self.and(&head.alive, &condition)?;
-        let rank = self.expr(variant, &head, &body.alive.clone())?;
-        if rank.boolean {
+        let rank = self.loop_annotation(variant, &head, &body.alive.clone(), annotation_index)?;
+        if rank.ty != Type::I64 {
             return Err("loop variant must have type i64".into());
         }
         self.guard(&body.alive, format!("(<= 0 {})", rank.text))?;
-        self.block(&s.body, &mut body, depth)?;
-        let preserved = self.loop_invariant(s, &body, &body.alive.clone())?;
+        if let Some((binding, array)) = element {
+            let index = &head.env[step.expect("array iteration index")];
+            let ty = frozen_element(&array.ty).expect("frozen element");
+            let value = self.typed_node(
+                format!(
+                    "(select (values_{} {}) {})",
+                    type_key(&array.ty),
+                    array.text,
+                    index.text
+                ),
+                ty,
+            )?;
+            body.env.insert(binding.to_owned(), value);
+        }
+        self.jumps
+            .push((Value::literal("false", true), Value::literal("false", true)));
+        self.block(body_block, &mut body, depth)?;
+        let (broken, continued) = self.jumps.pop().unwrap();
+        body.alive = self.node(format!("(or {} {})", body.alive.text, continued.text), true)?;
+        if let Some(name) = step {
+            let old = body.env[name].clone();
+            let next = self.node(format!("(+ {} 1)", old.text), false)?;
+            self.guard(&body.alive, bounds(&next.text))?;
+            let next = self.node(
+                format!("(ite {} {} {})", body.alive.text, next.text, old.text),
+                false,
+            )?;
+            body.env.insert(name.to_owned(), next);
+        }
+        let preserved =
+            self.loop_invariant(invariants, &body, &body.alive.clone(), annotation_index)?;
         self.guard(&body.alive, preserved.text)?;
-        let next = self.expr(variant, &body, &body.alive.clone())?;
-        if next.boolean {
+        let next = self.loop_annotation(variant, &body, &body.alive.clone(), annotation_index)?;
+        if next.ty != Type::I64 {
             return Err("loop variant must have type i64".into());
         }
         self.guard(&body.alive, format!("(< {} {})", next.text, rank.text))?;
@@ -427,9 +759,89 @@ impl Encoder<'_> {
             format!("(and {} (not {}))", head.alive.text, condition.text),
             true,
         )?;
+        for name in written {
+            if let (Some(old), Some(exit)) = (head.env.get(&name), body.env.get(&name)) {
+                let merged = self.typed_node(
+                    format!("(ite {} {} {})", broken.text, exit.text, old.text),
+                    &old.ty,
+                )?;
+                head.env.insert(name, merged);
+            }
+        }
+        head.alive = self.node(format!("(or {} {})", head.alive.text, broken.text), true)?;
         head.result = body.result;
         head.returned = body.returned;
         *state = head;
+        Ok(())
+    }
+
+    fn for_loop(&mut self, s: &ForStmt, state: &mut State, depth: usize) -> Result<(), String> {
+        let array;
+        let (start, end, counter, element) = if let Expr::Range(range) = &s.iterable {
+            let start = self.expr(&range.start, state, &state.alive.clone())?;
+            let end = self.expr(&range.end, state, &state.alive.clone())?;
+            (start, end, s.name.clone(), None)
+        } else {
+            array = self.expr(&s.iterable, state, &state.alive.clone())?;
+            frozen_element(&array.ty).ok_or("for requires range or immutable FrozenArray")?;
+            // An element does not exist at the empty/exhausted loop head.
+            // Head invariants/ranks use outer bindings, not the element binder.
+            for expression in s.invariants.iter().chain(s.variant.iter()) {
+                if AstWalk::new(AstEvent::Expr(expression))
+                    .any(|e| matches!(e,AstEvent::Expr(Expr::Var(name,..)) if *name == s.name))
+                {
+                    return Err("array loop annotations cannot reference the element binder at an exhausted head".into());
+                }
+            }
+            let end = self.node(
+                format!("(len_{} {})", type_key(&array.ty), array.text),
+                false,
+            )?;
+            (
+                Value::literal("0", false),
+                end,
+                format!("$for_index_{}", s.body.id),
+                Some((s.name.as_str(), &array)),
+            )
+        };
+        if start.ty != Type::I64 || end.ty != Type::I64 {
+            return Err("non-integer for range".into());
+        }
+        let saved = state.env.insert(counter.clone(), start);
+        let saved_element = state.env.get(&s.name).cloned();
+        let limit = format!("$for_end_{}", s.body.id);
+        state.env.insert(limit.clone(), end);
+        let cond = Expr::Binary(Box::new(BinaryExpr {
+            id: ExprId::fresh(),
+            lhs: Expr::Var(counter.clone(), s.span, ExprId::fresh()),
+            op: BinOp::Lt,
+            rhs: Expr::Var(limit.clone(), s.span, ExprId::fresh()),
+            span: s.span,
+        }));
+        self.loop_body(
+            &cond,
+            &s.invariants,
+            s.variant.as_ref(),
+            &s.body,
+            s.span,
+            state,
+            depth,
+            Some(&counter),
+            element,
+        )?;
+        state.env.remove(&limit);
+        if let Some(saved) = saved {
+            state.env.insert(counter.clone(), saved);
+        } else {
+            state.env.remove(&counter);
+        }
+        if element.is_some() {
+            if let Some(saved) = saved_element {
+                state.env.insert(s.name.clone(), saved);
+            } else {
+                state.env.remove(&s.name);
+            }
+        }
         Ok(())
     }
 
@@ -452,10 +864,55 @@ impl Encoder<'_> {
             format!("(and {})", terms.join(" "))
         }
     }
+    // Retain nested quantified text as an acyclic fragment graph. Each binder
+    // manipulates only its own text; final emission expands into one output sink.
+    // The marker carries free let-node dependencies for scoped liveness, and is
+    // never emitted to the solver.
+    fn fragment(&mut self, text: String, first_local: usize) -> String {
+        let mut dependencies = BTreeSet::new();
+        for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if let Some(index) = token
+                .strip_prefix('v')
+                .and_then(|n| n.parse::<usize>().ok())
+                && index < first_local
+            {
+                dependencies.insert(token);
+            }
+        }
+        let marker = format!(
+            "\u{1f}{}:{}\u{1f}",
+            self.fragments.len(),
+            dependencies.into_iter().collect::<Vec<_>>().join(",")
+        );
+        self.fragments.push(text);
+        marker
+    }
+    fn emit_fragment(&self, text: &str, output: &mut String) {
+        let mut pending = vec![text];
+        while let Some(mut text) = pending.pop() {
+            if let Some(start) = text.find('\u{1f}') {
+                output.push_str(&text[..start]);
+                text = &text[start + 1..];
+                let end = text.find('\u{1f}').expect("fragment marker end");
+                let id: usize = text[..end]
+                    .split(':')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .expect("fragment id");
+                pending.push(&text[end + 1..]);
+                pending.push(&self.fragments[id]);
+            } else {
+                output.push_str(text);
+            }
+        }
+    }
     fn definition(&self, name: &str, params: &str, ty: &str, result: &str) -> String {
         let mut s = format!("(define-fun {name} ({params}) {ty} ");
         for (v, expr) in &self.nodes {
-            s.push_str(&format!("(let (({} {expr})) ", v.text));
+            s.push_str(&format!("(let (({} ", v.text));
+            self.emit_fragment(expr, &mut s);
+            s.push_str(")) ");
         }
         s.push_str(result);
         s.extend(std::iter::repeat_n(')', self.nodes.len() + 1));
@@ -463,6 +920,41 @@ impl Encoder<'_> {
         s
     }
 }
+// Keep quantified safety and truth DAGs separate. Copying every local let into
+// both formulas doubles nested quantified bodies at each binder.
+fn scoped_lets(nodes: &[(Value, String)], result: &str) -> String {
+    let mut needed = std::collections::HashSet::new();
+    fn references(text: &str, needed: &mut std::collections::HashSet<String>) {
+        for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if token
+                .strip_prefix('v')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            {
+                needed.insert(token.to_owned());
+            }
+        }
+    }
+    references(result, &mut needed);
+    let mut selected = vec![false; nodes.len()];
+    for (i, (value, expr)) in nodes.iter().enumerate().rev() {
+        if needed.contains(&value.text) {
+            selected[i] = true;
+            references(expr, &mut needed);
+        }
+    }
+    let mut text = String::new();
+    let mut count = 0;
+    for ((value, expr), selected) in nodes.iter().zip(selected) {
+        if selected {
+            text += &format!("(let (({} {expr})) ", value.text);
+            count += 1;
+        }
+    }
+    text += result;
+    text.extend(std::iter::repeat_n(')', count));
+    text
+}
+
 pub(super) fn application(name: &str, args: &[String]) -> String {
     if args.is_empty() {
         name.into()
@@ -474,11 +966,13 @@ pub(super) fn encode(
     id: usize,
     functions: &[&FunctionDecl],
     names: &HashMap<&str, usize>,
+    data: &DataTypes,
 ) -> Result<Summary, String> {
     let f = functions[id];
     if !f.type_params.is_empty() || f.is_async || f.rust_bridge.is_some() {
         return Err("generic, async or external function outside V1".into());
     }
+    data.check(&f.return_type)?;
     let ret = sort(&f.return_type)?;
     let mut params = Vec::new();
     let mut env = im::HashMap::new();
@@ -486,21 +980,31 @@ pub(super) fn encode(
         if p.mode != ParamMode::Value {
             return Err("reference parameter outside V1".into());
         }
+        data.check(&p.ty)?;
         let ty = sort(&p.ty)?;
         params.push(format!("(p{i} {ty})"));
         env.insert(
             p.name.clone(),
-            Value::literal(format!("p{i}"), ty == "Bool"),
+            Value {
+                text: format!("p{i}"),
+                boolean: ty == "Bool",
+                ty: p.ty.clone(),
+            },
         );
     }
     let mut state = State {
         env,
         alive: Value::literal("true", true),
-        result: Value::literal(if ret == "Bool" { "false" } else { "0" }, ret == "Bool"),
+        result: Value {
+            text: default_value(&f.return_type),
+            boolean: ret == "Bool",
+            ty: f.return_type.clone(),
+        },
         returned: Value::literal("false", true),
     };
     let initial = state.clone();
     let mut e = Encoder {
+        data,
         functions,
         names,
         nodes: Vec::new(),
@@ -513,6 +1017,10 @@ pub(super) fn encode(
         loop_symbols: std::collections::BTreeMap::new(),
         loop_writes: HashMap::new(),
         verified: has(f, EffectContractKind::Verified),
+        jumps: Vec::new(),
+        next_quantifier: 0,
+        scoped_nodes: 0,
+        fragments: Vec::new(),
     };
     let pre = e.clauses(&f.requires, &state)?;
     let pre_safe = e.safety();
@@ -527,11 +1035,7 @@ pub(super) fn encode(
     index_loop_writes(&f.body, &mut e.loop_writes, 0)?;
     e.block(&f.body, &mut state, 0)?;
     for h in &e.havoc {
-        definitions += &format!(
-            "(declare-const {} {})\n",
-            h.text,
-            if h.boolean { "Bool" } else { "Int" }
-        );
+        definitions += &format!("(declare-const {} {})\n", h.text, sort(&h.ty)?);
     }
     e.guard(
         &Value::literal("true", true),
@@ -552,7 +1056,7 @@ pub(super) fn encode(
     definitions += &e.definition(
         &format!("f{id}_value"),
         &params.join(" "),
-        ret,
+        &ret,
         &state.result.text,
     );
     definitions += &e.definition(&format!("f{id}_safe"), &params.join(" "), "Bool", &safety);
@@ -584,6 +1088,7 @@ pub(super) fn encode(
     );
     // Separate contract predicate, with an arbitrary return, for callers.
     let mut c = Encoder {
+        data,
         functions,
         names,
         nodes: Vec::new(),
@@ -596,10 +1101,20 @@ pub(super) fn encode(
         loop_symbols: std::collections::BTreeMap::new(),
         loop_writes: HashMap::new(),
         verified: has(f, EffectContractKind::Verified),
+        jumps: Vec::new(),
+        next_quantifier: 0,
+        scoped_nodes: 0,
+        fragments: Vec::new(),
     };
     let mut cs = initial;
-    cs.env
-        .insert("result".into(), Value::literal("returned", ret == "Bool"));
+    cs.env.insert(
+        "result".into(),
+        Value {
+            text: "returned".into(),
+            boolean: ret == "Bool",
+            ty: f.return_type.clone(),
+        },
+    );
     let cp = c.clauses(&f.ensures, &cs)?;
     let safe = c.safety();
     params.push(format!("(returned {ret})"));
@@ -616,9 +1131,22 @@ pub(super) fn encode(
         &format!("(and {safe} {})", cp.text),
     );
     Ok(Summary {
+        #[cfg(test)]
+        assembly_bytes: e
+            .fragments
+            .iter()
+            .chain(&c.fragments)
+            .map(String::len)
+            .sum::<usize>()
+            + e.nodes
+                .iter()
+                .chain(&c.nodes)
+                .map(|(_, text)| text.len())
+                .sum::<usize>(),
+        data_digest: data.digest.clone(),
         contract_definitions,
         definitions,
-        nodes: e.nodes.len() + c.nodes.len(),
+        nodes: e.nodes.len() + c.nodes.len() + e.scoped_nodes + c.scoped_nodes,
         dependencies: e.dependencies,
         loop_symbols: e.loop_symbols,
     })
@@ -651,6 +1179,12 @@ fn index_loop_writes(
                     }
                     names.extend(other);
                 }
+                names
+            }
+            Stmt::For(s) => {
+                let mut names = index_loop_writes(&s.body, index, depth + 1)?;
+                names.remove(&s.name);
+                index.insert(s.body.id, names.clone());
                 names
             }
             Stmt::While(s) => {
@@ -690,6 +1224,7 @@ pub(super) fn contract_predicates(
     id: usize,
     functions: &[&FunctionDecl],
     names: &HashMap<&str, usize>,
+    data: &DataTypes,
 ) -> Result<String, String> {
     let f = functions[id];
     if !f.type_params.is_empty() || f.is_async || f.rust_bridge.is_some() {
@@ -701,21 +1236,32 @@ pub(super) fn contract_predicates(
         if p.mode != ParamMode::Value {
             return Err("reference contract parameter".into());
         }
+        data.check(&p.ty)?;
         let ty = sort(&p.ty)?;
         params.push(format!("(p{i} {ty})"));
         env.insert(
             p.name.clone(),
-            Value::literal(format!("p{i}"), ty == "Bool"),
+            Value {
+                text: format!("p{i}"),
+                boolean: ty == "Bool",
+                ty: p.ty.clone(),
+            },
         );
     }
+    data.check(&f.return_type)?;
     let ret = sort(&f.return_type)?;
     let mut state = State {
         env,
         alive: Value::literal("true", true),
-        result: Value::literal("returned", ret == "Bool"),
+        result: Value {
+            text: "returned".into(),
+            boolean: ret == "Bool",
+            ty: f.return_type.clone(),
+        },
         returned: Value::literal("true", true),
     };
     let mut e = Encoder {
+        data,
         functions,
         names,
         nodes: Vec::new(),
@@ -728,6 +1274,10 @@ pub(super) fn contract_predicates(
         loop_symbols: std::collections::BTreeMap::new(),
         loop_writes: HashMap::new(),
         verified: has(f, EffectContractKind::Verified),
+        jumps: Vec::new(),
+        next_quantifier: 0,
+        scoped_nodes: 0,
+        fragments: Vec::new(),
     };
     let pre = e.clauses(&f.requires, &state)?;
     let safety = e.safety();

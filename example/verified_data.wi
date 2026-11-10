@@ -1,0 +1,75 @@
+// Read-only arrays, immutable records, enums and bounded quantifiers.
+class Threshold { pub minimum: i64; }
+enum Reading { Value(i64), Missing }
+
+@pure
+@verified
+fn first(values: FrozenArray<i64>, threshold: Threshold) -> i64
+    requires values.len() > 0
+    requires forall(0, values.len(), |i:i64| values[i] >= threshold.minimum)
+    ensures result >= threshold.minimum
+{
+    return values[0];
+}
+
+@pure
+@verified
+fn reading_value(reading: Reading) -> i64
+    ensures result == match reading {
+        Reading::Value(value) => value,
+        Reading::Missing => 0
+    }
+{
+    return match reading {
+        Reading::Value(value) => value,
+        Reading::Missing => 0
+    };
+}
+
+@pure
+@verified
+fn count(values: FrozenArray<i64>) -> i64
+    ensures result == values.len()
+{
+    let mut total = 0;
+    for value in values
+        invariant total == iteration
+        invariant total >= 0 && total <= values.len()
+        variant values.len() - total
+    {
+        total = total + 1;
+        continue;
+    }
+    return total;
+}
+
+@pure
+@verified
+fn stop_at_three(n: i64) -> i64
+    requires n >= 0
+    ensures result >= 0 && result <= 3
+{
+    let mut total = 0;
+    for i in 0..n
+        invariant i >= 0 && i <= n
+        invariant total == i && total <= 3
+        variant n - i
+    {
+        if total == 3 { break; }
+        total = total + 1;
+    }
+    return total;
+}
+
+fn main() {
+    let values = [4, 7, 9].freeze();
+    println(first(values, new Threshold(2)));
+    println(reading_value(Reading::Value(7)));
+    println(reading_value(Reading::Missing));
+    println(count(values));
+    println(stop_at_three(10));
+    println(exists(0, values.len(), |i:i64| values[i] == 7));
+    println(forall(0, 0, |i:i64| false));
+    println(exists(3, 0, |i:i64| true));
+    println(forall(0, 3, |i:i64| exists(0, 3, |j:i64| i == j)));
+}

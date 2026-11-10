@@ -363,6 +363,126 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
     lower_value_args
 )]
 fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    if matches!(c.callee.as_str(), "forall" | "exists") {
+        if c.args.len() != 3 || !c.type_args.is_empty() {
+            return Err(unsupported(c.span, "malformed quantified expression"));
+        }
+        let Expr::Lambda(predicate) = &c.args[2].expr else {
+            return Err(unsupported(c.span, "quantifier predicate binder"));
+        };
+        let crate::parser::ast::LambdaBody::Expr(body) = &predicate.body else {
+            return Err(unsupported(c.span, "block-bodied quantifier predicate"));
+        };
+        if predicate.params.len() != 1 {
+            return Err(unsupported(c.span, "quantifier binder arity"));
+        }
+        // Bounds are lowered in the enclosing scope and evaluated exactly once.
+        let lo = lower_expr(&c.args[0].expr, ctx)?;
+        let hi = lower_expr(&c.args[1].expr, ctx)?;
+        ctx.push_scope();
+        let index = ctx.bind(predicate.params[0].name.clone(), Type::I64);
+        let limit = ctx.bind(format!("$quantifier_limit_{}", c.id), Type::I64);
+        let result = ctx.bind(format!("$quantifier_result_{}", c.id), Type::Bool);
+        let value = lower_expr(body, ctx);
+        ctx.pop_scope();
+        let value = value?;
+        let span = c.span;
+        let universal = c.callee == "forall";
+        let variable = |name: &str, ty: Type| lit(HirExprKind::Var(name.to_owned()), ty, span);
+        let condition = lit(
+            HirExprKind::Binary {
+                op: BinOp::Lt,
+                lhs: Box::new(variable(&index, Type::I64)),
+                rhs: Box::new(variable(&limit, Type::I64)),
+            },
+            Type::Bool,
+            span,
+        );
+        let decisive = if universal {
+            lit(
+                HirExprKind::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(value),
+                },
+                Type::Bool,
+                span,
+            )
+        } else {
+            value
+        };
+        let increment = lit(
+            HirExprKind::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(variable(&index, Type::I64)),
+                rhs: Box::new(lit(HirExprKind::Int(1), Type::I64, span)),
+            },
+            Type::I64,
+            span,
+        );
+        // index < limit <= i64::MAX establishes that this increment cannot overflow.
+        let statements = vec![
+            HirStmt::Let {
+                name: index.clone(),
+                mutable: true,
+                ty: Type::I64,
+                value: lo,
+                span,
+            },
+            HirStmt::Let {
+                name: limit,
+                mutable: false,
+                ty: Type::I64,
+                value: hi,
+                span,
+            },
+            HirStmt::Let {
+                name: result.clone(),
+                mutable: true,
+                ty: Type::Bool,
+                value: lit(HirExprKind::Bool(universal), Type::Bool, span),
+                span,
+            },
+            HirStmt::While {
+                cond: condition,
+                body: vec![
+                    HirStmt::If {
+                        cond: decisive,
+                        then_branch: vec![
+                            HirStmt::Assign {
+                                name: result.clone(),
+                                value: lit(HirExprKind::Bool(!universal), Type::Bool, span),
+                                span,
+                            },
+                            HirStmt::Break { span },
+                        ],
+                        else_branch: None,
+                        span,
+                    },
+                    HirStmt::Assign {
+                        name: index,
+                        value: increment,
+                        span,
+                    },
+                ],
+                span,
+            },
+            HirStmt::Expr(variable(&result, Type::Bool)),
+        ];
+        return Ok(lit(
+            HirExprKind::Match {
+                scrutinee: Box::new(lit(HirExprKind::Bool(true), Type::Bool, span)),
+                arms: vec![HirMatchArm {
+                    pattern: HirPattern::Wildcard,
+                    guard: None,
+                    body: statements,
+                    ty: Type::Bool,
+                    span,
+                }],
+            },
+            Type::Bool,
+            span,
+        ));
+    }
     let args = lower_value_args(&c.args, ctx)?;
     if let Some(binding) = ctx.lookup(&c.callee).filter(|binding| binding.cell) {
         let (Type::Fn(_, ret) | Type::Closure(_, ret)) = &binding.ty else {

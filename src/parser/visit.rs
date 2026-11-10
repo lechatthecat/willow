@@ -157,6 +157,9 @@ pub fn walk_stmt<V: AstVisitor + ?Sized>(visitor: &mut V, stmt: &Stmt) {
             visitor.visit_expr(&stmt.iterable);
             visitor.enter_scope();
             visitor.bind(&stmt.name);
+            for expr in stmt.invariants.iter().chain(stmt.variant.iter()) {
+                visitor.visit_expr(expr);
+            }
             visitor.visit_block(&stmt.body);
             visitor.exit_scope();
         }
@@ -186,6 +189,26 @@ pub fn walk_expr<V: AstVisitor + ?Sized>(visitor: &mut V, expr: &Expr) {
             visitor.visit_expr(&expr.rhs);
         }
         Expr::Unary(expr) => visitor.visit_expr(&expr.expr),
+        Expr::Call(call)
+            if matches!(call.callee.as_str(), "forall" | "exists")
+                && call.args.len() == 3
+                && matches!(call.args[2].expr, Expr::Lambda(_)) =>
+        {
+            visitor.visit_expr(&call.args[0].expr);
+            visitor.visit_expr(&call.args[1].expr);
+            let Expr::Lambda(lambda) = &call.args[2].expr else {
+                unreachable!()
+            };
+            visitor.enter_scope();
+            for param in &lambda.params {
+                visitor.bind(&param.name);
+            }
+            match &lambda.body {
+                LambdaBody::Expr(e) => visitor.visit_expr(e),
+                LambdaBody::Block(b) => visitor.visit_block(b),
+            }
+            visitor.exit_scope();
+        }
         Expr::Call(call) => walk_args(visitor, &call.args),
         Expr::FieldAccess(object, ..) => visitor.visit_expr(object),
         Expr::MethodCall(call) => {

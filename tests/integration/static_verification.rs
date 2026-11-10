@@ -183,3 +183,59 @@ fn verified_loop_rejections_reach_build_gate() {
         );
     }
 }
+
+#[test]
+fn verified_immutable_data_example_both_modes() {
+    let source = include_str!("../../example/verified_data.wi");
+    for (output, ok) in [compile_and_run(source), compile_and_run_release(source)] {
+        assert!(ok, "{output}");
+        assert_eq!(output, "4\n7\n0\n3\n3\ntrue\ntrue\nfalse\ntrue\n");
+    }
+}
+
+#[test]
+fn verified_quantifier_runtime_short_circuit_and_bounds() {
+    let source = r#"
+fn main() {
+    println(forall(0, 3, |i:i64| i == 0 ? false : 1 / 0 > 0));
+    println(exists(0, 3, |i:i64| i == 0 ? true : 1 / 0 > 0));
+    println(forall(9223372036854775806, 9223372036854775807, |i:i64| i == 9223372036854775806));
+    println(exists(1, 1, |i:i64| 1 / 0 > 0));
+    let iteration = 9;
+    let a = [1,2].freeze();
+    let mut total = 0;
+    for value in a invariant total == iteration * 9 variant a.len() - iteration {
+        total = total + iteration;
+    }
+    println(total);
+}
+"#;
+    for (output, ok) in [compile_and_run(source), compile_and_run_release(source)] {
+        assert!(ok, "{output}");
+        assert_eq!(output, "false\ntrue\ntrue\nfalse\n18\n");
+    }
+}
+
+#[test]
+fn verified_immutable_data_fail_closed_build_gate() {
+    for (source, code) in [
+        (
+            "@pure @verified fn f(a:Array<i64>)->i64{return a[0];}",
+            "E2631",
+        ),
+        (
+            "class C {pub x:i64;} fn write(c:C){c.x=2;} @pure @verified fn f(c:C)->i64{return c.x;}",
+            "E2631",
+        ),
+        (
+            "@pure @verified fn f(a:FrozenArray<i64>)->i64{return a[0];}",
+            "E2630",
+        ),
+        (
+            "@pure @verified fn f()->bool ensures result {return forall(0,3,|i:i64|forall(0,3,|j:i64|i==j));}",
+            "E2630",
+        ),
+    ] {
+        assert_compile_error_contains(&format!("{source} fn main(){{}}"), &[code]);
+    }
+}

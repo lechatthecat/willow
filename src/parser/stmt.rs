@@ -638,29 +638,7 @@ impl Parser {
             }));
         }
         let cond = self.parse_control_head()?;
-        let mut invariants = Vec::new();
-        let mut variant = None;
-        while let TokenKind::Ident(keyword) = self.peek_kind() {
-            let rank = match keyword.as_str() {
-                "invariant" => false,
-                "variant" => true,
-                _ => break,
-            };
-            if rank && variant.is_some() {
-                return Err(self.err_at(
-                    ErrorCode::E0103,
-                    "a while loop may have only one variant",
-                    self.current_span(),
-                ));
-            }
-            self.advance();
-            let expression = self.parse_control_head()?;
-            if rank {
-                variant = Some(expression);
-            } else {
-                invariants.push(expression);
-            }
-        }
+        let (invariants, variant) = self.parse_loop_annotations()?;
         let body = self.parse_block()?;
         Ok(Stmt::While(WhileStmt {
             cond,
@@ -717,6 +695,33 @@ impl Parser {
         })
     }
 
+    fn parse_loop_annotations(&mut self) -> Result<(Vec<Expr>, Option<Expr>), Diagnostic> {
+        let mut invariants = Vec::new();
+        let mut variant = None;
+        while let TokenKind::Ident(keyword) = self.peek_kind() {
+            let rank = match keyword.as_str() {
+                "invariant" => false,
+                "variant" => true,
+                _ => break,
+            };
+            if rank && variant.is_some() {
+                return Err(self.err_at(
+                    ErrorCode::E0103,
+                    "a loop may have only one variant",
+                    self.current_span(),
+                ));
+            }
+            self.advance();
+            let expression = self.parse_control_head()?;
+            if rank {
+                variant = Some(expression);
+            } else {
+                invariants.push(expression);
+            }
+        }
+        Ok((invariants, variant))
+    }
+
     pub(super) fn parse_for(&mut self) -> Result<Stmt, Diagnostic> {
         // Map iteration yields a pair even when the body discards the entry.
         self.tuple_arities.insert(2);
@@ -728,10 +733,15 @@ impl Parser {
         let iterable = self.parse_control_head()?;
         let scope = self.default_import_usage.scope();
         self.default_import_usage.bind(&name);
-        let result = self.parse_block();
+        let result = match self.parse_loop_annotations() {
+            Ok((invariants, variant)) => self.parse_block().map(|body| (invariants, variant, body)),
+            Err(error) => Err(error),
+        };
         self.default_import_usage.restore(scope);
-        let body = result?;
+        let (invariants, variant, body) = result?;
         Ok(Stmt::For(ForStmt {
+            invariants,
+            variant,
             name,
             name_span,
             iterable,

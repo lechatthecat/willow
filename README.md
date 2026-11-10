@@ -481,16 +481,20 @@ error[E2630]: @verified `non_negative`: COUNTEREXAMPLE: ensures truth: sat; cand
 
 Failures are reported as E2630 (counterexample), E2631 (unsupported construct) and E2632 (solver unknown or failure).
 
-**Scope:** `@verified` requires `@pure` and currently proves i64/bool contracts. It does not reason about arrays, objects, or other data structures. The proof also trusts Z3 and the Willow compiler.
+**Scope:** `@verified` requires `@pure` and proves checked i64/bool contracts, read-only `FrozenArray<T>` lengths and elements, closed immutable records, and enum payloads. Arrays use SMT array theory with explicit lengths and bounds; records and enums use algebraic datatypes. Supported data fields recursively contain these types. Reassigned fields, mutable `Array`/Map, open or recursive data types, unsupported operations, and unavailable declarations fail closed with E2631. Object identity equality and allocation remain outside the proof subset; inspect record fields or match enum variants instead. The proof trusts Z3 and the Willow compiler. See [`example/verified_data.wi`](example/verified_data.wi).
 
 **Setup:** install Z3 4.15.4 (`python -m pip install z3-solver==4.15.4.0`) and keep `z3` on PATH, or set `WILLOW_Z3` to its executable. Verification JSON and replayable SMT files are saved under `target/willow-verification` (override with `WILLOW_VERIFICATION_DIR`). See [`example/static_verification.wi`](example/static_verification.wi).
 
-**Loops:** for `while` proofs, add boolean `invariant` clauses and one i64 `variant` before the body; see [`example/verified_loops.wi`](example/verified_loops.wi). The verifier checks entry, preservation, and a nonnegative, strictly decreasing rank on iterations. Annotations are proof-only. Loops without both annotations, `for`, `break`, and `continue` remain unsupported in verified functions.
+**Quantified contracts:** `forall(lo, hi, |i:i64| predicate)` and `exists(lo, hi, |i:i64| predicate)` quantify over the half-open i64 range `[lo, hi)`. The names are reserved. Empty ranges yield true and false respectively. Bounds execute once; runtime evaluation short-circuits. Verification conservatively requires the predicate to be safe at every bounded index, including indices runtime short-circuiting might skip. Nested binders are lexical. The trigger policy uses the pinned solver's automatic pattern inference and model-based quantifier instantiation, with no user-supplied triggers or unchecked axioms. Timeout, resource exhaustion, incomplete theory and solver `unknown` fail with E2632; they never produce a proof.
+
+**Loops:** add boolean `invariant` clauses and one i64 `variant` before a `while` or `for` body. The verifier checks entry, preservation, and a nonnegative, strictly decreasing rank on backedges, including `continue`. `break` preserves its actual exit state and does not require a decrease. A range `for` includes its automatic increment before checking preservation/decrease. For `FrozenArray` iteration, annotations may use the proof-only zero-based `iteration` index (including the exhausted head at `len()`); use outer bindings rather than the element binder in annotations. Annotations are proof-only and both are required. See [`example/verified_loops.wi`](example/verified_loops.wi) and [`example/verified_data.wi`](example/verified_data.wi).
+
+`verify-edit` compares these contracts over arbitrary valid data, and `contracts.lock` includes immutable data declaration identities. Changes to data definitions are conservatively reported as not preserved, rather than reusing an older proof.
 
 ### `@pure` and run-time contracts
 
 - **`@pure`** requires a function to have no observable interaction outside its
-  arguments and result. Output, field and index writes, heap reads,
+  arguments and result. Immutable record/FrozenArray reads are permitted. Output, field and index writes, mutable heap reads,
   nondeterminism and unknown callees are rejected with E2620. Undeclared callees
   are analyzed, so they do not need their own `@pure`.
   See [pure functions](example/pure_functions.wi).

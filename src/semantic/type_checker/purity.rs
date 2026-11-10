@@ -96,7 +96,7 @@ mod tests {
             (
                 "field read",
                 "class C { pub x:i64; } @pure fn f(c:C)->i64 { return c.x; }",
-                true,
+                false,
             ),
             (
                 "field write",
@@ -173,6 +173,125 @@ mod tests {
                 errors.iter().all(|d| d.code == ErrorCode::E2620),
                 "{name}: unexpected errors {errors:?}"
             );
+        }
+    }
+
+    #[test]
+    fn purity_immutable_data_reads() {
+        for (name, source, rejected) in [
+            (
+                "frozen indexing",
+                "@pure fn f(a:FrozenArray<i64>)->i64 {return a[0];}",
+                false,
+            ),
+            (
+                "frozen length",
+                "@pure fn f(a:FrozenArray<i64>)->i64 {return a.len();}",
+                false,
+            ),
+            (
+                "frozen iteration",
+                "@pure fn f(a:FrozenArray<i64>)->i64 {let mut n=0;for x in a {n=x;}return n;}",
+                false,
+            ),
+            (
+                "nested record",
+                "class Inner {pub x:i64;} class Outer {pub inner:Inner;} @pure fn f(o:Outer)->i64 {return o.inner.x;}",
+                false,
+            ),
+            (
+                "foreign mutation",
+                "class C {pub x:i64;} fn change(c:C){c.x=3;} @pure fn f(c:C)->i64{return c.x;}",
+                true,
+            ),
+            (
+                "mutable descendant",
+                "class C {pub a:Array<i64>;} @pure fn f(c:C)->i64{return c.a[0];}",
+                true,
+            ),
+            (
+                "mutable frozen element",
+                "class C {pub x:i64;} fn change(c:C){c.x=3;} @pure fn f(a:FrozenArray<C>)->i64{return a[0].x;}",
+                true,
+            ),
+            (
+                "open record",
+                "open class C {pub x:i64;} @pure fn f(c:C)->i64{return c.x;}",
+                true,
+            ),
+            (
+                "recursive record",
+                "class C {pub child:C;pub x:i64;} @pure fn f(c:C)->i64{return c.x;}",
+                true,
+            ),
+            (
+                "identity remains impure",
+                "class C {pub x:i64;} @pure fn f(a:C,b:C)->bool{return a==b;}",
+                true,
+            ),
+        ] {
+            let source = format!("import std::collections::Array; {source} fn main() {{}}");
+            let errors: Vec<_> = check_source(&source)
+                .into_iter()
+                .filter(|d| d.severity == Severity::Error)
+                .collect();
+            assert_eq!(
+                errors.iter().any(|d| d.code == ErrorCode::E2620),
+                rejected,
+                "{name}: {errors:?}"
+            );
+            assert!(
+                errors.iter().all(|d| d.code == ErrorCode::E2620),
+                "{name}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn purity_immutable_type_cache_and_rejection() {
+        for size in [8, 16, 32] {
+            let mut source = String::from("class Leaf {pub value:i64;}");
+            for i in 0..size {
+                let child = if i == 0 {
+                    "Leaf".into()
+                } else {
+                    format!("N{}", i - 1)
+                };
+                source.push_str(&format!("class N{i} {{pub child:{child};}}"));
+            }
+            source.push_str(
+                "enum Data {One(i64), Flag(bool)} class Cycle {pub next:Cycle;} fn main() {}",
+            );
+            let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+            let (program, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty());
+            let mut checker = TypeChecker::new();
+            checker.check_program(&program);
+            let mut cache = HashMap::new();
+            for i in (0..size).rev() {
+                assert!(
+                    checker.verification_immutable_type(&Type::Named(format!("N{i}")), &mut cache)
+                );
+            }
+            assert_eq!(cache.len(), size + 2);
+            let count = cache.len();
+            for _ in 0..size {
+                assert!(checker.verification_immutable_type(
+                    &Type::Named(format!("N{}", size - 1)),
+                    &mut cache
+                ));
+            }
+            assert_eq!(cache.len(), count);
+            assert!(checker.verification_immutable_type(&Type::Named("Data".into()), &mut cache));
+            for ty in [
+                Type::Named("Cycle".into()),
+                Type::Named("AtomicI64".into()),
+                Type::Named("Missing".into()),
+                Type::Array(Box::new(Type::I64)),
+            ] {
+                assert!(!checker.verification_immutable_type(&ty, &mut cache));
+            }
+            eprintln!("immutable chain={size} distinct cached types={count}");
         }
     }
 
@@ -506,12 +625,74 @@ fn propagate(
 }
 
 impl TypeChecker {
+    /// Immutable proof data is narrower than Sync: atomics and locks are Sync
+    /// but their reads are not mathematical values. Cache failures as well as
+    /// successes; a provisional failure rejects recursive data graphs.
+    pub(super) fn verification_immutable_type(
+        &self,
+        ty: &Type,
+        cache: &mut HashMap<Type, bool>,
+    ) -> bool {
+        self.verification_immutable_type_at(ty, cache, 0)
+    }
+
+    fn verification_immutable_type_at(
+        &self,
+        ty: &Type,
+        cache: &mut HashMap<Type, bool>,
+        depth: usize,
+    ) -> bool {
+        if depth > 128 {
+            return false;
+        }
+        if let Some(&known) = cache.get(ty) {
+            return known;
+        }
+        cache.insert(ty.clone(), false);
+        use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
+        let result = match ty {
+            Type::I64 | Type::Bool => true,
+            Type::Generic(name, args) if Builtin::from_name(name) == Some(Builtin::FrozenArray) => {
+                args.len() == 1 && self.verification_immutable_type_at(&args[0], cache, depth + 1)
+            }
+            Type::Named(name) | Type::Generic(name, _) if Builtin::from_name(name).is_none() => {
+                if let Some(en) = self.symbols.lookup_enum(name) {
+                    let args = match ty {
+                        Type::Generic(_, args) => args.as_slice(),
+                        _ => &[],
+                    };
+                    en.type_params.len() == args.len()
+                        && en.instantiate(args).variants.iter().all(|variant| {
+                            variant.payload_types.iter().all(|payload| {
+                                self.verification_immutable_type_at(payload, cache, depth + 1)
+                            })
+                        })
+                } else if let Some(class) = self.symbols.lookup_class(name) {
+                    matches!(ty, Type::Named(_))
+                        && !class.is_open
+                        && class.base_class.is_none()
+                        && class.instance_field_order.iter().all(|(field, _)| {
+                            let field = &class.fields[field];
+                            !field.reassigned
+                                && self.verification_immutable_type_at(&field.ty, cache, depth + 1)
+                        })
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        cache.insert(ty.clone(), result);
+        result
+    }
+
     fn purity_body(
         &self,
         body: &Block,
         params: &[Param],
         asynchronous: bool,
         external: bool,
+        immutable: &mut HashMap<Type, bool>,
     ) -> Node {
         let mut node = Node::default();
         if asynchronous {
@@ -563,9 +744,12 @@ impl TypeChecker {
                         Expr::StaticField(c) if self.static_call_enum_key(&c.class).is_some() => {
                             Some(PuritySummary::UNKNOWN)
                         }
-                        Expr::FieldAccess(..) | Expr::StaticField(..) | Expr::Index(..) => {
-                            Some(PuritySummary::READ_EXTERNAL)
-                        }
+                        Expr::FieldAccess(receiver, ..) | Expr::Index(receiver, ..) => (!self
+                            .expr_types
+                            .get(&receiver.id())
+                            .is_some_and(|ty| self.verification_immutable_type(ty, immutable)))
+                        .then_some(PuritySummary::READ_EXTERNAL),
+                        Expr::StaticField(..) => Some(PuritySummary::READ_EXTERNAL),
                         Expr::StaticCall(c)
                             if self.is_static_field_call(c)
                                 && self
@@ -612,7 +796,15 @@ impl TypeChecker {
                         }
                         Stmt::Lock(_) => Some(PuritySummary::NONDETERMINISTIC),
                         Stmt::For(s) if !matches!(s.iterable, Expr::Range(_)) => {
-                            Some(PuritySummary::READ_EXTERNAL)
+                            (!self.expr_types.get(&s.iterable.id()).is_some_and(|ty| {
+                                crate::semantic::builtin_types::unary_arg(
+                                    ty,
+                                    crate::semantic::builtin_types::BuiltinTypeId::FrozenArray,
+                                )
+                                .is_some()
+                                    && self.verification_immutable_type(ty, immutable)
+                            }))
+                            .then_some(PuritySummary::READ_EXTERNAL)
                         }
                         _ => None,
                     };
@@ -636,13 +828,20 @@ impl TypeChecker {
         let mut nodes = HashMap::new();
         let mut spans = HashMap::new();
         let mut order = Vec::new();
+        let mut immutable = HashMap::new();
         for item in &program.items {
             match item {
                 Item::Function(f) => {
                     let id = FunctionId::free(&f.name);
                     nodes.insert(
                         id,
-                        self.purity_body(&f.body, &f.params, f.is_async, f.rust_bridge.is_some()),
+                        self.purity_body(
+                            &f.body,
+                            &f.params,
+                            f.is_async,
+                            f.rust_bridge.is_some(),
+                            &mut immutable,
+                        ),
                     );
                     spans.insert(id, f.span);
                     order.push(id);
@@ -650,7 +849,10 @@ impl TypeChecker {
                 Item::Class(c) => {
                     for m in &c.methods {
                         let id = FunctionId::method(TypeId::local(&c.name), &m.name);
-                        nodes.insert(id, self.purity_body(&m.body, &m.params, m.is_async, false));
+                        nodes.insert(
+                            id,
+                            self.purity_body(&m.body, &m.params, m.is_async, false, &mut immutable),
+                        );
                         spans.insert(id, m.span);
                         order.push(id);
                     }
@@ -659,7 +861,10 @@ impl TypeChecker {
                     for m in &i.methods {
                         if let Some(body) = &m.default_body {
                             let id = interface_default_effect_id(&i.name, &m.name);
-                            nodes.insert(id, self.purity_body(body, &m.params, false, false));
+                            nodes.insert(
+                                id,
+                                self.purity_body(body, &m.params, false, false, &mut immutable),
+                            );
                             spans.insert(id, m.span);
                             order.push(id);
                         }
@@ -704,6 +909,11 @@ impl TypeChecker {
                 }
             }
             for target in &sites.targets {
+                // The frozen container length cannot change, even when its
+                // elements are outside the immutable proof-data subset.
+                if *target == crate::semantic::intrinsics::Intrinsic::FrozenArrayLen.function_id() {
+                    continue;
+                }
                 let target_local = self.effect_index.local_target(*target);
                 let site = sites.call_spans.get(target).copied();
                 if nodes.contains_key(&target_local) {

@@ -163,14 +163,14 @@ fn verified_loop_proof_perspectives() {
             Counterexample,
         ),
         (
-            "break unsupported",
+            "break preserves actual exit state",
             countdown("break;", "invariant x>=0 variant x", "result==0"),
-            Unknown,
+            Counterexample,
         ),
         (
-            "continue unsupported",
+            "continue requires decreasing rank",
             countdown("continue;", "invariant x>=0 variant x", "result==0"),
-            Unknown,
+            Counterexample,
         ),
         (
             "nested loop",
@@ -416,7 +416,7 @@ fn verified_loop_nested_write_and_exit_scaling() {
             };
             let fs = [f];
             let names = HashMap::from([(f.name.as_str(), 0)]);
-            let summary = encode(0, &fs, &names).unwrap();
+            let summary = encode(0, &fs, &names, &DataTypes::default()).unwrap();
             let heads = if shared { n * n } else { n * (n + 1) / 2 };
             // Assigning outer bindings from inner bodies is visible at all
             // intervening heads; body-local declarations do not escape outward.

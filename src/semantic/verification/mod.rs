@@ -1,10 +1,12 @@
-//! Fail-closed, bounded i64/bool static verification over checked declarations.
+//! Fail-closed static verification over checked scalars and immutable data.
 //! Mathematical integers model values; every finite-width operation has a
 //! separate safety obligation. Summaries share helper bodies across call sites.
 mod cache;
 pub mod comparison;
+mod data;
 mod encode;
 pub use cache::ProofCache;
+use data::*;
 mod solver;
 #[cfg(test)]
 mod tests;
@@ -123,8 +125,8 @@ fn report(f: &FunctionDecl, options: &Options) -> Report {
         location: f.span,
         status: Status::Unknown,
         model: "checked-i64",
-        verified_scope: "i64/bool with annotated while loops",
-        analyzer_version: "2",
+        verified_scope: "checked scalars, immutable data, bounded quantifiers and annotated loops",
+        analyzer_version: "3",
         solver_version: solver::VERSION,
         solver_timeout_ms: options.timeout_ms,
         approval_status: "UNVERIFIED",
@@ -138,7 +140,11 @@ fn report(f: &FunctionDecl, options: &Options) -> Report {
     }
 }
 
-pub(crate) fn check(program: &Program, previous: &[Diagnostic]) -> Vec<Diagnostic> {
+pub(crate) fn check(
+    program: &Program,
+    previous: &[Diagnostic],
+    writes: &crate::semantic::field_writes::FieldWrites,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     // Methods are outside V1, including interface declarations without bodies.
     for item in &program.items {
@@ -166,7 +172,13 @@ pub(crate) fn check(program: &Program, previous: &[Diagnostic]) -> Vec<Diagnosti
         return diagnostics;
     }
     let prior_error = previous.iter().any(|d| d.severity == Severity::Error);
-    let verification = verify(program, &Options::default(), prior_error);
+    let verification = verify_with_data(
+        program,
+        &Options::default(),
+        prior_error,
+        &mut ProofCache::default(),
+        &DataTypes::new(program, writes),
+    );
     for r in &verification.reports {
         if r.status != Status::Proven && r.status != Status::RuntimeChecked {
             let detail = r.unknown_reasons.first().cloned().unwrap_or_else(|| {
@@ -229,6 +241,22 @@ pub fn verify_cached(
     options: &Options,
     prior_error: bool,
     cache: &mut ProofCache,
+) -> Verification {
+    let writes = crate::semantic::field_writes::FieldWrites::from_program(program);
+    verify_with_data(
+        program,
+        options,
+        prior_error,
+        cache,
+        &DataTypes::new(program, &writes),
+    )
+}
+fn verify_with_data(
+    program: &Program,
+    options: &Options,
+    prior_error: bool,
+    cache: &mut ProofCache,
+    data: &DataTypes,
 ) -> Verification {
     let functions: Vec<_> = program
         .items
@@ -305,10 +333,18 @@ pub fn verify_cached(
     {
         engine = Err(e);
     }
+    if let Ok(s) = &mut engine
+        && let Err(error) = s.exchange(&data.definitions)
+    {
+        engine = Err(error);
+    }
     for id in order {
         let f = functions[id];
         let verified = has(f, EffectContractKind::Verified);
         let mut r = report(f, options);
+        if !data.definitions.is_empty() {
+            r.contract_digest = digest(&(r.contract_digest + &data.digest));
+        }
         r.dependencies = edges[id]
             .iter()
             .map(|i| functions[*i].name.clone())
@@ -332,7 +368,7 @@ pub fn verify_cached(
                     ));
                 }
             }
-            let summary = encode(id, &functions, &names)?;
+            let summary = encode(id, &functions, &names, data)?;
             r.vc_nodes = summary.nodes;
             r.dependency_digests = edges[id]
                 .iter()
@@ -357,9 +393,7 @@ pub fn verify_cached(
                 let name = format!("a{id}_{i}");
                 let ty = sort(&p.ty)?;
                 s.exchange(&format!("(declare-const {name} {ty})\n"))?;
-                if ty == "Int" {
-                    domain.push(bounds(&name));
-                }
+                domain.push(data::domain(&p.ty, &name));
                 r.input_symbols.insert(name.clone(), p.name.clone());
                 args.push(name);
             }
@@ -557,7 +591,90 @@ fn contract_text(expr: &Expr) -> String {
                     stack.push(Part::Expr(&t.condition));
                     stack.push(Part::Text("(".into()));
                 }
-                _ => output.push_str("<outside-V1>"),
+                Expr::FieldAccess(object, field, ..) => {
+                    stack.push(Part::Text(format!(").{field}")));
+                    stack.push(Part::Expr(object));
+                    stack.push(Part::Text("(".into()));
+                }
+                Expr::Index(array, index, ..) => {
+                    stack.push(Part::Text("]".into()));
+                    stack.push(Part::Expr(index));
+                    stack.push(Part::Text("[".into()));
+                    stack.push(Part::Expr(array));
+                }
+                Expr::MethodCall(call) => {
+                    stack.push(Part::Text(")".into()));
+                    for (i, arg) in call.args.iter().enumerate().rev() {
+                        stack.push(Part::Expr(&arg.expr));
+                        if i > 0 {
+                            stack.push(Part::Text(", ".into()));
+                        }
+                    }
+                    stack.push(Part::Text(format!(").{}(", call.method)));
+                    stack.push(Part::Expr(&call.object));
+                    stack.push(Part::Text("(".into()));
+                }
+                Expr::Call(call) => {
+                    stack.push(Part::Text(")".into()));
+                    for (i, arg) in call.args.iter().enumerate().rev() {
+                        stack.push(Part::Expr(&arg.expr));
+                        if i > 0 {
+                            stack.push(Part::Text(", ".into()));
+                        }
+                    }
+                    stack.push(Part::Text(format!("{}(", call.callee)));
+                }
+                Expr::Lambda(lambda) if matches!(lambda.body, LambdaBody::Expr(_)) => {
+                    let LambdaBody::Expr(body) = &lambda.body else {
+                        unreachable!()
+                    };
+                    stack.push(Part::Expr(body));
+                    stack.push(Part::Text(format!(
+                        "|{}| ",
+                        lambda
+                            .params
+                            .iter()
+                            .map(|p| p.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+                Expr::Match(m) if m.arms.iter().all(|a| matches!(a.body, MatchBody::Expr(_))) => {
+                    stack.push(Part::Text(" }".into()));
+                    for arm in m.arms.iter().rev() {
+                        stack.push(Part::Text(", ".into()));
+                        let MatchBody::Expr(body) = &arm.body else {
+                            unreachable!()
+                        };
+                        stack.push(Part::Expr(body));
+                        stack.push(Part::Text(" => ".into()));
+                        if let Some(guard) = &arm.guard {
+                            stack.push(Part::Expr(guard));
+                            stack.push(Part::Text(" if ".into()));
+                        }
+                        let pattern = match &arm.pattern {
+                            Pattern::Wildcard(..) => "_".into(),
+                            Pattern::Binding { name, .. } => name.clone(),
+                            Pattern::LiteralBool(b, ..) => b.to_string(),
+                            Pattern::LiteralInt(n, ..) => n.to_string(),
+                            Pattern::EnumVariant {
+                                enum_name, variant, ..
+                            } => format!("{enum_name}::{variant}"),
+                            Pattern::EnumVariantTuple {
+                                enum_name,
+                                variant,
+                                bindings,
+                                ..
+                            } => format!("{enum_name}::{variant}({})", bindings.join(", ")),
+                            _ => "<unsupported pattern>".into(),
+                        };
+                        stack.push(Part::Text(pattern));
+                    }
+                    stack.push(Part::Text(" { ".into()));
+                    stack.push(Part::Expr(&m.scrutinee));
+                    stack.push(Part::Text("match ".into()));
+                }
+                _ => output.push_str(&comparison::canonical(expr).to_string()),
             },
         }
     }
@@ -566,3 +683,6 @@ fn contract_text(expr: &Expr) -> String {
 
 #[cfg(test)]
 mod loop_tests;
+
+#[cfg(test)]
+mod data_tests;

@@ -894,6 +894,10 @@ pub struct WhileStmt {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ForStmt {
+    #[serde(default)]
+    pub invariants: Vec<Expr>,
+    #[serde(default)]
+    pub variant: Option<Expr>,
     pub name: String,
     pub name_span: Span,
     pub iterable: Expr,
