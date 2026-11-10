@@ -1,0 +1,39 @@
+// Valid counterparts of the compiler's permanent-wait diagnostics.
+async fn producer(ch: Channel<i64>) {
+    ch.send(42);
+}
+
+async fn parked() {
+    let private_channel = Channel<i64>::new();
+    private_channel.recv();
+}
+
+async fn main() {
+    let messages = Channel<i64>::new();
+    let sender = producer(messages);
+    println(messages.recv());
+    await sender;
+
+    let closed = Channel<i64>::new();
+    closed.close();
+    println(closed.recv_opt().is_none());
+
+    let idle = Channel<i64>::new();
+    select {
+        let value = idle.recv() => { println(value); }
+        sleep(1) => { println("timeout"); }
+    }
+
+    let available = Channel<i64>::new();
+    select {
+        let value = available.recv() => { println(value); }
+        default => { println("default"); }
+    }
+
+    // The caller can finish even though the child has a private empty channel.
+    let child = parked();
+    select {
+        let done = await child => {}
+        sleep(1) => { println("task timeout"); }
+    }
+}

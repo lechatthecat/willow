@@ -766,11 +766,68 @@ Willow is an experimental language and compiler, **not yet suitable for producti
 
 - E2402 checks `Send`/`Sync` constraints on async-call captures and movable Task frames, not arbitrary shared-memory accesses. Closure values are conservatively neither `Send` nor `Sync`; environment-free function pointers can be both. Foreign/native memory is outside this check.
 - E2604 prevents modeled blocking/suspending behavior in Willow lexical lock bodies; it does not prove arbitrary programs deadlock-free.
+- E2607 rejects the [limited permanent-wait shapes](#e2607-certain-permanent-waits) below with a source witness. Absence of E2607 is **not** evidence of deadlock freedom.
 - Conservative dynamic/indirect-call analysis may reject code that is actually safe. Unavailable evidence is not treated as proof of purity.
 - Lock-order analysis conservatively rejects uncertain identities and acquisition cycles (E2605); simultaneous acquisition handles runtime ordering of distinct objects in the same class.
 - Native/foreign boundaries, compiler defects, and runtime defects are outside the guarantee of a static effect check.
 - The runtime benchmarks and agent-token experiment measure limited, published workloads.
 
 **The goal:** make semantic safety properties part of the compiler's ordinary contract, and make their evidence accessible to both humans and coding agents.
+
+### E2607: certain permanent waits
+
+The compiler reports an **error**, with the receive/channel creation or Task
+creation/await chain as its witness, for these closed, statically traceable shapes:
+
+- A fresh local channel is received from with no possible send or close in the
+  analyzed region. This includes `recv_opt`, which also waits on an open channel.
+- A Task awaits itself, including a handle delivered through a local channel.
+- Tasks form an await cycle reached by the creating function's own wait chain.
+
+For example, `let ch = Channel<i64>::new(); ch.recv();` is rejected. A self-wait
+can arise when `waiter(ch)` receives a Task handle and awaits it, while its caller
+does `let t = waiter(ch); ch.send(t); await t;`. Two such Tasks receiving each
+other's handles form a cycle. Witnesses identify each Task creation and await,
+and the channels transporting handles. `task.result()` retains the same identity.
+Task-handle transfers can also violate the existing exclusive-ownership rules
+(E2408). The compiler retains those errors and additionally reports the wait
+witness; E2607 does not authorize sharing or reuse of a transferred Task handle.
+See the runnable [valid sender and escape example](example/permanent_wait_escapes.wi).
+
+The current analysis starts at the process entry `main` and follows its
+straight-line body, local aliases, fresh builtin channels, and direct calls to
+same-module leaf functions. Async calls create Task identities; synchronous
+calls run on the caller's Task. Uncalled helpers and a function named `main` in
+an imported module are not assumed to be process roots. Leaf bodies may receive Task arguments or receive a Task through a
+channel with exactly one send and one receive. Summaries are built once rather
+than recursively expanding the call tree. Only the first unresolved await in a
+Task is followed: a later await may be unreachable after panic or cancellation.
+Detached cycles are not reported when the creating function can return.
+
+A sender in another Task or a close prevents the no-sender diagnostic. Select,
+timeout, cancellation, branches, loops, mutable assignments, defer, function
+values, collections, object fields/methods, imported/foreign calls and other
+unsupported operations cause the containing region to be left **unanalyzed**.
+Nested or recursive Task factories and ambiguous channel deliveries are also
+outside this proof. Bounded sends and sends on possibly closed channels stop the wait-chain proof
+because they can block or panic before a subsequent await. A bounded channel
+constructor is followed only when its capacity is a positive integer literal;
+other capacities might panic before a wait and are left unknown. These exclusions preserve valid programs;
+they do not certify those programs as safe. Even a possible close/send appearing
+after a wait suppresses the no-sender finding, so this intentionally misses some
+real deadlocks. General deadlock freedom remains a non-goal.
+
+The pass uses expected O(S + I + T + C + E) time and O(S + I + T + C + E) memory:
+S is source syntax, I is instantiated summary operations and argument bindings,
+T is Task instances (including the entry root), C is fresh channel instances,
+and E is recorded receive/await edges. Each summary operation is interpreted once
+per instance; each followed Task and wait edge is visited at most once per
+region. Scalar-only body syntax is not re-walked for repeated calls. Each summary keeps
+only the first two sends per channel slot (zero, one, or many deliveries); later
+arguments are still analyzed. Repeated equivalent sends therefore do not expand
+as the product of sends per body and calls to that body. Deterministic
+tests count syntax visits, summary operations, Tasks, channels, waits and graph
+steps for increasing cycles and repeated calls. The pass adds no generated code
+or runtime bookkeeping.
 
 MIT licensed. See [LICENSE](LICENSE).

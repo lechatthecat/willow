@@ -21,3 +21,5 @@ pub(crate) mod scopes;
 pub(crate) mod generic_inference;
 
 pub mod verification;
+
+pub(crate) mod permanent_wait;

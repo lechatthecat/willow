@@ -47,7 +47,13 @@ async fn main() {
 "#,
     ];
     for (case, source) in cases.iter().enumerate() {
-        let project = TestProject::new("async_deadlock", &[("main.wi", source)]);
+        // Keep exercising the runtime fallback: a returned channel is outside
+        // the closed local region checked by the compiler's E2607 analysis.
+        let source = format!(
+            "fn dynamic_inbox() -> Channel<i64> {{ return Channel<i64>::new(); }}\n{}",
+            source.replace("Channel<i64>::new()", "dynamic_inbox()")
+        );
+        let project = TestProject::new("async_deadlock", &[("main.wi", &source)]);
         let compiled = project.compile("main.wi");
         assert!(
             compiled.status.success(),
@@ -75,6 +81,113 @@ async fn main() {
             assert!(!String::from_utf8_lossy(&output.stdout).contains("UNREACHABLE"));
         }
     }
+}
+
+#[test]
+fn permanent_wait_compile_witnesses() {
+    let worker = "async fn waiter(ch: Channel<Task<void>>) { let t = ch.recv(); await t; }";
+    let cases = [
+        "fn main() { let ch = Channel<i64>::new(); println(ch.recv()); }".to_string(),
+        format!(
+            "{worker} async fn main() {{ let c = Channel<Task<void>>::new(); let t = waiter(c); c.send(t); await t; }}"
+        ),
+        format!(
+            "{worker} async fn main() {{ let a = Channel<Task<void>>::new(); let b = Channel<Task<void>>::new(); let x = waiter(a); let y = waiter(b); a.send(y); b.send(x); await x; }}"
+        ),
+    ];
+    for source in cases {
+        let project = TestProject::new("permanent_wait", &[("main.wi", &source)]);
+        // Repeat to exercise both fresh and cached type/body inputs.
+        for _ in 0..2 {
+            let output = project.compile("main.wi");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{source}");
+            assert!(
+                stderr.contains("E2607") && stderr.contains("witness"),
+                "{stderr}"
+            );
+            assert!(
+                !stderr.contains("E2402") && !stderr.contains("E2403"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn permanent_wait_valid_example() {
+    let project = TestProject::new(
+        "permanent_wait_escapes",
+        &[(
+            "main.wi",
+            include_str!("../../../example/permanent_wait_escapes.wi"),
+        )],
+    );
+    let output = project.compile("main.wi");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for workers in ["1", "4"] {
+        let output = project.run_with_env_timeout(
+            &[("WILLOW_WORKERS", workers)],
+            std::time::Duration::from_secs(10),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "42\ntrue\ntimeout\ndefault\ntask timeout\n"
+        );
+    }
+}
+
+#[test]
+fn permanent_wait_imported_body_is_unknown() {
+    let project = TestProject::new(
+        "permanent_wait_import",
+        &[
+            ("main.wi", "import worker; fn main() { worker::block(); }"),
+            (
+                "worker.wi",
+                "pub fn block() { let ch = Channel<i64>::new(); ch.recv(); }",
+            ),
+        ],
+    );
+    let output = project.compile("main.wi");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Do not execute: acceptance means unknown, not proven safe.
+}
+
+#[test]
+fn permanent_wait_imported_main_is_not_entry() {
+    let project = TestProject::new(
+        "permanent_wait_imported_main",
+        &[
+            (
+                "main.wi",
+                "import worker; async fn wrapper() { worker::main(); } async fn main() { let t = wrapper(); select { let v = await t => {} sleep(1) => {} } }",
+            ),
+            (
+                "worker.wi",
+                "pub fn main() { let ch = Channel<i64>::new(); ch.recv(); }",
+            ),
+        ],
+    );
+    let output = project.compile("main.wi");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

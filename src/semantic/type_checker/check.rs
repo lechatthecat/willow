@@ -410,6 +410,25 @@ impl TypeChecker {
             self.validate_generic_templates(file, program);
         }
         self.finish_effect_analysis(program);
+        // Ownership-transfer failures retain resolved types and identities.
+        // Keep those errors and also explain a statically visible wait cycle.
+        // Other type/flow errors make the wait proof unavailable.
+        if self.effect_graph_only.is_none()
+            && self.entry_program
+            && self
+                .errors
+                .iter()
+                .all(|d| d.severity != Severity::Error || d.code == ErrorCode::E2408)
+        {
+            let result = crate::semantic::permanent_wait::check(
+                program,
+                &self.expr_types,
+                &self.static_call_classes,
+            );
+            for diagnostic in result.diagnostics {
+                self.push(diagnostic);
+            }
+        }
         if self.effect_graph_only.is_none() && !self.defer_static_verification {
             let diagnostics = crate::semantic::verification::check(program, &self.errors);
             for diagnostic in diagnostics {

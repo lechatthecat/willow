@@ -237,6 +237,7 @@ error_codes! {
     E2602, // `lock` target is not the lock type the statement's mode requires
     E2603, // scheduler-aware `lock` is only allowed inside an `async fn`
     E2604, // cannot suspend (`await`/`select`) while holding a Willow lock
+    E2607, // statically certain permanent channel/Task wait
     E2605, // cyclic lock order, same-lock reacquisition, or nesting of unknown identity
     E2610, // declared effect contract violated
     E2611, // inherited effect contract weakened
