@@ -3,7 +3,7 @@ use super::ast::*;
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 use crate::lexer::token::TokenKind;
 
-const EFFECT_CONTRACT_NAMES: [&str; 3] = ["no_wait", "no_block", "no_suspend"];
+const EFFECT_CONTRACT_NAMES: [&str; 4] = ["no_wait", "no_block", "no_suspend", "no_io"];
 
 // Candidates are fixed ASCII names, so the DP row is bounded independently of
 // the invalid identifier's length. Ties follow the documented candidate order.
@@ -162,7 +162,7 @@ impl Parser {
     }
 
     /// Resolve the closed set of built-in contract names at declaration time.
-    fn parse_effect_contracts(&mut self) -> Result<Vec<EffectContract>, Diagnostic> {
+    pub(super) fn parse_effect_contracts(&mut self) -> Result<Vec<EffectContract>, Diagnostic> {
         let mut contracts = Vec::new();
         while self.eat(TokenKind::At) {
             let start = self.previous_span();
@@ -191,6 +191,7 @@ impl Parser {
                     "no_wait" => EffectContractKind::NoWait,
                     "no_block" => EffectContractKind::NoBlock,
                     "no_suspend" => EffectContractKind::NoSuspend,
+                    "no_io" => EffectContractKind::NoIo,
                     _ => {
                         return Err(self
                             .err_at(
@@ -1536,7 +1537,7 @@ mod effect_contract_diagnostic_tests {
             ("no_suspen", "no_suspend"),
             ("no_suspendd", "no_suspend"),
             ("no_suspond", "no_suspend"),
-            ("no_", "no_wait"),
+            ("no_", "no_io"),
         ] {
             for source in [
                 format!("@effects({name}) fn f() {{}}"),
@@ -1559,7 +1560,7 @@ mod effect_contract_diagnostic_tests {
                 assert_eq!(
                     error.helps,
                     [format!(
-                        "valid effect contracts: no_wait, no_block, no_suspend; did you mean `{closest}`?"
+                        "valid effect contracts: no_wait, no_block, no_suspend, no_io; did you mean `{closest}`?"
                     )]
                 );
             }
@@ -1572,6 +1573,7 @@ mod effect_contract_diagnostic_tests {
             "@effects(no_wait)",
             "@effects(no_block)",
             "@effects(no_suspend)",
+            "@effects(no_io)",
             "@effects(no_wait, no_block, no_suspend)",
             "@pure",
             "@verified",
@@ -1604,7 +1606,7 @@ mod effect_contract_diagnostic_tests {
         for length in [16, 256, 4096] {
             EDIT_CELLS.with(|n| n.set(0));
             closest_effect_contract(&"x".repeat(length));
-            EDIT_CELLS.with(|n| assert_eq!(n.get(), 25 * length));
+            EDIT_CELLS.with(|n| assert_eq!(n.get(), 30 * length));
         }
     }
 }

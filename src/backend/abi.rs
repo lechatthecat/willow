@@ -279,7 +279,10 @@ mod tests {
             !effects(rt::willow_channel_unregister_waiter)
                 .contains(RuntimeEffects::NO_PREEMPT_REGION)
         );
-        assert_eq!(effects(rt::willow_print_i64), RuntimeEffects::MAY_BLOCK);
+        assert_eq!(
+            effects(rt::willow_print_i64),
+            RuntimeEffects::MAY_BLOCK.union(RuntimeEffects::MAY_IO)
+        );
     }
 
     #[test]
@@ -295,7 +298,11 @@ mod tests {
             rt::willow_println_string,
         ] {
             let symbol = runtime_symbol(name).expect("stdout ABI export");
-            assert_eq!(symbol.effects(), RuntimeEffects::MAY_BLOCK, "{name}");
+            assert_eq!(
+                symbol.effects(),
+                RuntimeEffects::MAY_BLOCK.union(RuntimeEffects::MAY_IO),
+                "{name}"
+            );
         }
     }
 

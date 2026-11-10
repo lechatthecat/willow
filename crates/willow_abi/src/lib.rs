@@ -110,7 +110,7 @@ pub enum AbiTy {
     Ptr,
 }
 
-/// Scheduler, GC, and recoverable-panic effects attached to a runtime ABI row.
+/// Scheduler, GC, recoverable-panic and external-access effects of a runtime ABI row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RuntimeEffects(u8);
 
@@ -132,15 +132,18 @@ impl RuntimeEffects {
     /// while [`RuntimeEffects::MAY_PANIC`] stays exact for code generation.
     /// It lies outside [`RuntimeEffects::ALL`] and [`RuntimeEffects::BIT_COUNT`]:
     /// `MAY_PANIC` already implies it, so fail-closed defaults stay sound.
-    pub const MAY_CHECKED_PANIC: Self = Self(1 << 6);
+    pub const MAY_CHECKED_PANIC: Self = Self(1 << 7);
+
+    /// Access to external resources (console, files, network, or foreign I/O).
+    pub const MAY_IO: Self = Self(1 << 6);
 
     /// Every effect at once. The fail-closed default for a fact the compiler
     /// cannot see: an unanalyzed callee is assumed to do everything.
-    pub const ALL: Self = Self((1 << 6) - 1);
+    pub const ALL: Self = Self((1 << 7) - 1);
 
     /// Number of distinct effect bits, i.e. the exclusive upper bound of the
     /// bit indices [`RuntimeEffects::bits`] can set.
-    pub const BIT_COUNT: u32 = 6;
+    pub const BIT_COUNT: u32 = 7;
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)

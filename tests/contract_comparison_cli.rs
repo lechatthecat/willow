@@ -409,3 +409,45 @@ fn contract_comparison_cli_immutable_data_and_quantified_lock() {
     );
     assert_eq!(fs::read(root.join("contracts.lock")).unwrap(), lock);
 }
+
+#[test]
+fn io_contract_verify_edit_reports_new_external_effect() {
+    let root = std::env::temp_dir().join(format!("willow-io-diff-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "user.name", "Fixture"]);
+    git(&root, &["config", "user.email", "fixture@example.invalid"]);
+    fs::write(root.join("main.wi"), "fn leaf() {} fn main() { leaf(); }").unwrap();
+    git(&root, &["add", "main.wi"]);
+    git(&root, &["commit", "-qm", "Initial fixture"]);
+    let base = git(&root, &["rev-parse", "HEAD"]);
+    fs::write(
+        root.join("main.wi"),
+        "fn leaf() { println(1); } fn main() { leaf(); }",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .args(["verify-edit", "--root"])
+        .arg(&root)
+        .args(["--base", &base, "--format", "json"])
+        .output()
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        result["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["effects"]["added"]
+                .as_array()
+                .is_some_and(|effects| effects.iter().any(|effect| effect == "may-io"))),
+        "{result}"
+    );
+}

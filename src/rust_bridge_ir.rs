@@ -134,6 +134,9 @@ pub struct RustBridgeSymbol {
     pub records: Vec<Record>,
     pub output_type: Scalar,
     pub effects: u8,
+    /// Trusted declaration that the foreign implementation does not access external resources.
+    #[serde(default)]
+    pub no_io: bool,
     #[serde(default)]
     pub close_handle: bool,
     /// Developer assertion, bound to the resolved lock and bridge source.
@@ -174,9 +177,11 @@ impl RustBridgeSymbol {
     pub fn new(name: String, inputs: Vec<Scalar>, output: Scalar) -> Self {
         let effects = willow_abi::RuntimeEffects::MAY_PANIC
             .union(willow_abi::RuntimeEffects::MAY_BLOCK)
-            .union(willow_abi::RuntimeEffects::MAY_ALLOCATE);
+            .union(willow_abi::RuntimeEffects::MAY_ALLOCATE)
+            .union(willow_abi::RuntimeEffects::MAY_IO);
         Self {
             is_async: false,
+            no_io: false,
             rust_crate: String::new(),
             close_handle: false,
             nonblocking: None,

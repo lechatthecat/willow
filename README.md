@@ -409,6 +409,7 @@ its callers whether or not it runs under a lock:
 | `no_block` | Blocking waits such as stdout writes or `BlockingCell` reads | `await` and other suspension |
 | `no_suspend` | Suspension such as `await`, `select` and waiting channel operations | Blocking waits |
 | `no_wait` | Both | Creating a Task without awaiting it |
+| `no_io` | External resource access: console output, filesystem, network, process arguments and explicit clock reads, including async operations | Computation, allocation and synchronization |
 
 ```willow
 fn helper() { println(1); }
@@ -434,11 +435,34 @@ Contracts are checked fail-closed:
 - **E2611**: an override weakens an inherited contract. Overrides that declare nothing inherit the base contract and are checked against it.
 - **E2612**: the property cannot be proven, for example when the function calls an arbitrary function-value parameter. Missing evidence is not treated as success.
 
+`no_io` applies transitively, including virtual calls and imported functions. It is
+an effect contract, not an operating-system sandbox. Runtime housekeeping (GC,
+scheduling, clocks and fault reporting) is outside its external-resource scope.
+
+Foreign Rust and native-library implementations are opaque. Their I/O behavior
+is **UNKNOWN**, and a caller's `no_io` proof fails with E2612 unless the foreign
+declaration explicitly promises no I/O:
+
+```willow
+extern rust {
+    @effects(no_io) fn calculate(x: i64) -> i64;
+}
+```
+
+This declaration is a **trusted developer boundary**: Willow does not inspect
+or verify the foreign implementation, its dependencies, or destructors. An
+incorrect declaration invalidates the guarantee. It does not imply nonblocking;
+the existing `nonblocking("<review_fingerprint>")` modifier remains independent
+and follows the annotation when both are used. The same declaration applies
+when the bridge resolves through a native library. `effects` exposes the I/O
+bit (64), and `verify-edit` reports it as `may-io`.
+See [the runnable I/O contract example](example/io_contracts.wi).
+
 See [effect contracts](example/effect_contracts.wi) and [contracts across interface dispatch](example/effect_contract_dispatch.wi).
 
 ## Contracts: from run-time checks to proofs
 
-Effect contracts describe waiting. Value-level properties use separate annotations, from run-time checks up to static proofs.
+Effect contracts describe waiting and external access. Value-level properties use separate annotations, from run-time checks up to static proofs.
 
 ### `@verified`: prove a contract with Z3
 

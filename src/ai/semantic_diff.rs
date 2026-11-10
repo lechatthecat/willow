@@ -211,6 +211,7 @@ fn effect_names(bits: u8) -> Vec<String> {
                     "may-preempt",
                     "no-preempt-region",
                     "may-panic",
+                    "may-io",
                 ][i as usize]
                     .to_owned()
             })
@@ -225,6 +226,7 @@ fn contract_bits(contracts: &BTreeSet<String>) -> u8 {
                 .bits(),
             "no_block" => RuntimeEffects::MAY_BLOCK.bits(),
             "no_suspend" => RuntimeEffects::MAY_SUSPEND.bits(),
+            "no_io" => RuntimeEffects::MAY_IO.bits(),
             _ => 0,
         }
     })

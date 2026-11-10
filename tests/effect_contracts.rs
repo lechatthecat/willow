@@ -558,7 +558,7 @@ fn effect_contract_polymorphic_generics_and_defaults() {
         ),
         (
             "extern rust { @effects(no_wait) fn foreign(); } @effects(no_wait) fn guard() { foreign(); } fn main() {}",
-            Some("E0105"),
+            Some("E0102"),
         ),
     ] {
         let fixture = Fixture::new(source);
@@ -603,4 +603,78 @@ fn effect_contract_polymorphic_imported_virtual_caller() {
         !out.status.success() && (stderr.contains("E2610") || stderr.contains("E2612")),
         "{stderr}"
     );
+}
+
+#[test]
+fn io_contract_driver_imports_builtins_and_cache() {
+    let fixture =
+        Fixture::new("import worker; @effects(no_io) fn guard() { worker::run(); } fn main() {}");
+    for body in ["println(1);", "", "println(2);"] {
+        fs::write(
+            fixture.0.join("worker.wi"),
+            format!("pub fn run() {{ {body} }}"),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let output = fixture.command("check");
+            let text = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), body.is_empty(), "{text}");
+            if !body.is_empty() {
+                assert!(
+                    text.contains("E2610") && text.contains("worker::run"),
+                    "{text}"
+                );
+            }
+        }
+    }
+    for (import, call) in [
+        ("import std::fs;", "fs::exists(\"missing\");"),
+        ("import std::fs as files;", "files::exists(\"missing\");"),
+        ("import std::fs;", "await fs::exists_async(\"missing\");"),
+        ("import std::net;", "net::bind(\"127.0.0.1:0\");"),
+        (
+            "import std::net;",
+            "await net::connect_async(\"127.0.0.1:1\");",
+        ),
+    ] {
+        fs::write(
+            fixture.0.join("main.wi"),
+            format!("{import} @effects(no_io) async fn guard() {{ {call} }} fn main() {{}}"),
+        )
+        .unwrap();
+        let output = fixture.command("check");
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && text.contains("E2610"),
+            "{call}: {text}"
+        );
+    }
+}
+
+#[test]
+fn io_contract_example_runs() {
+    let fixture = Fixture::new(include_str!("../example/io_contracts.wi"));
+    let output = fixture.command("run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("value=42"));
+}
+
+#[test]
+fn io_contract_driver_inherited_default_and_generic_body() {
+    for source in [
+        "interface I { fn out(self) { println(1); } } class C implements I {} @effects(no_io) fn f(c:C) { c.out(); } fn main() {}",
+        "fn out<T>(x:T) { println(1); } @effects(no_io) fn f() { out(1); } fn main() {}",
+    ] {
+        let fixture = Fixture::new(source);
+        let output = fixture.command("check");
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && text.contains("E2610") && text.contains("root operation"),
+            "{text}"
+        );
+    }
 }

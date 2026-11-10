@@ -1428,6 +1428,7 @@ impl TypeChecker {
                 continue;
             }
             let action = match cause.kind {
+                LockEffectKind::Io => "accesses external resources",
                 LockEffectKind::Suspend => "suspends the task",
                 LockEffectKind::Block => "blocks the scheduler worker",
                 LockEffectKind::SuspendOrBlock => {
@@ -1474,6 +1475,7 @@ impl TypeChecker {
                 continue;
             }
             let effect = match cause.kind {
+                LockEffectKind::Io => "access external resources",
                 LockEffectKind::Suspend => "suspend the task",
                 LockEffectKind::Block => "block the scheduler worker",
                 LockEffectKind::SuspendOrBlock => "suspend the task or block the scheduler worker",

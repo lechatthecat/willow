@@ -92,6 +92,16 @@ impl Parser {
                 items.push(Item::Class(record));
                 continue;
             }
+            let effect_contracts = self.parse_effect_contracts()?;
+            if effect_contracts
+                .iter()
+                .any(|c| c.kind != EffectContractKind::NoIo)
+            {
+                return Err(self.err(
+                    ErrorCode::E0102,
+                    "extern effects accepts no_io; use nonblocking for waiting declarations",
+                ));
+            }
             let nonblocking = if matches!(self.peek_kind(), TokenKind::Ident(word) if word == "nonblocking")
             {
                 self.advance();
@@ -157,13 +167,17 @@ impl Parser {
                     Scalar::Void,
                 );
                 symbol.close_handle = true;
+                symbol.no_io = !effect_contracts.is_empty();
+                if symbol.no_io {
+                    symbol.effects &= !willow_abi::RuntimeEffects::MAY_IO.bits();
+                }
                 if let Some(fingerprint) = nonblocking {
                     symbol.declare_nonblocking(fingerprint);
                 }
                 items.push(Item::Function(FunctionDecl {
                     requires: Vec::new(),
                     ensures: Vec::new(),
-                    effect_contracts: Vec::new(),
+                    effect_contracts,
                     return_type_span: None,
                     type_params: Vec::new(),
                     name: close_name,
@@ -239,6 +253,10 @@ impl Parser {
             let span = span.to(self.previous_span());
             let mut symbol = RustBridgeSymbol::new(name.clone(), inputs, output);
             symbol.is_async = is_async;
+            symbol.no_io = !effect_contracts.is_empty();
+            if symbol.no_io {
+                symbol.effects &= !willow_abi::RuntimeEffects::MAY_IO.bits();
+            }
             if is_async {
                 symbol.effects &= !willow_abi::RuntimeEffects::MAY_BLOCK.bits();
                 symbol.effects |= willow_abi::RuntimeEffects::MAY_SUSPEND.bits();
@@ -250,7 +268,7 @@ impl Parser {
             items.push(Item::Function(FunctionDecl {
                 requires: Vec::new(),
                 ensures: Vec::new(),
-                effect_contracts: Vec::new(),
+                effect_contracts,
                 return_type_span: None,
                 type_params: Vec::new(),
                 rust_bridge: Some(Box::new(symbol)),

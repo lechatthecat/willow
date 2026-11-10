@@ -304,6 +304,7 @@ pub enum EffectContractKind {
     NoWait,
     NoBlock,
     NoSuspend,
+    NoIo,
 }
 
 impl EffectContractKind {
@@ -314,6 +315,7 @@ impl EffectContractKind {
             Self::NoWait => "no_wait",
             Self::NoBlock => "no_block",
             Self::NoSuspend => "no_suspend",
+            Self::NoIo => "no_io",
         }
     }
 
@@ -324,6 +326,7 @@ impl EffectContractKind {
             Self::NoWait => E::MAY_BLOCK.union(E::MAY_SUSPEND),
             Self::NoBlock => E::MAY_BLOCK,
             Self::NoSuspend => E::MAY_SUSPEND,
+            Self::NoIo => E::MAY_IO,
         }
     }
 }

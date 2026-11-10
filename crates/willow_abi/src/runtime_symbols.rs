@@ -57,6 +57,10 @@ impl RuntimeSymbol {
 /// decide what generated code may keep across a call, so an omission is a
 /// silent GC bug the day the bit is wired into a rooting decision, while a
 /// spurious bit only costs a root.
+const IO: RuntimeEffects = RuntimeEffects::MAY_IO;
+const IO_BLOCK: RuntimeEffects = IO.union(BLOCK);
+const IO_ALLOC: RuntimeEffects = IO.union(ALLOC);
+const IO_BLOCK_ALLOC: RuntimeEffects = IO.union(BLOCK_ALLOC);
 const NONE: RuntimeEffects = RuntimeEffects::NONE;
 const ALLOC: RuntimeEffects = RuntimeEffects::MAY_ALLOCATE;
 const BLOCK: RuntimeEffects = RuntimeEffects::MAY_BLOCK;
@@ -113,14 +117,14 @@ runtime_abi_schema! {
     // Stdout locking, writing and flushing can block the current OS thread.
     // Native formatting allocations do not enter the Willow GC, and I/O
     // failures are fatal rather than recoverable Willow panics.
-    BLOCK; willow_print_i64 => ([I64] -> None);
-    BLOCK; willow_println_i64 => ([I64] -> None);
-    BLOCK; willow_print_bool => ([I8] -> None);
-    BLOCK; willow_println_bool => ([I8] -> None);
-    BLOCK; willow_print_f64 => ([F64] -> None);
-    BLOCK; willow_println_f64 => ([F64] -> None);
-    BLOCK; willow_print_string => ([Ptr] -> None);
-    BLOCK; willow_println_string => ([Ptr] -> None);
+    IO_BLOCK; willow_print_i64 => ([I64] -> None);
+    IO_BLOCK; willow_println_i64 => ([I64] -> None);
+    IO_BLOCK; willow_print_bool => ([I8] -> None);
+    IO_BLOCK; willow_println_bool => ([I8] -> None);
+    IO_BLOCK; willow_print_f64 => ([F64] -> None);
+    IO_BLOCK; willow_println_f64 => ([F64] -> None);
+    IO_BLOCK; willow_print_string => ([Ptr] -> None);
+    IO_BLOCK; willow_println_string => ([Ptr] -> None);
     // --- math / float formatting ---
     PANIC_ALLOC; willow_i64_abs => ([I64] -> Some(I64));
     NONE; willow_i64_min => ([I64, I64] -> Some(I64));
@@ -173,11 +177,11 @@ runtime_abi_schema! {
     ALLOC; willow_string_alloc => ([Ptr, I64] -> Some(Ptr));
     ALLOC; willow_string_literal_slot => ([Ptr, Ptr, I64] -> Some(Ptr));
     // --- args ---
-    NONE; willow_time_now_ns => ([] -> Some(I64));
-    NONE; willow_runtime_args_len => ([] -> Some(I64));
-    ALLOC; willow_runtime_arg => ([I64] -> Some(Ptr));
-    ALLOC; willow_runtime_program_name => ([] -> Some(Ptr));
-    ALLOC; willow_runtime_args_array => ([] -> Some(Ptr));
+    IO; willow_time_now_ns => ([] -> Some(I64));
+    IO; willow_runtime_args_len => ([] -> Some(I64));
+    IO_ALLOC; willow_runtime_arg => ([I64] -> Some(Ptr));
+    IO_ALLOC; willow_runtime_program_name => ([] -> Some(Ptr));
+    IO_ALLOC; willow_runtime_args_array => ([] -> Some(Ptr));
     // --- GC allocation ---
     ALLOC; willow_alloc => ([I64] -> Some(Ptr));
     ALLOC; willow_alloc_typed => ([I64, I64] -> Some(Ptr));
@@ -444,26 +448,26 @@ runtime_abi_schema! {
     NONE; willow_sched_set_spawn_site => ([I64, Ptr, I64] -> None);
     NONE; willow_sched_set_cancel_fn => ([I64, Ptr] -> None);
     NONE; willow_sched_set_cancel_fn_cooperative => ([I64, Ptr, I32] -> None);
-    ALLOC; willow_fs_temp_path => ([Ptr] -> Some(Ptr));
-    BLOCK_ALLOC; willow_fs_read_to_string => ([Ptr] -> Some(Ptr));
-    BLOCK_ALLOC; willow_fs_write_string => ([Ptr, Ptr] -> Some(Ptr));
-    BLOCK_ALLOC; willow_fs_exists => ([Ptr] -> Some(I64));
-    BLOCK_ALLOC; willow_fs_remove_file => ([Ptr] -> Some(Ptr));
-    ALLOC; willow_fs_read_to_string_async => ([Ptr] -> Some(Ptr));
-    ALLOC; willow_fs_write_string_async => ([Ptr, Ptr] -> Some(Ptr));
-    ALLOC; willow_fs_exists_async => ([Ptr] -> Some(Ptr));
-    ALLOC; willow_fs_remove_file_async => ([Ptr] -> Some(Ptr));
+    IO_ALLOC; willow_fs_temp_path => ([Ptr] -> Some(Ptr));
+    IO_BLOCK_ALLOC; willow_fs_read_to_string => ([Ptr] -> Some(Ptr));
+    IO_BLOCK_ALLOC; willow_fs_write_string => ([Ptr, Ptr] -> Some(Ptr));
+    IO_BLOCK_ALLOC; willow_fs_exists => ([Ptr] -> Some(I64));
+    IO_BLOCK_ALLOC; willow_fs_remove_file => ([Ptr] -> Some(Ptr));
+    IO_ALLOC; willow_fs_read_to_string_async => ([Ptr] -> Some(Ptr));
+    IO_ALLOC; willow_fs_write_string_async => ([Ptr, Ptr] -> Some(Ptr));
+    IO_ALLOC; willow_fs_exists_async => ([Ptr] -> Some(Ptr));
+    IO_ALLOC; willow_fs_remove_file_async => ([Ptr] -> Some(Ptr));
     // --- scheduler-aware TCP (`std::net`) ---
-    BLOCK_ALLOC; willow_net_bind => ([Ptr] -> Some(Ptr));
-    ALLOC; willow_net_local_addr => ([Ptr] -> Some(Ptr));
-    ALLOC; willow_net_peer_addr => ([Ptr] -> Some(Ptr));
-    ALLOC; willow_net_shutdown => ([Ptr] -> Some(Ptr));
-    ALLOC; willow_net_connect_async => ([Ptr] -> Some(Ptr));
-    ALLOC; willow_net_accept_async => ([Ptr] -> Some(Ptr));
-    ALLOC; willow_net_read_bytes_async => ([Ptr, I64] -> Some(Ptr));
-    ALLOC; willow_net_write_bytes_async => ([Ptr, Ptr] -> Some(Ptr));
-    ALLOC; willow_net_read_async => ([Ptr, I64] -> Some(Ptr));
-    ALLOC; willow_net_write_async => ([Ptr, Ptr] -> Some(Ptr));
+    IO_BLOCK_ALLOC; willow_net_bind => ([Ptr] -> Some(Ptr));
+    IO_ALLOC; willow_net_local_addr => ([Ptr] -> Some(Ptr));
+    IO_ALLOC; willow_net_peer_addr => ([Ptr] -> Some(Ptr));
+    IO_ALLOC; willow_net_shutdown => ([Ptr] -> Some(Ptr));
+    IO_ALLOC; willow_net_connect_async => ([Ptr] -> Some(Ptr));
+    IO_ALLOC; willow_net_accept_async => ([Ptr] -> Some(Ptr));
+    IO_ALLOC; willow_net_read_bytes_async => ([Ptr, I64] -> Some(Ptr));
+    IO_ALLOC; willow_net_write_bytes_async => ([Ptr, Ptr] -> Some(Ptr));
+    IO_ALLOC; willow_net_read_async => ([Ptr, I64] -> Some(Ptr));
+    IO_ALLOC; willow_net_write_async => ([Ptr, Ptr] -> Some(Ptr));
     // --- cancellation tokens and structured scopes ---
     ALLOC; willow_cancellation_token_new => ([] -> Some(Ptr));
     ALLOC; willow_cancellation_token_child => ([Ptr] -> Some(Ptr));
@@ -488,7 +492,7 @@ runtime_abi_schema! {
     NONE; willow_blocking_slot_waiters => ([] -> Some(I64));
     NONE; willow_blocking_queue_capacity => ([] -> Some(I64));
     // Scalar Rust bridge entry gate and contained-panic termination.
-    BLOCK; willow_native_symbol_v1 => ([Ptr, Ptr] -> Some(Ptr));
+    IO_BLOCK; willow_native_symbol_v1 => ([Ptr, Ptr] -> Some(Ptr));
     ALLOC; willow_rust_bridge_async_spawn => ([Ptr, Ptr, Ptr, Ptr, I32] -> Some(Ptr));
     NONE; willow_rust_bridge_enter => ([I32] -> None);
     NONE; willow_rust_bridge_enter_nonblocking => ([I32] -> None);
@@ -585,5 +589,38 @@ mod tests {
         assert!(!PREEMPT.contains(ALLOC));
         assert!(!NO_PREEMPT.contains(ALLOC));
         assert!(NONE.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod io_classification_tests {
+    use super::*;
+    #[test]
+    fn io_contract_external_resource_inventory() {
+        let mut classified = 0;
+        for row in RUNTIME_SYMBOLS {
+            let external = row.name.starts_with("willow_print")
+                || row.name.starts_with("willow_fs_")
+                || row.name.starts_with("willow_net_")
+                || matches!(
+                    row.name,
+                    "willow_native_symbol_v1"
+                        | "willow_runtime_args_len"
+                        | "willow_runtime_args_array"
+                        | "willow_runtime_program_name"
+                        | "willow_runtime_arg"
+                        | "willow_time_now_ns"
+                );
+            assert_eq!(
+                row.effects.intersects(RuntimeEffects::MAY_IO),
+                external,
+                "{}",
+                row.name
+            );
+            classified += usize::from(external);
+        }
+        assert_eq!(classified, 33);
+        assert!(!RuntimeEffects::MAY_CHECKED_PANIC.intersects(RuntimeEffects::ALL));
+        assert_eq!(RuntimeEffects::from_bit(6), RuntimeEffects::MAY_IO);
     }
 }

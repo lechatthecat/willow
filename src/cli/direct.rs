@@ -609,6 +609,7 @@ fn effect_names(bits: &Value) -> String {
         (E::MAY_PREEMPT, "may-preempt"),
         (E::NO_PREEMPT_REGION, "may-run-without-preemption"),
         (E::MAY_PANIC, "may-panic"),
+        (E::MAY_IO, "may-io"),
     ]
     .into_iter()
     .filter_map(|(effect, name)| (bits & u64::from(effect.bits()) != 0).then_some(name))

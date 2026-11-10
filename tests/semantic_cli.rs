@@ -689,7 +689,10 @@ fn effects_human_decodes_masks_and_retains_source_evidence() {
     }
     let out = f.run(&["effects", "main::main", "--format=json"]);
     let value: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(value["result"]["bounds"]["runtime"], 63);
+    assert_eq!(
+        value["result"]["bounds"]["runtime"],
+        willow_compiler::semantic::effects::RuntimeEffects::ALL.bits()
+    );
     assert!(value["result"]["effect_evidence"].is_array());
     assert!(value["result"].get("compiler_witnesses").is_none());
 }
@@ -6345,7 +6348,10 @@ fn effect_states_versioned_schema_matches_impact_and_preserves_witnesses() {
     assert_eq!(result["schema"], "willow.effects.v2");
     assert!(result.get("runtime_effects").is_none());
     let effects = result["effects"].as_array().unwrap();
-    assert_eq!(effects.len(), 6);
+    assert_eq!(
+        effects.len(),
+        willow_compiler::semantic::effects::RuntimeEffects::BIT_COUNT as usize
+    );
     let panic = effects.iter().find(|e| e["effect"] == 32).unwrap();
     assert_eq!(panic["state"], "may", "{value}");
     assert!(panic["witness"]["location"].is_object(), "{value}");
@@ -6846,5 +6852,35 @@ fn string_builtin_paths_propagate_without_narrowing_imported_calls() {
                     && e["paths"]["panic"]["may_allocate"] == "may"),
             "{value}"
         );
+    }
+}
+
+#[test]
+fn io_contract_effect_queries_report_external_access() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/main.wi"), "fn leaf() { println(1); } fn relay() { leaf(); } @effects(no_io) fn pure() {} fn main() {}").unwrap();
+    for (name, state) in [("leaf", "may"), ("relay", "may"), ("pure", "none")] {
+        let value = f.json(&["effects", &format!("main::{name}")], 0);
+        let fact = value["result"]["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|fact| fact["effect"] == 64)
+            .unwrap();
+        assert_eq!(fact["state"], state, "{value}");
+        if state == "may" {
+            assert!(!fact["witness"].is_null(), "{value}");
+        }
+    }
+    for (annotation, state) in [("", "unknown"), ("@effects(no_io)", "none")] {
+        fs::write(f.0.join("src/main.wi"), format!("extern rust {{ {annotation} fn foreign(); }} fn relay() {{ foreign(); }} fn main() {{}}")).unwrap();
+        let value = f.json(&["effects", "main::relay"], 1);
+        let fact = value["result"]["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|fact| fact["effect"] == 64)
+            .unwrap();
+        assert_eq!(fact["state"], state, "{value}");
     }
 }

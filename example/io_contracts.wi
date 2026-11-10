@@ -1,0 +1,14 @@
+// Resource access belongs at the application boundary.
+@effects(no_io)
+fn render(value: i64) -> String {
+    return "value=" + value.toString();
+}
+
+@effects(no_io)
+fn prepare() -> String {
+    return render(42);
+}
+
+fn main() {
+    println(prepare());
+}

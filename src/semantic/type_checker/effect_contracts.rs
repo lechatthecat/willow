@@ -45,7 +45,7 @@ fn witness_paths(
         for callee in &sites.targets {
             #[cfg(test)]
             PATH_WORK.with(|n| n.set(n.get() + 1));
-            if asynchronous.get(callee) != Some(&true)
+            if (bit == RuntimeEffects::MAY_IO || asynchronous.get(callee) != Some(&true))
                 && owners.contains_key(caller)
                 && owners.get(caller) == owners.get(callee)
             {
@@ -79,10 +79,14 @@ impl TypeChecker {
     /// call-sites × candidate-values expansion.
     fn solve_contracts(
         &self,
+        program: &Program,
         graph: &CallGraph,
         facts: &EffectFacts<EffectWitness>,
         roots: impl Iterator<Item = FunctionId>,
     ) -> (CallGraph, EffectFacts<EffectWitness>) {
+        const CONTRACT_EFFECTS: RuntimeEffects = RuntimeEffects::MAY_BLOCK
+            .union(RuntimeEffects::MAY_SUSPEND)
+            .union(RuntimeEffects::MAY_IO);
         use crate::compiler_db::effects::LOCK_EFFECT_WAIT;
         use crate::semantic::{call_graph::CallSites, effects::EffectProblem};
         let mut graph = graph.clone();
@@ -116,10 +120,10 @@ impl TypeChecker {
             );
         }
         let mut problem = EffectProblem::new()
-            .external_callee(LOCK_EFFECT_WAIT)
-            .unknown_callee(LOCK_EFFECT_WAIT)
-            .missing_body(LOCK_EFFECT_WAIT)
-            .default_transmit(LOCK_EFFECT_WAIT);
+            .external_callee(CONTRACT_EFFECTS)
+            .unknown_callee(CONTRACT_EFFECTS)
+            .missing_body(CONTRACT_EFFECTS)
+            .default_transmit(CONTRACT_EFFECTS);
         // A matching arity identifies a possible target, not an exact dynamic
         // target. External witnesses sort after proven Lock witnesses, so an
         // uncertain candidate cannot hide an independently proven violation.
@@ -135,7 +139,11 @@ impl TypeChecker {
                 continue;
             };
             let hub = FunctionId::free(format!("$contract$arity{}", value.bit.trailing_zeros()));
-            for bit in [RuntimeEffects::MAY_BLOCK, RuntimeEffects::MAY_SUSPEND] {
+            for bit in [
+                RuntimeEffects::MAY_BLOCK,
+                RuntimeEffects::MAY_SUSPEND,
+                RuntimeEffects::MAY_IO,
+            ] {
                 if summary.intersects(bit) {
                     problem = problem.seed(hub, bit, Some(EffectWitness::External(hub)));
                 }
@@ -154,6 +162,11 @@ impl TypeChecker {
         );
         let mut normalized = CallGraph::default();
         let mut abi_effects = HashMap::new();
+        let builtin_aliases = self
+            .imported_std_modules
+            .iter()
+            .map(|(alias, module)| (alias.clone(), module.module.clone()))
+            .collect();
         for (&id, sites) in graph.iter() {
             let mut sites = sites.clone();
             if sites.has_unknown
@@ -204,7 +217,35 @@ impl TypeChecker {
                         .sum::<usize>(),
             )
         });
+        let foreign: HashMap<_, _> = program
+            .items
+            .iter()
+            .filter_map(|item| {
+                let Item::Function(f) = item else {
+                    return None;
+                };
+                f.rust_bridge.as_ref()?;
+                Some((
+                    FunctionId::free(&f.name),
+                    f.effect_contracts
+                        .iter()
+                        .any(|c| c.kind == EffectContractKind::NoIo),
+                ))
+            })
+            .collect();
         for id in nodes {
+            if let Some(no_io) = foreign.get(&id) {
+                problem = problem.seed(
+                    id,
+                    if *no_io {
+                        LOCK_EFFECT_WAIT
+                    } else {
+                        CONTRACT_EFFECTS
+                    },
+                    None,
+                );
+                continue;
+            }
             let local = graph.get(&id).is_some()
                 || id.is_lambda()
                 || (id.name().as_ref() == "init"
@@ -227,9 +268,23 @@ impl TypeChecker {
                         .cloned()
                 })
             };
+            if !local
+                && let Some(effects) = crate::semantic::intrinsics::builtin_target_effects(&id)
+                    .or_else(|| {
+                        crate::semantic::intrinsics::builtin_static_effects(&id, &builtin_aliases)
+                    })
+            {
+                abi_effects.insert(id, effects);
+                problem = problem.seed(id, effects.intersection(CONTRACT_EFFECTS), None);
+                continue;
+            }
             if let Some(summary) = summary {
                 problem = problem.seed(id, RuntimeEffects::NONE, None);
-                for bit in [RuntimeEffects::MAY_BLOCK, RuntimeEffects::MAY_SUSPEND] {
+                for bit in [
+                    RuntimeEffects::MAY_BLOCK,
+                    RuntimeEffects::MAY_SUSPEND,
+                    RuntimeEffects::MAY_IO,
+                ] {
                     if summary.intersects(bit) {
                         let witness = summary.witness(bit).cloned().filter(|w| {
                             w.lock()
@@ -250,18 +305,10 @@ impl TypeChecker {
                 {
                     problem = problem.seed(id, LOCK_EFFECT_WAIT, None);
                 }
-            } else if !local
-                && let Some(effects) = crate::semantic::intrinsics::builtin_target_effects(&id)
-                    .or_else(|| {
-                        crate::semantic::intrinsics::builtin_static_effects(&id, &HashMap::new())
-                    })
-            {
-                abi_effects.insert(id, effects);
-                problem = problem.seed(id, effects.intersection(LOCK_EFFECT_WAIT), None);
             } else if id.name().starts_with("$contract$arity") {
                 problem = problem.body(id);
             } else {
-                problem = problem.seed(id, LOCK_EFFECT_WAIT, None);
+                problem = problem.seed(id, CONTRACT_EFFECTS, None);
             }
             // Interface union nodes with no implementation do not prove a
             // signature merely because an empty runtime fact was allocated.
@@ -270,10 +317,10 @@ impl TypeChecker {
                 && !id.name().starts_with("$default$")
                 && graph.get(&id).is_none_or(|sites| sites.targets.is_empty())
             {
-                problem = problem.seed(id, LOCK_EFFECT_WAIT, None);
+                problem = problem.seed(id, CONTRACT_EFFECTS, None);
             }
             if self.lock_callee_is_async(&id) == Some(true) {
-                problem = problem.transmit(id, RuntimeEffects::NONE);
+                problem = problem.transmit(id, RuntimeEffects::MAY_IO);
             }
         }
         // ABI effects are proved at each actual source call, not at a shared
@@ -289,6 +336,7 @@ impl TypeChecker {
                 for (bit, kind) in [
                     (RuntimeEffects::MAY_BLOCK, LockEffectKind::Block),
                     (RuntimeEffects::MAY_SUSPEND, LockEffectKind::Suspend),
+                    (RuntimeEffects::MAY_IO, LockEffectKind::Io),
                 ] {
                     if effects.intersects(bit) {
                         problem = problem.seed(
@@ -323,7 +371,7 @@ impl TypeChecker {
         templates: bool,
     ) -> Vec<(FunctionId, EffectContract)> {
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
-        let mut obligations: HashMap<String, HashMap<String, [Option<EffectContract>; 5]>> =
+        let mut obligations: HashMap<String, HashMap<String, [Option<EffectContract>; 6]>> =
             HashMap::new();
         let mut queue = VecDeque::new();
         let mut types = HashSet::new();
@@ -402,6 +450,7 @@ impl TypeChecker {
                 EffectContractKind::NoWait => 0,
                 EffectContractKind::NoBlock => 1,
                 EffectContractKind::NoSuspend => 2,
+                EffectContractKind::NoIo => 5,
             };
             let entry = obligations
                 .entry(owner.clone())
@@ -527,8 +576,12 @@ impl TypeChecker {
                 EffectContractKind::Pure | EffectContractKind::Verified
             )
         });
-        let (graph, contract_facts) =
-            self.solve_contracts(graph, facts, declarations.iter().map(|(id, _)| *id));
+        let (graph, contract_facts) = self.solve_contracts(
+            program,
+            graph,
+            facts,
+            declarations.iter().map(|(id, _)| *id),
+        );
         let contract_facts = std::sync::Arc::new(contract_facts);
         let facts = &contract_facts;
         let graph = &graph;
@@ -542,7 +595,11 @@ impl TypeChecker {
             return;
         }
         let summaries: HashMap<_, _> = facts.iter().map(|(&id, summary)| (id, summary)).collect();
-        let bits = [RuntimeEffects::MAY_BLOCK, RuntimeEffects::MAY_SUSPEND];
+        let bits = [
+            RuntimeEffects::MAY_BLOCK,
+            RuntimeEffects::MAY_SUSPEND,
+            RuntimeEffects::MAY_IO,
+        ];
         let paths = bits.map(|bit| witness_paths(graph, facts, &self.effect_index.callables, bit));
         for (id, contract) in declarations {
             let Some(summary) = summaries.get(&id) else {
@@ -628,7 +685,7 @@ impl TypeChecker {
                 None => {
                     diagnostic = diagnostic.with_label(Label::primary(
                         contract.span,
-                        "waiting effect has no available source witness",
+                        "effect has no available source witness",
                     ));
                     "conservative-bound"
                 }
@@ -646,6 +703,245 @@ impl TypeChecker {
 mod tests {
     use super::super::check::check_source;
     use super::*;
+
+    #[test]
+    fn io_contract_graph_work_is_bounded() {
+        for shape in ["chain", "fanout", "cycle"] {
+            for n in [8, 32, 128, 512] {
+                let mut source = String::from("fn leaf() { println(1); } ");
+                for i in 0..n {
+                    let next = if shape == "fanout" || i == 0 {
+                        "leaf".to_owned()
+                    } else {
+                        format!("node_{}", i - 1)
+                    };
+                    source.push_str(&format!(
+                        "fn node_{i}() {{ {next}(); {} }} ",
+                        if shape == "cycle" && i == 0 {
+                            format!("node_{}();", n - 1)
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+                source.push_str(&format!(
+                    "@effects(no_io) fn guard() {{ node_{}(); }}",
+                    n - 1
+                ));
+                CONTRACT_GRAPH_WORK.with(|v| v.set(0));
+                PATH_WORK.with(|v| v.set(0));
+                crate::semantic::effects::REACHABLE_EDGE_VISITS.with(|v| v.set(0));
+                let errors = check_source(&source);
+                assert_eq!(
+                    errors.iter().filter(|d| d.code == ErrorCode::E2610).count(),
+                    1,
+                    "{shape} {n}: {errors:?}"
+                );
+                let graph = CONTRACT_GRAPH_WORK.with(|v| v.get());
+                let paths = PATH_WORK.with(|v| v.get());
+                let visits = crate::semantic::effects::REACHABLE_EDGE_VISITS.with(|v| v.get());
+                assert!(graph <= 12 * (n + 4), "{shape} {n} graph={graph}");
+                assert!(paths <= 30 * (n + 4), "{shape} {n} paths={paths}");
+                assert!(visits <= 12 * (n + 4), "{shape} {n} edges={visits}");
+                println!(
+                    "io-contract shape={shape} nodes={n} graph={graph} paths={paths} edge_visits={visits}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn io_contract_std_resource_catalog_is_complete() {
+        for module in crate::stdlib_schema::STDLIB_SCHEMA {
+            match module.name {
+                "fs" | "net" | "env" | "time" => {}
+                // Console output is syntax, tested through its overload ABI inventory.
+                "io" => {
+                    assert_eq!(
+                        module
+                            .items
+                            .iter()
+                            .map(|item| item.name)
+                            .collect::<Vec<_>>(),
+                        ["println", "print", "eprintln"]
+                    );
+                    continue;
+                }
+                // Pure value modules, or callback-driven effects classified at call sites.
+                "text" | "collections" | "option" | "result" | "parallel" => continue,
+                other => panic!("classify external access for new standard module {other}"),
+            }
+            for item in module.items {
+                if !matches!(
+                    item.kind,
+                    crate::stdlib_schema::StdItemKind::Function { .. }
+                ) {
+                    continue;
+                }
+                let builtin =
+                    crate::semantic::intrinsics::namespace_builtin(module.name, item.name)
+                        .unwrap_or_else(|| panic!("unclassified {}::{}", module.name, item.name));
+                assert!(
+                    willow_abi::runtime_symbol(builtin.runtime)
+                        .unwrap()
+                        .effects()
+                        .contains(RuntimeEffects::MAY_IO),
+                    "{}::{}",
+                    module.name,
+                    item.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn io_contract_permission_matrix() {
+        let cases = [
+            (
+                "defer",
+                "@effects(no_io) fn f() { defer println(1); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "synchronization",
+                "@effects(no_io) fn f(c:BlockingCell<i64>) { c.get(); }",
+                None,
+            ),
+            ("empty", "@effects(no_io) fn f() {}", None),
+            (
+                "arithmetic",
+                "@effects(no_io) fn f(x:i64)->i64 { return x+1; }",
+                None,
+            ),
+            (
+                "allocation",
+                "@effects(no_io) fn f()->String { return 3.toString(); }",
+                None,
+            ),
+            (
+                "print",
+                "@effects(no_io) fn f() { print(1); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "println",
+                "@effects(no_io) fn f() { println(1); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "transitive",
+                "fn leaf() { println(1); } fn relay() { leaf(); } @effects(no_io) fn f() { relay(); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "recursive",
+                "fn leaf(x:bool) { if x { leaf(false); } else { println(1); } } @effects(no_io) fn f() { leaf(true); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "pure helper",
+                "fn leaf() {} @effects(no_io) fn f() { leaf(); }",
+                None,
+            ),
+            (
+                "unknown foreign",
+                "extern rust { fn foreign(); } @effects(no_io) fn f() { foreign(); }",
+                Some(ErrorCode::E2612),
+            ),
+            (
+                "declared foreign",
+                "extern rust { @effects(no_io) fn foreign(); } @effects(no_io) fn f() { foreign(); }",
+                None,
+            ),
+            (
+                "foreign relay",
+                "extern rust { fn foreign(); } fn relay() { foreign(); } @effects(no_io) fn f() { relay(); }",
+                Some(ErrorCode::E2612),
+            ),
+            (
+                "declared relay",
+                "extern rust { @effects(no_io) fn foreign(); } fn relay() { foreign(); } @effects(no_io) fn f() { relay(); }",
+                None,
+            ),
+            (
+                "unused foreign",
+                "extern rust { fn foreign(); } @effects(no_io) fn f() {}",
+                None,
+            ),
+            (
+                "callback unknown",
+                "@effects(no_io) fn f(cb:fn()) { cb(); }",
+                Some(ErrorCode::E2612),
+            ),
+            (
+                "constructor",
+                "class C { pub init(self) { println(1); } } @effects(no_io) fn f() { let c = new C(); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "method",
+                "class C { pub fn out(self) { println(1); } } @effects(no_io) fn f(c:C) { c.out(); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "override",
+                "open class B { pub open fn out(self) {} } class C extends B { pub override fn out(self) { println(1); } } @effects(no_io) fn f(b:B) { b.out(); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "interface",
+                "interface I { fn out(self); } class C implements I { pub fn out(self) { println(1); } } @effects(no_io) fn f(i:I) { i.out(); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "inherited obligation",
+                "open class B { @effects(no_io) pub open fn out(self) {} } class C extends B { pub override fn out(self) { println(1); } }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "combined",
+                "@effects(no_io,no_block) fn f() { println(1); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "async body",
+                "@effects(no_io) async fn f() { println(1); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "async callee",
+                "async fn leaf() { println(1); } @effects(no_io) async fn f() { await leaf(); }",
+                Some(ErrorCode::E2610),
+            ),
+        ];
+        for (label, source, expected) in cases {
+            let errors: Vec<_> = check_source(source)
+                .into_iter()
+                .filter(|d| d.severity == Severity::Error)
+                .collect();
+            if let Some(code) = expected {
+                assert!(errors.iter().any(|d| d.code == code), "{label}: {errors:?}");
+                if code == ErrorCode::E2610 {
+                    assert!(
+                        errors.iter().any(|d| d.code == code
+                            && d.labels
+                                .iter()
+                                .any(|label| label.message.starts_with("root operation"))),
+                        "{label}: missing source witness: {errors:?}"
+                    );
+                }
+                assert!(
+                    errors.iter().all(|d| matches!(
+                        d.code,
+                        ErrorCode::E2610 | ErrorCode::E2611 | ErrorCode::E2612
+                    )),
+                    "{label}: {errors:?}"
+                );
+            } else {
+                assert!(errors.is_empty(), "{label}: {errors:?}");
+            }
+        }
+    }
 
     #[test]
     fn effect_contract_proven_wait_dominates_uncertain_value() {

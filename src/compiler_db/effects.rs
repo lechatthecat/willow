@@ -3630,6 +3630,7 @@ pub(crate) struct TaskMethodCall {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum LockEffectKind {
+    Io,
     Suspend,
     Block,
     /// A separately compiled/imported synchronous implementation whose body
@@ -3697,6 +3698,7 @@ impl LockEffectKind {
     ///
     pub(crate) fn effects(self) -> RuntimeEffects {
         match self {
+            Self::Io => RuntimeEffects::MAY_IO,
             Self::Suspend => RuntimeEffects::MAY_SUSPEND,
             Self::Block => RuntimeEffects::MAY_BLOCK,
             Self::SuspendOrBlock => RuntimeEffects::MAY_SUSPEND.union(RuntimeEffects::MAY_BLOCK),

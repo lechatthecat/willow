@@ -54,9 +54,16 @@ impl Analysis {
             evidence: Vec::new(),
             edge_visits: 0,
         };
+        let mut declared_no_io = vec![false; snapshot.functions.len()];
         for bridge in &snapshot.semantic.interop.bridges {
             if let Some(&i) = index.by_id.get(bridge.function.as_str()) {
-                result.reason(i, RuntimeEffects::ALL.bits(), 4, None);
+                declared_no_io[i] = bridge.symbol.no_io;
+                let unknown = if bridge.symbol.no_io {
+                    RuntimeEffects::ALL.difference(RuntimeEffects::MAY_IO)
+                } else {
+                    RuntimeEffects::ALL
+                };
+                result.reason(i, unknown.bits(), 4, None);
             }
         }
         let mut bodies = vec![false; snapshot.functions.len()];
@@ -70,7 +77,12 @@ impl Analysis {
         }
         for (i, f) in snapshot.functions.iter().enumerate() {
             if !bodies[i] && !f.synthetic {
-                result.reason(i, RuntimeEffects::ALL.bits(), 3, f.locations.first());
+                let unknown = if declared_no_io[i] {
+                    RuntimeEffects::ALL.difference(RuntimeEffects::MAY_IO)
+                } else {
+                    RuntimeEffects::ALL
+                };
+                result.reason(i, unknown.bits(), 3, f.locations.first());
             }
             if f.id.starts_with("$indirect-arity:") {
                 result.reason(i, f.runtime_effects, 0, None);
