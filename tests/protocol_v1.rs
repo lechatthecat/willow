@@ -257,11 +257,11 @@ fn unknown_indirect_effects_and_virtual_interface_dispatch() {
     let f = Fixture::new("fn indirect(f: fn() -> i64) -> i64 { return f(); } fn main() {}");
     let snapshot = f.facts();
     assert_eq!(named(&snapshot, "indirect")["unknown"], true);
-    assert_eq!(named(&snapshot, "indirect")["runtime_effects"], 63);
+    assert_eq!(named(&snapshot, "indirect")["runtime_effects"], 127);
     f.write("main.wi", "interface I { fn run(self) -> i64; } fn caller(x: I) -> i64 { return x.run(); } fn main() {}");
     let unknown = f.facts();
     assert_eq!(named(&unknown, "caller")["unknown"], true);
-    assert_eq!(named(&unknown, "caller")["runtime_effects"], 63);
+    assert_eq!(named(&unknown, "caller")["runtime_effects"], 127);
     let source = "interface I { fn run(self) -> i64; } class A implements I { pub fn run(self) -> i64 { return 1; } } fn call(x: I) -> i64 { return x.run(); } fn main() {}";
     f.write("main.wi", source);
     let snapshot = f.facts();

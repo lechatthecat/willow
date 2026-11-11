@@ -295,8 +295,11 @@ mod tests {
                 Box::new(Scalar::String)
             ))
         );
+        assert_eq!(
+            Scalar::from_type(&BuiltinTypeId::Array.apply(vec![Type::Bool])),
+            Some(Scalar::Array(Box::new(Scalar::Bool)))
+        );
         for (id, args) in [
-            (BuiltinTypeId::Array, vec![Type::Bool]),
             (BuiltinTypeId::Option, vec![]),
             (BuiltinTypeId::Option, vec![Type::I64, Type::I64]),
             (BuiltinTypeId::Result, vec![Type::I64]),

@@ -356,6 +356,9 @@ fn async_bridge_generation_counts_are_linear_and_async_identity_is_distinct() {
         sync.bind("crate").abi_symbol,
         asynchronous.bind("crate").abi_symbol
     );
+    // The fixed executor/support prelude size depends on template line endings
+    // (CRLF checkouts on Windows), so bound only the per-declaration growth.
+    let mut base = None;
     for count in [1, 16, 256, 1024] {
         let symbols: Vec<_> = (0..count)
             .map(|i| {
@@ -373,7 +376,8 @@ fn async_bridge_generation_counts_are_linear_and_async_identity_is_distinct() {
         assert_eq!(code.matches("let task = spawn_future(").count(), count);
         assert_eq!(code.matches(".to_owned();").count(), count);
         assert_eq!(code.matches("fn future_queue()").count(), 1);
-        assert!(code.len() < 27000 + count * 1000);
+        let base = *base.get_or_insert(code.len());
+        assert!(code.len() - base <= (count - 1) * 1000);
         eprintln!(
             "async declarations={count} constructors={count} owned_copies={count} executor_copies=1 bytes={}",
             code.len()

@@ -660,7 +660,7 @@ fn alias_23_a_user_module_of_the_same_name_still_wins() {
         (
             "src/fs.wi",
             r#"
-pub fn exists(path: String) -> bool {
+pub fn temp_path(path: String) -> bool {
     return path == "mine";
 }
 "#,
@@ -672,8 +672,8 @@ import std::fs as files;
 import fs;
 
 fn main() {
-    println(fs::exists("mine"));
-    println(fs::exists("willow-no-such-file-alias-23"));
+    println(fs::temp_path("mine"));
+    println(fs::temp_path("willow-no-such-file-alias-23"));
     println(files::exists("willow-no-such-file-alias-23"));
 }
 "#,

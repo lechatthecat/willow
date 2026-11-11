@@ -298,7 +298,9 @@ import std::collections::Array;
 
 async fn second(m: Mutex<Array<i64>>) -> i64 {
     let mut got: Array<i64> = [0];
-    lock m as value { got = value; }
+    // A protected Array is not Sync and may not escape the lock (E2408), so
+    // the section binds a fresh copy of it.
+    lock m as value { got = [value[0], value[1], value[2]]; }
     return got[1] + got.len();
 }
 async fn main() {

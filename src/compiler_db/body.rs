@@ -1673,7 +1673,8 @@ mod tests {
         let result = queries
             .definite_assignment(class.constructors[0].body.id, || panic!("recomputed flow"))
             .unwrap();
-        assert_eq!(*result, [false]);
+        // One own field, then the base-exit, violation and before-base-init flags.
+        assert_eq!(*result, [false; 4]);
         assert_eq!(queries.assignment.stats().computations, 1);
         assert_eq!(queries.assignment.stats().hits, 1);
     }
@@ -1776,7 +1777,7 @@ mod tests {
                                 "recomputed flow"
                             ))
                             .unwrap(),
-                        [false]
+                        [false; 4]
                     );
                 }
             }

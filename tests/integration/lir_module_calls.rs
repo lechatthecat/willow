@@ -664,7 +664,7 @@ fn module_call_26_a_user_module_beats_a_builtin_namespace() {
     let files = [
         (
             "fs.wi",
-            "pub fn exists(path: String) -> bool { return false; }",
+            "pub fn temp_path(path: String) -> bool { return false; }",
         ),
         (
             "main.wi",
@@ -672,7 +672,7 @@ fn module_call_26_a_user_module_beats_a_builtin_namespace() {
 import fs;
 
 fn main() {
-    println(fs::exists("anything"));
+    println(fs::temp_path("anything"));
 }
 "#,
         ),

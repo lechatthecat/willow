@@ -1584,8 +1584,14 @@ fn main() {
 fn rsm_77_release_empty_open_channel_recv_fails() {
     assert_unhandled_fault(
         r#"
+// A helper hides the fresh channel from the compile-time permanent-wait
+// check so this still exercises the runtime would-block panic.
+fn empty_channel() -> Channel<i64> {
+    return Channel<i64>::new();
+}
+
 fn main() {
-    let channel = Channel<i64>::new();
+    let channel = empty_channel();
     println(channel.recv());
 }
 "#,

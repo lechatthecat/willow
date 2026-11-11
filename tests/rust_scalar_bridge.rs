@@ -581,6 +581,10 @@ fn independent_project_archives_keep_same_named_rust_functions_distinct() {
         #[unsafe(no_mangle)]
         pub extern "C" fn willow_rust_bridge_enter(revision: u32) {{ assert_eq!(revision, {}); }}
         #[unsafe(no_mangle)]
+        pub extern "C" fn willow_rust_bridge_region_enter() -> u32 {{ 0 }}
+        #[unsafe(no_mangle)]
+        pub extern "C" fn willow_rust_bridge_region_exit(_: u32) {{}}
+        #[unsafe(no_mangle)]
         pub extern "C" fn willow_rust_bridge_panic() -> ! {{ std::process::abort() }}
         #[unsafe(no_mangle)]
         pub extern "C" fn willow_rust_bridge_handle_error(_: u32, _: u64) -> ! {{ std::process::abort() }}

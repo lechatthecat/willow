@@ -224,26 +224,29 @@ impl TypeChecker {
                 let Item::Function(f) = item else {
                     return None;
                 };
-                f.rust_bridge.as_ref()?;
-                Some((
-                    FunctionId::free(&f.name),
-                    f.effect_contracts
-                        .iter()
-                        .any(|c| c.kind == EffectContractKind::NoIo),
-                ))
+                let bridge = f.rust_bridge.as_ref()?;
+                // A reviewed `nonblocking` declaration does not wait; an
+                // `@effects(no_io)` declaration performs no I/O.
+                let mut effects = if bridge.nonblocking.is_some() {
+                    RuntimeEffects::NONE
+                } else {
+                    LOCK_EFFECT_WAIT
+                };
+                if !f
+                    .effect_contracts
+                    .iter()
+                    .any(|c| c.kind == EffectContractKind::NoIo)
+                {
+                    effects = effects.union(RuntimeEffects::MAY_IO);
+                }
+                // Same identity as the effect summaries: a namespaced
+                // declaration `ns::f` is `f` in namespace `ns`.
+                Some((FunctionId::free_from_source_name(&f.name), effects))
             })
             .collect();
         for id in nodes {
-            if let Some(no_io) = foreign.get(&id) {
-                problem = problem.seed(
-                    id,
-                    if *no_io {
-                        LOCK_EFFECT_WAIT
-                    } else {
-                        CONTRACT_EFFECTS
-                    },
-                    None,
-                );
+            if let Some(&effects) = foreign.get(&id) {
+                problem = problem.seed(id, effects.intersection(CONTRACT_EFFECTS), None);
                 continue;
             }
             let local = graph.get(&id).is_some()

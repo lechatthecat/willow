@@ -946,6 +946,7 @@ fn semantic_diff_incremental_cold_oracle_edit_shapes() {
 
 #[test]
 fn semantic_diff_incremental_query_scaling() {
+    let bits = willow_abi::RuntimeEffects::BIT_COUNT as usize;
     let mut independent_work = None;
     for shape in ["independent", "chain", "fanout", "exits"] {
         for size in [8, 32, 128] {
@@ -1036,8 +1037,9 @@ fn semantic_diff_incremental_query_scaling() {
                 ("snapshot_functions_rebuilt", affected),
                 ("snapshot_symbols_rebuilt", 5 * affected),
                 ("report_facts_rebuilt", affected),
-                ("report_witness_owners_visited", 6 * affected),
-                ("report_witness_edges_visited", 12 * affected),
+                // Witness repair visits each affected owner once per effect bit.
+                ("report_witness_owners_visited", bits * affected),
+                ("report_witness_edges_visited", 2 * bits * affected),
                 ("report_witness_queue_operations", 4 * affected),
                 ("report_dependency_edges_visited", 10 * affected),
             ] {
