@@ -1418,8 +1418,23 @@ fn run_rust_project_examples() {
             "willow_rust_example_{}",
             unique_test_id()
         )));
-        let project_copy = copy.join("project");
-        copy_dir(Path::new(project), &project_copy);
+        let project_dir = Path::new(project);
+        let project_copy = copy.join(project_dir.file_name().unwrap());
+        copy_dir(project_dir, &project_copy);
+        // Relative `path = "..."` Rust dependencies (for example a sibling
+        // example's native crate) keep the same layout beside the copy.
+        let manifest = fs::read_to_string(project_dir.join("project.toml")).unwrap();
+        for dependency in manifest
+            .split("path = \"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .filter(|path| path.starts_with(".."))
+        {
+            copy_dir(
+                &project_dir.join(dependency),
+                &project_copy.join(dependency),
+            );
+        }
         // Capture diagnostics: missing cargo/rustc and unavailable registry
         // access must fail explicitly, never silently skip the example.
         let original_home = std::env::var_os("HOME")
