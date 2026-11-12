@@ -1705,6 +1705,13 @@ fn nonblocking_regex_example_review_is_portable() {
         String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
         "true\nfalse\n"
     );
+    // A CRLF checkout (Windows) keeps the same reviewed fingerprint.
+    let bridge = fs::read_to_string(f.root.join("bridge.rs")).unwrap();
+    fs::write(f.root.join("bridge.rs"), bridge.replace('\n', "\r\n")).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
+        "true\nfalse\n"
+    );
 }
 
 #[test]
@@ -2085,10 +2092,14 @@ extern rust {
     nonblocking("REVIEW") fn resource() -> Resource;
     nonblocking("REVIEW") fn drops() -> i64;
     nonblocking("REVIEW") fn created() -> bool;
+    nonblocking("REVIEW") fn mark();
 }
 async fn hold() {
     let resource = resource();
     defer Resource_close(resource);
+    // Signal only once the cleanup is registered: a cancel requested
+    // between `resource()` and the `defer` would rightly skip it.
+    mark();
     await sleep(100000);
 }
 async fn main() {
@@ -2105,7 +2116,8 @@ static CREATED: AtomicI64 = AtomicI64::new(0);
 static DROPS: AtomicI64 = AtomicI64::new(0);
 pub struct Resource;
 impl Drop for Resource { fn drop(&mut self) { DROPS.fetch_add(1, Ordering::SeqCst); } }
-pub fn resource() -> Box<Resource> { CREATED.store(1, Ordering::SeqCst); Box::new(Resource) }
+pub fn resource() -> Box<Resource> { Box::new(Resource) }
+pub fn mark() { CREATED.store(1, Ordering::SeqCst); }
 pub fn created() -> bool { CREATED.load(Ordering::SeqCst) != 0 }
 pub fn drops() -> i64 { DROPS.load(Ordering::SeqCst) }
 "#,
