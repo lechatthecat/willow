@@ -1707,7 +1707,8 @@ fn nonblocking_regex_example_review_is_portable() {
     );
     // A CRLF checkout (Windows) keeps the same reviewed fingerprint.
     let bridge = fs::read_to_string(f.root.join("bridge.rs")).unwrap();
-    fs::write(f.root.join("bridge.rs"), bridge.replace('\n', "\r\n")).unwrap();
+    let crlf = bridge.replace("\r\n", "\n").replace('\n', "\r\n");
+    fs::write(f.root.join("bridge.rs"), crlf).unwrap();
     assert_eq!(
         String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
         "true\nfalse\n"
