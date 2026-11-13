@@ -228,7 +228,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         .expect("willow_string_concat_n returns a string")
     }
 
-    #[allow(clippy::too_many_lines, reason = "split pending")]
     pub(super) fn emit_lir_rvalue(
         &mut self,
         function: &LirFunction,
@@ -237,6 +236,46 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         use crate::ir::lowered::LirRvalue;
         match value {
+            LirRvalue::StartTask { .. }
+            | LirRvalue::PrepareMethod { .. }
+            | LirRvalue::MethodCall { .. }
+            | LirRvalue::StaticCall { .. }
+            | LirRvalue::ConstructorCall { .. } => {
+                self.emit_lir_calls_rvalue(function, value, span)
+            }
+            LirRvalue::AwaitFuture { .. }
+            | LirRvalue::SelectIdleWait { .. }
+            | LirRvalue::EnumMethod { .. }
+            | LirRvalue::BuiltinCall { .. }
+            | LirRvalue::Panic { .. }
+            | LirRvalue::Recover
+            | LirRvalue::IntrinsicCall { .. }
+            | LirRvalue::Print { .. } => self.emit_lir_runtime_rvalue(function, value, span),
+            LirRvalue::Coerce { .. }
+            | LirRvalue::ArrayAlloc { .. }
+            | LirRvalue::CaptureArrayOwner { .. }
+            | LirRvalue::ArrayStore { .. }
+            | LirRvalue::Index { .. }
+            | LirRvalue::ObjectAlloc { .. }
+            | LirRvalue::FieldLoad { .. }
+            | LirRvalue::FieldStore { .. }
+            | LirRvalue::StaticField { .. }
+            | LirRvalue::StaticStore { .. }
+            | LirRvalue::EnumAlloc { .. }
+            | LirRvalue::EnumPayloadStore { .. }
+            | LirRvalue::Range { .. }
+            | LirRvalue::RebindResultError { .. }
+            | LirRvalue::IntoError { .. } => self.emit_lir_storage_rvalue(function, value, span),
+            LirRvalue::FunctionRef { .. }
+            | LirRvalue::Closure { .. }
+            | LirRvalue::DirectCall { .. } => self.emit_lir_functions_rvalue(function, value, span),
+            LirRvalue::Unary { .. }
+            | LirRvalue::Binary { .. }
+            | LirRvalue::StringConcat { .. }
+            | LirRvalue::FormatScalar { .. } => {
+                self.emit_lir_operators_rvalue(function, value, span)
+            }
+            LirRvalue::IndirectCall { .. } => self.emit_lir_indirect_rvalue(function, value, span),
             LirRvalue::BeginReferenceCall => {
                 self.emit_debug_reference_call_scope_push();
                 self.diagnostics.lir_reference_scopes.push(Vec::new());
@@ -259,6 +298,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     });
                 self.builder.ins().iconst(types::I8, 0)
             }
+            LirRvalue::Use(operand) => self.emit_lir_operand(function, operand),
+            LirRvalue::StringLiteral(value) => self.emit_string_literal(value),
+        }
+    }
+
+    fn emit_lir_calls_rvalue(
+        &mut self,
+        function: &LirFunction,
+        value: &crate::ir::lowered::LirRvalue,
+        span: Span,
+    ) -> cranelift_codegen::ir::Value {
+        use crate::ir::lowered::LirRvalue;
+        match value {
             LirRvalue::StartTask { callee, args, .. } => {
                 let has_references = args
                     .iter()
@@ -271,17 +323,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_flat_reference_call_end();
                 }
                 result
-            }
-            LirRvalue::AwaitFuture { future, result } => {
-                let future = self.emit_lir_operand(function, future);
-                self.emit_flat_await_future(future, result)
-            }
-            LirRvalue::SelectIdleWait { deadlines } => {
-                let deadlines: Vec<_> = deadlines
-                    .iter()
-                    .map(|deadline| self.emit_lir_operand(function, deadline))
-                    .collect();
-                self.emit_flat_select_idle_wait(&deadlines)
             }
             LirRvalue::PrepareMethod {
                 receiver,
@@ -358,6 +399,159 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.roots.gc_root_count -= roots;
                 result
             }
+            LirRvalue::StaticCall {
+                class,
+                method,
+                args,
+                arg_types,
+                result,
+                ..
+            } => {
+                // The relocatable operand roots stay valid: on every static
+                // call path the operands reach the callee without an
+                // intervening GC point, except heap enum construction, which
+                // roots and reloads its payloads around the allocation.
+                let (args, roots) = self.emit_flat_call_operands(function, args);
+                let result = self.emit_lir_static_call_values(
+                    &class.to_string(),
+                    method,
+                    &args,
+                    arg_types,
+                    result,
+                    span,
+                );
+                if !self.locals.terminated {
+                    self.emit_pop_roots_n(roots);
+                }
+                self.roots.gc_root_count -= roots;
+                result
+            }
+            LirRvalue::ConstructorCall {
+                object,
+                class,
+                args,
+                arg_types,
+            } => self.emit_flat_constructor_call(function, object, class, args, arg_types, span),
+            _ => unreachable!("rvalue dispatched by responsibility"),
+        }
+    }
+
+    fn emit_lir_runtime_rvalue(
+        &mut self,
+        function: &LirFunction,
+        value: &crate::ir::lowered::LirRvalue,
+        span: Span,
+    ) -> cranelift_codegen::ir::Value {
+        use crate::ir::lowered::LirRvalue;
+        match value {
+            LirRvalue::AwaitFuture { future, result } => {
+                let future = self.emit_lir_operand(function, future);
+                self.emit_flat_await_future(future, result)
+            }
+            LirRvalue::SelectIdleWait { deadlines } => {
+                let deadlines: Vec<_> = deadlines
+                    .iter()
+                    .map(|deadline| self.emit_lir_operand(function, deadline))
+                    .collect();
+                self.emit_flat_select_idle_wait(&deadlines)
+            }
+            LirRvalue::EnumMethod {
+                receiver,
+                receiver_ty,
+                method,
+                args,
+                arg_types,
+                ..
+            } => {
+                let receiver = self.emit_lir_operand(function, receiver);
+                let args: Vec<_> = args
+                    .iter()
+                    .map(|arg| self.emit_lir_operand(function, arg))
+                    .collect();
+                self.emit_flat_enum_method(receiver, receiver_ty, method, &args, arg_types, span)
+            }
+            LirRvalue::BuiltinCall { callee, args, .. } => {
+                let args: Vec<_> = args
+                    .iter()
+                    .map(|arg| self.emit_lir_operand(function, arg))
+                    .collect();
+                if callee.is_free_named("$contract_i64") || callee.is_free_named("$contract_check")
+                {
+                    let runtime = if callee.is_free_named("$contract_i64") {
+                        rt::willow_contract_i64
+                    } else {
+                        rt::willow_contract_check
+                    };
+                    let mut args = args;
+                    if callee.is_free_named("$contract_check") {
+                        args[0] = self.builder.ins().uextend(types::I64, args[0]);
+                    }
+                    let file = self.emit_string_literal(self.diagnostics.source_file);
+                    let line = self.builder.ins().iconst(types::I32, span.line as i64);
+                    let col = self.builder.ins().iconst(types::I32, span.col as i64);
+                    args.extend([file, line, col]);
+                    self.emit_runtime_call_with_cleanup(runtime, &args, |_| {})
+                        .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
+                } else {
+                    self.emit_flat_builtin_call(callee, &args)
+                }
+            }
+            LirRvalue::Panic { message } => {
+                let message = self.emit_lir_operand(function, message);
+                self.emit_panic_with_message(message, span)
+            }
+            LirRvalue::Recover => self.emit_recover_call(),
+            LirRvalue::IntrinsicCall {
+                intrinsic,
+                receiver,
+                receiver_ty,
+                args,
+                arg_types,
+                result,
+                ..
+            } => {
+                let receiver = self.emit_lir_operand(function, receiver);
+                let args: Vec<_> = args
+                    .iter()
+                    .map(|arg| self.emit_lir_operand(function, arg))
+                    .collect();
+                self.emit_flat_intrinsic(
+                    *intrinsic,
+                    (receiver, receiver_ty),
+                    &args,
+                    arg_types,
+                    result,
+                    span,
+                )
+            }
+            LirRvalue::Print { value, ty, newline } => {
+                let value = self.emit_lir_operand(function, value);
+                let name = match (ty, newline) {
+                    (Type::I64, false) => rt::willow_print_i64,
+                    (Type::I64, true) => rt::willow_println_i64,
+                    (Type::F64, false) => rt::willow_print_f64,
+                    (Type::F64, true) => rt::willow_println_f64,
+                    (Type::Bool, false) => rt::willow_print_bool,
+                    (Type::Bool, true) => rt::willow_println_bool,
+                    (Type::String, false) => rt::willow_print_string,
+                    (Type::String, true) => rt::willow_println_string,
+                    _ => unreachable!("print type validated"),
+                };
+                self.emit_void_runtime_call(name, &[value]);
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            _ => unreachable!("rvalue dispatched by responsibility"),
+        }
+    }
+
+    fn emit_lir_storage_rvalue(
+        &mut self,
+        function: &LirFunction,
+        value: &crate::ir::lowered::LirRvalue,
+        _span: Span,
+    ) -> cranelift_codegen::ir::Value {
+        use crate::ir::lowered::LirRvalue;
+        match value {
             LirRvalue::Coerce {
                 value,
                 source,
@@ -404,33 +598,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 field,
                 value,
             } => self.emit_flat_static_store(function, &class.to_string(), field, value),
-            LirRvalue::StaticCall {
-                class,
-                method,
-                args,
-                arg_types,
-                result,
-                ..
-            } => {
-                // The relocatable operand roots stay valid: on every static
-                // call path the operands reach the callee without an
-                // intervening GC point, except heap enum construction, which
-                // roots and reloads its payloads around the allocation.
-                let (args, roots) = self.emit_flat_call_operands(function, args);
-                let result = self.emit_lir_static_call_values(
-                    &class.to_string(),
-                    method,
-                    &args,
-                    arg_types,
-                    result,
-                    span,
-                );
-                if !self.locals.terminated {
-                    self.emit_pop_roots_n(roots);
-                }
-                self.roots.gc_root_count -= roots;
-                result
-            }
             LirRvalue::EnumAlloc {
                 class,
                 variant,
@@ -456,12 +623,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     enum_ty,
                 )
             }
-            LirRvalue::ConstructorCall {
-                object,
-                class,
-                args,
-                arg_types,
-            } => self.emit_flat_constructor_call(function, object, class, args, arg_types, span),
             LirRvalue::Range { start, end } => {
                 let start = self.emit_lir_operand(function, start);
                 let end = self.emit_lir_operand(function, end);
@@ -470,56 +631,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().store(MemFlagsData::new(), end, ptr, 8);
                 ptr
             }
-            LirRvalue::EnumMethod {
-                receiver,
-                receiver_ty,
-                method,
-                args,
-                arg_types,
-                ..
-            } => {
-                let receiver = self.emit_lir_operand(function, receiver);
-                let args: Vec<_> = args
-                    .iter()
-                    .map(|arg| self.emit_lir_operand(function, arg))
-                    .collect();
-                self.emit_flat_enum_method(receiver, receiver_ty, method, &args, arg_types, span)
-            }
-            LirRvalue::BuiltinCall { callee, args, .. } => {
-                let args: Vec<_> = args
-                    .iter()
-                    .map(|arg| self.emit_lir_operand(function, arg))
-                    .collect();
-                if callee.is_free_named("$contract_i64") || callee.is_free_named("$contract_check")
-                {
-                    let runtime = if callee.is_free_named("$contract_i64") {
-                        rt::willow_contract_i64
-                    } else {
-                        rt::willow_contract_check
-                    };
-                    let mut args = args;
-                    if callee.is_free_named("$contract_check") {
-                        args[0] = self.builder.ins().uextend(types::I64, args[0]);
-                    }
-                    let file = self.emit_string_literal(self.diagnostics.source_file);
-                    let line = self.builder.ins().iconst(types::I32, span.line as i64);
-                    let col = self.builder.ins().iconst(types::I32, span.col as i64);
-                    args.extend([file, line, col]);
-                    self.emit_runtime_call_with_cleanup(runtime, &args, |_| {})
-                        .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
-                } else {
-                    self.emit_flat_builtin_call(callee, &args)
-                }
-            }
-            LirRvalue::FormatScalar { value, ty, format } => {
-                let value = self.emit_lir_operand(function, value);
-                self.emit_flat_format_scalar(value, ty, *format)
-            }
-            LirRvalue::Panic { message } => {
-                let message = self.emit_lir_operand(function, message);
-                self.emit_panic_with_message(message, span)
-            }
-            LirRvalue::Recover => self.emit_recover_call(),
             LirRvalue::RebindResultError {
                 value,
                 source,
@@ -549,31 +660,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_post_willow_call_panic_check(panic_depth);
                 converted
             }
-            LirRvalue::IntrinsicCall {
-                intrinsic,
-                receiver,
-                receiver_ty,
-                args,
-                arg_types,
-                result,
-                ..
-            } => {
-                let receiver = self.emit_lir_operand(function, receiver);
-                let args: Vec<_> = args
-                    .iter()
-                    .map(|arg| self.emit_lir_operand(function, arg))
-                    .collect();
-                self.emit_flat_intrinsic(
-                    *intrinsic,
-                    (receiver, receiver_ty),
-                    &args,
-                    arg_types,
-                    result,
-                    span,
-                )
-            }
-            LirRvalue::Use(operand) => self.emit_lir_operand(function, operand),
-            LirRvalue::StringLiteral(value) => self.emit_string_literal(value),
+            _ => unreachable!("rvalue dispatched by responsibility"),
+        }
+    }
+
+    fn emit_lir_functions_rvalue(
+        &mut self,
+        function: &LirFunction,
+        value: &crate::ir::lowered::LirRvalue,
+        span: Span,
+    ) -> cranelift_codegen::ir::Value {
+        use crate::ir::lowered::LirRvalue;
+        match value {
             LirRvalue::FunctionRef { function, .. } => {
                 let fid = *self
                     .func_ids
@@ -638,22 +736,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 env
             }
-            LirRvalue::Print { value, ty, newline } => {
-                let value = self.emit_lir_operand(function, value);
-                let name = match (ty, newline) {
-                    (Type::I64, false) => rt::willow_print_i64,
-                    (Type::I64, true) => rt::willow_println_i64,
-                    (Type::F64, false) => rt::willow_print_f64,
-                    (Type::F64, true) => rt::willow_println_f64,
-                    (Type::Bool, false) => rt::willow_print_bool,
-                    (Type::Bool, true) => rt::willow_println_bool,
-                    (Type::String, false) => rt::willow_print_string,
-                    (Type::String, true) => rt::willow_println_string,
-                    _ => unreachable!("print type validated"),
-                };
-                self.emit_void_runtime_call(name, &[value]);
-                self.builder.ins().iconst(types::I8, 0)
-            }
             LirRvalue::DirectCall { callee, args, .. } => {
                 let has_references = args
                     .iter()
@@ -684,6 +766,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_post_willow_call_panic_check(panic_depth);
                 result
             }
+            _ => unreachable!("rvalue dispatched by responsibility"),
+        }
+    }
+
+    fn emit_lir_operators_rvalue(
+        &mut self,
+        function: &LirFunction,
+        value: &crate::ir::lowered::LirRvalue,
+        span: Span,
+    ) -> cranelift_codegen::ir::Value {
+        use crate::ir::lowered::LirRvalue;
+        match value {
             LirRvalue::Unary { op, operand, ty } => {
                 let checked = self.overflow_checks()
                     && crate::ir::lowered::value::is_overflow_checked_unary(op, operand, ty);
@@ -706,71 +800,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.builder.ins().bxor(operand, one)
                     }
                 }
-            }
-            LirRvalue::IndirectCall {
-                callee,
-                name,
-                args,
-                params,
-                result,
-            } => {
-                let closure = matches!(callee.ty(&function.locals), Some(Type::Closure(..)));
-                // Every addressable target is a compiled synchronous Willow
-                // body, which roots its own GC parameters (the closure
-                // environment included) before its first safepoint, or a
-                // scalar builtin. Operands evaluate without reaching a GC
-                // point, so the call site keeps no roots of its own
-                //, as interface dispatch does for targets
-                // that root their receiver.
-                let target = self.emit_lir_operand(function, callee);
-                let mut values = Vec::with_capacity(args.len() + usize::from(closure));
-                if closure {
-                    values.push(target);
-                }
-                for argument in args {
-                    values.push(self.emit_lir_operand(function, argument));
-                }
-                let mut signature = self.module.make_signature();
-                if closure {
-                    signature
-                        .params
-                        .push(AbiParam::new(reference_type(self.module.target_config())));
-                }
-                signature
-                    .params
-                    .extend(params.iter().map(|ty| AbiParam::new(self.clif_type(ty))));
-                if *result != Type::Void {
-                    signature
-                        .returns
-                        .push(AbiParam::new(self.clif_type(result)));
-                }
-                let signature = self.builder.import_signature(signature);
-                let name = name.to_string();
-                if !closure {
-                    return self.emit_promoted_fn_call(
-                        signature,
-                        target,
-                        &values,
-                        (params, result),
-                        &name,
-                        span,
-                    );
-                }
-                // A closure whose body cannot raise tags its code word
-                // (see `LirRvalue::Closure`); only an untagged one needs the
-                // panic-depth protocol around the call.
-                let word = self.builder.ins().load(
-                    reference_type(self.module.target_config()),
-                    MemFlagsData::trusted(),
-                    target,
-                    0,
-                );
-                let code = self.builder.ins().band_imm_s(word, !CLOSURE_CODE_NO_PANIC);
-                let unchecked = self.builder.ins().band_imm_s(word, CLOSURE_CODE_NO_PANIC);
-                self.emit_lir_indirect_call(signature, code, &values, &name, span, Some(unchecked))
-            }
-            LirRvalue::StringConcat { parts, part_types } => {
-                self.emit_string_concat_n(function, parts, part_types)
             }
             LirRvalue::Binary {
                 op,
@@ -886,6 +915,88 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_lir_binop(op, lhs, rhs, float)
                 }
             }
+            LirRvalue::StringConcat { parts, part_types } => {
+                self.emit_string_concat_n(function, parts, part_types)
+            }
+            LirRvalue::FormatScalar { value, ty, format } => {
+                let value = self.emit_lir_operand(function, value);
+                self.emit_flat_format_scalar(value, ty, *format)
+            }
+            _ => unreachable!("rvalue dispatched by responsibility"),
+        }
+    }
+
+    fn emit_lir_indirect_rvalue(
+        &mut self,
+        function: &LirFunction,
+        value: &crate::ir::lowered::LirRvalue,
+        span: Span,
+    ) -> cranelift_codegen::ir::Value {
+        use crate::ir::lowered::LirRvalue;
+        match value {
+            LirRvalue::IndirectCall {
+                callee,
+                name,
+                args,
+                params,
+                result,
+            } => {
+                let closure = matches!(callee.ty(&function.locals), Some(Type::Closure(..)));
+                // Every addressable target is a compiled synchronous Willow
+                // body, which roots its own GC parameters (the closure
+                // environment included) before its first safepoint, or a
+                // scalar builtin. Operands evaluate without reaching a GC
+                // point, so the call site keeps no roots of its own
+                //, as interface dispatch does for targets
+                // that root their receiver.
+                let target = self.emit_lir_operand(function, callee);
+                let mut values = Vec::with_capacity(args.len() + usize::from(closure));
+                if closure {
+                    values.push(target);
+                }
+                for argument in args {
+                    values.push(self.emit_lir_operand(function, argument));
+                }
+                let mut signature = self.module.make_signature();
+                if closure {
+                    signature
+                        .params
+                        .push(AbiParam::new(reference_type(self.module.target_config())));
+                }
+                signature
+                    .params
+                    .extend(params.iter().map(|ty| AbiParam::new(self.clif_type(ty))));
+                if *result != Type::Void {
+                    signature
+                        .returns
+                        .push(AbiParam::new(self.clif_type(result)));
+                }
+                let signature = self.builder.import_signature(signature);
+                let name = name.to_string();
+                if !closure {
+                    return self.emit_promoted_fn_call(
+                        signature,
+                        target,
+                        &values,
+                        (params, result),
+                        &name,
+                        span,
+                    );
+                }
+                // A closure whose body cannot raise tags its code word
+                // (see `LirRvalue::Closure`); only an untagged one needs the
+                // panic-depth protocol around the call.
+                let word = self.builder.ins().load(
+                    reference_type(self.module.target_config()),
+                    MemFlagsData::trusted(),
+                    target,
+                    0,
+                );
+                let code = self.builder.ins().band_imm_s(word, !CLOSURE_CODE_NO_PANIC);
+                let unchecked = self.builder.ins().band_imm_s(word, CLOSURE_CODE_NO_PANIC);
+                self.emit_lir_indirect_call(signature, code, &values, &name, span, Some(unchecked))
+            }
+            _ => unreachable!("rvalue dispatched by responsibility"),
         }
     }
 

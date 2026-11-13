@@ -41,6 +41,24 @@ struct Graph {
     lock_ends: HashMap<usize, usize>,
 }
 
+/// Per-body state shared by the iterative ownership walk and final reduction.
+#[derive(Default)]
+struct OwnershipState {
+    graph: Graph,
+    pending_bindings: HashMap<usize, ExprId>,
+    lock_bindings: HashMap<usize, usize>,
+    sync: super::send_sync::MarkerCache,
+    select_sends: HashSet<ExprId>,
+    select_receives: HashSet<usize>,
+    deferred: i32,
+    conditional: usize,
+    loans: Vec<(usize, usize, usize, Span)>,
+    loan_exprs: HashMap<Span, ExprId>,
+    task_methods: HashMap<(String, String), (bool, bool)>,
+    waits: Vec<(usize, usize)>,
+    loan_errors: Vec<(Span, &'static str)>,
+}
+
 impl Graph {
     fn node(&mut self, borrowed: bool) -> usize {
         let id = self.parents.len();
@@ -189,500 +207,146 @@ impl TypeChecker {
                 .all(|ty| self.is_sync_cached(ty, cache))
     }
 
-    #[allow(clippy::too_many_lines, reason = "split pending")]
     pub(super) fn check_transfer_ownership(&mut self, root: AstEvent<'_>) {
         if !self.enforce_send_sync {
             return;
         }
-        let mut graph = Graph::default();
-        graph.scopes.push(Vec::new());
-        let mut pending_bindings = HashMap::new();
-        let mut lock_bindings = HashMap::new();
-        let mut sync = super::send_sync::MarkerCache::default();
-        let mut select_sends = HashSet::new();
-        let mut select_receives = HashSet::new();
-        let mut deferred = 0;
-        let mut conditional = 0usize;
-        let mut loans = Vec::new();
-        let mut loan_exprs = HashMap::new();
-        let mut task_methods = HashMap::new();
-        let mut waits = Vec::new();
-        let mut loan_errors = Vec::new();
+        let mut state = OwnershipState::default();
+        state.graph.scopes.push(Vec::new());
         let mut walk = AstWalk::new(root);
         while let Some(event) = walk.next() {
-            graph.ticks += 1;
+            state.graph.ticks += 1;
             match event {
                 AstEvent::Stmt(Stmt::If(_) | Stmt::While(_) | Stmt::For(_))
                 | AstEvent::Expr(
                     Expr::Match(_) | Expr::Select(_) | Expr::Ternary(_) | Expr::Binary(_),
-                ) => conditional += 1,
+                ) => state.conditional += 1,
                 AstEvent::ExitStmt(Stmt::If(_) | Stmt::While(_) | Stmt::For(_))
                 | AstEvent::ExitExpr(
                     Expr::Match(_) | Expr::Select(_) | Expr::Ternary(_) | Expr::Binary(_),
-                ) => conditional -= 1,
+                ) => state.conditional -= 1,
                 _ => {}
             }
             match event {
-                AstEvent::EnterScope => graph.scopes.push(Vec::new()),
+                AstEvent::EnterScope => state.graph.scopes.push(Vec::new()),
                 AstEvent::ExitScope => {
-                    for name in graph.scopes.pop().unwrap() {
-                        graph.names.get_mut(&name).unwrap().pop();
+                    for name in state.graph.scopes.pop().unwrap() {
+                        state.graph.names.get_mut(&name).unwrap().pop();
                     }
                 }
-                AstEvent::Stmt(Stmt::Defer(_)) => deferred += 1,
-                AstEvent::ExitStmt(Stmt::Defer(_)) => deferred -= 1,
+                AstEvent::Stmt(Stmt::Defer(_)) => state.deferred += 1,
+                AstEvent::ExitStmt(Stmt::Defer(_)) => state.deferred -= 1,
                 AstEvent::Stmt(stmt @ (Stmt::While(_) | Stmt::For(_))) => {
                     if let Stmt::For(for_loop) = stmt {
-                        pending_bindings
+                        state
+                            .pending_bindings
                             .insert(for_loop.name.as_ptr() as usize, for_loop.iterable.id());
                     }
-                    graph.loop_stack.push(graph.loop_id);
-                    graph.loop_id = graph.ticks;
+                    state.graph.loop_stack.push(state.graph.loop_id);
+                    state.graph.loop_id = state.graph.ticks;
                 }
                 AstEvent::ExitStmt(Stmt::While(_) | Stmt::For(_)) => {
-                    graph.loop_id = graph.loop_stack.pop().unwrap();
+                    state.graph.loop_id = state.graph.loop_stack.pop().unwrap();
                 }
                 AstEvent::Stmt(Stmt::Lock(lock)) => {
-                    let start = graph.ticks;
-                    lock_bindings.insert(lock.binding.as_ptr() as usize, start);
+                    let start = state.graph.ticks;
+                    state
+                        .lock_bindings
+                        .insert(lock.binding.as_ptr() as usize, start);
                     for member in &lock.additional {
-                        lock_bindings.insert(member.binding.as_ptr() as usize, start);
+                        state
+                            .lock_bindings
+                            .insert(member.binding.as_ptr() as usize, start);
                     }
                 }
                 AstEvent::ExitStmt(Stmt::Lock(lock)) => {
-                    let start = lock_bindings[&(lock.binding.as_ptr() as usize)];
-                    graph.lock_ends.insert(start, graph.ticks);
+                    let start = state.lock_bindings[&(lock.binding.as_ptr() as usize)];
+                    state.graph.lock_ends.insert(start, state.graph.ticks);
                 }
                 AstEvent::Stmt(Stmt::Let(binding)) => {
-                    pending_bindings.insert(binding.name.as_ptr() as usize, binding.init.id());
+                    state
+                        .pending_bindings
+                        .insert(binding.name.as_ptr() as usize, binding.init.id());
                 }
                 AstEvent::Bind(name) => {
                     // Allocate at the binding event so a receive inside a loop
                     // owns a new value in that iteration, like ordinary recv.
-                    let received = select_receives.remove(&(name.as_ptr() as usize));
-                    let id = pending_bindings
+                    let received = state.select_receives.remove(&(name.as_ptr() as usize));
+                    let id = state
+                        .pending_bindings
                         .get(&(name.as_ptr() as usize))
-                        .and_then(|expr| graph.values.get(expr))
+                        .and_then(|expr| state.graph.values.get(expr))
                         .copied()
-                        .unwrap_or_else(|| graph.node(!received));
-                    if let Some(start) = lock_bindings.get(&(name.as_ptr() as usize)) {
-                        let root = graph.root(id);
-                        graph.locks[root] = Some((*start, *start));
+                        .unwrap_or_else(|| state.graph.node(!received));
+                    if let Some(start) = state.lock_bindings.get(&(name.as_ptr() as usize)) {
+                        let root = state.graph.root(id);
+                        state.graph.locks[root] = Some((*start, *start));
                     }
-                    graph.declarations.insert(id, graph.ticks);
-                    graph.bind(name, id);
+                    state.graph.declarations.insert(id, state.graph.ticks);
+                    state.graph.bind(name, id);
                 }
                 AstEvent::Expr(expr) => {
-                    if let Expr::Match(m) = expr {
-                        for arm in &m.arms {
-                            let pattern = &arm.pattern;
-                            for event in AstWalk::new(AstEvent::Pattern(pattern)) {
-                                if let AstEvent::Bind(name) = event {
-                                    pending_bindings
-                                        .insert(name.as_ptr() as usize, m.scrutinee.id());
-                                }
-                            }
-                        }
-                    }
-                    if let Expr::Select(select) = expr {
-                        for case in &select.cases {
-                            match &case.kind {
-                                SelectCaseKind::Send { value, .. } => {
-                                    select_sends.insert(value.id());
-                                }
-                                SelectCaseKind::Recv { binding, .. } => {
-                                    select_receives.insert(binding.as_ptr() as usize);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    if let Some(ty) = self.expr_types.get(&expr.id())
-                        && !self.is_sync_cached(ty, &mut sync)
-                    {
-                        let borrowed =
-                            matches!(expr, Expr::StaticField(_) | Expr::Call(_) | Expr::Await(_));
-                        let id = graph.node(borrowed);
-                        graph.loan_payload[id] = self.task_loan_type(ty, &mut sync);
-                        graph.loan_unsupported[id] = !graph.loan_payload[id];
-                        graph.values.insert(expr.id(), id);
-                    }
-                    if let Expr::Lambda(lambda) = expr {
-                        // Captures retain aliases even if the closure is never invoked.
-                        let result = graph.values.get(&expr.id()).copied();
-                        for capture in self.lambda_captures.get(&lambda.id).into_iter().flatten() {
-                            let id = graph.lookup(&capture.name);
-                            let root = graph.root(id);
-                            let payload = self.task_loan_type(&capture.ty, &mut sync);
-                            graph.loan_payload[root] |= payload;
-                            graph.loan_borrowed[root] |= graph.external[id] && payload;
-                            if let Some(result) = result {
-                                graph.join(result, id);
-                            }
-                            let root = graph.root(id);
-                            graph.escaped[root] = true;
-                            graph.escapes.push((id, lambda.span));
-                        }
+                    if self.enter_transfer_expr(&mut state, expr) {
                         walk.skip_children();
                     }
                 }
-                AstEvent::ExitExpr(expr) => {
-                    let result = graph.values.get(&expr.id()).copied();
-                    let args = match expr {
-                        Expr::Call(call) => Some(&call.args),
-                        Expr::MethodCall(call) => Some(&call.args),
-                        Expr::StaticCall(call) => Some(&call.args),
-                        _ => None,
-                    };
-                    let mut loan_values: Vec<&Expr> = args
-                        .into_iter()
-                        .flatten()
-                        .filter(|arg| self.local.task_loan_args.contains(&arg.expr.id()))
-                        .map(|arg| &arg.expr)
-                        .collect();
-                    if let Expr::MethodCall(call) = expr {
-                        let (is_async, is_open) = match self.expr_types.get(&call.object.id()) {
-                            Some(Type::Named(class)) => *task_methods
-                                .entry((class.clone(), call.method.clone()))
-                                .or_insert_with(|| {
-                                    self.lookup_method_in_hierarchy(class, &call.method)
-                                        .map_or((false, true), |(_, method)| {
-                                            (method.is_async, method.is_open)
-                                        })
-                                }),
-                            _ => (false, true),
-                        };
-                        if is_async && graph.values.contains_key(&call.object.id()) {
-                            loan_values.push(&call.object);
-                        }
-                        if !loan_values.is_empty() && (!is_async || is_open) {
-                            loan_errors.push((
-                                call.span,
-                                "non-Sync task loans require a statically known async method",
-                            ));
-                        }
-                    }
-                    if !loan_values.is_empty() {
-                        for value in loan_values {
-                            loan_exprs.insert(value.span(), value.id());
-                            if let (Some(value_id), Some(task)) =
-                                (graph.values.get(&value.id()).copied(), result)
-                            {
-                                loans.push((value_id, task, graph.ticks, value.span()));
-                                if conditional > 0 || deferred > 0 || graph.scopes.len() > 2 {
-                                    loan_errors.push((value.span(), "non-Sync task loans require an unconditional body-level call"));
-                                }
-                            } else {
-                                loan_errors.push((
-                                    value.span(),
-                                    "cannot establish the task loan identity",
-                                ));
-                            }
-                        }
-                        if let Some(task) = result {
-                            graph.borrowed[task] = false;
-                        }
-                        // The Task handle is not an alias of its captured payload.
-                        continue;
-                    }
-                    match expr {
-                        Expr::Await(wait) => {
-                            if conditional == 0
-                                && deferred == 0
-                                && graph.scopes.len() <= 2
-                                && let Some(task) = graph.values.get(&wait.expr.id()).copied()
-                            {
-                                waits.push((task, graph.ticks));
-                            }
-                        }
-                        Expr::Var(name, span, _) => {
-                            if let Some(result) = result {
-                                let binding = graph.lookup(name);
-                                graph.loan_borrowed[result] |=
-                                    graph.external[binding] && graph.loan_payload[result];
-                                graph.join(result, binding);
-                                graph.uses.push((result, graph.ticks, *span));
-                                if deferred > 0 {
-                                    graph.escape(expr);
-                                }
-                            }
-                        }
-                        Expr::ArrayLiteral(values, ..) => {
-                            for value in values {
-                                graph.alias(result, value);
-                            }
-                        }
-                        Expr::ObjectLiteral(object) => {
-                            for field in &object.fields {
-                                graph.alias(result, &field.value);
-                            }
-                        }
-                        Expr::FieldAccess(object, ..) => {
-                            graph.alias(result, object);
-                        }
-                        Expr::TryPropagate(operand, ..) => {
-                            graph.alias(result, operand);
-                            // The Err branch returns a payload even when Ok is
-                            // Sync and therefore has no ownership graph node.
-                            // Inspect the source error: an implicit Into::into
-                            // may retain it even if the destination error is Sync.
-                            // Option's None path carries no reference to escape.
-                            if let Some((_, error)) = self
-                                .expr_types
-                                .get(&operand.id())
-                                .and_then(|ty| builtin_types::binary_args(ty, B::Result))
-                                && !self.is_sync_cached(error, &mut sync)
-                            {
-                                graph.escape(operand);
-                            }
-                        }
-                        Expr::Index(object, ..) => {
-                            graph.use_value(object);
-                            graph.alias(result, object);
-                        }
-                        Expr::Ternary(ternary) => {
-                            graph.alias(result, &ternary.then_expr);
-                            graph.alias(result, &ternary.else_expr);
-                        }
-                        Expr::New(new) => {
-                            let class = match self.expr_types.get(&expr.id()) {
-                                Some(Type::Named(class)) => class,
-                                _ => &new.class_name,
-                            };
-                            let implicit = self.symbols.lookup_class(class).is_some_and(|c| {
-                                c.constructor.as_ref().is_none_or(|ctor| ctor.isolated_body)
-                            });
-                            if !implicit && let Some(id) = result {
-                                let root = graph.root(id);
-                                graph.borrowed[root] = true;
-                            }
-                            for arg in &new.args {
-                                graph.alias(result, &arg.expr);
-                                if !implicit {
-                                    graph.escape(&arg.expr);
-                                }
-                            }
-                        }
-                        Expr::StaticCall(call) => {
-                            // Classify the resolved callee, never its return type:
-                            // a user helper returning Result may retain its inputs.
-                            let owner = self.resolve_static_call_class_quiet(&call.class);
-                            let builtin = owner.as_deref().and_then(B::from_name);
-                            let transfers = call.method == "new"
-                                && matches!(
-                                    builtin,
-                                    Some(
-                                        B::Mutex | B::RwLock | B::BlockingCell | B::BlockingRwCell
-                                    )
-                                );
-                            // Source Array constructors dispatch to a specialized
-                            // provider class. Match its recorded target identity,
-                            // rather than accepting every method returning Array.
-                            let array_constructor = call.method == "new"
-                                && self
-                                    .expr_types
-                                    .get(&expr.id())
-                                    .and_then(|ty| self.array_class(ty))
-                                    .is_some_and(|class| {
-                                        self.static_call_classes.get(&call.id)
-                                            == Some(
-                                                &crate::semantic::ids::TypeId::from_source_name(
-                                                    class,
-                                                ),
-                                            )
-                                    });
-                            let aggregate = self.static_call_enum_key(&call.class).is_some()
-                                || array_constructor
-                                || (call.method == "new"
-                                    && matches!(builtin, Some(B::Array | B::Map)));
-                            for arg in &call.args {
-                                if transfers {
-                                    graph.transfer(&arg.expr);
-                                } else {
-                                    graph.alias(result, &arg.expr);
-                                    if !aggregate {
-                                        graph.escape(&arg.expr);
-                                    }
-                                }
-                            }
-                            if !transfers
-                                && !aggregate
-                                && let Some(id) = result
-                            {
-                                let root = graph.root(id);
-                                graph.borrowed[root] = true;
-                            }
-                        }
-                        Expr::MethodCall(call) => {
-                            graph.use_value(&call.object);
-                            let builtin = self
-                                .expr_types
-                                .get(&call.object.id())
-                                .and_then(builtin_types::resolve)
-                                .map(|b| b.id);
-                            let channel = builtin.is_some_and(|b| b == B::Channel);
-                            let cell = builtin
-                                .is_some_and(|b| matches!(b, B::BlockingCell | B::BlockingRwCell));
-                            let send = (channel && call.method == "send")
-                                || (cell && matches!(call.method.as_str(), "set" | "write"));
-                            if cell && result.is_some() {
-                                self.push(
-                                    Diagnostic::new(
-                                        Severity::Error,
-                                        ErrorCode::E2408,
-                                        "cannot extract a non-Sync reference from a blocking cell",
-                                    )
-                                    .with_label(Label::primary(
-                                        call.span,
-                                        "the cell unlocks before the reference can be used",
-                                    ))
-                                    .with_help(
-                                        "use Mutex and access this value inside a lexical lock",
-                                    ),
-                                );
-                            }
-                            let receive =
-                                channel && matches!(call.method.as_str(), "recv" | "recv_opt");
-                            let option_action = builtin.and_then(|owner| {
-                                super::builtin_methods::option_method(owner, &call.method)
-                                    .map(|(_, action)| action)
-                            });
-                            if let Some(super::builtin_methods::OptionAction::Transform {
-                                error_input,
-                                no_input,
-                                ..
-                            }) = option_action
-                            {
-                                // A Sync function pointer may retain the non-Sync
-                                // payload passed implicitly by this builtin.
-                                // Use the same input contract as type checking;
-                                // Option::or_else receives no payload at all.
-                                if !no_input
-                                    && let Some(input) = self
-                                        .expr_types
-                                        .get(&call.object.id())
-                                        .and_then(builtin_types::resolve)
-                                        .and_then(|ty| ty.args.get(usize::from(error_input)))
-                                    && !self.is_sync_cached(input, &mut sync)
-                                {
-                                    graph.escape(&call.object);
-                                }
-                                // The callback's returned references are opaque,
-                                // just like the result of an ordinary call.
-                                if let Some(Type::Fn(_, output) | Type::Closure(_, output)) = call
-                                    .args
-                                    .first()
-                                    .and_then(|arg| self.expr_types.get(&arg.expr.id()))
-                                    && !self.is_sync_cached(output, &mut sync)
-                                    && let Some(id) = result
-                                {
-                                    let root = graph.root(id);
-                                    graph.borrowed[root] = true;
-                                }
-                            }
-                            let local_builtin = matches!(builtin, Some(B::Array | B::Map))
-                                || option_action.is_some();
-                            if !send && !receive {
-                                graph.alias(result, &call.object);
-                                if !local_builtin && !self.isolated_method(call, &mut sync) {
-                                    graph.escape(&call.object);
-                                }
-                            }
-                            for arg in &call.args {
-                                if send {
-                                    graph.transfer(&arg.expr);
-                                } else {
-                                    graph.alias(result, &arg.expr);
-                                    graph.escape(&arg.expr);
-                                    // Collection insertion retains its argument even when
-                                    // the return type is scalar or Void.
-                                    let receiver = graph.values.get(&call.object.id()).copied();
-                                    graph.alias(receiver, &arg.expr);
-                                }
-                            }
-                            if !receive
-                                && !local_builtin
-                                && let Some(id) = result
-                            {
-                                let root = graph.root(id);
-                                graph.borrowed[root] = true;
-                            }
-                        }
-                        Expr::Call(call) => {
-                            for arg in &call.args {
-                                graph.escape(&arg.expr);
-                                graph.alias(result, &arg.expr);
-                            }
-                        }
-
-                        Expr::Match(m) => {
-                            // Destructured payloads are conservatively borrowed.
-                            for arm in &m.arms {
-                                if let MatchBody::Expr(value) = &arm.body {
-                                    graph.alias(result, value);
-                                }
-                            }
-                            if let Some(id) = result {
-                                let root = graph.root(id);
-                                graph.borrowed[root] = true;
-                            }
-                        }
-                        _ => {}
-                    }
-                    if select_sends.contains(&expr.id()) {
-                        graph.transfer(expr);
-                    }
-                }
+                AstEvent::ExitExpr(expr) => self.exit_transfer_expr(&mut state, expr),
                 AstEvent::ExitStmt(Stmt::Assign(assign)) => {
-                    let target = graph.lookup(&assign.name);
-                    if let Some(value) = graph.values.get(&assign.value.id()).copied() {
-                        graph.stores.push((
+                    let target = state.graph.lookup(&assign.name);
+                    if let Some(value) = state.graph.values.get(&assign.value.id()).copied() {
+                        state.graph.stores.push((
                             value,
-                            graph.declarations.get(&target).copied().unwrap_or(0),
+                            state.graph.declarations.get(&target).copied().unwrap_or(0),
                             assign.value.span(),
                         ));
                     }
-                    graph.alias(Some(target), &assign.value);
+                    state.graph.alias(Some(target), &assign.value);
                 }
                 AstEvent::ExitStmt(Stmt::FieldAssign(assign)) => {
-                    graph.use_value(&assign.object);
-                    graph.escape(&assign.value);
-                    let target = graph.values.get(&assign.object.id()).copied();
-                    graph.alias(target, &assign.value);
+                    state.graph.use_value(&assign.object);
+                    state.graph.escape(&assign.value);
+                    let target = state.graph.values.get(&assign.object.id()).copied();
+                    state.graph.alias(target, &assign.value);
                 }
                 AstEvent::ExitStmt(Stmt::IndexAssign(assign)) => {
-                    graph.use_value(&assign.array);
-                    graph.escape(&assign.value);
-                    let target = graph.values.get(&assign.array.id()).copied();
-                    graph.alias(target, &assign.value);
+                    state.graph.use_value(&assign.array);
+                    state.graph.escape(&assign.value);
+                    let target = state.graph.values.get(&assign.array.id()).copied();
+                    state.graph.alias(target, &assign.value);
                 }
-                AstEvent::ExitStmt(Stmt::StaticFieldAssign(assign)) => graph.escape(&assign.value),
+                AstEvent::ExitStmt(Stmt::StaticFieldAssign(assign)) => {
+                    state.graph.escape(&assign.value)
+                }
                 AstEvent::ExitStmt(Stmt::Return(ret)) => {
                     if let Some(value) = &ret.value {
-                        graph.escape(value);
+                        state.graph.escape(value);
                     }
                 }
                 _ => {}
             }
         }
+        self.finish_transfer_ownership(&mut state);
+    }
+
+    fn finish_transfer_ownership(&mut self, state: &mut OwnershipState) {
         // Reduce permanent transfers first: a payload can be read as an early
         // argument, then moved by a later argument before its task is scheduled.
         // Reuse this component index for both loan starts and later value uses.
         let mut diagnostics = Vec::new();
         let mut moved = HashMap::new();
-        for (id, tick, loop_id, span) in std::mem::take(&mut graph.transfers) {
-            let root = graph.root(id);
-            if self.local.current_async_context && graph.loan_borrowed[root] {
-                loan_errors.push((
+        for (id, tick, loop_id, span) in std::mem::take(&mut state.graph.transfers) {
+            let root = state.graph.root(id);
+            if self.local.current_async_context && state.graph.loan_borrowed[root] {
+                state.loan_errors.push((
                     span,
                     "borrowed non-Sync argument cannot transfer out of its async call",
                 ));
             }
-            let reason = if graph.borrowed[root] {
+            let reason = if state.graph.borrowed[root] {
                 Some("cannot transfer a borrowed non-Sync value")
-            } else if graph.escaped[root] {
+            } else if state.graph.escaped[root] {
                 Some("cannot transfer a non-Sync value whose alias may have escaped")
-            } else if graph.origins[root] != loop_id {
+            } else if state.graph.origins[root] != loop_id {
                 Some("cannot transfer an outer non-Sync value in a repeated loop")
             } else if moved.contains_key(&root) {
                 Some("non-Sync value is transferred more than once")
@@ -698,24 +362,24 @@ impl TypeChecker {
         // No per-use scan over all tasks or all aliases is needed.
         let mut task_counts = HashMap::new();
         let mut task_origins = HashSet::new();
-        for (_, task, _, _) in &loans {
+        for (_, task, _, _) in &state.loans {
             if task_origins.insert(*task) {
-                *task_counts.entry(graph.root(*task)).or_insert(0usize) += 1;
+                *task_counts.entry(state.graph.root(*task)).or_insert(0usize) += 1;
             }
         }
         let mut completed = HashMap::new();
-        for (task, tick) in waits {
-            let task = graph.root(task);
-            if !graph.borrowed[task] && !graph.escaped[task] {
+        for (task, tick) in std::mem::take(&mut state.waits) {
+            let task = state.graph.root(task);
+            if !state.graph.borrowed[task] && !state.graph.escaped[task] {
                 completed.entry(task).or_insert(tick);
             }
         }
         let mut intervals: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
-        for (value, task, start, span) in loans {
-            let value = graph.root(value);
-            let task = graph.root(task);
+        for (value, task, start, span) in std::mem::take(&mut state.loans) {
+            let value = state.graph.root(value);
+            let task = state.graph.root(task);
             if moved.get(&value).is_some_and(|tick| *tick < start) {
-                loan_errors.push((
+                state.loan_errors.push((
                     span,
                     "cannot lend a non-Sync value after permanent transfer",
                 ));
@@ -725,12 +389,12 @@ impl TypeChecker {
                 .copied()
                 .filter(|end| *end > start && task_counts[&task] == 1)
                 .unwrap_or(usize::MAX);
-            if graph.borrowed[value]
-                || graph.escaped[value]
-                || graph.loan_unsupported[value]
-                || graph.locks[value].is_some()
+            if state.graph.borrowed[value]
+                || state.graph.escaped[value]
+                || state.graph.loan_unsupported[value]
+                || state.graph.locks[value].is_some()
             {
-                loan_errors.push((
+                state.loan_errors.push((
                     span,
                     "cannot lend a borrowed, escaped, or unsupported non-Sync value to a task",
                 ));
@@ -741,13 +405,15 @@ impl TypeChecker {
                 continue;
             }
             if ranges.last().is_some_and(|(_, end)| start < *end) {
-                loan_errors.push((span, "non-Sync value already has an outstanding task loan"));
+                state
+                    .loan_errors
+                    .push((span, "non-Sync value already has an outstanding task loan"));
             }
             ranges.push((start, end));
         }
         let mut positions = HashMap::<usize, usize>::new();
-        for (id, tick, span) in std::mem::take(&mut graph.uses) {
-            let root = graph.root(id);
+        for (id, tick, span) in std::mem::take(&mut state.graph.uses) {
+            let root = state.graph.root(id);
             if let Some(ranges) = intervals.get(&root) {
                 let pos = positions.entry(root).or_default();
                 while *pos < ranges.len() && ranges[*pos].1 <= tick {
@@ -757,7 +423,7 @@ impl TypeChecker {
                     .get(*pos)
                     .is_some_and(|(start, end)| *start < tick && tick < *end)
                 {
-                    loan_errors.push((
+                    state.loan_errors.push((
                         span,
                         "non-Sync value is unavailable until its task has been awaited",
                     ));
@@ -765,43 +431,47 @@ impl TypeChecker {
             }
             if moved.get(&root).is_some_and(|moved| tick > *moved) {
                 if intervals.contains_key(&root) {
-                    loan_errors.push((
+                    state.loan_errors.push((
                         span,
                         "cannot access or lend a non-Sync value after permanent transfer",
                     ));
                 }
                 diagnostics.push((span, "use of a non-Sync value after ownership transfer"));
             }
-            if let Some((start, end_key)) = graph.locks[root]
-                && (tick < start || tick > graph.lock_ends[&end_key])
+            if let Some((start, end_key)) = state.graph.locks[root]
+                && (tick < start || tick > state.graph.lock_ends[&end_key])
             {
                 diagnostics.push((span, "protected non-Sync value escapes its lock scope"));
             }
         }
-        for (id, declared, span) in std::mem::take(&mut graph.stores) {
-            let root = graph.root(id);
-            if graph.locks[root].is_some_and(|(start, _)| declared < start) {
+        for (id, declared, span) in std::mem::take(&mut state.graph.stores) {
+            let root = state.graph.root(id);
+            if state.graph.locks[root].is_some_and(|(start, _)| declared < start) {
                 diagnostics.push((
                     span,
                     "protected non-Sync value is stored outside its lock scope",
                 ));
             }
         }
-        for (id, span) in std::mem::take(&mut graph.escapes) {
-            let root = graph.root(id);
-            if self.local.current_async_context && graph.loan_borrowed[root] {
-                loan_errors.push((span, "borrowed non-Sync argument may escape its async call"));
+        for (id, span) in std::mem::take(&mut state.graph.escapes) {
+            let root = state.graph.root(id);
+            if self.local.current_async_context && state.graph.loan_borrowed[root] {
+                state
+                    .loan_errors
+                    .push((span, "borrowed non-Sync argument may escape its async call"));
             }
-            if graph.locks[root].is_some() {
+            if state.graph.locks[root].is_some() {
                 diagnostics.push((
                     span,
                     "protected non-Sync value may escape through this operation",
                 ));
             }
         }
-        for (span, reason) in loan_errors {
-            if let Some(ty @ Type::Named(_)) =
-                loan_exprs.get(&span).and_then(|id| self.expr_types.get(id))
+        for (span, reason) in std::mem::take(&mut state.loan_errors) {
+            if let Some(ty @ Type::Named(_)) = state
+                .loan_exprs
+                .get(&span)
+                .and_then(|id| self.expr_types.get(id))
             {
                 let diagnostic = self.task_loan_failure(ty, span, reason);
                 self.push(diagnostic);
@@ -814,13 +484,19 @@ impl TypeChecker {
         }
         #[cfg(test)]
         {
-            COUNTS.with(|counts| counts.set((graph.ticks, graph.parents.len(), graph.root_steps)));
+            COUNTS.with(|counts| {
+                counts.set((
+                    state.graph.ticks,
+                    state.graph.parents.len(),
+                    state.graph.root_steps,
+                ))
+            });
             TOTAL_COUNTS.with(|counts| {
                 let (ticks, nodes, roots) = counts.get();
                 counts.set((
-                    ticks + graph.ticks,
-                    nodes + graph.parents.len(),
-                    roots + graph.root_steps,
+                    ticks + state.graph.ticks,
+                    nodes + state.graph.parents.len(),
+                    roots + state.graph.root_steps,
                 ));
             });
         }
@@ -831,6 +507,378 @@ impl TypeChecker {
                     .with_label(Label::primary(span, "exclusive ownership cannot be established"))
                     .with_help("transfer a fresh, unescaped local value and stop using its aliases; keep protected references inside the lock, or copy Sync data"));
             }
+        }
+    }
+
+    fn transfer_static_call(
+        &mut self,
+        state: &mut OwnershipState,
+        expr: &Expr,
+        call: &StaticCallExpr,
+        result: Option<usize>,
+    ) {
+        // Classify the resolved callee, never its return type:
+        // a user helper returning Result may retain its inputs.
+        let owner = self.resolve_static_call_class_quiet(&call.class);
+        let builtin = owner.as_deref().and_then(B::from_name);
+        let transfers = call.method == "new"
+            && matches!(
+                builtin,
+                Some(B::Mutex | B::RwLock | B::BlockingCell | B::BlockingRwCell)
+            );
+        // Source Array constructors dispatch to a specialized
+        // provider class. Match its recorded target identity,
+        // rather than accepting every method returning Array.
+        let array_constructor = call.method == "new"
+            && self
+                .expr_types
+                .get(&expr.id())
+                .and_then(|ty| self.array_class(ty))
+                .is_some_and(|class| {
+                    self.static_call_classes.get(&call.id)
+                        == Some(&crate::semantic::ids::TypeId::from_source_name(class))
+                });
+        let aggregate = self.static_call_enum_key(&call.class).is_some()
+            || array_constructor
+            || (call.method == "new" && matches!(builtin, Some(B::Array | B::Map)));
+        for arg in &call.args {
+            if transfers {
+                state.graph.transfer(&arg.expr);
+            } else {
+                state.graph.alias(result, &arg.expr);
+                if !aggregate {
+                    state.graph.escape(&arg.expr);
+                }
+            }
+        }
+        if !transfers
+            && !aggregate
+            && let Some(id) = result
+        {
+            let root = state.graph.root(id);
+            state.graph.borrowed[root] = true;
+        }
+    }
+
+    fn transfer_method_call(
+        &mut self,
+        state: &mut OwnershipState,
+        call: &MethodCallExpr,
+        result: Option<usize>,
+    ) {
+        state.graph.use_value(&call.object);
+        let builtin = self
+            .expr_types
+            .get(&call.object.id())
+            .and_then(builtin_types::resolve)
+            .map(|b| b.id);
+        let channel = builtin.is_some_and(|b| b == B::Channel);
+        let cell = builtin.is_some_and(|b| matches!(b, B::BlockingCell | B::BlockingRwCell));
+        let send = (channel && call.method == "send")
+            || (cell && matches!(call.method.as_str(), "set" | "write"));
+        if cell && result.is_some() {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2408,
+                    "cannot extract a non-Sync reference from a blocking cell",
+                )
+                .with_label(Label::primary(
+                    call.span,
+                    "the cell unlocks before the reference can be used",
+                ))
+                .with_help("use Mutex and access this value inside a lexical lock"),
+            );
+        }
+        let receive = channel && matches!(call.method.as_str(), "recv" | "recv_opt");
+        let option_action = builtin.and_then(|owner| {
+            super::builtin_methods::option_method(owner, &call.method).map(|(_, action)| action)
+        });
+        if let Some(super::builtin_methods::OptionAction::Transform {
+            error_input,
+            no_input,
+            ..
+        }) = option_action
+        {
+            // A Sync function pointer may retain the non-Sync
+            // payload passed implicitly by this builtin.
+            // Use the same input contract as type checking;
+            // Option::or_else receives no payload at all.
+            if !no_input
+                && let Some(input) = self
+                    .expr_types
+                    .get(&call.object.id())
+                    .and_then(builtin_types::resolve)
+                    .and_then(|ty| ty.args.get(usize::from(error_input)))
+                && !self.is_sync_cached(input, &mut state.sync)
+            {
+                state.graph.escape(&call.object);
+            }
+            // The callback's returned references are opaque,
+            // just like the result of an ordinary call.
+            if let Some(Type::Fn(_, output) | Type::Closure(_, output)) = call
+                .args
+                .first()
+                .and_then(|arg| self.expr_types.get(&arg.expr.id()))
+                && !self.is_sync_cached(output, &mut state.sync)
+                && let Some(id) = result
+            {
+                let root = state.graph.root(id);
+                state.graph.borrowed[root] = true;
+            }
+        }
+        let local_builtin = matches!(builtin, Some(B::Array | B::Map)) || option_action.is_some();
+        if !send && !receive {
+            state.graph.alias(result, &call.object);
+            if !local_builtin && !self.isolated_method(call, &mut state.sync) {
+                state.graph.escape(&call.object);
+            }
+        }
+        for arg in &call.args {
+            if send {
+                state.graph.transfer(&arg.expr);
+            } else {
+                state.graph.alias(result, &arg.expr);
+                state.graph.escape(&arg.expr);
+                // Collection insertion retains its argument even when
+                // the return type is scalar or Void.
+                let receiver = state.graph.values.get(&call.object.id()).copied();
+                state.graph.alias(receiver, &arg.expr);
+            }
+        }
+        if !receive
+            && !local_builtin
+            && let Some(id) = result
+        {
+            let root = state.graph.root(id);
+            state.graph.borrowed[root] = true;
+        }
+    }
+
+    fn enter_transfer_expr(&mut self, state: &mut OwnershipState, expr: &Expr) -> bool {
+        if let Expr::Match(m) = expr {
+            for arm in &m.arms {
+                let pattern = &arm.pattern;
+                for event in AstWalk::new(AstEvent::Pattern(pattern)) {
+                    if let AstEvent::Bind(name) = event {
+                        state
+                            .pending_bindings
+                            .insert(name.as_ptr() as usize, m.scrutinee.id());
+                    }
+                }
+            }
+        }
+        if let Expr::Select(select) = expr {
+            for case in &select.cases {
+                match &case.kind {
+                    SelectCaseKind::Send { value, .. } => {
+                        state.select_sends.insert(value.id());
+                    }
+                    SelectCaseKind::Recv { binding, .. } => {
+                        state.select_receives.insert(binding.as_ptr() as usize);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(ty) = self.expr_types.get(&expr.id())
+            && !self.is_sync_cached(ty, &mut state.sync)
+        {
+            let borrowed = matches!(expr, Expr::StaticField(_) | Expr::Call(_) | Expr::Await(_));
+            let id = state.graph.node(borrowed);
+            state.graph.loan_payload[id] = self.task_loan_type(ty, &mut state.sync);
+            state.graph.loan_unsupported[id] = !state.graph.loan_payload[id];
+            state.graph.values.insert(expr.id(), id);
+        }
+        if let Expr::Lambda(lambda) = expr {
+            // Captures retain aliases even if the closure is never invoked.
+            let result = state.graph.values.get(&expr.id()).copied();
+            for capture in self.lambda_captures.get(&lambda.id).into_iter().flatten() {
+                let id = state.graph.lookup(&capture.name);
+                let root = state.graph.root(id);
+                let payload = self.task_loan_type(&capture.ty, &mut state.sync);
+                state.graph.loan_payload[root] |= payload;
+                state.graph.loan_borrowed[root] |= state.graph.external[id] && payload;
+                if let Some(result) = result {
+                    state.graph.join(result, id);
+                }
+                let root = state.graph.root(id);
+                state.graph.escaped[root] = true;
+                state.graph.escapes.push((id, lambda.span));
+            }
+            return true;
+        }
+        false
+    }
+
+    fn exit_transfer_expr(&mut self, state: &mut OwnershipState, expr: &Expr) {
+        let result = state.graph.values.get(&expr.id()).copied();
+        let args = match expr {
+            Expr::Call(call) => Some(&call.args),
+            Expr::MethodCall(call) => Some(&call.args),
+            Expr::StaticCall(call) => Some(&call.args),
+            _ => None,
+        };
+        let mut loan_values: Vec<&Expr> = args
+            .into_iter()
+            .flatten()
+            .filter(|arg| self.local.task_loan_args.contains(&arg.expr.id()))
+            .map(|arg| &arg.expr)
+            .collect();
+        if let Expr::MethodCall(call) = expr {
+            let (is_async, is_open) = match self.expr_types.get(&call.object.id()) {
+                Some(Type::Named(class)) => *state
+                    .task_methods
+                    .entry((class.clone(), call.method.clone()))
+                    .or_insert_with(|| {
+                        self.lookup_method_in_hierarchy(class, &call.method)
+                            .map_or((false, true), |(_, method)| {
+                                (method.is_async, method.is_open)
+                            })
+                    }),
+                _ => (false, true),
+            };
+            if is_async && state.graph.values.contains_key(&call.object.id()) {
+                loan_values.push(&call.object);
+            }
+            if !loan_values.is_empty() && (!is_async || is_open) {
+                state.loan_errors.push((
+                    call.span,
+                    "non-Sync task loans require a statically known async method",
+                ));
+            }
+        }
+        if !loan_values.is_empty() {
+            for value in loan_values {
+                state.loan_exprs.insert(value.span(), value.id());
+                if let (Some(value_id), Some(task)) =
+                    (state.graph.values.get(&value.id()).copied(), result)
+                {
+                    state
+                        .loans
+                        .push((value_id, task, state.graph.ticks, value.span()));
+                    if state.conditional > 0 || state.deferred > 0 || state.graph.scopes.len() > 2 {
+                        state.loan_errors.push((
+                            value.span(),
+                            "non-Sync task loans require an unconditional body-level call",
+                        ));
+                    }
+                } else {
+                    state
+                        .loan_errors
+                        .push((value.span(), "cannot establish the task loan identity"));
+                }
+            }
+            if let Some(task) = result {
+                state.graph.borrowed[task] = false;
+            }
+            // The Task handle is not an alias of its captured payload.
+            return;
+        }
+        match expr {
+            Expr::Await(wait) => {
+                if state.conditional == 0
+                    && state.deferred == 0
+                    && state.graph.scopes.len() <= 2
+                    && let Some(task) = state.graph.values.get(&wait.expr.id()).copied()
+                {
+                    state.waits.push((task, state.graph.ticks));
+                }
+            }
+            Expr::Var(name, span, _) => {
+                if let Some(result) = result {
+                    let binding = state.graph.lookup(name);
+                    state.graph.loan_borrowed[result] |=
+                        state.graph.external[binding] && state.graph.loan_payload[result];
+                    state.graph.join(result, binding);
+                    state.graph.uses.push((result, state.graph.ticks, *span));
+                    if state.deferred > 0 {
+                        state.graph.escape(expr);
+                    }
+                }
+            }
+            Expr::ArrayLiteral(values, ..) => {
+                for value in values {
+                    state.graph.alias(result, value);
+                }
+            }
+            Expr::ObjectLiteral(object) => {
+                for field in &object.fields {
+                    state.graph.alias(result, &field.value);
+                }
+            }
+            Expr::FieldAccess(object, ..) => {
+                state.graph.alias(result, object);
+            }
+            Expr::TryPropagate(operand, ..) => {
+                state.graph.alias(result, operand);
+                // The Err branch returns a payload even when Ok is
+                // Sync and therefore has no ownership graph node.
+                // Inspect the source error: an implicit Into::into
+                // may retain it even if the destination error is Sync.
+                // Option's None path carries no reference to escape.
+                if let Some((_, error)) = self
+                    .expr_types
+                    .get(&operand.id())
+                    .and_then(|ty| builtin_types::binary_args(ty, B::Result))
+                    && !self.is_sync_cached(error, &mut state.sync)
+                {
+                    state.graph.escape(operand);
+                }
+            }
+            Expr::Index(object, ..) => {
+                state.graph.use_value(object);
+                state.graph.alias(result, object);
+            }
+            Expr::Ternary(ternary) => {
+                state.graph.alias(result, &ternary.then_expr);
+                state.graph.alias(result, &ternary.else_expr);
+            }
+            Expr::New(new) => {
+                let class = match self.expr_types.get(&expr.id()) {
+                    Some(Type::Named(class)) => class,
+                    _ => &new.class_name,
+                };
+                let implicit = self
+                    .symbols
+                    .lookup_class(class)
+                    .is_some_and(|c| c.constructor.as_ref().is_none_or(|ctor| ctor.isolated_body));
+                if !implicit && let Some(id) = result {
+                    let root = state.graph.root(id);
+                    state.graph.borrowed[root] = true;
+                }
+                for arg in &new.args {
+                    state.graph.alias(result, &arg.expr);
+                    if !implicit {
+                        state.graph.escape(&arg.expr);
+                    }
+                }
+            }
+            Expr::StaticCall(call) => self.transfer_static_call(state, expr, call, result),
+            Expr::MethodCall(call) => self.transfer_method_call(state, call, result),
+            Expr::Call(call) => {
+                for arg in &call.args {
+                    state.graph.escape(&arg.expr);
+                    state.graph.alias(result, &arg.expr);
+                }
+            }
+
+            Expr::Match(m) => {
+                // Destructured payloads are conservatively borrowed.
+                for arm in &m.arms {
+                    if let MatchBody::Expr(value) = &arm.body {
+                        state.graph.alias(result, value);
+                    }
+                }
+                if let Some(id) = result {
+                    let root = state.graph.root(id);
+                    state.graph.borrowed[root] = true;
+                }
+            }
+            _ => {}
+        }
+        if state.select_sends.contains(&expr.id()) {
+            state.graph.transfer(expr);
         }
     }
 }

@@ -193,7 +193,6 @@ pub(crate) struct CaptureInputs<'a> {
     pub symbols: &'a crate::semantic::analysis_symbols::Facts,
 }
 
-#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(crate) fn capture(
     program: &Program,
     graph: &CallGraph,
@@ -209,115 +208,8 @@ pub(crate) fn capture(
         patterns,
         symbols: symbol_facts,
     } = inputs;
-    // Bodiless interface contracts (e.g. prelude `Into::into`) are callable
-    // signatures, not functions. Calls through them stay unresolved/unknown.
-    let mut unit_graph = CallGraph::default();
-    for (id, sites) in graph.iter() {
-        let contract = id.namespace().is_none()
-            && !id.name().starts_with("$default$")
-            && id
-                .owner()
-                .is_some_and(|owner| symbols.lookup_interface(owner.as_ref()).is_some())
-            && sites.targets.is_empty()
-            && !sites.has_unknown;
-        if !contract {
-            unit_graph.merge(*id, sites.clone());
-        }
-    }
-    let mut result = CapturedUnit {
-        graph: unit_graph,
-        indirect: indirect::Inputs {
-            values: indirect
-                .values
-                .iter()
-                .map(|value| (value.target, value.bit, value.key.clone()))
-                .collect(),
-            calls: indirect.calls.clone(),
-        },
-        semantic: semantic::Captured::default(),
-        symbols: symbol_facts.clone(),
-        symbol_owners: symbols::owners(program),
-        symbol_details: symbols::details(program, symbols),
-        declarations: HashMap::new(),
-        identities: HashMap::new(),
-        lambda_names: HashMap::new(),
-        rename_calls: Vec::new(),
-        direct: HashMap::new(),
-        own_effects: HashMap::new(),
-        dispatches: HashMap::new(),
-        dispatch_sites: HashMap::new(),
-        interfaces: Default::default(),
-        templates: Default::default(),
-    };
-    result.interfaces.targets(symbols, &result.graph);
-    symbols::declarations(program, &mut result.symbols, symbols);
-    result.semantic.rename_relations = rename::relations(program, symbols);
-    let mut pending = Vec::new();
-    for item in &program.items {
-        match item {
-            Item::Function(f) => pending.push((
-                FunctionId::free(&f.name),
-                f.span,
-                f.body.id,
-                AstEvent::Block(&f.body),
-                f.is_async,
-            )),
-            Item::Class(c) => {
-                for field in &c.fields {
-                    if let Some(expr) = &field.initializer
-                        && let Some(body) = index.and_then(|i| i.initializer_body(expr.id()))
-                    {
-                        pending.push((
-                            FunctionId::method(
-                                TypeId::local(&c.name),
-                                format!("$static${}", field.name),
-                            ),
-                            field.span,
-                            body,
-                            AstEvent::Expr(expr),
-                            false,
-                        ));
-                    }
-                }
-                for m in &c.methods {
-                    // Injected copies retain the original file's source span.
-                    pending.push((
-                        FunctionId::method(TypeId::local(&c.name), &m.name),
-                        m.span,
-                        m.body.id,
-                        AstEvent::Block(&m.body),
-                        m.is_async,
-                    ));
-                }
-                for init in &c.constructors {
-                    pending.push((
-                        FunctionId::method(TypeId::local(&c.name), "init"),
-                        init.span,
-                        init.body.id,
-                        AstEvent::Block(&init.body),
-                        false,
-                    ));
-                }
-            }
-            Item::Interface(i) => {
-                for m in &i.methods {
-                    if let Some(body) = &m.default_body {
-                        pending.push((
-                            FunctionId::method(
-                                TypeId::local(&i.name),
-                                format!("$default${}", m.name),
-                            ),
-                            m.span,
-                            body.id,
-                            AstEvent::Block(body),
-                            false,
-                        ));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    let mut result = capture_unit_declarations(program, graph, indirect, symbol_facts, symbols);
+    let mut pending = capture_body_roots(program, index);
     let builtin_aliases = crate::compiler_db::normalize::builtin_module_aliases(program);
     let mut lambda_roots = HashMap::new();
     while let Some((id, span, body_id, body, is_async)) = pending.pop() {
@@ -347,31 +239,7 @@ pub(crate) fn capture(
         if is_async {
             result.semantic.async_functions.insert(id);
         }
-        if let Some(summary) = facts.get(&id) {
-            result.semantic.compiler_effects.insert(
-                id,
-                summary.effects().intersection(RuntimeEffects::ALL).bits(),
-            );
-            let witnesses = (0..RuntimeEffects::BIT_COUNT).filter_map(|bit| {
-                let effect = RuntimeEffects::from_bit(bit);
-                if !summary.contains(effect) { return None; }
-                let witness = match summary.witness(effect) {
-                    Some(crate::compiler_db::effects::EffectWitness::Lock(w)) => serde_json::json!({"kind":"wait", "owner_key":w.owner, "cause":w.cause}),
-                    Some(crate::compiler_db::effects::EffectWitness::Panic {owner, source}) => serde_json::json!({"kind":"panic", "owner_key":owner, "cause":{"span":Span::in_file(crate::diagnostics::FileId(source.0),source.1,source.2,0,0), "operation":"panic-guard"}}),
-                    Some(crate::compiler_db::effects::EffectWitness::Allocation {owner, source}) => serde_json::json!({"kind":"allocation", "owner_key":owner, "cause":{"span":Span::in_file(crate::diagnostics::FileId(source.0),source.1,source.2,0,0), "operation":"allocation"}}),
-                    Some(crate::compiler_db::effects::EffectWitness::External(target)) => serde_json::json!({"kind":"external-boundary","target":target.to_string(),"target_key":target}),
-                    Some(crate::compiler_db::effects::EffectWitness::Helper { reason, owner, source }) => serde_json::json!({"kind":"nonpreemptible", "owner_key":owner, "reason":format!("{reason:?}: synchronous helper may run in a nonpreemptible region; loop safepoints are separate potential preemption points, subject to runtime/platform gating"), "cause":{"span":Span::in_file(crate::diagnostics::FileId(source.0),source.1,source.2,0,0),"operation":match reason { crate::semantic::concurrency::NonpreemptibleReason::Loop => "synchronous-loop", crate::semantic::concurrency::NonpreemptibleReason::Recursion => "synchronous-recursion" }}}),
-                    None => serde_json::json!({"kind":"unavailable"}),
-                };
-                // Fixed-point witnesses may belong to a callee. Capture only
-                // this body's facts; query traversal explains transitive ones.
-                if witness.get("owner_key").is_some_and(|owner| *owner != serde_json::json!(id)) {
-                    return None;
-                }
-                Some(serde_json::json!({"effect":effect.bits(), "witness":witness}))
-            }).collect();
-            result.semantic.witnesses.insert(id, witnesses);
-        }
+        capture_compiler_effects(&mut result, facts, id);
         let compiler_bits = facts.get(&id).map_or_else(
             || {
                 if matches!(body, AstEvent::Expr(_)) {
@@ -408,225 +276,17 @@ pub(crate) fn capture(
                     s.span(),
                     "loop-safepoint",
                 )),
-                AstEvent::Expr(e) => {
-                    if let Some(target) = calls.get(&e.id()) {
-                        let operation = match e {
-                            Expr::Call(c) => Some(c.callee.clone()),
-                            Expr::MethodCall(c) => Some(c.method.clone()),
-                            Expr::StaticCall(c) => Some(QualifiedName::join(&c.class, &c.method)),
-                            _ => None,
-                        };
-                        let builtin = target.as_ref().is_some_and(|target| {
-                            crate::semantic::intrinsics::builtin_target_effects(target)
-                                .or_else(|| {
-                                    crate::semantic::intrinsics::builtin_static_effects(
-                                        target,
-                                        &builtin_aliases,
-                                    )
-                                })
-                                .is_some()
-                        });
-                        if builtin && let Some(target) = target {
-                            result.semantic.builtin_calls.push((id, e.span(), *target));
-                        }
-                        if !builtin && let Some(operation) = operation {
-                            result
-                                .semantic
-                                .call_sites
-                                .push((id, e.span(), *target, operation));
-                        }
+                AstEvent::Expr(e) => Some(
+                    CaptureExpressionContext {
+                        id,
+                        is_async,
+                        types,
+                        calls,
+                        symbols,
+                        builtin_aliases: &builtin_aliases,
                     }
-                    if let Expr::MethodCall(call) = e
-                        && let Some(intrinsic) = calls
-                            .get(&e.id())
-                            .and_then(|t| t.as_ref())
-                            .and_then(Intrinsic::from_function_id)
-                        && matches!(
-                            intrinsic,
-                            Intrinsic::StringLen
-                                | Intrinsic::StringByteAt
-                                | Intrinsic::StringContains
-                                | Intrinsic::StringFind
-                                | Intrinsic::StringStartsWith
-                                | Intrinsic::StringEndsWith
-                        )
-                    {
-                        // Presentation only: never narrow the ABI/call-graph mask.
-                        result.semantic.builtin_effect_paths(
-                            id,
-                            e.span(),
-                            &call.method,
-                            intrinsic == Intrinsic::StringByteAt,
-                        );
-                    }
-                    if matches!(e, Expr::String(..)) {
-                        // Literal slots can allocate on first use, but a static
-                        // literal is not evidence of a per-evaluation allocation.
-                        // Keep the bound without displacing actual allocation sites.
-                        bits |= RuntimeEffects::MAY_ALLOCATE.bits();
-                    }
-                    // A resolved enum variant has no callable body. Keep its
-                    // allocation bound tied to the construction site rather
-                    // than exposing a propagated bit without any witness.
-                    if matches!(e, Expr::StaticCall(_))
-                        && calls
-                            .get(&e.id())
-                            .and_then(|target| *target)
-                            .and_then(|target| target.owner_type())
-                            .is_some_and(|owner| symbols.lookup_enum(&owner.to_string()).is_some())
-                    {
-                        bits |= RuntimeEffects::MAY_ALLOCATE.bits();
-                        result.semantic.capability(
-                            id,
-                            RuntimeEffects::MAY_ALLOCATE.bits(),
-                            e.span(),
-                            "enum-allocation",
-                        );
-                    }
-                    let effects = match e {
-                        Expr::New(_) | Expr::ArrayLiteral(..) | Expr::ObjectLiteral(_) => {
-                            RuntimeEffects::MAY_ALLOCATE.bits()
-                        }
-                        // Async select parks via SuspendOp::SelectWait. Its case
-                        // expressions/bodies are visited independently below.
-                        Expr::Select(_) if is_async => RuntimeEffects::MAY_ALLOCATE
-                            .union(RuntimeEffects::MAY_SUSPEND)
-                            .union(RuntimeEffects::MAY_PREEMPT)
-                            .union(RuntimeEffects::MAY_PANIC)
-                            .bits(),
-                        Expr::Binary(b)
-                            if b.op == BinOp::Add
-                                && matches!(types.get(&b.id), Some(Type::String)) =>
-                        {
-                            willow_abi::runtime_symbol("willow_string_concat")
-                                .expect("string concat ABI")
-                                .effects()
-                                .bits()
-                        }
-                        // Only direct runtime scheduler builtins prove this lowering.
-                        // Stored/custom futures retain their conservative await bound.
-                        Expr::Await(a)
-                            if is_async
-                                && matches!(&a.expr, Expr::Call(c)
-                                    if matches!(c.callee.as_str(), "sleep" | "yield")
-                                        && calls.get(&c.id) == Some(&Some(FunctionId::free(&c.callee)))
-                                        && symbols.lookup_func(&c.callee)
-                                            .is_some_and(|f| f.declaration_span.end == 0)) =>
-                        {
-                            RuntimeEffects::MAY_SUSPEND
-                                .union(RuntimeEffects::MAY_PREEMPT)
-                                .bits()
-                        }
-                        // An async function lowers `await` of a Task/JoinHandle/
-                        // TaskResult value to `SuspendOp::AwaitTask`: the task
-                        // parks in `willow_frame_await` and reads the terminal
-                        // value through `willow_frame_await_check` (plain await:
-                        // a cancelled task panics) or a `Result` allocation
-                        // (`TaskResult`). No OS thread blocks. `Future<T>`
-                        // values still lower to a blocking runtime call.
-                        Expr::Await(a)
-                            if is_async
-                                && types.get(&a.expr.id()).is_some_and(|ty| {
-                                    crate::semantic::type_checker::awaitable_task_type(ty).is_some()
-                                }) =>
-                        {
-                            ["willow_frame_await", "willow_frame_await_check"]
-                                .into_iter()
-                                .map(|name| {
-                                    willow_abi::runtime_symbol(name)
-                                        .expect("task await ABI")
-                                        .effects()
-                                })
-                                .fold(RuntimeEffects::MAY_PREEMPT, RuntimeEffects::union)
-                                .intersection(RuntimeEffects::ALL)
-                                .bits()
-                        }
-                        Expr::Await(_) | Expr::Select(_) | Expr::Print(..) => {
-                            RuntimeEffects::ALL.bits()
-                        }
-                        Expr::Binary(b)
-                            if b.op == BinOp::Add
-                                && !matches!(types.get(&b.id), Some(Type::I64 | Type::F64)) =>
-                        {
-                            RuntimeEffects::ALL.bits()
-                        }
-                        Expr::MethodCall(_) => calls
-                            .get(&e.id())
-                            .and_then(|target| target.as_ref())
-                            .and_then(crate::semantic::intrinsics::builtin_target_effects)
-                            .map_or(0, |effects| effects.bits()),
-                        Expr::StaticCall(_) => calls
-                            .get(&e.id())
-                            .and_then(|target| target.as_ref())
-                            .filter(|target| {
-                                target
-                                    .owner()
-                                    .is_some_and(|owner| symbols.lookup_class(&owner).is_none())
-                            })
-                            .and_then(|target| {
-                                crate::semantic::intrinsics::builtin_static_effects(
-                                    target,
-                                    &builtin_aliases,
-                                )
-                            })
-                            .map_or(0, |effects| effects.bits()),
-                        Expr::Call(c)
-                            if symbols
-                                .lookup_func(&c.callee)
-                                .is_none_or(|f| f.declaration_span.end == 0) =>
-                        {
-                            crate::semantic::intrinsics::builtin_call_runtime_name(&c.callee)
-                                .and_then(willow_abi::runtime_symbol)
-                                .map_or(0, |s| s.effects().intersection(RuntimeEffects::ALL).bits())
-                        }
-                        _ => 0,
-                    };
-                    if let Some(intrinsic) = calls
-                        .get(&e.id())
-                        .and_then(|target| target.as_ref())
-                        .and_then(Intrinsic::from_function_id)
-                    {
-                        let operation = match intrinsic {
-                            Intrinsic::ChannelSend => Some("channel-send"),
-                            Intrinsic::ChannelRecv => Some("channel-recv"),
-                            Intrinsic::ChannelRecvOpt => Some("channel-recv-opt"),
-                            _ => None,
-                        };
-                        if let Some(operation) = operation {
-                            result.semantic.channel_site(id, e.span(), operation);
-                        }
-                    }
-                    let operation = match e {
-                        Expr::New(_) => "object-allocation",
-                        Expr::ArrayLiteral(..) => "array-allocation",
-                        Expr::ObjectLiteral(_) => "object-literal-allocation",
-                        Expr::Await(_) => "await",
-                        Expr::Select(_) => "select",
-                        Expr::Print(..) => "print",
-                        Expr::Binary(b) if matches!(types.get(&b.id), Some(Type::String)) => {
-                            "string-concatenation"
-                        }
-                        Expr::Binary(_) => "non-scalar-addition",
-                        Expr::MethodCall(_)
-                            if calls
-                                .get(&e.id())
-                                .and_then(|target| target.as_ref())
-                                .and_then(Intrinsic::from_function_id)
-                                .is_some_and(|intrinsic| {
-                                    matches!(
-                                        intrinsic,
-                                        Intrinsic::ArrayLen | Intrinsic::FrozenArrayLen
-                                    )
-                                }) =>
-                        {
-                            "array-length-null-panic"
-                        }
-                        Expr::MethodCall(_) => "builtin-method-call",
-                        Expr::Call(_) | Expr::StaticCall(_) => "builtin-call",
-                        _ => "expression",
-                    };
-                    Some((effects, e.span(), operation))
-                }
+                    .capture(e, &mut result, &mut bits),
+                ),
                 _ => None,
             };
             if let Some((effects, span, reason)) = capability {
@@ -720,6 +380,408 @@ pub(crate) fn capture(
         *result.direct.entry(id).or_default() |= bits | compiler_bits;
     }
     result
+}
+
+fn capture_unit_declarations(
+    program: &Program,
+    graph: &CallGraph,
+    indirect: &crate::semantic::indirect_lock::IndirectInputs,
+    symbol_facts: &crate::semantic::analysis_symbols::Facts,
+    symbols: &crate::semantic::symbols::SymbolTable,
+) -> CapturedUnit {
+    // Bodiless interface contracts (e.g. prelude `Into::into`) are callable
+    // signatures, not functions. Calls through them stay unresolved/unknown.
+    let mut unit_graph = CallGraph::default();
+    for (id, sites) in graph.iter() {
+        let contract = id.namespace().is_none()
+            && !id.name().starts_with("$default$")
+            && id
+                .owner()
+                .is_some_and(|owner| symbols.lookup_interface(owner.as_ref()).is_some())
+            && sites.targets.is_empty()
+            && !sites.has_unknown;
+        if !contract {
+            unit_graph.merge(*id, sites.clone());
+        }
+    }
+    let mut result = CapturedUnit {
+        graph: unit_graph,
+        indirect: indirect::Inputs {
+            values: indirect
+                .values
+                .iter()
+                .map(|value| (value.target, value.bit, value.key.clone()))
+                .collect(),
+            calls: indirect.calls.clone(),
+        },
+        semantic: semantic::Captured::default(),
+        symbols: symbol_facts.clone(),
+        symbol_owners: symbols::owners(program),
+        symbol_details: symbols::details(program, symbols),
+        declarations: HashMap::new(),
+        identities: HashMap::new(),
+        lambda_names: HashMap::new(),
+        rename_calls: Vec::new(),
+        direct: HashMap::new(),
+        own_effects: HashMap::new(),
+        dispatches: HashMap::new(),
+        dispatch_sites: HashMap::new(),
+        interfaces: Default::default(),
+        templates: Default::default(),
+    };
+    result.interfaces.targets(symbols, &result.graph);
+    symbols::declarations(program, &mut result.symbols, symbols);
+    result.semantic.rename_relations = rename::relations(program, symbols);
+    result
+}
+
+fn capture_compiler_effects(
+    result: &mut CapturedUnit,
+    facts: &crate::semantic::effects::EffectFacts<crate::compiler_db::effects::EffectWitness>,
+    id: FunctionId,
+) {
+    if let Some(summary) = facts.get(&id) {
+        result.semantic.compiler_effects.insert(
+            id,
+            summary.effects().intersection(RuntimeEffects::ALL).bits(),
+        );
+        let witnesses = (0..RuntimeEffects::BIT_COUNT).filter_map(|bit| {
+            let effect = RuntimeEffects::from_bit(bit);
+            if !summary.contains(effect) { return None; }
+            let witness = match summary.witness(effect) {
+                Some(crate::compiler_db::effects::EffectWitness::Lock(w)) => serde_json::json!({"kind":"wait", "owner_key":w.owner, "cause":w.cause}),
+                Some(crate::compiler_db::effects::EffectWitness::Panic {owner, source}) => serde_json::json!({"kind":"panic", "owner_key":owner, "cause":{"span":Span::in_file(crate::diagnostics::FileId(source.0),source.1,source.2,0,0), "operation":"panic-guard"}}),
+                Some(crate::compiler_db::effects::EffectWitness::Allocation {owner, source}) => serde_json::json!({"kind":"allocation", "owner_key":owner, "cause":{"span":Span::in_file(crate::diagnostics::FileId(source.0),source.1,source.2,0,0), "operation":"allocation"}}),
+                Some(crate::compiler_db::effects::EffectWitness::External(target)) => serde_json::json!({"kind":"external-boundary","target":target.to_string(),"target_key":target}),
+                Some(crate::compiler_db::effects::EffectWitness::Helper { reason, owner, source }) => serde_json::json!({"kind":"nonpreemptible", "owner_key":owner, "reason":format!("{reason:?}: synchronous helper may run in a nonpreemptible region; loop safepoints are separate potential preemption points, subject to runtime/platform gating"), "cause":{"span":Span::in_file(crate::diagnostics::FileId(source.0),source.1,source.2,0,0),"operation":match reason { crate::semantic::concurrency::NonpreemptibleReason::Loop => "synchronous-loop", crate::semantic::concurrency::NonpreemptibleReason::Recursion => "synchronous-recursion" }}}),
+                None => serde_json::json!({"kind":"unavailable"}),
+            };
+            // Fixed-point witnesses may belong to a callee. Capture only
+            // this body's facts; query traversal explains transitive ones.
+            if witness.get("owner_key").is_some_and(|owner| *owner != serde_json::json!(id)) {
+                return None;
+            }
+            Some(serde_json::json!({"effect":effect.bits(), "witness":witness}))
+        }).collect();
+        result.semantic.witnesses.insert(id, witnesses);
+    }
+}
+
+fn capture_body_roots<'a>(
+    program: &'a Program,
+    index: Option<&crate::compiler_db::ids::BodyIndex>,
+) -> Vec<(FunctionId, Span, BodyId, AstEvent<'a>, bool)> {
+    let mut pending = Vec::new();
+    for item in &program.items {
+        match item {
+            Item::Function(f) => pending.push((
+                FunctionId::free(&f.name),
+                f.span,
+                f.body.id,
+                AstEvent::Block(&f.body),
+                f.is_async,
+            )),
+            Item::Class(c) => {
+                for field in &c.fields {
+                    if let Some(expr) = &field.initializer
+                        && let Some(body) = index.and_then(|i| i.initializer_body(expr.id()))
+                    {
+                        pending.push((
+                            FunctionId::method(
+                                TypeId::local(&c.name),
+                                format!("$static${}", field.name),
+                            ),
+                            field.span,
+                            body,
+                            AstEvent::Expr(expr),
+                            false,
+                        ));
+                    }
+                }
+                for m in &c.methods {
+                    // Injected copies retain the original file's source span.
+                    pending.push((
+                        FunctionId::method(TypeId::local(&c.name), &m.name),
+                        m.span,
+                        m.body.id,
+                        AstEvent::Block(&m.body),
+                        m.is_async,
+                    ));
+                }
+                for init in &c.constructors {
+                    pending.push((
+                        FunctionId::method(TypeId::local(&c.name), "init"),
+                        init.span,
+                        init.body.id,
+                        AstEvent::Block(&init.body),
+                        false,
+                    ));
+                }
+            }
+            Item::Interface(i) => {
+                for m in &i.methods {
+                    if let Some(body) = &m.default_body {
+                        pending.push((
+                            FunctionId::method(
+                                TypeId::local(&i.name),
+                                format!("$default${}", m.name),
+                            ),
+                            m.span,
+                            body.id,
+                            AstEvent::Block(body),
+                            false,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    pending
+}
+
+struct CaptureExpressionContext<'a> {
+    id: FunctionId,
+    is_async: bool,
+    types: &'a HashMap<ExprId, Type>,
+    calls: &'a HashMap<ExprId, Option<FunctionId>>,
+    symbols: &'a crate::semantic::symbols::SymbolTable,
+    builtin_aliases: &'a HashMap<String, String>,
+}
+
+impl CaptureExpressionContext<'_> {
+    fn effects(&self, e: &Expr) -> u8 {
+        let Self {
+            id: _,
+            is_async,
+            types,
+            calls,
+            symbols,
+            builtin_aliases,
+        } = *self;
+        match e {
+            Expr::New(_) | Expr::ArrayLiteral(..) | Expr::ObjectLiteral(_) => {
+                RuntimeEffects::MAY_ALLOCATE.bits()
+            }
+            // Async select parks via SuspendOp::SelectWait. Its case
+            // expressions/bodies are visited independently below.
+            Expr::Select(_) if is_async => RuntimeEffects::MAY_ALLOCATE
+                .union(RuntimeEffects::MAY_SUSPEND)
+                .union(RuntimeEffects::MAY_PREEMPT)
+                .union(RuntimeEffects::MAY_PANIC)
+                .bits(),
+            Expr::Binary(b)
+                if b.op == BinOp::Add && matches!(types.get(&b.id), Some(Type::String)) =>
+            {
+                willow_abi::runtime_symbol("willow_string_concat")
+                    .expect("string concat ABI")
+                    .effects()
+                    .bits()
+            }
+            // Only direct runtime scheduler builtins prove this lowering.
+            // Stored/custom futures retain their conservative await bound.
+            Expr::Await(a)
+                if is_async
+                    && matches!(&a.expr, Expr::Call(c)
+                        if matches!(c.callee.as_str(), "sleep" | "yield")
+                            && calls.get(&c.id) == Some(&Some(FunctionId::free(&c.callee)))
+                            && symbols.lookup_func(&c.callee)
+                                .is_some_and(|f| f.declaration_span.end == 0)) =>
+            {
+                RuntimeEffects::MAY_SUSPEND
+                    .union(RuntimeEffects::MAY_PREEMPT)
+                    .bits()
+            }
+            // An async function lowers `await` of a Task/JoinHandle/
+            // TaskResult value to `SuspendOp::AwaitTask`: the task
+            // parks in `willow_frame_await` and reads the terminal
+            // value through `willow_frame_await_check` (plain await:
+            // a cancelled task panics) or a `Result` allocation
+            // (`TaskResult`). No OS thread blocks. `Future<T>`
+            // values still lower to a blocking runtime call.
+            Expr::Await(a)
+                if is_async
+                    && types.get(&a.expr.id()).is_some_and(|ty| {
+                        crate::semantic::type_checker::awaitable_task_type(ty).is_some()
+                    }) =>
+            {
+                ["willow_frame_await", "willow_frame_await_check"]
+                    .into_iter()
+                    .map(|name| {
+                        willow_abi::runtime_symbol(name)
+                            .expect("task await ABI")
+                            .effects()
+                    })
+                    .fold(RuntimeEffects::MAY_PREEMPT, RuntimeEffects::union)
+                    .intersection(RuntimeEffects::ALL)
+                    .bits()
+            }
+            Expr::Await(_) | Expr::Select(_) | Expr::Print(..) => RuntimeEffects::ALL.bits(),
+            Expr::Binary(b)
+                if b.op == BinOp::Add
+                    && !matches!(types.get(&b.id), Some(Type::I64 | Type::F64)) =>
+            {
+                RuntimeEffects::ALL.bits()
+            }
+            Expr::MethodCall(_) => calls
+                .get(&e.id())
+                .and_then(|target| target.as_ref())
+                .and_then(crate::semantic::intrinsics::builtin_target_effects)
+                .map_or(0, |effects| effects.bits()),
+            Expr::StaticCall(_) => calls
+                .get(&e.id())
+                .and_then(|target| target.as_ref())
+                .filter(|target| {
+                    target
+                        .owner()
+                        .is_some_and(|owner| symbols.lookup_class(&owner).is_none())
+                })
+                .and_then(|target| {
+                    crate::semantic::intrinsics::builtin_static_effects(target, builtin_aliases)
+                })
+                .map_or(0, |effects| effects.bits()),
+            Expr::Call(c)
+                if symbols
+                    .lookup_func(&c.callee)
+                    .is_none_or(|f| f.declaration_span.end == 0) =>
+            {
+                crate::semantic::intrinsics::builtin_call_runtime_name(&c.callee)
+                    .and_then(willow_abi::runtime_symbol)
+                    .map_or(0, |s| s.effects().intersection(RuntimeEffects::ALL).bits())
+            }
+            _ => 0,
+        }
+    }
+
+    fn capture(
+        &self,
+        e: &Expr,
+        result: &mut CapturedUnit,
+        bits: &mut u8,
+    ) -> (u8, Span, &'static str) {
+        let Self {
+            id,
+            is_async: _,
+            types,
+            calls,
+            symbols,
+            builtin_aliases,
+        } = *self;
+        if let Some(target) = calls.get(&e.id()) {
+            let operation = match e {
+                Expr::Call(c) => Some(c.callee.clone()),
+                Expr::MethodCall(c) => Some(c.method.clone()),
+                Expr::StaticCall(c) => Some(QualifiedName::join(&c.class, &c.method)),
+                _ => None,
+            };
+            let builtin = target.as_ref().is_some_and(|target| {
+                crate::semantic::intrinsics::builtin_target_effects(target)
+                    .or_else(|| {
+                        crate::semantic::intrinsics::builtin_static_effects(target, builtin_aliases)
+                    })
+                    .is_some()
+            });
+            if builtin && let Some(target) = target {
+                result.semantic.builtin_calls.push((id, e.span(), *target));
+            }
+            if !builtin && let Some(operation) = operation {
+                result
+                    .semantic
+                    .call_sites
+                    .push((id, e.span(), *target, operation));
+            }
+        }
+        if let Expr::MethodCall(call) = e
+            && let Some(intrinsic) = calls
+                .get(&e.id())
+                .and_then(|t| t.as_ref())
+                .and_then(Intrinsic::from_function_id)
+            && matches!(
+                intrinsic,
+                Intrinsic::StringLen
+                    | Intrinsic::StringByteAt
+                    | Intrinsic::StringContains
+                    | Intrinsic::StringFind
+                    | Intrinsic::StringStartsWith
+                    | Intrinsic::StringEndsWith
+            )
+        {
+            // Presentation only: never narrow the ABI/call-graph mask.
+            result.semantic.builtin_effect_paths(
+                id,
+                e.span(),
+                &call.method,
+                intrinsic == Intrinsic::StringByteAt,
+            );
+        }
+        if matches!(e, Expr::String(..)) {
+            // Literal slots can allocate on first use, but a static
+            // literal is not evidence of a per-evaluation allocation.
+            // Keep the bound without displacing actual allocation sites.
+            *bits |= RuntimeEffects::MAY_ALLOCATE.bits();
+        }
+        // A resolved enum variant has no callable body. Keep its
+        // allocation bound tied to the construction site rather
+        // than exposing a propagated bit without any witness.
+        if matches!(e, Expr::StaticCall(_))
+            && calls
+                .get(&e.id())
+                .and_then(|target| *target)
+                .and_then(|target| target.owner_type())
+                .is_some_and(|owner| symbols.lookup_enum(&owner.to_string()).is_some())
+        {
+            *bits |= RuntimeEffects::MAY_ALLOCATE.bits();
+            result.semantic.capability(
+                id,
+                RuntimeEffects::MAY_ALLOCATE.bits(),
+                e.span(),
+                "enum-allocation",
+            );
+        }
+        let effects = self.effects(e);
+        if let Some(intrinsic) = calls
+            .get(&e.id())
+            .and_then(|target| target.as_ref())
+            .and_then(Intrinsic::from_function_id)
+        {
+            let operation = match intrinsic {
+                Intrinsic::ChannelSend => Some("channel-send"),
+                Intrinsic::ChannelRecv => Some("channel-recv"),
+                Intrinsic::ChannelRecvOpt => Some("channel-recv-opt"),
+                _ => None,
+            };
+            if let Some(operation) = operation {
+                result.semantic.channel_site(id, e.span(), operation);
+            }
+        }
+        let operation = match e {
+            Expr::New(_) => "object-allocation",
+            Expr::ArrayLiteral(..) => "array-allocation",
+            Expr::ObjectLiteral(_) => "object-literal-allocation",
+            Expr::Await(_) => "await",
+            Expr::Select(_) => "select",
+            Expr::Print(..) => "print",
+            Expr::Binary(b) if matches!(types.get(&b.id), Some(Type::String)) => {
+                "string-concatenation"
+            }
+            Expr::Binary(_) => "non-scalar-addition",
+            Expr::MethodCall(_)
+                if calls
+                    .get(&e.id())
+                    .and_then(|target| target.as_ref())
+                    .and_then(Intrinsic::from_function_id)
+                    .is_some_and(|intrinsic| {
+                        matches!(intrinsic, Intrinsic::ArrayLen | Intrinsic::FrozenArrayLen)
+                    }) =>
+            {
+                "array-length-null-panic"
+            }
+            Expr::MethodCall(_) => "builtin-method-call",
+            Expr::Call(_) | Expr::StaticCall(_) => "builtin-call",
+            _ => "expression",
+        };
+        (effects, e.span(), operation)
+    }
 }
 
 /// Spell an awaited operand type for AI output. A task with no value is

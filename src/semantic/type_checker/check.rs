@@ -3129,417 +3129,12 @@ impl TypeChecker {
             Expr::Float(_, _, _) => Type::F64,
             Expr::Bool(_, _, _) => Type::Bool,
             Expr::String(_, _, _) => Type::String,
-            Expr::Var(name, span, _) => {
-                if name == "this" {
-                    self.push_legacy_this_error(*span);
-                    return Type::Void;
-                }
-                // Local variable?
-                if let Some(info) = self.symbols.lookup_var(name) {
-                    if let Some((uses, _)) =
-                        self.local.inferred_maps.get_mut(&info.declaration_span)
-                    {
-                        uses.push(expr.id());
-                        self.local.pending_map_uses.insert(expr.id());
-                    }
-                    return info.ty.clone();
-                }
-                // Named function used as a value: `apply(10, double)` where `double: fn(...)`
-                if let Some(info) = self.symbols.lookup_func(name) {
-                    // A module-level `const` is a value of its declared type,
-                    // inlined by lowering.
-                    if info.constant.is_some() {
-                        return info.return_type.clone();
-                    }
-                    let params = info.params.clone();
-                    let ret = info.return_type.clone();
-                    // An async function has no plain entry point (a call
-                    // creates its Task), and a builtin is lowered inline at
-                    // each call site, so neither has an address to take. Builtins are the functions without a
-                    //
-                    // source declaration; a few are defined as real functions.
-                    let is_async = info.is_async;
-                    let not_addressable = if is_async {
-                        Some("an async function")
-                    } else if info.declaration_span == Span::dummy()
-                        && !crate::semantic::intrinsics::ADDRESSABLE_BUILTINS
-                            .contains(&name.as_str())
-                    {
-                        Some("a builtin function")
-                    } else {
-                        None
-                    };
-                    if let Some(kind) = not_addressable {
-                        let args = (0..params.len())
-                            .map(|i| format!("a{i}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let typed = params
-                            .iter()
-                            .enumerate()
-                            .map(|(i, ty)| format!("a{i}: {}", self.diagnostic_type_name(ty)))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E1012,
-                                format!(
-                                    "`{name}` is {kind} and cannot be used as a function value"
-                                ),
-                            )
-                            .with_label(Label::primary(*span, "named here as a value"))
-                            .with_help(format!(
-                                "wrap the call in a lambda instead: `|{typed}| {name}({args})`"
-                            )),
-                        );
-                        // The type the call would have, so uses of the
-                        // value do not report follow-on errors.
-                        let ret = if is_async {
-                            Type::Generic("Task".into(), vec![ret])
-                        } else {
-                            ret
-                        };
-                        return Type::Fn(params, Box::new(ret));
-                    }
-                    let arity = params.len();
-                    let ty = Type::Fn(params, Box::new(ret));
-                    self.record_function_value(
-                        Some(FunctionId::free_from_source_name(name)),
-                        arity,
-                        *span,
-                        &ty,
-                    );
-                    return ty;
-                }
-                // Give a specialized error for receiver keywords used outside instance methods.
-                if name == "self" {
-                    let diag = if self.local.in_static_method {
-                        let where_ = self
-                            .local
-                            .current_class
-                            .as_deref()
-                            .map(|c| format!(" `{}`", c))
-                            .unwrap_or_default();
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0831,
-                            format!("`self` is not available in static method{}", where_),
-                        )
-                        .with_label(Label::primary(*span, "`self` in a static method"))
-                        .with_help(
-                            "static methods have no receiver; use an instance method instead",
-                        )
-                    } else if self.local.in_static_initializer {
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0837,
-                            "`self` is not available in a static property initializer",
-                        )
-                        .with_label(Label::primary(*span, "`self` in static initializer"))
-                        .with_help("static initializers run before any instance exists")
-                    } else {
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0550,
-                            "`self` can only be used inside an instance method",
-                        )
-                        .with_label(Label::primary(*span, "`self` used outside instance method"))
-                        .with_help(
-                            "declare the method without `static` to make it an instance method",
-                        )
-                    };
-                    self.push(diag);
-                    return Type::Void;
-                }
-                if name == "super" {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0851,
-                            "`super` is not a value",
-                        )
-                        .with_label(Label::primary(*span, "`super` used as a value"))
-                        .with_help(
-                            "call a base-class method with `super.method(...)`, or read fields through `self`",
-                        ),
-                    );
-                    return Self::error_type();
-                }
-                if self.report_contextless_variant(name, *span) {
-                    return Self::error_type();
-                }
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0350,
-                        format!("cannot find variable `{}`", name),
-                    )
-                    .with_label(Label::primary(*span, "not found in this scope")),
-                );
-                // The error type suppresses cascades: a use of the missing name
-                // must not be judged as some guessed type.
-                Self::error_type()
-            }
+            Expr::Var(name, span, _) => self.check_variable_value(expr, name, span),
             Expr::Binary(_) | Expr::Unary(_) => self.check_operator_tree(expr),
             Expr::Call(c) if matches!(c.callee.as_str(), "forall" | "exists") => {
-                if c.args.len() != 3 || !c.type_args.is_empty() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E2631,
-                            "quantifiers require two i64 bounds and one predicate binder",
-                        )
-                        .with_label(Label::primary(c.span, "unsupported quantified expression")),
-                    );
-                    return Self::error_type();
-                }
-                self.reject_reference_args(&c.callee, &c.args);
-                for bound in &c.args[..2] {
-                    if self.check_expr(&bound.expr) != Type::I64 {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E2631,
-                                "quantifier bounds must have type i64",
-                            )
-                            .with_label(Label::primary(bound.span, "invalid bound")),
-                        );
-                    }
-                }
-                let Expr::Lambda(predicate) = &c.args[2].expr else {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E2631,
-                            "quantifier predicate must be an expression-bodied |index:i64| binder",
-                        )
-                        .with_label(Label::primary(c.args[2].span, "invalid predicate")),
-                    );
-                    return Self::error_type();
-                };
-                if predicate.params.len() != 1
-                    || predicate.params[0]
-                        .ty
-                        .as_ref()
-                        .is_some_and(|ty| *ty != Type::I64)
-                    || predicate
-                        .return_type
-                        .as_ref()
-                        .is_some_and(|ty| *ty != Type::Bool)
-                {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E2631,
-                            "quantifier predicate requires one i64 binder and a bool result",
-                        )
-                        .with_label(Label::primary(
-                            predicate.span,
-                            "invalid predicate signature",
-                        )),
-                    );
-                    return Self::error_type();
-                }
-                let LambdaBody::Expr(body) = &predicate.body else {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E2631,
-                            "quantifier predicates must be expression-bodied",
-                        )
-                        .with_label(Label::primary(predicate.span, "unsupported predicate body")),
-                    );
-                    return Self::error_type();
-                };
-                self.symbols.push_scope();
-                self.define_var(
-                    predicate.params[0].name.clone(),
-                    VarInfo {
-                        ty: Type::I64,
-                        mutable: false,
-                        is_param: false,
-                        declaration_span: predicate.params[0].span,
-                    },
-                );
-                let ty = self.check_expr(body);
-                self.symbols.pop_scope();
-                if ty != Type::Bool {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E2631,
-                            "quantifier predicate must have type bool",
-                        )
-                        .with_label(Label::primary(body.span(), "invalid predicate result")),
-                    );
-                }
-                Type::Bool
+                self.check_quantifier(c)
             }
-            Expr::Call(c) => {
-                // Lexical value bindings win over module/free-function names.
-                // Looking up the free function first silently compiled
-                // `let f = |...| ...; f(...)` as a direct call when a top-level
-                // `fn f` also existed.
-                if let Some(var_info) = self.symbols.lookup_var(&c.callee).cloned() {
-                    if !c.type_args.is_empty() {
-                        self.generic_error(
-                            c.span,
-                            format!(
-                                "function value `{}` does not accept type arguments",
-                                c.callee
-                            ),
-                        );
-                    }
-                    match &var_info.ty {
-                        // Both callable types are called the same way in source; they differ only in what codegen
-                        //
-                        // has to load first.
-                        Type::Fn(param_types, ret) | Type::Closure(param_types, ret) => {
-                            if param_types.len() != c.args.len() {
-                                self.push(
-                                    Diagnostic::new(
-                                        Severity::Error,
-                                        ErrorCode::E0201,
-                                        format!(
-                                            "function value `{}` takes {} argument(s) but {} were supplied",
-                                            c.callee,
-                                            param_types.len(),
-                                            c.args.len()
-                                        ),
-                                    )
-                                    .with_label(Label::primary(
-                                        c.span,
-                                        "wrong number of arguments",
-                                    )),
-                                );
-                            }
-                            self.check_value_call_args(param_types, &c.args);
-                            return ret.as_ref().clone();
-                        }
-                        ty => {
-                            for arg in &c.args {
-                                self.check_expr(&arg.expr);
-                            }
-                            if Self::contains_error_type(ty) {
-                                return Self::error_type();
-                            }
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "cannot call value `{}` of type `{}`",
-                                        c.callee,
-                                        self.diagnostic_type_name(ty)
-                                    ),
-                                )
-                                .with_label(Label::primary(
-                                    c.span,
-                                    "this binding is not a function",
-                                )),
-                            );
-                            return Type::Void;
-                        }
-                    }
-                }
-
-                if let Some(ty) = self.check_generic_call(c, None) {
-                    return ty;
-                }
-                if !c.type_args.is_empty() {
-                    self.generic_error(
-                        c.span,
-                        format!("function `{}` does not accept type arguments", c.callee),
-                    );
-                }
-                if c.callee == "format" {
-                    return self.check_format_call(c);
-                }
-                // Variadic formatted panic: `panic(spec, args...)`.
-                // The one-argument form stays a plain-String builtin call.
-                if c.callee == "panic" && c.args.len() != 1 {
-                    return self.check_panic_interpolation(c);
-                }
-
-                // Direct call to a named function.
-                if let Some(info) = self.symbols.lookup_func(&c.callee).cloned() {
-                    if info.constant.is_some() {
-                        return self.reject_constant_call(&c.callee, &info, &c.args, c.span);
-                    }
-                    if info.params.len() != c.args.len() {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!(
-                                    "function `{}` takes {} argument(s) but {} were supplied",
-                                    c.callee,
-                                    info.params.len(),
-                                    c.args.len()
-                                ),
-                            )
-                            .with_label(Label::primary(c.span, "wrong number of arguments")),
-                        );
-                    }
-                    if info.foreign {
-                        self.check_foreign_call(c.span, info.is_async);
-                    }
-                    self.check_call_args_against_param_infos(&info.param_infos, &c.args);
-                    self.check_async_call_captures(&info.param_infos, &c.args, info.is_async);
-                    if let Some(operation) =
-                        self.imported_blocking_std_functions.get(&c.callee).copied()
-                    {
-                        self.record_direct_lock_effect(c.span, operation, LockEffectKind::Block);
-                    }
-                    self.record_lock_effect_call(
-                        FunctionId::free_from_source_name(&c.callee),
-                        c.span,
-                    );
-                    return function_call_return_type(&info);
-                }
-
-                // Prelude constructors can infer their payload without an outer
-                // annotation, just like the qualified Result::Ok/Err forms.
-                let inferred_enum = match c.callee.as_str() {
-                    "Ok" | "Err" => Some(B::Result.source_name()),
-                    _ => None,
-                };
-                if let Some(name) = inferred_enum
-                    && self.prelude_variant_name_is_unshadowed(&c.callee)
-                    && self
-                        .symbols
-                        .lookup_enum(name)
-                        .is_some_and(|info| info.name == name)
-                {
-                    let ty = self.resolve_static_call(
-                        name,
-                        &[],
-                        &c.callee,
-                        &c.args,
-                        (c.span, c.span),
-                        None,
-                    );
-                    self.enum_variant_resolutions.insert(c.id, name.to_string());
-                    return ty;
-                }
-
-                if self.report_contextless_variant(&c.callee, c.span) {
-                    for arg in &c.args {
-                        self.check_expr(&arg.expr);
-                    }
-                    return Self::error_type();
-                }
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0350,
-                        format!("cannot find function `{}`", c.callee),
-                    )
-                    .with_label(Label::primary(c.span, "not found in this scope")),
-                );
-                Type::Void
-            }
+            Expr::Call(c) => self.check_named_call(c),
             Expr::FieldAccess(obj, field_name, span, _) => {
                 let obj_ty = self.check_expr(obj);
                 self.resolve_field(&obj_ty, field_name, *span, true, "read")
@@ -3552,180 +3147,572 @@ impl TypeChecker {
             Expr::StaticField(s) => self.resolve_static_field_read(&s.class, &s.field, s.span),
             Expr::New(n) => self.check_new_with_effects(n, &n.class_name),
             Expr::ObjectLiteral(o) => self.check_object_literal(o),
-            Expr::Await(a) => {
-                self.record_direct_lock_effect(a.span, "await", LockEffectKind::Suspend);
-                let errors_before = self.error_generation;
-                let awaited_ty = self.check_expr(&a.expr);
-                if !self.local.current_async_context {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0801,
-                            "`await` can only be used inside an async function",
-                        )
-                        .with_label(Label::primary(
-                            a.span,
-                            "`await` used in a non-async function",
-                        ))
-                        .with_help("make the enclosing function `async`"),
-                    );
-                    return Type::Void;
-                }
-                if Self::contains_error_type(&awaited_ty) || self.error_generation != errors_before
-                {
-                    return Self::error_type();
-                }
-                // `Task<T>`/`JoinHandle<T>` yield `T`; `Future<T>` yields `T`;
-                // `await task.result()` is the same wait, same
-                // frame and same waiter registration as `await task` — only the
-                // cancelled mapping differs, so `TaskResult<T>` yields
-                // `Result<T, Cancelled>`. `JoinHandle<T>` must be here because
-                // it is what E0812 tells users to migrate `join()` to.
-                match await_output_type(&awaited_ty) {
-                    Some(ty) => ty,
-                    None => {
-                        let other = awaited_ty;
-                        if let Some(replacement) = self.sync_fs_await_replacement(&a.expr) {
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0803,
-                                    "synchronous filesystem operations cannot be awaited",
-                                )
-                                .with_label(Label::primary(
-                                    a.expr.span(),
-                                    format!(
-                                        "this call returns `{}` immediately",
-                                        self.diagnostic_type_name(&other)
-                                    ),
-                                ))
-                                .with_help(format!(
-                                    "use `await {replacement}(...)` to run on the blocking pool, or remove `await` to keep the synchronous call"
-                                )),
-                            );
-                            return Type::Void;
-                        }
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0803,
-                                format!("cannot await value of type `{}`", self.diagnostic_type_name(&other)),
-                            )
-                            .with_label(Label::primary(a.expr.span(), "expected an awaitable"))
-                            .with_help(
-                                "await only `Task<T>` values returned by async functions or `Future<T>` runtime APIs",
-                            ),
-                        );
-                        Type::Void
-                    }
-                }
-            }
+            Expr::Await(a) => self.check_await_expr(a),
             Expr::Select(s) => {
                 self.record_direct_lock_effect(s.span, "select", LockEffectKind::Suspend);
                 self.check_select(s);
                 Type::Void
             }
-            Expr::Print(arg, newline, _, _) => {
-                let arg_ty = self.check_expr(arg);
-                // Printable: i64/f64/bool/String and Never (a panicking
-                // argument never reaches the print). Option values require
-                // explicit matching/unwrapping. Anything else used to compile
-                // and silently print NOTHING.
-                if !matches!(
-                    &arg_ty,
-                    Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never
-                ) && !Self::contains_error_type(&arg_ty)
-                {
-                    let fn_name = if *newline { "println" } else { "print" };
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E1402,
-                            format!(
-                                "cannot {fn_name} a value of type `{}`",
-                                self.diagnostic_type_name(&arg_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(
-                            arg.span(),
-                            "printable types are i64, f64, bool, and String",
-                        ))
-                        .with_help(
-                            "convert the value first, e.g. with `match`, `.toString()`, or `format`",
-                        ),
-                    );
-                }
-                Type::Void
-            }
-            Expr::Ternary(t) => {
-                let errors_before = self.error_generation;
-                let cond_ty = self.check_expr(&t.condition);
-                if cond_ty != Type::Bool
-                    && self.error_generation == errors_before
-                    && !Self::contains_error_type(&cond_ty)
-                {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0901,
-                            format!(
-                                "if-expression condition must be `bool`, found `{}`",
-                                self.diagnostic_type_name(&cond_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(
-                            t.condition.span(),
-                            format!(
-                                "expected `bool`, found `{}`",
-                                self.diagnostic_type_name(&cond_ty)
-                            ),
-                        )),
-                    );
-                }
-                let then_ty = self.check_branch_value(&t.then_expr);
-                let else_ty = self.check_branch_value(&t.else_expr);
-                if let Some(unified_ty) = self.unify_ternary_types(&then_ty, &else_ty) {
-                    self.resolve_generic_values([&t.then_expr, &t.else_expr], &unified_ty);
-                    self.validate_type(&unified_ty, t.span);
-                    unified_ty
-                } else {
-                    let help = self.common_supertype_help(&then_ty, &else_ty);
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0902,
-                            format!(
-                                "ternary branches have incompatible types: `{}` and `{}`",
-                                self.diagnostic_type_name(&then_ty),
-                                self.diagnostic_type_name(&else_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(
-                            t.else_expr.span(),
-                            format!(
-                                "expected `{}`, found `{}`",
-                                self.diagnostic_type_name(&then_ty),
-                                self.diagnostic_type_name(&else_ty)
-                            ),
-                        ))
-                        .with_label(Label::secondary(
-                            t.then_expr.span(),
-                            format!(
-                                "this branch has type `{}`",
-                                self.diagnostic_type_name(&then_ty)
-                            ),
-                        ))
-                        .with_help(help),
-                    );
-                    Type::Void
-                }
-            }
+            Expr::Print(arg, newline, _, _) => self.check_print_expr(arg, newline),
+            Expr::Ternary(t) => self.check_ternary_expr(t),
             Expr::Range(r) => self.check_range(r),
             Expr::Lambda(l) => self.check_lambda(l),
             Expr::Match(m) => self.check_match_expr(m),
             Expr::TryPropagate(inner, span, _) => self.check_try_propagate(inner, *span),
             Expr::ArrayLiteral(elements, _span, _) => self.check_array_literal(elements),
             Expr::Index(arr, index, span, _) => self.check_index(arr, index, *span),
+        }
+    }
+
+    fn check_variable_value(&mut self, expr: &Expr, name: &str, span: &Span) -> Type {
+        if name == "this" {
+            self.push_legacy_this_error(*span);
+            return Type::Void;
+        }
+        // Local variable?
+        if let Some(info) = self.symbols.lookup_var(name) {
+            if let Some((uses, _)) = self.local.inferred_maps.get_mut(&info.declaration_span) {
+                uses.push(expr.id());
+                self.local.pending_map_uses.insert(expr.id());
+            }
+            return info.ty.clone();
+        }
+        // Named function used as a value: `apply(10, double)` where `double: fn(...)`
+        if let Some(info) = self.symbols.lookup_func(name) {
+            // A module-level `const` is a value of its declared type,
+            // inlined by lowering.
+            if info.constant.is_some() {
+                return info.return_type.clone();
+            }
+            let params = info.params.clone();
+            let ret = info.return_type.clone();
+            // An async function has no plain entry point (a call
+            // creates its Task), and a builtin is lowered inline at
+            // each call site, so neither has an address to take. Builtins are the functions without a
+            //
+            // source declaration; a few are defined as real functions.
+            let is_async = info.is_async;
+            let not_addressable = if is_async {
+                Some("an async function")
+            } else if info.declaration_span == Span::dummy()
+                && !crate::semantic::intrinsics::ADDRESSABLE_BUILTINS.contains(&name)
+            {
+                Some("a builtin function")
+            } else {
+                None
+            };
+            if let Some(kind) = not_addressable {
+                let args = (0..params.len())
+                    .map(|i| format!("a{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let typed = params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ty)| format!("a{i}: {}", self.diagnostic_type_name(ty)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E1012,
+                        format!("`{name}` is {kind} and cannot be used as a function value"),
+                    )
+                    .with_label(Label::primary(*span, "named here as a value"))
+                    .with_help(format!(
+                        "wrap the call in a lambda instead: `|{typed}| {name}({args})`"
+                    )),
+                );
+                // The type the call would have, so uses of the
+                // value do not report follow-on errors.
+                let ret = if is_async {
+                    Type::Generic("Task".into(), vec![ret])
+                } else {
+                    ret
+                };
+                return Type::Fn(params, Box::new(ret));
+            }
+            let arity = params.len();
+            let ty = Type::Fn(params, Box::new(ret));
+            self.record_function_value(
+                Some(FunctionId::free_from_source_name(name)),
+                arity,
+                *span,
+                &ty,
+            );
+            return ty;
+        }
+        // Give a specialized error for receiver keywords used outside instance methods.
+        if name == "self" {
+            let diag = if self.local.in_static_method {
+                let where_ = self
+                    .local
+                    .current_class
+                    .as_deref()
+                    .map(|c| format!(" `{}`", c))
+                    .unwrap_or_default();
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0831,
+                    format!("`self` is not available in static method{}", where_),
+                )
+                .with_label(Label::primary(*span, "`self` in a static method"))
+                .with_help("static methods have no receiver; use an instance method instead")
+            } else if self.local.in_static_initializer {
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0837,
+                    "`self` is not available in a static property initializer",
+                )
+                .with_label(Label::primary(*span, "`self` in static initializer"))
+                .with_help("static initializers run before any instance exists")
+            } else {
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0550,
+                    "`self` can only be used inside an instance method",
+                )
+                .with_label(Label::primary(*span, "`self` used outside instance method"))
+                .with_help("declare the method without `static` to make it an instance method")
+            };
+            self.push(diag);
+            return Type::Void;
+        }
+        if name == "super" {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0851,
+                    "`super` is not a value",
+                )
+                .with_label(Label::primary(*span, "`super` used as a value"))
+                .with_help(
+                    "call a base-class method with `super.method(...)`, or read fields through `self`",
+                ),
+            );
+            return Self::error_type();
+        }
+        if self.report_contextless_variant(name, *span) {
+            return Self::error_type();
+        }
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0350,
+                format!("cannot find variable `{}`", name),
+            )
+            .with_label(Label::primary(*span, "not found in this scope")),
+        );
+        // The error type suppresses cascades: a use of the missing name
+        // must not be judged as some guessed type.
+        Self::error_type()
+    }
+
+    fn check_quantifier(&mut self, c: &CallExpr) -> Type {
+        if c.args.len() != 3 || !c.type_args.is_empty() {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2631,
+                    "quantifiers require two i64 bounds and one predicate binder",
+                )
+                .with_label(Label::primary(c.span, "unsupported quantified expression")),
+            );
+            return Self::error_type();
+        }
+        self.reject_reference_args(&c.callee, &c.args);
+        for bound in &c.args[..2] {
+            if self.check_expr(&bound.expr) != Type::I64 {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E2631,
+                        "quantifier bounds must have type i64",
+                    )
+                    .with_label(Label::primary(bound.span, "invalid bound")),
+                );
+            }
+        }
+        let Expr::Lambda(predicate) = &c.args[2].expr else {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2631,
+                    "quantifier predicate must be an expression-bodied |index:i64| binder",
+                )
+                .with_label(Label::primary(c.args[2].span, "invalid predicate")),
+            );
+            return Self::error_type();
+        };
+        if predicate.params.len() != 1
+            || predicate.params[0]
+                .ty
+                .as_ref()
+                .is_some_and(|ty| *ty != Type::I64)
+            || predicate
+                .return_type
+                .as_ref()
+                .is_some_and(|ty| *ty != Type::Bool)
+        {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2631,
+                    "quantifier predicate requires one i64 binder and a bool result",
+                )
+                .with_label(Label::primary(
+                    predicate.span,
+                    "invalid predicate signature",
+                )),
+            );
+            return Self::error_type();
+        }
+        let LambdaBody::Expr(body) = &predicate.body else {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2631,
+                    "quantifier predicates must be expression-bodied",
+                )
+                .with_label(Label::primary(predicate.span, "unsupported predicate body")),
+            );
+            return Self::error_type();
+        };
+        self.symbols.push_scope();
+        self.define_var(
+            predicate.params[0].name.clone(),
+            VarInfo {
+                ty: Type::I64,
+                mutable: false,
+                is_param: false,
+                declaration_span: predicate.params[0].span,
+            },
+        );
+        let ty = self.check_expr(body);
+        self.symbols.pop_scope();
+        if ty != Type::Bool {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2631,
+                    "quantifier predicate must have type bool",
+                )
+                .with_label(Label::primary(body.span(), "invalid predicate result")),
+            );
+        }
+        Type::Bool
+    }
+
+    fn check_named_call(&mut self, c: &CallExpr) -> Type {
+        // Lexical value bindings win over module/free-function names.
+        // Looking up the free function first silently compiled
+        // `let f = |...| ...; f(...)` as a direct call when a top-level
+        // `fn f` also existed.
+        if let Some(var_info) = self.symbols.lookup_var(&c.callee).cloned() {
+            if !c.type_args.is_empty() {
+                self.generic_error(
+                    c.span,
+                    format!(
+                        "function value `{}` does not accept type arguments",
+                        c.callee
+                    ),
+                );
+            }
+            match &var_info.ty {
+                // Both callable types are called the same way in source; they differ only in what codegen
+                //
+                // has to load first.
+                Type::Fn(param_types, ret) | Type::Closure(param_types, ret) => {
+                    if param_types.len() != c.args.len() {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!(
+                                    "function value `{}` takes {} argument(s) but {} were supplied",
+                                    c.callee,
+                                    param_types.len(),
+                                    c.args.len()
+                                ),
+                            )
+                            .with_label(Label::primary(c.span, "wrong number of arguments")),
+                        );
+                    }
+                    self.check_value_call_args(param_types, &c.args);
+                    return ret.as_ref().clone();
+                }
+                ty => {
+                    for arg in &c.args {
+                        self.check_expr(&arg.expr);
+                    }
+                    if Self::contains_error_type(ty) {
+                        return Self::error_type();
+                    }
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "cannot call value `{}` of type `{}`",
+                                c.callee,
+                                self.diagnostic_type_name(ty)
+                            ),
+                        )
+                        .with_label(Label::primary(c.span, "this binding is not a function")),
+                    );
+                    return Type::Void;
+                }
+            }
+        }
+
+        if let Some(ty) = self.check_generic_call(c, None) {
+            return ty;
+        }
+        if !c.type_args.is_empty() {
+            self.generic_error(
+                c.span,
+                format!("function `{}` does not accept type arguments", c.callee),
+            );
+        }
+        if c.callee == "format" {
+            return self.check_format_call(c);
+        }
+        // Variadic formatted panic: `panic(spec, args...)`.
+        // The one-argument form stays a plain-String builtin call.
+        if c.callee == "panic" && c.args.len() != 1 {
+            return self.check_panic_interpolation(c);
+        }
+
+        // Direct call to a named function.
+        if let Some(info) = self.symbols.lookup_func(&c.callee).cloned() {
+            if info.constant.is_some() {
+                return self.reject_constant_call(&c.callee, &info, &c.args, c.span);
+            }
+            if info.params.len() != c.args.len() {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "function `{}` takes {} argument(s) but {} were supplied",
+                            c.callee,
+                            info.params.len(),
+                            c.args.len()
+                        ),
+                    )
+                    .with_label(Label::primary(c.span, "wrong number of arguments")),
+                );
+            }
+            if info.foreign {
+                self.check_foreign_call(c.span, info.is_async);
+            }
+            self.check_call_args_against_param_infos(&info.param_infos, &c.args);
+            self.check_async_call_captures(&info.param_infos, &c.args, info.is_async);
+            if let Some(operation) = self.imported_blocking_std_functions.get(&c.callee).copied() {
+                self.record_direct_lock_effect(c.span, operation, LockEffectKind::Block);
+            }
+            self.record_lock_effect_call(FunctionId::free_from_source_name(&c.callee), c.span);
+            return function_call_return_type(&info);
+        }
+
+        // Prelude constructors can infer their payload without an outer
+        // annotation, just like the qualified Result::Ok/Err forms.
+        let inferred_enum = match c.callee.as_str() {
+            "Ok" | "Err" => Some(B::Result.source_name()),
+            _ => None,
+        };
+        if let Some(name) = inferred_enum
+            && self.prelude_variant_name_is_unshadowed(&c.callee)
+            && self
+                .symbols
+                .lookup_enum(name)
+                .is_some_and(|info| info.name == name)
+        {
+            let ty =
+                self.resolve_static_call(name, &[], &c.callee, &c.args, (c.span, c.span), None);
+            self.enum_variant_resolutions.insert(c.id, name.to_string());
+            return ty;
+        }
+
+        if self.report_contextless_variant(&c.callee, c.span) {
+            for arg in &c.args {
+                self.check_expr(&arg.expr);
+            }
+            return Self::error_type();
+        }
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0350,
+                format!("cannot find function `{}`", c.callee),
+            )
+            .with_label(Label::primary(c.span, "not found in this scope")),
+        );
+        Type::Void
+    }
+
+    fn check_await_expr(&mut self, a: &AwaitExpr) -> Type {
+        self.record_direct_lock_effect(a.span, "await", LockEffectKind::Suspend);
+        let errors_before = self.error_generation;
+        let awaited_ty = self.check_expr(&a.expr);
+        if !self.local.current_async_context {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0801,
+                    "`await` can only be used inside an async function",
+                )
+                .with_label(Label::primary(
+                    a.span,
+                    "`await` used in a non-async function",
+                ))
+                .with_help("make the enclosing function `async`"),
+            );
+            return Type::Void;
+        }
+        if Self::contains_error_type(&awaited_ty) || self.error_generation != errors_before {
+            return Self::error_type();
+        }
+        // `Task<T>`/`JoinHandle<T>` yield `T`; `Future<T>` yields `T`;
+        // `await task.result()` is the same wait, same
+        // frame and same waiter registration as `await task` — only the
+        // cancelled mapping differs, so `TaskResult<T>` yields
+        // `Result<T, Cancelled>`. `JoinHandle<T>` must be here because
+        // it is what E0812 tells users to migrate `join()` to.
+        match await_output_type(&awaited_ty) {
+            Some(ty) => ty,
+            None => {
+                let other = awaited_ty;
+                if let Some(replacement) = self.sync_fs_await_replacement(&a.expr) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0803,
+                            "synchronous filesystem operations cannot be awaited",
+                        )
+                        .with_label(Label::primary(
+                            a.expr.span(),
+                            format!(
+                                "this call returns `{}` immediately",
+                                self.diagnostic_type_name(&other)
+                            ),
+                        ))
+                        .with_help(format!(
+                            "use `await {replacement}(...)` to run on the blocking pool, or remove `await` to keep the synchronous call"
+                        )),
+                    );
+                    return Type::Void;
+                }
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0803,
+                        format!("cannot await value of type `{}`", self.diagnostic_type_name(&other)),
+                    )
+                    .with_label(Label::primary(a.expr.span(), "expected an awaitable"))
+                    .with_help(
+                        "await only `Task<T>` values returned by async functions or `Future<T>` runtime APIs",
+                    ),
+                );
+                Type::Void
+            }
+        }
+    }
+
+    fn check_print_expr(&mut self, arg: &Expr, newline: &bool) -> Type {
+        let arg_ty = self.check_expr(arg);
+        // Printable: i64/f64/bool/String and Never (a panicking
+        // argument never reaches the print). Option values require
+        // explicit matching/unwrapping. Anything else used to compile
+        // and silently print NOTHING.
+        if !matches!(
+            &arg_ty,
+            Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never
+        ) && !Self::contains_error_type(&arg_ty)
+        {
+            let fn_name = if *newline { "println" } else { "print" };
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E1402,
+                    format!(
+                        "cannot {fn_name} a value of type `{}`",
+                        self.diagnostic_type_name(&arg_ty)
+                    ),
+                )
+                .with_label(Label::primary(
+                    arg.span(),
+                    "printable types are i64, f64, bool, and String",
+                ))
+                .with_help(
+                    "convert the value first, e.g. with `match`, `.toString()`, or `format`",
+                ),
+            );
+        }
+        Type::Void
+    }
+
+    fn check_ternary_expr(&mut self, t: &TernaryExpr) -> Type {
+        let errors_before = self.error_generation;
+        let cond_ty = self.check_expr(&t.condition);
+        if cond_ty != Type::Bool
+            && self.error_generation == errors_before
+            && !Self::contains_error_type(&cond_ty)
+        {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0901,
+                    format!(
+                        "if-expression condition must be `bool`, found `{}`",
+                        self.diagnostic_type_name(&cond_ty)
+                    ),
+                )
+                .with_label(Label::primary(
+                    t.condition.span(),
+                    format!(
+                        "expected `bool`, found `{}`",
+                        self.diagnostic_type_name(&cond_ty)
+                    ),
+                )),
+            );
+        }
+        let then_ty = self.check_branch_value(&t.then_expr);
+        let else_ty = self.check_branch_value(&t.else_expr);
+        if let Some(unified_ty) = self.unify_ternary_types(&then_ty, &else_ty) {
+            self.resolve_generic_values([&t.then_expr, &t.else_expr], &unified_ty);
+            self.validate_type(&unified_ty, t.span);
+            unified_ty
+        } else {
+            let help = self.common_supertype_help(&then_ty, &else_ty);
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0902,
+                    format!(
+                        "ternary branches have incompatible types: `{}` and `{}`",
+                        self.diagnostic_type_name(&then_ty),
+                        self.diagnostic_type_name(&else_ty)
+                    ),
+                )
+                .with_label(Label::primary(
+                    t.else_expr.span(),
+                    format!(
+                        "expected `{}`, found `{}`",
+                        self.diagnostic_type_name(&then_ty),
+                        self.diagnostic_type_name(&else_ty)
+                    ),
+                ))
+                .with_label(Label::secondary(
+                    t.then_expr.span(),
+                    format!(
+                        "this branch has type `{}`",
+                        self.diagnostic_type_name(&then_ty)
+                    ),
+                ))
+                .with_help(help),
+            );
+            Type::Void
         }
     }
 
