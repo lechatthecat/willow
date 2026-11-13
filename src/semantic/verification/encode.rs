@@ -50,6 +50,17 @@ struct State {
     result: Value,
     returned: Value,
 }
+/// Shape of one verified loop. `while` loops have no counter; `for` loops
+/// name their counter as `step`, and array iteration also binds `element`.
+struct LoopShape<'a> {
+    cond: &'a Expr,
+    invariants: &'a [Expr],
+    variant: Option<&'a Expr>,
+    body: &'a Block,
+    span: Span,
+    step: Option<&'a str>,
+    element: Option<(&'a str, &'a Value)>,
+}
 struct Encoder<'a> {
     data: &'a DataTypes,
     functions: &'a [&'a FunctionDecl],
@@ -522,15 +533,17 @@ impl Encoder<'_> {
                     )?;
                 }
                 Stmt::While(s) => self.loop_body(
-                    &s.cond,
-                    &s.invariants,
-                    s.variant.as_ref(),
-                    &s.body,
-                    s.span,
+                    LoopShape {
+                        cond: &s.cond,
+                        invariants: &s.invariants,
+                        variant: s.variant.as_ref(),
+                        body: &s.body,
+                        span: s.span,
+                        step: None,
+                        element: None,
+                    },
                     state,
                     depth + 1,
-                    None,
-                    None,
                 )?,
                 Stmt::For(s) => self.for_loop(s, state, depth + 1)?,
                 Stmt::Break(_) | Stmt::Continue(_) => {
@@ -623,19 +636,21 @@ impl Encoder<'_> {
         Ok(result)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn loop_body(
         &mut self,
-        cond: &Expr,
-        invariants: &[Expr],
-        variant: Option<&Expr>,
-        body_block: &Block,
-        span: Span,
+        shape: LoopShape<'_>,
         state: &mut State,
         depth: usize,
-        step: Option<&str>,
-        element: Option<(&str, &Value)>,
     ) -> Result<(), String> {
+        let LoopShape {
+            cond,
+            invariants,
+            variant,
+            body: body_block,
+            span,
+            step,
+            element,
+        } = shape;
         if !self.verified {
             return Err("a helper containing loops must itself be @verified".into());
         }
@@ -819,15 +834,17 @@ impl Encoder<'_> {
             span: s.span,
         }));
         self.loop_body(
-            &cond,
-            &s.invariants,
-            s.variant.as_ref(),
-            &s.body,
-            s.span,
+            LoopShape {
+                cond: &cond,
+                invariants: &s.invariants,
+                variant: s.variant.as_ref(),
+                body: &s.body,
+                span: s.span,
+                step: Some(&counter),
+                element,
+            },
             state,
             depth,
-            Some(&counter),
-            element,
         )?;
         state.env.remove(&limit);
         if let Some(saved) = saved {
