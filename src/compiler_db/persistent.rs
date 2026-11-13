@@ -173,7 +173,15 @@ fn load_admitted(
         let current = if input.file == FileId::ENTRY {
             std::borrow::Cow::Borrowed(source)
         } else {
-            std::borrow::Cow::Owned(super::captured::FileInput::read(input.path.clone())?.source)
+            match super::captured::FileInput::read(input.path.clone()) {
+                Ok(file) => std::borrow::Cow::Owned(file.source),
+                // A deleted module keeps none of its owners; reuse density
+                // (and the dependency graph after restore) accounts for it.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::borrow::Cow::Borrowed("")
+                }
+                Err(error) => return Err(error.into()),
+            }
         };
         work.current_source_bytes += current.len();
         let matched = input

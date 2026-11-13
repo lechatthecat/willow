@@ -4,6 +4,8 @@ Notable user-facing changes to the Willow compiler, runtime, and toolchain.
 
 ## Unreleased
 
+## 0.1.11 - 2026-11-12
+
 ### Breaking
 
 - **Constructors can no longer observe unassigned fields.** Reading

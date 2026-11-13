@@ -780,7 +780,7 @@ mod recursive_schema_tests {
             ("time", 1),
             ("env", 4),
             ("fs", 9),
-            ("net", 10),
+            ("net", 12),
             ("parallel", 1),
         ] {
             assert_eq!(

@@ -5596,9 +5596,9 @@ fn lock_check_47_effect_free_helper_is_accepted() {
 fn lock_check_48_helper_sync_fs_call_is_rejected_transitively() {
     assert_lock_error_count(
         "import std::fs; \
-             fn exists(path: String) -> bool { return fs::exists(path); } \
+             fn file_present(path: String) -> bool { return fs::exists(path); } \
              async fn main() { let m = Mutex::new(0); \
-             lock m as value { let present = exists(\"/tmp/willow-lock-effect\"); } }",
+             lock m as value { let present = file_present(\"/tmp/willow-lock-effect\"); } }",
         ErrorCode::E2604,
         1,
     );

@@ -87,10 +87,17 @@ fn async_gc_reference_importer_dispatch_diagnostics() {
                 &[("api.wi", &api), ("main.wi", &main)],
                 "main.wi",
             );
+            // A by-value non-Sync argument is a task loan: it needs a
+            // statically known async target, which dynamic dispatch lacks.
+            let expected = if mode.is_empty() {
+                "non-Sync task loans require a statically known async method"
+            } else {
+                "to an async call"
+            };
             assert!(
                 out.contains("E2402")
                     && out.contains("not `Sync`")
-                    && out.contains("to an async call")
+                    && out.contains(expected)
                     && out.contains("api.wi"),
                 "interface={interface} mode={mode}: {out}"
             );

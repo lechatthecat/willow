@@ -5,6 +5,28 @@ use super::*;
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         ("example/abi_handshake.wi", "42\n"),
+        (
+            "example/builtin_method_contracts.wi",
+            "true\ntrue\n4\n9\n5\n3\n6\ntrue\ntrue\n16\nbad!\n3\n5\ntrue\n1\n5\n2\n2\n10\ntrue\n15\n6\n11\ntrue\n7\ntrue\n7\ntrue\n",
+        ),
+        ("example/enum_array_payload.wi", "0\n1\n0\n0\n0\n0\n0\n"),
+        ("example/io_contracts.wi", "value=42\n"),
+        (
+            "example/json.wi",
+            "Willow\n{\"name\":\"Willow\",\"count\":18446744073709551615,\"tags\":[true,null]}\n3\n",
+        ),
+        ("example/owned_class_task_loans.wi", "11\n13\n23\n14\n"),
+        ("example/owned_task_loans.wi", "11\n13\n23\n1\n"),
+        ("example/ownership_transfer.wi", "42\n7\n"),
+        ("example/parallel_allocation_scaling.wi", "true\n"),
+        (
+            "example/permanent_wait_escapes.wi",
+            "42\ntrue\ntimeout\ndefault\ntask timeout\n",
+        ),
+        (
+            "example/verified_data.wi",
+            "4\n7\n0\n3\n3\ntrue\ntrue\nfalse\ntrue\n",
+        ),
         ("example/contextual_open.wi", "5\n8\n1\n3\n3\n3\n3\n3\n"),
         (
             "example/array_utilities.wi",
@@ -1351,6 +1373,22 @@ fn runnable_rust_project_example_cases() -> &'static [(&'static str, &'static st
         ),
         ("example/rust_lock", "example/rust_lock/src/main.wi", "42\n"),
         (
+            "example/rust_async_pull",
+            "example/rust_async_pull/src/main.wi",
+            "handled request-0\nhandled request-1\nhandled request-2\n",
+        ),
+        (
+            "example/rust_record_bridge",
+            "example/rust_record_bridge/src/main.wi",
+            // 22 round-trip checks, as in widened_bridge_values_roundtrip.
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+        ),
+        (
+            "example/rust_task_bridge",
+            "example/rust_task_bridge/src/main.wi",
+            "true\nfalse\n",
+        ),
+        (
             "example/rust_opaque_bridge",
             "example/rust_opaque_bridge/src/main.wi",
             "true\nfalse\n",
@@ -1380,8 +1418,23 @@ fn run_rust_project_examples() {
             "willow_rust_example_{}",
             unique_test_id()
         )));
-        let project_copy = copy.join("project");
-        copy_dir(Path::new(project), &project_copy);
+        let project_dir = Path::new(project);
+        let project_copy = copy.join(project_dir.file_name().unwrap());
+        copy_dir(project_dir, &project_copy);
+        // Relative `path = "..."` Rust dependencies (for example a sibling
+        // example's native crate) keep the same layout beside the copy.
+        let manifest = fs::read_to_string(project_dir.join("project.toml")).unwrap();
+        for dependency in manifest
+            .split("path = \"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .filter(|path| path.starts_with(".."))
+        {
+            copy_dir(
+                &project_dir.join(dependency),
+                &project_copy.join(dependency),
+            );
+        }
         // Capture diagnostics: missing cargo/rustc and unavailable registry
         // access must fail explicitly, never silently skip the example.
         let original_home = std::env::var_os("HOME")

@@ -650,7 +650,9 @@ fn prepare_bridge(
     }
     // Compute once for all declarations. Source and manifest changes require
     // review even when Cargo's resolved package versions have not changed.
-    let bridge_hash = hash_file(&bridge)?;
+    // Line endings carry no Rust meaning and differ between checkouts (CRLF on
+    // Windows), so a reviewed fingerprint stays portable across platforms.
+    let bridge_hash = hash_source_file(&bridge)?;
     let review = hash(&serde_json::to_vec(&(
         &lock_hash,
         &bridge_hash,
@@ -947,6 +949,20 @@ fn canonical_output_path(path: &Path) -> Result<PathBuf> {
         resolved.push(component);
     }
     Ok(resolved)
+}
+
+fn hash_source_file(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path)?;
+    let mut digest = Sha256::new();
+    let mut rest = bytes.as_slice();
+    // Feed each CRLF as LF without allocating a normalized copy.
+    while let Some(at) = rest.windows(2).position(|pair| pair == b"\r\n") {
+        digest.update(&rest[..at]);
+        digest.update(b"\n");
+        rest = &rest[at + 2..];
+    }
+    digest.update(rest);
+    Ok(format!("{:x}", crate::hex::Hex(&digest.finalize())))
 }
 
 fn hash_file(path: &Path) -> Result<String> {

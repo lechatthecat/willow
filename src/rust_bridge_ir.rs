@@ -288,9 +288,7 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
         source.push_str(include_str!("rust_bridge_ir/support.rs"));
     }
     if symbols.iter().any(|s| s.is_async) {
-        source.push_str(include_str!(
-            "../crates/willow_runtime/src/rust_bridge_abi/futures.rs"
-        ));
+        source.push_str(include_str!("rust_bridge_ir/futures.rs"));
     }
     aggregate::record_structs(&mut source, symbols);
     for symbol in symbols {

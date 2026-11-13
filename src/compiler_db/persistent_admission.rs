@@ -11,7 +11,9 @@ pub(crate) struct SourceAdmission {
     source: [u8; 32],
     declarations: [u8; 32],
     imports: [u8; 32],
-    templates: bool,
+    /// Generic owners. Editing one (or a member nested under it) may
+    /// invalidate many instantiations despite identical signatures.
+    template_owners: Vec<String>,
     owners: Vec<(String, [u8; 32], usize)>,
 }
 
@@ -54,7 +56,14 @@ impl SyntaxQueries {
                     source: hash(source.text.as_bytes()),
                     declarations: hash(&parsed.declarations.bytes),
                     imports: hash(&parsed.imports.bytes),
-                    templates: templates(&parsed.declarations.decode::<Value>()?),
+                    template_owners: parsed
+                        .owners
+                        .iter()
+                        .map(|(owner, (signature, _))| {
+                            Ok(templates(&signature.decode::<Value>()?).then(|| owner.clone()))
+                        })
+                        .filter_map(Result::transpose)
+                        .collect::<Result<_>>()?,
                     owners: parsed
                         .owners
                         .iter()
@@ -107,7 +116,9 @@ impl SourceAdmission {
             .disk_admission()?
             .pop()
             .ok_or_else(|| anyhow::anyhow!("missing current admission"))?;
-        if self.declarations != current.declarations || self.imports != current.imports {
+        // Import edits are revalidated through the restored dependency graph;
+        // like body edits they are admitted when owner reuse stays dense.
+        if self.declarations != current.declarations {
             return Ok(None);
         }
         let current: HashMap<_, _> = current
@@ -120,17 +131,27 @@ impl SourceAdmission {
         // malformed metadata cannot overflow the density comparison.
         let mut matched_bytes = 0_u128;
         let mut bytes = 0_u128;
+        let templates: std::collections::HashSet<&str> =
+            self.template_owners.iter().map(String::as_str).collect();
+        // A member owner is named `<parent>/<field><kind>:<name>`, so its
+        // generic ancestors are the `/`-delimited prefixes of its name.
+        let generic = |name: &str| {
+            templates.contains(name)
+                || name
+                    .match_indices('/')
+                    .any(|(end, _)| templates.contains(&name[..end]))
+        };
         for (name, fingerprint, weight) in &self.owners {
             bytes += *weight as u128;
             if current.get(name) == Some(fingerprint) {
                 matched += 1;
                 matched_bytes += *weight as u128;
+            } else if generic(name) {
+                // Template edits may invalidate many instantiations despite
+                // identical signatures, so a source-owner density test must
+                // not admit them. Edits outside templates are still measured.
+                return Ok(None);
             }
-        }
-        // Template edits may invalidate many instantiations despite identical
-        // signatures. They must not be admitted by a source-owner density test.
-        if self.templates && matched != self.owners.len() {
-            return Ok(None);
         }
         Ok(Some(ReuseDensity {
             owners: self.owners.len(),

@@ -1,5 +1,5 @@
 extern rust {
-    nonblocking("7781c20f601fc9762ee316a1d6c845ba67a8e5166ff763613661c62be5cf67ab") fn is_identifier(text:String)->bool;
+    nonblocking("9444fb4ae2af2173a876aecb492ff9daf29306ca50522fd595daeff668e13b8c") fn is_identifier(text:String)->bool;
 }
 async fn validate(text:String)->bool { return is_identifier(text); }
 async fn main() {

@@ -114,7 +114,7 @@ class Box {
 fn main() {
     let refill_before = gc_tlab_refills();
     let mut sum = 0;
-    for i in 0..1400 {
+    for i in 0..5000 {
         let b = new Box(i);
         sum = sum + b.value;
     }
@@ -123,7 +123,9 @@ fn main() {
     println(gc_tlab_fast_allocations() > 0);
 }
 "#;
-    assert_gc_allocation_modes(src, "979300\ntrue\ntrue\n", "979300\nfalse\nfalse\n");
+    // 5000 small objects span well over two 64 KiB TLAB chunks whatever the
+    // exact object layout, so at least two refills must happen.
+    assert_gc_allocation_modes(src, "12497500\ntrue\ntrue\n", "12497500\nfalse\nfalse\n");
 }
 
 #[test]

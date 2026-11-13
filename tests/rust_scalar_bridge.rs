@@ -581,6 +581,10 @@ fn independent_project_archives_keep_same_named_rust_functions_distinct() {
         #[unsafe(no_mangle)]
         pub extern "C" fn willow_rust_bridge_enter(revision: u32) {{ assert_eq!(revision, {}); }}
         #[unsafe(no_mangle)]
+        pub extern "C" fn willow_rust_bridge_region_enter() -> u32 {{ 0 }}
+        #[unsafe(no_mangle)]
+        pub extern "C" fn willow_rust_bridge_region_exit(_: u32) {{}}
+        #[unsafe(no_mangle)]
         pub extern "C" fn willow_rust_bridge_panic() -> ! {{ std::process::abort() }}
         #[unsafe(no_mangle)]
         pub extern "C" fn willow_rust_bridge_handle_error(_: u32, _: u64) -> ! {{ std::process::abort() }}
@@ -1701,6 +1705,14 @@ fn nonblocking_regex_example_review_is_portable() {
         String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
         "true\nfalse\n"
     );
+    // A CRLF checkout (Windows) keeps the same reviewed fingerprint.
+    let bridge = fs::read_to_string(f.root.join("bridge.rs")).unwrap();
+    let crlf = bridge.replace("\r\n", "\n").replace('\n', "\r\n");
+    fs::write(f.root.join("bridge.rs"), crlf).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
+        "true\nfalse\n"
+    );
 }
 
 #[test]
@@ -2081,10 +2093,14 @@ extern rust {
     nonblocking("REVIEW") fn resource() -> Resource;
     nonblocking("REVIEW") fn drops() -> i64;
     nonblocking("REVIEW") fn created() -> bool;
+    nonblocking("REVIEW") fn mark();
 }
 async fn hold() {
     let resource = resource();
     defer Resource_close(resource);
+    // Signal only once the cleanup is registered: a cancel requested
+    // between `resource()` and the `defer` would rightly skip it.
+    mark();
     await sleep(100000);
 }
 async fn main() {
@@ -2101,7 +2117,8 @@ static CREATED: AtomicI64 = AtomicI64::new(0);
 static DROPS: AtomicI64 = AtomicI64::new(0);
 pub struct Resource;
 impl Drop for Resource { fn drop(&mut self) { DROPS.fetch_add(1, Ordering::SeqCst); } }
-pub fn resource() -> Box<Resource> { CREATED.store(1, Ordering::SeqCst); Box::new(Resource) }
+pub fn resource() -> Box<Resource> { Box::new(Resource) }
+pub fn mark() { CREATED.store(1, Ordering::SeqCst); }
 pub fn created() -> bool { CREATED.load(Ordering::SeqCst) != 0 }
 pub fn drops() -> i64 { DROPS.load(Ordering::SeqCst) }
 "#,

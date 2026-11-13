@@ -9,7 +9,6 @@ class Holder<T> {
 }
 
 fn wrap<T>(value: T) -> Holder<T> { return new Holder<T>(value); }
-fn guarded<T>(value: T) -> Mutex<T> { return Mutex::new(value); }
 
 // The return type is the context too.
 fn empty_index() -> RwLock<Map<String, Array<i64>>> {
@@ -29,11 +28,13 @@ async fn main() {
     let names: RwLock<FrozenMap<String, i64>> = RwLock::new(Map::new().freeze());
     lock read names as n { println(n.len()); }
 
-    // Through a generic function, alone and nested in a lock.
+    // Through a generic function, and a string-keyed lock.
     let boxed: Holder<Array<i64>> = wrap([]);
     boxed.value.push(1);
     println(boxed.value.len());
-    let counts: Mutex<Map<String, i64>> = guarded(Map::new());
+    // A call result is not a provably fresh value, so a lock constructor
+    // takes the collection directly (E2408 rejects `Mutex::new(wrap(...))`).
+    let counts: Mutex<Map<String, i64>> = Mutex::new(Map::new());
     lock counts as mut c { c.insert("a", 1); c.insert("b", 2); }
     lock counts as c { println(c.len()); }
 
