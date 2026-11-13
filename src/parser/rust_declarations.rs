@@ -93,13 +93,16 @@ impl Parser {
                 continue;
             }
             let effect_contracts = self.parse_effect_contracts()?;
-            if effect_contracts
+            if let Some(contract) = effect_contracts
                 .iter()
-                .any(|c| c.kind != EffectContractKind::NoIo)
+                .find(|c| c.kind != EffectContractKind::NoIo)
             {
-                return Err(self.err(
-                    ErrorCode::E0102,
-                    "extern effects accepts no_io; use nonblocking for waiting declarations",
+                // A misplaced modifier, like other declaration-position
+                // contract misuse: report it at the contract itself.
+                return Err(self.err_at(
+                    ErrorCode::E0105,
+                    "extern declarations accept only `@effects(no_io)`; use nonblocking for waiting declarations",
+                    contract.span,
                 ));
             }
             let nonblocking = if matches!(self.peek_kind(), TokenKind::Ident(word) if word == "nonblocking")

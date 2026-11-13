@@ -546,6 +546,7 @@ mod alloc_effects_tests {
         rt::willow_rust_bridge_array_get,
         rt::willow_rust_bridge_array_set,
         rt::willow_rust_bridge_enum,
+        rt::willow_rust_bridge_async_spawn,
         rt::willow_alloc,
         rt::willow_alloc_typed,
         rt::willow_gc_alloc_layout,

@@ -708,7 +708,8 @@ fn monotonic_clock_abi() {
     assert_schema("willow_time_now_ns", &[], Some(I64));
     assert_eq!(
         runtime_symbol("willow_time_now_ns").unwrap().effects,
-        willow_abi::RuntimeEffects::NONE
+        // Reading the clock observes the outside world, so it is I/O.
+        willow_abi::RuntimeEffects::MAY_IO
     );
 }
 

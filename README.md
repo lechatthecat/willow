@@ -115,8 +115,6 @@ cargo build --release
 ./target/release/willow --version
 ```
 
-**Release note:** v0.1.10, the latest prebuilt release, rejects all nested locks and has no group acquisition (`lock a as x, b as y`). Build from source to use the [lock rules below](#acquiring-multiple-locks).
-
 [`RELEASE_README.md`](RELEASE_README.md) covers installation, library layout, checksums and toolchain requirements.
 
 ## Rust interop

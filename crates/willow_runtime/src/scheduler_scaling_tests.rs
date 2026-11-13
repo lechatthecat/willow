@@ -1181,7 +1181,12 @@ fn queue_profile(
                 (workers * (per_worker / 2)) as u64
             );
         }
-        QueueProfile::Injection => assert_eq!(metrics.global_pushes, total as u64),
+        QueueProfile::Injection => {
+            // A spawn from a worker that owns its local queue is published to
+            // that queue's spawned inbox, not to the global injector.
+            assert_eq!(metrics.local_pushes, total as u64);
+            assert_eq!(metrics.global_pushes, 0);
+        }
         QueueProfile::SpawnSteal | QueueProfile::InboxSteal => {
             assert_eq!(metrics.local_pushes, total as u64);
             assert_eq!(metrics.steal_successes, total as u64);

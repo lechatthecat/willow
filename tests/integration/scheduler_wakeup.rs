@@ -323,8 +323,14 @@ fn main() {
 fn sched_wake_31_sync_recv_without_a_producer_still_reports_blocking() {
     let (out, ok) = compile_and_run_check_exit(
         r#"
+// A helper hides the fresh channel from the compile-time permanent-wait
+// check so this still exercises the runtime would-block panic.
+fn empty_channel() -> Channel<i64> {
+    return Channel<i64>::new();
+}
+
 fn main() {
-    let ch = Channel<i64>::new();
+    let ch = empty_channel();
     println(ch.recv());
 }
 "#,

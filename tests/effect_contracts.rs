@@ -558,7 +558,7 @@ fn effect_contract_polymorphic_generics_and_defaults() {
         ),
         (
             "extern rust { @effects(no_wait) fn foreign(); } @effects(no_wait) fn guard() { foreign(); } fn main() {}",
-            Some("E0102"),
+            Some("E0105"),
         ),
     ] {
         let fixture = Fixture::new(source);

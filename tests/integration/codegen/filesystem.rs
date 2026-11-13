@@ -211,11 +211,11 @@ fn fs_21_user_module_named_fs_wins() {
         &[
             (
                 "main.wi",
-                "import mine as fs;\nfn main() { println(fs::exists(\"/definitely/not/there\")); }\n",
+                "import mine as fs;\nfn main() { println(fs::temp_path(\"willow_t21\")); }\n",
             ),
             (
                 "mine.wi",
-                "module mine;\npub fn exists(p: String) -> bool { return true; }\n",
+                "module mine;\npub fn temp_path(p: String) -> bool { return true; }\n",
             ),
         ],
         "main.wi",

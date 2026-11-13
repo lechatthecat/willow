@@ -199,7 +199,7 @@ fn closure_effects_missing_candidates_remain_unknown() {
         "apply",
     );
     assert_eq!(result["status"], "unknown", "{result}");
-    assert_eq!(result["bounds"]["runtime"], 63);
+    assert_eq!(result["bounds"]["runtime"], 127);
 }
 
 #[test]
@@ -327,7 +327,7 @@ fn closure_effects_opaque_value_does_not_disappear_beside_known_candidate() {
     let source = "fn apply(f: fn(f64, f64) -> f64) -> f64 { return f(1.0, 2.0); } fn main() { apply(pow); apply(|a: f64, b: f64| a + b); }";
     let result = effects(snapshot(source, "opaque"), "apply");
     assert_eq!(result["status"], "unknown", "{result}");
-    assert_eq!(result["bounds"]["runtime"], 63);
+    assert_eq!(result["bounds"]["runtime"], 127);
 }
 
 #[test]
@@ -373,7 +373,7 @@ fn closure_effects_unresolved_virtual_call_is_not_hidden_by_known_lambda() {
     let source = "interface Run { fn run(self) -> i64; } fn apply(f: closure() -> i64, r: Run) -> i64 { return f() + r.run(); } fn main() { let k = 1; let f = || k; f(); }";
     let result = effects(snapshot(source, "unresolved-virtual"), "apply");
     assert_eq!(result["status"], "unknown", "{result}");
-    assert_eq!(result["bounds"]["runtime"], 63);
+    assert_eq!(result["bounds"]["runtime"], 127);
 }
 
 fn evidence_operation(result: &serde_json::Value, effect: u64) -> String {
