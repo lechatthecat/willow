@@ -89,8 +89,10 @@ impl NativeStack {
             stack.poll = poll;
             stack.cancel_entry = None;
             stack.frame = frame;
-            stack.cancelled = false;
-            stack.cancel_epoch = 0;
+            let (epoch, cancelled) =
+                crate::scheduler::current_cancel_snapshot().unwrap_or((0, false));
+            stack.cancelled = cancelled;
+            stack.cancel_epoch = epoch;
             stack.cleanup_depth = 0;
             stack.poll_countdown = 0;
             stack.poll_granted = 0;
@@ -142,6 +144,8 @@ impl NativeStack {
             let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
             (lower, lower + page)
         };
+        let (cancel_epoch, cancelled) =
+            crate::scheduler::current_cancel_snapshot().unwrap_or((0, false));
         Box::new(Self {
             context: crate::generated_context::Context::new(),
             worker: crate::scheduler::current_worker(),
@@ -157,8 +161,8 @@ impl NativeStack {
             frame,
             result: 0,
             suspended: false,
-            cancelled: false,
-            cancel_epoch: 0,
+            cancelled,
+            cancel_epoch,
             cleanup_depth: 0,
             poll_countdown: 0,
             poll_granted: 0,

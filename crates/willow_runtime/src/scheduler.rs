@@ -1073,6 +1073,8 @@ impl ShardedTaskTable {
     }
 
     fn lock_shard(&self, index: usize) -> std::sync::MutexGuard<'_, TaskShard> {
+        #[cfg(test)]
+        switch_lock_tests::record_mutex();
         self.shards[index]
             .0
             .lock()
@@ -1208,7 +1210,8 @@ impl ShardedTaskTable {
         after_transition: impl FnOnce(),
     ) -> Option<RuntimeTask> {
         let mut shard = self.lock_shard(self.shard_index(id));
-        let task = shard.get(&id)?;
+        let task = shard.get_mut(&id)?;
+        TaskExecution::publish(task);
         let before = task.state.lifecycle();
         let transitioned = task.state.finish_terminal();
         if transitioned {
@@ -1552,6 +1555,9 @@ impl RuntimeScheduler {
             }
             let has_cleanup =
                 outcome == ClaimOutcome::Cancel && task.cancel.is_some() && !task.frame.is_null();
+            if outcome == ClaimOutcome::Poll || (outcome == ClaimOutcome::Cancel && has_cleanup) {
+                TaskExecution::claim(task);
+            }
             (outcome, has_cleanup, task.panic_context())
         })?;
         match outcome {
@@ -1601,11 +1607,19 @@ impl RuntimeScheduler {
                     ),
                     all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
                 ))]
-                if task
-                    .native_stack
-                    .as_ref()
-                    .is_some_and(|stack| stack.is_suspended())
-                {
+                if CURRENT_EXECUTION.with(|slot| {
+                    let current = slot.borrow();
+                    if current.owner == Some(task.id) {
+                        current
+                            .stack
+                            .as_ref()
+                            .is_some_and(|stack| stack.is_suspended())
+                    } else {
+                        task.native_stack
+                            .as_ref()
+                            .is_some_and(|stack| stack.is_suspended())
+                    }
+                }) {
                     return None;
                 }
                 if task.state.lifecycle() != TaskLifecycle::Cancelling {
@@ -1854,10 +1868,14 @@ impl RuntimeScheduler {
                 }
                 task.yield_requested = false;
                 task.started = true;
-                matches!(
+                let claimed = matches!(
                     task.state.claim_for_poll(),
                     ClaimOutcome::Poll | ClaimOutcome::Cancel
-                )
+                );
+                if claimed {
+                    TaskExecution::claim(task);
+                }
+                claimed
             })
             .unwrap_or(false);
         if claimed {
@@ -1985,6 +2003,7 @@ impl RuntimeScheduler {
             self.set_running(id);
         }
         self.with_task_state(id, |task| {
+            TaskExecution::publish(task);
             let _ = task.state.park_after_poll();
         });
     }
@@ -2012,6 +2031,7 @@ impl RuntimeScheduler {
         let tasks = Arc::clone(&self.tasks);
         let run_queues = Arc::clone(&self.run_queues);
         tasks.with_mut(id, |task| {
+            TaskExecution::publish(task);
             let before = task.state.lifecycle();
             let outcome = {
                 task.yield_requested = false;
@@ -2041,6 +2061,7 @@ impl RuntimeScheduler {
         let tasks = Arc::clone(&self.tasks);
         let run_queues = Arc::clone(&self.run_queues);
         tasks.with_mut(id, |task| {
+            TaskExecution::publish(task);
             let before = task.state.lifecycle();
             let outcome = {
                 let yielded = task.yield_requested;
@@ -2490,6 +2511,7 @@ fn finish_global_poll_boundary(id: RuntimeTaskId, boundary: GlobalPollBoundary) 
     let tasks = global_task_table();
     let run_queues = global_run_queues();
     tasks.with_mut(id, |task| {
+        TaskExecution::publish(task);
         let before = task.state.lifecycle();
         let yielded = task.yield_requested;
         task.yield_requested = false;
@@ -2553,7 +2575,7 @@ fn claimed_task_work(task: &mut RuntimeTask) -> ClaimedTaskWork {
         suspended = stack.is_suspended();
         cleanup = stack.is_cleanup();
     }
-    ClaimedTaskWork {
+    let work = ClaimedTaskWork {
         poll: task
             .poll
             .map(|poll| (poll, task.frame, task.preempt_flag_ptr())),
@@ -2564,7 +2586,119 @@ fn claimed_task_work(task: &mut RuntimeTask) -> ClaimedTaskWork {
         },
         direct_poll: task.cooperative_poll && !cleanup,
         direct_cancel: task.cooperative_poll && !task.native_cancel_cleanup,
+    };
+    TaskExecution::claim(task);
+    work
+}
+
+/// Exclusive execution state moved out of the task shard while a worker owns
+/// the poll. No pointer into the movable task table and no TLS borrow survives
+/// a callback. A nested drive saves this entire context and restores it on exit.
+#[derive(Default)]
+struct TaskExecution {
+    owner: Option<RuntimeTaskId>,
+    cancel_epoch: u64,
+    cancelled: bool,
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    ))]
+    stack: Option<Box<crate::native_stack::NativeStack>>,
+}
+
+impl TaskExecution {
+    const fn new() -> Self {
+        Self {
+            owner: None,
+            cancel_epoch: 0,
+            cancelled: false,
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "macos",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+            ))]
+            stack: None,
+        }
     }
+
+    fn claim(task: &mut RuntimeTask) {
+        CURRENT_EXECUTION.with(|slot| {
+            let mut current = slot.borrow_mut();
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "macos",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+            ))]
+            {
+                assert!(
+                    current.stack.is_none(),
+                    "previous task still owns its stack"
+                );
+                current.stack = task.native_stack.take();
+            }
+            current.owner = Some(task.id);
+            // Observe the epoch before the state, so a later request always
+            // invalidates this snapshot before a helper trusts it.
+            current.cancel_epoch = crate::task_state::cancel_epoch();
+            let state = task.state.load();
+            current.cancelled =
+                state.cancel_requested() || state.lifecycle() == TaskLifecycle::Cancelling;
+        });
+    }
+
+    /// Called under the task shard, before publishing a lifecycle transition
+    /// that allows another worker to claim the task or retire its frame.
+    fn publish(task: &mut RuntimeTask) {
+        CURRENT_EXECUTION.with(|slot| {
+            let mut current = slot.borrow_mut();
+            if current.owner != Some(task.id) {
+                return;
+            }
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "macos",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+            ))]
+            {
+                assert!(task.native_stack.is_none(), "task stack has two owners");
+                task.native_stack = current.stack.take();
+            }
+            current.owner = None;
+        });
+    }
+}
+
+thread_local! {
+    static CURRENT_EXECUTION: RefCell<TaskExecution> = const { RefCell::new(TaskExecution::new()) };
 }
 
 thread_local! {
@@ -2584,6 +2718,16 @@ fn current_task_id() -> Option<RuntimeTaskId> {
     CURRENT_TASK.with(Cell::get)
 }
 
+/// Claim-time snapshot; callers compare the epoch before reusing it. Stack
+/// leases acquired repeatedly in one poll need no repeated task-table lookup.
+pub(crate) fn current_cancel_snapshot() -> Option<(u64, bool)> {
+    CURRENT_EXECUTION.with(|slot| {
+        let current = slot.borrow();
+        (current.owner.is_some() && current.owner == current_task_id())
+            .then_some((current.cancel_epoch, current.cancelled))
+    })
+}
+
 /// Every poll boundary drops the published fault location: release synchronous
 /// code publishes none, so a site left by the previous task (or by an async
 /// poll that returned to synchronous code) must not label its faults.
@@ -2591,8 +2735,22 @@ fn current_task_id() -> Option<RuntimeTaskId> {
 fn set_current_task(id: Option<RuntimeTaskId>) {
     crate::panic_context::willow_fault_site_clear();
     CURRENT_TASK.with(|current| current.set(id));
-    let context =
-        id.and_then(|task_id| global_task_table().with(task_id, RuntimeTask::panic_context));
+    let context = id.and_then(|task_id| {
+        global_task_table().with_mut(task_id, |task| {
+            if CURRENT_EXECUTION.with(|slot| slot.borrow().owner) != Some(task_id) {
+                TaskExecution::claim(task);
+            }
+            task.panic_context()
+        })
+    });
+    if id.is_none() {
+        CURRENT_EXECUTION.with(|slot| {
+            let previous = slot.replace(TaskExecution::new());
+            // Every runnable/terminal boundary publishes the stack first.
+            // Dropping a suspended stack here would violate worker ownership.
+            drop(previous);
+        });
+    }
     crate::panic_context::replace_current_context(context);
 }
 
@@ -3557,6 +3715,7 @@ pub extern "C" fn willow_select_idle_wait() {
 struct SchedulerDriveGuard {
     saved_depth: u32,
     saved_running: Option<RuntimeTaskId>,
+    saved_execution: TaskExecution,
     saved_panic_context: Option<Arc<crate::panic_context::PanicContext>>,
     shared_state: Option<Arc<ParallelRunState>>,
     paused_parallel_poll: bool,
@@ -3567,6 +3726,7 @@ impl SchedulerDriveGuard {
     fn new() -> Self {
         let saved_depth = SCHED_RUN_DEPTH.with(Cell::get);
         let saved_running = current_task_id();
+        let saved_execution = CURRENT_EXECUTION.with(|slot| slot.take());
         let saved_panic_context = crate::panic_context::current_context();
         let shared_state = CURRENT_RUN_STATE.with(|slot| slot.borrow().clone());
         let mutator = (saved_depth == 0).then(crate::gc::MutatorRegistration::new);
@@ -3579,6 +3739,7 @@ impl SchedulerDriveGuard {
         Self {
             saved_depth,
             saved_running,
+            saved_execution,
             saved_panic_context,
             shared_state,
             paused_parallel_poll,
@@ -3590,6 +3751,7 @@ impl SchedulerDriveGuard {
 impl Drop for SchedulerDriveGuard {
     fn drop(&mut self) {
         CURRENT_TASK.with(|current| current.set(self.saved_running));
+        CURRENT_EXECUTION.with(|slot| slot.replace(std::mem::take(&mut self.saved_execution)));
         crate::panic_context::replace_current_context(self.saved_panic_context.take());
         if let Some(id) = self.saved_running {
             // The outer task still owns its frame and lifecycle; only its TLS
@@ -4869,7 +5031,7 @@ fn scheduler_run_loop(
                     let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
                     crate::preempt::willow_preempt_end();
                     if stack.is_suspended() {
-                        global_task_table().with_mut(id, |task| task.native_stack = Some(stack));
+                        CURRENT_EXECUTION.with(|slot| slot.borrow_mut().stack = Some(stack));
                         let boundary = match result {
                             RUNTIME_POLL_PENDING => GlobalPollBoundary::Pending,
                             RUNTIME_POLL_BLOCKED_SYSCALL => GlobalPollBoundary::BlockedSyscall,
@@ -4995,14 +5157,13 @@ fn scheduler_run_loop(
                     false,
                 )
             } else {
-                let mut stack = global_task_table()
-                    .with_mut(id, |task| task.native_stack.take())
-                    .flatten()
+                let mut stack = CURRENT_EXECUTION
+                    .with(|slot| slot.borrow_mut().stack.take())
                     .unwrap_or_else(|| crate::native_stack::NativeStack::acquire(poll, frame));
                 let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
                 let cancelled = stack.is_cancelled();
                 if stack.is_suspended() {
-                    global_task_table().with_mut(id, |task| task.native_stack = Some(stack));
+                    CURRENT_EXECUTION.with(|slot| slot.borrow_mut().stack = Some(stack));
                 } else {
                     crate::native_stack::NativeStack::recycle(stack);
                 }
@@ -5239,9 +5400,12 @@ fn task_stack_enter(callback: RuntimePollFn, frame: *mut c_void) -> i32 {
     ))]
     {
         let id = current_task_id().expect("task stack entry outside a task");
-        let mut stack = global_task_table()
-            .with_mut(id, |task| task.native_stack.take())
-            .flatten()
+        let mut stack = CURRENT_EXECUTION
+            .with(|slot| {
+                let mut current = slot.borrow_mut();
+                assert_eq!(current.owner, Some(id), "task execution context missing");
+                current.stack.take()
+            })
             .unwrap_or_else(|| crate::native_stack::NativeStack::acquire(callback, frame));
         let panic_depth = stack.entry_panic_depth();
         let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
@@ -5249,7 +5413,7 @@ fn task_stack_enter(callback: RuntimePollFn, frame: *mut c_void) -> i32 {
         // an already-active outer panic is not a new helper failure.
         let new_panic = crate::panic_context::willow_panic_depth() > panic_depth;
         let pending = stack.is_suspended() || stack.is_cancelled();
-        global_task_table().with_mut(id, |task| task.native_stack = Some(stack));
+        CURRENT_EXECUTION.with(|slot| slot.borrow_mut().stack = Some(stack));
         if pending && !(result == RUNTIME_POLL_PANICKED && new_panic) {
             match result {
                 RUNTIME_POLL_PENDING | RUNTIME_POLL_BLOCKED_SYSCALL => result,
@@ -5294,19 +5458,19 @@ pub extern "C" fn willow_task_stack_leave() {
     ))]
     {
         let id = current_task_id().expect("task stack exit outside a task");
-        let stack = global_task_table()
-            .with_mut(id, |task| {
-                if task
-                    .native_stack
-                    .as_ref()
-                    .is_some_and(|stack| !stack.is_suspended())
-                {
-                    task.native_stack.take()
-                } else {
-                    None
-                }
-            })
-            .flatten();
+        let stack = CURRENT_EXECUTION.with(|slot| {
+            let mut current = slot.borrow_mut();
+            assert_eq!(current.owner, Some(id), "task execution context missing");
+            if current
+                .stack
+                .as_ref()
+                .is_some_and(|stack| !stack.is_suspended())
+            {
+                current.stack.take()
+            } else {
+                None
+            }
+        });
         if let Some(stack) = stack {
             crate::native_stack::NativeStack::recycle(stack);
         }
@@ -5405,3 +5569,7 @@ pub fn gc_metrics_v1() -> GcMetricsV1 {
         runnable: global_run_queues().len(),
     }
 }
+
+#[cfg(test)]
+#[path = "scheduler_switch_lock_tests.rs"]
+pub(crate) mod switch_lock_tests;
