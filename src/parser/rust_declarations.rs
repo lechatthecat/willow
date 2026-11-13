@@ -93,6 +93,17 @@ impl Parser {
                 continue;
             }
             let effect_contracts = self.parse_effect_contracts()?;
+            if effect_contracts.iter().any(|c| {
+                matches!(
+                    c.kind,
+                    EffectContractKind::Pure | EffectContractKind::Verified
+                )
+            }) {
+                return Err(self.err(
+                    ErrorCode::E0105,
+                    "`@pure` and `@verified` require a Willow function body",
+                ));
+            }
             if effect_contracts
                 .iter()
                 .any(|c| c.kind != EffectContractKind::NoIo)

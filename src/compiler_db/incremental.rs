@@ -1079,27 +1079,31 @@ impl SyntaxQueries {
                 .filter_map(FunctionId::owner_type)
                 .collect();
             let effects = &self.effect_functions;
-            let size = self.table.compact(|node| match node {
-                QueryNode::EffectCapabilities(unit, id) => {
-                    effects.get(unit).is_some_and(|ids| ids.contains(id))
-                }
-                QueryNode::ClassLayout(id) | QueryNode::GcLayout(id) => {
-                    classes.contains(id) || captured.contains(&InputNode::LayoutDeclaration(*id))
-                }
-                QueryNode::InterfaceLayout(id) => {
-                    interfaces.contains(id)
-                        || captured.contains(&InputNode::InterfaceDeclaration(*id))
-                }
-                QueryNode::TypedBody(id)
-                | QueryNode::NormalizedBody(id)
-                | QueryNode::DefiniteAssignment(id)
-                | QueryNode::AsyncBorrowReport(id)
-                | QueryNode::ResolvedReferences(id)
-                | QueryNode::DirectEffects(id)
-                | QueryNode::LirBody(id)
-                | QueryNode::AsyncFrameLayout(id) => bodies.contains_key(id),
-                _ => false,
-            });
+            let size = self.table.compact_rooted(
+                |node| match node {
+                    QueryNode::EffectCapabilities(unit, id) => {
+                        effects.get(unit).is_some_and(|ids| ids.contains(id))
+                    }
+                    QueryNode::ClassLayout(id) | QueryNode::GcLayout(id) => {
+                        classes.contains(id)
+                            || captured.contains(&InputNode::LayoutDeclaration(*id))
+                    }
+                    QueryNode::InterfaceLayout(id) => {
+                        interfaces.contains(id)
+                            || captured.contains(&InputNode::InterfaceDeclaration(*id))
+                    }
+                    QueryNode::TypedBody(id)
+                    | QueryNode::NormalizedBody(id)
+                    | QueryNode::DefiniteAssignment(id)
+                    | QueryNode::AsyncBorrowReport(id)
+                    | QueryNode::ResolvedReferences(id)
+                    | QueryNode::DirectEffects(id)
+                    | QueryNode::LirBody(id)
+                    | QueryNode::AsyncFrameLayout(id) => bodies.contains_key(id),
+                    _ => false,
+                },
+                |node| captured.contains(node),
+            );
             self.table.account_reclamation_indexes(index_work);
             size
         } else {

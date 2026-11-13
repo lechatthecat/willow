@@ -561,6 +561,49 @@ fn symbol_effects(name: &str) -> RuntimeEffects {
     willow_abi::runtime_symbol(name).map_or(RuntimeEffects::ALL, |s| s.effects())
 }
 
+/// Runtime entry points whose only managed allocation formats a language
+/// fault's message before raising it. The ABI row keeps `MAY_ALLOCATE` for GC
+/// and summary consumers; `no_alloc` excludes fault reporting, so contracts
+/// drop that bit. Keep in step with each symbol's success path.
+/// Map lookups stay conservative: key encoding may box at the call site.
+const FAULT_ONLY_ALLOCATION: [&str; 9] = [
+    rt::willow_array_len,
+    rt::willow_array_get,
+    rt::willow_array_set,
+    rt::willow_array_element_addr,
+    rt::willow_array_reference_owner,
+    rt::willow_i64_abs,
+    rt::willow_i64_clamp,
+    rt::willow_f64_clamp,
+    rt::willow_string_byte_at,
+];
+
+/// [`builtin_target_effects`]/[`builtin_static_effects`] as seen by effect
+/// contracts: allocation that happens only while reporting a fault is not a
+/// `no_alloc` violation. Every symbol an intrinsic may call must be
+/// fault-only for its allocation bit to be dropped.
+pub(crate) fn builtin_contract_effects(
+    target: &FunctionId,
+    module_aliases: &std::collections::HashMap<String, String>,
+) -> Option<RuntimeEffects> {
+    let effects = builtin_target_effects(target)
+        .or_else(|| builtin_static_effects(target, module_aliases))?;
+    let fault_only = if let Some(intrinsic) = Intrinsic::from_function_id(target) {
+        let symbols = intrinsic.runtime_symbols();
+        !symbols.is_empty() && symbols.iter().all(|s| FAULT_ONLY_ALLOCATION.contains(s))
+    } else {
+        // Unwrapping only allocates the panic payload on the failing branch.
+        target.owner().as_deref() == Some("$adt")
+            && target.namespace().is_none()
+            && matches!(target.name().as_ref(), "unwrap" | "unwrap_err" | "expect")
+    };
+    Some(if fault_only {
+        effects.difference(RuntimeEffects::MAY_ALLOCATE)
+    } else {
+        effects
+    })
+}
+
 /// The runtime constructor a builtin `Class::method(...)` static call lowers to
 /// (`emit_lir_static_call_values_inner`). The caller rules out user classes of
 /// the same name first: a declared static method always wins.

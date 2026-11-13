@@ -107,15 +107,15 @@ impl<W: Clone + Ord> EffectSummary<W> {
     /// with `effects`, if that effect has one.
     pub fn witness(&self, effects: RuntimeEffects) -> Option<&W> {
         let matching = self.effects.intersection(effects);
-        (0..RuntimeEffects::BIT_COUNT)
-            .filter(|bit| matching.contains(RuntimeEffects::from_bit(*bit)))
-            .find_map(|bit| self.witnesses.get(&bit))
+        propagated_bits()
+            .filter(|(_, effect)| matching.contains(*effect))
+            .find_map(|(bit, _)| self.witnesses.get(&bit))
     }
 
     pub(crate) fn remove_effect(&mut self, effect: RuntimeEffects) {
         self.effects = self.effects.difference(effect);
         self.witnesses
-            .retain(|&bit, _| !effect.intersects(RuntimeEffects::from_bit(bit)));
+            .retain(|&bit, _| !effect.intersects(effect_bit(bit)));
     }
     pub(crate) fn add_effect(&mut self, effect: RuntimeEffects, witness: Option<&W>) {
         self.add(effect, witness);
@@ -131,8 +131,8 @@ impl<W: Clone + Ord> EffectSummary<W> {
         let Some(witness) = witness else {
             return changed;
         };
-        for bit in 0..RuntimeEffects::BIT_COUNT {
-            if !effects.contains(RuntimeEffects::from_bit(bit)) {
+        for (bit, effect) in propagated_bits() {
+            if !effects.contains(effect) {
                 continue;
             }
             changed |= self.record_witness(bit, witness);
@@ -149,7 +149,7 @@ impl<W: Clone + Ord> EffectSummary<W> {
         let mut changed = !self.effects.contains(effects);
         self.effects = self.effects.union(effects);
         for (bit, witness) in &other.witnesses {
-            if !effects.contains(RuntimeEffects::from_bit(*bit)) {
+            if !effects.contains(effect_bit(*bit)) {
                 continue;
             }
             changed |= self.record_witness(*bit, witness);
@@ -170,9 +170,16 @@ impl<W: Clone + Ord> EffectSummary<W> {
     }
 }
 
-/// Bits the solver propagates along call edges: every runtime effect plus the
-/// compiler-internal checked-panic bit. That bit has no witness slot, so its
-/// pass only joins reachability; checker verdicts read it transitively.
+/// Decode runtime and compiler-internal witness slots without changing the ABI.
+fn effect_bit(index: u32) -> RuntimeEffects {
+    if index == RuntimeEffects::BIT_COUNT {
+        RuntimeEffects::MAY_CHECKED_PANIC
+    } else {
+        RuntimeEffects::from_bit(index)
+    }
+}
+
+/// Runtime effects plus the compiler-internal checked-panic bit and its witness.
 fn propagated_bits() -> impl Iterator<Item = (u32, RuntimeEffects)> {
     (0..RuntimeEffects::BIT_COUNT)
         .map(|bit| (bit, RuntimeEffects::from_bit(bit)))
@@ -180,6 +187,13 @@ fn propagated_bits() -> impl Iterator<Item = (u32, RuntimeEffects)> {
             RuntimeEffects::BIT_COUNT,
             RuntimeEffects::MAY_CHECKED_PANIC,
         )))
+}
+
+/// Every effect that owns a witness slot, including the compiler-internal
+/// checked-panic bit. Witness comparisons and size accounting must use this,
+/// not `0..BIT_COUNT`, or the checked-panic witness is silently ignored.
+pub(crate) fn witnessed_effects() -> impl Iterator<Item = RuntimeEffects> {
+    propagated_bits().map(|(_, effect)| effect)
 }
 
 /// One effect-propagation problem, ready to [`EffectProblem::solve`].
@@ -787,8 +801,8 @@ impl<W: Clone> StoredEffectSolution<W> {
             anyhow::ensure!(
                 s.witnesses
                     .keys()
-                    .all(|&bit| bit < RuntimeEffects::BIT_COUNT
-                        && value.intersects(RuntimeEffects::from_bit(bit))),
+                    .all(|&bit| bit <= RuntimeEffects::BIT_COUNT
+                        && value.intersects(effect_bit(bit))),
                 "invalid effect witness bit"
             );
             Ok(EffectSummary {
@@ -1209,6 +1223,40 @@ mod tests {
                 assert_eq!(solution.facts.get(&detached).unwrap().effects(), BLOCK);
             }
         }
+    }
+
+    #[test]
+    fn checked_panic_witness_survives_solve_store_and_delta() {
+        let checked = RuntimeEffects::MAY_CHECKED_PANIC;
+        let mut graph = CallGraph::default();
+        calls(&mut graph, "caller", &["leaf"]);
+        calls(&mut graph, "leaf", &[]);
+        let make = |effect| {
+            permissive::<u8>()
+                .default_transmit(checked)
+                .seed(id("leaf"), effect, Some(7))
+        };
+        let cold = make(checked).solve(&graph);
+        let reachable = make(checked).solve_reachable(&graph);
+        let initial = make(checked).solve_incremental(&graph, None);
+        for facts in [&cold, &reachable, &initial.facts] {
+            assert_eq!(facts.get(&id("caller")).unwrap().witness(checked), Some(&7));
+        }
+        let bytes = serde_json::to_vec(&initial.store()).unwrap();
+        let stored: StoredEffectSolution<u8> = serde_json::from_slice(&bytes).unwrap();
+        let restored = stored.restore().unwrap();
+        assert_eq!(
+            restored.facts.get(&id("caller")).unwrap().witness(checked),
+            Some(&7)
+        );
+        let removed = make(NONE).solve_incremental(&graph, Some(&restored));
+        assert!(
+            !removed
+                .facts
+                .get(&id("caller"))
+                .unwrap()
+                .intersects(checked)
+        );
     }
 
     #[test]

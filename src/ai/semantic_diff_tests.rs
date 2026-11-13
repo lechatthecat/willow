@@ -62,6 +62,15 @@ fn semantic_diff_contract_strength_and_weakness() {
         ("no_block", "no_wait", "strengthened"),
         ("no_wait", "no_block", "weakened"),
         ("no_block", "no_suspend", "changed"),
+        ("", "no_panic", "added"),
+        ("no_panic", "", "removed"),
+        ("", "no_alloc", "added"),
+        ("no_alloc", "", "removed"),
+        ("no_panic", "no_panic,no_alloc", "strengthened"),
+        ("no_alloc", "no_panic,no_alloc", "strengthened"),
+        ("no_panic,no_alloc", "no_panic", "weakened"),
+        ("no_panic,no_alloc", "no_alloc", "weakened"),
+        ("no_panic", "no_alloc", "changed"),
     ] {
         let src = |c: &str| {
             format!(
@@ -1036,7 +1045,11 @@ fn semantic_diff_incremental_query_scaling() {
                 ("snapshot_functions_rebuilt", affected),
                 ("snapshot_symbols_rebuilt", 5 * affected),
                 ("report_facts_rebuilt", affected),
-                ("report_witness_owners_visited", 6 * affected),
+                // Cause repair visits each affected owner once per effect bit.
+                (
+                    "report_witness_owners_visited",
+                    RuntimeEffects::BIT_COUNT as usize * affected,
+                ),
                 ("report_witness_edges_visited", 12 * affected),
                 ("report_witness_queue_operations", 4 * affected),
                 ("report_dependency_edges_visited", 10 * affected),
@@ -2498,4 +2511,19 @@ fn semantic_diff_rename_lambda_collision_preserves_effect_growth() {
                     .contains(&json!("may-block"))),
         "{r:?}"
     );
+}
+
+#[test]
+fn semantic_diff_panic_allocation_helper_violations() {
+    for (contract, body) in [("no_panic", "panic(\"bad\");"), ("no_alloc", "let a=[1];")] {
+        let before =
+            format!("fn leaf() {{}} @effects({contract}) fn guard() {{ leaf(); }} fn main() {{}}");
+        let after = before.replace("fn leaf() {}", &format!("fn leaf() {{ {body} }}"));
+        let result = report(&before, &after);
+        assert_eq!(result.exit_code(), 1, "{result:?}");
+        assert!(
+            result.summary["contract_violations"].as_u64().unwrap() > 0,
+            "{result:?}"
+        );
+    }
 }

@@ -1,0 +1,33 @@
+// Scalar selection satisfies both contracts without checked arithmetic.
+@effects(no_panic, no_alloc)
+fn choose(flag: bool, left: i64, right: i64) -> i64 {
+    if flag { return left; }
+    return right;
+}
+
+@effects(no_panic, no_alloc)
+fn answer() -> i64 {
+    return choose(true, 42, 0);
+}
+
+@effects(no_alloc)
+fn store_scalar(cell: BlockingCell<i64>, value: i64) {
+    // A syntactic loop range uses scalar bounds; no Range object is created.
+    for i in 0..1 { cell.set(value); }
+}
+
+// Inline enum construction and matching Result propagation need no GC object.
+@effects(no_alloc)
+fn wrap(value: i64) -> Result<i64, bool> { return Ok(value); }
+
+@effects(no_alloc)
+fn relay(value: Result<i64, bool>) -> Result<i64, bool> {
+    value?;
+    return value;
+}
+
+fn main() {
+    let cell = BlockingCell::new(0);
+    store_scalar(cell, relay(wrap(answer())).unwrap());
+    println(cell.get());
+}

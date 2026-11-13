@@ -678,3 +678,912 @@ fn io_contract_driver_inherited_default_and_generic_body() {
         );
     }
 }
+
+#[test]
+fn panic_allocation_imported_contracts() {
+    for (contract, body, root) in [
+        ("no_panic", "panic(\"bad\");", "panic"),
+        ("no_alloc", "let a=[1];", "allocation"),
+    ] {
+        let fixture = Fixture::new(&format!(
+            "import worker; @effects({contract}) fn guard() {{ worker::middle(); }} fn main() {{}}"
+        ));
+        fs::write(
+            fixture.0.join("worker.wi"),
+            format!("fn leaf() {{ {body} }} pub fn middle() {{ leaf(); }}"),
+        )
+        .unwrap();
+        for command in ["check", "build", "check"] {
+            let out = fixture.command(command);
+            let text = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !out.status.success() && text.contains("E2610"),
+                "{command}: {text}"
+            );
+            assert!(
+                text.contains("guard")
+                    && text.contains("middle")
+                    && text.contains(root)
+                    && text.contains("call chain"),
+                "{text}"
+            );
+        }
+        fs::write(fixture.0.join("worker.wi"), "pub fn middle() {}").unwrap();
+        let out = fixture.command("check");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn panic_allocation_example_runs() {
+    let out = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .args(["run", "example/panic_allocation_contracts.wi"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line == "42")
+    );
+}
+
+#[test]
+fn panic_allocation_checked_profiles() {
+    let fixture = Fixture::new(
+        "fn helper(x:i64)->i64 { return x+1; } @effects(no_panic) fn guard(x:i64)->i64 { return helper(x); } fn main() {}",
+    );
+    for profile in ["--debug", "--release"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .current_dir(&fixture.0)
+            .args(["build", "main.wi", profile])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && text.contains("E2610") && text.contains("guard -> helper"),
+            "{profile}: {text}"
+        );
+    }
+}
+
+#[test]
+fn panic_allocation_imported_string_constant() {
+    for expression in ["worker::MESSAGE", "MESSAGE"] {
+        let import = if expression == "MESSAGE" {
+            "import worker::MESSAGE;"
+        } else {
+            "import worker;"
+        };
+        let fixture = Fixture::new(&format!(
+            "{import} @effects(no_alloc) fn value()->String {{ return {expression}; }} fn main() {{}}"
+        ));
+        fs::write(
+            fixture.0.join("worker.wi"),
+            "pub const MESSAGE:String=\"hello\";",
+        )
+        .unwrap();
+        let out = fixture.command("check");
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && text.contains("E2610"),
+            "{expression}: {text}"
+        );
+    }
+}
+
+#[test]
+fn panic_allocation_imported_dispatch_and_obligations() {
+    for (contract, other, body) in [
+        ("no_panic", "no_alloc", "panic(\"bad\");"),
+        ("no_alloc", "no_panic", "let a=[1];"),
+    ] {
+        let fixture = Fixture::new(&format!(
+            "import worker; class C implements worker::I {{ pub fn run(self) {{ {body} }} }} @effects({contract}) fn guard(i:worker::I) {{ i.run(); }} fn main() {{}}"
+        ));
+        fs::write(
+            fixture.0.join("worker.wi"),
+            "pub interface I { fn run(self); }",
+        )
+        .unwrap();
+        let out = fixture.command("check");
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success()
+                && text.contains("E2610")
+                && text.contains("guard")
+                && text.contains("call chain"),
+            "{text}"
+        );
+        fs::write(
+            fixture.0.join("worker.wi"),
+            format!("pub interface I {{ @effects({contract}) fn run(self); }}"),
+        )
+        .unwrap();
+        let out = fixture.command("check");
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && text.contains("E2610"), "{text}");
+        fs::write(fixture.0.join("main.wi"), format!("import worker; class C implements worker::I {{ @effects({other}) pub fn run(self) {{}} }} fn main() {{}}")).unwrap();
+        let out = fixture.command("check");
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && text.contains("E2611"), "{text}");
+    }
+}
+
+#[test]
+fn no_alloc_imported_ranges_and_typed_storage() {
+    for (params, args, body) in [
+        ("", "", "let r=0..10;"),
+        ("c:BlockingCell<I>,v:I", "c,v", "c.set(v);"),
+        (
+            "c:BlockingCell<Option<i64>>,v:Option<i64>",
+            "c,v",
+            "c.set(v);",
+        ),
+        (
+            "c:BlockingRwCell<Result<i64,bool>>,v:Result<i64,bool>",
+            "c,v",
+            "c.write(v);",
+        ),
+    ] {
+        let source = format!(
+            "import worker; import worker::I; @effects(no_alloc) fn guard({params}) {{ worker::helper({args}); }} fn main() {{}}"
+        );
+        let fixture = Fixture::new(&source);
+        fs::write(
+            fixture.0.join("worker.wi"),
+            format!("pub interface I extends Sync {{}} pub fn helper({params}) {{ {body} }}"),
+        )
+        .unwrap();
+        for command in ["check", "build", "check"] {
+            let output = fixture.command(command);
+            let text = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success()
+                    && text.contains("E2610")
+                    && text.contains("allocation")
+                    && text.contains("guard -> worker::helper"),
+                "{body} {command}: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn no_alloc_generic_typed_storage_helper() {
+    let fixture = Fixture::new(
+        "interface I extends Sync {} @effects(no_alloc) fn guard(c:BlockingCell<I>,v:I) { helper(0,c,v); } fn helper<T>(tag:T,c:BlockingCell<I>,v:I) { c.set(v); } fn main() {}",
+    );
+    for command in ["check", "build"] {
+        let output = fixture.command(command);
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success()
+                && text.contains("E2610")
+                && text.contains("guard")
+                && text.contains("helper"),
+            "{command}: {text}"
+        );
+    }
+}
+
+#[test]
+fn no_alloc_enum_representations_and_propagation() {
+    for (label, declarations, params, result, body, allocates) in [
+        (
+            "tag",
+            "enum Color { Red, Blue }",
+            "",
+            "Color",
+            "return Color::Red;",
+            false,
+        ),
+        (
+            "discarded tag",
+            "enum Color { Red, Blue }",
+            "",
+            "Color",
+            "Color::Blue; return Color::Red;",
+            false,
+        ),
+        (
+            "bare tag",
+            "enum Color { Red, Blue }",
+            "",
+            "Color",
+            "return Red;",
+            false,
+        ),
+        (
+            "scalar some",
+            "",
+            "",
+            "Option<i64>",
+            "return Some(1);",
+            false,
+        ),
+        ("scalar none", "", "", "Option<i64>", "return None;", false),
+        (
+            "float some",
+            "",
+            "",
+            "Option<f64>",
+            "return Some(1.5);",
+            false,
+        ),
+        (
+            "bool some",
+            "",
+            "",
+            "Option<bool>",
+            "return Some(true);",
+            false,
+        ),
+        (
+            "scalar ok",
+            "",
+            "",
+            "Result<i64,bool>",
+            "return Ok(1);",
+            false,
+        ),
+        (
+            "scalar err",
+            "",
+            "",
+            "Result<i64,bool>",
+            "return Err(false);",
+            false,
+        ),
+        (
+            "nullable some",
+            "",
+            "s:String",
+            "Option<String>",
+            "return Some(s);",
+            false,
+        ),
+        (
+            "nullable none",
+            "",
+            "",
+            "Option<String>",
+            "return None;",
+            false,
+        ),
+        (
+            "nullable class",
+            "class C {}",
+            "c:C",
+            "Option<C>",
+            "return Some(c);",
+            false,
+        ),
+        (
+            "boxed variant",
+            "enum E { A(i64), B }",
+            "",
+            "E",
+            "return E::A(1);",
+            true,
+        ),
+        (
+            "boxed empty variant",
+            "enum E { A(i64), B }",
+            "",
+            "E",
+            "return E::B;",
+            true,
+        ),
+        (
+            "nested option",
+            "",
+            "x:Option<i64>",
+            "Option<Option<i64>>",
+            "return Some(x);",
+            true,
+        ),
+        (
+            "nested none",
+            "",
+            "",
+            "Option<Option<i64>>",
+            "return None;",
+            true,
+        ),
+        (
+            "boxed result",
+            "",
+            "s:String",
+            "Result<String,bool>",
+            "return Ok(s);",
+            true,
+        ),
+        (
+            "allocating payload",
+            "",
+            "",
+            "Option<String>",
+            "return Some(\"hello\");",
+            true,
+        ),
+        (
+            "pair propagation",
+            "",
+            "x:Result<i64,bool>",
+            "Result<i64,bool>",
+            "x?; return x;",
+            false,
+        ),
+        (
+            "boxed propagation",
+            "",
+            "x:Result<String,bool>",
+            "Result<String,bool>",
+            "x?; return x;",
+            false,
+        ),
+        (
+            "boxed rebind",
+            "",
+            "x:Result<String,bool>,y:Result<Option<i64>,bool>",
+            "Result<Option<i64>,bool>",
+            "x?; return y;",
+            false,
+        ),
+        (
+            "pair to box",
+            "",
+            "x:Result<i64,bool>,y:Result<String,bool>",
+            "Result<String,bool>",
+            "x?; return y;",
+            true,
+        ),
+        (
+            "box to pair",
+            "",
+            "x:Result<String,bool>,y:Result<i64,bool>",
+            "Result<i64,bool>",
+            "x?; return y;",
+            false,
+        ),
+        (
+            "option pair propagation",
+            "",
+            "x:Option<i64>",
+            "Option<i64>",
+            "x?; return x;",
+            false,
+        ),
+        (
+            "option nullable propagation",
+            "",
+            "x:Option<String>",
+            "Option<String>",
+            "x?; return x;",
+            false,
+        ),
+        (
+            "option boxed propagation",
+            "",
+            "x:Option<Option<i64>>",
+            "Option<Option<i64>>",
+            "x?; return x;",
+            true,
+        ),
+        (
+            "option to nullable",
+            "",
+            "x:Option<i64>,y:Option<String>",
+            "Option<String>",
+            "x?; return y;",
+            false,
+        ),
+        (
+            "option to box",
+            "",
+            "x:Option<i64>,y:Option<Option<i64>>",
+            "Option<Option<i64>>",
+            "x?; return y;",
+            true,
+        ),
+    ] {
+        let fixture = Fixture::new(&format!(
+            "{declarations} @effects(no_alloc) fn f({params})->{result} {{ {body} }} fn main() {{}}"
+        ));
+        for command in ["check", "build"] {
+            let out = fixture.command(command);
+            let text = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.success(),
+                !allocates,
+                "{label} {command}: {text}"
+            );
+            if allocates {
+                assert!(text.contains("E2610"), "{label}: {text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn no_alloc_propagation_conversion_effects() {
+    for (label, declarations, target, allocates) in [
+        (
+            "pure scalar conversion",
+            "class Source implements Into<i64> { pub fn into(self)->i64 { return 7; } }",
+            "i64",
+            false,
+        ),
+        (
+            "allocating scalar conversion",
+            "class Source implements Into<i64> { pub fn into(self)->i64 { let a=[1]; return 7; } }",
+            "i64",
+            true,
+        ),
+        (
+            "virtual scalar conversion",
+            "open class Source implements Into<i64> { pub open fn into(self)->i64 { return 7; } } class Child extends Source { pub override fn into(self)->i64 { let a=[1]; return 8; } }",
+            "i64",
+            true,
+        ),
+        (
+            "boxed converted result",
+            "class Dest {} class Source implements Into<Dest> { pub dest:Dest; pub fn into(self)->Dest { return self.dest; } }",
+            "Dest",
+            true,
+        ),
+    ] {
+        for helper in [false, true] {
+            let functions = if helper {
+                format!(
+                    "@effects(no_alloc) fn f(x:Result<i64,Source>,y:Result<i64,{target}>)->Result<i64,{target}> {{ return helper(x,y); }} fn helper(x:Result<i64,Source>,y:Result<i64,{target}>)->Result<i64,{target}> {{ x?; return y; }}"
+                )
+            } else {
+                format!(
+                    "@effects(no_alloc) fn f(x:Result<i64,Source>,y:Result<i64,{target}>)->Result<i64,{target}> {{ x?; return y; }}"
+                )
+            };
+            let fixture = Fixture::new(&format!("{declarations} {functions} fn main() {{}}"));
+            for command in ["check", "build"] {
+                let out = fixture.command(command);
+                let text = String::from_utf8_lossy(&out.stderr);
+                assert_eq!(
+                    out.status.success(),
+                    !allocates,
+                    "{label} helper={helper} {command}: {text}"
+                );
+                if allocates {
+                    assert!(text.contains("E2610"), "{label}: {text}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn no_alloc_imported_enum_propagation() {
+    for allocates in [false, true] {
+        let result = if allocates {
+            "Result<String,bool>"
+        } else {
+            "Result<i64,bool>"
+        };
+        let fixture = Fixture::new(&format!(
+            "import worker; @effects(no_alloc) fn f(x:Result<i64,bool>,y:{result})->{result} {{ return worker::helper(x,y); }} fn main() {{}}"
+        ));
+        fs::write(
+            fixture.0.join("worker.wi"),
+            format!("pub fn helper(x:Result<i64,bool>,y:{result})->{result} {{ x?; return y; }}"),
+        )
+        .unwrap();
+        for command in ["check", "build", "check"] {
+            let out = fixture.command(command);
+            let text = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.success(), !allocates, "{command}: {text}");
+            if allocates {
+                assert!(
+                    text.contains("E2610") && text.contains("f -> worker::helper"),
+                    "{text}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn no_alloc_imported_enum_and_conversion_dispatch() {
+    for (provider, params, result, body, allocates) in [
+        (
+            "pub enum Color { Red, Blue }",
+            "",
+            "worker::Color",
+            "return worker::Color::Red;",
+            false,
+        ),
+        (
+            "pub class Source implements Into<i64> { pub fn into(self)->i64 { return 1; } }",
+            "x:Result<i64,worker::Source>,y:Result<i64,i64>",
+            "Result<i64,i64>",
+            "x?; return y;",
+            false,
+        ),
+        (
+            "pub class Source implements Into<i64> { pub fn into(self)->i64 { let a=[1]; return 1; } }",
+            "x:Result<i64,worker::Source>,y:Result<i64,i64>",
+            "Result<i64,i64>",
+            "x?; return y;",
+            true,
+        ),
+    ] {
+        let fixture = Fixture::new(&format!(
+            "import worker; @effects(no_alloc) fn f({params})->{result} {{ {body} }} fn main() {{}}"
+        ));
+        fs::write(fixture.0.join("worker.wi"), provider).unwrap();
+        for command in ["check", "build", "check"] {
+            let out = fixture.command(command);
+            let text = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.success(),
+                !allocates,
+                "{provider} {command}: {text}"
+            );
+            if allocates {
+                assert!(text.contains("E2610") && text.contains("into"), "{text}");
+            }
+            assert!(
+                !text.contains("$contract$into$"),
+                "synthetic node exposed: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn no_alloc_interface_option_boxes() {
+    for (declaration, payload) in [
+        ("pub interface I {}", "I"),
+        ("pub interface I<T> {}", "I<i64>"),
+    ] {
+        for body in ["return Some(x);", "return None;", "v?; return v;"] {
+            for route in ["direct", "helper", "imported"] {
+                let params = format!("x:{payload},v:Option<{payload}>");
+                let result = format!("Option<{payload}>");
+                let source = match route {
+                    "direct" => format!(
+                        "{declaration} @effects(no_alloc) fn guard({params})->{result} {{ {body} }} fn main() {{}}"
+                    ),
+                    "helper" => format!(
+                        "{declaration} fn helper({params})->{result} {{ {body} }} @effects(no_alloc) fn guard({params})->{result} {{ return helper(x,v); }} fn main() {{}}"
+                    ),
+                    _ => format!(
+                        "import worker; import worker::I; @effects(no_alloc) fn guard({params})->{result} {{ return worker::helper(x,v); }} fn main() {{}}"
+                    ),
+                };
+                let fixture = Fixture::new(&source);
+                if route == "imported" {
+                    fs::write(
+                        fixture.0.join("worker.wi"),
+                        format!("{declaration} pub fn helper({params})->{result} {{ {body} }}"),
+                    )
+                    .unwrap();
+                }
+                for command in ["check", "build", "check"] {
+                    let output = fixture.command(command);
+                    let text = String::from_utf8_lossy(&output.stderr);
+                    let chain = match route {
+                        "direct" => "guard -> allocation",
+                        "helper" => "guard -> helper -> allocation",
+                        _ => "guard -> worker::helper -> allocation",
+                    };
+                    assert!(
+                        !output.status.success() && text.contains("E2610") && text.contains(chain),
+                        "{payload} {body} {route} {command}: {text}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn no_alloc_map_iteration_snapshot() {
+    for (ty, body, allocates) in [
+        ("Map<i64,i64>", "for item in value {}", true),
+        ("Map<String,bool>", "for item in value { break; }", true),
+        ("Array<i64>", "for item in value {}", false),
+        ("Range<i64>", "for item in value {}", false),
+        ("i64", "for item in 0..value {}", false),
+    ] {
+        for route in ["direct", "helper", "imported"] {
+            let imports = "import std::collections::Map; import std::collections::Array;";
+            let source = match route {
+                "direct" => format!(
+                    "{imports} @effects(no_alloc) fn guard(value:{ty}) {{ {body} }} fn main() {{}}"
+                ),
+                "helper" => format!(
+                    "{imports} fn helper(value:{ty}) {{ {body} }} @effects(no_alloc) fn guard(value:{ty}) {{ helper(value); }} fn main() {{}}"
+                ),
+                _ => format!(
+                    "{imports} import worker; @effects(no_alloc) fn guard(value:{ty}) {{ worker::helper(value); }} fn main() {{}}"
+                ),
+            };
+            let fixture = Fixture::new(&source);
+            if route == "imported" {
+                fs::write(
+                    fixture.0.join("worker.wi"),
+                    format!("{imports} pub fn helper(value:{ty}) {{ {body} }}"),
+                )
+                .unwrap();
+            }
+            for command in ["check", "build", "check"] {
+                let output = fixture.command(command);
+                let text = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    output.status.success(),
+                    !allocates,
+                    "{ty} {route} {command}: {text}"
+                );
+                if allocates {
+                    let chain = match route {
+                        "direct" => "guard -> allocation",
+                        "helper" => "guard -> helper -> allocation",
+                        _ => "guard -> worker::helper -> allocation",
+                    };
+                    assert!(
+                        text.contains("E2610") && text.contains(chain),
+                        "{ty} {route} {command}: {text}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn panic_allocation_generic_error_conversion() {
+    for generic in [false, true] {
+        let (decl, ty) = if generic {
+            (
+                "class Wrap<T> implements Into<Other> { pub o: Other; pub v: T;",
+                "Wrap<i64>",
+            )
+        } else {
+            (
+                "class Wrap implements Into<Other> { pub o: Other; pub v: i64;",
+                "Wrap",
+            )
+        };
+        for (contract, into, chain) in [
+            ("no_alloc", "return new Other(1);", Some("g -> allocation")),
+            (
+                "no_panic",
+                "panic(\"boom\");",
+                Some("g -> Wrap::into -> panic"),
+            ),
+            ("no_panic", "return self.o;", None),
+        ] {
+            let source = format!(
+                "interface Into<T> {{ fn into(self) -> T; }} class Other {{ pub v: i64; }} {decl} pub fn into(self) -> Other {{ {into} }} }} @effects({contract}) fn g(x: Result<i64, {ty}>, y: Result<i64, Other>) -> Result<i64, Other> {{ x?; return y; }} fn main() {{}}"
+            );
+            let output = Fixture::new(&source).command("check");
+            let text = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.success(),
+                chain.is_none(),
+                "{ty} {contract}: {text}"
+            );
+            if let Some(chain) = chain {
+                assert!(
+                    text.contains("E2610") && text.contains(chain),
+                    "{ty} {contract}: {text}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn no_alloc_async_call_through_dispatch() {
+    for (receiver, overridden) in [("Base", true), ("D", true), ("Base", false)] {
+        let (modifier, body) = if overridden {
+            (
+                "open",
+                "pub override async fn run(self) -> i64 { return 2; }",
+            )
+        } else {
+            ("", "")
+        };
+        let source = format!(
+            "open class Base {{ pub {modifier} async fn run(self) -> i64 {{ return 1; }} }} class D extends Base {{ {body} }} @effects(no_alloc) fn f(x: {receiver}) {{ let _ = x.run(); }} @effects(no_alloc) fn sync_ok(x: {receiver}) {{ }} fn main() {{}}"
+        );
+        for command in ["check", "build"] {
+            let output = Fixture::new(&source).command(command);
+            let text = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success()
+                    && text.contains("E2610")
+                    && text.contains("f -> allocation")
+                    && !text.contains("violated by `sync_ok`"),
+                "{receiver} {overridden} {command}: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn contract_diagnostics_locate_offset_witnesses() {
+    for (source, line, chain) in [
+        (
+            "import std::collections::Map;\n@effects(no_alloc) fn f(m: Map<i64,i64>) {\n  for i in m {}\n}\nfn main() {}",
+            "main.wi:3:3",
+            "f -> allocation",
+        ),
+        (
+            "async fn h() -> i64 { return 1; }\n@effects(no_alloc) fn k() {\n  let _ = h();\n}\nfn main() {}",
+            "main.wi:3:",
+            "k -> allocation",
+        ),
+        (
+            "fn boom() { panic(\"x\"); }\n@effects(no_panic) fn p() {\n  boom();\n}\nfn main() {}",
+            "main.wi:",
+            "p -> boom -> panic",
+        ),
+    ] {
+        let output = Fixture::new(source).command("check");
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success()
+                && text.contains("E2610")
+                && text.contains(chain)
+                && text.contains(line)
+                && !text.contains("main.wi:0:0"),
+            "{source}: {text}"
+        );
+    }
+}
+
+#[test]
+fn contract_injected_defaults_and_enum_members_fail_closed() {
+    for (source, ok) in [
+        // A class copy of an interface default is not re-scanned with the
+        // copy's missing checked types; the canonical default decides.
+        (
+            "enum Result<T,E> { Ok(T), Err(E) } interface I { fn m(self, x: Result<i64,i64>) -> Result<i64,i64> { x?; return x; } } class C implements I {} @effects(no_alloc) fn f(c: C, x: Result<i64,i64>) { let _ = c.m(x); } fn main() {}",
+            true,
+        ),
+        (
+            "interface I { fn m(self) -> String { return \"s\"; } } class C implements I {} @effects(no_alloc) fn f(c: C) { let _ = c.m(); } fn main() {}",
+            false,
+        ),
+        // Variants are values; a non-variant member is not silently dropped.
+        (
+            "enum Color { Red, Green(i64) } @effects(no_panic) fn f() -> Color { return Color::Red; } @effects(no_panic) fn g() -> Color { return Color::Green(1); } fn main() {}",
+            true,
+        ),
+    ] {
+        let output = Fixture::new(source).command("check");
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), ok, "{source}: {text}");
+        if !ok {
+            assert!(
+                text.contains("E2610") || text.contains("E2612"),
+                "{source}: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn no_alloc_fault_reporting_and_proof_only_clauses() {
+    let prelude = "import std::collections::Array;";
+    for (body, contract, expected) in [
+        // Allocation only on the fault path (message of the raised panic).
+        (
+            "fn f(a: FrozenArray<i64>) -> i64 { return a.len(); }",
+            "no_alloc",
+            None,
+        ),
+        (
+            "fn f(a: Array<i64>) -> i64 { return a.len(); }",
+            "no_alloc",
+            None,
+        ),
+        (
+            "fn f(a: Array<i64>) -> i64 { return a[0]; }",
+            "no_alloc",
+            None,
+        ),
+        (
+            "fn f(s: String) -> i64 { return s.byte_at(0); }",
+            "no_alloc",
+            None,
+        ),
+        (
+            "fn f(o: Option<i64>) -> i64 { return o.unwrap(); }",
+            "no_alloc",
+            None,
+        ),
+        // The fault itself is still a panic.
+        (
+            "fn f(a: Array<i64>) -> i64 { return a.len(); }",
+            "no_panic",
+            Some("E2610"),
+        ),
+        (
+            "fn f(o: Option<i64>) -> i64 { return o.unwrap(); }",
+            "no_panic",
+            Some("E2610"),
+        ),
+        // Success-path allocation and the expect message literal still count.
+        (
+            "fn f(s: String) -> String { return s + s; }",
+            "no_alloc",
+            Some("E2610"),
+        ),
+        (
+            "fn f(o: Option<i64>) -> i64 { return o.expect(\"x\"); }",
+            "no_alloc",
+            Some("E2610"),
+        ),
+        // Loop invariants/variants are dropped by lowering.
+        (
+            "fn f(a: FrozenArray<i64>) -> i64 { let mut t = 0; for v in a invariant t >= 0 && t <= a.len() variant a.len() - t { t = t + 1; } return t; }",
+            "no_alloc",
+            None,
+        ),
+        (
+            "fn f(a: FrozenArray<i64>) -> i64 { let mut t = 0; for v in a invariant t <= a.len() { t = 1; } return t; }",
+            "no_panic",
+            None,
+        ),
+        (
+            "fn f(n: i64) -> i64 { let mut i = 0; while i < n invariant i >= 0 variant n - i { i = i + 1; } return i; }",
+            "no_alloc",
+            None,
+        ),
+        // Checked arithmetic in a variant is not a runtime panic site; the
+        // same arithmetic in the loop body still is.
+        (
+            "fn f(n: i64) { let mut i = 0; while i < n invariant i >= 0 variant n - i { break; } }",
+            "no_panic",
+            None,
+        ),
+        (
+            "fn f(n: i64) { let mut i = 0; while i < n invariant i >= 0 variant n - i { i = i + 1; } }",
+            "no_panic",
+            Some("E2610"),
+        ),
+        // Generic Option payloads may need the boxed representation.
+        (
+            "fn f<T>(x: T) -> Option<T> { return Some(x); }",
+            "no_alloc",
+            Some("E2610"),
+        ),
+        (
+            "fn f(x: String) -> Option<String> { return Some(x); }",
+            "no_alloc",
+            None,
+        ),
+    ] {
+        let source = format!("{prelude} @effects({contract}) {body} fn main() {{}}");
+        let output = Fixture::new(&source).command("check");
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.success(),
+            expected.is_none(),
+            "{source}: {text}"
+        );
+        if let Some(code) = expected {
+            assert!(text.contains(code), "{source}: {text}");
+        }
+    }
+}

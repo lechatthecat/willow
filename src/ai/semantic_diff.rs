@@ -227,6 +227,10 @@ fn contract_bits(contracts: &BTreeSet<String>) -> u8 {
             "no_block" => RuntimeEffects::MAY_BLOCK.bits(),
             "no_suspend" => RuntimeEffects::MAY_SUSPEND.bits(),
             "no_io" => RuntimeEffects::MAY_IO.bits(),
+            "no_panic" => RuntimeEffects::MAY_PANIC
+                .union(RuntimeEffects::MAY_CHECKED_PANIC)
+                .bits(),
+            "no_alloc" => RuntimeEffects::MAY_ALLOCATE.bits(),
             _ => 0,
         }
     })

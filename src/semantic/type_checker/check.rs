@@ -2799,10 +2799,13 @@ impl TypeChecker {
     /// receiver types are still available. Unknown is explicit for panic safety.
     fn record_resolved_call(&mut self, expr: &Expr) {
         let mut targets = match expr {
+            // Constant reads inline their value. Keep a string constant's
+            // resolved identity outside AI capture too, so allocation proofs
+            // distinguish it from a shadowing local without resolving again.
             Expr::Var(name, _, id)
-                if self.capture_call_sites
-                    && self.symbols.lookup_var(name).is_none()
-                    && self.symbols.lookup_func(name).is_some() =>
+                if self.symbols.lookup_func(name).is_some_and(|info| {
+                    self.capture_call_sites || matches!(info.constant, Some(ConstValue::String(_)))
+                }) && self.symbols.lookup_var(name).is_none() =>
             {
                 self.analysis_calls
                     .insert(*id, Some(FunctionId::free_from_source_name(name)));
@@ -2851,6 +2854,22 @@ impl TypeChecker {
                     targets
                 })
                 .unwrap_or_default(),
+            // Qualified enum construction is a value too. Its representation
+            // supplies allocation evidence; it has no missing callable body, so
+            // it never enters the call graph. AI capture still needs the
+            // resolved variant identity to attach its allocation witness.
+            Expr::StaticCall(call) if self.is_static_enum_variant(&call.class, &call.method) => {
+                if self.capture_call_sites || self.local.in_constructor {
+                    let owner = self
+                        .static_call_classes
+                        .get(&call.id)
+                        .copied()
+                        .unwrap_or_else(|| TypeId::from_source_name(&call.class));
+                    self.analysis_calls
+                        .insert(expr.id(), Some(FunctionId::method(owner, &call.method)));
+                }
+                return;
+            }
             // Bare class properties/module constants do not invoke a method.
             // Their initializer dependencies are recorded by the field resolver.
             Expr::StaticCall(call) if self.is_static_field_call(call) => return,

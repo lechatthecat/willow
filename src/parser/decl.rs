@@ -3,7 +3,14 @@ use super::ast::*;
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 use crate::lexer::token::TokenKind;
 
-const EFFECT_CONTRACT_NAMES: [&str; 4] = ["no_wait", "no_block", "no_suspend", "no_io"];
+const EFFECT_CONTRACT_NAMES: [&str; 6] = [
+    "no_wait",
+    "no_block",
+    "no_suspend",
+    "no_io",
+    "no_panic",
+    "no_alloc",
+];
 
 // Candidates are fixed ASCII names, so the DP row is bounded independently of
 // the invalid identifier's length. Ties follow the documented candidate order.
@@ -192,6 +199,8 @@ impl Parser {
                     "no_block" => EffectContractKind::NoBlock,
                     "no_suspend" => EffectContractKind::NoSuspend,
                     "no_io" => EffectContractKind::NoIo,
+                    "no_panic" => EffectContractKind::NoPanic,
+                    "no_alloc" => EffectContractKind::NoAlloc,
                     _ => {
                         return Err(self
                             .err_at(
@@ -1533,7 +1542,8 @@ mod effect_contract_diagnostic_tests {
             ("no_bloc", "no_block"),
             ("no_blockk", "no_block"),
             ("no_blook", "no_block"),
-            ("no_alloc", "no_block"),
+            ("no_allo", "no_alloc"),
+            ("no_pani", "no_panic"),
             ("no_suspen", "no_suspend"),
             ("no_suspendd", "no_suspend"),
             ("no_suspond", "no_suspend"),
@@ -1560,7 +1570,7 @@ mod effect_contract_diagnostic_tests {
                 assert_eq!(
                     error.helps,
                     [format!(
-                        "valid effect contracts: no_wait, no_block, no_suspend, no_io; did you mean `{closest}`?"
+                        "valid effect contracts: no_wait, no_block, no_suspend, no_io, no_panic, no_alloc; did you mean `{closest}`?"
                     )]
                 );
             }
@@ -1606,7 +1616,7 @@ mod effect_contract_diagnostic_tests {
         for length in [16, 256, 4096] {
             EDIT_CELLS.with(|n| n.set(0));
             closest_effect_contract(&"x".repeat(length));
-            EDIT_CELLS.with(|n| assert_eq!(n.get(), 30 * length));
+            EDIT_CELLS.with(|n| assert_eq!(n.get(), 46 * length));
         }
     }
 }

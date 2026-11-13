@@ -697,6 +697,16 @@ impl TypeChecker {
             .map(|info| info.name.clone())
     }
 
+    /// `Enum::Variant(..)`/`Enum::Variant`: the qualifier names an enum AND the
+    /// member is one of its variants. Any other member stays an ordinary call.
+    pub(super) fn is_static_enum_variant(&self, class: &str, member: &str) -> bool {
+        self.static_call_enum_key(class).is_some_and(|key| {
+            self.symbols
+                .lookup_enum(&key)
+                .is_some_and(|info| info.variants.iter().any(|v| v.name == member))
+        })
+    }
+
     /// A qualified variant participates in contextual construction only when
     /// its enum identity and any explicit type arguments agree with the
     /// expected enum. Mismatches fall through to ordinary static-call checking

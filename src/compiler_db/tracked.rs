@@ -486,9 +486,16 @@ impl TrackedQueryTable {
     }
     /// Explicit full collection, also used at serialization boundaries. Each
     /// actual node/edge visit is recorded; no graph scan determines the trigger.
-    pub(crate) fn compact(
+    pub(crate) fn compact(&mut self, inventory: impl FnMut(&QueryNode) -> bool) -> (usize, usize) {
+        self.compact_rooted(inventory, |_| false)
+    }
+    /// Inputs captured by the current candidate are current facts even when no
+    /// retained query read them yet. Reclaiming them would make the next
+    /// unchanged revision recapture them as changed inputs.
+    pub(crate) fn compact_rooted(
         &mut self,
         mut inventory: impl FnMut(&QueryNode) -> bool,
+        captured: impl Fn(&InputNode) -> bool,
     ) -> (usize, usize) {
         assert_frozen_read();
         assert!(self.stack.get_mut().is_empty());
@@ -538,7 +545,7 @@ impl TrackedQueryTable {
         let dead: Vec<_> = self
             .inputs
             .keys()
-            .filter(|node| !inputs.contains(*node))
+            .filter(|node| !inputs.contains(*node) && !captured(node))
             .cloned()
             .collect();
         node_visits += self.inputs.len();

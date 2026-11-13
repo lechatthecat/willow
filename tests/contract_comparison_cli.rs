@@ -451,3 +451,70 @@ fn io_contract_verify_edit_reports_new_external_effect() {
         "{result}"
     );
 }
+
+#[test]
+fn verify_edit_panic_allocation_contract_changes() {
+    let root = std::env::temp_dir().join(format!("willow-effect-changes-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "user.name", "Fixture"]);
+    git(&root, &["config", "user.email", "fixture@example.invalid"]);
+    for (before, after, change) in [
+        ("", "no_panic", "added"),
+        ("no_panic", "", "removed"),
+        ("", "no_alloc", "added"),
+        ("no_alloc", "", "removed"),
+        ("no_panic", "no_panic,no_alloc", "strengthened"),
+        ("no_alloc", "no_panic,no_alloc", "strengthened"),
+        ("no_panic,no_alloc", "no_panic", "weakened"),
+        ("no_panic,no_alloc", "no_alloc", "weakened"),
+    ] {
+        let source = |c: &str| {
+            format!(
+                "{} fn f() {{}} fn main() {{}}",
+                if c.is_empty() {
+                    String::new()
+                } else {
+                    format!("@effects({c})")
+                }
+            )
+        };
+        fs::write(root.join("main.wi"), source(before)).unwrap();
+        git(&root, &["add", "main.wi"]);
+        let staged_files = git(&root, &["diff", "--cached", "--name-only"]);
+        if !staged_files.is_empty() {
+            assert_eq!(staged_files, "main.wi");
+            let staged = git(&root, &["diff", "--cached"]);
+            assert!(staged.contains("fn f()"));
+            git(&root, &["commit", "-qm", "Contract baseline"]);
+        }
+        fs::write(root.join("main.wi"), source(after)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .args(["verify-edit", "--root"])
+            .arg(&root)
+            .args(["--base", "HEAD", "--format", "json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            result["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["contract"]["change"] == change),
+            "{before} -> {after}: {result}"
+        );
+    }
+}

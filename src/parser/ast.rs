@@ -305,6 +305,8 @@ pub enum EffectContractKind {
     NoBlock,
     NoSuspend,
     NoIo,
+    NoPanic,
+    NoAlloc,
 }
 
 impl EffectContractKind {
@@ -316,6 +318,8 @@ impl EffectContractKind {
             Self::NoBlock => "no_block",
             Self::NoSuspend => "no_suspend",
             Self::NoIo => "no_io",
+            Self::NoPanic => "no_panic",
+            Self::NoAlloc => "no_alloc",
         }
     }
 
@@ -327,6 +331,8 @@ impl EffectContractKind {
             Self::NoBlock => E::MAY_BLOCK,
             Self::NoSuspend => E::MAY_SUSPEND,
             Self::NoIo => E::MAY_IO,
+            Self::NoPanic => E::MAY_PANIC.union(E::MAY_CHECKED_PANIC),
+            Self::NoAlloc => E::MAY_ALLOCATE,
         }
     }
 }

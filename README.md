@@ -409,6 +409,8 @@ its callers whether or not it runs under a lock:
 | `no_block` | Blocking waits such as stdout writes or `BlockingCell` reads | `await` and other suspension |
 | `no_suspend` | Suspension such as `await`, `select` and waiting channel operations | Blocking waits |
 | `no_wait` | Both | Creating a Task without awaiting it |
+| `no_panic` | Explicit panic and checked language faults, including bounds, integer arithmetic and requires/ensures guards | Operations whose panic-free behavior is established by the effect analysis |
+| `no_alloc` | Managed allocation, including literals, objects, closures, tasks and allocating runtime calls | Scalar computation and access to existing values |
 | `no_io` | External resource access: console output, filesystem, network, process arguments and explicit clock reads, including async operations | Computation, allocation and synchronization |
 
 ```willow
@@ -434,6 +436,33 @@ Contracts are checked fail-closed:
 - **E2610**: a proven witness violates the contract, transitively through helpers, dispatch and imported modules.
 - **E2611**: an override weakens an inherited contract. Overrides that declare nothing inherit the base contract and are checked against it.
 - **E2612**: the property cannot be proven, for example when the function calls an arbitrary function-value parameter. Missing evidence is not treated as success.
+
+`no_panic` includes checked integer faults even in profiles that wrap integer
+arithmetic. It is a conservative effect proof, not a value-range proof: a
+potential guard is rejected even when an application invariant would prevent
+it from failing. It does not promise termination or prevent hardware faults,
+out-of-memory aborts, stack exhaustion, or failures inside runtime housekeeping.
+
+`no_alloc` forbids managed/GC allocation at language operations and runtime ABI
+calls. String literals count because first use initializes their cached managed
+object. Materialized ranges and implicit interface/scalar-pair boxes used by
+storage operations count too; a syntactic `for i in start..end` uses scalar
+bounds without creating a Range object. Iterating a Map allocates an entries
+snapshot; iterating an existing array or range does not. Tag-only enums, scalar Option/Result
+pairs, and nullable-pointer Options do not allocate on construction. Options
+containing interfaces, and `Option<T>` of a generic parameter `T`, use or may
+use a heap box, including `None` and `?` failure values. The `?`
+operator counts only allocations required by its failure representation or
+implicit error conversion, including the conversion method's effects.
+Allocations solely for compiler-generated fault reporting (for example the
+message of a failed bounds check, `len()` on a null array or `unwrap()` of an
+empty value), GC and scheduler bookkeeping are outside this contract; it is not a promise of zero
+native allocator calls or of no GC safepoints. Explicit allocating expressions
+on a panic branch still count. Foreign implementations and arbitrary callbacks
+remain unknown for both contracts; extern declarations accept only
+`@effects(no_io)`. Combine `no_alloc` and `no_panic` when both are required.
+Loop invariants and variants are verifier-only and contribute no effects;
+`requires`/`ensures` guards run and count.
 
 `no_io` applies transitively, including virtual calls and imported functions. It is
 an effect contract, not an operating-system sandbox. Runtime housekeeping (GC,

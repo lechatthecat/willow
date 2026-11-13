@@ -12,6 +12,9 @@ impl TypeChecker {
     }
 
     pub(super) fn check_loop_contracts(&mut self, invariants: &[Expr], variant: Option<&Expr>) {
+        // Lowering drops invariants and variants; they are verifier-only, so
+        // their operations must not become runtime effect edges of the body.
+        let caller = self.local.current_effect_callable.take();
         let mut immutable = HashMap::new();
         for (expr, expected) in invariants
             .iter()
@@ -31,6 +34,7 @@ impl TypeChecker {
                 );
             }
         }
+        self.local.current_effect_callable = caller;
     }
 
     fn check_proof_expression(

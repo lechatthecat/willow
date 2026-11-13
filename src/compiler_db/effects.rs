@@ -42,6 +42,10 @@ pub(crate) enum EffectWitness {
         owner: FunctionId,
         source: (u32, usize, usize),
     },
+    Allocation {
+        owner: FunctionId,
+        source: (u32, usize, usize),
+    },
     External(FunctionId),
 }
 impl EffectWitness {
@@ -683,7 +687,9 @@ impl EffectQueries {
                             target.target = *span;
                         }
                     }
-                    EffectWitness::Helper { source, .. } | EffectWitness::Panic { source, .. } => {
+                    EffectWitness::Helper { source, .. }
+                    | EffectWitness::Panic { source, .. }
+                    | EffectWitness::Allocation { source, .. } => {
                         if let Some(location) = locations.get(source) {
                             changed |= *source != *location;
                             *source = *location;
@@ -3311,10 +3317,14 @@ fn scan_direct_effects<N: std::fmt::Display>(
         let mut lock_span = None;
         let mut lock_target = None;
         let mut defer_depth = 0;
+        // Loop invariants and variants are verifier-only: no backend evaluates
+        // them, so their operations are not runtime effects of the body.
+        let mut ghosts = HashSet::new();
         let mut walk = AstWalk::new(AstEvent::Block(body));
         while let Some(event) = walk.next() {
             visits += 1;
             match event {
+                AstEvent::Expr(expr) if ghosts.contains(&expr.id()) => walk.skip_children(),
                 AstEvent::Lambda(lambda) => {
                     if let LambdaBody::Block(child) = &lambda.body {
                         let child_id = index
@@ -3326,6 +3336,15 @@ fn scan_direct_effects<N: std::fmt::Display>(
                 }
                 AstEvent::Stmt(stmt) => {
                     preemption_loop |= matches!(stmt, Stmt::While(_) | Stmt::For(_));
+                    match stmt {
+                        Stmt::While(s) => {
+                            ghosts.extend(s.invariants.iter().chain(&s.variant).map(Expr::id))
+                        }
+                        Stmt::For(s) => {
+                            ghosts.extend(s.invariants.iter().chain(&s.variant).map(Expr::id))
+                        }
+                        _ => {}
+                    }
                     hazards.visit_stmt(stmt);
                     match stmt {
                         Stmt::Lock(lock) if lock_span.is_none() => {
@@ -3382,8 +3401,7 @@ fn scan_direct_effects<N: std::fmt::Display>(
 
 fn same_seed(a: &EffectSummary<EffectWitness>, b: &EffectSummary<EffectWitness>) -> bool {
     a.effects() == b.effects()
-        && (0..RuntimeEffects::BIT_COUNT).all(|bit| {
-            let bit = RuntimeEffects::from_bit(bit);
+        && crate::semantic::effects::witnessed_effects().all(|bit| {
             match (a.witness(bit), b.witness(bit)) {
                 (Some(EffectWitness::Lock(a)), Some(EffectWitness::Lock(b))) => {
                     a.owner == b.owner
@@ -4619,6 +4637,41 @@ mod tests {
         );
     }
 
+    /// The compiler-internal checked-panic bit owns its own witness slot past
+    /// the runtime bits; seed equality and size accounting must include it.
+    #[test]
+    fn checked_panic_witness_participates_in_seed_equality() {
+        use super::super::retained::Retained;
+        let checked = RuntimeEffects::MAY_CHECKED_PANIC;
+        let summary = |offset| {
+            EffectSummary::new(
+                checked,
+                Some(EffectWitness::Panic {
+                    owner: FunctionId::free("add"),
+                    source: (0, offset, offset + 3),
+                }),
+            )
+        };
+        assert_eq!(
+            summary(4).witness(checked),
+            Some(&EffectWitness::Panic {
+                owner: FunctionId::free("add"),
+                source: (0, 4, 7),
+            })
+        );
+        assert!(same_seed(&summary(4), &summary(4)));
+        assert!(!same_seed(&summary(4), &summary(9)));
+        assert_ne!(
+            EffectEvidence::new(summary(4)),
+            EffectEvidence::new(summary(9))
+        );
+        let runtime_slots = RuntimeEffects::BIT_COUNT as usize;
+        assert_eq!(
+            EffectEvidence::new(summary(4)).heap_bytes(),
+            (runtime_slots + 1) * (std::mem::size_of::<EffectWitness>() + 64)
+        );
+    }
+
     #[test]
     fn callable_capabilities_separate_io_and_evidence() {
         fn evaluate(source: &str) -> EffectQueries {
@@ -5146,21 +5199,21 @@ fn witness_type_bytes(ty: &Type) -> usize {
 }
 impl super::retained::Retained for EffectEvidence {
     fn heap_bytes(&self) -> usize {
-        // At most one witness per runtime bit. Include dynamic witness storage.
-        let dynamic: usize = (0..RuntimeEffects::BIT_COUNT)
-            .filter_map(
-                |bit| match self.summary.witness(RuntimeEffects::from_bit(bit)) {
-                    Some(EffectWitness::Lock(w)) => Some(
-                        w.cause.operation.len()
-                            + w.cause.lock.as_ref().map_or(0, |lock| {
-                                lock.mode.len() + lock.r#type.as_ref().map_or(0, witness_type_bytes)
-                            }),
-                    ),
-                    _ => None,
-                },
-            )
+        // At most one witness per witnessed bit. Include dynamic witness storage.
+        let mut slots = 0usize;
+        let dynamic: usize = crate::semantic::effects::witnessed_effects()
+            .inspect(|_| slots += 1)
+            .filter_map(|bit| match self.summary.witness(bit) {
+                Some(EffectWitness::Lock(w)) => Some(
+                    w.cause.operation.len()
+                        + w.cause.lock.as_ref().map_or(0, |lock| {
+                            lock.mode.len() + lock.r#type.as_ref().map_or(0, witness_type_bytes)
+                        }),
+                ),
+                _ => None,
+            })
             .sum();
-        dynamic + RuntimeEffects::BIT_COUNT as usize * (std::mem::size_of::<EffectWitness>() + 64)
+        dynamic + slots * (std::mem::size_of::<EffectWitness>() + 64)
     }
 }
 impl super::retained::Retained for CapturedEffect {
