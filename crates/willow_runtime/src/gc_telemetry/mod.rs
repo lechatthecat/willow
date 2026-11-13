@@ -947,7 +947,10 @@ pub(crate) fn resident_bytes() -> Option<u64> {
     macos_resident(false)
 }
 #[cfg(target_os = "macos")]
-#[allow(deprecated)] // libc exposes this stable Darwin ABI; avoid a dependency for one call.
+#[allow(
+    deprecated,
+    reason = "libc exposes the stable Darwin ABI used for resident memory accounting"
+)] // libc exposes this stable Darwin ABI; avoid a dependency for one call.
 fn macos_resident(peak: bool) -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info>::zeroed();
     let mut count = (std::mem::size_of::<libc::mach_task_basic_info>()

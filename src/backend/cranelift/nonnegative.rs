@@ -40,6 +40,7 @@ impl Proof {
     }
 }
 
+#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(super) fn analyze(f: &LirFunction) -> Proof {
     let n = f.locals.len();
     let mut out = Proof {

@@ -1555,6 +1555,7 @@ impl QueryProvider for SyntaxProvider<'_> {
     fn contains_body(&self, body: BodyId) -> bool {
         self.bodies.contains_key(&body)
     }
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn compute(&self, table: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
         match node {
             QueryNode::CompilerEnvironment => {

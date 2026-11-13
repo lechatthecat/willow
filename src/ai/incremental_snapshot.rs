@@ -749,6 +749,7 @@ pub(crate) struct CaptureOrigin<'a> {
     pub queries: &'a EffectQueries,
 }
 
+#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(crate) fn capture_incremental(
     origin: CaptureOrigin<'_>,
     program: &Program,

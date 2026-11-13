@@ -206,7 +206,13 @@ struct Solution<'a> {
     exit: Option<State>,
     violations: Vec<Violation<'a>>,
     before_base_init: Option<(Span, usize)>,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "Retain analysis metadata inspected by focused tests"
+        )
+    )]
     counts: Counts,
 }
 
@@ -349,6 +355,7 @@ impl<'a, 'f> Graph<'a, 'f> {
         }
     }
 
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn build(&mut self) {
         while let Some(Work {
             input,

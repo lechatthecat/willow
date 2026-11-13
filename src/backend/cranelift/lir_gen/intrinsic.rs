@@ -166,6 +166,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     // Keep explicit emission operands aligned with the LIR/runtime ABI.
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn emit_flat_intrinsic_inner(
         &mut self,
         intrinsic: Intrinsic,

@@ -227,6 +227,7 @@ impl Source {
     }
 }
 
+#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(super) fn restore(
     sources: &HashMap<UnitId, Source>,
     captures: &mut HashMap<UnitId, CapturedUnit>,

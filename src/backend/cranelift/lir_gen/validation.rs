@@ -80,6 +80,7 @@ pub(super) fn lir_cleanup_graph_is_valid(f: &LirFunction) -> bool {
 /// This is what the compile error prints, which is the difference between
 /// "something in this function is unsupported" and a construct, a type and a
 /// line to go and fix.
+#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(in crate::backend::cranelift) fn lir_rejection_reason(
     f: &LirFunction,
     ctx: &LirTypeCtx<'_>,

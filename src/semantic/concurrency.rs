@@ -115,7 +115,10 @@ pub struct ConcurrencyAnalyzer {
 
 // The preemption default is true on supported native-stack targets, so deriving
 // Default would change behavior even though this looks derivable elsewhere.
-#[allow(clippy::derivable_impls)]
+#[allow(
+    clippy::derivable_impls,
+    reason = "Preemption defaults differ across supported native-stack targets"
+)]
 impl Default for ConcurrencyAnalyzer {
     fn default() -> Self {
         Self {

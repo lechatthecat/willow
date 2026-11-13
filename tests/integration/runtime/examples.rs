@@ -2,6 +2,7 @@ use super::*;
 
 // ── Example files ───────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines, reason = "split pending")]
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         ("example/abi_handshake.wi", "42\n"),

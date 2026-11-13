@@ -492,6 +492,7 @@ impl UnitCodegenContext<'_> {
         BodyPlanner(self.body_queries.is_some()).program_body_plan(unit)
     }
 
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     pub(crate) fn declare_module_with_types(
         mut self,
         mod_name: &str,

@@ -399,7 +399,7 @@ pub(super) fn record_structs(source: &mut String, symbols: &[RustBridgeSymbol]) 
             records.push(record);
         }
     }
-    source.push_str("#[allow(dead_code)] pub mod records {\n");
+    source.push_str("#[allow(dead_code, reason = \"Shared record support may be unused by a particular adapter\")] pub mod records {\n");
     for record in &records {
         let super::Record { name, fields } = record;
         write!(source, "pub struct r#{name}").unwrap();
@@ -423,7 +423,7 @@ pub(super) fn record_structs(source: &mut String, symbols: &[RustBridgeSymbol]) 
         } else {
             "record_outputs"
         };
-        writeln!(source, "#[allow(dead_code)] pub mod {module} {{").unwrap();
+        writeln!(source, "#[allow(dead_code, reason = \"Shared record support may be unused by a particular adapter\")] pub mod {module} {{").unwrap();
         for record in &records {
             let super::Record { name, fields } = record;
             write!(
@@ -445,7 +445,7 @@ pub(super) fn record_structs(source: &mut String, symbols: &[RustBridgeSymbol]) 
         source.push_str("}\n");
     }
     if symbols.iter().any(|s| s.is_async) {
-        source.push_str("#[allow(dead_code)] pub mod record_owned {\n");
+        source.push_str("#[allow(dead_code, reason = \"Shared record support may be unused by a particular adapter\")] pub mod record_owned {\n");
         for record in &records {
             write!(
                 source,
@@ -466,7 +466,7 @@ pub(super) fn record_structs(source: &mut String, symbols: &[RustBridgeSymbol]) 
         source.push_str("}\n");
         for record in &records {
             let name = &record.name;
-            writeln!(source, "#[allow(non_snake_case, dead_code)] fn decode_owned_record_{name}(frame: &BridgeFrame, value: BridgeValue) -> record_owned::r#{name} {{ frame.root(value.low);").unwrap();
+            writeln!(source, "#[allow(non_snake_case, dead_code, reason = \"Generated record adapters preserve source names and may be unused\")] fn decode_owned_record_{name}(frame: &BridgeFrame, value: BridgeValue) -> record_owned::r#{name} {{ frame.root(value.low);").unwrap();
             let mut offset = 1;
             let mut serial = 0;
             let mut values = Vec::new();
@@ -486,7 +486,7 @@ pub(super) fn record_structs(source: &mut String, symbols: &[RustBridgeSymbol]) 
     }
     for record in &records {
         let super::Record { name, fields } = record;
-        writeln!(source, "#[allow(non_snake_case, dead_code)] fn decode_record_{name}(frame: &BridgeFrame, value: BridgeValue) -> record_inputs::r#{name}<'_> {{ frame.root(value.low);").unwrap();
+        writeln!(source, "#[allow(non_snake_case, dead_code, reason = \"Generated record adapters preserve source names and may be unused\")] fn decode_record_{name}(frame: &BridgeFrame, value: BridgeValue) -> record_inputs::r#{name}<'_> {{ frame.root(value.low);").unwrap();
         let mut serial = 0;
         let mut offset = 1usize;
         let mut values = Vec::new();
@@ -513,7 +513,7 @@ pub(super) fn record_structs(source: &mut String, symbols: &[RustBridgeSymbol]) 
             offset += if ty.pair() { 2 } else { 1 };
         }
         let digest = willow_abi::gc_bitmap_fingerprint(&bitmap[1..]);
-        writeln!(source, "#[allow(non_snake_case, dead_code)] fn encode_record_{name}(frame: &BridgeFrame, value: record_outputs::r#{name}) -> BridgeValue {{ let object = frame.record_new(frame.descriptors[{name:?}], {words}, &{bitmap:?}, {digest});").unwrap();
+        writeln!(source, "#[allow(non_snake_case, dead_code, reason = \"Generated record adapters preserve source names and may be unused\")] fn encode_record_{name}(frame: &BridgeFrame, value: record_outputs::r#{name}) -> BridgeValue {{ let object = frame.record_new(frame.descriptors[{name:?}], {words}, &{bitmap:?}, {digest});").unwrap();
         offset = 1;
         for (field, ty) in fields {
             let child = ty.encode(source, &format!("value.r#{field}"), &mut serial);

@@ -174,6 +174,7 @@ impl Checker<'_> {
     /// One source-order walk handles both local discharge and ancestor uses.
     /// Names resolve through binding stacks; exits drain indexed active tasks,
     /// so already-reported tasks never multiply work at later exits.
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn walk<'a>(&mut self, root: AstEvent<'a>, boundary: Span, escape_label: Option<Span>) {
         let mut state = WalkState::default();
         let mut next_block = None;

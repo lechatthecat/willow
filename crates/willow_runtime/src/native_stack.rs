@@ -19,7 +19,7 @@ use crate::task::{RUNTIME_POLL_PREEMPTED, RuntimeCancelFn, RuntimePollFn};
 thread_local! {
     static CURRENT: Cell<*mut NativeStack> = const { Cell::new(std::ptr::null_mut()) };
     // NativeStack and the coroutine stack retain stable addresses across cache moves.
-    #[allow(clippy::vec_box)]
+    #[allow(clippy::vec_box, reason = "Native stacks need stable addresses across cache moves")]
     static IDLE_STACKS: std::cell::RefCell<Vec<Box<NativeStack>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 

@@ -16,6 +16,7 @@ impl FuncGen<'_, '_> {
         self.cleanup.lock_scopes = state.locks.clone();
     }
 
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     pub(super) fn prepare_lir_cleanup(
         &mut self,
         function: &LirFunction,

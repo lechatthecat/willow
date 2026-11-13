@@ -17,6 +17,7 @@ impl Parser {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     pub(super) fn parse_rust_bridge(&mut self) -> Result<Vec<Item>, Diagnostic> {
         self.advance();
         if self.expect_ident()? != "rust" {

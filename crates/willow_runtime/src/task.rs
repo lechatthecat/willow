@@ -133,7 +133,10 @@ pub(crate) struct TaskWaitLinks {
     wait_channels: Vec<ChannelOwnershipToken>,
     // Keep small channel waits free of hash-table allocations and
     // inline HashMap metadata. Once promoted, retain the index until drained.
-    #[allow(clippy::box_collection)] // Saves inline map metadata on every small wait.
+    #[allow(
+        clippy::box_collection,
+        reason = "Avoid inline map metadata on small channel waits"
+    )] // Saves inline map metadata on every small wait.
     channel_ownership_index: Option<Box<HashMap<ChannelOwnershipKey, usize>>>,
     /// The lock this task is queued on, or holds a reserved handoff for. At most one: a
     /// critical section may not nest and may

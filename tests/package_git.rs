@@ -31,7 +31,10 @@ impl Drop for Fixture {
                 #[cfg(windows)]
                 {
                     // Windows clears the read-only attribute, not Unix access bits.
-                    #[allow(clippy::permissions_set_readonly_false)]
+                    #[allow(
+                        clippy::permissions_set_readonly_false,
+                        reason = "Windows clears the read-only attribute without changing Unix access bits"
+                    )]
                     permissions.set_readonly(false);
                 }
                 fs::set_permissions(&path, permissions).unwrap();

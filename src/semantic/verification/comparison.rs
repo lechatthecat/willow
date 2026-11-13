@@ -290,6 +290,7 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
     }
 }
 
+#[allow(clippy::too_many_lines, reason = "split pending")]
 pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
     let old: BTreeMap<_, _> = a
         .program

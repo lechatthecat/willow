@@ -69,6 +69,7 @@ pub(super) fn finish_with_hooks(
     finish_with_policy(cycle, started, wait, before_recheck, false)
 }
 
+#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(super) fn finish_with_policy(
     cycle: &Arc<ConcurrentCycle>,
     started: std::time::Instant,

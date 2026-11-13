@@ -5,9 +5,9 @@ unsafe extern "C" {
 }
 /// Collections proceed while the foreign body runs, however long it blocks.
 /// Dropping also leaves the region when the body panics.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "Shared bridge region support may be unused by an adapter")]
 struct BridgeRegion(u32);
-#[allow(dead_code)]
+#[allow(dead_code, reason = "Shared bridge region support may be unused by an adapter")]
 impl BridgeRegion {
     fn enter() -> Self {
         Self(unsafe { willow_rust_bridge_region_enter() })

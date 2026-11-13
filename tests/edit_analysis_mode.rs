@@ -148,6 +148,7 @@ fn verification_disk_borrow_cache_both_workflows_match_clean() {
     ]);
 }
 
+#[allow(clippy::too_many_lines, reason = "split pending")]
 fn verification_disk_cache_both_workflows(cases: &[(&str, &str, i32)]) {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;

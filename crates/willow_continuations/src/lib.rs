@@ -235,7 +235,7 @@ pub fn methods(arguments: TokenStream, input: TokenStream) -> TokenStream {
         method.block = parse_quote!({ crate::compiler_stack::run(self.#name(#(#arguments),*)) });
         // A method can be used solely by another continuation; preserve the
         // synchronous API for tests and independently-entered compiler stages.
-        method.attrs.push(parse_quote!(#[allow(dead_code)]));
+        method.attrs.push(parse_quote!(#[allow(dead_code, reason = "Preserve synchronous wrappers used independently of continuations")]));
         generated.push(ImplItem::Fn(continuation));
     }
     implementation.items.extend(generated);
@@ -299,7 +299,7 @@ pub fn function(arguments: TokenStream, input: TokenStream) -> TokenStream {
         .collect();
     let name = &continuation.sig.ident;
     *function.block = parse_quote!({crate::compiler_stack::run(#name(#(#arguments),*))});
-    function.attrs.push(parse_quote!(#[allow(dead_code)]));
+    function.attrs.push(parse_quote!(#[allow(dead_code, reason = "Preserve synchronous wrappers used independently of continuations")]));
     quote!(#function #continuation).into()
 }
 

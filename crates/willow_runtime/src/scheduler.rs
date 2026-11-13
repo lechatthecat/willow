@@ -4679,6 +4679,7 @@ fn parallel_run_is_idle_locked(state: &ParallelRunState) -> bool {
         .any(|source| work_source_is_live(state, *source))
 }
 
+#[allow(clippy::too_many_lines, reason = "split pending")]
 fn scheduler_run_loop(
     target: Option<RuntimeTaskId>,
     worker: usize,

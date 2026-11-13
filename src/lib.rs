@@ -1,7 +1,10 @@
 // `Diagnostic` is the compiler's pervasive error type; returning it by value
 // keeps fallible parser/semantic signatures readable. Boxing every `Result` to
 // shrink the cold `Err` path is churn not worth it here, so allow it crate-wide.
-#![allow(clippy::result_large_err)]
+#![allow(
+    clippy::result_large_err,
+    reason = "Keep the pervasive Diagnostic error type by value"
+)]
 
 pub mod ai;
 pub mod backend;

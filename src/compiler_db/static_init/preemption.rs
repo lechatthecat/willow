@@ -107,6 +107,7 @@ impl StaticInitQueries {
 
     /// Resolve deferred module obligations using shared dispatch unions and
     /// 64 shared arity nodes. No caller copies its transitive target set.
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     pub(crate) fn check_preemption(
         &self,
         order: &[UnitId],

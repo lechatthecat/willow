@@ -228,6 +228,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         .expect("willow_string_concat_n returns a string")
     }
 
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     pub(super) fn emit_lir_rvalue(
         &mut self,
         function: &LirFunction,

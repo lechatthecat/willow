@@ -242,14 +242,14 @@ impl RustBridgeSymbol {
 /// Exactly one adapter per declaration; O(declarations + parameters + output).
 pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revision: u32) -> String {
     let mut source = format!(
-        "#[allow(dead_code)] #[path = {abi_path:?}] mod willow_bridge_abi;\nconst _: () = assert!(willow_bridge_abi::WILLOW_RUST_BRIDGE_ABI_REVISION == {revision});\nunsafe extern \"C\" {{ fn willow_rust_bridge_enter(revision: u32); fn willow_rust_bridge_enter_nonblocking(revision: u32); fn willow_rust_bridge_panic() -> !; }}\n"
+        "#[allow(dead_code, reason = \"Shared bridge support may be unused by a particular adapter\")] #[path = {abi_path:?}] mod willow_bridge_abi;\nconst _: () = assert!(willow_bridge_abi::WILLOW_RUST_BRIDGE_ABI_REVISION == {revision});\nunsafe extern \"C\" {{ fn willow_rust_bridge_enter(revision: u32); fn willow_rust_bridge_enter_nonblocking(revision: u32); fn willow_rust_bridge_panic() -> !; }}\n"
     );
     source.push_str(
         "#[cfg(panic = \"abort\")] compile_error!(\"Rust bridge requires panic=unwind\");\n",
     );
     source.push_str(include_str!("rust_bridge_ir/panic.rs"));
     source.push_str(include_str!("rust_bridge_ir/region.rs"));
-    source.push_str("#[allow(dead_code)] mod handles {\n");
+    source.push_str("#[allow(dead_code, reason = \"Shared bridge support may be unused by a particular adapter\")] mod handles {\n");
     source.push_str(include_str!(
         "../crates/willow_runtime/src/rust_bridge_abi/handles.rs"
     ));
@@ -330,6 +330,9 @@ mod aggregate;
 use aggregate::aggregate_wrapper;
 
 #[cfg(test)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "Shared bridge support may be unused by a particular adapter"
+)]
 #[path = "rust_bridge_ir/async_executor_tests.rs"]
 mod async_executor_tests;

@@ -353,6 +353,7 @@ fn human(value: &Value, options: &Options) -> String {
     human_items(value, options).join("\n")
 }
 
+#[allow(clippy::too_many_lines, reason = "split pending")]
 fn human_items(value: &Value, options: &Options) -> Vec<String> {
     let result = &value["result"];
     if options.command == "rename" && options.dry_run && value["status"] == "ok" {

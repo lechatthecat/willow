@@ -258,7 +258,10 @@ pub enum Item {
     Class(ClassDecl),
     Enum(EnumDecl),
     // Payload consumed by the interface type checker/codegen.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "Retain interface metadata for type checking and serialization"
+    )]
     Interface(InterfaceDecl),
 }
 
@@ -268,7 +271,10 @@ pub enum Item {
 /// no fields, and no constructors. Classes declare conformance via an
 /// `implements` clause. See requirements/willow_interface_requirements.md.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)] // fields consumed by the interface type checker
+#[allow(
+    dead_code,
+    reason = "Retain interface metadata for type checking and serialization"
+)] // fields consumed by the interface type checker
 pub struct InterfaceDecl {
     /// Lexically free import spellings from generic defaults, captured during parsing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -345,7 +351,10 @@ pub struct EffectContract {
 
 /// A required method signature inside an interface (no body).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)] // fields consumed by the interface type checker
+#[allow(
+    dead_code,
+    reason = "Retain interface metadata for type checking and serialization"
+)] // fields consumed by the interface type checker
 pub struct InterfaceMethodDecl {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effect_contracts: Vec<EffectContract>,
@@ -399,7 +408,10 @@ pub struct ClassDecl {
     /// Interfaces this class declares conformance to via `implements I, J`.
     /// Each entry is a `Type` so generic interfaces (`implements From<E>`) carry
     /// their type arguments. Consumed by the conformance checker.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "Retain interface metadata for type checking and serialization"
+    )]
     pub implements: Vec<Type>,
     /// Original source prefix; desugaring appends inherited contracts. Only
     /// the source entries require import visibility at this declaration site.

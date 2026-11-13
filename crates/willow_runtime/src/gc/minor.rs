@@ -831,6 +831,7 @@ impl<'a> MinorCollector<'a> {
         mark_roots
     }
 
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn run(
         mut self,
         roots: MinorRoots,

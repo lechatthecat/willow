@@ -193,6 +193,7 @@ pub(crate) struct CaptureInputs<'a> {
     pub symbols: &'a crate::semantic::analysis_symbols::Facts,
 }
 
+#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(crate) fn capture(
     program: &Program,
     graph: &CallGraph,
@@ -769,6 +770,7 @@ struct SnapshotBoundary<'a> {
     indirect: Option<&'a HashMap<UnitId, indirect::Inputs>>,
     generics: Option<&'a HashMap<UnitId, generics::Source>>,
 }
+#[allow(clippy::too_many_lines, reason = "split pending")]
 fn snapshot_with_boundary(
     frontend: &crate::Frontend,
     entry: &Path,

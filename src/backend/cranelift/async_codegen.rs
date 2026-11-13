@@ -68,7 +68,13 @@ type LirAsyncLayoutPlan = (
 );
 const MUTEX_STATUS_RECURSIVE: i64 = willow_abi::LockAcquireStatus::Recursive as i64;
 /// This acquisition's generation is dead; the caller must acquire again.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Retain analysis metadata inspected by focused tests"
+    )
+)]
 const MUTEX_STATUS_LOST: i64 = willow_abi::LockAcquireStatus::Lost as i64;
 /// The task may not park, so nothing was registered. Only the scheduler can
 /// clear this, by running the task's cancellation entry.
@@ -114,6 +120,7 @@ impl UnitCodegenContext<'_> {
     /// Turn the LIR-owned logical frame into the runtime's physical data-slot
     /// layout. The returned identity map is keyed only by `LirLocalId`; the
     /// optional spans on physical slots are diagnostic metadata only.
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn lir_async_layout(
         &self,
         lir: &LirFunction,
@@ -510,6 +517,7 @@ impl UnitCodegenContext<'_> {
     /// Shared constructor, poll and cancellation lowering. `method` supplies
     /// the class context and static flag; methods always reserve an ABI receiver
     /// argument, but only instance methods store a receiver in the frame.
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn compile_cooperative_task(
         &mut self,
         name: &str,
@@ -990,6 +998,7 @@ impl UnitCodegenContext<'_> {
 
     /// The poll-fn state machine: split the body at `await sleep(n)` points into
     /// per-state segments; the entry dispatches on the frame state word.
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn compile_coop_main_poll(
         &mut self,
         poll_symbol: &str,
@@ -1858,6 +1867,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// `offsets` are the section's frame slots in the order
     /// [`crate::ir::lowered::LirLockSlots::locals`] gives them: handle, token,
     /// phase, protected value.
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     pub(super) fn emit_lir_lock_acquire(
         &mut self,
         slots: &crate::ir::lowered::LirLockSlots,

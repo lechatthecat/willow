@@ -217,9 +217,15 @@ pub struct StaticPropInfo {
     /// Declaration index within the class, for init order / forward-reference
     /// checks (static member support §10.4). Populated now; read once §10.4 lands
     /// (tracked: static property initialization checks).
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "Retain declaration metadata in serialized symbol records"
+    )]
     pub decl_index: usize,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "Retain declaration metadata in serialized symbol records"
+    )]
     pub declaration_span: Span,
 }
 
@@ -243,7 +249,10 @@ pub struct MethodInfo {
     pub public: bool,
     pub protected: bool,
     pub is_open: bool,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "Retain declaration metadata in serialized symbol records"
+    )]
     pub is_override: bool,
     pub declaration_span: Span,
 }
@@ -321,7 +330,10 @@ pub struct InterfaceInfo<N = String> {
     pub name: N,
     // `public`/`module_path` drive import visibility; `declaration_span`
     // feeds future diagnostics. Not read until those stages.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "Retain declaration metadata in serialized symbol records"
+    )]
     pub public: bool,
     pub methods: HashMap<String, InterfaceMethodInfo<N>>,
     /// Method names in declaration order — the deterministic vtable slot order
@@ -329,15 +341,24 @@ pub struct InterfaceInfo<N = String> {
     pub method_order: super::method_slots::MethodSlots,
     /// Generic type parameter names in declaration order (`interface Foo<T>`),
     /// empty for non-generic interfaces.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "Retain declaration metadata in serialized symbol records"
+    )]
     pub type_params: Vec<N>,
     /// Direct super-interfaces (`interface B extends A`), module-qualified. Drives
     /// interface-to-interface subtyping; the inherited
     /// methods themselves are composed into `method_order` during desugaring.
     pub extends: Vec<N>,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "Retain declaration metadata in serialized symbol records"
+    )]
     pub declaration_span: Span,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "Retain declaration metadata in serialized symbol records"
+    )]
     pub module_path: Option<String>,
 }
 

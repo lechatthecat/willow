@@ -368,6 +368,7 @@ pub(super) fn declarations(
     }
     declarations_of(&program.imports, program.items.iter(), facts, checked);
 }
+#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(super) fn declarations_of<'a>(
     imports: &[crate::parser::ast::ImportDecl],
     items: impl Iterator<Item = &'a Item> + Clone,
@@ -611,6 +612,7 @@ pub(super) fn select(
     })
 }
 
+#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(super) fn finish(
     captures: &HashMap<UnitId, CapturedUnit>,
     paths: &HashMap<UnitId, String>,

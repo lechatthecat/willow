@@ -138,7 +138,10 @@ fn counter_shard_index() -> usize {
 }
 
 // Lowercase names deliberately match the public snapshot fields.
-#[allow(non_upper_case_globals)]
+#[allow(
+    non_upper_case_globals,
+    reason = "Identifiers retain exported ABI or snapshot field spelling"
+)]
 mod counts {
     use super::*;
     counters! {

@@ -4,6 +4,7 @@ use super::*;
 use willow_abi::runtime_symbols::names as rt;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn emit_lir_select_instruction(&mut self, function: &LirFunction, inst: &LirInst) {
         match inst {
             LirInst::SelectInit { operations } => {
@@ -487,6 +488,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().jump(blocks[resume.0], &[]);
     }
 
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     pub(super) fn emit_lir_block(
         &mut self,
         layout: LirBlockLayout<'_>,

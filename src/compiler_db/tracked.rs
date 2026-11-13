@@ -2,7 +2,10 @@
 //! metadata belongs to this engine and is never serialized with an artifact.
 // Query-family migration follows the engine phase. Keep the typed dispatcher
 // internal until those families have passed their purity/equality audits.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "Typed query dispatcher supports query-family migration"
+)]
 use super::retained::Retained;
 use crate::{module::UnitId, parser::ast::BodyId, semantic::ids::FunctionId};
 use anyhow::{Context, Result};

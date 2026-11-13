@@ -8,3 +8,6 @@ proc-macro = true
 syn = { version = "3.0.7", features = ["full", "visit-mut"] }
 quote = "1.0.47"
 proc-macro2 = "1.0.107"
+
+[lints]
+workspace = true

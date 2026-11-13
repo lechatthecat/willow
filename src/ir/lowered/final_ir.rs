@@ -59,7 +59,10 @@ impl Drop for LirFunction {
 impl Clone for LirFunction {
     fn clone(&self) -> Self {
         // Inline work items avoid another allocation for each cleanup frame.
-        #[allow(clippy::large_enum_variant)]
+        #[allow(
+            clippy::large_enum_variant,
+            reason = "Keep work items and instructions inline without extra allocations"
+        )]
         enum Work<'a> {
             Enter(usize, &'a LirFunction),
             Finish(usize, LirFunction, Vec<(usize, usize, usize)>),
@@ -178,7 +181,10 @@ pub enum LirPattern {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 // Keep the hot instruction stream contiguous; boxing changes every emitter.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Keep work items and instructions inline without extra allocations"
+)]
 pub enum LirInst {
     Compute {
         local: LirLocalId,

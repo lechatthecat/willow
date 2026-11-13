@@ -876,6 +876,7 @@ fn no_alloc_generic_typed_storage_helper() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines, reason = "split pending")]
 fn no_alloc_enum_representations_and_propagation() {
     for (label, declarations, params, result, body, allocates) in [
         (

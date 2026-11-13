@@ -128,6 +128,7 @@ impl TypeChecker {
         value
     }
 
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn finish_binary(&mut self, b: &BinaryExpr, lty: Type, rty: Type) -> Type {
         if Self::contains_error_type(&lty) || Self::contains_error_type(&rty) {
             return Self::error_type();

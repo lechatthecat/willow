@@ -549,6 +549,7 @@ impl<'a> Graph<'a> {
         node
     }
 
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn build(&mut self) {
         while let Some(Work {
             input,

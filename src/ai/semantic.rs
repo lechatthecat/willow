@@ -274,6 +274,7 @@ fn evidence_status(witness: &Value) -> &'static str {
         "compiler-fact"
     }
 }
+#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(super) fn finish(
     captures: &HashMap<UnitId, CapturedUnit>,
     paths: &HashMap<UnitId, String>,

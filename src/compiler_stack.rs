@@ -507,7 +507,11 @@ impl<C: ContinuationCollection<T>, T, E> ContinuationCollection<Result<T, E>> fo
 }
 
 #[cfg(test)]
-#[allow(clippy::overly_complex_bool_expr, clippy::unnecessary_literal_unwrap)]
+#[allow(
+    clippy::overly_complex_bool_expr,
+    clippy::unnecessary_literal_unwrap,
+    reason = "Exercise continuation lowering of literal control flow"
+)]
 mod macro_semantic_tests {
     use super::*;
     #[derive(Default)]

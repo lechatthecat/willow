@@ -550,6 +550,7 @@ impl TypeChecker {
     /// an unknown callback must fail a declaration proof even outside a lock.
     /// Arity hub nodes reuse the existing address-taken analysis without a
     /// call-sites × candidate-values expansion.
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn solve_contracts(
         &self,
         program: &Program,

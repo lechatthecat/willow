@@ -251,6 +251,7 @@ pub fn verify_cached(
         &DataTypes::new(program, &writes),
     )
 }
+#[allow(clippy::too_many_lines, reason = "split pending")]
 fn verify_with_data(
     program: &Program,
     options: &Options,

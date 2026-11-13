@@ -189,6 +189,7 @@ impl TypeChecker {
                 .all(|ty| self.is_sync_cached(ty, cache))
     }
 
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     pub(super) fn check_transfer_ownership(&mut self, root: AstEvent<'_>) {
         if !self.enforce_send_sync {
             return;

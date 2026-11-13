@@ -12,6 +12,7 @@ use crate::semantic::ids::SemanticType as Type;
 
 /// With `overflow_checks` (debug builds), checked integer arithmetic is a
 /// fault whose call stack must keep every recursive frame.
+#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_checks: bool) {
     const MAX_DEPTH: u32 = 3;
     const MAX_INSTRUCTIONS: usize = 256;

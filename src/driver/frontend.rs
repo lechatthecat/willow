@@ -366,6 +366,7 @@ fn parse_entry(
         outcome: parse,
     })
 }
+#[allow(clippy::too_many_lines, reason = "split pending")]
 fn expand_templates(
     mut program: parser::ast::Program,
     graph: &mut module::ModuleGraph,

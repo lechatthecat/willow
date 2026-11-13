@@ -28,18 +28,30 @@
 //! signal/exception handlers instead obey their audited no-panic discipline:
 //! unwinding, allocation and Rust stderr locks are not signal-safe.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "Runtime entry points and helpers are consumed by generated code"
+)]
 // The `extern "C"` ABI exports take raw pointers from Cranelift-generated code
 // and dereference them; they are the unsafe FFI boundary by design, so
 // `not_unsafe_ptr_arg_deref` (which wants `unsafe fn`, incompatible with the
 // exported C symbol contract) is allowed crate-wide.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "Runtime exports are the raw-pointer boundary for generated code"
+)]
 // FFI-boundary code casts raw pointers explicitly to document intent even when
 // the source and target type already match; allow the resulting no-op casts.
-#![allow(clippy::unnecessary_cast)]
+#![allow(
+    clippy::unnecessary_cast,
+    reason = "Explicit FFI casts document the ABI types across targets"
+)]
 // Some f64 formatting tests use `3.14` as a sample value, not an approximation
 // of pi; the lint is a false positive there.
-#![allow(clippy::approx_constant)]
+#![allow(
+    clippy::approx_constant,
+    reason = "Formatting tests use decimal samples rather than mathematical constants"
+)]
 
 #[cfg(test)]
 mod abi_signature_tests;

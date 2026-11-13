@@ -38,3 +38,6 @@ corosensei = "0.3.4"
 
 [dev-dependencies]
 wat = "1.245.1"
+
+[lints]
+workspace = true

@@ -92,7 +92,7 @@ macro_rules! runtime_abi_schema {
         /// use willow_abi::runtime_symbols::names;
         /// let _ = names::willow_string_conact;
         /// ```
-        #[allow(non_upper_case_globals)] // Keep the exported C spelling as the identifier.
+        #[allow(non_upper_case_globals, reason = "Identifiers retain exported ABI or snapshot field spelling")] // Keep the exported C spelling as the identifier.
         pub mod names {
             $(pub const $name: &str = stringify!($name);)*
         }

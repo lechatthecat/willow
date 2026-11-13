@@ -254,7 +254,10 @@ impl DirectSession {
         )
     }
     /// Preserve the caller's diagnostic policy through validation and publication.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Preserve the exported rename_with_emitter API"
+    )]
     pub fn rename_with_emitter(
         mut self,
         entry: &Path,
@@ -555,6 +558,7 @@ impl DirectSession {
         }
         Ok(reason)
     }
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     pub fn resolve(&mut self, selector: &str, filter: &SelectorFilter) -> Result<Value> {
         let revision = self.session.revision().to_owned();
         let mut location_reason = None;

@@ -168,6 +168,7 @@ pub struct CleanupGraph {
 }
 
 impl CleanupGraph {
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     pub fn lower(function: &LirFunction) -> Result<Self, &'static str> {
         let mut graph = Self {
             entries: vec![None; function.blocks.len()],

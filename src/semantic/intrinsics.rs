@@ -668,6 +668,7 @@ pub(crate) fn builtin_static_effects(
 /// Returns `None` when the call is not a builtin — a user class method, an
 /// interface method, an Option/Result combinator, or an error the checker has
 /// already reported.
+#[allow(clippy::too_many_lines, reason = "split pending")]
 pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
     recv: &Type<N>,
     method: &str,

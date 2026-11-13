@@ -631,6 +631,7 @@ impl Cursor {
         }
     }
 
+    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn chunk_step(&mut self, state: &mut GcState, assist: bool, remaining: u64) -> Action {
         let index = self.chunks;
         let chunk = &mut state.tlab_chunks[index];
