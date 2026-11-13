@@ -81,6 +81,10 @@ mod validation;
 pub(super) use validation::*;
 mod expression_validation;
 use expression_validation::*;
+#[cfg(test)]
+mod expression_validation_tests;
+#[cfg(test)]
+use expression_validation_tests::*;
 mod intrinsic;
 mod rvalue;
 mod terminator;
