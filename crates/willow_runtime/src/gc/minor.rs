@@ -4,14 +4,14 @@ use std::alloc::{Layout, dealloc};
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
 
+#[cfg(test)]
+use super::runtime;
 use super::{
     DropFn, GC_GENERATION_OLD, GC_GENERATION_YOUNG, GC_HEADER_SIZE, GC_REGION_MARK_GRANULE,
-    GcHeader, GcPayload, GcState, HeapObject, MinorRegistrySnapshot, RegionKind, RootSlot,
-    allocate_old_region_object_for_move, append_object_reference_slots, append_parked_roots,
-    foreign_root_stack_owner_active, foreign_root_stack_owner_active_locked, index_retired_chunk,
-    minor_registry_snapshot, minor_stack_roots, retire_all_tlabs_unindexed, runtime,
-    runtime_root_slots, tlab_payload_generation, verify_old_region_metadata, verify_remembered_set,
-    willow_gc_safepoint, with_stw,
+    GcHeader, GcPayload, GcRuntime, GcState, HeapObject, MinorRegistrySnapshot, RegionKind,
+    RootSlot, allocate_old_region_object_for_move_in, append_object_reference_slots,
+    append_parked_roots, index_retired_chunk, minor_stack_roots, runtime_root_slots,
+    tlab_payload_generation, verify_old_region_metadata, verify_remembered_set,
 };
 
 /// Collector-private address keys use the shared folded multiply; SipHash
@@ -44,14 +44,48 @@ mod m4_probe;
 #[path = "minor_overlap_tests.rs"]
 mod overlap_tests;
 
+trait MinorObservation {
+    fn reset_policy_visits(&self) {}
+    fn policy_visit(&self) {}
+    fn page_query(&self) {}
+    fn snapshot_keys(&self, _keys: usize) {}
+}
+
+#[cfg(not(test))]
+#[derive(Default)]
+pub(super) struct RuntimeMinorObservation {
+    _disabled: (),
+}
+#[cfg(not(test))]
+impl MinorObservation for RuntimeMinorObservation {}
+
 #[cfg(test)]
-thread_local! {
-    static PAGE_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static SNAPSHOT_DEDUP_KEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+#[derive(Default)]
+pub(super) struct RuntimeMinorObservation {
+    page_queries: std::cell::Cell<usize>,
+    policy_visits: std::cell::Cell<usize>,
+    snapshot_dedup_keys: std::cell::Cell<usize>,
+}
+#[cfg(test)]
+impl MinorObservation for RuntimeMinorObservation {
+    fn reset_policy_visits(&self) {
+        self.policy_visits.set(0);
+    }
+    fn policy_visit(&self) {
+        self.policy_visits.set(self.policy_visits.get() + 1);
+    }
+    fn page_query(&self) {
+        self.page_queries.set(self.page_queries.get() + 1);
+    }
+    fn snapshot_keys(&self, keys: usize) {
+        self.snapshot_dedup_keys.set(keys);
+    }
 }
 
 struct MinorCollector<'a> {
-    #[cfg(test)]
+    owner: &'a crate::runtime::Runtime,
+    // Own only a reserve admitted by this collector; an outer admission
+    // remains responsible for a reserve prepared before the stop.
     release_reserve_on_drop: bool,
     work: crate::gc_telemetry::MarkWork,
     stop_work: &'a mut crate::gc_telemetry::stops::StopWorkV2,
@@ -86,7 +120,6 @@ struct MinorCollector<'a> {
 impl Drop for MinorCollector<'_> {
     fn drop(&mut self) {
         self.release_promotion_destination();
-        #[cfg(test)]
         if self.release_reserve_on_drop {
             release_survivor_reserve(self.state);
         }
@@ -95,6 +128,7 @@ impl Drop for MinorCollector<'_> {
 
 impl<'a> MinorCollector<'a> {
     fn new(
+        owner: &'a crate::runtime::Runtime,
         state: &'a mut GcState,
         registry: std::sync::Arc<MinorRegistrySnapshot>,
         stop_work: &'a mut crate::gc_telemetry::stops::StopWorkV2,
@@ -111,15 +145,13 @@ impl<'a> MinorCollector<'a> {
         // the collector wrote every survivor header. Young
         // membership is answered by the chunk index plus start bitmap, so no
         // per-object index is built for the (mostly dead) nursery.
-        #[cfg(test)]
         let release_reserve_on_drop = !state.survivor_reserve_active;
-        #[cfg(test)]
         if release_reserve_on_drop {
-            prepare_survivor_reserve(state);
+            prepare_survivor_reserve_in(owner, state);
         }
         let source_chunks = state.tlab_chunks.len();
         let mut collector = Self {
-            #[cfg(test)]
+            owner,
             release_reserve_on_drop,
             work: crate::gc_telemetry::MarkWork::default(),
             stop_work,
@@ -183,8 +215,7 @@ impl<'a> MinorCollector<'a> {
                 return Some(index);
             }
         }
-        #[cfg(test)]
-        PAGE_QUERIES.set(PAGE_QUERIES.get() + 1);
+        self.state.minor_observation.page_query();
         let index = self
             .chunk_pages
             .get(&(header / super::GC_TLAB_CHUNK_SIZE))?
@@ -255,7 +286,7 @@ impl<'a> MinorCollector<'a> {
             return;
         }
         if let Some(object) = self.young_source(address) {
-            if verify_no_pin() {
+            if *self.owner.diagnostics.gc_verify_no_pin {
                 crate::failure::fatal_invariant(&format!(
                     "WILLOW_GC_VERIFY_NO_PIN: minor collection pinned a young object ({})",
                     source.describe()
@@ -326,7 +357,7 @@ impl<'a> MinorCollector<'a> {
             self.state.survivor_reserve_stats.consumed_bytes += chunk.capacity as u64;
             let index = self.state.tlab_chunks.len();
             self.state.tlab_addresses.insert(chunk.base as usize, index);
-            runtime().root_tlabs.insert(&chunk);
+            self.owner.gc.root_tlabs.insert(&chunk);
             self.state.tlab_chunks.push(chunk);
             self.index_chunk(index);
             self.state.survivor_stats.survivor_space_reserved += GC_TLAB_CHUNK_SIZE as u64;
@@ -385,31 +416,38 @@ impl<'a> MinorCollector<'a> {
         if let Some(index) = self.promotion_destination {
             let allocated = if self.buffer_promotion_entries {
                 self.state.old_regions[index]
-                    .allocate_fresh_promotion(source, size, &mut self.promotion_entries)
+                    .allocate_fresh_promotion(
+                        self.owner.gc.mark_phase(),
+                        source,
+                        size,
+                        &mut self.promotion_entries,
+                    )
                     .map(|object| (object, false))
             } else {
                 self.state.old_regions[index].allocate_object_for_move_buffered(
-                    metadata.type_id,
-                    metadata.layout_id,
-                    metadata.gc_ref_mask,
-                    metadata.payload_size,
+                    self.owner.gc.mark_phase(),
+                    metadata,
                     Some(source),
                     None,
                 )
             };
             if let Some((object, reused)) = allocated {
-                super::account_old_region_allocation(self.state, size, reused, false);
+                super::account_old_region_allocation_in(
+                    &self.owner.gc,
+                    self.state,
+                    size,
+                    reused,
+                    false,
+                );
                 return Some(object);
             }
             self.release_promotion_destination();
         }
         let previous_regions = self.state.old_regions.len();
-        let object = allocate_old_region_object_for_move(
+        let object = allocate_old_region_object_for_move_in(
+            self.owner,
             self.state,
-            metadata.layout_id,
-            metadata.type_id,
-            metadata.payload_size,
-            metadata.gc_ref_mask,
+            metadata,
             false,
             Some(source),
         )?;
@@ -499,7 +537,8 @@ impl<'a> MinorCollector<'a> {
                 self.pin_root(payload, PinSource::MemoryBudget);
                 return payload;
             }
-            crate::gc_telemetry::failure_record::emit(
+            crate::gc_telemetry::failure_record::emit_in(
+                self.owner,
                 "evacuation_allocation",
                 "minor evacuation allocation failed without a region budget",
             );
@@ -825,8 +864,7 @@ impl<'a> MinorCollector<'a> {
                     retain(address, false);
                 });
             }
-            #[cfg(test)]
-            SNAPSHOT_DEDUP_KEYS.set(seen.len());
+            self.state.minor_observation.snapshot_keys(seen.len());
         }
         mark_roots
     }
@@ -840,10 +878,11 @@ impl<'a> MinorCollector<'a> {
         let started = std::time::Instant::now();
         self.work.remembered_owners = remembered.len() as u64;
         let cpu_start = crate::gc_telemetry::workers::thread_cpu_ns();
-        let evacuation = crate::gc_telemetry::measurement::Span::new(
+        let evacuation = crate::gc_telemetry::measurement::Span::for_runtime(
+            self.owner,
             crate::gc_telemetry::measurement::Phase::Evacuation,
         );
-        let root_scan = crate::gc_telemetry::measurement::Span::fused_roots();
+        let root_scan = crate::gc_telemetry::measurement::Span::fused_roots_in(self.owner);
         let count = roots.slots.len() + roots.values.len();
         self.work.root_scan_bytes = crate::gc_telemetry::MarkWork::roots(count).root_scan_bytes;
         self.stop_work.root_values += count as u64;
@@ -862,6 +901,7 @@ impl<'a> MinorCollector<'a> {
             }
         }
         let remembered_scan = crate::gc_telemetry::pause::Span::new(
+            &self.owner.telemetry.pause,
             crate::gc_telemetry::pause::Component::Remembered,
         );
         let (whole, carded) = remembered.into_parts();
@@ -936,7 +976,7 @@ impl<'a> MinorCollector<'a> {
         let mut reclaimed_young = 0u64;
         // Nursery runs are usually one type; skip the registry probe for them.
         let mut last_type: Option<(u32, Option<DropFn>)> = None;
-        let poison_moved = moved_sources_poisoned();
+        let poison_moved = moved_sources_poisoned(&self.owner.diagnostics);
         self.state.survivor_stats.survivor_space_reserved = 0;
         self.state.survivor_stats.survivor_space_live = 0;
         let mut chunk_identities: Vec<_> = (0..self.state.tlab_chunks.len()).collect();
@@ -1068,7 +1108,14 @@ impl<'a> MinorCollector<'a> {
                         && !forwarded
                     {
                         // SAFETY: unreachable young objects still own their runtime payload.
-                        unsafe { super::run_drop_hook(drop_fn, object.payload().as_ptr()) };
+                        unsafe {
+                            super::run_drop_hook(
+                                &self.owner.gc,
+                                drop_fn,
+                                object.payload().as_ptr(),
+                                crate::observation::Value::new(|| type_id),
+                            )
+                        };
                     }
                     if poison_moved && forwarded {
                         // A holder that kept the pre-move address instead of
@@ -1192,7 +1239,7 @@ impl<'a> MinorCollector<'a> {
             cycle.termination.restart();
         }
         crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::SweepComplete);
-        crate::gc_telemetry::observations::graph_work(self.work);
+        crate::gc_telemetry::observations::graph_work_in(self.owner, self.work);
         (reclaimed_bytes, std::mem::take(&mut self.work))
     }
 
@@ -1259,7 +1306,7 @@ impl<'a> MinorCollector<'a> {
     /// Free a source chunk none of whose objects remain allocated.
     fn release_chunk(&mut self, chunk_index: usize, chunk_identities: &mut Vec<usize>) {
         let chunk = self.state.tlab_chunks.swap_remove(chunk_index);
-        runtime().root_tlabs.remove(chunk.base as usize);
+        self.owner.gc.root_tlabs.remove(chunk.base as usize);
         chunk_identities.swap_remove(chunk_index);
         self.state.released_bytes = self
             .state
@@ -1323,13 +1370,6 @@ impl PinSource {
     }
 }
 
-/// Whether `WILLOW_GC_VERIFY_NO_PIN` is enabled: set to a non-empty value
-/// other than `0`. Read once; consulted only when a young object is about to
-/// be pinned.
-fn verify_no_pin() -> bool {
-    *crate::diagnostic_settings::GC_VERIFY_NO_PIN
-}
-
 #[cfg(test)]
 use crate::diagnostic_settings::verify_no_pin_enabled;
 
@@ -1345,15 +1385,20 @@ use crate::diagnostic_settings::verify_no_pin_enabled;
 /// budget that cannot grow the nursery, the collection runs and promotes only
 /// those runtime-held referents in place.
 fn minor_collect_with_roots(
+    owner: &crate::runtime::Runtime,
     mut roots: MinorRoots,
+    force_pin: bool,
     stop_work: &mut crate::gc_telemetry::stops::StopWorkV2,
 ) -> Option<(u64, u64, crate::gc_telemetry::MarkWork)> {
-    let root_scan =
-        crate::gc_telemetry::measurement::Span::new(crate::gc_telemetry::measurement::Phase::Roots);
-    append_parked_roots(&mut roots);
-    roots.slots.extend(runtime_root_slots());
+    let root_scan = crate::gc_telemetry::measurement::Span::for_runtime(
+        owner,
+        crate::gc_telemetry::measurement::Phase::Roots,
+    );
+    append_parked_roots(&owner.gc, &mut roots);
+    roots.slots.extend(runtime_root_slots(&owner.gc));
     roots.values.extend(
-        runtime()
+        owner
+            .gc
             .pin_lease_slots
             .snapshot()
             .into_iter()
@@ -1367,9 +1412,9 @@ fn minor_collect_with_roots(
     // below and subsequent stores use the old-to-young barrier. Scanning
     // the complete registry here would revisit every suspended task each minor.
     drop(root_scan);
-    let registry = minor_registry_snapshot();
-    let mut state = runtime().heap.lock().unwrap();
-    runtime().runtime_roots.drain_pending(|address| {
+    let registry = super::registry::minor_registry_snapshot_in(&owner.gc);
+    let mut state = owner.gc.heap.lock().unwrap();
+    owner.gc.runtime_roots.drain_pending(|address| {
         // A root may have been removed after transferring the owner elsewhere.
         // Pending addresses are obligations, not retention: under the heap lock
         // validate managed old storage before touching any header. Major sweep
@@ -1382,8 +1427,8 @@ fn minor_collect_with_roots(
     });
     // Promotion raises `occupied` per object; drop the lock-free headrooms
     // once instead of charging each copy.
-    super::invalidate_external_headroom();
-    if should_defer_minor(&mut state, &roots) {
+    owner.gc.headroom.invalidate();
+    if should_defer_minor(&mut state, &roots, force_pin) {
         state.survivor_stats.deferred_minor_collections += 1;
         let end = state
             .minor_deferral_start_bytes
@@ -1399,14 +1444,16 @@ fn minor_collect_with_roots(
     state.minor_deferral_budget_bytes = 0;
     state.survivor_stats.minor_blockers = 0;
     state.minor_retry_bytes = 0;
-    if crate::diagnostic_settings::GC_VERIFY_BARRIER.unicode
+    if owner.diagnostics.verify_barrier.unicode
         && let Err(message) = verify_remembered_set(&state, &registry.trace)
     {
-        crate::gc_telemetry::failure_record::emit("invariant", &message);
+        crate::gc_telemetry::failure_record::emit_in(owner, "invariant", &message);
         panic!("willow gc: write barrier verification failed: {message}");
     }
-    let remembered_reset =
-        crate::gc_telemetry::pause::Span::new(crate::gc_telemetry::pause::Component::Remembered);
+    let remembered_reset = crate::gc_telemetry::pause::Span::new(
+        &owner.telemetry.pause,
+        crate::gc_telemetry::pause::Component::Remembered,
+    );
     let remembered = state.remembered_set.take();
     state.dirty_cards.clear();
     drop(remembered_reset);
@@ -1416,9 +1463,11 @@ fn minor_collect_with_roots(
     let promoted_before = state.promoted_bytes;
     let copied_before = state.survivor_stats.survivor_bytes;
     let pinned_before = state.survivor_stats.pinned_promotions;
-    let collector = MinorCollector::new(&mut state, registry, stop_work);
-    let root_enumeration =
-        crate::gc_telemetry::pause::Span::new(crate::gc_telemetry::pause::Component::Roots);
+    let collector = MinorCollector::new(owner, &mut state, registry, stop_work);
+    let root_enumeration = crate::gc_telemetry::pause::Span::new(
+        &owner.telemetry.pause,
+        crate::gc_telemetry::pause::Component::Roots,
+    );
     let mut mark_roots = collector.snapshot_roots();
     roots
         .slots
@@ -1442,7 +1491,7 @@ fn minor_collect_with_roots(
         allocators,
         state.memory_limit_bytes,
     );
-    if *crate::diagnostic_settings::GC_VERIFY_REGIONS
+    if *owner.diagnostics.verify_regions
         && let Err(message) = verify_old_region_metadata(&state)
     {
         panic!("willow gc: region verification failed after minor collection: {message}");
@@ -1451,7 +1500,7 @@ fn minor_collect_with_roots(
     state
         .pacer
         .resume_allocation(crate::gc_telemetry::timestamp_ns(), allocated_total);
-    super::progress::record_success(state.total_allocated_bytes);
+    super::progress::record_success(&owner.gc, state.total_allocated_bytes);
     Some((before, state.allocated_bytes as u64, work))
 }
 
@@ -1463,9 +1512,8 @@ fn minor_collect_with_roots(
 /// Collection is requested at a refill boundary; concurrent active TLABs can
 /// overshoot by their bump runway.
 /// Reservation caps remain independently enforced by the allocation paths.
-fn should_defer_minor(state: &mut super::GcState, roots: &MinorRoots) -> bool {
-    #[cfg(test)]
-    LEASE_POLICY_VISITS.set(0);
+fn should_defer_minor(state: &mut super::GcState, roots: &MinorRoots, force_pin: bool) -> bool {
+    state.minor_observation.reset_policy_visits();
     // A scoped loan already requires in-place promotion. Its unsafe-stack
     // aliases cannot become movable by waiting, so do not accrue deferral debt
     // for them. Build the membership index once, rather than scanning leases
@@ -1474,8 +1522,7 @@ fn should_defer_minor(state: &mut super::GcState, roots: &MinorRoots) -> bool {
         .values
         .iter()
         .filter_map(|&(value, source)| {
-            #[cfg(test)]
-            LEASE_POLICY_VISITS.set(LEASE_POLICY_VISITS.get() + 1);
+            state.minor_observation.policy_visit();
             (source == PinSource::ScopedLoan).then_some(value as usize)
         })
         .collect();
@@ -1483,15 +1530,14 @@ fn should_defer_minor(state: &mut super::GcState, roots: &MinorRoots) -> bool {
         .values
         .iter()
         .filter(|&&(value, source)| {
-            #[cfg(test)]
-            LEASE_POLICY_VISITS.set(LEASE_POLICY_VISITS.get() + 1);
+            state.minor_observation.policy_visit();
             source == PinSource::RuntimeCodeStack
                 && !leased.contains(&(value as usize))
                 && tlab_payload_generation(state, value as usize) == Some(GC_GENERATION_YOUNG)
         })
         .count();
     state.survivor_stats.minor_blockers = blockers as u64;
-    if state.memory_limit_bytes.is_some() || force_pin_fallback() || blockers == 0 {
+    if state.memory_limit_bytes.is_some() || force_pin || blockers == 0 {
         return false;
     }
     if state.minor_deferral_start_bytes.is_none() {
@@ -1500,23 +1546,6 @@ fn should_defer_minor(state: &mut super::GcState, roots: &MinorRoots) -> bool {
     }
     let age = super::minor_deferral_age(state);
     state.young_allocation_clock != u64::MAX && age < state.minor_deferral_budget_bytes
-}
-
-#[cfg(test)]
-thread_local! {
-    static FORCE_PIN_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static LEASE_POLICY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-fn force_pin_fallback() -> bool {
-    FORCE_PIN_FALLBACK.with(std::cell::Cell::get)
-}
-
-#[cfg(not(test))]
-#[inline(always)]
-fn force_pin_fallback() -> bool {
-    false
 }
 
 #[cfg(test)]
@@ -1532,40 +1561,51 @@ pub(crate) fn deferred_minor_collections_for_test() -> u64 {
 /// Run a minor collection that promotes young referents of runtime-held value
 /// roots in place, as under a hard memory budget, instead of deferring. Unit
 /// fixtures use it to drive the remaining pinned-region paths without a
-/// budget. The flag is thread-local so concurrently running
-/// tests that expect deferral are unaffected.
+/// budget. The policy is passed through this call only; no override survives
+/// return, deferral to another collector, or unwinding.
 #[cfg(test)]
 pub(crate) fn minor_collect_pinning_for_test() {
-    FORCE_PIN_FALLBACK.with(|force| force.set(true));
-    minor_collect_internal();
-    FORCE_PIN_FALLBACK.with(|force| force.set(false));
+    minor_collect_with_policy(true);
 }
 
 // Only the major owner may relocate while its epoch exists. Requests coalesce;
 // initial/remark/sweep requests are serviced at a safe owner boundary.
-static PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 pub(super) fn reset_pending() {
-    PENDING.store(false, std::sync::atomic::Ordering::Release);
+    runtime()
+        .minor_pending
+        .store(false, std::sync::atomic::Ordering::Release);
 }
 
-pub(super) fn requested() -> bool {
-    PENDING.load(std::sync::atomic::Ordering::Acquire)
+pub(super) fn requested(owner: &GcRuntime) -> bool {
+    owner
+        .minor_pending
+        .load(std::sync::atomic::Ordering::Acquire)
 }
 
 pub(super) fn service_pending() {
-    if PENDING.swap(false, std::sync::atomic::Ordering::AcqRel) {
-        collect_owned();
+    service_pending_in(crate::runtime::current());
+}
+
+pub(super) fn service_pending_in(owner: &crate::runtime::Runtime) {
+    if owner
+        .gc
+        .minor_pending
+        .swap(false, std::sync::atomic::Ordering::AcqRel)
+    {
+        collect_owned_in(owner);
     }
 }
 
 fn collect_stopped(
+    owner: &crate::runtime::Runtime,
     coord: &super::GcCoord,
+    force_pin: bool,
     stop_work: &mut crate::gc_telemetry::stops::StopWorkV2,
 ) -> Option<(u64, u64, crate::gc_telemetry::MarkWork)> {
     {
-        let mut state = runtime().heap.lock().unwrap();
+        let mut state = owner.gc.heap.lock().unwrap();
         assert!(
             state.sweeping.is_none(),
             "minor relocation must wait for old sweep finalization"
@@ -1574,14 +1614,16 @@ fn collect_stopped(
             assert_eq!(cycle.collector, std::thread::current().id());
         }
         super::flush_satb_all_locked(coord, &mut state);
-        retire_all_tlabs_unindexed(&mut state);
+        super::tlab::retire_all_tlabs_unindexed_in(owner, &mut state);
     }
-    let root_scan =
-        crate::gc_telemetry::measurement::Span::new(crate::gc_telemetry::measurement::Phase::Roots);
+    let root_scan = crate::gc_telemetry::measurement::Span::for_runtime(
+        owner,
+        crate::gc_telemetry::measurement::Phase::Roots,
+    );
     let roots = minor_stack_roots(coord);
     drop(root_scan);
-    let result = minor_collect_with_roots(roots, stop_work);
-    if let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref()
+    let result = minor_collect_with_roots(owner, roots, force_pin, stop_work);
+    if let Some(cycle) = owner.gc.heap.lock().unwrap().concurrent_cycle.as_ref()
         && !cycle.closing.load(std::sync::atomic::Ordering::Acquire)
     {
         cycle.satb_shards.reopen_stopped(coord);
@@ -1590,63 +1632,100 @@ fn collect_stopped(
 }
 
 pub(super) fn collect_owned() {
-    let cycle = crate::gc_telemetry::Cycle::begin(crate::gc_telemetry::CycleKind::Minor);
-    let _reserve = SurvivorAdmission::new();
-    let collected = with_stw(
+    collect_owned_in(crate::runtime::current());
+}
+
+fn collect_owned_in(owner: &crate::runtime::Runtime) {
+    let cycle = crate::gc_telemetry::Cycle::begin_in(
+        &owner.telemetry,
+        crate::gc_telemetry::CycleKind::Minor,
+    );
+    let _reserve = SurvivorAdmission::new(owner);
+    let collected = super::safepoint::with_stw_in(
+        owner,
         crate::gc_telemetry::stops::StopReason::Minor,
         |coord, stop_work| {
-            if foreign_root_stack_owner_active_locked(coord) {
-                super::progress::record_skip(super::GcSkipReason::ForeignOwnerAtHandshake);
+            if super::root::foreign_root_stack_owner_active_locked_in(&owner.gc, coord) {
+                super::progress::record_skip(
+                    &owner.gc,
+                    super::GcSkipReason::ForeignOwnerAtHandshake,
+                );
                 return None;
             }
-            collect_stopped(coord, stop_work)
+            collect_stopped(owner, coord, false, stop_work)
         },
     );
     drop(_reserve);
     if let Some((before, after, work)) = collected {
-        crate::gc_telemetry::emit_cycle(cycle.finish(before, after, work));
+        crate::gc_telemetry::emit_cycle_in(owner, cycle.finish(before, after, work));
     }
 }
 
 pub(crate) fn minor_collect_internal() {
-    if runtime()
+    minor_collect_with_policy(false);
+}
+
+pub(super) fn minor_collect_in(owner: &crate::runtime::Runtime) {
+    minor_collect_with_policy_in(owner, false);
+}
+
+fn minor_collect_with_policy(force_pin: bool) {
+    minor_collect_with_policy_in(crate::runtime::current(), force_pin);
+}
+
+fn minor_collect_with_policy_in(owner: &crate::runtime::Runtime, force_pin: bool) {
+    if owner
+        .gc
         .stop_requested
         .load(std::sync::atomic::Ordering::Acquire)
     {
-        PENDING.store(true, std::sync::atomic::Ordering::Release);
-        willow_gc_safepoint();
+        owner
+            .gc
+            .minor_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+        super::safepoint::safepoint_in(owner);
         return;
     }
-    let Some(_serialize) = super::cycle_wait::CollectorGuard::try_acquire() else {
-        PENDING.store(true, std::sync::atomic::Ordering::Release);
-        willow_gc_safepoint();
+    let Some(_serialize) = super::cycle_wait::CollectorGuard::try_acquire_in(owner) else {
+        owner
+            .gc
+            .minor_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+        super::safepoint::safepoint_in(owner);
         return;
     };
-    if foreign_root_stack_owner_active() {
-        super::progress::record_skip(super::GcSkipReason::ForeignOwner);
+    if super::root::foreign_root_stack_owner_active_in(&owner.gc) {
+        super::progress::record_skip(&owner.gc, super::GcSkipReason::ForeignOwner);
         return;
     }
 
     // This elected minor satisfies any request left at a previous owner boundary.
-    PENDING.swap(false, std::sync::atomic::Ordering::AcqRel);
-    let cycle = crate::gc_telemetry::Cycle::begin(crate::gc_telemetry::CycleKind::Minor);
-    let _reserve = SurvivorAdmission::new();
+    owner
+        .gc
+        .minor_pending
+        .swap(false, std::sync::atomic::Ordering::AcqRel);
+    let cycle = crate::gc_telemetry::Cycle::begin_in(
+        &owner.telemetry,
+        crate::gc_telemetry::CycleKind::Minor,
+    );
+    let _reserve = SurvivorAdmission::new(owner);
     // Stop the world and scan every registered mutator, for the reason spelled
     // out over the major cycle's mark phase: a registration that races a
     // single-mutator scan leaves the newcomer's objects unmarked.
-    let collected = with_stw(
+    let collected = super::safepoint::with_stw_in(
+        owner,
         crate::gc_telemetry::stops::StopReason::Minor,
         |coord, stop_work| {
             // Recheck under the stop's coord hold: an owner may have left the
             // registry, stack still nonempty, after the unlocked check above.
-            if foreign_root_stack_owner_active_locked(coord) {
+            if super::root::foreign_root_stack_owner_active_locked_in(&owner.gc, coord) {
                 return None;
             }
-            Some(collect_stopped(coord, stop_work))
+            Some(collect_stopped(owner, coord, force_pin, stop_work))
         },
     );
     let Some(collected) = collected else {
-        super::progress::record_skip(super::GcSkipReason::ForeignOwnerAtHandshake);
+        super::progress::record_skip(&owner.gc, super::GcSkipReason::ForeignOwnerAtHandshake);
         return;
     };
     let Some((before, after, work)) = collected else {
@@ -1655,7 +1734,7 @@ pub(crate) fn minor_collect_internal() {
     drop(_reserve);
     let event = cycle.finish(before, after, work);
     drop(_serialize);
-    crate::gc_telemetry::emit_cycle(event);
+    crate::gc_telemetry::emit_cycle_in(owner, event);
 }
 
 /// Reserve one destination chunk per source chunk before the stop. Packing
@@ -1664,7 +1743,12 @@ pub(crate) fn minor_collect_internal() {
 /// allocation. Refills before the stop admit their own destination
 /// (`admit_refill_survivor`). Empty reserve chunks are not addressable heap
 /// objects.
+#[cfg(test)]
 fn prepare_survivor_reserve(state: &mut GcState) {
+    prepare_survivor_reserve_in(crate::runtime::current(), state);
+}
+
+fn prepare_survivor_reserve_in(owner: &crate::runtime::Runtime, state: &mut GcState) {
     assert!(!state.survivor_reserve_active);
     state.survivor_reserve_active = true;
     let count = state
@@ -1676,7 +1760,7 @@ fn prepare_survivor_reserve(state: &mut GcState) {
     state.survivor_reserve.reserve(count);
     state.tlab_chunks.reserve(count);
     for _ in 0..count {
-        if !admit_survivor_chunk(state) {
+        if !admit_survivor_chunk_in(owner, state) {
             break;
         }
     }
@@ -1687,19 +1771,24 @@ fn prepare_survivor_reserve(state: &mut GcState) {
 /// A TLAB installed between admission and the stop is one more evacuation
 /// source; admit its destination now so concurrent refills cannot exhaust
 /// the reserve. O(1) under the heap lock the refill already holds.
-pub(super) fn admit_refill_survivor(state: &mut GcState) {
+pub(super) fn admit_refill_survivor(owner: &crate::runtime::Runtime, state: &mut GcState) {
     if state.survivor_reserve_active {
         state.survivor_reserve_stats.requested_bytes = state
             .survivor_reserve_stats
             .requested_bytes
             .saturating_add(super::GC_TLAB_CHUNK_SIZE as u64);
-        admit_survivor_chunk(state);
+        admit_survivor_chunk_in(owner, state);
     }
 }
 
+#[cfg(test)]
 fn admit_survivor_chunk(state: &mut GcState) -> bool {
+    admit_survivor_chunk_in(crate::runtime::current(), state)
+}
+
+fn admit_survivor_chunk_in(owner: &crate::runtime::Runtime, state: &mut GcState) -> bool {
     use super::{BumpChunk, GC_TLAB_CHUNK_SIZE, RegionMarkBitmap};
-    if !super::can_reserve(state, GC_TLAB_CHUNK_SIZE) {
+    if !super::can_reserve_in(&owner.gc, state, GC_TLAB_CHUNK_SIZE) {
         return false;
     }
     if let Some(mut chunk) = state.region_cache.take_survivor() {
@@ -1710,7 +1799,7 @@ fn admit_survivor_chunk(state: &mut GcState) -> bool {
         state.tlab_reserved_bytes += GC_TLAB_CHUNK_SIZE;
         state.survivor_reserve_stats.admitted_bytes += GC_TLAB_CHUNK_SIZE as u64;
         state.survivor_reserve_stats.available_bytes += GC_TLAB_CHUNK_SIZE as u64;
-        super::note_reservation_growth(state);
+        super::note_reservation_growth_in(owner, state);
         return true;
     }
     let layout =
@@ -1719,11 +1808,12 @@ fn admit_survivor_chunk(state: &mut GcState) -> bool {
     // chunk sweep owns it. Only initialized object starts below `used` are
     // readable: evacuation writes the full header and copies the full payload
     // before publishing the object. Empty reserve and unused tails stay opaque.
-    let base = unsafe { super::allocate_survivor_storage(layout) };
+    let base = unsafe { super::allocate_survivor_storage(&state.storage_allocator, layout) };
     if base.is_null() {
         return false;
     }
     state.survivor_reserve.push(BumpChunk {
+        lookup_comparisons: crate::observation::Value::default(),
         base,
         capacity: GC_TLAB_CHUNK_SIZE,
         used: 0,
@@ -1739,7 +1829,7 @@ fn admit_survivor_chunk(state: &mut GcState) -> bool {
     state.tlab_reserved_bytes += GC_TLAB_CHUNK_SIZE;
     state.survivor_reserve_stats.admitted_bytes += GC_TLAB_CHUNK_SIZE as u64;
     state.survivor_reserve_stats.available_bytes += GC_TLAB_CHUNK_SIZE as u64;
-    super::note_reservation_growth(state);
+    super::note_reservation_growth_in(owner, state);
     true
 }
 
@@ -1759,21 +1849,57 @@ pub(super) fn release_survivor_reserve(state: &mut GcState) {
     state.survivor_reserve_stats.available_bytes = 0;
 }
 
-struct SurvivorAdmission;
-impl SurvivorAdmission {
-    fn new() -> Self {
-        prepare_survivor_reserve(&mut runtime().heap.lock().unwrap());
-        Self
+struct SurvivorAdmission<'a> {
+    owner: &'a GcRuntime,
+}
+impl<'a> SurvivorAdmission<'a> {
+    fn new(owner: &'a crate::runtime::Runtime) -> Self {
+        prepare_survivor_reserve_in(owner, &mut owner.gc.heap.lock().unwrap());
+        Self { owner: &owner.gc }
     }
 }
-impl Drop for SurvivorAdmission {
+impl Drop for SurvivorAdmission<'_> {
     fn drop(&mut self) {
-        release_survivor_reserve(&mut runtime().heap.lock().unwrap_or_else(|p| p.into_inner()));
+        release_survivor_reserve(&mut self.owner.heap.lock().unwrap_or_else(|p| p.into_inner()));
     }
 }
 
 /// Debug builds and relocation stress poison every moved source payload,
 /// which needs the per-object sweep walk of each source chunk.
-fn moved_sources_poisoned() -> bool {
-    cfg!(debug_assertions) || super::gc_stress_enabled("relocate")
+fn moved_sources_poisoned(diagnostics: &crate::diagnostic_settings::RuntimeDiagnostics) -> bool {
+    cfg!(debug_assertions) || diagnostics.stress_enabled("relocate")
+}
+
+#[cfg(test)]
+mod pending_owner_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn private_collectors_keep_pending_minor_requests_independent() {
+        let first = GcRuntime::default();
+        let second = GcRuntime::default();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for owner in [&first, &second] {
+                let barrier = &barrier;
+                scope.spawn(crate::runtime::serving(move || {
+                    for _ in 0..64 {
+                        assert!(!requested(owner));
+                        owner.minor_pending.store(true, Ordering::Release);
+                        owner.minor_pending.store(true, Ordering::Release);
+                        barrier.wait();
+                        assert!(requested(owner));
+                        assert!(owner.minor_pending.swap(false, Ordering::AcqRel));
+                        assert!(!owner.minor_pending.swap(false, Ordering::AcqRel));
+                        barrier.wait();
+                    }
+                }));
+            }
+        });
+        first.minor_pending.store(true, Ordering::Release);
+        assert!(!requested(&second));
+        drop(first);
+        assert!(!requested(&second));
+    }
 }

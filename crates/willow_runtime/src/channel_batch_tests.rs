@@ -31,7 +31,7 @@ fn fixture(count: usize, receive: bool) -> (*mut c_void, Vec<u64>) {
 
 #[test]
 fn fanout_batches_have_linear_counts_and_preserve_values() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for receive in [true, false] {
         for count in [1usize, 32, 33, 1024, 4096] {
             let (raw, tasks) = fixture(count, receive);
@@ -80,7 +80,7 @@ fn fanout_batches_have_linear_counts_and_preserve_values() {
 
 #[test]
 fn stale_waiters_spanning_a_batch_do_not_hide_live_waiters() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for receive in [true, false] {
         let (raw, tasks) = fixture(CHANNEL_WAKE_BATCH * 2 + 1, receive);
         let channel = unsafe { channel_from_raw(raw) }.unwrap();
@@ -110,7 +110,7 @@ fn stale_waiters_spanning_a_batch_do_not_hide_live_waiters() {
 
 #[test]
 fn cancellation_in_middle_between_reservation_and_publication_cleans_up() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     let _single_worker = crate::scheduler::single_worker_for_test();
     for receive in [true, false] {
         let (raw, tasks) = fixture(CHANNEL_WAKE_BATCH, receive);
@@ -152,7 +152,7 @@ fn cancellation_in_middle_between_reservation_and_publication_cleans_up() {
 
 #[test]
 fn close_between_reservation_and_publication_preserves_only_live_claims() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for receive in [true, false] {
         let (raw, tasks) = fixture(CHANNEL_WAKE_BATCH + 1, receive);
         let channel = unsafe { channel_from_raw(raw) }.unwrap();
@@ -186,7 +186,7 @@ fn close_between_reservation_and_publication_preserves_only_live_claims() {
 
 #[test]
 fn terminal_batch_cleanup_removes_exact_generations_without_task_purge() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for receive in [true, false] {
         let (raw, tasks) = fixture(7, receive);
         let channel = unsafe { channel_from_raw(raw) }.unwrap();
@@ -229,7 +229,7 @@ fn terminal_batch_cleanup_removes_exact_generations_without_task_purge() {
 
 #[test]
 fn closed_empty_fanout_wakes_every_waiter_and_deduplicates_roles() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for close_via_abi in [true, false] {
         let (raw, tasks) = fixture(CHANNEL_WAKE_BATCH * 2 + 1, false);
         let channel = unsafe { channel_from_raw(raw) }.unwrap();

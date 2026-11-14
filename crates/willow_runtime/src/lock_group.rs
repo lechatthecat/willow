@@ -76,8 +76,7 @@ struct LockGroup {
     restart: bool,
     owner: Option<RuntimeTaskId>,
     generation: i64,
-    #[cfg(test)]
-    released: Vec<u64>,
+    released: crate::observation::Value<Vec<u64>>,
 }
 
 impl LockGroup {
@@ -92,8 +91,7 @@ impl LockGroup {
             restart: false,
             owner: None,
             generation: crate::lock_wait::next_lock_id() as i64,
-            #[cfg(test)]
-            released: Vec::new(),
+            released: crate::observation::Value::default(),
         }
     }
 
@@ -186,8 +184,8 @@ impl LockGroup {
         while let Some(index) = self.acquired.pop() {
             let entry = &mut self.entries[index];
             entry.held = false;
-            #[cfg(test)]
-            self.released.push(entry.id);
+            self.released
+                .observe_mut(|released| released.push(entry.id));
             entry.release();
         }
     }
@@ -342,7 +340,7 @@ pub extern "C" fn willow_lock_group_cancel(group: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::runtime_test_guard;
+    use crate::gc::isolated_runtime;
     use crate::scheduler::{
         reset_global_scheduler_for_test, with_current_task_for_test, with_global_for_test,
     };
@@ -361,7 +359,7 @@ mod tests {
 
     #[test]
     fn group_source_bindings_follow_identity_order_and_reverse_release() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let a = mutex(10);
         let b = mutex(20);
@@ -403,7 +401,7 @@ mod tests {
 
     #[test]
     fn group_duplicate_identity_rejects_before_any_acquisition() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let a = mutex(10);
         let b = mutex(20);
@@ -425,7 +423,7 @@ mod tests {
 
     #[test]
     fn group_mixed_modes_preserve_read_only_bindings() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let a = mutex(10);
         let b = rwlock(20);
@@ -449,7 +447,7 @@ mod tests {
 
     #[test]
     fn group_read_read_duplicate_is_rejected() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let a = rwlock(10);
         with_current_task_for_test(task(), || {
@@ -466,7 +464,7 @@ mod tests {
 
     #[test]
     fn group_partial_wait_cancellation_releases_acquired_members() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let a = mutex(10);
         let b = mutex(20);
@@ -502,7 +500,7 @@ mod tests {
 
     #[test]
     fn group_handoff_poll_finishes_remaining_acquisitions() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let a = mutex(10);
         let b = mutex(20);
@@ -543,7 +541,7 @@ mod tests {
 
     #[test]
     fn group_handoff_cancellation_does_not_double_release() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let a = mutex(10);
         let owner = task();
@@ -590,7 +588,7 @@ mod tests {
     #[test]
     fn group_handoff_beats_a_steady_queue_on_any_member() {
         for contended in 0..2 {
-            let _guard = runtime_test_guard();
+            let _guard = isolated_runtime();
             reset_global_scheduler_for_test();
             let locks = [mutex(10), mutex(20)];
             let lock = locks[contended].load().cast();
@@ -644,7 +642,7 @@ mod tests {
     #[test]
     fn group_kept_handoff_is_released_before_waiting_on_another_member() {
         for first in 0..2 {
-            let _guard = runtime_test_guard();
+            let _guard = isolated_runtime();
             reset_global_scheduler_for_test();
             let locks = [mutex(10), mutex(20)];
             let contended = locks[first].load().cast();
@@ -705,7 +703,7 @@ mod tests {
     #[test]
     fn group_kept_rwlock_and_mutex_handoffs_load_and_commit() {
         for mode in [1, 2, 0] {
-            let _guard = runtime_test_guard();
+            let _guard = isolated_runtime();
             reset_global_scheduler_for_test();
             let contended = if mode == 0 { mutex(10) } else { rwlock(10) };
             let other = mutex(20);
@@ -753,7 +751,7 @@ mod tests {
 
     #[test]
     fn group_failed_kept_handoff_restarts_from_lowest_identity() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let low = mutex(10);
         let high = mutex(20);
@@ -819,7 +817,7 @@ mod tests {
 
     #[test]
     fn group_wait_releases_acquired_members_against_reverse_lexical_order() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         // IDs sort B before A; ordinary code instead acquires A then B.
         let b = mutex(20);

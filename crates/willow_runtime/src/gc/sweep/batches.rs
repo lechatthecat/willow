@@ -68,6 +68,30 @@ struct Report {
     assist_cpu_incomplete: bool,
 }
 
+trait SweepCountObservation {
+    const TIMED_HOLDS: bool = false;
+    fn index_read(&mut self) {}
+    fn bulk_live_nursery(&mut self) {}
+    fn bulk_dead_nursery(&mut self, _objects: u64) {}
+}
+#[cfg(not(test))]
+impl SweepCountObservation for Report {}
+#[cfg(test)]
+impl SweepCountObservation for Report {
+    const TIMED_HOLDS: bool = true;
+
+    fn index_read(&mut self) {
+        self.index_reads += 1;
+    }
+    fn bulk_live_nursery(&mut self) {
+        self.bulk_live_nursery_chunks += 1;
+    }
+    fn bulk_dead_nursery(&mut self, objects: u64) {
+        self.bulk_nursery_chunks += 1;
+        self.bulk_nursery_objects += objects;
+    }
+}
+
 struct Cursor {
     plan: SweepPlan,
     old: usize,
@@ -102,29 +126,35 @@ struct Cursor {
     report: Report,
 }
 
-static ACTIVE_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static ACTIVE: Mutex<Option<Arc<Mutex<Cursor>>>> = Mutex::new(None);
-#[cfg(test)]
-static LAST: Mutex<Option<Report>> = Mutex::new(None);
-
-fn set_active(job: Option<Arc<Mutex<Cursor>>>) {
-    let present = job.is_some();
-    *ACTIVE.lock().unwrap() = job;
-    ACTIVE_FLAG.store(present, Ordering::Release);
+#[derive(Default)]
+pub(crate) struct ActiveSweep {
+    flag: std::sync::atomic::AtomicBool,
+    release: RuntimeReleaseObservation,
+    cursor: Mutex<Option<Arc<Mutex<Cursor>>>>,
+    last: RuntimeReportObservation,
 }
 
-pub(super) fn assist() {
-    if !ACTIVE_FLAG.load(Ordering::Acquire) {
+impl ActiveSweep {
+    fn publish(&self, job: Option<Arc<Mutex<Cursor>>>) {
+        let present = job.is_some();
+        *self.cursor.lock().unwrap() = job;
+        self.flag.store(present, Ordering::Release);
+    }
+}
+
+pub(super) fn assist_in(owner: &crate::runtime::Runtime) {
+    let active = &owner.gc.active_sweep;
+    if !active.flag.load(Ordering::Acquire) {
         return;
     }
-    let job = match ACTIVE.try_lock() {
+    let job = match active.cursor.try_lock() {
         Ok(active) => active.clone(),
         Err(_) => return,
     };
     if let Some(job) = job {
         match job.try_lock() {
             Ok(mut cursor) => {
-                cursor.batch(ALLOCATION, true);
+                cursor.batch_in(owner, ALLOCATION, true);
             }
             Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Poisoned(_)) => panic!("sweep cursor poisoned"),
@@ -132,18 +162,18 @@ pub(super) fn assist() {
     }
 }
 
-pub(super) fn execute(mut plan: SweepPlan) -> usize {
+pub(super) fn execute_in(owner: &crate::runtime::Runtime, mut plan: SweepPlan) -> usize {
     let began = Instant::now();
     drop(std::mem::take(&mut plan.stale_storage));
-    let job = Arc::new(Mutex::new(Cursor::new(plan)));
+    let job = Arc::new(Mutex::new(Cursor::new_in(owner, plan)));
     job.lock().unwrap().report.setup_ns = began.elapsed().as_nanos() as u64;
-    assert!(ACTIVE.lock().unwrap().is_none());
-    set_active(Some(job.clone()));
+    assert!(owner.gc.active_sweep.cursor.lock().unwrap().is_none());
+    owner.gc.active_sweep.publish(Some(job.clone()));
     loop {
         let (done, completed) = {
             let mut cursor = job.lock().unwrap();
             let before = cursor.old;
-            cursor.batch(BACKGROUND, false);
+            cursor.batch_in(owner, BACKGROUND, false);
             (cursor.done, (cursor.old > before).then(|| cursor.old - 1))
         };
         if done {
@@ -151,12 +181,12 @@ pub(super) fn execute(mut plan: SweepPlan) -> usize {
         }
         // No heap/cursor guard survives a yield or test pause.
         if let Some(index) = completed {
-            between_regions(index);
+            between_regions_in(&owner.gc, index);
         } else {
             std::thread::yield_now();
         }
     }
-    set_active(None);
+    owner.gc.active_sweep.publish(None);
     let mut cursor = job.lock().unwrap();
     cursor.report.sweep_wall_ns = began.elapsed().as_nanos() as u64;
     if let Some(marking) = &cursor.plan.marking {
@@ -171,24 +201,21 @@ pub(super) fn execute(mut plan: SweepPlan) -> usize {
             .unwrap()
             .transition(old_cycle::Phase::Idle);
     }
-    crate::gc_telemetry::sweep::completed(
+    owner.telemetry.sweep.completed(
         cursor.report.swept_objects,
         cursor.report.swept_bytes,
         cursor.report.sweep_wall_ns,
         cursor.report.reclaimed_bytes,
     );
     let freed = cursor.report.reclaimed_bytes as usize;
-    crate::frame_lifetime::record_sweep(
+    owner.frame_lifetime.record_sweep(
         crate::frame_lifetime::FrameEventKind::SweepCompleted,
         0,
         cursor.plan.epoch,
         freed as u64,
     );
-    #[cfg(test)]
-    {
-        *LAST.lock().unwrap() = Some(cursor.report.clone());
-    }
-    if crate::diagnostic_settings::GC_LOG.unicode {
+    owner.gc.active_sweep.last.completed(&cursor.report);
+    if owner.diagnostics.gc_log.unicode {
         eprintln!(
             "[gc] sweep background_limits={}/{}/{} assist_limits={}/{}/{} {:?}",
             BACKGROUND.objects,
@@ -200,7 +227,10 @@ pub(super) fn execute(mut plan: SweepPlan) -> usize {
             cursor.report
         );
     }
-    crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::SweepComplete);
+    owner
+        .telemetry
+        .milestones
+        .reached(crate::gc_telemetry::GcStage::SweepComplete);
     freed
 }
 
@@ -209,7 +239,7 @@ fn elapsed_ns(start: Option<Instant>) -> u64 {
 }
 
 impl Cursor {
-    fn new(plan: SweepPlan) -> Self {
+    fn new_in(owner: &crate::runtime::Runtime, plan: SweepPlan) -> Self {
         Self {
             finalize_old: plan.old,
             finalize_chunks: plan.chunks,
@@ -229,10 +259,10 @@ impl Cursor {
             build_headers: false,
             headers: None,
             done: false,
-            timed_holds: cfg!(test)
-                || crate::gc_telemetry::collector_profile::enabled()
-                || crate::gc_telemetry::profiling()
-                || crate::diagnostic_settings::GC_LOG.os,
+            timed_holds: Report::TIMED_HOLDS
+                || owner.diagnostics.gc_profile.one
+                || owner.diagnostics.gc_profile.os
+                || owner.diagnostics.gc_log.os,
             deadline_due: false,
             ahead: Vec::with_capacity(DEADLINE_STRIDE as usize),
             epoch_region_hint: None,
@@ -244,17 +274,23 @@ impl Cursor {
         self.timed_holds.then(Instant::now)
     }
 
-    fn batch(&mut self, limits: Limits, assist: bool) {
-        self.batch_with_clock(limits, assist, crate::gc_telemetry::timestamp_ns);
+    fn batch_in(&mut self, owner: &crate::runtime::Runtime, limits: Limits, assist: bool) {
+        self.batch_with_clock_in(owner, limits, assist, crate::gc_telemetry::timestamp_ns);
     }
 
-    fn batch_with_clock(&mut self, limits: Limits, assist: bool, mut now: impl FnMut() -> u64) {
+    fn batch_with_clock_in(
+        &mut self,
+        owner: &crate::runtime::Runtime,
+        limits: Limits,
+        assist: bool,
+        mut now: impl FnMut() -> u64,
+    ) {
         if self.done {
             return;
         }
         assert!(limits.objects > 0 && limits.bytes > 0 && limits.ns > 0);
         let external_assist = assist
-            && crate::gc_telemetry::profiling()
+            && owner.diagnostics.gc_profile.os
             && self
                 .plan
                 .marking
@@ -282,12 +318,13 @@ impl Cursor {
                     break;
                 }
             }
-            if runtime().stop_requested.load(Ordering::Acquire) {
+            if owner.gc.stop_requested.load(Ordering::Acquire) {
                 break;
             }
             // Steps up to the next deadline sample may share one heap hold.
             let run = DEADLINE_STRIDE - unsampled;
-            let (progress, steps) = self.step(assist, limits, before_objects, before_bytes, run);
+            let (progress, steps) =
+                self.step(owner, assist, limits, (before_objects, before_bytes), run);
             unsampled += steps - 1;
             if !progress {
                 break;
@@ -326,12 +363,13 @@ impl Cursor {
     /// Returns whether the batch may continue and how many steps ran.
     fn step(
         &mut self,
+        owner: &crate::runtime::Runtime,
         assist: bool,
         limits: Limits,
-        before_objects: u64,
-        before_bytes: u64,
+        before: (u64, u64),
         run: u32,
     ) -> (bool, u32) {
+        let (before_objects, before_bytes) = before;
         let remaining = limits.bytes - (self.report.bytes - before_bytes);
         if let Some((index, builder)) = &mut self.building {
             const METADATA_BYTES: u64 =
@@ -350,13 +388,13 @@ impl Cursor {
             // retains the completed builder for the next batch.
             let wait = self.hold_clock();
             let mut state = if assist {
-                match runtime().heap.try_lock() {
+                match owner.gc.heap.try_lock() {
                     Ok(state) => state,
                     Err(TryLockError::WouldBlock) => return (true, 1),
                     Err(TryLockError::Poisoned(_)) => panic!("GC heap poisoned"),
                 }
             } else {
-                runtime().heap.lock().unwrap()
+                owner.gc.heap.lock().unwrap()
             };
             let waited = elapsed_ns(wait);
             self.report.heap_wait_ns += waited;
@@ -387,11 +425,13 @@ impl Cursor {
             self.report.heap_hold_ns += held_ns;
             self.report.heap_max_hold_ns = self.report.heap_max_hold_ns.max(held_ns);
             drop(state);
-            crate::gc_telemetry::collector_profile::record(
+            crate::gc_telemetry::collector_profile::record_in(
+                owner,
                 crate::gc_telemetry::collector_profile::Kind::SweepWait,
                 waited,
             );
-            crate::gc_telemetry::collector_profile::record(
+            crate::gc_telemetry::collector_profile::record_in(
+                owner,
                 crate::gc_telemetry::collector_profile::Kind::SweepHold,
                 held_ns,
             );
@@ -402,13 +442,13 @@ impl Cursor {
         }
         let wait = self.hold_clock();
         let mut state = if assist {
-            match runtime().heap.try_lock() {
+            match owner.gc.heap.try_lock() {
                 Ok(state) => state,
                 Err(TryLockError::WouldBlock) => return (false, 1),
                 Err(TryLockError::Poisoned(_)) => panic!("GC heap poisoned"),
             }
         } else {
-            runtime().heap.lock().unwrap()
+            owner.gc.heap.lock().unwrap()
         };
         let waited_ns = elapsed_ns(wait);
         self.report.heap_wait_ns = self.report.heap_wait_ns.saturating_add(waited_ns);
@@ -422,13 +462,13 @@ impl Cursor {
         let action = loop {
             let remaining = limits.bytes - (self.report.bytes - before_bytes);
             let action = if self.old < self.plan.old {
-                self.old_step(&mut state, assist, remaining, run - steps)
+                self.old_step(owner, &mut state, assist, remaining, run - steps)
             } else if self.chunks < self.plan.chunks {
-                self.chunk_step(&mut state, assist, remaining)
+                self.chunk_step(owner, &mut state, assist, remaining)
             } else if assist {
                 Action::Yield // Finalization, hooks and release are collector-only.
             } else {
-                self.finish_step(&mut state)
+                self.finish_step(&owner.gc, &mut state)
             };
             steps += 1;
             if !matches!(action, Action::Progress)
@@ -437,7 +477,7 @@ impl Cursor {
                 || self.old != region
                 || self.report.objects - before_objects >= limits.objects
                 || self.report.bytes - before_bytes >= limits.bytes
-                || runtime().stop_requested.load(Ordering::Acquire)
+                || owner.gc.stop_requested.load(Ordering::Acquire)
             {
                 break action;
             }
@@ -447,11 +487,13 @@ impl Cursor {
         self.report.heap_hold_ns = self.report.heap_hold_ns.saturating_add(held_ns);
         self.report.heap_max_hold_ns = self.report.heap_max_hold_ns.max(held_ns);
         drop(state);
-        crate::gc_telemetry::collector_profile::record(
+        crate::gc_telemetry::collector_profile::record_in(
+            owner,
             crate::gc_telemetry::collector_profile::Kind::SweepWait,
             waited_ns,
         );
-        crate::gc_telemetry::collector_profile::record(
+        crate::gc_telemetry::collector_profile::record_in(
+            owner,
             crate::gc_telemetry::collector_profile::Kind::SweepHold,
             held_ns,
         );
@@ -459,13 +501,13 @@ impl Cursor {
         let progress = match action {
             Action::Yield => false,
             Action::Progress => true,
-            Action::Drop(hook, payload) => {
+            Action::Drop(hook, payload, observed_type) => {
                 // Only background batches admit hooks. The live index no longer
                 // names the object, but its quarantined extent still owns it.
                 let began = Instant::now();
-                unsafe { run_drop_hook(hook, payload) };
+                unsafe { run_drop_hook(&owner.gc, hook, payload, observed_type) };
                 self.report.hook_ns += began.elapsed().as_nanos() as u64;
-                crate::frame_lifetime::record_sweep(
+                owner.frame_lifetime.record_sweep(
                     crate::frame_lifetime::FrameEventKind::DropCompleted,
                     payload as usize,
                     self.plan.epoch,
@@ -487,7 +529,7 @@ impl Cursor {
             }
             Action::ReleaseOld(region, excess) => {
                 let began = Instant::now();
-                release_pause();
+                owner.gc.active_sweep.release.pause();
                 if let Some(base) = excess {
                     // SAFETY: storage the cache declined is owned here.
                     unsafe { region_cache::free_region_storage(base, region.capacity) };
@@ -498,7 +540,7 @@ impl Cursor {
             }
             Action::ReleaseChunk(chunk) => {
                 let began = Instant::now();
-                release_pause();
+                owner.gc.active_sweep.release.pause();
                 let layout =
                     Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>())
                         .unwrap();
@@ -510,7 +552,14 @@ impl Cursor {
         (progress, steps)
     }
 
-    fn old_step(&mut self, state: &mut GcState, assist: bool, remaining: u64, want: u32) -> Action {
+    fn old_step(
+        &mut self,
+        owner: &crate::runtime::Runtime,
+        state: &mut GcState,
+        assist: bool,
+        remaining: u64,
+        want: u32,
+    ) -> Action {
         let index = self.old;
         let region = &mut state.old_regions[index];
         if !self.started_region {
@@ -530,10 +579,7 @@ impl Cursor {
             self.started_region = true;
         }
         if self.ahead.is_empty() {
-            #[cfg(test)]
-            {
-                self.report.index_reads += 1;
-            }
+            self.report.index_read();
             let entries = region.allocations.range(self.offset..);
             // One short epoch guard for this heap hold, never across hooks,
             // reclamation callbacks or yields. Marking is sealed before sweep.
@@ -570,7 +616,7 @@ impl Cursor {
         let hook = if live {
             None
         } else {
-            match sweep_drop(object.type_id()) {
+            match sweep_drop(&owner.gc, object.type_id()) {
                 Ok(hook) => hook,
                 Err(()) => return Action::Yield,
             }
@@ -619,20 +665,31 @@ impl Cursor {
             self.region_reclaimed = true;
             let payload = object.payload().as_ptr();
             if hook.is_some() {
-                crate::frame_lifetime::pending_drop(payload as usize, self.plan.epoch);
+                owner
+                    .frame_lifetime
+                    .pending_drop(payload as usize, self.plan.epoch);
             }
-            note_dead_frame(object, self.plan.epoch);
+            note_dead_frame_in(&owner.frame_lifetime, object, self.plan.epoch);
             region.allocations.remove(&offset);
             region.mark_bitmap.unmark(offset);
             region.live_bytes = region.live_bytes.saturating_sub(size);
-            reclaim(state, object, size, reclaim_permit.unwrap());
+            let observed_type = crate::observation::Value::new(|| object.type_id());
+            reclaim(&owner.gc, state, object, size, reclaim_permit.unwrap());
             self.report.reclaimed_bytes += size as u64;
-            hook.map_or(Action::Progress, |hook| Action::Drop(hook, payload))
+            hook.map_or(Action::Progress, |hook| {
+                Action::Drop(hook, payload, observed_type)
+            })
         }
     }
 
     #[allow(clippy::too_many_lines, reason = "split pending")]
-    fn chunk_step(&mut self, state: &mut GcState, assist: bool, remaining: u64) -> Action {
+    fn chunk_step(
+        &mut self,
+        owner: &crate::runtime::Runtime,
+        state: &mut GcState,
+        assist: bool,
+        remaining: u64,
+    ) -> Action {
         let index = self.chunks;
         let chunk = &mut state.tlab_chunks[index];
         if chunk.owner_state.is_some() {
@@ -669,16 +726,13 @@ impl Cursor {
                 self.report.bytes += chunk.used as u64;
                 self.report.swept_objects += objects;
                 self.report.swept_bytes += chunk.used as u64;
-                #[cfg(test)]
-                {
-                    self.report.bulk_live_nursery_chunks += 1;
-                }
+                self.report.bulk_live_nursery();
                 self.dead_chunks.push(false);
                 self.chunks += 1;
                 state.pending_sweep_chunks.start = self.chunks;
                 return Action::Progress;
             }
-            let hooks = match drop_registry().try_lock() {
+            let hooks = match owner.gc.drop_registry.try_lock() {
                 Ok(hooks) => hooks,
                 Err(TryLockError::WouldBlock) => return Action::Yield,
                 Err(TryLockError::Poisoned(_)) => panic!("drop registry poisoned"),
@@ -706,11 +760,7 @@ impl Cursor {
                         assert_eq!(end, chunk.used);
                     }
                     let objects = chunk.mark_bitmap.bits.count() as u64;
-                    #[cfg(test)]
-                    {
-                        self.report.bulk_nursery_chunks += 1;
-                        self.report.bulk_nursery_objects += objects;
-                    }
+                    self.report.bulk_dead_nursery(objects);
                     let bytes = chunk.used;
                     first.reclaim_with_permit(permit);
                     chunk.mark_bitmap.clear();
@@ -811,7 +861,7 @@ impl Cursor {
         let hook = if !object.allocated() || live {
             None
         } else {
-            match sweep_drop(object.type_id()) {
+            match sweep_drop(&owner.gc, object.type_id()) {
                 Ok(hook) => hook,
                 Err(()) => return Action::Yield,
             }
@@ -859,19 +909,24 @@ impl Cursor {
         } else if object.allocated() {
             let payload = object.payload().as_ptr();
             if hook.is_some() {
-                crate::frame_lifetime::pending_drop(payload as usize, self.plan.epoch);
+                owner
+                    .frame_lifetime
+                    .pending_drop(payload as usize, self.plan.epoch);
             }
-            note_dead_frame(object, self.plan.epoch);
+            note_dead_frame_in(&owner.frame_lifetime, object, self.plan.epoch);
             chunk.mark_bitmap.unmark(offset);
-            reclaim(state, object, size, reclaim_permit.unwrap());
+            let observed_type = crate::observation::Value::new(|| object.type_id());
+            reclaim(&owner.gc, state, object, size, reclaim_permit.unwrap());
             self.report.reclaimed_bytes += size as u64;
-            hook.map_or(Action::Progress, |hook| Action::Drop(hook, payload))
+            hook.map_or(Action::Progress, |hook| {
+                Action::Drop(hook, payload, observed_type)
+            })
         } else {
             Action::Progress
         }
     }
 
-    fn finish_step(&mut self, state: &mut GcState) -> Action {
+    fn finish_step(&mut self, owner: &GcRuntime, state: &mut GcState) -> Action {
         self.report.objects += 1;
         // Descending original positions remain stable across swap_remove. A new
         // extent moved from the tail keeps its base-keyed buffer ownership.
@@ -899,7 +954,7 @@ impl Cursor {
                 // Retaining is O(1); only storage over budget is freed after
                 // the heap lock is dropped.
                 let base = region.take_storage();
-                let budget = region_cache_budget(state);
+                let budget = region_cache_budget_in(owner, state);
                 // SAFETY: the released region handed over its unindexed storage.
                 let excess = unsafe { state.region_cache.retain(base, region.capacity, budget) };
                 return Action::ReleaseOld(region, excess);
@@ -921,7 +976,7 @@ impl Cursor {
                 if chunk.kind == RegionKind::Survivor {
                     state.survivor_stats.survivor_space_reserved -= chunk.capacity as u64;
                 }
-                runtime().root_tlabs.remove(chunk.base as usize);
+                owner.root_tlabs.remove(chunk.base as usize);
                 state.tlab_addresses.remove(chunk.base as usize);
                 if index < state.tlab_chunks.len() {
                     state
@@ -936,7 +991,7 @@ impl Cursor {
         }
         state.sweeping = None;
         state.pending_sweep_chunks = 0..0;
-        publish_collection_busy(state);
+        publish_collection_busy_in(owner, state);
         self.done = true;
         Action::Progress
     }
@@ -944,18 +999,24 @@ impl Cursor {
 
 /// Registry updates may allocate/resize. Never wait for them under the heap
 /// mutex; a rejected lookup keeps this object's cursor and ownership intact.
-fn sweep_drop(type_id: u32) -> Result<Option<DropFn>, ()> {
-    match drop_registry().try_lock() {
+fn sweep_drop(owner: &GcRuntime, type_id: u32) -> Result<Option<DropFn>, ()> {
+    match owner.drop_registry.try_lock() {
         Ok(registry) => Ok(registry.get(&type_id).copied()),
         Err(TryLockError::WouldBlock) => Err(()),
         Err(TryLockError::Poisoned(_)) => panic!("drop registry poisoned"),
     }
 }
 
-fn reclaim(state: &mut GcState, object: HeapObject, size: usize, permit: raw_heap::ReclaimPermit) {
+fn reclaim(
+    owner: &GcRuntime,
+    state: &mut GcState,
+    object: HeapObject,
+    size: usize,
+    permit: raw_heap::ReclaimPermit,
+) {
     let payload = object.payload().as_ptr() as usize;
     if object.generation() == GC_GENERATION_OLD {
-        runtime().runtime_roots.forget_pending(payload);
+        owner.runtime_roots.forget_pending(payload);
     }
     if state.remembered_set.remove(&payload) {
         let card = payload / GC_CARD_SIZE;
@@ -972,19 +1033,47 @@ fn reclaim(state: &mut GcState, object: HeapObject, size: usize, permit: raw_hea
     state.total_frees = state.total_frees.saturating_add(1);
 }
 
-fn release_pause() {
-    #[cfg(test)]
-    if let Some(hook) = *RELEASE_HOOK.lock().unwrap() {
-        hook();
+trait ReportObservation {
+    fn completed(&self, _report: &Report) {}
+}
+#[derive(Default)]
+struct NoReportObservation;
+impl ReportObservation for NoReportObservation {}
+#[cfg(not(test))]
+type RuntimeReportObservation = NoReportObservation;
+#[cfg(test)]
+type RuntimeReportObservation = Mutex<Option<Report>>;
+#[cfg(test)]
+impl ReportObservation for RuntimeReportObservation {
+    fn completed(&self, report: &Report) {
+        *self.lock().unwrap() = Some(report.clone());
     }
 }
+
+trait ReleaseObservation {
+    fn pause(&self) {}
+}
+#[derive(Default)]
+struct NoReleaseObservation;
+impl ReleaseObservation for NoReleaseObservation {}
+#[cfg(not(test))]
+type RuntimeReleaseObservation = NoReleaseObservation;
 #[cfg(test)]
-static RELEASE_HOOK: Mutex<Option<fn()>> = Mutex::new(None);
+type RuntimeReleaseObservation = Mutex<Option<fn()>>;
+#[cfg(test)]
+impl ReleaseObservation for RuntimeReleaseObservation {
+    fn pause(&self) {
+        let hook = *self.lock().unwrap();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
 
 enum Action {
     Yield,
     Progress,
-    Drop(DropFn, *mut u8),
+    Drop(DropFn, *mut u8, crate::observation::Value<u32>),
     Build(usize, FreeSpans),
     ReserveHeaders(usize),
     /// A released region's metadata and any storage the cache declined.
@@ -994,7 +1083,29 @@ enum Action {
 
 #[cfg(test)]
 mod tests {
+    use super::super::assist;
     use super::*;
+
+    impl Cursor {
+        fn batch(&mut self, limits: Limits, assist: bool) {
+            self.batch_with_clock(limits, assist, crate::gc_telemetry::timestamp_ns);
+        }
+
+        fn batch_with_clock(&mut self, limits: Limits, assist: bool, now: impl FnMut() -> u64) {
+            if self.done {
+                return;
+            }
+            self.batch_with_clock_in(crate::runtime::current(), limits, assist, now);
+        }
+
+        fn new(plan: SweepPlan) -> Self {
+            Self::new_in(crate::runtime::current(), plan)
+        }
+    }
+
+    fn set_active(job: Option<Arc<Mutex<Cursor>>>) {
+        runtime().active_sweep.publish(job);
+    }
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     fn make_cursor() -> Cursor {
@@ -1050,7 +1161,7 @@ mod tests {
 
     #[test]
     fn bulk_nursery_sweep_counts_chunks_not_dead_objects() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for objects in [32usize, 128, 512] {
             for chunks in [1usize, 4, 16] {
                 reset_internal_for_test();
@@ -1096,7 +1207,7 @@ mod tests {
 
     #[test]
     fn bulk_nursery_sweep_preserves_live_chunks_and_falls_back_for_hooks() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for hooks in [false, true] {
             reset_internal_for_test();
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -1124,7 +1235,7 @@ mod tests {
 
     #[test]
     fn bulk_nursery_sweep_keeps_all_live_prefix_unindexed() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for count in [32usize, 128, 512] {
             reset_internal_for_test();
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -1159,7 +1270,7 @@ mod tests {
 
     #[test]
     fn bulk_nursery_sweep_respects_cursor_modes_and_contention() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for mode in 0..6 {
             reset_internal_for_test();
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -1209,7 +1320,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_one_object_batches_are_lossless_and_keep_live_start_bits() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for objects in [1usize, 2, 17, 513, 8193] {
             reset_internal_for_test();
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -1275,7 +1386,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_fake_deadlines_preserve_the_unprocessed_suffix() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         for _ in 0..65 {
@@ -1313,7 +1424,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_giant_objects_never_run_in_allocation_assistance() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for size in [ALLOCATION.bytes as usize + 8, 1 << 20, 1 << 24] {
             reset_internal_for_test();
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -1333,7 +1444,8 @@ mod tests {
         reset_internal_for_test();
     }
 
-    static COUNTED_HOOKS: AtomicUsize = AtomicUsize::new(0);
+    static COUNTED_HOOKS: crate::runtime::PerRuntime<AtomicUsize> =
+        crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
     unsafe fn counted_hook(_: *mut u8) {
         COUNTED_HOOKS.fetch_add(1, Ordering::Relaxed);
@@ -1341,7 +1453,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_hooks_force_deadline_samples_between_strides() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         COUNTED_HOOKS.store(0, Ordering::Relaxed);
@@ -1375,7 +1487,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_amortizes_heap_holds_and_index_reads_over_strides() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for objects in [513usize, 8193, 40_000] {
             reset_internal_for_test();
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -1421,9 +1533,12 @@ mod tests {
         reset_internal_for_test();
     }
 
-    static HOOK_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static HOOK_ENTERED: AtomicBool = AtomicBool::new(false);
-    static ALLOCATED_DURING_HOOK: AtomicBool = AtomicBool::new(false);
+    static HOOK_CALLS: crate::runtime::PerRuntime<AtomicUsize> =
+        crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+    static HOOK_ENTERED: crate::runtime::PerRuntime<AtomicBool> =
+        crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+    static ALLOCATED_DURING_HOOK: crate::runtime::PerRuntime<AtomicBool> =
+        crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
 
     unsafe fn delayed_hook(_: *mut u8) {
         assert!(runtime().heap.try_lock().is_ok(), "hook holds heap mutex");
@@ -1439,7 +1554,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_delayed_hook_is_once_only_outside_heap_and_never_assisted() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         HOOK_CALLS.store(0, Ordering::Relaxed);
@@ -1452,7 +1567,7 @@ mod tests {
         cursor.lock().unwrap().batch(ALLOCATION, true);
         assert_eq!(HOOK_CALLS.load(Ordering::Relaxed), 0);
         assert_eq!(cursor.lock().unwrap().report.objects, 0);
-        let worker = std::thread::spawn(|| {
+        let worker = std::thread::spawn(crate::runtime::serving(|| {
             let _mutator = MutatorRegistration::new();
             while !HOOK_ENTERED.load(Ordering::Acquire) {
                 std::thread::yield_now();
@@ -1463,7 +1578,7 @@ mod tests {
             }
             ALLOCATED_DURING_HOOK.store(true, Ordering::Release);
             pointer as usize
-        });
+        }));
         let mut guard = cursor.lock().unwrap();
         finish(&mut guard);
         assert_eq!(HOOK_CALLS.load(Ordering::Relaxed), 1);
@@ -1525,7 +1640,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_try_lock_and_stop_requests_never_consume_work() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         willow_alloc(8);
         let job = Arc::new(Mutex::new(make_cursor()));
@@ -1556,7 +1671,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_epoch_quarantine_releases_only_after_next_activation() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let pointer = willow_alloc(8);
         let object = HeapObject::from_payload(GcPayload::from_raw(pointer).unwrap());
@@ -1595,7 +1710,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_delayed_release_keeps_allocators_running_and_is_charged() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         willow_alloc((GC_LARGE_OBJECT_THRESHOLD + 8) as i64);
@@ -1603,8 +1718,8 @@ mod tests {
         ALLOCATED_DURING_HOOK.store(false, Ordering::Relaxed);
         let job = Arc::new(Mutex::new(make_cursor()));
         set_active(Some(job.clone()));
-        *RELEASE_HOOK.lock().unwrap() = Some(delayed_release);
-        let worker = std::thread::spawn(|| {
+        *runtime().active_sweep.release.lock().unwrap() = Some(delayed_release);
+        let worker = std::thread::spawn(crate::runtime::serving(|| {
             let _mutator = MutatorRegistration::new();
             while !HOOK_ENTERED.load(Ordering::Acquire) {
                 std::thread::yield_now();
@@ -1612,11 +1727,11 @@ mod tests {
             let pointer = willow_alloc(8);
             ALLOCATED_DURING_HOOK.store(true, Ordering::Release);
             pointer as usize
-        });
+        }));
         finish(&mut job.lock().unwrap());
         assert!(job.lock().unwrap().report.release_ns >= 2_000_000);
         assert!(job.lock().unwrap().report.overshoots > 0);
-        *RELEASE_HOOK.lock().unwrap() = None;
+        *runtime().active_sweep.release.lock().unwrap() = None;
         set_active(None);
         let pointer = worker.join().unwrap();
         assert!(find_old_region_object(&runtime().heap.lock().unwrap(), pointer, false).is_some());
@@ -1625,7 +1740,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_next_epoch_keeps_previously_safe_holes_reusable() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let live = willow_alloc(8);
         let dead = willow_alloc(8);
@@ -1657,8 +1772,10 @@ mod tests {
         reset_internal_for_test();
     }
 
-    static SCALE_START: AtomicBool = AtomicBool::new(false);
-    static SCALE_DONE: AtomicBool = AtomicBool::new(false);
+    static SCALE_START: crate::runtime::PerRuntime<AtomicBool> =
+        crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+    static SCALE_DONE: crate::runtime::PerRuntime<AtomicBool> =
+        crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
     // One background batch can complete several regions and reports only the
     // last one, so the first pause need not carry index 0.
     fn scale_between_regions(_index: usize) {
@@ -1667,7 +1784,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_fixed_root_scaling_reports_stalls_and_reclamation() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for mib in [64usize, 256, 1024] {
             reset_internal_for_test();
             let mut root = willow_alloc(8);
@@ -1693,7 +1810,7 @@ mod tests {
             let ready = Arc::new(AtomicBool::new(false));
             let worker = {
                 let ready = ready.clone();
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     let _mutator = MutatorRegistration::new();
                     ready.store(true, Ordering::Release);
                     while !SCALE_START.load(Ordering::Acquire) {
@@ -1704,7 +1821,8 @@ mod tests {
                     let mut stalls = Vec::new();
                     let mut overlapped = 0usize;
                     for _ in 0..2048 {
-                        overlapped += usize::from(ACTIVE_FLAG.load(Ordering::Acquire));
+                        overlapped +=
+                            usize::from(runtime().active_sweep.flag.load(Ordering::Acquire));
                         let started = Instant::now();
                         willow_alloc(8);
                         stalls.push(started.elapsed().as_nanos() as u64);
@@ -1713,22 +1831,24 @@ mod tests {
                     SCALE_DONE.store(true, Ordering::Release);
                     stalls.sort_unstable();
                     (stalls, elapsed, overlapped)
-                })
+                }))
             };
             while !ready.load(Ordering::Acquire) {
                 std::thread::yield_now();
             }
-            *SWEEP_TEST_HOOK.lock().unwrap() = Some(scale_between_regions);
+            *runtime().sweep_observation.hook.lock().unwrap() = Some(scale_between_regions);
             old_cycle::take_stop_diagnostics();
             let began = Instant::now();
             willow_gc_collect();
             let elapsed = began.elapsed().as_nanos() as u64;
-            *SWEEP_TEST_HOOK.lock().unwrap() = None;
+            *runtime().sweep_observation.hook.lock().unwrap() = None;
             // A sweep that finishes inside its first batch never pauses;
             // release the mutator instead of waiting for it forever.
             SCALE_START.store(true, Ordering::Release);
             let (stalls, mutator_ns, overlapped) = worker.join().unwrap();
-            let report = LAST
+            let report = runtime()
+                .active_sweep
+                .last
                 .lock()
                 .unwrap()
                 .clone()
@@ -1777,22 +1897,21 @@ mod tests {
         reset_internal_for_test();
     }
 
-    struct LabsEnabled;
+    struct LabsEnabled(bool);
     impl LabsEnabled {
         fn new() -> Self {
-            old_lab::OLD_LABS_FOR_TEST.store(true, Ordering::Release);
-            Self
+            Self(runtime().old_lab_policy.swap(true, Ordering::AcqRel))
         }
     }
     impl Drop for LabsEnabled {
         fn drop(&mut self) {
-            old_lab::OLD_LABS_FOR_TEST.store(false, Ordering::Release);
+            runtime().old_lab_policy.store(self.0, Ordering::Release);
         }
     }
 
     #[test]
     fn bounded_sweep_release_reindexes_active_new_buffers_by_stable_base() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         willow_alloc((GC_LARGE_OBJECT_THRESHOLD + 8) as i64);
@@ -1826,7 +1945,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_competing_assists_share_ownership_without_double_reclamation() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         for _ in 0..2048 {
@@ -1836,11 +1955,11 @@ mod tests {
         set_active(Some(job.clone()));
         std::thread::scope(|scope| {
             for _ in 0..8 {
-                scope.spawn(|| {
+                scope.spawn(crate::runtime::serving(|| {
                     for _ in 0..256 {
                         assist();
                     }
-                });
+                }));
             }
         });
         let mut cursor = job.lock().unwrap();
@@ -1858,7 +1977,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_competing_allocators_keep_forward_progress() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         for _ in 0..4096 {
@@ -1869,7 +1988,7 @@ mod tests {
         let stalls = std::thread::scope(|scope| {
             let mut threads = Vec::new();
             for _ in 0..8 {
-                threads.push(scope.spawn(|| {
+                threads.push(scope.spawn(crate::runtime::serving(|| {
                     let _mutator = MutatorRegistration::new();
                     let mut stalls = Vec::new();
                     for _ in 0..128 {
@@ -1881,7 +2000,7 @@ mod tests {
                         stalls.push(began.elapsed().as_nanos() as u64);
                     }
                     stalls
-                }));
+                })));
             }
             threads
                 .into_iter()
@@ -1912,7 +2031,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_partial_tlab_index_keeps_unprocessed_live_objects_visible() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         let mut tls = tlab_state_for_test();
@@ -1964,7 +2083,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_fragmented_tlabs_skip_already_reclaimed_physical_headers() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for objects in [128usize, 512, GC_TLAB_CHUNK_SIZE / (GC_HEADER_SIZE + 8)] {
             reset_internal_for_test();
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -2010,8 +2129,10 @@ mod tests {
         }
     }
 
-    static SHUTDOWN_PAUSED: AtomicBool = AtomicBool::new(false);
-    static SHUTDOWN_RESUME: AtomicBool = AtomicBool::new(false);
+    static SHUTDOWN_PAUSED: crate::runtime::PerRuntime<AtomicBool> =
+        crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+    static SHUTDOWN_RESUME: crate::runtime::PerRuntime<AtomicBool> =
+        crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
     fn pause_for_shutdown(index: usize) {
         if index != 0 {
             return;
@@ -2027,7 +2148,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_coordinator_shutdown_waits_for_owned_cleanup() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         willow_alloc((GC_LARGE_OBJECT_THRESHOLD + 8) as i64);
@@ -2036,7 +2157,7 @@ mod tests {
         willow_push_root(&mut root);
         SHUTDOWN_PAUSED.store(false, Ordering::Relaxed);
         SHUTDOWN_RESUME.store(false, Ordering::Relaxed);
-        *SWEEP_TEST_HOOK.lock().unwrap() = Some(pause_for_shutdown);
+        *runtime().sweep_observation.hook.lock().unwrap() = Some(pause_for_shutdown);
         assert!(coordinator::request());
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
         while !SHUTDOWN_PAUSED.load(Ordering::Acquire) {
@@ -2044,15 +2165,15 @@ mod tests {
             willow_gc_safepoint();
             std::thread::yield_now();
         }
-        assert!(ACTIVE_FLAG.load(Ordering::Acquire));
-        let releaser = std::thread::spawn(|| {
+        assert!(runtime().active_sweep.flag.load(Ordering::Acquire));
+        let releaser = std::thread::spawn(crate::runtime::serving(|| {
             std::thread::sleep(std::time::Duration::from_millis(2));
             SHUTDOWN_RESUME.store(true, Ordering::Release);
-        });
+        }));
         coordinator::shutdown();
         releaser.join().unwrap();
-        *SWEEP_TEST_HOOK.lock().unwrap() = None;
-        assert!(!ACTIVE_FLAG.load(Ordering::Acquire));
+        *runtime().sweep_observation.hook.lock().unwrap() = None;
+        assert!(!runtime().active_sweep.flag.load(Ordering::Acquire));
         assert!(runtime().heap.lock().unwrap().sweeping.is_none());
         assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
         assert!(runtime().heap.lock().unwrap().released_bytes > 0);
@@ -2063,7 +2184,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_allocate_reclaim_waves_preserve_root_and_accounting() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         let mut root = willow_alloc(8);
@@ -2088,7 +2209,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_descriptor_writer_contention_preserves_work_and_references() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for tlab in [false, true] {
             reset_internal_for_test();
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -2184,7 +2305,7 @@ mod tests {
 
     #[test]
     fn bounded_sweep_hook_runs_once_for_dead_payload_before_storage_release() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for tlab in [false, true] {
             reset_internal_for_test();
             HOOK_CALLS.store(0, Ordering::Relaxed);

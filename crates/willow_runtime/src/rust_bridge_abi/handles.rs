@@ -18,8 +18,29 @@ struct Slot {
 pub struct Table {
     slots: Vec<Slot>,
     free: Vec<u32>,
+    probes: ProbeCount,
+}
+/// Slot-lookup probes observed by this file's scaling test. This source is
+/// also compiled into generated bridges, so it carries its own erasure: the
+/// count is zero-sized and recording is a no-op outside tests.
+#[derive(Default)]
+struct ProbeCount(#[cfg(test)] std::cell::Cell<usize>);
+impl ProbeCount {
+    #[cfg(not(test))]
+    #[inline]
+    fn record(&self) {}
     #[cfg(test)]
-    probes: std::cell::Cell<usize>,
+    fn record(&self) {
+        self.0.set(self.0.get() + 1);
+    }
+    #[cfg(test)]
+    fn get(&self) -> usize {
+        self.0.get()
+    }
+    #[cfg(test)]
+    fn set(&self, value: usize) {
+        self.0.set(value);
+    }
 }
 impl Table {
     pub fn insert<T: Any + Send + Sync>(&mut self, value: Box<T>, name: TypeId) -> u64 {
@@ -46,8 +67,7 @@ impl Table {
     }
     fn index(&self, id: u64, name: TypeId) -> Result<usize, HandleError> {
         let index = (id as u32).checked_sub(1).ok_or(HandleError::Invalid)? as usize;
-        #[cfg(test)]
-        self.probes.set(self.probes.get() + 1);
+        self.probes.record();
         let slot = self.slots.get(index).ok_or(HandleError::Invalid)?;
         let generation = (id >> 32) as u32;
         if generation == 0 || generation > slot.generation {

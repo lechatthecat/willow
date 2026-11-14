@@ -11,26 +11,81 @@ struct State {
     shutdown: bool,
 }
 
-struct Coordinator {
+pub(super) struct Coordinator {
     shared: Arc<(Mutex<State>, Condvar)>,
-    thread: std::thread::JoinHandle<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
     completed: Arc<std::sync::atomic::AtomicBool>,
 }
 
-static COORDINATOR: Mutex<Option<Coordinator>> = Mutex::new(None);
+#[derive(Clone)]
+enum Owner {
+    Static(&'static crate::runtime::Runtime),
+    Shared(std::sync::Weak<crate::runtime::Runtime>),
+}
+
+pub(super) enum Lease {
+    Static(&'static crate::runtime::Runtime),
+    Shared(Arc<crate::runtime::Runtime>),
+}
+
+impl std::ops::Deref for Lease {
+    type Target = crate::runtime::Runtime;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Static(owner) => owner,
+            Self::Shared(owner) => owner,
+        }
+    }
+}
+
+impl Lease {
+    pub(super) fn for_runtime(owner: &crate::runtime::Runtime) -> Option<Self> {
+        if std::ptr::eq(owner, crate::runtime::current()) {
+            Some(Self::Static(crate::runtime::current()))
+        } else {
+            owner.service_owner.get()?.upgrade().map(Self::Shared)
+        }
+    }
+}
+
+impl Owner {
+    fn acquire(&self) -> Option<Lease> {
+        match self {
+            Self::Static(owner) => Some(Lease::Static(owner)),
+            Self::Shared(owner) => owner.upgrade().map(Lease::Shared),
+        }
+    }
+}
+
+impl Drop for Coordinator {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+        state.shutdown = true;
+        state.pending = false;
+        cv.notify_all();
+    }
+}
 
 impl Coordinator {
-    fn new() -> std::io::Result<Self> {
+    fn new(owner: Owner) -> std::io::Result<Self> {
         let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
         let worker = shared.clone();
         let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let completion = completed.clone();
         let thread = std::thread::Builder::new()
             .name("willow-gc-cycle".into())
-            .spawn(move || run(worker, completion))?;
+            .spawn(move || {
+                // The process-lifetime owner's collector thread serves it, so
+                // its implicit default paths reach that owner.
+                if let Owner::Static(serving) = &owner {
+                    serving.select_for_thread();
+                }
+                run(owner, worker, completion)
+            })?;
         Ok(Self {
             shared,
-            thread,
+            thread: Some(thread),
             completed,
         })
     }
@@ -40,6 +95,16 @@ impl Coordinator {
 /// the registry cannot publish roots to a background collector.
 pub(super) fn request() -> bool {
     request_tracked().is_some()
+}
+
+pub(super) fn request_in(owner: &crate::runtime::Runtime) -> bool {
+    if std::ptr::eq(owner, crate::runtime::current()) {
+        return request();
+    }
+    let Some(shared) = owner.service_owner.get().and_then(std::sync::Weak::upgrade) else {
+        return false;
+    };
+    request_tracked_in(owner, Owner::Shared(Arc::downgrade(&shared))).is_some()
 }
 
 /// A receipt is completed only by a successful coordinator collection which
@@ -67,18 +132,46 @@ impl Request {
 }
 
 pub(super) fn request_tracked() -> Option<Request> {
-    let id = std::thread::current().id();
-    if !runtime().coord.0.lock().unwrap().mutators.contains_key(&id) {
+    let owner = crate::runtime::current();
+    if !owner
+        .gc
+        .coord
+        .0
+        .lock()
+        .unwrap()
+        .mutators
+        .contains_key(&std::thread::current().id())
+    {
         return None;
     }
-    let mut coordinator = COORDINATOR.lock().unwrap();
+    request_tracked_in(owner, Owner::Static(owner))
+}
+
+/// Request an explicitly owned runtime. Unregistered callers may use this only
+/// without thread-local managed roots; persistent roots belong to the owner's
+/// root registries. Foreign legacy owners are still checked by collector election.
+pub(super) fn request_shared(owner: &Arc<crate::runtime::Runtime>) -> Option<Request> {
+    owner.service_owner.get_or_init(|| Arc::downgrade(owner));
+    if crate::generated_context::depth() != 0 || crate::generated_context::has_active_bridge() {
+        return None;
+    }
+    request_tracked_in(owner, Owner::Shared(Arc::downgrade(owner)))
+}
+
+fn request_tracked_in(
+    runtime_owner: &crate::runtime::Runtime,
+    service_owner: Owner,
+) -> Option<Request> {
+    let owner = &runtime_owner.gc;
+    let mut coordinator = owner.coordinator.lock().unwrap();
     if coordinator.is_none() {
-        match Coordinator::new() {
+        match Coordinator::new(service_owner) {
             Ok(created) => *coordinator = Some(created),
             Err(_) => {
-                crate::gc_telemetry::workers::record_failure(
-                    crate::gc_telemetry::workers::Failure::Spawn,
-                );
+                runtime_owner
+                    .telemetry
+                    .workers
+                    .record_failure(crate::gc_telemetry::workers::Failure::Spawn);
                 return None;
             }
         }
@@ -104,18 +197,26 @@ pub(super) fn request_tracked() -> Option<Request> {
     Some(receipt)
 }
 
-fn run(shared: Arc<(Mutex<State>, Condvar)>, completion: Arc<std::sync::atomic::AtomicBool>) {
+fn run(
+    owner: Owner,
+    shared: Arc<(Mutex<State>, Condvar)>,
+    completion: Arc<std::sync::atomic::AtomicBool>,
+) {
     crate::failure::ffi_boundary("GC coordinator", || {
-        run_loop(shared);
+        run_loop(&owner, shared);
         // Publish under coord so completion and stop requests share the
         // waiter's predicate lock. run_loop has released every GC owner.
-        let _coord = runtime().coord.0.lock().unwrap();
-        completion.store(true, Ordering::Relaxed);
-        runtime().budget_cv.notify_all();
+        if let Some(owner) = owner.acquire() {
+            let _coord = owner.gc.coord.0.lock().unwrap();
+            completion.store(true, Ordering::Relaxed);
+            owner.gc.budget_cv.notify_all();
+        } else {
+            completion.store(true, Ordering::Release);
+        }
     });
 }
 
-fn run_loop(shared: Arc<(Mutex<State>, Condvar)>) {
+fn run_loop(service_owner: &Owner, shared: Arc<(Mutex<State>, Condvar)>) {
     let (lock, cv) = &*shared;
     loop {
         let mut state = lock.lock().unwrap();
@@ -129,14 +230,13 @@ fn run_loop(shared: Arc<(Mutex<State>, Condvar)>) {
         state.running = true;
         let mut selected = state.requested;
         drop(state);
+        let Some(owner) = service_owner.acquire() else {
+            return;
+        };
         let succeeded = loop {
-            willow_gc_register_mutator();
-            #[cfg(test)]
-            if PANIC_BEFORE_COLLECTION.load(Ordering::Relaxed) {
-                panic!("injected coordinator collection panic");
-            }
-            let attempt = try_collect_internal();
-            willow_gc_unregister_mutator();
+            // Dedicated collector threads hold no mutator roots outside an elected cycle.
+            RuntimeWaitObservation::before_coordinator_collection(|| &owner.gc.wait_observation);
+            let attempt = try_collect_internal_in(&owner);
             if attempt == CollectionAttempt::Completed {
                 break true;
             }
@@ -156,7 +256,7 @@ fn run_loop(shared: Arc<(Mutex<State>, Condvar)>) {
                     .0;
             } else {
                 drop(state);
-                cycle_wait::wait_for_current_cycle();
+                cycle_wait::wait_for_current_cycle_in(&owner);
                 state = lock.lock().unwrap();
             }
             if state.shutdown {
@@ -175,7 +275,11 @@ fn run_loop(shared: Arc<(Mutex<State>, Condvar)>) {
 }
 
 pub(super) fn shutdown() {
-    let Some(coordinator) = COORDINATOR.lock().unwrap().take() else {
+    shutdown_in(crate::runtime::current());
+}
+
+pub(super) fn shutdown_in(owner: &crate::runtime::Runtime) {
+    let Some(mut coordinator) = owner.gc.coordinator.lock().unwrap().take() else {
         return;
     };
     {
@@ -187,47 +291,48 @@ pub(super) fn shutdown() {
     }
     // The caller may still be a registered mutator. A blocking join would
     // deadlock a coordinator awaiting its root snapshot or fallback safepoint.
-    let mut coord = runtime().coord.0.lock().unwrap();
+    let mut coord = owner.gc.coord.0.lock().unwrap();
     while !coordinator.completed.load(Ordering::Relaxed) {
         if coord.stop_requested {
             drop(coord);
-            willow_gc_safepoint();
-            coord = runtime().coord.0.lock().unwrap();
+            safepoint::safepoint_in(owner);
+            coord = owner.gc.coord.0.lock().unwrap();
         } else {
-            #[cfg(test)]
-            SHUTDOWN_WAITS.fetch_add(1, Ordering::Release);
-            coord = runtime().budget_cv.wait(coord).unwrap();
+            RuntimeWaitObservation::coordinator_wait(|| &owner.gc.wait_observation);
+            coord = owner.gc.budget_cv.wait(coord).unwrap();
         }
     }
     drop(coord);
     // Completion proves heap quiescence, even if OS/TLS teardown is delayed.
-    if coordinator.thread.is_finished() {
-        let _ = coordinator.thread.join();
+    if coordinator
+        .thread
+        .as_ref()
+        .is_some_and(|thread| thread.is_finished())
+    {
+        let _ = coordinator.thread.take().unwrap().join();
     }
 }
 
 #[cfg(test)]
-static SHUTDOWN_WAITS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(test)]
-static PANIC_BEFORE_COLLECTION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    static ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    static RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    #[derive(Default)]
+    struct TracePause {
+        entered: std::sync::atomic::AtomicBool,
+        release: std::sync::atomic::AtomicBool,
+    }
 
     unsafe fn legacy(_: *mut u8, _: &mut Vec<*mut *mut u8>) {}
     unsafe fn paused_trace(
-        _: *mut u8,
+        payload: *mut u8,
         _: usize,
         _: usize,
         _: &mut Vec<*mut u8>,
     ) -> TraceSliceProgress {
-        ENTERED.store(true, Ordering::Release);
-        if RELEASE.load(Ordering::Acquire) {
+        // The rooted old-generation object retains its observation while tracing.
+        let pause = unsafe { &*payload.cast::<TracePause>() };
+        pause.entered.store(true, Ordering::Release);
+        if pause.release.load(Ordering::Acquire) {
             TraceSliceProgress::Done
         } else {
             TraceSliceProgress::Retry
@@ -235,18 +340,169 @@ mod tests {
     }
 
     #[test]
+    fn private_coordinators_collect_live_heaps_and_release_their_owners() {
+        let barrier = std::sync::Barrier::new(2);
+        let first_gone = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = [8usize, 24]
+                .into_iter()
+                .map(|size| {
+                    let barrier = &barrier;
+                    let first_gone = &first_gone;
+                    scope.spawn(move || {
+                        let mut runtime = crate::runtime::Runtime::new(
+                            crate::scheduler::environment_worker_config,
+                        );
+                        runtime.marker_count = std::sync::LazyLock::new(|| 2);
+                        let owner = Arc::new(runtime);
+                        let weak = Arc::downgrade(&owner);
+                        let root = {
+                            let mut state = owner.gc.heap.lock().unwrap();
+                            let object =
+                                allocate_old_region_object_locked(&mut state, 0, 0, size, 0, true)
+                                    .unwrap();
+                            for _ in 0..128 {
+                                allocate_old_region_object_locked(&mut state, 0, 0, 8, 0, true)
+                                    .unwrap();
+                            }
+                            object.payload().as_ptr()
+                        };
+                        root::add_task_frame_root_in(&owner, root);
+                        barrier.wait();
+                        for round in 1..=2 {
+                            let receipt = request_shared(&owner).unwrap();
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(10);
+                            while !receipt.is_complete() {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "private collection stalled"
+                                );
+                                std::thread::yield_now();
+                            }
+                            let state = owner.gc.heap.lock().unwrap();
+                            assert_eq!(state.major_collections, round);
+                            assert_eq!(
+                                owner.telemetry.workers.snapshot().completed_jobs,
+                                round as u64 * 2
+                            );
+                            assert_eq!(
+                                state.allocated_bytes,
+                                if round == 1 { size + GC_HEADER_SIZE } else { 0 }
+                            );
+                            drop(state);
+                            barrier.wait();
+                            root::remove_runtime_root_in(&owner, root);
+                        }
+                        if size == 24 {
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(10);
+                            while !first_gone.load(Ordering::Acquire) {
+                                assert!(std::time::Instant::now() < deadline);
+                                std::thread::yield_now();
+                            }
+                            let object = allocate_old_region_object_locked(
+                                &mut owner.gc.heap.lock().unwrap(),
+                                0,
+                                0,
+                                size,
+                                0,
+                                true,
+                            )
+                            .unwrap();
+                            let payload = object.payload().as_ptr();
+                            owner.gc.runtime_roots.add(payload);
+                            let receipt = request_shared(&owner).unwrap();
+                            while !receipt.is_complete() {
+                                assert!(std::time::Instant::now() < deadline);
+                                std::thread::yield_now();
+                            }
+                            let state = owner.gc.heap.lock().unwrap();
+                            assert_eq!(state.major_collections, 3);
+                            assert_eq!(owner.telemetry.workers.snapshot().completed_jobs, 6);
+                            assert_eq!(state.allocated_bytes, size + GC_HEADER_SIZE);
+                            drop(state);
+                            owner.gc.runtime_roots.remove(payload);
+                        }
+                        let completed = owner
+                            .gc
+                            .coordinator
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .completed
+                            .clone();
+                        drop(owner);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        while !completed.load(Ordering::Acquire) {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "private coordinator retained its owner"
+                            );
+                            std::thread::yield_now();
+                        }
+                        assert!(weak.upgrade().is_none());
+                        if size == 8 {
+                            first_gone.store(true, Ordering::Release);
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn private_shutdown_consumes_only_its_owners_coordinator_slot() {
+        let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+        let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+        let make = || Coordinator {
+            shared: Arc::new((Mutex::new(State::default()), Condvar::new())),
+            thread: Some(std::thread::spawn(|| {})),
+            completed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let first_coordinator = make();
+        let first_state = first_coordinator.shared.clone();
+        let second_coordinator = make();
+        let second_state = second_coordinator.shared.clone();
+        *first.gc.coordinator.lock().unwrap() = Some(first_coordinator);
+        *second.gc.coordinator.lock().unwrap() = Some(second_coordinator);
+        shutdown_in(&first);
+        assert!(first.gc.coordinator.lock().unwrap().is_none());
+        assert!(first_state.0.lock().unwrap().shutdown);
+        assert!(second.gc.coordinator.lock().unwrap().is_some());
+        assert!(!second_state.0.lock().unwrap().shutdown);
+        shutdown_in(&first);
+        shutdown_in(&second);
+        assert!(second.gc.coordinator.lock().unwrap().is_none());
+        assert!(second_state.0.lock().unwrap().shutdown);
+    }
+
+    #[test]
     fn shutdown_notification_spurious_wakes_and_stop_rounds() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let _mutator = MutatorRegistration::new();
-        SHUTDOWN_WAITS.store(0, Ordering::Relaxed);
+        runtime()
+            .wait_observation
+            .coordinator_waits
+            .store(0, Ordering::Relaxed);
         let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let completion = completed.clone();
         let caller = std::thread::current().id();
-        let thread = std::thread::spawn(move || {
+        let thread = std::thread::spawn(crate::runtime::serving(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             for round in 1..=5 {
-                while SHUTDOWN_WAITS.load(Ordering::Acquire) < round {
+                while runtime()
+                    .wait_observation
+                    .coordinator_waits
+                    .load(Ordering::Acquire)
+                    < round
+                {
                     assert!(
                         std::time::Instant::now() < deadline,
                         "shutdown did not sleep"
@@ -268,14 +524,20 @@ mod tests {
             let _coord = runtime().coord.0.lock().unwrap();
             completion.store(true, Ordering::Relaxed);
             runtime().budget_cv.notify_all();
-        });
-        *COORDINATOR.lock().unwrap() = Some(Coordinator {
+        }));
+        *runtime().coordinator.lock().unwrap() = Some(Coordinator {
             shared: Arc::new((Mutex::new(State::default()), Condvar::new())),
-            thread,
+            thread: Some(thread),
             completed,
         });
         shutdown();
-        assert!(SHUTDOWN_WAITS.load(Ordering::Relaxed) >= 5);
+        assert!(
+            runtime()
+                .wait_observation
+                .coordinator_waits
+                .load(Ordering::Relaxed)
+                >= 5
+        );
         assert_eq!(registered_mutator_count(), 1);
         drop(_mutator);
         reset_internal_for_test();
@@ -283,25 +545,26 @@ mod tests {
 
     #[test]
     fn shutdown_notification_idle_repeated_and_before_wait() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         shutdown(); // Absent coordinator.
         for _ in 0..64 {
-            *COORDINATOR.lock().unwrap() = Some(Coordinator::new().unwrap());
+            *runtime().coordinator.lock().unwrap() =
+                Some(Coordinator::new(Owner::Static(crate::runtime::current())).unwrap());
             shutdown();
-            assert!(COORDINATOR.lock().unwrap().is_none());
+            assert!(runtime().coordinator.lock().unwrap().is_none());
         }
         // Completion may be published before the shutdown waiter acquires coord.
         // Delay OS thread teardown to ensure shutdown never joins it blindly.
         let (release, released) = std::sync::mpsc::channel();
         let (done, completed) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
+        let thread = std::thread::spawn(crate::runtime::serving(move || {
             released.recv().unwrap();
             done.send(()).unwrap();
-        });
-        *COORDINATOR.lock().unwrap() = Some(Coordinator {
+        }));
+        *runtime().coordinator.lock().unwrap() = Some(Coordinator {
             shared: Arc::new((Mutex::new(State::default()), Condvar::new())),
-            thread,
+            thread: Some(thread),
             completed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         });
         shutdown();
@@ -318,7 +581,10 @@ mod tests {
         if std::env::var_os(GC_FATAL_CASE).is_some() {
             reset_internal_for_test();
             willow_gc_register_mutator();
-            PANIC_BEFORE_COLLECTION.store(true, Ordering::Relaxed);
+            runtime()
+                .wait_observation
+                .panic_before_collection
+                .store(true, Ordering::Relaxed);
             assert!(request());
             loop {
                 std::thread::park();
@@ -334,10 +600,8 @@ mod tests {
 
     #[test]
     fn allocation_resumes_while_automatic_collection_is_tracing() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
-        ENTERED.store(false, Ordering::Relaxed);
-        RELEASE.store(false, Ordering::Relaxed);
         const TYPE: u32 = 0xFA88;
         willow_register_type_capability(
             TYPE,
@@ -345,13 +609,15 @@ mod tests {
             NativeTraceCapability::SliceConcurrentSafe(paused_trace),
         );
         let mut root = willow_alloc_object(TYPE as i64, 8);
+        unsafe { root.cast::<TracePause>().write(TracePause::default()) };
+        let pause = unsafe { &*root.cast::<TracePause>() };
         willow_push_root(&mut root);
         willow_gc_register_mutator();
         runtime().heap.lock().unwrap().threshold_bytes = 1;
         crate::gc::invalidate_runtime_policy_budgets();
         assert!(!willow_alloc(8).is_null());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !ENTERED.load(Ordering::Acquire) {
+        while !pause.entered.load(Ordering::Acquire) {
             willow_gc_safepoint();
             assert!(
                 std::time::Instant::now() < deadline,
@@ -363,7 +629,7 @@ mod tests {
             assert!(!willow_alloc(8).is_null());
             assert!(request()); // Coalesces into the already-running cycle.
         }
-        RELEASE.store(true, Ordering::Release);
+        pause.release.store(true, Ordering::Release);
         shutdown();
         assert_eq!(runtime().heap.lock().unwrap().major_collections, 1);
         assert_eq!(registered_mutator_count(), 1);
@@ -376,11 +642,12 @@ mod tests {
 
     #[test]
     fn automatic_request_survives_explicit_collector_election_loss() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
-        ENTERED.store(false, Ordering::Relaxed);
-        RELEASE.store(false, Ordering::Relaxed);
-        cycle_wait::SLEEPS.store(0, Ordering::Relaxed);
+        runtime()
+            .wait_observation
+            .sleeps
+            .store(0, Ordering::Relaxed);
         const TYPE: u32 = 0xFA89;
         willow_register_type_capability(
             TYPE,
@@ -389,14 +656,16 @@ mod tests {
         );
         let _mutator = MutatorRegistration::new();
         let mut root = willow_alloc_object(TYPE as i64, 8);
+        unsafe { root.cast::<TracePause>().write(TracePause::default()) };
+        let pause = unsafe { &*root.cast::<TracePause>() };
         willow_push_root(&mut root);
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
-        let explicit = std::thread::spawn(|| {
+        let explicit = std::thread::spawn(crate::runtime::serving(|| {
             let _mutator = MutatorRegistration::new();
             willow_gc_collect();
-        });
+        }));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !ENTERED.load(Ordering::Acquire) {
+        while !pause.entered.load(Ordering::Acquire) {
             willow_gc_safepoint();
             assert!(
                 std::time::Instant::now() < deadline,
@@ -406,7 +675,7 @@ mod tests {
         }
         let receipt = request_tracked().unwrap(); // Only automatic request; no later allocations.
         assert!(!receipt.is_complete());
-        while cycle_wait::SLEEPS.load(Ordering::Acquire) == 0 {
+        while runtime().wait_observation.sleeps.load(Ordering::Acquire) == 0 {
             willow_gc_safepoint();
             assert!(
                 std::time::Instant::now() < deadline,
@@ -415,7 +684,7 @@ mod tests {
             std::thread::yield_now();
         }
         {
-            let coordinator = COORDINATOR.lock().unwrap();
+            let coordinator = runtime().coordinator.lock().unwrap();
             let state = coordinator.as_ref().unwrap().shared.0.lock().unwrap();
             assert!(
                 state.pending && state.running,
@@ -423,7 +692,7 @@ mod tests {
             );
         }
         assert_eq!(runtime().heap.lock().unwrap().major_collections, 0);
-        RELEASE.store(true, Ordering::Release);
+        pause.release.store(true, Ordering::Release);
         while !explicit.is_finished() || runtime().heap.lock().unwrap().major_collections < 2 {
             willow_gc_safepoint();
             assert!(
@@ -444,7 +713,7 @@ mod tests {
         assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
         println!(
             "explicit_cycles=1 retained_automatic_cycles=1 additional_requests=0 cooperative_sleeps={}",
-            cycle_wait::SLEEPS.load(Ordering::Relaxed)
+            runtime().wait_observation.sleeps.load(Ordering::Relaxed)
         );
         willow_pop_roots(1);
         drop(_mutator);
@@ -453,20 +722,20 @@ mod tests {
 
     #[test]
     fn m3_receipts_defer_foreign_roots_before_and_at_handshake() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for asynchronous in [false, true] {
             for handshake in [false, true] {
                 reset_internal_for_test();
-                RECEIPT_TEST_HANDSHAKE_ONLY.store(handshake, Ordering::Relaxed);
+                let _handshake_policy = runtime().handshake_policy.with_handshake_only(handshake);
                 let (ready_tx, ready_rx) = std::sync::mpsc::channel();
                 let (release_tx, release_rx) = std::sync::mpsc::channel();
-                let owner = std::thread::spawn(move || {
+                let owner = std::thread::spawn(crate::runtime::serving(move || {
                     let mut root = willow_alloc(32);
                     willow_push_root(&mut root);
                     ready_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                     willow_pop_root();
-                });
+                }));
                 ready_rx.recv().unwrap();
                 let registration = asynchronous.then(MutatorRegistration::new);
                 let before = gc_progress();
@@ -486,7 +755,7 @@ mod tests {
                         assert!(!receipt.is_complete());
                         willow_gc_safepoint();
                         // Exercise spurious wakeups during the timed backoff.
-                        if let Some(coordinator) = COORDINATOR.lock().unwrap().as_ref() {
+                        if let Some(coordinator) = runtime().coordinator.lock().unwrap().as_ref() {
                             coordinator.shared.1.notify_all();
                         }
                         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -538,7 +807,6 @@ mod tests {
                 assert_eq!(willow_gc_allocated_bytes(), 0);
                 shutdown();
                 drop(registration);
-                RECEIPT_TEST_HANDSHAKE_ONLY.store(false, Ordering::Relaxed);
                 println!(
                     "receipt asynchronous={asynchronous} handshake_skip={handshake} skipped_not_completed=true recovered=true"
                 );
@@ -549,17 +817,17 @@ mod tests {
 
     #[test]
     fn m3_foreign_root_deferred_receipt_shutdown_stays_incomplete() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let owner = std::thread::spawn(move || {
+        let owner = std::thread::spawn(crate::runtime::serving(move || {
             let mut root = willow_alloc(32);
             willow_push_root(&mut root);
             ready_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             willow_pop_root();
-        });
+        }));
         ready_rx.recv().unwrap();
         let registration = MutatorRegistration::new();
         let receipt = request_tracked().unwrap();
@@ -586,9 +854,9 @@ mod tests {
 
     #[test]
     fn unregistered_native_callers_keep_synchronous_compatibility() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         assert!(!request());
-        assert!(COORDINATOR.lock().unwrap().is_none());
+        assert!(runtime().coordinator.lock().unwrap().is_none());
     }
 }

@@ -481,6 +481,13 @@ pub extern "C" fn willow_panic_finish_unhandled() -> ! {
     finish_unhandled_with_async_chain(&async_chain)
 }
 
+// Lets tests observe the report point; an empty inline function otherwise.
+#[cfg(test)]
+use tests::observe_unhandled_report;
+#[cfg(not(test))]
+#[inline(always)]
+fn observe_unhandled_report() {}
+
 /// Report an active task-owned language panic after the scheduler has already
 /// published/reaped the task as Panicked. The chain is captured before task
 /// removal, while the TLS-held PanicContext keeps every PanicInfo rooted.
@@ -490,8 +497,7 @@ pub(crate) fn finish_unhandled_with_async_chain(async_chain: &str) -> ! {
     if records.is_empty() {
         fatal_invariant("finish-unhandled called without an active panic");
     }
-    #[cfg(test)]
-    tests::observe_unhandled_report();
+    observe_unhandled_report();
     let async_chain = records
         .last()
         .map(|record| record.async_stack.as_str())
@@ -555,7 +561,7 @@ pub unsafe fn panic_info_column(info: *mut u8) -> i64 {
 mod tests {
     use super::*;
     use crate::gc::{
-        runtime_root_count, runtime_test_guard, willow_gc_allocated_bytes, willow_gc_collect,
+        isolated_runtime, runtime_root_count, willow_gc_allocated_bytes, willow_gc_collect,
         willow_gc_init,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -600,7 +606,7 @@ mod tests {
             }
             return;
         }
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         reset_global_scheduler_for_test();
         unsafe extern "C" fn poll(frame: *mut std::ffi::c_void) -> i32 {
@@ -685,7 +691,7 @@ mod tests {
 
     #[test]
     fn panic_info_roots_supplied_file_before_message_fallback() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         struct RestoreStress;
         impl Drop for RestoreStress {
@@ -706,7 +712,7 @@ mod tests {
 
     #[test]
     fn depth_matches_nested_recovery_and_context_swaps() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _restore = ContextTestGuard::install(240);
         let first = current_context().unwrap();
@@ -747,7 +753,7 @@ mod tests {
 
     #[test]
     fn generated_depth_tracks_active_context_lifetime_and_nested_recovery() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let generated = crate::generated_context::Context::new();
         generated.refresh();
@@ -782,20 +788,20 @@ mod tests {
 
     #[test]
     fn shared_context_depth_tracks_another_threads_mutations() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _restore = ContextTestGuard::install(242);
         let context = current_context().unwrap();
         raise("shared", "", 0, 0);
         let worker_context = Arc::clone(&context);
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             assert_eq!(willow_panic_depth(), 0, "fresh worker has no context");
             replace_current_context(Some(Arc::clone(&worker_context)));
             assert_eq!(willow_panic_depth(), 1);
             willow_panic_release_recovered(recover_one());
             assert_eq!(willow_panic_depth(), 0);
             replace_current_context(None);
-        })
+        }))
         .join()
         .unwrap();
         assert_eq!(willow_panic_depth(), 0);
@@ -816,7 +822,7 @@ mod tests {
 
     #[test]
     fn array_dynamic_lengths_preserve_recoverable_panics() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(30);
         for len in [-1, i64::MIN, i64::MAX] {
@@ -845,7 +851,7 @@ mod tests {
 
     #[test]
     fn panic_context_01_normal_path_is_inactive_and_recover_is_null() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(1);
         let before = willow_gc_allocated_bytes();
@@ -856,7 +862,7 @@ mod tests {
 
     #[test]
     fn panic_context_02_raise_records_all_fields() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(2);
         raise("boom", "main.wi", 7, 9);
@@ -871,7 +877,7 @@ mod tests {
 
     #[test]
     fn panic_context_03_recover_requires_panic_defer_depth() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(3);
         raise("boom", "", 0, 0);
@@ -884,7 +890,7 @@ mod tests {
 
     #[test]
     fn panic_context_04_one_record_can_only_be_recovered_once() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(4);
         raise("once", "", 0, 0);
@@ -896,7 +902,7 @@ mod tests {
 
     #[test]
     fn panic_context_05_nested_recover_pops_only_the_top_record() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(5);
         raise("outer", "", 0, 0);
@@ -913,7 +919,7 @@ mod tests {
 
     #[test]
     fn panic_context_06_defer_depth_is_checked_and_nested() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(6);
         willow_panic_enter_defer();
@@ -926,7 +932,7 @@ mod tests {
 
     #[test]
     fn panic_context_07_active_info_survives_minor_and_major_gc() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(7);
         raise("rooted message", "rooted.wi", 11, 12);
@@ -940,7 +946,7 @@ mod tests {
 
     #[test]
     fn panic_context_08_recovered_transfer_root_survives_collection() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(8);
         raise("transferred", "", 0, 0);
@@ -956,7 +962,7 @@ mod tests {
 
     #[test]
     fn panic_context_09_contexts_are_isolated_on_one_thread() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let first = Arc::new(PanicContext::new(91));
         let second = Arc::new(PanicContext::new(92));
@@ -977,7 +983,7 @@ mod tests {
 
     #[test]
     fn panic_context_10_owner_and_root_counts_are_observable() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(10);
         raise("a", "", 0, 0);
@@ -996,7 +1002,7 @@ mod tests {
 
     #[test]
     fn panic_context_11_null_inputs_receive_required_defaults() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(11);
         willow_panic_raise(std::ptr::null(), std::ptr::null(), -1, -1);
@@ -1008,7 +1014,8 @@ mod tests {
         willow_panic_release_recovered(info);
     }
 
-    static TASK_CONTEXT_OBSERVATION: AtomicUsize = AtomicUsize::new(0);
+    static TASK_CONTEXT_OBSERVATION: crate::runtime::PerRuntime<AtomicUsize> =
+        crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
     unsafe extern "C" fn context_observer_poll(_frame: *mut std::ffi::c_void) -> i32 {
         let before = willow_panic_active() as usize;
@@ -1020,7 +1027,7 @@ mod tests {
 
     #[test]
     fn panic_context_12_scheduler_installs_task_context_and_restores_sync_context() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         let _single = crate::scheduler::single_worker_for_test();
         willow_gc_init();
         crate::scheduler::reset_global_scheduler_for_test();
@@ -1034,7 +1041,8 @@ mod tests {
         assert_eq!(willow_gc_allocated_bytes(), 0, "task panic roots leaked");
     }
 
-    static NESTED_CONTEXT_OBSERVATION: AtomicUsize = AtomicUsize::new(0);
+    static NESTED_CONTEXT_OBSERVATION: crate::runtime::PerRuntime<AtomicUsize> =
+        crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
     unsafe extern "C" fn nested_inner_poll(_frame: *mut std::ffi::c_void) -> i32 {
         if willow_panic_active() == 0 {
@@ -1055,7 +1063,7 @@ mod tests {
 
     #[test]
     fn panic_context_13_nested_scheduler_drive_isolates_and_restores_outer_task() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         let _single = crate::scheduler::single_worker_for_test();
         willow_gc_init();
         crate::scheduler::reset_global_scheduler_for_test();
@@ -1161,7 +1169,7 @@ mod tests {
     /// runtime root it took, so repeated recoveries cannot grow the root table.
     #[test]
     fn panic_context_16_full_cycle_returns_every_runtime_root() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(16);
         let baseline = runtime_root_count();
@@ -1183,7 +1191,7 @@ mod tests {
     /// after an unhandled panic was reported) still releases its roots.
     #[test]
     fn panic_context_17_dropped_context_releases_unrecovered_roots() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let baseline = runtime_root_count();
         {
@@ -1209,7 +1217,7 @@ mod tests {
     /// and major collections, and unwinds in LIFO order afterwards.
     #[test]
     fn panic_context_18_nested_stack_survives_minor_and_major_collections() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(18);
         let baseline = runtime_root_count();
@@ -1237,7 +1245,7 @@ mod tests {
     /// out, so a stray release cannot silently drop someone else's root.
     #[test]
     fn panic_context_19_release_rejects_untransferred_pointers() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let context = Arc::new(PanicContext::new(19));
         let previous = replace_current_context(Some(Arc::clone(&context)));
@@ -1256,7 +1264,7 @@ mod tests {
     /// so ordinary code after cleanup cannot consume a later panic.
     #[test]
     fn panic_context_20_recover_window_closes_with_defer_scope() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(20);
         willow_panic_enter_defer();
@@ -1272,8 +1280,10 @@ mod tests {
         baseline_snapshot_is_clean("recover window");
     }
 
-    static POOL_CLEAN_POLLS: AtomicUsize = AtomicUsize::new(0);
-    static POOL_DIRTY_POLLS: AtomicUsize = AtomicUsize::new(0);
+    static POOL_CLEAN_POLLS: crate::runtime::PerRuntime<AtomicUsize> =
+        crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+    static POOL_DIRTY_POLLS: crate::runtime::PerRuntime<AtomicUsize> =
+        crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
     unsafe extern "C" fn pool_recover_poll(_frame: *mut std::ffi::c_void) -> i32 {
         let entry_clean = willow_panic_active() == 0
@@ -1306,7 +1316,7 @@ mod tests {
     /// than to the worker thread that polled it.
     #[test]
     fn panic_context_21_pool_tasks_recover_independently_without_bleed() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         crate::scheduler::reset_global_scheduler_for_test();
         let _sync = ContextTestGuard::install(210);
@@ -1340,7 +1350,8 @@ mod tests {
         baseline_snapshot_is_clean("pool drive");
     }
 
-    static REUSE_OBSERVATIONS: AtomicUsize = AtomicUsize::new(0);
+    static REUSE_OBSERVATIONS: crate::runtime::PerRuntime<AtomicUsize> =
+        crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
     unsafe extern "C" fn reuse_probe_poll(_frame: *mut std::ffi::c_void) -> i32 {
         if willow_panic_active() == 0
@@ -1360,7 +1371,7 @@ mod tests {
     /// carries panic state, transfer roots, or defer depth into the next task.
     #[test]
     fn panic_context_22_single_worker_reuse_starts_every_task_clean() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         let _single = crate::scheduler::single_worker_for_test();
         willow_gc_init();
         crate::scheduler::reset_global_scheduler_for_test();
@@ -1381,7 +1392,8 @@ mod tests {
         assert_eq!(willow_gc_allocated_bytes(), 0, "recovered payloads leaked");
     }
 
-    static STRESS_FAILURES: AtomicUsize = AtomicUsize::new(0);
+    static STRESS_FAILURES: crate::runtime::PerRuntime<AtomicUsize> =
+        crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
     unsafe extern "C" fn gc_stress_recover_poll(_frame: *mut std::ffi::c_void) -> i32 {
         let mut message = ws("stressed");
@@ -1411,7 +1423,7 @@ mod tests {
     /// collections run between the raise and the recover.
     #[test]
     fn panic_context_23_task_payload_survives_collections_between_raise_and_recover() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         crate::scheduler::reset_global_scheduler_for_test();
         let _sync = ContextTestGuard::install(230);
@@ -1435,7 +1447,7 @@ mod tests {
     /// runs `enter_defer` with no panic record at all.
     #[test]
     fn panic_context_24_unwind_cleanup_flag_tracks_the_cleanup_entry() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(24);
         assert!(!panic_unwind_cleanup_active());
@@ -1475,7 +1487,7 @@ mod tests {
     /// re-installed on another worker resumes with its own records and depth.
     #[test]
     fn panic_context_25_migrated_context_resumes_with_its_own_records() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let baseline = runtime_root_count();
         let migrating = Arc::new(PanicContext::new(25));
@@ -1491,7 +1503,7 @@ mod tests {
         raise("other", "", 0, 0);
         let other_info = recover_one();
 
-        let handle = std::thread::spawn({
+        let handle = std::thread::spawn(crate::runtime::serving({
             let migrating = Arc::clone(&migrating);
             move || {
                 // A different OS thread can adopt the same context; TLS only
@@ -1505,7 +1517,7 @@ mod tests {
                 replace_current_context(None);
                 (snapshot, message)
             }
-        });
+        }));
         let (snapshot, message) = handle.join().expect("migrated worker thread panicked");
         assert_eq!(snapshot.owner, 25);
         assert_eq!(snapshot.active, 1);
@@ -1537,7 +1549,7 @@ mod tests {
     /// `String` the recovered `PanicInfo` can read.
     #[test]
     fn panic_context_26_runtime_fault_adopts_the_published_site() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(26);
         willow_fault_site_clear();
@@ -1562,7 +1574,7 @@ mod tests {
     /// the location degrades to empty.
     #[test]
     fn panic_context_27_runtime_fault_without_a_site_still_raises() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(27);
         willow_fault_site_clear();
@@ -1583,7 +1595,7 @@ mod tests {
     /// statement that raised it, never an earlier one that already returned.
     #[test]
     fn panic_context_28_latest_fault_site_wins() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(28);
         willow_fault_site_clear();
@@ -1607,7 +1619,7 @@ mod tests {
     /// unrelated later fault.
     #[test]
     fn panic_context_29_cleared_fault_site_is_not_inherited() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(29);
 
@@ -1628,13 +1640,13 @@ mod tests {
     /// worker's fault.
     #[test]
     fn panic_context_30_fault_site_is_per_thread() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(30);
         willow_fault_site_clear();
         set_fault_site("main-thread.wi", 11, 2);
 
-        let worker = std::thread::spawn(|| {
+        let worker = std::thread::spawn(crate::runtime::serving(|| {
             let context = Arc::new(PanicContext::new(31));
             replace_current_context(Some(context));
             // This thread never published a site of its own.
@@ -1645,7 +1657,7 @@ mod tests {
             willow_panic_release_recovered(info);
             replace_current_context(None);
             (file, line)
-        });
+        }));
         let (file, line) = worker.join().expect("fault-site worker panicked");
         assert_eq!(file, "", "fault site bled across threads");
         assert_eq!(line, 0);
@@ -1667,7 +1679,7 @@ mod tests {
     /// instead of reading unmapped memory or storing nonsense.
     #[test]
     fn panic_context_31_fault_site_rejects_malformed_arguments() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(32);
 
@@ -1700,7 +1712,7 @@ mod tests {
     /// take, including the file `String` the site allocates on the GC heap.
     #[test]
     fn panic_context_32_repeated_runtime_faults_do_not_leak_roots() {
-        let _heap = runtime_test_guard();
+        let _heap = isolated_runtime();
         willow_gc_init();
         let _context = ContextTestGuard::install(33);
         let baseline = runtime_root_count();

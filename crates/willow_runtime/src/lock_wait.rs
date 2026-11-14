@@ -935,7 +935,7 @@ pub fn consume_handoff(task: RuntimeTaskId, lock_id: LockId, token: Registration
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::runtime_test_guard;
+    use crate::gc::isolated_runtime;
     use crate::scheduler::{
         reset_global_scheduler_for_test, willow_sched_cancel, with_global_for_test,
     };
@@ -1057,7 +1057,7 @@ mod tests {
     // 1, 3
     #[test]
     fn lock_ids_are_monotonic_and_tokens_are_per_lock() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let first = AsyncLockState::new();
@@ -1102,7 +1102,7 @@ mod tests {
     // 5, 6
     #[test]
     fn identity_is_the_lock_id_and_token_pair() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let first = AsyncLockState::new();
@@ -1127,7 +1127,7 @@ mod tests {
     // 7, 12
     #[test]
     fn registration_publishes_queue_entry_and_link_in_fifo_order() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1151,7 +1151,7 @@ mod tests {
     // 8
     #[test]
     fn a_terminal_task_is_not_registered() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1167,7 +1167,7 @@ mod tests {
     // 9
     #[test]
     fn a_cancel_requested_task_is_not_registered() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1182,7 +1182,7 @@ mod tests {
     // 10
     #[test]
     fn an_unknown_task_is_not_registered() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1193,7 +1193,7 @@ mod tests {
     // 11
     #[test]
     fn a_task_cannot_register_on_two_locks_at_once() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let first = AsyncLockState::new();
@@ -1212,7 +1212,7 @@ mod tests {
     // 13
     #[test]
     fn handoff_reserves_ownership_and_promotes_the_link() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1242,7 +1242,7 @@ mod tests {
     // 14
     #[test]
     fn handoff_refuses_while_the_lock_is_owned() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1259,7 +1259,7 @@ mod tests {
     // 15, 20
     #[test]
     fn handoff_skips_a_cancelled_candidate() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1281,7 +1281,7 @@ mod tests {
     // 16
     #[test]
     fn handoff_skips_a_candidate_whose_record_is_gone() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1300,7 +1300,7 @@ mod tests {
     // 17
     #[test]
     fn handoff_on_an_empty_queue_leaves_the_lock_unowned() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1312,7 +1312,7 @@ mod tests {
     // 18, 35
     #[test]
     fn cancelling_a_waiting_registration_clears_both_sides() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1342,7 +1342,7 @@ mod tests {
     // 19, 21
     #[test]
     fn cancelling_a_handoff_owned_registration_releases_the_lock() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1370,7 +1370,7 @@ mod tests {
     // 22
     #[test]
     fn cancelling_without_a_registration_is_a_no_op() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let task = parked_task();
@@ -1381,7 +1381,7 @@ mod tests {
     // 23, 25
     #[test]
     fn a_stale_cancellation_does_not_remove_a_newer_registration() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1425,7 +1425,7 @@ mod tests {
     // 24
     #[test]
     fn a_stale_release_does_not_steal_the_lock() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1444,7 +1444,7 @@ mod tests {
     // 26, 27
     #[test]
     fn consume_handoff_matches_exactly_one_generation() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1475,7 +1475,7 @@ mod tests {
     // 27 (Waiting link)
     #[test]
     fn consume_handoff_rejects_a_waiting_link() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1492,7 +1492,7 @@ mod tests {
     // 38
     #[test]
     fn consume_handoff_rejects_a_missing_owner_reservation() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1520,7 +1520,7 @@ mod tests {
     // 28, 29
     #[test]
     fn uncontended_acquire_takes_ownership_without_a_link() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1542,7 +1542,7 @@ mod tests {
     // 30
     #[test]
     fn handoff_wakes_the_new_owner() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1562,7 +1562,7 @@ mod tests {
     // 31
     #[test]
     fn a_handoff_to_a_running_task_defers_to_its_poll_boundary() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1589,7 +1589,7 @@ mod tests {
     // 30 (terminal)
     #[test]
     fn waking_a_terminal_owner_reports_no_transition() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1612,7 +1612,7 @@ mod tests {
     // 37
     #[test]
     fn a_task_terminal_after_promotion_is_revoked_and_the_next_waiter_wakes() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1648,7 +1648,7 @@ mod tests {
     // 32
     #[test]
     fn concurrent_register_and_cancel_never_split_the_two_sides() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for _ in 0..64 {
             reset_global_scheduler_for_test();
             let state = Arc::new(AsyncLockState::new());
@@ -1658,17 +1658,17 @@ mod tests {
             let registrar = {
                 let state = Arc::clone(&state);
                 let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     barrier.wait();
                     state.register_waiter(task)
-                })
+                }))
             };
             let canceller = {
                 let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     barrier.wait();
                     cancel_lock_wait(task)
-                })
+                }))
             };
 
             let registered = registrar.join().expect("registrar");
@@ -1692,7 +1692,7 @@ mod tests {
     // 33
     #[test]
     fn concurrent_cancel_and_handoff_agree_on_one_outcome() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for iteration in 0..64 {
             reset_global_scheduler_for_test();
             let state = Arc::new(AsyncLockState::new());
@@ -1703,14 +1703,14 @@ mod tests {
             let handoff = {
                 let state = Arc::clone(&state);
                 let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     barrier.wait();
                     state.handoff_to_next_waiter_and_wake()
-                })
+                }))
             };
             let cancel = {
                 let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     barrier.wait();
                     // Alternate which side is favoured: without the handicap the
                     // canceller almost always reaches the task shard first, and
@@ -1720,7 +1720,7 @@ mod tests {
                         std::thread::sleep(std::time::Duration::from_micros(200));
                     }
                     cancel_lock_wait(task)
-                })
+                }))
             };
 
             let handed = handoff.join().expect("handoff");
@@ -1756,7 +1756,7 @@ mod tests {
     // 34
     #[test]
     fn the_fixed_lock_order_does_not_deadlock_under_contention() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = Arc::new(AsyncLockState::new());
@@ -1769,7 +1769,7 @@ mod tests {
             let state = Arc::clone(&state);
             let barrier = Arc::clone(&barrier);
             let done_tx = done_tx.clone();
-            handles.push(std::thread::spawn(move || {
+            handles.push(std::thread::spawn(crate::runtime::serving(move || {
                 barrier.wait();
                 for _ in 0..200 {
                     if state.register_waiter(task).is_some() {
@@ -1784,7 +1784,7 @@ mod tests {
                     }
                 }
                 done_tx.send(()).expect("send completion");
-            }));
+            })));
         }
         drop(done_tx);
 
@@ -1814,7 +1814,7 @@ mod tests {
     // 36
     #[test]
     fn a_finished_lock_wait_releases_the_task_wait_allocation() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1834,7 +1834,7 @@ mod tests {
     // 39
     #[test]
     fn acquire_or_register_takes_an_idle_lock_outright() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1852,7 +1852,7 @@ mod tests {
     // 40
     #[test]
     fn acquire_or_register_queues_behind_an_owner() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1877,7 +1877,7 @@ mod tests {
     // 41
     #[test]
     fn acquire_or_register_does_not_barge_past_a_queued_waiter() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1909,7 +1909,7 @@ mod tests {
     // 42
     #[test]
     fn acquire_or_register_refuses_an_ineligible_task() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
 
         let state = AsyncLockState::new();
@@ -1932,7 +1932,7 @@ mod tests {
     // 43
     #[test]
     fn concurrent_release_and_acquire_never_strand_a_waiter() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for iteration in 0..256 {
             reset_global_scheduler_for_test();
             let state = Arc::new(AsyncLockState::new());
@@ -1949,20 +1949,20 @@ mod tests {
             let releaser = {
                 let state = Arc::clone(&state);
                 let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     barrier.wait();
                     assert!(state.release_owner(owner, owner_token));
                     state.handoff_to_next_waiter_and_wake()
-                })
+                }))
             };
             // The acquiring side, racing the release.
             let acquirer = {
                 let state = Arc::clone(&state);
                 let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     barrier.wait();
                     state.acquire_or_register(waiter)
-                })
+                }))
             };
 
             let handed_to = releaser.join().expect("releaser");
@@ -1987,7 +1987,7 @@ mod tests {
 
     #[test]
     fn rwlock_new_reader_cannot_barge_past_queued_writer() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let state = AsyncLockState::new_rwlock();
         let first_reader = parked_task();
@@ -2011,7 +2011,7 @@ mod tests {
 
     #[test]
     fn rwlock_handoff_promotes_one_writer_before_later_readers() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let state = AsyncLockState::new_rwlock();
         let owner = parked_task();
@@ -2041,7 +2041,7 @@ mod tests {
 
     #[test]
     fn rwlock_handoff_wakes_contiguous_reader_batch() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let state = AsyncLockState::new_rwlock();
         let owner = parked_task();
@@ -2075,7 +2075,7 @@ mod tests {
 
     #[test]
     fn rwlock_cancelled_handoff_reader_does_not_strand_writer() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let state = AsyncLockState::new_rwlock();
         let owner = parked_task();
@@ -2116,7 +2116,7 @@ mod tests {
 
     #[test]
     fn rwlock_terminal_reader_in_batch_is_compensated() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let state = AsyncLockState::new_rwlock();
         let owner = parked_task();
@@ -2167,7 +2167,7 @@ mod native_accounting_tests {
     use super::*;
     #[test]
     fn boxed_lock_waiters_tokens_modes_readers_release_on_drop() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         let baseline = crate::gc_telemetry::external_bytes();
         for count in [1, 32, 1024] {

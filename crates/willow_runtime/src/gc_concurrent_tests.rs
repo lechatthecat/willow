@@ -25,7 +25,7 @@ fn sweep_if_planned(plan: Option<sweep::SweepPlan>) {
 #[test]
 fn failed_stopped_callback_resumes_world_and_remains_in_stop_telemetry() {
     use crate::gc_telemetry::stops::{STOP_COUNTERS_VALID, StopReason, snapshot_stops};
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let result = std::panic::catch_unwind(|| {
         with_stw(StopReason::InitialMark, |_, _| {
@@ -55,12 +55,14 @@ fn failed_stopped_callback_resumes_world_and_remains_in_stop_telemetry() {
     reset_internal_for_test();
 }
 
-static SNAPSHOT_READY: AtomicBool = AtomicBool::new(false);
-static MUTATION_DONE: AtomicBool = AtomicBool::new(false);
+static SNAPSHOT_READY: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+static MUTATION_DONE: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
 
 #[test]
 fn satb_deleted_subgraph_survives_then_dies_in_the_next_epoch() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for capacity in [1, 256] {
         for unregister in [false, true] {
             reset_internal_for_test();
@@ -92,7 +94,7 @@ fn satb_deleted_subgraph_survives_then_dies_in_the_next_epoch() {
             let worker = {
                 let source = source as usize;
                 let (ready, stop) = (ready.clone(), stop.clone());
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     willow_gc_register_mutator();
                     ready.store(true, Ordering::Release);
                     while !SNAPSHOT_READY.load(Ordering::Acquire) {
@@ -119,7 +121,7 @@ fn satb_deleted_subgraph_survives_then_dies_in_the_next_epoch() {
                         }
                         willow_gc_unregister_mutator();
                     }
-                })
+                }))
             };
             while !ready.load(Ordering::Acquire) {
                 std::thread::yield_now();
@@ -159,7 +161,9 @@ pub(super) fn assert_satb_mutation_retains(old: *mut u8, mutation: impl FnOnce()
             0,
         ));
         marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
-        GC_MARK_PHASE.store(1, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(1, Ordering::Release);
         cycle
     };
     mutation();
@@ -186,7 +190,9 @@ pub(super) fn assert_satb_mutation_retains(old: *mut u8, mutation: impl FnOnce()
             .sum();
     assert_eq!(cycle.work.lock().unwrap().marked_bytes, expected_bytes);
     drop(deferred);
-    GC_MARK_PHASE.store(0, Ordering::Release);
+    crate::runtime::current()
+        .mark_phase()
+        .store(0, Ordering::Release);
     marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
     assert_eq!(cycle.queue.end_epoch(), 0);
 }
@@ -219,7 +225,7 @@ fn assert_satb_variant_mutation_retains(
 /// later publications take the heap-locked path.
 #[test]
 fn cycle_cache_lookup_survives_thread_local_teardown() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let cycle = {
         let mut state = runtime().heap.lock().unwrap();
@@ -244,12 +250,12 @@ fn cycle_cache_lookup_survives_thread_local_teardown() {
     thread_local! {
         static LOOKUP: LookupOnDrop = const { LookupOnDrop };
     }
-    std::thread::spawn(|| {
+    std::thread::spawn(crate::runtime::serving(|| {
         // Register the lookup first so the cache slot, registered second, is
         // destroyed before it on platforms with LIFO TLS destruction.
         LOOKUP.with(|_| ());
         assert!(marking::cached_cycle().is_some());
-    })
+    }))
     .join()
     .expect("lookup during TLS teardown must not panic");
     assert!(FOUND.load(Ordering::Relaxed));
@@ -260,7 +266,7 @@ fn cycle_cache_lookup_survives_thread_local_teardown() {
 
 #[test]
 fn marking_barriers_publish_without_heap_lock_until_sealed() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let owner = willow_alloc_typed(8, 1);
     let old = willow_alloc(8);
@@ -282,7 +288,9 @@ fn marking_barriers_publish_without_heap_lock_until_sealed() {
             0,
         ));
         marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
-        GC_MARK_PHASE.store(1, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(1, Ordering::Release);
         cycle
     };
     let warmed = Arc::new(AtomicBool::new(false));
@@ -297,7 +305,7 @@ fn marking_barriers_publish_without_heap_lock_until_sealed() {
             value as usize,
             deleted as usize,
         );
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             // A cache miss reads the cycle under the heap lock: warm it first.
             assert!(marking::cached_cycle().is_some());
             warmed.store(true, Ordering::Release);
@@ -318,7 +326,7 @@ fn marking_barriers_publish_without_heap_lock_until_sealed() {
             );
             satb_delete(deleted as *mut u8);
             done.store(true, Ordering::Release);
-        })
+        }))
     };
     while !warmed.load(Ordering::Acquire) {
         std::thread::yield_now();
@@ -365,7 +373,9 @@ fn marking_barriers_publish_without_heap_lock_until_sealed() {
     );
     assert!(cycle.is_marked(late as usize));
     cycle.drain(usize::MAX);
-    GC_MARK_PHASE.store(0, Ordering::Release);
+    crate::runtime::current()
+        .mark_phase()
+        .store(0, Ordering::Release);
     marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
     assert_eq!(cycle.queue.end_epoch(), 0);
     reset_internal_for_test();
@@ -373,7 +383,7 @@ fn marking_barriers_publish_without_heap_lock_until_sealed() {
 
 #[test]
 fn old_only_barriers_still_publish_during_marking_and_closure() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for phase in [1, 2] {
         for deletion in [false, true] {
             for runtime_root in [false, true] {
@@ -384,7 +394,9 @@ fn old_only_barriers_still_publish_during_marking_and_closure() {
                     willow_gc_add_runtime_root(object);
                 }
                 assert_satb_mutation_retains(object, || {
-                    GC_MARK_PHASE.store(phase, Ordering::Release);
+                    crate::runtime::current()
+                        .mark_phase()
+                        .store(phase, Ordering::Release);
                     if runtime_root {
                         if deletion {
                             willow_gc_remove_runtime_root(object);
@@ -417,7 +429,7 @@ fn old_only_barriers_still_publish_during_marking_and_closure() {
 
 #[test]
 fn satb_native_container_overwrites_and_removals_publish_old_references() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _stress = GcStressTestScope::with_modes("all");
     for capacity in [1, 256] {
         for case in 0..12 {
@@ -548,7 +560,7 @@ fn satb_native_container_overwrites_and_removals_publish_old_references() {
 
 #[test]
 fn satb_repeated_equivalent_deletions_do_not_expand_mark_work() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for n in [16, 256, 4096] {
         reset_internal_for_test();
         let old = willow_alloc(8);
@@ -622,7 +634,7 @@ unsafe fn snapshot_before_mutation(
 
 #[test]
 fn concurrent_edge_publication_and_new_allocation_survive_remark() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     SNAPSHOT_READY.store(false, Ordering::Relaxed);
     MUTATION_DONE.store(false, Ordering::Relaxed);
@@ -650,7 +662,7 @@ fn concurrent_edge_publication_and_new_allocation_survive_remark() {
     let worker = {
         let (target, source) = (target as usize, source as usize);
         let (ready, stop, newborn) = (Arc::clone(&ready), Arc::clone(&stop), Arc::clone(&newborn));
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let mutator = crate::gc::MutatorRegistration::new();
             ready.store(true, Ordering::Release);
             while !SNAPSHOT_READY.load(Ordering::Acquire) {
@@ -693,7 +705,7 @@ fn concurrent_edge_publication_and_new_allocation_survive_remark() {
                 std::thread::yield_now();
             }
             drop(mutator);
-        })
+        }))
     };
     while !ready.load(Ordering::Acquire) {
         std::thread::yield_now();
@@ -715,7 +727,7 @@ fn concurrent_edge_publication_and_new_allocation_survive_remark() {
 
 #[test]
 fn parked_native_stack_roots_survive_major_and_minor_then_resume() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let mut root = willow_alloc(8);
     let depth = gc_thread_root_depth();
@@ -737,7 +749,7 @@ fn parked_native_stack_roots_survive_major_and_minor_then_resume() {
 
 #[test]
 fn memory_limit_bounds_region_reservations_and_recovers_after_sweep() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     runtime().heap.lock().unwrap().memory_limit_bytes = Some(GC_OLD_REGION_SIZE);
     let mut root = willow_alloc(8);
@@ -766,12 +778,16 @@ fn memory_limit_bounds_region_reservations_and_recovers_after_sweep() {
     reset_internal_for_test();
 }
 
-static ASSIST_READY: AtomicBool = AtomicBool::new(false);
-static ASSIST_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-static ASSIST_SAW_REMARK: AtomicBool = AtomicBool::new(false);
+static ASSIST_READY: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+static ASSIST_IN_FLIGHT: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+static ASSIST_SAW_REMARK: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
 /// Set by whichever participant gives up first, so the others leave their
 /// rendezvous instead of each burning its own full budget in turn.
-static ASSIST_ABORT: AtomicBool = AtomicBool::new(false);
+static ASSIST_ABORT: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
 
 // Preserve the cause without unwinding out of a GC trace callback or off a
 // worker thread. The collector owns live cycle state while a callback runs,
@@ -783,7 +799,8 @@ const CYCLE_MISSING: usize = 8;
 const CLAIM_REFUSED: usize = 16;
 const ASSIST_SLOT_UNAVAILABLE: usize = 32;
 const ASSIST_PUSH_FAILED: usize = 64;
-static ASSIST_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static ASSIST_FAILURES: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
 /// Generous enough that an oversubscribed CI runner cannot lose the rendezvous
 /// on scheduling alone; the fixture reports rather than hangs when it expires.
@@ -885,7 +902,12 @@ fn run_mutator_assist(child: *mut u8) {
     if await_assist_step(
         REMARK_NEVER_REQUESTED,
         || willow_gc_safepoint(),
-        || mark_closure::READER_WAIT_OBSERVED.load(Ordering::Acquire),
+        || {
+            runtime()
+                .wait_observation
+                .reader_wait_observed
+                .load(Ordering::Acquire)
+        },
     ) {
         ASSIST_SAW_REMARK.store(true, Ordering::Release);
     }
@@ -894,14 +916,17 @@ fn run_mutator_assist(child: *mut u8) {
 
 #[test]
 fn remark_waits_for_an_in_flight_mutator_assist() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     ASSIST_READY.store(false, Ordering::Relaxed);
     ASSIST_IN_FLIGHT.store(false, Ordering::Relaxed);
     ASSIST_SAW_REMARK.store(false, Ordering::Relaxed);
     ASSIST_ABORT.store(false, Ordering::Relaxed);
     ASSIST_FAILURES.store(0, Ordering::Relaxed);
-    mark_closure::READER_WAIT_OBSERVED.store(false, Ordering::Relaxed);
+    runtime()
+        .wait_observation
+        .reader_wait_observed
+        .store(false, Ordering::Relaxed);
     for (id, callback) in [
         (0xFD01, hold_marker_for_assistant as ConcurrentTraceSliceFn),
         (0xFD02, assist_overlaps_remark as ConcurrentTraceSliceFn),
@@ -931,7 +956,7 @@ fn remark_waits_for_an_in_flight_mutator_assist() {
     let worker = {
         let (ready, stop) = (Arc::clone(&ready), Arc::clone(&stop));
         let source = source as usize;
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             // The guard, not a trailing call, owns the unregistration: this
             // thread must leave the mutator registry even if it unwinds, or
             // the collector waits for it forever.
@@ -949,7 +974,7 @@ fn remark_waits_for_an_in_flight_mutator_assist() {
             // Stay registered and cooperating until the collection is over, so
             // the drive that follows it observes a quiesced worker.
             await_assist_step(0, || willow_gc_safepoint(), || stop.load(Ordering::Acquire));
-        })
+        }))
     };
     await_assist_step(MARKER_NEVER_TRACED, || {}, || ready.load(Ordering::Acquire));
     willow_gc_collect();
@@ -973,7 +998,7 @@ fn remark_waits_for_an_in_flight_mutator_assist() {
 
 #[test]
 fn memory_limit_also_bounds_generated_tlab_reservations() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     runtime().heap.lock().unwrap().memory_limit_bytes = Some(GC_TLAB_CHUNK_SIZE);
     let mut tls = tlab_state_for_test();
@@ -992,7 +1017,7 @@ fn memory_limit_also_bounds_generated_tlab_reservations() {
 
 #[test]
 fn minor_collection_pins_children_when_region_budget_prevents_copying() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let mut tls = tlab_state_for_test();
     let mut parent = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 1);
@@ -1051,7 +1076,7 @@ fn budget_exhaustion_reports_error_before_callers_can_dereference_null() {
 
 #[test]
 fn reservation_pressure_collects_garbage_before_rejecting_an_allocation() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     runtime().heap.lock().unwrap().memory_limit_bytes = Some(2 * GC_OLD_REGION_SIZE);
     // A tiny garbage object occupies a regular region, leaving less reserved
@@ -1066,7 +1091,7 @@ fn reservation_pressure_collects_garbage_before_rejecting_an_allocation() {
 
 #[test]
 fn captured_array_owner_survives_resize_and_moving_collection() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     // Alloc stress allocates old objects; this fixture requires evacuation.
     let _stress = GcStressTestScope::normal();
     reset_internal_for_test();
@@ -1158,7 +1183,7 @@ unsafe fn snapshot_scratch_fixture(payload: *mut u8, children: &mut Vec<*mut u8>
 fn concurrent_trace_reuses_scratch_across_bounded_drains() {
     for n in [16, 64, 256] {
         for fanout in [1, 8, 64] {
-            std::thread::spawn(move || {
+            std::thread::spawn(crate::runtime::serving(move || {
                 // A chain closed into a cycle, with repeated equivalent edges.
                 let mut payloads: Vec<_> = (0..n).map(|_| vec![0usize; fanout + 1]).collect();
                 let addresses: Vec<_> = payloads
@@ -1200,14 +1225,15 @@ fn concurrent_trace_reuses_scratch_across_bounded_drains() {
                     "objects={n} fanout={fanout} slots={} scratch_growths=1",
                     n * fanout
                 );
-            })
+            }))
             .join()
             .unwrap();
         }
     }
 }
 
-static MARKER_THREAD_IDS: Mutex<Vec<std::thread::ThreadId>> = Mutex::new(Vec::new());
+static MARKER_THREAD_IDS: crate::runtime::PerRuntime<Mutex<Vec<std::thread::ThreadId>>> =
+    crate::runtime::PerRuntime::new(|| Mutex::new(Vec::new()));
 
 unsafe fn record_marker_thread(payload: *mut u8, children: &mut Vec<*mut u8>) {
     MARKER_THREAD_IDS
@@ -1223,7 +1249,7 @@ unsafe fn failing_concurrent_trace(_: *mut u8, _: &mut Vec<*mut u8>) {
 
 #[test]
 fn dedicated_marker_pool_reuses_threads_and_quiesces_before_reclamation() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     for workers in [1, 5, 8] {
         let pool = mark_workers::Pool::new(workers).unwrap();
@@ -1252,7 +1278,7 @@ fn dedicated_marker_pool_reuses_threads_and_quiesces_before_reclamation() {
             cycle.enqueue(addresses[0] as *mut u8);
             // No collector assistance during the bounded pool job.
             let before = crate::gc_telemetry::workers::snapshot();
-            pool.run(&cycle, 0);
+            pool.run(crate::runtime::current(), &cycle, 0);
             let after = crate::gc_telemetry::workers::snapshot();
             assert_eq!(after.completed_jobs - before.completed_jobs, workers as u64);
             assert_eq!(
@@ -1330,7 +1356,7 @@ fn concurrent_native_contract_failures_reject_before_reclamation() {
         }
         return;
     };
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     unsafe fn failing_slice(
         _: *mut u8,
@@ -1374,10 +1400,10 @@ fn concurrent_native_contract_failures_reject_before_reclamation() {
 
 #[test]
 fn disabled_mark_workers_use_collector_queue_tracing() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     shutdown_mark_workers();
-    *MARK_WORKERS.lock().unwrap() = Some(mark_workers::Pool::new(0).unwrap());
+    *runtime().marker_workers.lock().unwrap() = Some(mark_workers::Pool::new(0).unwrap());
     let mut root = willow_alloc_typed(8, 1);
     let child = willow_alloc_typed(8, 1);
     unsafe {
@@ -1407,24 +1433,30 @@ fn disabled_mark_workers_use_collector_queue_tracing() {
 
 #[test]
 fn marker_unregister_without_tlab_does_not_scan_mutator_allocation_records() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [16usize, 64, 256] {
         reset_internal_for_test();
         let mut states: Vec<_> = (0..count).map(|_| tlab_state_for_test()).collect();
         for state in &mut states {
             assert!(!willow_gc_alloc_slow(state, 0, 0, 8, 0).is_null());
         }
-        TLAB_ACCOUNTING_RECORD_VISITS.store(0, Ordering::Relaxed);
-        std::thread::spawn(|| {
+        runtime().heap.lock().unwrap().tlab_accounting_observation = 0;
+        std::thread::spawn(crate::runtime::serving(|| {
             willow_gc_register_mutator();
             willow_gc_unregister_mutator();
-        })
+        }))
         .join()
         .unwrap();
-        assert_eq!(TLAB_ACCOUNTING_RECORD_VISITS.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            runtime().heap.lock().unwrap().tlab_accounting_observation,
+            0
+        );
         assert_eq!(runtime().heap.lock().unwrap().tlab_states.len(), count);
         willow_gc_unregister_mutator();
-        assert_eq!(TLAB_ACCOUNTING_RECORD_VISITS.load(Ordering::Relaxed), count);
+        assert_eq!(
+            runtime().heap.lock().unwrap().tlab_accounting_observation,
+            count
+        );
         assert!(runtime().heap.lock().unwrap().tlab_states.is_empty());
         reset_internal_for_test();
     }
@@ -1432,7 +1464,7 @@ fn marker_unregister_without_tlab_does_not_scan_mutator_allocation_records() {
 
 #[test]
 fn marker_panics_publish_failure_and_retire_worker_collector_and_assist() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     for case in ["worker1", "worker5", "collector", "assist"] {
         let object = willow_alloc(8) as usize;
@@ -1455,11 +1487,15 @@ fn marker_panics_publish_failure_and_retire_worker_collector_and_assist() {
         match case {
             "worker1" | "worker5" => {
                 let pool = mark_workers::Pool::new(if case == "worker1" { 1 } else { 5 }).unwrap();
-                pool.run(&cycle, 0);
+                pool.run(crate::runtime::current(), &cycle, 0);
                 // The same OS threads remain usable after a failed cycle.
-                pool.run(&cycle, 0);
+                pool.run(crate::runtime::current(), &cycle, 0);
             }
-            "collector" => mark_workers::Pool::new(0).unwrap().run(&cycle, 1),
+            "collector" => {
+                mark_workers::Pool::new(0)
+                    .unwrap()
+                    .run(crate::runtime::current(), &cycle, 1)
+            }
             "assist" => {
                 cycle.drain_checked(1);
             }
@@ -1481,8 +1517,10 @@ fn marker_panics_publish_failure_and_retire_worker_collector_and_assist() {
     reset_internal_for_test();
 }
 
-static SWEEP_MUTATOR_READY: AtomicBool = AtomicBool::new(false);
-static SWEEP_MUTATOR_DONE: AtomicBool = AtomicBool::new(false);
+static SWEEP_MUTATOR_READY: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+static SWEEP_MUTATOR_DONE: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
 
 fn await_allocation_between_sweep_regions(index: usize) {
     if index != 0 {
@@ -1524,12 +1562,15 @@ fn recovery_sweep_retains_new_allocations_and_quarantines_processed_spans() {
 }
 
 fn assert_sweep_retains_new_allocations(recovery: bool) {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for allocate_in_pending_region in [true, false] {
         reset_internal_for_test();
         if recovery {
-            old_cycle::REMARK_WORK_NS_FOR_TEST.store(1, Ordering::Relaxed);
-            *MARK_WORKERS.lock().unwrap() = Some(mark_workers::Pool::new(0).unwrap());
+            runtime()
+                .remark_observation
+                .work_ns
+                .store(1, Ordering::Relaxed);
+            *runtime().marker_workers.lock().unwrap() = Some(mark_workers::Pool::new(0).unwrap());
         }
         SWEEP_MUTATOR_READY.store(false, Ordering::Relaxed);
         SWEEP_MUTATOR_DONE.store(false, Ordering::Relaxed);
@@ -1550,7 +1591,7 @@ fn assert_sweep_retains_new_allocations(recovery: bool) {
         let address = Arc::new(AtomicUsize::new(0));
         let worker = {
             let (ready, stop, address) = (ready.clone(), stop.clone(), address.clone());
-            std::thread::spawn(move || {
+            std::thread::spawn(crate::runtime::serving(move || {
                 let mutator = crate::gc::MutatorRegistration::new();
                 ready.store(true, Ordering::Release);
                 while !SWEEP_MUTATOR_READY.load(Ordering::Acquire) {
@@ -1570,14 +1611,15 @@ fn assert_sweep_retains_new_allocations(recovery: bool) {
                 }
                 willow_pop_root();
                 drop(mutator);
-            })
+            }))
         };
         while !ready.load(Ordering::Acquire) {
             std::thread::yield_now();
         }
-        *sweep::SWEEP_TEST_HOOK.lock().unwrap() = Some(m2_await_allocation_with_frame_quarantined);
+        *runtime().sweep_observation.hook.lock().unwrap() =
+            Some(m2_await_allocation_with_frame_quarantined);
         willow_gc_collect();
-        *sweep::SWEEP_TEST_HOOK.lock().unwrap() = None;
+        *runtime().sweep_observation.hook.lock().unwrap() = None;
         stop.store(true, Ordering::Release);
         worker.join().unwrap();
         let address = address.load(Ordering::Acquire);
@@ -1626,7 +1668,11 @@ fn await_reservation_wait_between_regions(index: usize) {
     assert!(!runtime().stop_requested.load(Ordering::Acquire));
     SWEEP_MUTATOR_READY.store(true, Ordering::Release);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !SWEEP_BUDGET_WAITING.load(Ordering::Acquire) {
+    while !runtime()
+        .wait_observation
+        .sweep_waiting
+        .load(Ordering::Acquire)
+    {
         assert!(
             Instant::now() < deadline,
             "reservation retry did not wait for pending sweep"
@@ -1637,10 +1683,13 @@ fn await_reservation_wait_between_regions(index: usize) {
 
 #[test]
 fn reservation_pressure_waits_until_concurrent_sweep_releases_quarantine() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     SWEEP_MUTATOR_READY.store(false, Ordering::Relaxed);
-    SWEEP_BUDGET_WAITING.store(false, Ordering::Relaxed);
+    runtime()
+        .wait_observation
+        .sweep_waiting
+        .store(false, Ordering::Relaxed);
     willow_alloc(8);
     willow_alloc((GC_LARGE_OBJECT_THRESHOLD + 8) as i64);
     {
@@ -1650,7 +1699,7 @@ fn reservation_pressure_waits_until_concurrent_sweep_releases_quarantine() {
     let ready = Arc::new(AtomicBool::new(false));
     let worker = {
         let ready = ready.clone();
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let mutator = crate::gc::MutatorRegistration::new();
             ready.store(true, Ordering::Release);
             while !SWEEP_MUTATOR_READY.load(Ordering::Acquire) {
@@ -1681,16 +1730,22 @@ fn reservation_pressure_waits_until_concurrent_sweep_releases_quarantine() {
             let address = object.payload().as_ptr() as usize;
             drop(mutator);
             address
-        })
+        }))
     };
     while !ready.load(Ordering::Acquire) {
         std::thread::yield_now();
     }
-    *sweep::SWEEP_TEST_HOOK.lock().unwrap() = Some(await_reservation_wait_between_regions);
+    *runtime().sweep_observation.hook.lock().unwrap() =
+        Some(await_reservation_wait_between_regions);
     willow_gc_collect();
-    *sweep::SWEEP_TEST_HOOK.lock().unwrap() = None;
+    *runtime().sweep_observation.hook.lock().unwrap() = None;
     let address = worker.join().unwrap();
-    assert!(SWEEP_BUDGET_WAITING.load(Ordering::Acquire));
+    assert!(
+        runtime()
+            .wait_observation
+            .sweep_waiting
+            .load(Ordering::Acquire)
+    );
     assert_eq!(
         payload_generation(&runtime().heap.lock().unwrap(), address as *mut u8),
         Some(GC_GENERATION_OLD)
@@ -1703,7 +1758,7 @@ fn reservation_pressure_waits_until_concurrent_sweep_releases_quarantine() {
 
 #[test]
 fn concurrent_sweep_excludes_new_active_and_retired_tlab_chunks() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     SWEEP_MUTATOR_READY.store(false, Ordering::Relaxed);
     SWEEP_MUTATOR_DONE.store(false, Ordering::Relaxed);
@@ -1712,7 +1767,7 @@ fn concurrent_sweep_excludes_new_active_and_retired_tlab_chunks() {
     let stop = Arc::new(AtomicBool::new(false));
     let worker = {
         let (ready, stop) = (ready.clone(), stop.clone());
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let mutator = crate::gc::MutatorRegistration::new();
             let mut tls = tlab_state_for_test();
             ready.store(true, Ordering::Release);
@@ -1729,14 +1784,15 @@ fn concurrent_sweep_excludes_new_active_and_retired_tlab_chunks() {
             }
             drop(mutator);
             [first, second]
-        })
+        }))
     };
     while !ready.load(Ordering::Acquire) {
         std::thread::yield_now();
     }
-    *sweep::SWEEP_TEST_HOOK.lock().unwrap() = Some(await_allocation_between_sweep_regions);
+    *runtime().sweep_observation.hook.lock().unwrap() =
+        Some(await_allocation_between_sweep_regions);
     willow_gc_collect();
-    *sweep::SWEEP_TEST_HOOK.lock().unwrap() = None;
+    *runtime().sweep_observation.hook.lock().unwrap() = None;
     stop.store(true, Ordering::Release);
     let addresses = worker.join().unwrap();
     let state = runtime().heap.lock().unwrap();
@@ -1756,22 +1812,29 @@ fn concurrent_sweep_excludes_new_active_and_retired_tlab_chunks() {
 
 #[test]
 fn reservation_retry_waits_for_election_before_phase_publication() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
-    ELECTION_BUDGET_WAITING.store(false, Ordering::Relaxed);
+    runtime()
+        .wait_observation
+        .election_waiting
+        .store(false, Ordering::Relaxed);
     let elected = cycle_wait::CollectorGuard::try_acquire().unwrap();
     let done = Arc::new(AtomicBool::new(false));
     let worker = {
         let done = done.clone();
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let mutator = crate::gc::MutatorRegistration::new();
             collect_for_budget();
             done.store(true, Ordering::Release);
             drop(mutator);
-        })
+        }))
     };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !ELECTION_BUDGET_WAITING.load(Ordering::Acquire) {
+    while !runtime()
+        .wait_observation
+        .election_waiting
+        .load(Ordering::Acquire)
+    {
         assert!(
             Instant::now() < deadline,
             "retry returned before observing collector election"
@@ -1785,9 +1848,12 @@ fn reservation_retry_waits_for_election_before_phase_publication() {
     reset_internal_for_test();
 }
 
-static SATB_MUTATORS_READY: AtomicBool = AtomicBool::new(false);
-static SATB_MUTATORS_DONE: AtomicUsize = AtomicUsize::new(0);
-static SATB_MUTATORS_EXPECTED: AtomicUsize = AtomicUsize::new(0);
+static SATB_MUTATORS_READY: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+static SATB_MUTATORS_DONE: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static SATB_MUTATORS_EXPECTED: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
 unsafe fn hold_snapshot_for_deleting_mutators(
     _: *mut u8,
@@ -1806,7 +1872,7 @@ unsafe fn hold_snapshot_for_deleting_mutators(
 
 #[test]
 fn satb_parallel_mutators_retain_deleted_subgraphs_across_phase_flips() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1usize, 5, 16] {
         for capacity in [1, 256] {
             reset_internal_for_test();
@@ -1844,7 +1910,7 @@ fn satb_parallel_mutators_retain_deleted_subgraphs_across_phase_flips() {
             for (index, &source) in roots[1..].iter().enumerate() {
                 let source = source as usize;
                 let ready = ready.clone();
-                workers.push(std::thread::spawn(move || {
+                workers.push(std::thread::spawn(crate::runtime::serving(move || {
                     willow_gc_register_mutator();
                     ready.fetch_add(1, Ordering::Release);
                     while !SATB_MUTATORS_READY.load(Ordering::Acquire) {
@@ -1865,7 +1931,7 @@ fn satb_parallel_mutators_retain_deleted_subgraphs_across_phase_flips() {
                     }
                     willow_gc_unregister_mutator();
                     SATB_MUTATORS_DONE.fetch_add(1, Ordering::Release);
-                }));
+                })));
             }
             while ready.load(Ordering::Acquire) != count {
                 std::thread::yield_now();
@@ -1980,7 +2046,7 @@ fn assist_work_credit_counts_only_each_consumers_actual_work() {
                 let mut handles = Vec::new();
                 for _ in 0..threads {
                     let cycle = cycle.clone();
-                    handles.push(scope.spawn(move || {
+                    handles.push(scope.spawn(crate::runtime::serving(move || {
                         let mut total = 0;
                         loop {
                             let work = cycle.drain_checked(8);
@@ -1990,7 +2056,7 @@ fn assist_work_credit_counts_only_each_consumers_actual_work() {
                             total += work;
                         }
                         total
-                    }));
+                    })));
                 }
                 handles
                     .into_iter()
@@ -2108,7 +2174,7 @@ fn large_bitmap_continuations_bound_scan_work_without_rescanning_prefixes() {
 
 #[test]
 fn native_reference_arrays_use_bounded_continuations_in_the_real_engine() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for slots in [65usize, 513, 4097, 65_537] {
         reset_internal_for_test();
         let mut array = crate::array::willow_array_new(slots as i64, 1);
@@ -2138,7 +2204,9 @@ fn native_reference_arrays_use_bounded_continuations_in_the_real_engine() {
         drop(consumer);
         assert_eq!(cycle.queue.end_epoch(), 0);
         marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
-        GC_MARK_PHASE.store(0, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(0, Ordering::Release);
         willow_pop_root();
         println!("native array slots={slots} jobs={jobs} max_slots_per_job=512");
     }
@@ -2147,7 +2215,7 @@ fn native_reference_arrays_use_bounded_continuations_in_the_real_engine() {
 
 #[test]
 fn array_shrink_between_slices_preserves_unscanned_deleted_references() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let mut array = crate::array::willow_array_new(1024, 1);
     willow_push_root(&mut array);
@@ -2190,7 +2258,7 @@ fn array_shrink_between_slices_preserves_unscanned_deleted_references() {
 
 #[test]
 fn map_growth_during_slices_has_a_finite_cursor_and_preserves_deleted_values() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [513usize, 4097, 65_537] {
         reset_internal_for_test();
         let mut map = crate::map::willow_map_new(0, 0, 1);
@@ -2242,7 +2310,7 @@ fn map_growth_during_slices_has_a_finite_cursor_and_preserves_deleted_values() {
 
 #[test]
 fn nested_scope_remembers_young_frames_without_an_independent_child_root() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let mut parent = crate::cancellation::willow_task_scope_new();
     willow_push_root(&mut parent);
@@ -2289,7 +2357,7 @@ fn nested_scope_remembers_young_frames_without_an_independent_child_root() {
 
 #[test]
 fn task_scope_graph_traces_each_scope_and_frame_once() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for fan_out in [false, true] {
         for count in [16usize, 256, 4096] {
             reset_internal_for_test();
@@ -2354,7 +2422,7 @@ fn task_scope_graph_traces_each_scope_and_frame_once() {
 
 #[test]
 fn channel_pops_and_appends_do_not_shift_or_extend_the_snapshot() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [513usize, 4097, 65_537] {
         reset_internal_for_test();
         let mut channel = crate::channel::willow_channel_new(1).cast::<u8>();
@@ -2408,7 +2476,7 @@ fn channel_pops_and_appends_do_not_shift_or_extend_the_snapshot() {
 
 #[test]
 fn satb_phase_flip_stops_owners_before_activation_and_remark() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for _cycle_number in 0..2 {
         reset_internal_for_test();
         let ready = Arc::new(AtomicBool::new(false));
@@ -2417,7 +2485,7 @@ fn satb_phase_flip_stops_owners_before_activation_and_remark() {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = {
             let (ready, deleted, done) = (ready.clone(), deleted.clone(), done.clone());
-            std::thread::spawn(move || {
+            std::thread::spawn(crate::runtime::serving(move || {
                 let _registration = MutatorRegistration::new();
                 let mut owner = willow_alloc_typed(8, 1);
                 let child = willow_alloc(8);
@@ -2427,7 +2495,11 @@ fn satb_phase_flip_stops_owners_before_activation_and_remark() {
                 willow_push_root(&mut owner);
                 tx.send(child as usize).unwrap();
                 ready.store(true, Ordering::Release);
-                while GC_MARK_PHASE.load(Ordering::Acquire) == 0 {
+                while crate::runtime::current()
+                    .mark_phase()
+                    .load(Ordering::Acquire)
+                    == 0
+                {
                     willow_gc_safepoint();
                     std::thread::yield_now();
                 }
@@ -2447,7 +2519,7 @@ fn satb_phase_flip_stops_owners_before_activation_and_remark() {
                     std::thread::yield_now();
                 }
                 willow_pop_root();
-            })
+            }))
         };
         let child = rx.recv().unwrap();
         while !ready.load(Ordering::Acquire) {
@@ -2458,7 +2530,12 @@ fn satb_phase_flip_stops_owners_before_activation_and_remark() {
             std::thread::yield_now();
         }
         let (_, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
-        assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+        assert_eq!(
+            crate::runtime::current()
+                .mark_phase()
+                .load(Ordering::Acquire),
+            0
+        );
         assert!(cycle.is_marked(child));
         assert!(cycle.satb_shards.is_empty());
         let stops = crate::gc_telemetry::stops::snapshot_stops();
@@ -2475,7 +2552,7 @@ fn satb_phase_flip_stops_owners_before_activation_and_remark() {
 
 #[test]
 fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1, 5, 16] {
         reset_internal_for_test();
         willow_gc_register_mutator();
@@ -2484,7 +2561,7 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
         let workers: Vec<_> = (0..count)
             .map(|_| {
                 let (ready, done) = (ready.clone(), done.clone());
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     let mutator = crate::gc::MutatorRegistration::new();
                     let mut tls = tlab_state_for_test();
                     let mut object = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
@@ -2496,14 +2573,17 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
                     }
                     willow_pop_root();
                     drop(mutator);
-                })
+                }))
             })
             .collect();
         while ready.load(Ordering::Acquire) != count {
             std::thread::yield_now();
         }
-        TLAB_ACCOUNTING_RECORD_VISITS.store(0, Ordering::Relaxed);
-        root_handshake::INITIAL_PARTICIPANTS.store(0, Ordering::Relaxed);
+        runtime().heap.lock().unwrap().tlab_accounting_observation = 0;
+        runtime()
+            .handshake_policy
+            .participants
+            .store(0, Ordering::Relaxed);
         willow_gc_collect();
         println!("initial_stw mutators={count} completed_stops=1");
         assert_eq!(
@@ -2518,7 +2598,7 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
         let remarks = (stops.by_reason[1].requests + stops.by_reason[3].requests) as usize;
         let expected_reads = (2 + remarks) * count;
         assert_eq!(
-            TLAB_ACCOUNTING_RECORD_VISITS.load(Ordering::Relaxed),
+            runtime().heap.lock().unwrap().tlab_accounting_observation,
             expected_reads
         );
         assert_eq!(
@@ -2526,11 +2606,17 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
             1
         );
         assert_eq!(
-            root_handshake::INITIAL_PARTICIPANTS.load(Ordering::Relaxed),
+            runtime()
+                .handshake_policy
+                .participants
+                .load(Ordering::Relaxed),
             count + 1
         );
         assert_eq!(
-            root_handshake::INITIAL_PARTICIPANTS.load(Ordering::Relaxed),
+            runtime()
+                .handshake_policy
+                .participants
+                .load(Ordering::Relaxed),
             count + 1
         );
         println!(
@@ -2560,13 +2646,13 @@ fn legacy_owner_unregistering_during_activation_still_publishes_its_roots() {
     // acknowledges activation and then unregisters must not leave before the
     // publication round: it keeps using its roots, so dropping them from the
     // snapshot freed its live object (chroot_01 hang on ubuntu CI).
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let leaving = Arc::new(AtomicBool::new(false));
     let collected = Arc::new(AtomicBool::new(false));
     let owner = {
         let (leaving, collected) = (leaving.clone(), collected.clone());
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let mut tls = tlab_state_for_test();
             let mut object = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
             willow_push_root(&mut object);
@@ -2583,11 +2669,11 @@ fn legacy_owner_unregistering_during_activation_still_publishes_its_roots() {
             }
             assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
             willow_pop_root();
-        })
+        }))
     };
     let blocker = {
         let leaving = leaving.clone();
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             willow_gc_register_mutator();
             while !leaving.load(Ordering::Acquire) {
                 willow_gc_safepoint();
@@ -2602,7 +2688,7 @@ fn legacy_owner_unregistering_during_activation_still_publishes_its_roots() {
             }
             willow_gc_safepoint();
             willow_gc_unregister_mutator();
-        })
+        }))
     };
     while runtime().coord.0.lock().unwrap().mutators.len() != 2 {
         std::thread::yield_now();
@@ -2625,11 +2711,11 @@ fn legacy_owner_unregistering_during_activation_still_publishes_its_roots() {
 fn root_handshake_refuses_an_unregistered_owner_with_a_nonempty_stack() {
     // collect_internal's early skip releases coord before begin(); begin must
     // decide again under its own hold or an owner leaving in between is lost.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let owner = std::thread::spawn(move || {
+    let owner = std::thread::spawn(crate::runtime::serving(move || {
         let mut tls = tlab_state_for_test();
         let mut object = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
         willow_push_root(&mut object);
@@ -2638,11 +2724,16 @@ fn root_handshake_refuses_an_unregistered_owner_with_a_nonempty_stack() {
         held_tx.send(()).unwrap();
         release_rx.recv().unwrap();
         willow_pop_root();
-    });
+    }));
     held_rx.recv().unwrap();
     assert!(root_handshake::begin().is_none());
     assert!(!runtime().coord.0.lock().unwrap().stop_requested);
-    assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+    assert_eq!(
+        crate::runtime::current()
+            .mark_phase()
+            .load(Ordering::Acquire),
+        0
+    );
     release_tx.send(()).unwrap();
     owner.join().unwrap();
     reset_internal_for_test();
@@ -2650,7 +2741,7 @@ fn root_handshake_refuses_an_unregistered_owner_with_a_nonempty_stack() {
 
 #[test]
 fn native_stack_root_transfers_publish_during_initial_handshake() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for resume_during_mark in [false, true] {
         reset_internal_for_test();
         let mut root = willow_alloc_typed(8, 1);
@@ -2684,7 +2775,7 @@ fn native_stack_root_transfers_publish_during_initial_handshake() {
 
 #[test]
 fn registered_peers_do_not_hide_an_unregistered_foreign_root_owner() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let mut root = willow_alloc(8);
     willow_push_root(&mut root); // Deliberately legacy/unregistered owner.
@@ -2692,7 +2783,7 @@ fn registered_peers_do_not_hide_an_unregistered_foreign_root_owner() {
     let done = Arc::new(AtomicBool::new(false));
     let peer = {
         let (ready, done) = (ready.clone(), done.clone());
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let mutator = crate::gc::MutatorRegistration::new();
             ready.store(true, Ordering::Release);
             while !done.load(Ordering::Acquire) {
@@ -2700,18 +2791,18 @@ fn registered_peers_do_not_hide_an_unregistered_foreign_root_owner() {
                 std::thread::yield_now();
             }
             drop(mutator);
-        })
+        }))
     };
     while !ready.load(Ordering::Acquire) {
         std::thread::yield_now();
     }
-    std::thread::spawn(|| {
+    std::thread::spawn(crate::runtime::serving(|| {
         let mutator = crate::gc::MutatorRegistration::new();
         assert!(multi_mutator_active());
         willow_gc_collect();
         crate::gc::minor_collect_internal();
         drop(mutator);
-    })
+    }))
     .join()
     .unwrap();
     done.store(true, Ordering::Release);
@@ -2736,10 +2827,13 @@ fn registered_peers_do_not_hide_an_unregistered_foreign_root_owner() {
 
 #[test]
 fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for outcome in [0, 1, 2] {
         reset_internal_for_test();
-        mark_closure::READER_WAIT_OBSERVED.store(false, Ordering::Relaxed);
+        runtime()
+            .wait_observation
+            .reader_wait_observed
+            .store(false, Ordering::Relaxed);
         let object = willow_alloc(8) as usize;
         let cycle = {
             let mut state = runtime().heap.lock().unwrap();
@@ -2751,18 +2845,21 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
             ));
             assert!(cycle.objects.claim(object));
             marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
-            GC_MARK_PHASE.store(1, Ordering::Release);
+            crate::runtime::current()
+                .mark_phase()
+                .store(1, Ordering::Release);
             cycle
         };
         let ready = Arc::new(AtomicBool::new(false));
         let assist = {
             let (cycle, ready) = (cycle.clone(), ready.clone());
-            std::thread::spawn(move || {
+            std::thread::spawn(crate::runtime::serving(move || {
                 let result = std::panic::catch_unwind(|| {
                     // Model a drain that has completed its queue item but still
                     // owns unpublished accounting or an exception batch.
                     cycle.active_drains.fetch_add(1, Ordering::AcqRel);
                     let mut batch = MarkBatch {
+                        owner: crate::runtime::current(),
                         cpu_start: None,
                         inline_children: false,
                         branch_children: Vec::new(),
@@ -2784,7 +2881,11 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
                     }
                     ready.store(true, Ordering::Release);
                     let deadline = Instant::now() + Duration::from_secs(10);
-                    while !mark_closure::READER_WAIT_OBSERVED.load(Ordering::Acquire) {
+                    while !runtime()
+                        .wait_observation
+                        .reader_wait_observed
+                        .load(Ordering::Acquire)
+                    {
                         assert!(
                             Instant::now() < deadline,
                             "closure ignored an unpublished engine batch"
@@ -2799,7 +2900,7 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
                     drop(batch);
                 });
                 assert_eq!(result.is_err(), outcome == 2);
-            })
+            }))
         };
         while !ready.load(Ordering::Acquire) {
             std::thread::yield_now();
@@ -2820,7 +2921,9 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
                 usize::from(outcome == 1)
             );
             marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
-            GC_MARK_PHASE.store(0, Ordering::Release);
+            crate::runtime::current()
+                .mark_phase()
+                .store(0, Ordering::Release);
             cycle.queue.end_epoch();
         }
         assert!(
@@ -2841,7 +2944,7 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
 
 #[test]
 fn m3_real_closure_last_work_latency_and_cpu() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for notification in [false, true] {
         let mut latencies = Vec::new();
         let mut cpu_ns = 0u64;
@@ -2849,7 +2952,10 @@ fn m3_real_closure_last_work_latency_and_cpu() {
         for sample in 0..100 {
             let (last_tx, last_rx) = std::sync::mpsc::channel();
             reset_internal_for_test();
-            mark_closure::READER_WAIT_OBSERVED.store(false, Ordering::Relaxed);
+            runtime()
+                .wait_observation
+                .reader_wait_observed
+                .store(false, Ordering::Relaxed);
             let object = willow_alloc(8) as usize;
             let cycle = {
                 let mut state = runtime().heap.lock().unwrap();
@@ -2861,19 +2967,22 @@ fn m3_real_closure_last_work_latency_and_cpu() {
                 ));
                 assert!(cycle.objects.claim(object));
                 marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
-                GC_MARK_PHASE.store(1, Ordering::Release);
+                crate::runtime::current()
+                    .mark_phase()
+                    .store(1, Ordering::Release);
                 cycle
             };
             let ready = Arc::new(AtomicBool::new(false));
             let assist = {
                 let (cycle, ready) = (cycle.clone(), ready.clone());
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     {
                         // Model a drain that has completed its queue item but still
                         // owns unpublished accounting or an exception batch.
                         let owner = cycle.termination.enter();
                         cycle.active_drains.fetch_add(1, Ordering::AcqRel);
                         let mut batch = MarkBatch {
+                            owner: crate::runtime::current(),
                             cpu_start: None,
                             inline_children: false,
                             branch_children: Vec::new(),
@@ -2892,7 +3001,11 @@ fn m3_real_closure_last_work_latency_and_cpu() {
                         batch.work.object(GC_HEADER_SIZE + 8, 0);
                         ready.store(true, Ordering::Release);
                         let deadline = Instant::now() + Duration::from_secs(10);
-                        while !mark_closure::READER_WAIT_OBSERVED.load(Ordering::Acquire) {
+                        while !runtime()
+                            .wait_observation
+                            .reader_wait_observed
+                            .load(Ordering::Acquire)
+                        {
                             assert!(
                                 Instant::now() < deadline,
                                 "closure ignored an unpublished engine batch"
@@ -2909,7 +3022,7 @@ fn m3_real_closure_last_work_latency_and_cpu() {
                         drop(owner);
                         last_tx.send(last_work).unwrap();
                     }
-                })
+                }))
             };
             while !ready.load(Ordering::Acquire) {
                 std::thread::yield_now();
@@ -2949,7 +3062,12 @@ fn m3_real_closure_last_work_latency_and_cpu() {
                 }
             };
             assert_eq!(work.marked_bytes, (GC_HEADER_SIZE + 8) as u64);
-            assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+            assert_eq!(
+                crate::runtime::current()
+                    .mark_phase()
+                    .load(Ordering::Acquire),
+                0
+            );
             assert!(cycle.queue.snapshot().is_drained());
             sweep_if_planned(plan);
             assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
@@ -2974,7 +3092,7 @@ fn m3_real_closure_last_work_latency_and_cpu() {
 
 #[test]
 fn concurrent_closure_and_sweep_preserve_a_new_active_tlab_after_stopped_ownership_transfer() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     SNAPSHOT_READY.store(false, Ordering::Relaxed);
     MUTATION_DONE.store(false, Ordering::Relaxed);
@@ -2996,7 +3114,7 @@ fn concurrent_closure_and_sweep_preserve_a_new_active_tlab_after_stopped_ownersh
     let worker = {
         let (ready, done, published) = (ready.clone(), done.clone(), published.clone());
         let (control, leaf) = (control as usize, leaf as usize);
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let mutator = crate::gc::MutatorRegistration::new();
             let mut tls = tlab_state_for_test();
             ready.store(true, Ordering::Release);
@@ -3035,7 +3153,7 @@ fn concurrent_closure_and_sweep_preserve_a_new_active_tlab_after_stopped_ownersh
                 "normal closure retired a post-snapshot TLAB"
             );
             drop(mutator);
-        })
+        }))
     };
     while !ready.load(Ordering::Acquire) {
         std::thread::yield_now();
@@ -3070,7 +3188,7 @@ fn concurrent_closure_and_sweep_preserve_a_new_active_tlab_after_stopped_ownersh
 
 #[test]
 fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let parent = willow_alloc_typed(8, 1) as usize;
     let child = willow_alloc_typed(8, 1) as usize;
@@ -3090,16 +3208,19 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
         ));
         assert!(cycle.objects.claim(parent));
         marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
-        GC_MARK_PHASE.store(1, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(1, Ordering::Release);
         cycle
     };
     let ready = Arc::new(AtomicBool::new(false));
     let producer = {
         let (cycle, ready) = (cycle.clone(), ready.clone());
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let mutator = crate::gc::MutatorRegistration::new();
             cycle.active_drains.fetch_add(1, Ordering::AcqRel);
             let mut batch = MarkBatch {
+                owner: crate::runtime::current(),
                 cpu_start: None,
                 inline_children: false,
                 branch_children: Vec::new(),
@@ -3134,7 +3255,7 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
             assert!(cycle.is_marked(child));
             drop(batch);
             drop(mutator);
-        })
+        }))
     };
     while !ready.load(Ordering::Acquire) {
         std::thread::yield_now();
@@ -3156,8 +3277,10 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
     reset_internal_for_test();
 }
 
-static BUDGET_RETRY_CALLS: AtomicUsize = AtomicUsize::new(0);
-static BUDGET_RETRY_LIMIT: AtomicUsize = AtomicUsize::new(0);
+static BUDGET_RETRY_CALLS: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static BUDGET_RETRY_LIMIT: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
 unsafe fn budget_retry_slice(
     _: *mut u8,
@@ -3175,7 +3298,7 @@ unsafe fn budget_retry_slice(
 
 #[test]
 fn marker_pool_shared_budget_bounds_retries_and_preserves_pending_work() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     for workers in [1, 5, 16] {
         let pool = mark_workers::Pool::new(workers).unwrap();
@@ -3206,7 +3329,7 @@ fn marker_pool_shared_budget_bounds_retries_and_preserves_pending_work() {
             for address in 1..=objects {
                 cycle.enqueue(address as *mut u8);
             }
-            pool.run(&cycle, 0);
+            pool.run(crate::runtime::current(), &cycle, 0);
             let calls = BUDGET_RETRY_CALLS.load(Ordering::Relaxed);
             assert!(
                 calls <= budget,
@@ -3241,7 +3364,7 @@ fn marker_pool_shared_budget_bounds_retries_and_preserves_pending_work() {
 
 #[test]
 fn marker_pool_drains_each_claim_in_one_batch() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let pool = mark_workers::Pool::new(1).unwrap();
     for objects in [256usize, 1024, 4096] {
@@ -3268,10 +3391,13 @@ fn marker_pool_drains_each_claim_in_one_batch() {
         for address in 1..=objects {
             cycle.enqueue(address as *mut u8);
         }
-        mark_workers::BACKGROUND_DRAINS.store(0, Ordering::Relaxed);
+        runtime()
+            .marker_observation
+            .drains
+            .store(0, Ordering::Relaxed);
         // A zero collector budget leaves every object to the single worker.
-        pool.run(&cycle, 0);
-        let drains = mark_workers::BACKGROUND_DRAINS.load(Ordering::Relaxed);
+        pool.run(crate::runtime::current(), &cycle, 0);
+        let drains = runtime().marker_observation.drains.load(Ordering::Relaxed);
         // A minor request or an empty sample on a loaded host ends the worker
         // job early; closure then drains what the worker left.
         cycle.drain(usize::MAX);
@@ -3293,12 +3419,15 @@ fn marker_pool_drains_each_claim_in_one_batch() {
 
 #[test]
 fn concurrent_closure_paces_contention_and_retains_work_until_release() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for waits_before_release in [1usize, 4, 16, 64] {
         reset_internal_for_test();
         // The remark stop's 1ms wall-clock budget can expire on a preempted CI
         // runner, which correctly takes the stopped fallback this test excludes.
-        old_cycle::REMARK_WORK_NS_FOR_TEST.store(100_000_000, Ordering::Relaxed);
+        runtime()
+            .remark_observation
+            .work_ns
+            .store(100_000_000, Ordering::Relaxed);
         BUDGET_RETRY_CALLS.store(0, Ordering::Relaxed);
         // Finite on the old spin loop too, so regression fails without hanging.
         BUDGET_RETRY_LIMIT.store(waits_before_release * 1024, Ordering::Relaxed);
@@ -3315,7 +3444,9 @@ fn concurrent_closure_paces_contention_and_retains_work_until_release() {
             cycle.enqueue(object as *mut u8);
             let cycle = Arc::new(cycle);
             marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
-            GC_MARK_PHASE.store(1, Ordering::Release);
+            crate::runtime::current()
+                .mark_phase()
+                .store(1, Ordering::Release);
             cycle
         };
         let mut waits = 0;
@@ -3374,7 +3505,7 @@ fn concurrent_closure_paces_contention_and_retains_work_until_release() {
 
 #[test]
 fn root_activation_crosses_pending_stores_before_snapshots_or_assist_scans() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for deletion in [true, false] {
         for unregister in [false, true] {
             reset_internal_for_test();
@@ -3391,7 +3522,7 @@ fn root_activation_crosses_pending_stores_before_snapshots_or_assist_scans() {
             let done = Arc::new(AtomicBool::new(false));
             let writer = {
                 let (done, parent) = (done.clone(), parent as usize);
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     let registration = MutatorRegistration::new();
                     let value = if deletion {
                         std::ptr::null_mut()
@@ -3422,24 +3553,34 @@ fn root_activation_crosses_pending_stores_before_snapshots_or_assist_scans() {
                         std::thread::yield_now();
                     }
                     drop(registration);
-                })
+                }))
             };
             ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            let observer = std::thread::spawn(move || {
+            let observer = std::thread::spawn(crate::runtime::serving(move || {
                 while !runtime().stop_requested.load(Ordering::Acquire) {
                     std::thread::yield_now();
                 }
-                assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+                assert_eq!(
+                    crate::runtime::current()
+                        .mark_phase()
+                        .load(Ordering::Acquire),
+                    0
+                );
                 assert!(runtime().heap.lock().unwrap().concurrent_cycle.is_none());
                 release_tx.send(()).unwrap();
-            });
+            }));
             let (_, cycle) = root_handshake::begin().unwrap();
             observer.join().unwrap();
             cycle.drain(usize::MAX);
             assert_eq!(cycle.is_marked(child), !deletion);
             let (_, plan) = finish_or_recover(&cycle);
             sweep_if_planned(plan);
-            assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+            assert_eq!(
+                crate::runtime::current()
+                    .mark_phase()
+                    .load(Ordering::Acquire),
+                0
+            );
             done.store(true, Ordering::Release);
             writer.join().unwrap();
             willow_pop_root();
@@ -3452,7 +3593,7 @@ fn root_activation_crosses_pending_stores_before_snapshots_or_assist_scans() {
 
 #[test]
 fn root_activation_late_registration_waits_for_the_stw_boundary() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let started = Arc::new(AtomicBool::new(false));
     let registered = Arc::new(AtomicBool::new(false));
@@ -3463,11 +3604,11 @@ fn root_activation_late_registration_waits_for_the_stw_boundary() {
             let (started, registered) = (started.clone(), registered.clone());
             let worker = {
                 let (started, registered) = (started.clone(), registered.clone());
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     started.store(true, Ordering::Release);
                     let _registration = MutatorRegistration::new();
                     registered.store(true, Ordering::Release);
-                })
+                }))
             };
             while !started.load(Ordering::Acquire) {
                 std::thread::yield_now();
@@ -3486,14 +3627,14 @@ fn root_activation_late_registration_waits_for_the_stw_boundary() {
 
 #[test]
 fn a_registered_mutator_that_panics_still_unregisters() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     willow_gc_register_mutator();
     let registered = registered_mutator_count();
-    let worker = std::thread::spawn(|| {
+    let worker = std::thread::spawn(crate::runtime::serving(|| {
         let _mutator = crate::gc::MutatorRegistration::new();
         panic!("worker unwinds while registered as a mutator");
-    });
+    }));
     assert!(worker.join().is_err());
     assert_eq!(registered_mutator_count(), registered);
     // Both handshake rounds must find every participant, so this returns
@@ -3546,12 +3687,12 @@ fn a_mutator_that_dies_registered_reports_instead_of_hanging_the_collector() {
         assert!(stderr.contains("gc::MutatorRegistration"), "{output:?}");
         return;
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     willow_gc_register_mutator();
     // Deliberately violate the contract the guard exists to keep: register
     // through the raw entry point and let the thread end still registered.
-    std::thread::spawn(|| willow_gc_register_mutator())
+    std::thread::spawn(crate::runtime::serving(|| willow_gc_register_mutator()))
         .join()
         .unwrap();
     willow_gc_collect();
@@ -3563,7 +3704,7 @@ fn a_mutator_that_dies_registered_reports_instead_of_hanging_the_collector() {
 #[test]
 #[ignore = "reference-store throughput measurement"]
 fn satb_reference_store_throughput_baseline_and_current() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let owner = willow_alloc(8);
     let values = [willow_alloc(8), willow_alloc(8)];
@@ -3651,7 +3792,9 @@ fn satb_reference_store_throughput_baseline_and_current() {
                 cycle.satb_shards = satb::SatbShards::new(capacity);
                 let cycle = Arc::new(cycle);
                 marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
-                GC_MARK_PHASE.store(1, Ordering::Release);
+                crate::runtime::current()
+                    .mark_phase()
+                    .store(1, Ordering::Release);
                 cycle
             },
         );
@@ -3689,7 +3832,7 @@ fn satb_reference_store_throughput_baseline_and_current() {
 
 #[test]
 fn satb_registration_owns_buffer_and_unwind_unregister_drains_it() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for capacity in [1, 256] {
         for unwind in [false, true] {
             reset_internal_for_test();
@@ -3705,10 +3848,12 @@ fn satb_registration_owns_buffer_and_unwind_unregister_drains_it() {
                 cycle.satb_shards = satb::SatbShards::new(capacity);
                 let cycle = Arc::new(cycle);
                 marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
-                GC_MARK_PHASE.store(1, Ordering::Release);
+                crate::runtime::current()
+                    .mark_phase()
+                    .store(1, Ordering::Release);
                 cycle
             };
-            std::thread::spawn(move || {
+            std::thread::spawn(crate::runtime::serving(move || {
                 let result = std::panic::catch_unwind(|| {
                     let _registration = MutatorRegistration::new();
                     let local = safepoint::current_satb_buffer().unwrap();
@@ -3733,7 +3878,7 @@ fn satb_registration_owns_buffer_and_unwind_unregister_drains_it() {
                         .mutators
                         .contains_key(&std::thread::current().id())
                 );
-            })
+            }))
             .join()
             .unwrap();
             assert!(
@@ -3743,7 +3888,9 @@ fn satb_registration_owns_buffer_and_unwind_unregister_drains_it() {
             assert!(cycle.satb_shards.is_empty());
             cycle.drain(usize::MAX);
             assert!(cycle.queue.snapshot().is_drained());
-            GC_MARK_PHASE.store(0, Ordering::Release);
+            crate::runtime::current()
+                .mark_phase()
+                .store(0, Ordering::Release);
             marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
             reset_internal_for_test();
         }
@@ -3752,7 +3899,7 @@ fn satb_registration_owns_buffer_and_unwind_unregister_drains_it() {
 
 #[test]
 fn satb_remark_cap_preserves_rendezvous_deletions_through_stopped_completion() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1, 16, 257] {
         for unregister in [false, true] {
             reset_internal_for_test();
@@ -3783,7 +3930,9 @@ fn satb_remark_cap_preserves_rendezvous_deletions_through_stopped_completion() {
                     cycle.work.lock().unwrap().object(GC_HEADER_SIZE + 8, 1);
                 }
                 marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
-                GC_MARK_PHASE.store(1, Ordering::Release);
+                crate::runtime::current()
+                    .mark_phase()
+                    .store(1, Ordering::Release);
                 cycle
             };
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -3792,7 +3941,7 @@ fn satb_remark_cap_preserves_rendezvous_deletions_through_stopped_completion() {
             let done = Arc::new(AtomicBool::new(false));
             let worker = {
                 let done = done.clone();
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     let registration = MutatorRegistration::new();
                     let mut owners: Vec<_> =
                         owners.into_iter().map(|value| value as *mut u8).collect();
@@ -3838,7 +3987,7 @@ fn satb_remark_cap_preserves_rendezvous_deletions_through_stopped_completion() {
                         willow_pop_roots(count as i32);
                         drop(registration);
                     }
-                })
+                }))
             };
             ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             let mut rechecks = 0;
@@ -3872,7 +4021,12 @@ fn satb_remark_cap_preserves_rendezvous_deletions_through_stopped_completion() {
                 willow_gc_allocated_bytes(),
                 (3 * count * (GC_HEADER_SIZE + 8)) as i64
             );
-            assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+            assert_eq!(
+                crate::runtime::current()
+                    .mark_phase()
+                    .load(Ordering::Acquire),
+                0
+            );
             assert_eq!(
                 crate::gc_telemetry::stops::snapshot_stops().by_reason[1].requests as usize,
                 mark_closure::MAX_REMARK_ROUNDS - 1
@@ -3907,7 +4061,7 @@ fn satb_closure_wave_cap_resumes_retrying_work_with_bounded_recovery() {
             unsafe { snapshot_slot_slice(object, cursor, budget, output) }
         }
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1, 16, 257] {
         reset_internal_for_test();
         BUDGET_RETRY_CALLS.store(0, Ordering::Relaxed);
@@ -3937,7 +4091,9 @@ fn satb_closure_wave_cap_resumes_retrying_work_with_bounded_recovery() {
                 cycle.enqueue(parent);
             }
             marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
-            GC_MARK_PHASE.store(1, Ordering::Release);
+            crate::runtime::current()
+                .mark_phase()
+                .store(1, Ordering::Release);
             cycle
         };
         let mut waits = 0;
@@ -3989,7 +4145,12 @@ fn satb_closure_wave_cap_resumes_retrying_work_with_bounded_recovery() {
         let recovery = crate::gc_telemetry::stops::snapshot_stops().by_reason[3];
         assert!(recovery.requests >= 1);
         assert_eq!(recovery.work.swept_objects, 0);
-        assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+        assert_eq!(
+            crate::runtime::current()
+                .mark_phase()
+                .load(Ordering::Acquire),
+            0
+        );
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         println!(
@@ -4017,7 +4178,7 @@ fn satb_bounded_native_and_retry_slice_complete_with_snapshot_retention() {
             unsafe { snapshot_slot_slice(object, cursor, budget, output) }
         }
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for (count, predrain) in [
         (1, true),
         (16, true),
@@ -4067,7 +4228,9 @@ fn satb_bounded_native_and_retry_slice_complete_with_snapshot_retention() {
                 cycle.enqueue(parent);
             }
             marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
-            GC_MARK_PHASE.store(1, Ordering::Release);
+            crate::runtime::current()
+                .mark_phase()
+                .store(1, Ordering::Release);
             cycle
         };
         if predrain {
@@ -4125,7 +4288,12 @@ fn satb_bounded_native_and_retry_slice_complete_with_snapshot_retention() {
         let recovery = crate::gc_telemetry::stops::snapshot_stops().by_reason[3];
         assert!(recovery.requests >= 1);
         assert_eq!(recovery.work.swept_objects, 0);
-        assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+        assert_eq!(
+            crate::runtime::current()
+                .mark_phase()
+                .load(Ordering::Acquire),
+            0
+        );
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         println!(
@@ -4138,7 +4306,7 @@ fn satb_bounded_native_and_retry_slice_complete_with_snapshot_retention() {
 
 #[test]
 fn marker_discovery_diagnostics_count_duplicate_and_unindexed_candidates() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [16usize, 128, 1024] {
         let before = crate::gc_telemetry::workers::discovery_snapshot();
         let cycle = ConcurrentCycle::new(
@@ -4184,9 +4352,12 @@ fn marker_discovery_diagnostics_count_duplicate_and_unindexed_candidates() {
     }
 }
 
-static ENGINE_READER_ENTERED: AtomicBool = AtomicBool::new(false);
-static ENGINE_MUTATORS_DONE: AtomicUsize = AtomicUsize::new(0);
-static ENGINE_MUTATORS_EXPECTED: AtomicUsize = AtomicUsize::new(0);
+static ENGINE_READER_ENTERED: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+static ENGINE_MUTATORS_DONE: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static ENGINE_MUTATORS_EXPECTED: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
 unsafe fn await_engine_mutators(
     payload: *mut u8,
@@ -4214,7 +4385,7 @@ unsafe fn await_engine_mutators(
 
 #[test]
 fn background_marker_snapshot_survives_registry_changes_and_mutator_allocations() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1, 5, 16] {
         reset_internal_for_test();
         ENGINE_READER_ENTERED.store(false, Ordering::Relaxed);
@@ -4243,14 +4414,16 @@ fn background_marker_snapshot_survives_registry_changes_and_mutator_allocations(
             cycle.slices = runtime().concurrent_slice_registry.lock().unwrap().clone();
             let cycle = Arc::new(cycle);
             marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
-            GC_MARK_PHASE.store(1, Ordering::Release);
+            crate::runtime::current()
+                .mark_phase()
+                .store(1, Ordering::Release);
             cycle
         };
         cycle.enqueue(parent);
         let mut mutators = Vec::new();
         for _ in 0..count {
             let cycle = cycle.clone();
-            mutators.push(std::thread::spawn(move || {
+            mutators.push(std::thread::spawn(crate::runtime::serving(move || {
                 willow_gc_register_mutator();
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while !ENGINE_READER_ENTERED.load(Ordering::Acquire) {
@@ -4267,10 +4440,10 @@ fn background_marker_snapshot_survives_registry_changes_and_mutator_allocations(
                 );
                 willow_gc_unregister_mutator();
                 ENGINE_MUTATORS_DONE.fetch_add(1, Ordering::Release);
-            }));
+            })));
         }
         let pool = mark_workers::Pool::new(1).unwrap();
-        pool.run(&cycle, 0);
+        pool.run(crate::runtime::current(), &cycle, 0);
         for mutator in mutators {
             mutator.join().unwrap();
         }
@@ -4280,7 +4453,9 @@ fn background_marker_snapshot_survives_registry_changes_and_mutator_allocations(
         assert!(!cycle.worker_failed.load(Ordering::Acquire));
         assert_eq!(cycle.queue.end_epoch(), 0);
         assert_eq!(registered_mutator_count(), 0);
-        GC_MARK_PHASE.store(0, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(0, Ordering::Release);
         marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
         drop(pool);
         drop(cycle);
@@ -4291,7 +4466,8 @@ fn background_marker_snapshot_survives_registry_changes_and_mutator_allocations(
     reset_internal_for_test();
 }
 
-static RETRY_UNTIL_ALLOCATED: AtomicBool = AtomicBool::new(false);
+static RETRY_UNTIL_ALLOCATED: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
 
 unsafe fn retry_until_mutator_allocated(
     payload: *mut u8,
@@ -4311,7 +4487,7 @@ unsafe fn retry_until_mutator_allocated(
 /// in assist repayment or the allocation stall; the cycle then completes.
 #[test]
 fn exhausted_runway_allocation_returns_while_only_its_own_slice_retries() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for threads in [1, 4] {
         reset_internal_for_test();
         RETRY_UNTIL_ALLOCATED.store(false, Ordering::Relaxed);
@@ -4338,7 +4514,9 @@ fn exhausted_runway_allocation_returns_while_only_its_own_slice_retries() {
             cycle.slices = runtime().concurrent_slice_registry.lock().unwrap().clone();
             let cycle = Arc::new(cycle);
             marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
-            GC_MARK_PHASE.store(1, Ordering::Release);
+            crate::runtime::current()
+                .mark_phase()
+                .store(1, Ordering::Release);
             cycle
         };
         cycle.enqueue(parent);
@@ -4346,7 +4524,7 @@ fn exhausted_runway_allocation_returns_while_only_its_own_slice_retries() {
         let mutators: Vec<_> = (0..threads)
             .map(|_| {
                 let done = done.clone();
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     willow_gc_register_mutator();
                     // Fresh TLAB: the slow path charges and assists.
                     for _ in 0..4 {
@@ -4354,16 +4532,16 @@ fn exhausted_runway_allocation_returns_while_only_its_own_slice_retries() {
                     }
                     willow_gc_unregister_mutator();
                     done.send(()).unwrap();
-                })
+                }))
             })
             .collect();
         drop(done);
         let marker = {
             let cycle = cycle.clone();
-            std::thread::spawn(move || {
+            std::thread::spawn(crate::runtime::serving(move || {
                 let pool = mark_workers::Pool::new(1).unwrap();
-                pool.run(&cycle, 0);
-            })
+                pool.run(crate::runtime::current(), &cycle, 0);
+            }))
         };
         let deadline = Instant::now() + Duration::from_secs(20);
         for _ in 0..threads {
@@ -4385,7 +4563,9 @@ fn exhausted_runway_allocation_returns_while_only_its_own_slice_retries() {
         assert!(cycle.is_marked(child as usize));
         assert!(!cycle.worker_failed.load(Ordering::Acquire));
         assert_eq!(registered_mutator_count(), 0);
-        GC_MARK_PHASE.store(0, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(0, Ordering::Release);
         marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
         println!(
             "retrying_slice_owner_threads={threads} retries={}",
@@ -4398,7 +4578,7 @@ fn exhausted_runway_allocation_returns_while_only_its_own_slice_retries() {
 
 #[test]
 fn pointer_free_leaf_fanout_uses_only_bounded_parent_jobs() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1_000usize, 10_000, 100_000] {
         reset_internal_for_test();
         let mut array = crate::array::willow_array_new(count as i64, 1);
@@ -4432,7 +4612,9 @@ fn pointer_free_leaf_fanout_uses_only_bounded_parent_jobs() {
         drop(consumer);
         assert_eq!(cycle.queue.end_epoch(), 0);
         marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
-        GC_MARK_PHASE.store(0, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(0, Ordering::Release);
         willow_pop_root();
     }
     reset_internal_for_test();
@@ -4440,7 +4622,7 @@ fn pointer_free_leaf_fanout_uses_only_bounded_parent_jobs() {
 
 #[test]
 fn concurrent_chain_continuations_bound_queue_publication_and_preserve_tails() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [100usize, 1_000, 10_000] {
         reset_internal_for_test();
         let mut head = std::ptr::null_mut();
@@ -4457,14 +4639,14 @@ fn concurrent_chain_continuations_bound_queue_publication_and_preserve_tails() {
         let mut children = Vec::new();
         let mut scanned = 0;
         let before = cycle.queue.snapshot().injected;
-        epoch_index::EPOCH_READS.set(0);
+        cycle.objects.1.reset_reads();
         while !cycle.queue.snapshot().is_drained() {
             let (processed, _) = cycle.drain_worker(64, &mut children, &mut consumer);
             assert!(processed > 0 && processed <= 64);
             scanned += processed;
             assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
         }
-        let readers = epoch_index::EPOCH_READS.get();
+        let readers = cycle.objects.1.reads();
         assert_eq!(readers, count.div_ceil(64));
         eprintln!("inline-chain nodes={count} epoch_readers={readers}");
         assert_eq!(scanned, count);
@@ -4482,7 +4664,9 @@ fn concurrent_chain_continuations_bound_queue_publication_and_preserve_tails() {
         drop(consumer);
         assert_eq!(cycle.queue.end_epoch(), 0);
         marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
-        GC_MARK_PHASE.store(0, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(0, Ordering::Release);
         willow_pop_root();
     }
     reset_internal_for_test();
@@ -4490,7 +4674,7 @@ fn concurrent_chain_continuations_bound_queue_publication_and_preserve_tails() {
 
 #[test]
 fn concurrent_nonleaf_fanout_batches_claims_without_losing_shared_edges() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1_000usize, 10_000, 100_000] {
         reset_internal_for_test();
         let mut array = crate::array::willow_array_new(count as i64, 1);
@@ -4508,11 +4692,11 @@ fn concurrent_nonleaf_fanout_batches_claims_without_losing_shared_edges() {
         let before = cycle.queue.snapshot().injected;
         let mut consumer = cycle.queue.register_assist();
         let mut children = Vec::new();
-        epoch_index::EPOCH_READS.set(0);
+        cycle.objects.1.reset_reads();
         while !cycle.queue.snapshot().is_drained() {
             cycle.drain_worker(64, &mut children, &mut consumer);
         }
-        let readers = epoch_index::EPOCH_READS.get();
+        let readers = cycle.objects.1.reads();
         assert!(
             readers <= count.div_ceil(32) + 4 * count.div_ceil(512) + 8,
             "fanout={count} epoch_readers={readers}"
@@ -4536,7 +4720,9 @@ fn concurrent_nonleaf_fanout_batches_claims_without_losing_shared_edges() {
         drop(consumer);
         assert_eq!(cycle.queue.end_epoch(), 0);
         marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
-        GC_MARK_PHASE.store(0, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(0, Ordering::Release);
         willow_pop_root();
         willow_pop_root();
     }
@@ -4546,7 +4732,7 @@ fn concurrent_nonleaf_fanout_batches_claims_without_losing_shared_edges() {
 #[test]
 fn owned_pair_growth_bulk_barrier_retains_all_snapshot_edges() {
     use crate::array::{willow_array_new, willow_array_push_owned_pair};
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [4usize, 1024, 16384] {
         reset_internal_for_test();
         {
@@ -4590,7 +4776,9 @@ fn owned_pair_growth_bulk_barrier_retains_all_snapshot_edges() {
         assert_eq!(cycle.queue.snapshot().counter_underflows, 0);
         assert_eq!(cycle.queue.end_epoch(), 0);
         marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
-        GC_MARK_PHASE.store(0, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(0, Ordering::Release);
         willow_gc_collect();
         assert_eq!(crate::array::willow_array_len(array), count as i64 + 1);
         willow_pop_root();
@@ -4602,7 +4790,7 @@ fn owned_pair_growth_bulk_barrier_retains_all_snapshot_edges() {
 #[test]
 fn owned_pair_growth_bulk_barrier_remembers_young_destination_edges() {
     use crate::array::{willow_array_new, willow_array_push_owned_pair};
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1024usize, 16384] {
         reset_internal_for_test();
         {
@@ -4678,7 +4866,7 @@ fn m0_marker_slice_recovery_emits_without_panic_hook() {
         }
         return;
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     std::panic::set_hook(Box::new(|_| {}));
     unsafe fn invalid_slice(
@@ -4752,12 +4940,17 @@ fn stage6_recovery_sweep_is_outside_stop() {
         assert!(DROPPED.lock().unwrap().insert(payload as usize));
         DROPS.fetch_add(1, Ordering::Relaxed);
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [16, 256, 4096] {
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
-        old_lab::OLD_LABS_FOR_TEST.store(true, Ordering::Release);
-        mark_closure::RECOVERY_SAMPLES.lock().unwrap().clear();
+        runtime().old_lab_policy.store(true, Ordering::Release);
+        runtime()
+            .wait_observation
+            .recovery_samples
+            .lock()
+            .unwrap()
+            .clear();
         DROPS.store(0, Ordering::Relaxed);
         DROPPED.lock().unwrap().clear();
         const TYPE: u32 = 0xFA90;
@@ -4780,10 +4973,16 @@ fn stage6_recovery_sweep_is_outside_stop() {
         // Start with an entirely undrained graph, so every chain edge is
         // processed by recovery between stopped ownership/publication slices.
         let (_, cycle) = root_handshake::begin().unwrap();
-        let publication_before = sweep::CONCURRENT_PUBLICATIONS.load(Ordering::Relaxed);
+        let publication_before = runtime()
+            .sweep_observation
+            .publications
+            .load(Ordering::Relaxed);
         let (work, plan, _) = mark_closure::finish_stopped(&cycle, Instant::now());
-        let concurrent_publications =
-            sweep::CONCURRENT_PUBLICATIONS.load(Ordering::Relaxed) - publication_before;
+        let concurrent_publications = runtime()
+            .sweep_observation
+            .publications
+            .load(Ordering::Relaxed)
+            - publication_before;
         sweep::concurrent(plan.unwrap());
         assert_eq!(work.objects, count as u64);
         assert_eq!(DROPS.load(Ordering::Relaxed), count);
@@ -4791,7 +4990,7 @@ fn stage6_recovery_sweep_is_outside_stop() {
         let recovery = &stops.by_reason[3];
         assert_eq!(willow_gc_allocated_bytes(), before);
         assert!(recovery.requests >= 1);
-        let samples = mark_closure::RECOVERY_SAMPLES.lock().unwrap();
+        let samples = runtime().wait_observation.recovery_samples.lock().unwrap();
         assert_eq!(samples.len() as u64, recovery.requests);
         for &[slots, bytes, regions, metadata] in samples.iter() {
             assert!(slots <= mark_closure::RECOVERY_SLOTS);
@@ -4830,13 +5029,13 @@ fn stage6_recovery_sweep_is_outside_stop() {
             0,
         );
     }
-    old_lab::OLD_LABS_FOR_TEST.store(false, Ordering::Release);
+    runtime().old_lab_policy.store(false, Ordering::Release);
     reset_internal_for_test();
 }
 
 #[test]
 fn bounded_cancellation_clears_partial_publication_without_touching_active_tlabs() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     {
         let mut state = runtime().heap.lock().unwrap();
@@ -4865,7 +5064,12 @@ fn bounded_cancellation_clears_partial_publication_without_touching_active_tlabs
     let generated = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
     assert!(!generated.is_null());
     mark_closure::cancel(&cycle);
-    assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+    assert_eq!(
+        crate::runtime::current()
+            .mark_phase()
+            .load(Ordering::Acquire),
+        0
+    );
     assert!(!HeapObject::from_payload(GcPayload::from_raw(black).unwrap()).marked());
     {
         let state = runtime().heap.lock().unwrap();
@@ -4935,7 +5139,7 @@ fn native_retry_exhaustion_resolves_recovery_without_reclamation() {
     unsafe fn drop_probe(_: *mut u8) {
         eprintln!("UNSAFE_RECLAMATION");
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
     const TYPE: u32 = 0xFA98;
@@ -4963,7 +5167,7 @@ fn native_retry_exhaustion_resolves_recovery_without_reclamation() {
 
 #[test]
 fn allocation_assist_progress_latency_and_thread_fairness() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for threads in [1usize, 5, 16] {
         if std::env::var("WILLOW_ASSIST_THREADS")
             .ok()
@@ -5005,7 +5209,9 @@ fn allocation_assist_progress_latency_and_thread_fairness() {
         let completion_bytes = AtomicU64::new(0);
         cycle.enqueue_satb_batch(&(1..=objects).collect::<Vec<_>>());
         marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), Some(cycle.clone()));
-        GC_MARK_PHASE.store(1, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(1, Ordering::Release);
         let start = Instant::now();
         let barrier = std::sync::Barrier::new(threads);
         let reports = std::thread::scope(|scope| {
@@ -5015,9 +5221,9 @@ fn allocation_assist_progress_latency_and_thread_fairness() {
                 let allocated = &allocated;
                 let completion_bytes = &completion_bytes;
                 let cycle = &cycle;
-                handles.push(scope.spawn(move || {
+                handles.push(scope.spawn(crate::runtime::serving(move || {
                     willow_gc_register_mutator();
-                    assist::CREDITED.set(0);
+                    assist::reset_credited();
                     barrier.wait();
                     let cpu = crate::gc_telemetry::workers::thread_cpu_ns();
                     let mut samples = Vec::new();
@@ -5041,7 +5247,7 @@ fn allocation_assist_progress_latency_and_thread_fairness() {
                     let cpu = cpu
                         .zip(crate::gc_telemetry::workers::thread_cpu_ns())
                         .map(|(a, b)| b - a);
-                    let work = assist::CREDITED.get();
+                    let work = assist::credited();
                     let debt = assist::debt_units();
                     willow_gc_unregister_mutator();
                     assert_eq!(assist::debt_units(), 0);
@@ -5055,7 +5261,7 @@ fn allocation_assist_progress_latency_and_thread_fairness() {
                         samples[1013],
                         samples[1023],
                     )
-                }));
+                })));
             }
             handles
                 .into_iter()
@@ -5118,7 +5324,9 @@ fn allocation_assist_progress_latency_and_thread_fairness() {
         );
         assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
         assert_eq!(cycle.queue.end_epoch(), 0);
-        GC_MARK_PHASE.store(0, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(0, Ordering::Release);
         marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
         drop(cycle);
     }
@@ -5127,7 +5335,7 @@ fn allocation_assist_progress_latency_and_thread_fairness() {
 
 #[test]
 fn assist_remark_boundary_republishes_satb_tail() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     for stop in [false, true] {
         let cycle = Arc::new(ConcurrentCycle::new(
@@ -5150,7 +5358,7 @@ fn assist_remark_boundary_republishes_satb_tail() {
         cycle.closing.store(!stop, Ordering::Release);
         runtime().poll_requested.store(stop, Ordering::Release);
         let other = cycle.clone();
-        let work = std::thread::spawn(move || other.drain_checked(8))
+        let work = std::thread::spawn(crate::runtime::serving(move || other.drain_checked(8)))
             .join()
             .unwrap();
         assert_eq!(work, GC_HEADER_SIZE as u64);
@@ -5167,7 +5375,7 @@ fn assist_remark_boundary_republishes_satb_tail() {
 
 #[test]
 fn allocation_assist_pressure_preserves_hard_reservation_bound() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for threads in [1usize, 5, 16] {
         reset_internal_for_test();
         let limit = 16 * 1024 * 1024;
@@ -5177,7 +5385,7 @@ fn allocation_assist_pressure_preserves_hard_reservation_bound() {
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 let peak = &peak;
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     let _registration = safepoint::MutatorRegistration::new();
                     for i in 0..1024 {
                         assert!(!willow_alloc(4096).is_null());
@@ -5188,7 +5396,7 @@ fn allocation_assist_pressure_preserves_hard_reservation_bound() {
                             assert!(reserved <= limit);
                         }
                     }
-                });
+                }));
             }
         });
         marking::shutdown_mark_workers();
@@ -5208,7 +5416,7 @@ fn allocation_assist_pressure_preserves_hard_reservation_bound() {
 
 #[test]
 fn inline_satb_roots_survive_minor_overlap_and_unregister_without_runtime_calls() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1, 16, 64] {
         reset_internal_for_test();
         willow_gc_register_mutator();
@@ -5265,7 +5473,9 @@ fn inline_satb_roots_survive_minor_overlap_and_unregister_without_runtime_calls(
             },
             0
         );
-        GC_MARK_PHASE.store(0, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(0, Ordering::Release);
         marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
         cycle.queue.end_epoch();
         reset_internal_for_test();
@@ -5274,7 +5484,7 @@ fn inline_satb_roots_survive_minor_overlap_and_unregister_without_runtime_calls(
 
 #[test]
 fn map_remove_compaction_during_slices_preserves_satb_and_live_values() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let mut map = crate::map::willow_map_new(0, 0, 1);
     willow_push_root(&mut map);
@@ -5317,7 +5527,7 @@ fn map_remove_compaction_during_slices_preserves_satb_and_live_values() {
 
 #[test]
 fn branching_continuations_amortize_publication_and_preserve_drain_tails() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [100usize, 1_000, 10_000] {
         for limit in [1usize, 64, 1024] {
             reset_internal_for_test();
@@ -5371,7 +5581,9 @@ fn branching_continuations_amortize_publication_and_preserve_drain_tails() {
             drop(consumer);
             assert_eq!(cycle.queue.end_epoch(), 0);
             marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
-            GC_MARK_PHASE.store(0, Ordering::Release);
+            crate::runtime::current()
+                .mark_phase()
+                .store(0, Ordering::Release);
             willow_pop_root();
             willow_pop_root();
         }
@@ -5381,7 +5593,7 @@ fn branching_continuations_amortize_publication_and_preserve_drain_tails() {
 
 #[test]
 fn bounded_drain_claim_cache_preserves_graph_and_resets_between_drains() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for stride in [2usize, 512] {
         let leaves = vec![0usize; 64 * stride];
         let children: Vec<_> = (0..64)
@@ -5411,7 +5623,7 @@ fn bounded_drain_claim_cache_preserves_graph_and_resets_between_drains() {
                 for parent in &parents {
                     cycle.enqueue(parent.as_ptr() as *mut u8);
                 }
-                let before = epoch_index::CLAIM_METADATA_CALLS.get();
+                let before = cycle.objects.1.claims();
                 let mut drains = 0;
                 while !cycle.queue.snapshot().is_drained() {
                     cycle.drain(limit);
@@ -5419,10 +5631,7 @@ fn bounded_drain_claim_cache_preserves_graph_and_resets_between_drains() {
                 }
                 assert_eq!(cycle.objects.marked_count(), count + 64);
                 let expected_claims = if stride == 2 { drains * 64 } else { count * 64 };
-                assert_eq!(
-                    epoch_index::CLAIM_METADATA_CALLS.get() - before,
-                    expected_claims
-                );
+                assert_eq!(cycle.objects.1.claims() - before, expected_claims);
                 assert_eq!(
                     cycle.work.lock().unwrap().scanned_bytes,
                     (count * 64 * 8) as u64
@@ -5439,7 +5648,7 @@ fn bounded_drain_claim_cache_preserves_graph_and_resets_between_drains() {
 
 #[test]
 fn reference_array_growth_during_marking_preserves_copied_edges() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [512i64, 4096] {
         reset_internal_for_test();
         {

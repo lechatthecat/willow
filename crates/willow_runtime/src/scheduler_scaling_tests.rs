@@ -72,7 +72,7 @@
 //! boxed allocations, or the scheduler's own task table.
 
 use super::*;
-use crate::gc::runtime_test_guard;
+use crate::gc::isolated_runtime;
 
 const TASK_COUNTS: [usize; 4] = [1_000, 2_500, 5_000, 10_000];
 
@@ -303,7 +303,7 @@ fn task_inspection_does_not_allocate_or_duplicate_payloads() {
 fn scaling_01_fan_in_registration() {
     // Serialize against the other measurement runs so the timings are not
     // taken while another test is competing for the same allocator.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     header();
     for tasks in TASK_COUNTS {
         let mut scheduler = RuntimeScheduler::with_worker_count(1);
@@ -334,7 +334,7 @@ fn scaling_01_fan_in_registration() {
 fn scaling_02_fan_in_completion() {
     // Serialize against the other measurement runs so the timings are not
     // taken while another test is competing for the same allocator.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     header();
     for tasks in TASK_COUNTS {
         let mut scheduler = RuntimeScheduler::with_worker_count(1);
@@ -360,7 +360,7 @@ fn scaling_02_fan_in_completion() {
 fn scaling_03_losing_select_arm_churn() {
     // Serialize against the other measurement runs so the timings are not
     // taken while another test is competing for the same allocator.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     header();
     for tasks in TASK_COUNTS {
         let mut scheduler = RuntimeScheduler::with_worker_count(1);
@@ -393,7 +393,7 @@ fn scaling_03_losing_select_arm_churn() {
 fn scaling_04_waiter_teardown() {
     // Serialize against the other measurement runs so the timings are not
     // taken while another test is competing for the same allocator.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     header();
     for tasks in TASK_COUNTS {
         let mut scheduler = RuntimeScheduler::with_worker_count(1);
@@ -429,7 +429,7 @@ fn scaling_04_waiter_teardown() {
 fn scaling_05_active_task_footprint_by_workload() {
     // Serialize against the other measurement runs so the timings are not
     // taken while another test is competing for the same allocator.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     header();
     for tasks in TASK_COUNTS {
         // Ready: the cheapest active task, no wait relationships at all.
@@ -516,7 +516,7 @@ fn scaling_05_active_task_footprint_by_workload() {
 #[test]
 #[ignore = "scheduler footprint measurement"]
 fn scaling_07_measured_heap_per_active_task() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     println!("case,tasks,heap_bytes,heap_bytes_per_task,allocs_per_task,inline_bytes_per_task");
 
     /// Build a scheduler and report (heap bytes, allocation count) that were
@@ -628,7 +628,7 @@ fn scaling_07_measured_heap_per_active_task() {
 fn scaling_06_short_task_throughput() {
     // Serialize against the other measurement runs so the timings are not
     // taken while another test is competing for the same allocator.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     header();
     for tasks in TASK_COUNTS {
         let mut scheduler = RuntimeScheduler::with_worker_count(1);
@@ -733,7 +733,7 @@ fn contention_report(
 #[test]
 #[ignore = "scheduler lock contention profile"]
 fn contention_01_spawn_only() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     contention_header();
     let mut base = 0.0;
     for threads in CONTENTION_THREADS {
@@ -743,7 +743,7 @@ fn contention_01_spawn_only() {
         let start = std::time::Instant::now();
         std::thread::scope(|scope| {
             for _ in 0..threads {
-                scope.spawn(|| {
+                scope.spawn(crate::runtime::serving(|| {
                     for _ in 0..OPS_PER_THREAD {
                         let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let task = RuntimeTask::new(id);
@@ -751,7 +751,7 @@ fn contention_01_spawn_only() {
                         tasks.insert(id, task);
                         queues.push_global(id);
                     }
-                });
+                }));
             }
         });
         let ops = threads * OPS_PER_THREAD;
@@ -767,7 +767,7 @@ fn contention_01_spawn_only() {
 #[test]
 #[ignore = "scheduler lock contention profile"]
 fn contention_02_spawn_claim_complete() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     contention_header();
     let mut base = 0.0;
     for threads in CONTENTION_THREADS {
@@ -780,7 +780,7 @@ fn contention_02_spawn_claim_complete() {
                 let tasks = &tasks;
                 let queues = &queues;
                 let next_id = &next_id;
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     for _ in 0..OPS_PER_THREAD {
                         let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let task = RuntimeTask::new(id);
@@ -794,7 +794,7 @@ fn contention_02_spawn_claim_complete() {
                         });
                         tasks.remove(popped);
                     }
-                });
+                }));
             }
         });
         let ops = threads * OPS_PER_THREAD;
@@ -810,7 +810,7 @@ fn contention_02_spawn_claim_complete() {
 #[test]
 #[ignore = "scheduler lock contention profile"]
 fn contention_03_wake_only() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     contention_header();
     let mut base = 0.0;
     for threads in CONTENTION_THREADS {
@@ -829,7 +829,7 @@ fn contention_03_wake_only() {
             for (worker, &id) in ids.iter().enumerate() {
                 let tasks = &tasks;
                 let queues = &queues;
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     for _ in 0..OPS_PER_THREAD {
                         let outcome = tasks.with_mut(id, |task| task.state.wake()).unwrap();
                         if outcome == WakeOutcome::Enqueue {
@@ -843,7 +843,7 @@ fn contention_03_wake_only() {
                             assert_eq!(task.state.park_after_poll(), BoundaryOutcome::Suspended);
                         });
                     }
-                });
+                }));
             }
         });
         let ops = threads * OPS_PER_THREAD;
@@ -861,19 +861,19 @@ fn contention_03_wake_only() {
 #[test]
 #[ignore = "scheduler lock contention profile"]
 fn contention_04_uncontended_control() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     contention_header();
     let mut base = 0.0;
     for threads in CONTENTION_THREADS {
         let start = std::time::Instant::now();
         std::thread::scope(|scope| {
             for _ in 0..threads {
-                scope.spawn(|| {
+                scope.spawn(crate::runtime::serving(|| {
                     let mut sched = RuntimeScheduler::with_worker_count(8);
                     for _ in 0..OPS_PER_THREAD {
                         sched.spawn_parked_placeholder();
                     }
-                });
+                }));
             }
         });
         let ops = threads * OPS_PER_THREAD;
@@ -900,7 +900,7 @@ fn contention_04_uncontended_control() {
 #[test]
 #[ignore = "scheduler lock contention profile"]
 fn contention_05_timer_register_and_drain() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     contention_header();
     let mut base = 0.0;
     for threads in CONTENTION_THREADS {
@@ -923,7 +923,7 @@ fn contention_05_timer_register_and_drain() {
                 let tasks = &tasks;
                 let queues = &queues;
                 let timers = &timers;
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     for _ in 0..OPS_PER_THREAD {
                         let deadline = std::time::Instant::now();
                         tasks.with_mut(id, |task| task.wake_deadline = Some(deadline));
@@ -957,7 +957,7 @@ fn contention_05_timer_register_and_drain() {
                             assert_eq!(task.state.park_after_poll(), BoundaryOutcome::Suspended);
                         });
                     }
-                });
+                }));
             }
         });
         let ops = threads * OPS_PER_THREAD;
@@ -984,7 +984,7 @@ fn contention_05_timer_register_and_drain() {
 #[test]
 #[ignore = "scheduler lock contention profile"]
 fn contention_06_idle_timer_probe() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     contention_header();
     let mut base = 0.0;
     for threads in CONTENTION_THREADS {
@@ -994,11 +994,11 @@ fn contention_06_idle_timer_probe() {
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 let timers = &timers;
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     for _ in 0..OPS_PER_THREAD {
                         assert!(!std::hint::black_box(timers.maybe_due(now)));
                     }
-                });
+                }));
             }
         });
         let ops = threads * OPS_PER_THREAD;
@@ -1052,7 +1052,7 @@ fn queue_profile(
             let queues = &queues;
             let start_gate = &start_gate;
             let publishers_left = &publishers_left;
-            handles.push(scope.spawn(move || {
+            handles.push(scope.spawn(crate::runtime::serving(move || {
                 let worker = if private.is_some() {
                     0
                 } else {
@@ -1113,12 +1113,12 @@ fn queue_profile(
                         queue.metrics_snapshot()
                     }),
                 )
-            }));
+            })));
         }
         let publisher = (producer != 0).then(|| {
             let queues = &queues;
             let start_gate = &start_gate;
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 CURRENT_WORKER.with(|current| current.set(0));
                 SCHED_RUN_DEPTH.with(|depth| depth.set(1));
                 let publish = || {
@@ -1138,7 +1138,7 @@ fn queue_profile(
                     assert!(queues.locals[0].stealer.is_empty());
                 }
                 SCHED_RUN_DEPTH.with(|depth| depth.set(0));
-            })
+            }))
         });
         let start = std::time::Instant::now();
         start_gate.wait();
@@ -1203,7 +1203,7 @@ fn queue_profile(
 
 #[test]
 fn queue_profile_exact_once_and_path_counts() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for mode in [
         QueueProfile::PrivateLocal,
         QueueProfile::Local,
@@ -1226,7 +1226,7 @@ fn queue_profile_exact_once_and_path_counts() {
 #[test]
 #[ignore = "queue-only spawn/steal contention profile"]
 fn contention_08_queue_spawn_steal() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     println!(
         "queue_case,trial,workers,publishers,per_worker,tokens,elapsed_ns,local_pushes,global_pushes,local_hits,global_hits,global_probes,steals,steal_hits,steal_failures,victim_locks"
     );

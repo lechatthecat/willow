@@ -1,6 +1,6 @@
 use super::*;
 use crate::async_rwlock::{AsyncRwLock, RwAcquire, RwRelease};
-use crate::gc::{runtime_test_guard, total_frees_for_test, willow_gc_collect, willow_gc_init};
+use crate::gc::{isolated_runtime, total_frees_for_test, willow_gc_collect, willow_gc_init};
 use crate::lock_wait::{LockAccess, lock_wait_link_of};
 use crate::scheduler::{
     reset_global_scheduler_for_test, single_worker_for_test, willow_sched_cancel,
@@ -151,7 +151,7 @@ fn queue_on(mutex: &AsyncMutex, task: RuntimeTaskId) -> RegistrationToken {
 // 1
 #[test]
 fn fresh_mutex_is_idle_and_reclaimable() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(7, false);
@@ -165,7 +165,7 @@ fn fresh_mutex_is_idle_and_reclaimable() {
 // 2, 3
 #[test]
 fn uncontended_acquire_owns_without_a_reverse_link() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(41, false);
@@ -187,7 +187,7 @@ fn uncontended_acquire_owns_without_a_reverse_link() {
 // 4
 #[test]
 fn only_the_owner_commits_and_the_next_owner_sees_it() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(0, false);
@@ -216,7 +216,7 @@ fn only_the_owner_commits_and_the_next_owner_sees_it() {
 // 5, 6, 7
 #[test]
 fn waiters_are_fifo_and_a_new_arrival_never_bargs() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(1, false);
@@ -249,7 +249,7 @@ fn waiters_are_fifo_and_a_new_arrival_never_bargs() {
 // 8, 9, 10
 #[test]
 fn poll_acquire_distinguishes_handoff_spurious_wake_and_loss() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(0, false);
@@ -291,7 +291,7 @@ fn poll_acquire_distinguishes_handoff_spurious_wake_and_loss() {
 // 11, 12, 13
 #[test]
 fn recursive_acquire_is_rejected_and_changes_nothing() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(0, false);
@@ -325,7 +325,7 @@ fn recursive_acquire_is_rejected_and_changes_nothing() {
 // 14, 15
 #[test]
 fn a_task_that_cannot_park_is_ineligible() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(0, false);
@@ -350,7 +350,7 @@ fn a_task_that_cannot_park_is_ineligible() {
 // 16, 17
 #[test]
 fn a_stale_or_repeated_release_never_steals_the_lock() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(0, false);
@@ -379,7 +379,7 @@ fn a_stale_or_repeated_release_never_steals_the_lock() {
 // 18, 19
 #[test]
 fn a_wake_that_cannot_land_is_compensated_not_dropped() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(0, false);
@@ -412,7 +412,7 @@ fn a_wake_that_cannot_land_is_compensated_not_dropped() {
 // 20, 21, 22
 #[test]
 fn cancellation_reconciles_by_phase_and_re_hands_reserved_ownership() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(0, false);
@@ -459,7 +459,7 @@ fn cancellation_reconciles_by_phase_and_re_hands_reserved_ownership() {
 // 34, 35
 #[test]
 fn cleanup_acts_on_the_task_s_own_lock_not_a_bystander_lock() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     // Two live mutexes. Everything interesting happens on `b`; `a` exists
@@ -531,7 +531,7 @@ fn cleanup_acts_on_the_task_s_own_lock_not_a_bystander_lock() {
 // 23
 #[test]
 fn terminal_cleanup_path_re_hands_a_reserved_lock() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(0, false);
@@ -562,7 +562,7 @@ fn terminal_cleanup_path_re_hands_a_reserved_lock() {
 // 24
 #[test]
 fn concurrent_acquire_yields_exactly_one_owner() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(0, false);
@@ -575,10 +575,10 @@ fn concurrent_acquire_yields_exactly_one_owner() {
             .map(|&task| {
                 let barrier = Arc::clone(&barrier);
                 let mutex = &mutex;
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     barrier.wait();
                     mutex.acquire(task)
-                })
+                }))
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -601,7 +601,7 @@ fn concurrent_acquire_yields_exactly_one_owner() {
 // 25
 #[test]
 fn ten_thousand_waiters_drain_in_fifo_order() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(0, false);
@@ -642,7 +642,7 @@ fn ten_thousand_waiters_drain_in_fifo_order() {
 
 #[test]
 fn ten_thousand_waiter_cancellation_storm_leaves_no_links_or_tombstones() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(0, false);
@@ -691,7 +691,7 @@ fn ten_thousand_waiter_cancellation_storm_leaves_no_links_or_tombstones() {
 // 26, 27
 #[test]
 fn reclamation_and_frame_refs_track_live_relationships() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(0, false);
@@ -754,7 +754,7 @@ fn reclamation_and_frame_refs_track_live_relationships() {
 // 28
 #[test]
 fn gc_roots_cover_ref_words_only() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mut word = 0xABCDu64;
@@ -799,7 +799,7 @@ fn gc_roots_cover_ref_words_only() {
 // 39, 40
 #[test]
 fn a_real_collection_keeps_a_ref_cell_s_object_alive() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     willow_gc_init();
 
@@ -855,7 +855,7 @@ fn a_real_collection_keeps_a_ref_cell_s_object_alive() {
 
 #[test]
 fn repeated_unreachable_mutex_handles_are_finalized() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     willow_gc_init();
     let before = ASYNC_MUTEX_DROP_COUNT.load(Ordering::SeqCst);
@@ -873,7 +873,7 @@ fn repeated_unreachable_mutex_handles_are_finalized() {
 // 29
 #[test]
 fn c_abi_routes_the_full_acquire_release_cycle() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let raw = willow_async_mutex_new(3, 0);
@@ -938,7 +938,7 @@ fn c_abi_routes_the_full_acquire_release_cycle() {
 // 30
 #[test]
 fn c_abi_reports_loss_without_a_handle_or_a_running_task() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let raw = willow_async_mutex_new(5, 0);
@@ -976,7 +976,7 @@ fn c_abi_reports_loss_without_a_handle_or_a_running_task() {
 // 41
 #[test]
 fn c_abi_reports_cancelled_without_publishing_a_waiter() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let raw = willow_async_mutex_new(5, 0);
@@ -1016,7 +1016,7 @@ fn c_abi_reports_cancelled_without_publishing_a_waiter() {
 // 31
 #[test]
 fn a_cancellation_storm_leaves_the_lock_consistent() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(0, false);
@@ -1029,7 +1029,7 @@ fn a_cancellation_storm_leaves_the_lock_consistent() {
         for &task in &tasks {
             let barrier = Arc::clone(&barrier);
             let mutex = &mutex;
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 barrier.wait();
                 for _ in 0..40 {
                     match mutex.acquire(task) {
@@ -1047,7 +1047,7 @@ fn a_cancellation_storm_leaves_the_lock_consistent() {
                         MutexAcquire::Ineligible => break,
                     }
                 }
-            });
+            }));
         }
     });
 
@@ -1071,7 +1071,7 @@ fn a_cancellation_storm_leaves_the_lock_consistent() {
 // 33
 #[test]
 fn a_handoff_to_a_running_task_is_not_lost() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     let mutex = AsyncMutex::new(0, false);
@@ -1112,22 +1112,29 @@ fn a_handoff_to_a_running_task_is_not_lost() {
 //
 // Cross-poll state lives in statics rather than in a frame, because
 // `willow_sched_spawn` roots the frame pointer with the collector and these
-// tests have no GC frame to give it. `runtime_test_guard()` serialises
-// runtime tests, so the statics are effectively test-local; each test
-// resets the ones it uses.
+// tests have no GC frame to give it. The statics are keyed by the runtime
+// the test thread serves (`isolated_runtime()`), so they are test-local;
+// each test resets the ones it uses.
 //
 // Task creation is *chained* — each stage spawns the next from inside its
 // own poll — so the interleaving is forced by causality instead of by the
 // run queue's discipline. Nothing here depends on the order the scheduler
 // happens to pop ready tasks in.
 
-static SCHED_LOCK: AtomicUsize = AtomicUsize::new(0);
-static SCHED_EVENTS: TestMutex<Vec<String>> = TestMutex::new(Vec::new());
-static SCHED_HOLDER_TASK: AtomicU64 = AtomicU64::new(0);
-static SCHED_HOLDER_TOKEN: AtomicI64 = AtomicI64::new(-1);
-static SCHED_HOLDER_STEP: AtomicUsize = AtomicUsize::new(0);
-static SCHED_WAITER_TOKEN: AtomicI64 = AtomicI64::new(-1);
-static SCHED_WAITER_STEP: AtomicUsize = AtomicUsize::new(0);
+static SCHED_LOCK: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static SCHED_EVENTS: crate::runtime::PerRuntime<TestMutex<Vec<String>>> =
+    crate::runtime::PerRuntime::new(|| TestMutex::new(Vec::new()));
+static SCHED_HOLDER_TASK: crate::runtime::PerRuntime<AtomicU64> =
+    crate::runtime::PerRuntime::new(|| AtomicU64::new(0));
+static SCHED_HOLDER_TOKEN: crate::runtime::PerRuntime<AtomicI64> =
+    crate::runtime::PerRuntime::new(|| AtomicI64::new(-1));
+static SCHED_HOLDER_STEP: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static SCHED_WAITER_TOKEN: crate::runtime::PerRuntime<AtomicI64> =
+    crate::runtime::PerRuntime::new(|| AtomicI64::new(-1));
+static SCHED_WAITER_STEP: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
 fn sched_reset(is_ref: bool) -> *mut c_void {
     reset_global_scheduler_for_test();
@@ -1235,7 +1242,7 @@ unsafe extern "C" fn poll_unrelated_work(_frame: *mut c_void) -> i32 {
 // 36
 #[test]
 fn one_worker_keeps_working_while_a_task_is_parked_on_the_lock() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     sched_reset(false);
 
@@ -1268,10 +1275,12 @@ fn one_worker_keeps_working_while_a_task_is_parked_on_the_lock() {
 
 // ── 37: a chain of real tasks drains in registration order ──────────────
 
-static CHAIN_REMAINING: AtomicUsize = AtomicUsize::new(0);
+static CHAIN_REMAINING: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 /// `(task id, token, polls so far)` per chained waiter, in the order they
 /// registered on the lock.
-static CHAIN_TOKENS: TestMutex<Vec<(u64, i64, usize)>> = TestMutex::new(Vec::new());
+static CHAIN_TOKENS: crate::runtime::PerRuntime<TestMutex<Vec<(u64, i64, usize)>>> =
+    crate::runtime::PerRuntime::new(|| TestMutex::new(Vec::new()));
 
 unsafe extern "C" fn poll_chain_waiter(_frame: *mut c_void) -> i32 {
     let task = willow_sched_current_task();
@@ -1339,7 +1348,7 @@ unsafe extern "C" fn poll_hold_then_start_a_chain(_frame: *mut c_void) -> i32 {
 // 37
 #[test]
 fn one_worker_drains_a_chain_of_real_tasks_in_registration_order() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     sched_reset(false);
 
@@ -1390,7 +1399,8 @@ fn one_worker_drains_a_chain_of_real_tasks_in_registration_order() {
 
 // ── 38: a cancelled waiter is retired without stranding the lock ────────
 
-static CANCEL_VICTIM: AtomicU64 = AtomicU64::new(0);
+static CANCEL_VICTIM: crate::runtime::PerRuntime<AtomicU64> =
+    crate::runtime::PerRuntime::new(|| AtomicU64::new(0));
 
 /// Parks on the lock and requests its own cancellation without cleaning up
 /// its registration. Because this synthetic task has no compiler-generated
@@ -1437,7 +1447,7 @@ unsafe extern "C" fn poll_hold_then_start_a_cancel(_frame: *mut c_void) -> i32 {
 // 38
 #[test]
 fn a_cancelled_waiter_is_retired_without_stranding_the_lock() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     sched_reset(false);
     CANCEL_VICTIM.store(0, Ordering::SeqCst);
@@ -1482,7 +1492,7 @@ fn a_cancelled_waiter_is_retired_without_stranding_the_lock() {
 // 32
 #[test]
 fn ownership_is_task_based_and_survives_a_worker_change() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     reset_global_scheduler_for_test();
 
@@ -1499,10 +1509,12 @@ fn ownership_is_task_based_and_survives_a_worker_change() {
     let handed_to = std::thread::scope(|scope| {
         let mutex = &mutex;
         scope
-            .spawn(move || match mutex.release(owner, owner_token) {
-                MutexRelease::Released { handed_to } => handed_to,
-                MutexRelease::NotOwner => panic!("ownership must not be thread-local"),
-            })
+            .spawn(crate::runtime::serving(move || {
+                match mutex.release(owner, owner_token) {
+                    MutexRelease::Released { handed_to } => handed_to,
+                    MutexRelease::NotOwner => panic!("ownership must not be thread-local"),
+                }
+            }))
             .join()
             .unwrap()
     });
@@ -1552,7 +1564,7 @@ fn scheduler_aware_lock_benchmark_reports_stage7_metrics() {
         sorted[(sorted.len() - 1) * percent / 100]
     }
 
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     const OPERATIONS: usize = 100_000;
     const WAITERS: usize = 10_000;
@@ -1660,7 +1672,7 @@ fn scheduler_aware_lock_benchmark_reports_stage7_metrics() {
 
 #[test]
 fn fast_mutex_generation_scaling_has_two_transitions_per_section() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let task = parked_task();
     for n in [1, 8, 64, 512, 4096] {
@@ -1689,7 +1701,7 @@ fn fast_mutex_generation_scaling_has_two_transitions_per_section() {
 
 #[test]
 fn fast_mutex_reopens_after_fifo_drain_without_reusing_tokens() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let mutex = AsyncMutex::new(0, false);
     let a = parked_task();
@@ -1724,7 +1736,7 @@ fn fast_mutex_reopens_after_fifo_drain_without_reusing_tokens() {
 
 #[test]
 fn fast_mutex_publication_window_does_not_report_false_recursion() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let mutex = AsyncMutex::new(0, false);
     let previous = parked_task();
@@ -1761,7 +1773,7 @@ fn fast_mutex_publication_window_does_not_report_false_recursion() {
 
 #[test]
 fn fast_mutex_failed_and_stale_admission_leave_no_hidden_waiter() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let mutex = AsyncMutex::new(0, false);
     let owner = parked_task();
@@ -1787,7 +1799,7 @@ fn fast_mutex_failed_and_stale_admission_leave_no_hidden_waiter() {
 
 #[test]
 fn fast_mutex_concurrent_reopening_preserves_exclusion_and_sum() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let mutex = AsyncMutex::new(0, false);
     let tasks: Vec<_> = (0..8)
@@ -1804,7 +1816,7 @@ fn fast_mutex_concurrent_reopening_preserves_exclusion_and_sum() {
             let mutex = &mutex;
             let inside = &inside;
             let start = &start;
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 start.wait();
                 for _ in 0..1000 {
                     let token = match mutex.acquire(task) {
@@ -1830,7 +1842,7 @@ fn fast_mutex_concurrent_reopening_preserves_exclusion_and_sum() {
                         MutexRelease::Released { .. }
                     ));
                 }
-            });
+            }));
         }
     });
     let token = acquire_now(&mutex, tasks[0]);
@@ -1844,7 +1856,7 @@ fn fast_mutex_concurrent_reopening_preserves_exclusion_and_sum() {
 
 #[test]
 fn fused_commit_release_rejects_stale_and_wrong_owner() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     willow_gc_init();
     let raw = willow_async_mutex_new(0, 0);
@@ -1878,7 +1890,7 @@ fn fused_commit_release_rejects_stale_and_wrong_owner() {
 
 #[test]
 fn fused_scalar_acquire_and_poll_write_only_on_success() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let raw = willow_async_mutex_new(7, 0);
     let a = parked_task();
@@ -1937,7 +1949,7 @@ fn fused_scalar_acquire_and_poll_write_only_on_success() {
 
 #[test]
 fn fast_mutex_single_worker_and_off_task_never_spin() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     reset_global_scheduler_for_test();
     let task = parked_task();

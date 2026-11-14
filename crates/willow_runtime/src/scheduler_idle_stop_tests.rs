@@ -48,7 +48,7 @@
 //! 30. a poll that requeues and ends mid-snapshot is never missed
 
 use super::*;
-use crate::gc::{reset_internal_for_test, runtime_test_guard};
+use crate::gc::{isolated_runtime, reset_internal_for_test};
 use std::sync::Barrier;
 
 /// Never completes, and registers no wake source: the only way a drive can
@@ -74,8 +74,8 @@ unsafe extern "C" fn poll_yield_thrice(frame: *mut c_void) -> i32 {
     }
 }
 
-fn fresh_scheduler() -> std::sync::MutexGuard<'static, ()> {
-    let guard = runtime_test_guard();
+fn fresh_scheduler() -> crate::runtime::IsolatedRuntime {
+    let guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     guard
@@ -134,7 +134,8 @@ unsafe fn take_chain_frame(frame: *mut c_void) -> ChainFrame {
 }
 
 /// How many chain nodes have registered themselves as waiters on the tail.
-static CHAIN_PARKED: AtomicUsize = AtomicUsize::new(0);
+static CHAIN_PARKED: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
 /// The number of non-tail nodes in the chain built by perspective 20.
 const CHAIN_WAITERS: usize = 2;
@@ -170,15 +171,19 @@ unsafe extern "C" fn poll_chain_tail(frame: *mut c_void) -> i32 {
 }
 
 /// The highest `paused_polls` count seen from inside a nested drive.
-static NESTED_PAUSED_PEAK: AtomicUsize = AtomicUsize::new(0);
+static NESTED_PAUSED_PEAK: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
 /// Whether `WorkSource::Claim` covered that paused outer poll.
-static NESTED_CLAIM_LIVE: AtomicBool = AtomicBool::new(false);
+static NESTED_CLAIM_LIVE: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
 
 /// Whether the outer poll was counted as active again once its nested drive
 /// returned, and what the pause count had fallen back to.
-static NESTED_RESUMED_ACTIVE: AtomicBool = AtomicBool::new(false);
-static NESTED_RESUMED_PAUSED: AtomicUsize = AtomicUsize::new(usize::MAX);
+static NESTED_RESUMED_ACTIVE: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+static NESTED_RESUMED_PAUSED: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(usize::MAX));
 
 /// Drives its child to completion with a NESTED `run_until` from inside its own
 /// poll — the shape a blocking operation inside a task takes. This is the only
@@ -437,7 +442,7 @@ fn idle_13b_a_claim_racing_the_stop_decision_is_never_missed() {
         let gate = Arc::new(Barrier::new(2));
         let claim_gate = Arc::clone(&gate);
         let claim_state = Arc::clone(&state);
-        let claimer = std::thread::spawn(move || {
+        let claimer = std::thread::spawn(crate::runtime::serving(move || {
             claim_gate.wait();
             match claim_global_ready_for_worker(0, Some(&claim_state)) {
                 Some((claimed, _work)) => {
@@ -448,7 +453,7 @@ fn idle_13b_a_claim_racing_the_stop_decision_is_never_missed() {
                 }
                 None => false,
             }
-        });
+        }));
         gate.wait();
         std::thread::yield_now();
         let stopped = state.publish_stop_if(parallel_run_is_idle_locked);
@@ -756,11 +761,11 @@ fn idle_26_a_claim_without_a_decision_never_waits_for_the_gate() {
     let held = state.claim_gate.lock().unwrap();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let claim_state = Arc::clone(&state);
-    let claimer = std::thread::spawn(move || {
+    let claimer = std::thread::spawn(crate::runtime::serving(move || {
         let claimed = claim_global_ready_for_worker(0, Some(&claim_state)).map(|(id, _)| id);
         set_current_task(None);
         done_tx.send(claimed).unwrap();
-    });
+    }));
     let claimed = done_rx.recv_timeout(Duration::from_secs(5));
     drop(held);
     claimer.join().unwrap();
@@ -786,11 +791,11 @@ fn claim_behind_a_decision(
     state.stop_intent.store(true, Ordering::SeqCst);
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let claim_state = Arc::clone(state);
-    let claimer = std::thread::spawn(move || {
+    let claimer = std::thread::spawn(crate::runtime::serving(move || {
         let claimed = claim_global_ready_for_worker(0, Some(&claim_state)).map(|(id, _)| id);
         set_current_task(None);
         done_tx.send(claimed).unwrap();
-    });
+    }));
     // The claim is visible (and holding the popped task) before it blocks.
     let deadline = Instant::now() + Duration::from_secs(5);
     while claim_word_count() == 0 && Instant::now() < deadline {
@@ -851,7 +856,7 @@ fn idle_29_a_moving_poll_is_always_live() {
     let done = Arc::new(AtomicBool::new(false));
     let mover_state = Arc::clone(&state);
     let mover_done = Arc::clone(&done);
-    let mover = std::thread::spawn(move || {
+    let mover = std::thread::spawn(crate::runtime::serving(move || {
         mover_state.begin_poll();
         mover_entered.wait();
         for _ in 0..200_000 {
@@ -859,7 +864,7 @@ fn idle_29_a_moving_poll_is_always_live() {
             mover_state.resume_paused_poll();
         }
         mover_done.store(true, Ordering::Release);
-    });
+    }));
     entered.wait();
     let mut reads = 0u64;
     while !done.load(Ordering::Acquire) {

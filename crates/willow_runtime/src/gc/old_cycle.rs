@@ -1,6 +1,8 @@
 //! Checked old-cycle transitions. Collector serialization spans sweep's final
 //! free-span publication; epoch identities are process-monotonic, never reused.
 
+use super::GcRuntime;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Phase {
     Idle,
@@ -137,6 +139,7 @@ pub(super) struct RemarkBudget {
     checks: u64,
     yields: u64,
     regions: u64,
+    observation: RuntimeBudgetObservation,
 }
 
 fn positive_setting(setting: Option<&str>, default: u64, maximum: u64) -> u64 {
@@ -151,18 +154,31 @@ impl RemarkBudget {
         fn positive(name: &str, default: u64, maximum: u64) -> u64 {
             positive_setting(std::env::var(name).ok().as_deref(), default, maximum)
         }
-        Self::new(
+        let observation =
+            RuntimeBudgetObservation::capture(|| &super::runtime().remark_observation);
+        Self::with_observation(
             positive("WILLOW_GC_REMARK_MAX_SLOTS", 4096, 1_000_000),
             positive("WILLOW_GC_REMARK_MAX_BYTES", 1024 * 1024, 16 * 1024 * 1024),
-            match remark_work_ns_for_test() {
+            match observation.work_ns() {
                 0 => positive("WILLOW_GC_REMARK_MAX_WORK_NS", 1_000_000, 100_000_000),
                 ns => ns,
             },
             now,
+            observation,
         )
     }
 
     pub(super) fn new(max_slots: u64, max_bytes: u64, max_work_ns: u64, start: u64) -> Self {
+        Self::with_observation(max_slots, max_bytes, max_work_ns, start, Default::default())
+    }
+
+    fn with_observation(
+        max_slots: u64,
+        max_bytes: u64,
+        max_work_ns: u64,
+        start: u64,
+        observation: RuntimeBudgetObservation,
+    ) -> Self {
         assert!(max_slots > 0 && max_bytes > 0 && max_work_ns > 0);
         Self {
             max_slots,
@@ -175,6 +191,7 @@ impl RemarkBudget {
             checks: 0,
             yields: 0,
             regions: 0,
+            observation,
         }
     }
 
@@ -187,7 +204,6 @@ impl RemarkBudget {
             .min((self.max_bytes - self.bytes) / bytes_per_entry) as usize
     }
 
-    #[cfg(test)]
     pub(super) fn counts(&self) -> [u64; 3] {
         [self.slots, self.bytes, self.regions]
     }
@@ -199,8 +215,7 @@ impl RemarkBudget {
     pub(super) fn reserve(&mut self, slots: u64, bytes: u64, now: u64) -> bool {
         self.last_ns = now;
         self.checks += 1;
-        #[cfg(test)]
-        BUDGET_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.observation.checked();
         let Some(total_slots) = self.slots.checked_add(slots) else {
             self.yields += 1;
             return false;
@@ -214,8 +229,7 @@ impl RemarkBudget {
             || now.saturating_sub(self.start) >= self.max_work_ns
         {
             self.yields += 1;
-            #[cfg(test)]
-            BUDGET_YIELDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.observation.yielded();
             return false;
         }
         self.slots = total_slots;
@@ -227,6 +241,54 @@ impl RemarkBudget {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Default)]
+    pub(crate) struct Counters {
+        pub(crate) checks: AtomicU64,
+        pub(crate) yields: AtomicU64,
+        pub(crate) work_ns: AtomicU64,
+    }
+
+    #[test]
+    fn remark_budget_observations_follow_the_captured_owner() {
+        let first = super::super::GcRuntime::default();
+        let second = super::super::GcRuntime::default();
+        first.remark_observation.work_ns.store(7, Ordering::Relaxed);
+        assert_eq!(first.remark_observation.work_ns(), 7);
+        assert_eq!(second.remark_observation.work_ns(), 0);
+        let a = RuntimeBudgetObservation::capture(|| &first.remark_observation);
+        let b = RuntimeBudgetObservation::capture(|| &second.remark_observation);
+        std::thread::scope(|scope| {
+            for (observation, stride) in [(a, 1), (b, 3)] {
+                scope.spawn(crate::runtime::serving(move || {
+                    for _ in 0..64 {
+                        let mut budget =
+                            RemarkBudget::with_observation(stride, 8, 7, 100, observation.clone());
+                        for _ in 0..stride {
+                            assert!(budget.reserve(1, 0, 100));
+                        }
+                        assert!(!budget.reserve(1, 0, 100));
+                    }
+                }));
+            }
+        });
+        assert_eq!(first.remark_observation.checks.load(Ordering::Relaxed), 128);
+        assert_eq!(
+            second.remark_observation.checks.load(Ordering::Relaxed),
+            256
+        );
+        assert_eq!(first.remark_observation.yields.load(Ordering::Relaxed), 64);
+        assert_eq!(second.remark_observation.yields.load(Ordering::Relaxed), 64);
+        let retained = RuntimeBudgetObservation::capture(|| &first.remark_observation);
+        drop(first);
+        let mut budget = RemarkBudget::with_observation(1, 1, 1, 0, retained.clone());
+        assert!(budget.reserve(1, 1, 0));
+        assert!(!budget.reserve(1, 0, 0));
+        assert_eq!(retained.checks.load(Ordering::Relaxed), 130);
+        NoBudgetObservation::capture(|| panic!("production observer resolved an owner"));
+        assert_eq!(NoBudgetObservation.work_ns(), 0);
+    }
 
     #[test]
     fn old_cycle_remark_settings_reject_zero_overflow_and_effectively_unlimited_limits() {
@@ -262,25 +324,44 @@ mod budget_tests {
     }
 }
 
+/// Production budgets retain a zero-sized observer. Test budgets capture their
+/// collector's counters once, rather than resolving a default collector per check.
+pub(super) trait BudgetObservation: Default {
+    fn capture<'a>(_owner: impl FnOnce() -> &'a Self) -> Self
+    where
+        Self: 'a,
+    {
+        Self::default()
+    }
+    fn work_ns(&self) -> u64 {
+        0
+    }
+    fn checked(&self) {}
+    fn yielded(&self) {}
+}
+#[derive(Default)]
+pub(super) struct NoBudgetObservation;
+impl BudgetObservation for NoBudgetObservation {}
+#[cfg(not(test))]
+pub(super) type RuntimeBudgetObservation = NoBudgetObservation;
 #[cfg(test)]
-pub(super) static REGION_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(super) type RuntimeBudgetObservation = std::sync::Arc<budget_tests::Counters>;
 #[cfg(test)]
-pub(super) static BUDGET_CHECKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
-pub(super) static BUDGET_YIELDS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Nonzero replaces the wall-clock remark limit for in-process tests whose
-/// assertions are about pacing, not about a preempted runner overrunning 1ms.
-#[cfg(test)]
-pub(super) static REMARK_WORK_NS_FOR_TEST: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-fn remark_work_ns_for_test() -> u64 {
-    #[cfg(test)]
-    return REMARK_WORK_NS_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed);
-    #[cfg(not(test))]
-    0
+impl BudgetObservation for RuntimeBudgetObservation {
+    fn capture<'a>(owner: impl FnOnce() -> &'a Self) -> Self {
+        owner().clone()
+    }
+    fn work_ns(&self) -> u64 {
+        self.work_ns.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn checked(&self) {
+        self.checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn yielded(&self) {
+        self.yields
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -308,7 +389,7 @@ mod integration_tests {
             );
             return;
         }
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for mib in [64, 256, 1024] {
             reset_internal_for_test();
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -328,9 +409,12 @@ mod integration_tests {
             }
             let before = willow_gc_allocated_bytes();
             take_stop_diagnostics();
-            let views = REGION_VIEWS.load(Ordering::Relaxed);
-            let checks = BUDGET_CHECKS.load(Ordering::Relaxed);
-            let concurrent_regions = sweep::CONCURRENT_PUBLICATIONS.load(Ordering::Relaxed);
+            let views = runtime().heap.lock().unwrap().epoch_views.count();
+            let checks = runtime().remark_observation.checks.load(Ordering::Relaxed);
+            let concurrent_regions = runtime()
+                .sweep_observation
+                .publications
+                .load(Ordering::Relaxed);
             willow_gc_collect();
             let stops = crate::gc_telemetry::stops::snapshot_stops();
             assert_eq!(stops.by_reason[0].work.metadata_objects, 0);
@@ -378,8 +462,11 @@ mod integration_tests {
                 published_regions, 0,
                 "existing regions publish outside stops"
             );
-            let concurrent_regions =
-                sweep::CONCURRENT_PUBLICATIONS.load(Ordering::Relaxed) - concurrent_regions;
+            let concurrent_regions = runtime()
+                .sweep_observation
+                .publications
+                .load(Ordering::Relaxed)
+                - concurrent_regions;
             assert_eq!(
                 concurrent_regions,
                 runtime().heap.lock().unwrap().old_regions.len()
@@ -387,7 +474,7 @@ mod integration_tests {
             println!(
                 "live_mib={mib} concurrent_region_publications={concurrent_regions} stopped_region_publications={published_regions}"
             );
-            let preparation = *PREPARATION.lock().unwrap();
+            let preparation = *runtime().preparation_diagnostic.lock().unwrap();
             println!(
                 "live_mib={mib} concurrent_prepare_regions={} concurrent_index_entries={} concurrent_bitmap_words={} concurrent_bitmap_bytes={} concurrent_heap_hold_ns={}",
                 preparation.regions,
@@ -400,9 +487,9 @@ mod integration_tests {
             let remark = &stops.by_reason[1];
             println!(
                 "live_mib={mib} heap_objects={count} roots=1 region_views={} initial_metadata_objects=0 remark_metadata_objects=0 stopped_sweep=0 recovery_stops={} budget_checks={} initial_wait_ns={} initial_work_resume_ns={} remark_wait_ns={} remark_work_resume_ns={}",
-                REGION_VIEWS.load(Ordering::Relaxed) - views,
+                runtime().heap.lock().unwrap().epoch_views.count() - views,
                 stops.by_reason[3].requests,
-                BUDGET_CHECKS.load(Ordering::Relaxed) - checks,
+                runtime().remark_observation.checks.load(Ordering::Relaxed) - checks,
                 initial.rendezvous.total_ns,
                 initial.stopped.total_ns,
                 remark.rendezvous.total_ns,
@@ -444,7 +531,7 @@ mod integration_tests {
 
     #[test]
     fn old_cycle_root_count_scaling_is_separate_from_heap_scaling() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for count in [1, 16, 257, 4096] {
             reset_internal_for_test();
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -485,7 +572,7 @@ mod integration_tests {
             );
             return;
         }
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let mut root = willow_alloc(8);
         willow_push_root(&mut root);
@@ -495,7 +582,7 @@ mod integration_tests {
         assert_eq!(stops.by_reason[1].requests, 1);
         assert_eq!(stops.by_reason[1].work.swept_objects, 0);
         assert_eq!(stops.by_reason[3].requests, 1);
-        assert!(BUDGET_YIELDS.load(Ordering::Relaxed) > 0);
+        assert!(runtime().remark_observation.yields.load(Ordering::Relaxed) > 0);
         assert_eq!(willow_gc_allocated_bytes(), before);
         willow_pop_roots(1);
         willow_gc_collect();
@@ -524,7 +611,7 @@ mod integration_tests {
             );
             return;
         }
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let mut root = willow_alloc_typed(8, 1);
         let child = willow_alloc(8);
@@ -540,7 +627,12 @@ mod integration_tests {
         let stops = crate::gc_telemetry::stops::snapshot_stops();
         assert_eq!(stops.by_reason[3].requests, 1);
         assert_eq!(stops.by_reason[1].work.swept_objects, 0);
-        assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+        assert_eq!(
+            crate::runtime::current()
+                .mark_phase()
+                .load(Ordering::Acquire),
+            0
+        );
         willow_pop_roots(1);
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
@@ -549,7 +641,7 @@ mod integration_tests {
 
     #[test]
     fn old_cycle_tlab_initial_snapshot_does_not_index_headers() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         let mut tls = tlab_state_for_test();
@@ -588,10 +680,13 @@ pub(super) struct StopDiagnostic {
     pub(super) coordination_hold_ns: u64,
     budget: Option<BudgetDiagnostic>,
 }
-static STOP_DIAGNOSTICS: std::sync::Mutex<std::collections::VecDeque<StopDiagnostic>> =
-    std::sync::Mutex::new(std::collections::VecDeque::new());
-
-pub(super) fn record_stop(reason: u32, start: u64, work_end: u64, unlocked: u64) {
+pub(super) fn record_stop(
+    owner: &GcRuntime,
+    reason: u32,
+    start: u64,
+    work_end: u64,
+    unlocked: u64,
+) {
     let diagnostic = StopDiagnostic {
         reason,
         collector_ns: work_end.saturating_sub(start),
@@ -599,7 +694,7 @@ pub(super) fn record_stop(reason: u32, start: u64, work_end: u64, unlocked: u64)
         coordination_hold_ns: unlocked.saturating_sub(start),
         budget: (reason == 2).then(|| LAST_BUDGET.get()),
     };
-    if crate::diagnostic_settings::GC_LOG.os {
+    if crate::runtime::current().diagnostics.gc_log.os {
         if reason == 2 {
             let budget = diagnostic.budget.expect("remark owns its budget");
             eprintln!(
@@ -625,7 +720,10 @@ pub(super) fn record_stop(reason: u32, start: u64, work_end: u64, unlocked: u64)
             diagnostic.coordination_hold_ns
         );
     }
-    let mut events = STOP_DIAGNOSTICS.lock().unwrap_or_else(|p| p.into_inner());
+    let mut events = owner
+        .stop_diagnostics
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     if events.len() == 64 {
         events.pop_front();
     }
@@ -634,7 +732,12 @@ pub(super) fn record_stop(reason: u32, start: u64, work_end: u64, unlocked: u64)
 
 #[cfg(test)]
 pub(super) fn take_stop_diagnostics() -> Vec<StopDiagnostic> {
-    STOP_DIAGNOSTICS.lock().unwrap().drain(..).collect()
+    super::runtime()
+        .stop_diagnostics
+        .lock()
+        .unwrap()
+        .drain(..)
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -644,14 +747,8 @@ pub(super) struct PreparationDiagnostic {
     pub(super) index_entries: usize,
     pub(super) heap_hold_ns: u64,
 }
-static PREPARATION: std::sync::Mutex<PreparationDiagnostic> =
-    std::sync::Mutex::new(PreparationDiagnostic {
-        bitmap_words: 0,
-        regions: 0,
-        index_entries: 0,
-        heap_hold_ns: 0,
-    });
 pub(super) fn record_preparation(
+    owner: &GcRuntime,
     bitmap_words: usize,
     regions: usize,
     index_entries: usize,
@@ -663,7 +760,7 @@ pub(super) fn record_preparation(
         index_entries,
         heap_hold_ns,
     };
-    if crate::diagnostic_settings::GC_LOG.os {
+    if crate::runtime::current().diagnostics.gc_log.os {
         eprintln!(
             "[gc] concurrent_prepare regions={} index_entries={} bitmap_words={} bitmap_bytes={} heap_hold_ns={}",
             diagnostic.regions,
@@ -673,7 +770,10 @@ pub(super) fn record_preparation(
             diagnostic.heap_hold_ns
         );
     }
-    *PREPARATION.lock().unwrap_or_else(|p| p.into_inner()) = diagnostic;
+    *owner
+        .preparation_diagnostic
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = diagnostic;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -710,5 +810,40 @@ impl Drop for RemarkBudget {
             yields: self.yields,
             regions: self.regions,
         });
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_owner_tests {
+    use super::*;
+
+    #[test]
+    fn private_collectors_keep_stop_history_and_preparation_independent() {
+        let first = GcRuntime::default();
+        let second = GcRuntime::default();
+        std::thread::scope(|scope| {
+            for (owner, count) in [(&first, 20), (&second, 80)] {
+                scope.spawn(crate::runtime::serving(move || {
+                    for index in 0..count {
+                        record_stop(owner, 1, 0, index, index + 1);
+                        record_preparation(owner, index as usize, count as usize, 7, index);
+                    }
+                }));
+            }
+        });
+        for (owner, count) in [(&first, 20), (&second, 80)] {
+            let history = owner.stop_diagnostics.lock().unwrap();
+            assert_eq!(history.len(), count.min(64));
+            assert_eq!(
+                history.front().unwrap().collector_ns,
+                count.saturating_sub(64) as u64
+            );
+            assert_eq!(history.back().unwrap().collector_ns, (count - 1) as u64);
+            let preparation = owner.preparation_diagnostic.lock().unwrap();
+            assert_eq!(preparation.regions, count);
+            assert_eq!(preparation.bitmap_words, count - 1);
+        }
+        first.stop_diagnostics.lock().unwrap().clear();
+        assert_eq!(second.stop_diagnostics.lock().unwrap().len(), 64);
     }
 }

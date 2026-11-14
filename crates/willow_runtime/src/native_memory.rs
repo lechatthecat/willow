@@ -8,9 +8,44 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::{LockResult, PoisonError, TryLockError, TryLockResult};
 
+pub(crate) trait ObserveReconciliation {
+    fn record(&self);
+}
+
+#[cfg(not(test))]
+#[derive(Debug, Default)]
+pub(crate) struct ReconciliationObservation {
+    _disabled: (),
+}
+#[cfg(not(test))]
+impl ObserveReconciliation for ReconciliationObservation {
+    fn record(&self) {}
+}
 #[cfg(test)]
-thread_local! {
-    static RECONCILIATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+pub(crate) type ReconciliationObservation = std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+impl ObserveReconciliation for ReconciliationObservation {
+    fn record(&self) {
+        self.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(test))]
+type ReconciliationHandle = ReconciliationObservation;
+#[cfg(test)]
+#[derive(Debug)]
+struct ReconciliationHandle(&'static ReconciliationObservation);
+#[cfg(test)]
+impl Default for ReconciliationHandle {
+    fn default() -> Self {
+        Self(crate::gc::native_reconciliation_observation())
+    }
+}
+#[cfg(test)]
+impl ObserveReconciliation for ReconciliationHandle {
+    fn record(&self) {
+        self.0.record();
+    }
 }
 
 pub(crate) trait Footprint {
@@ -52,29 +87,41 @@ struct Owner<T: Footprint> {
     value: T,
     base: usize,
     charge: Charge,
+    observation: ReconciliationHandle,
 }
 impl<T: Footprint> Owner<T> {
     fn reconcile(&mut self) {
-        #[cfg(test)]
-        RECONCILIATIONS.set(RECONCILIATIONS.get() + 1);
+        self.observation.record();
         let bytes = self
             .base
             .checked_add(self.value.native_bytes())
             .unwrap_or_else(|| {
                 crate::failure::resource_exhausted(format_args!("native capacity overflow"))
             });
-        // Hash owners retain per-table high water marks in their Footprint;
-        // exact buffers can release their charge after a real shrink.
-        if bytes > self.charge.0 {
-            crate::gc::charge_external(bytes - self.charge.0);
-        } else if bytes < self.charge.0 {
-            crate::gc::release_external(self.charge.0 - bytes);
+        if bytes != self.charge.0 {
+            self.charge.recharge(bytes);
         }
-        self.charge.0 = bytes;
     }
 }
 #[derive(Debug)]
 struct Charge(usize);
+impl Charge {
+    /// Most guarded mutations leave the footprint unchanged. Keeping the
+    /// runtime accounting update out of line keeps that common reconcile a
+    /// short leaf instead of carrying the accounting path's register spills.
+    #[cold]
+    #[inline(never)]
+    fn recharge(&mut self, bytes: usize) {
+        // Hash owners retain per-table high water marks in their Footprint;
+        // exact buffers can release their charge after a real shrink.
+        if bytes > self.0 {
+            crate::gc::charge_external(bytes - self.0);
+        } else {
+            crate::gc::release_external(self.0 - bytes);
+        }
+        self.0 = bytes;
+    }
+}
 impl Drop for Charge {
     fn drop(&mut self) {
         crate::gc::release_external(self.0);
@@ -92,6 +139,7 @@ impl<T: Footprint> Mutex<T> {
             value,
             base,
             charge: Charge(0),
+            observation: ReconciliationHandle::default(),
         };
         owner.reconcile();
         Self(std::sync::Mutex::new(owner))
@@ -142,6 +190,7 @@ impl<T: Footprint> Local<T> {
             value,
             base: 0,
             charge: Charge(0),
+            observation: ReconciliationHandle::default(),
         };
         owner.reconcile();
         Self(std::cell::RefCell::new(owner))
@@ -198,7 +247,7 @@ mod tests {
 
     #[test]
     fn accounting_visits_once_per_guard_independent_of_buffer_length() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         let baseline = crate::gc_telemetry::external_bytes();
         for count in [1, 32, 1024] {
@@ -229,7 +278,7 @@ mod tests {
 
     #[test]
     fn poisoned_guard_accounts_growth_and_drop_releases_it() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         let baseline = crate::gc_telemetry::external_bytes();
         let buffer = Mutex::new(Buffer {
@@ -252,7 +301,7 @@ mod tests {
 
     #[test]
     fn parallel_owners_reconcile_without_lost_updates() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         let baseline = crate::gc_telemetry::external_bytes();
         let owners: Vec<_> = (0..8)
@@ -265,11 +314,11 @@ mod tests {
             .collect();
         std::thread::scope(|scope| {
             for owner in &owners {
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     for value in 0..1024 {
                         owner.lock().unwrap().values.push(value);
                     }
-                });
+                }));
             }
         });
         assert_eq!(
@@ -310,7 +359,7 @@ mod tests {
 
     #[test]
     fn shrink_and_unwind_release_only_freed_capacity() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         let baseline = crate::gc_telemetry::external_bytes();
         let buffer = Mutex::with_base(
@@ -341,12 +390,12 @@ mod tests {
 
     #[test]
     fn increasing_channel_counts_have_linear_accounting_and_balanced_lifetimes() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         for reset in [false, true] {
             for count in [1, 32, 1024] {
                 crate::gc::willow_gc_init();
                 let baseline = crate::gc_telemetry::external_bytes();
-                RECONCILIATIONS.set(0);
+                crate::gc::native_reconciliation_observation().store(0, Ordering::Relaxed);
                 let mut roots = Vec::new();
                 let mut per_channel = 0;
                 for _ in 0..count {
@@ -363,10 +412,13 @@ mod tests {
                     count as u64 * per_channel
                 );
                 // Construction and one send each: no scan over prior channels.
-                assert_eq!(RECONCILIATIONS.get(), 2 * count);
+                assert_eq!(
+                    crate::gc::native_reconciliation_observation().load(Ordering::Relaxed),
+                    2 * count
+                );
                 println!(
                     "native channels={count} reconciliations={} requested_bytes={} reset={reset}",
-                    RECONCILIATIONS.get(),
+                    crate::gc::native_reconciliation_observation().load(Ordering::Relaxed),
                     count as u64 * per_channel
                 );
                 drop(roots);

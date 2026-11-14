@@ -31,7 +31,6 @@ pub(crate) struct ChannelOwnershipToken {
 
 // Generation is deliberately excluded: one live generation per channel/role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), derive(Hash))]
 struct ChannelOwnershipKey(usize, ChannelRole);
 
 impl ChannelOwnershipToken {
@@ -41,15 +40,15 @@ impl ChannelOwnershipToken {
 }
 
 #[cfg(test)]
-thread_local! {
-    static CHANNEL_OWNERSHIP_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static CHANNEL_OWNERSHIP_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
+const CHANNEL_OWNERSHIP_HASHES: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::ChannelOwnershipHashes);
 #[cfg(test)]
+const CHANNEL_OWNERSHIP_SCANS: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::ChannelOwnershipScans);
+
 impl std::hash::Hash for ChannelOwnershipKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        CHANNEL_OWNERSHIP_HASHES.with(|count| count.set(count.get() + 1));
+        crate::observation::record(crate::observation::Event::ChannelOwnershipHashes, 1);
         std::hash::Hash::hash(&(self.0, self.1), state);
     }
 }
@@ -152,8 +151,7 @@ impl TaskWaitLinks {
         match &self.channel_ownership_index {
             Some(index) => index.get(&key).copied(),
             None => self.wait_channels.iter().position(|token| {
-                #[cfg(test)]
-                CHANNEL_OWNERSHIP_SCANS.with(|count| count.set(count.get() + 1));
+                crate::observation::record(crate::observation::Event::ChannelOwnershipScans, 1);
                 token.key() == key
             }),
         }

@@ -68,6 +68,20 @@ pub(super) struct SweepState {
     pub(super) phase: SweepPhase,
 }
 
+trait AllocationObservation {
+    fn attempt(&mut self) {}
+    fn cleared(&mut self, _bytes: usize) {}
+}
+#[derive(Default)]
+pub(super) struct NoAllocationObservation {
+    _private: (),
+}
+impl AllocationObservation for NoAllocationObservation {}
+#[cfg(not(test))]
+type RegionAllocationObservation = NoAllocationObservation;
+#[cfg(test)]
+type RegionAllocationObservation = zero_initialization_tests::AllocationCounts;
+
 /// Metadata for one regular or large-object old-generation region.
 ///
 /// Invariants:
@@ -95,10 +109,7 @@ pub(super) struct OldRegion {
     pub(super) sweep_quarantined: bool,
     /// Active per-thread old allocation buffers carved from this region.
     pub(super) active_labs: usize,
-    #[cfg(test)]
-    pub(super) allocation_attempts: usize,
-    #[cfg(test)]
-    cleared_bytes: usize,
+    pub(super) observation: RegionAllocationObservation,
     pub(super) mark_bitmap: RegionMarkBitmap,
     pub(super) concurrent_marks: Arc<concurrent_bitmap::ConcurrentMarkBits>,
 }
@@ -106,6 +117,7 @@ pub(super) struct OldRegion {
 /// Shared indexed storage for mutator TLABs and collector-only survivor chunks.
 /// Survivor chunks never have an owner_state and are never refilled by mutators.
 pub(super) struct BumpChunk {
+    pub(super) lookup_comparisons: crate::observation::Value<std::sync::atomic::AtomicUsize>,
     pub(super) base: *mut u8,
     pub(super) capacity: usize,
     /// Allocated prefix in bytes. For an active chunk this is refreshed from
@@ -155,10 +167,14 @@ impl RegionMarkBitmap {
 }
 
 impl OldRegion {
-    pub(super) fn new(kind: RegionKind, capacity: usize) -> Option<Self> {
+    pub(super) fn new(
+        allocator: &RuntimeStorageAllocator,
+        kind: RegionKind,
+        capacity: usize,
+    ) -> Option<Self> {
         let layout = Layout::from_size_align(capacity, std::mem::align_of::<GcHeader>()).ok()?;
         // SAFETY: `layout` is nonzero, aligned, and owned by the returned region.
-        let base = unsafe { allocate_region_storage(layout) };
+        let base = unsafe { allocate_region_storage(allocator, layout) };
         if base.is_null() {
             return None;
         }
@@ -205,10 +221,7 @@ impl OldRegion {
             reusable_after_epoch: 0,
             sweep_quarantined: false,
             active_labs: 0,
-            #[cfg(test)]
-            allocation_attempts: 0,
-            #[cfg(test)]
-            cleared_bytes: 0,
+            observation: RegionAllocationObservation::default(),
             mark_bitmap: RegionMarkBitmap::new(bitmap_capacity),
             concurrent_marks: Arc::new(concurrent_bitmap::ConcurrentMarkBits::new(
                 bitmap_capacity.div_ceil(GC_REGION_MARK_GRANULE),
@@ -257,10 +270,13 @@ impl OldRegion {
         source: Option<HeapObject>,
     ) -> Option<(HeapObject, bool)> {
         self.allocate_object_for_move_buffered(
-            type_id,
-            layout_id,
-            gc_ref_mask,
-            payload_size,
+            crate::runtime::current().mark_phase(),
+            raw_heap::TraceMetadata {
+                type_id,
+                layout_id,
+                gc_ref_mask,
+                payload_size,
+            },
             source,
             None,
         )
@@ -272,21 +288,22 @@ impl OldRegion {
     /// only stopped minor evacuation supplies one.
     pub(super) fn allocate_object_for_move_buffered(
         &mut self,
-        type_id: u32,
-        layout_id: u64,
-        gc_ref_mask: u64,
-        payload_size: usize,
+        phase: &std::sync::atomic::AtomicU8,
+        metadata: raw_heap::TraceMetadata,
         source: Option<HeapObject>,
         pending: Option<&mut Vec<(usize, usize)>>,
     ) -> Option<(HeapObject, bool)> {
+        let raw_heap::TraceMetadata {
+            type_id,
+            layout_id,
+            gc_ref_mask,
+            payload_size,
+        } = metadata;
         assert!(
             !self.sweep_quarantined,
             "reclaimed spans are not reusable before sweep completion"
         );
-        #[cfg(test)]
-        {
-            self.allocation_attempts += 1;
-        }
+        self.observation.attempt();
         let total_size = GC_HEADER_SIZE.checked_add(payload_size)?;
         let span_size = total_size.checked_next_multiple_of(GC_REGION_MARK_GRANULE)?;
         // The sweep-built index preserves address-ordered first fit without
@@ -317,10 +334,7 @@ impl OldRegion {
         // Every later allocation clears its span, even after used returns to 0.
         if source.is_none() && !self.pristine {
             unsafe { std::ptr::write_bytes(raw, 0, span_size) };
-            #[cfg(test)]
-            {
-                self.cleared_bytes += span_size;
-            }
+            self.observation.cleared(span_size);
         }
         self.pristine = false;
         let object = if let Some(source) = source {
@@ -345,7 +359,7 @@ impl OldRegion {
         self.live_bytes = self.live_bytes.saturating_add(total_size);
         // Header initialization and black color precede publishing the start bit.
         // An epoch reader that observes the start may safely read immutable metadata.
-        if GC_MARK_PHASE.load(Ordering::Acquire) != 0 {
+        if phase.load(Ordering::Acquire) != 0 {
             if source.is_some() {
                 self.concurrent_marks
                     .set_stopped(offset / GC_REGION_MARK_GRANULE);
@@ -371,16 +385,14 @@ impl OldRegion {
     #[inline]
     pub(super) fn allocate_fresh_promotion(
         &mut self,
+        phase: &std::sync::atomic::AtomicU8,
         source: HeapObject,
         size: usize,
         pending: &mut Vec<(usize, usize)>,
     ) -> Option<HeapObject> {
         debug_assert!(!self.sweep_quarantined && !self.sweep_pending);
         debug_assert_eq!(self.largest_free_span, 0);
-        #[cfg(test)]
-        {
-            self.allocation_attempts += 1;
-        }
+        self.observation.attempt();
         debug_assert_eq!(size, source.size());
         debug_assert!(size.is_multiple_of(GC_REGION_MARK_GRANULE));
         if size > self.capacity - self.used {
@@ -397,7 +409,7 @@ impl OldRegion {
         self.used += size;
         self.live_bytes += size;
         pending.push((offset, size));
-        if GC_MARK_PHASE.load(Ordering::Acquire) != 0 {
+        if phase.load(Ordering::Acquire) != 0 {
             self.concurrent_marks
                 .set_stopped(offset / GC_REGION_MARK_GRANULE);
         }
@@ -530,41 +542,24 @@ impl OldRegion {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    pub(super) static STORAGE_FAILURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    pub(super) static STORAGE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    pub(super) static ZEROED_STORAGE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+/// Allocate validated region storage through its collector's allocator owner.
+/// # Safety
+/// Layout must be nonzero; the caller owns successful storage until deallocation.
+pub(super) unsafe fn allocate_region_storage(
+    allocator: &RuntimeStorageAllocator,
+    layout: Layout,
+) -> *mut u8 {
+    unsafe { allocator.allocate::<true>(layout) }
 }
 
-/// Allocate a validated, nonzero region layout. The test hook injects actual
-/// storage failures without affecting Rust metadata allocations or other threads.
-pub(super) unsafe fn allocate_region_storage(layout: Layout) -> *mut u8 {
-    unsafe { allocate_storage::<true>(layout) }
-}
-
-/// Evacuation overwrites each header and payload before publication. Unused
-/// reserve capacity is never inspected, so it need not be zero-filled.
-pub(super) unsafe fn allocate_survivor_storage(layout: Layout) -> *mut u8 {
-    unsafe { allocate_storage::<false>(layout) }
-}
-
-unsafe fn allocate_storage<const ZEROED: bool>(layout: Layout) -> *mut u8 {
-    #[cfg(test)]
-    {
-        STORAGE_ATTEMPTS.set(STORAGE_ATTEMPTS.get() + 1);
-        if STORAGE_FAILURES.get() != 0 {
-            STORAGE_FAILURES.set(STORAGE_FAILURES.get() - 1);
-            return std::ptr::null_mut();
-        }
-    }
-    if ZEROED {
-        #[cfg(test)]
-        ZEROED_STORAGE_BYTES.set(ZEROED_STORAGE_BYTES.get() + layout.size());
-        unsafe { alloc_zeroed(layout) }
-    } else {
-        unsafe { std::alloc::alloc(layout) }
-    }
+/// Evacuation overwrites published headers/payloads; unused capacity stays opaque.
+/// # Safety
+/// As for allocate_region_storage; the caller initializes bytes before reading them.
+pub(super) unsafe fn allocate_survivor_storage(
+    allocator: &RuntimeStorageAllocator,
+    layout: Layout,
+) -> *mut u8 {
+    unsafe { allocator.allocate::<false>(layout) }
 }
 
 impl Drop for OldRegion {
@@ -586,6 +581,20 @@ impl Drop for OldRegion {
 mod zero_initialization_tests {
     use super::*;
 
+    #[derive(Default)]
+    pub(crate) struct AllocationCounts {
+        pub(crate) allocation_attempts: usize,
+        pub(crate) cleared_bytes: usize,
+    }
+    impl AllocationObservation for AllocationCounts {
+        fn attempt(&mut self) {
+            self.allocation_attempts += 1;
+        }
+        fn cleared(&mut self, bytes: usize) {
+            self.cleared_bytes += bytes;
+        }
+    }
+
     fn assert_zero(object: HeapObject, bytes: usize) {
         let payload = unsafe { std::slice::from_raw_parts(object.payload().as_ptr(), bytes) };
         assert!(payload.iter().all(|byte| *byte == 0));
@@ -593,15 +602,16 @@ mod zero_initialization_tests {
 
     #[test]
     fn fresh_and_reused_regions_preserve_zero_initialization() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for kind in [RegionKind::Old, RegionKind::LargeObject] {
             for bytes in [0, 8, 64, 512, 4096, 65536] {
-                let mut region = OldRegion::new(kind, 131072).unwrap();
+                let mut region =
+                    OldRegion::new(&RuntimeStorageAllocator::default(), kind, 131072).unwrap();
                 assert!(region.pristine);
                 let (first, _) = region.allocate_object(0, 0, 0, bytes).unwrap();
                 assert!(!region.pristine);
                 assert_zero(first, bytes);
-                assert_eq!(region.cleared_bytes, 0);
+                assert_eq!(region.observation.cleared_bytes, 0);
                 unsafe { std::ptr::write_bytes(first.payload().as_ptr(), 0xa5, bytes) };
                 region.release_object(first);
                 assert_eq!(region.used, 0);
@@ -612,12 +622,12 @@ mod zero_initialization_tests {
                 let (second, _) = region.allocate_object(0, 0, 0, bytes).unwrap();
                 assert_zero(second, bytes);
                 assert_eq!(
-                    region.cleared_bytes,
+                    region.observation.cleared_bytes,
                     (GC_HEADER_SIZE + bytes).next_multiple_of(GC_REGION_MARK_GRANULE)
                 );
                 println!(
                     "kind={kind:?} bytes={bytes} fresh_clear_bytes=0 reused_clear_bytes={}",
-                    region.cleared_bytes
+                    region.observation.cleared_bytes
                 );
             }
         }
@@ -626,7 +636,8 @@ mod zero_initialization_tests {
     #[test]
     fn released_storage_reuse_clears_every_allocation() {
         for kind in [RegionKind::Old, RegionKind::LargeObject] {
-            let mut released = OldRegion::new(kind, 4096).unwrap();
+            let mut released =
+                OldRegion::new(&RuntimeStorageAllocator::default(), kind, 4096).unwrap();
             let base = released.take_storage();
             drop(released);
             unsafe { std::ptr::write_bytes(base, 0xa5, 4096) };
@@ -637,14 +648,15 @@ mod zero_initialization_tests {
             let bytes = 4096 - GC_HEADER_SIZE;
             let (object, _) = region.allocate_object(0, 0, 0, bytes).unwrap();
             assert_zero(object, bytes);
-            assert_eq!(region.cleared_bytes, 4096);
+            assert_eq!(region.observation.cleared_bytes, 4096);
         }
     }
 
     #[test]
     fn reclaimed_middle_hole_is_cleared() {
-        let _guard = runtime_test_guard();
-        let mut region = OldRegion::new(RegionKind::Old, 4096).unwrap();
+        let _guard = isolated_runtime();
+        let mut region =
+            OldRegion::new(&RuntimeStorageAllocator::default(), RegionKind::Old, 4096).unwrap();
         let (first, _) = region.allocate_object(0, 0, 0, 64).unwrap();
         let (_last, _) = region.allocate_object(0, 0, 0, 64).unwrap();
         unsafe { std::ptr::write_bytes(first.payload().as_ptr(), 0xa5, 64) };
@@ -656,8 +668,9 @@ mod zero_initialization_tests {
 
     #[test]
     fn lab_carving_and_promotion_consume_pristine_state() {
-        let _guard = runtime_test_guard();
-        let mut carved = OldRegion::new(RegionKind::Old, 4096).unwrap();
+        let _guard = isolated_runtime();
+        let mut carved =
+            OldRegion::new(&RuntimeStorageAllocator::default(), RegionKind::Old, 4096).unwrap();
         assert!(carved.carve(4096, 4096).is_some());
         assert!(!carved.pristine);
         // Model a dirty retired LAB whose whole span became the bump tail.
@@ -666,15 +679,22 @@ mod zero_initialization_tests {
         let (object, _) = carved.allocate_object(0, 0, 0, 64).unwrap();
         assert_zero(object, 64);
 
-        let mut source_region = OldRegion::new(RegionKind::Old, 4096).unwrap();
+        let mut source_region =
+            OldRegion::new(&RuntimeStorageAllocator::default(), RegionKind::Old, 4096).unwrap();
         let (source, _) = source_region.allocate_object(0, 0, 0, 64).unwrap();
         unsafe { std::ptr::write_bytes(source.payload().as_ptr(), 0xa5, 64) };
         for buffered in [false, true] {
-            let mut destination = OldRegion::new(RegionKind::Old, 4096).unwrap();
+            let mut destination =
+                OldRegion::new(&RuntimeStorageAllocator::default(), RegionKind::Old, 4096).unwrap();
             let copied = if buffered {
                 let mut pending = Vec::new();
                 let copied = destination
-                    .allocate_fresh_promotion(source, source.size(), &mut pending)
+                    .allocate_fresh_promotion(
+                        crate::runtime::current().mark_phase(),
+                        source,
+                        source.size(),
+                        &mut pending,
+                    )
                     .unwrap();
                 destination.allocations.extend(pending);
                 copied

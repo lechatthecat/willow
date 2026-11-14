@@ -111,11 +111,10 @@ unsafe fn snapshot_array_ref_slice(
     }
 }
 
-/// Register the ref-buffer trace. Called on every reference-buffer allocation
-/// (idempotent): `willow_gc_init` clears the type registry, so a process-global
-/// `Once` would fail to re-register after the first reset (e.g. in multi-init
-/// test runs). Real programs init once, so the repeated insert is harmless.
-static ARRAY_REGISTRATION: crate::gc::NativeGcRegistration = crate::gc::NativeGcRegistration::new();
+/// Register the ref-buffer trace once per owning collector's registry generation.
+/// `willow_gc_init` invalidates registration, so the next allocation reinstalls
+/// the hook after a reset; warmed allocations only check the generation.
+const ARRAY_REGISTRATION: crate::gc::NativeGcRegistration = crate::gc::NativeGcRegistration::Array;
 const ARRAY_GC_TYPES: &[crate::gc::NativeGcType] =
     &[
         crate::gc::NativeGcType::new(ARRAY_REF_TYPE_ID, Some(trace_array_ref), None)
@@ -907,7 +906,7 @@ pub extern "C" fn willow_array_to_string(arr: *mut u8, elem_kind: i64) -> *mut u
 mod tests {
     use super::*;
     use crate::gc::{
-        runtime_test_guard, willow_gc_collect, willow_gc_init, willow_pop_roots, willow_push_root,
+        isolated_runtime, willow_gc_collect, willow_gc_init, willow_pop_roots, willow_push_root,
     };
     use crate::string::{willow_string_as_str, willow_string_from_str};
 
@@ -953,7 +952,7 @@ mod tests {
 
     #[test]
     fn array_shared_layout_matches_allocated_payload() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let array = willow_array_new(3, 0);
         willow_array_push(array, 42);
@@ -985,7 +984,7 @@ mod tests {
 
     #[test]
     fn array_unit_01_new_sets_length() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let arr = willow_array_new(3, 0);
         assert!(!arr.is_null());
@@ -994,7 +993,7 @@ mod tests {
 
     #[test]
     fn array_unit_02_zero_length_array() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let arr = willow_array_new(0, 0);
         assert_eq!(willow_array_len(arr), 0);
@@ -1002,7 +1001,7 @@ mod tests {
 
     #[test]
     fn array_unit_03_scalar_get_set_roundtrip() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let arr = willow_array_new(4, 0);
         willow_array_set(arr, 0, 10);
@@ -1017,7 +1016,7 @@ mod tests {
 
     #[test]
     fn array_unit_04_reference_elements_roundtrip() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         // Root the array as generated code would (Array is GC-managed): the
         // string allocation below can trigger a collection under GC stress.
@@ -1032,7 +1031,7 @@ mod tests {
 
     #[test]
     fn array_unit_05_reference_elements_survive_collection_when_rooted() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let mut arr = willow_array_new(1, 1);
         // Root the array slot so the collector can reach it.
@@ -1051,7 +1050,7 @@ mod tests {
 
     #[test]
     fn array_unit_06_large_reference_array_traces_all_elements() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         // More than 64 elements: exercises the trace function, not gc_ref_mask.
         let n = 100i64;
@@ -1071,7 +1070,7 @@ mod tests {
 
     #[test]
     fn array_unit_07_push_grows_and_reads() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let arr = willow_array_new(0, 0);
         assert_eq!(willow_array_len(arr), 0);
@@ -1085,7 +1084,7 @@ mod tests {
 
     #[test]
     fn array_unit_08_pop_returns_last_and_shrinks() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let arr = willow_array_new(0, 0);
         willow_array_push(arr, 1);
@@ -1099,7 +1098,7 @@ mod tests {
 
     #[test]
     fn array_unit_09_pushed_reference_values_survive_gc_across_growth() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let mut arr = willow_array_new(0, 1);
         willow_push_root(&mut arr as *mut *mut u8);
@@ -1126,7 +1125,7 @@ mod tests {
     // popped slots stay traced but hold null.
     #[test]
     fn array_trace_work_is_bounded_by_high_water_after_pop_and_regrowth() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         for capacity in [16, 256, 4096] {
             let mut arr = willow_array_new(capacity, 1);
@@ -1176,7 +1175,7 @@ mod tests {
 
     #[test]
     fn array_trace_preserves_captured_reference_buffer_after_growth() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let mut arr = willow_array_new(1, 1);
         willow_push_root(&mut arr);
@@ -1201,7 +1200,7 @@ mod tests {
 
     #[test]
     fn array_snapshot_length_publication_during_push_pop() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let mut arr = willow_array_new(256, 1);
         willow_push_root(&mut arr);
@@ -1215,7 +1214,7 @@ mod tests {
         let start = std::sync::Barrier::new(2);
         // No allocations/collections while the reader borrows this buffer.
         std::thread::scope(|scope| {
-            let reader = scope.spawn(|| {
+            let reader = scope.spawn(crate::runtime::serving(|| {
                 start.wait();
                 let mut children = Vec::new();
                 for _ in 0..4096 {
@@ -1228,7 +1227,7 @@ mod tests {
                             .all(|child| child.is_null() || *child as usize == expected)
                     );
                 }
-            });
+            }));
             start.wait();
             for _ in 0..16 {
                 for _ in 0..256 {
@@ -1250,7 +1249,7 @@ mod tests {
     // under GC stress). Stress mode forces a collection on every allocation.
     #[test]
     fn array_unit_10_scalar_push_grow_under_gc_stress() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let mut arr = willow_array_new(0, 0); // scalar (non-reference) array
         willow_push_root(&mut arr as *mut *mut u8);
@@ -1270,7 +1269,7 @@ mod tests {
 
     #[test]
     fn array_copy_and_reference_growth_keep_temporary_roots_under_gc_stress() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let mut arr = willow_array_new(0, 1);
         willow_push_root(&mut arr);
@@ -1310,7 +1309,7 @@ mod tests {
     #[test]
     fn minor_contiguous_range_requires_the_builtin_trace_registration() {
         unsafe fn replacement(_: *mut u8, _: &mut Vec<*mut *mut u8>) {}
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         for count in [1, 32, 10_000] {
             let mut array = willow_array_new(count, 1);
@@ -1333,7 +1332,7 @@ mod tests {
 
     #[test]
     fn owned_pair_growth_transfers_only_unexposed_storage() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for count in [4i64, 16, 1024] {
             willow_gc_init();
             let mut arr = willow_array_new(0, 1);
@@ -1388,7 +1387,7 @@ mod tests {
 
     #[test]
     fn interface_pair_copies_use_tlab_and_preserve_moving_references() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let _owner = crate::gc::RuntimeTlabOwner::enter();
         let mut source = interface_pair_for_test("retained", 1234);
@@ -1426,7 +1425,7 @@ mod tests {
 
     #[test]
     fn interface_pair_copy_and_growth_preserve_tracing_and_independent_storage() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         for count in [1, 16, 64] {
             let mut arr = willow_array_new(count, 1);
@@ -1475,7 +1474,7 @@ mod tests {
 
     #[test]
     fn interface_pair_pop_reuse_clears_edges_and_preserves_storage() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let mut arr = willow_array_new(1, 1);
         willow_push_root(&mut arr);
@@ -1523,7 +1522,7 @@ mod tests {
 
     #[test]
     fn scalar_pair_freeze_copies_boxes_and_survives_gc_stress() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let mut arr = willow_array_new(4, 1);
         willow_push_root(&mut arr);
@@ -1560,7 +1559,7 @@ mod tests {
 
     #[test]
     fn scalar_pair_growth_copies_each_element_once_and_preserves_old_buffer() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         for count in [1, 16, 128] {
             let mut arr = willow_array_new(count, 1);
@@ -1614,7 +1613,7 @@ mod tests {
 
     #[test]
     fn scalar_pair_pop_reuse_preserves_storage_and_tracing() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         for count in [1, 16, 128] {
             let mut arr = willow_array_new(count, 1);
@@ -1685,7 +1684,7 @@ mod tests {
     #[test]
     fn scalar_pair_pop_errors_initialize_output_without_losing_roots() {
         use crate::panic_context::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(905))));
         let depth = crate::gc::willow_root_depth();
@@ -1711,7 +1710,7 @@ mod tests {
     #[test]
     fn scalar_pair_freeze_null_preserves_root_depth_and_raises() {
         use crate::panic_context::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(904))));
         let depth = crate::gc::willow_root_depth();
@@ -1732,7 +1731,7 @@ mod tests {
     #[test]
     fn array_len_raises_for_null_and_negative_lengths() {
         use crate::panic_context::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(906))));
         let arr = willow_array_new(2, 0);
@@ -1761,7 +1760,7 @@ mod tests {
     #[test]
     fn array_null_push_preserves_error_and_root_depth() {
         use crate::panic_context::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(903))));
         let depth = crate::gc::willow_root_depth();
@@ -1784,7 +1783,7 @@ mod tests {
     #[test]
     fn array_allocation_overflow_preserves_state_and_roots() {
         use crate::panic_context::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(902))));
         for (is_ref, nonnull_value) in [(false, false), (true, false), (true, true)] {

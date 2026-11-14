@@ -5,12 +5,12 @@ use std::time::Duration;
 
 #[test]
 fn idle_roots_survive_minor_major_and_relocation() {
-    let _test = runtime_test_guard();
+    let _test = isolated_runtime();
     for relocate in [false, true] {
         reset_internal_for_test();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
+        let worker = std::thread::spawn(crate::runtime::serving(move || {
             let mutator = MutatorRegistration::new();
             let mut tls = tlab_state_for_test();
             let mut root = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
@@ -30,7 +30,7 @@ fn idle_roots_survive_minor_major_and_relocation() {
             drop(relocation);
             willow_pop_roots(1);
             drop(mutator);
-        });
+        }));
         let (id, before) = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         with_stw(crate::gc_telemetry::stops::StopReason::Minor, |coord, _| {
             assert!(coord.parked.contains(&id));
@@ -52,13 +52,13 @@ fn idle_roots_survive_minor_major_and_relocation() {
 
 #[test]
 fn idle_publication_is_reused_across_increasing_stop_counts_and_root_counts() {
-    let _test = runtime_test_guard();
+    let _test = isolated_runtime();
     for roots in [0, 1, 64, 1024] {
         for cycles in [1, 8, 64] {
             reset_internal_for_test();
             let (ready_tx, ready_rx) = mpsc::channel();
             let (resume_tx, resume_rx) = mpsc::channel();
-            let worker = std::thread::spawn(move || {
+            let worker = std::thread::spawn(crate::runtime::serving(move || {
                 let mutator = MutatorRegistration::new();
                 let mut slots = vec![willow_alloc_object(0, 8); roots];
                 for slot in &mut slots {
@@ -71,7 +71,7 @@ fn idle_publication_is_reused_across_increasing_stop_counts_and_root_counts() {
                 drop(idle);
                 willow_pop_roots(roots as i32);
                 drop(mutator);
-            });
+            }));
             let id = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             let mut publication = None;
             let notifications = (
@@ -102,13 +102,13 @@ fn idle_publication_is_reused_across_increasing_stop_counts_and_root_counts() {
 
 #[test]
 fn idle_resume_waits_for_active_stop() {
-    let _test = runtime_test_guard();
+    let _test = isolated_runtime();
     reset_internal_for_test();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
     let (dropping_tx, dropping_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
+    let worker = std::thread::spawn(crate::runtime::serving(move || {
         let _mutator = MutatorRegistration::new();
         // SAFETY: native channel synchronization only until drop.
         let idle = unsafe { IdleMutator::enter() };
@@ -117,7 +117,7 @@ fn idle_resume_waits_for_active_stop() {
         dropping_tx.send(()).unwrap();
         drop(idle);
         done_tx.send(()).unwrap();
-    });
+    }));
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     with_stw(crate::gc_telemetry::stops::StopReason::Minor, |_, _| {
         resume_tx.send(()).unwrap();
@@ -134,11 +134,11 @@ fn idle_resume_waits_for_active_stop() {
 
 #[test]
 fn idle_entry_acknowledges_an_already_requested_stop() {
-    let _test = runtime_test_guard();
+    let _test = isolated_runtime();
     reset_internal_for_test();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
+    let worker = std::thread::spawn(crate::runtime::serving(move || {
         let _mutator = MutatorRegistration::new();
         ready_tx.send(()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -149,7 +149,7 @@ fn idle_entry_acknowledges_an_already_requested_stop() {
         // SAFETY: no managed access after publishing the stop acknowledgement.
         let _idle = unsafe { IdleMutator::enter() };
         resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    });
+    }));
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     with_stw(crate::gc_telemetry::stops::StopReason::Minor, |coord, _| {
         assert_eq!(coord.parked.len(), 1);
@@ -162,7 +162,7 @@ fn idle_entry_acknowledges_an_already_requested_stop() {
 
 #[test]
 fn idle_unregistered_and_unwind_paths_release_ownership() {
-    let _test = runtime_test_guard();
+    let _test = isolated_runtime();
     reset_internal_for_test();
     // SAFETY: no managed access occurs in this empty interval.
     drop(unsafe { IdleMutator::enter() });
@@ -180,12 +180,12 @@ fn idle_unregistered_and_unwind_paths_release_ownership() {
 
 #[test]
 fn idle_entry_reads_no_roots_at_any_depth_until_a_stop() {
-    let _test = runtime_test_guard();
+    let _test = isolated_runtime();
     for roots in [0, 1, 64, 1024, 65536] {
         reset_internal_for_test();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
+        let worker = std::thread::spawn(crate::runtime::serving(move || {
             let mutator = MutatorRegistration::new();
             let mut slots = vec![willow_alloc_object(0, 8); roots];
             for slot in &mut slots {
@@ -202,7 +202,7 @@ fn idle_entry_reads_no_roots_at_any_depth_until_a_stop() {
             drop(coord);
             willow_pop_roots(roots as i32);
             drop(mutator);
-        });
+        }));
         let id = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         {
             let coord = runtime().coord.0.lock().unwrap();
@@ -238,7 +238,7 @@ fn assert_blocked_call_leaves_collections_running(
     reset_internal_for_test();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
+    let worker = std::thread::spawn(crate::runtime::serving(move || {
         let mutator = MutatorRegistration::new();
         let mut tls = tlab_state_for_test();
         let mut root = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
@@ -256,7 +256,7 @@ fn assert_blocked_call_leaves_collections_running(
         drop(relocation);
         willow_pop_roots(1);
         drop(mutator);
-    });
+    }));
     let (id, before) = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     wait_until_parked(id);
     with_stw(crate::gc_telemetry::stops::StopReason::Minor, |coord, _| {
@@ -279,7 +279,7 @@ fn assert_blocked_call_leaves_collections_running(
 
 #[test]
 fn blocked_sync_call_leaves_collections_running_and_parks_on_return() {
-    let _test = runtime_test_guard();
+    let _test = isolated_runtime();
     for relocate in [false, true] {
         let (release_tx, release_rx) = mpsc::channel::<()>();
         assert_blocked_call_leaves_collections_running(
@@ -297,7 +297,7 @@ fn blocked_sync_call_leaves_collections_running_and_parks_on_return() {
 
 #[test]
 fn blocked_foreign_region_leaves_collections_running_and_parks_on_return() {
-    let _test = runtime_test_guard();
+    let _test = isolated_runtime();
     for unwind in [false, true] {
         let (release_tx, release_rx) = mpsc::channel::<()>();
         assert_blocked_call_leaves_collections_running(
@@ -325,7 +325,7 @@ fn blocked_foreign_region_leaves_collections_running_and_parks_on_return() {
 
 #[test]
 fn sync_select_timeout_leaves_collections_running_and_parks_on_return() {
-    let _test = runtime_test_guard();
+    let _test = isolated_runtime();
     assert_blocked_call_leaves_collections_running(
         false,
         || {
@@ -338,7 +338,7 @@ fn sync_select_timeout_leaves_collections_running_and_parks_on_return() {
 
 #[test]
 fn collection_requested_during_a_stop_keeps_the_foreign_region() {
-    let _test = runtime_test_guard();
+    let _test = isolated_runtime();
     for collect in [
         willow_gc_collect as extern "C" fn(),
         willow_gc_minor_collect as extern "C" fn(),
@@ -348,7 +348,7 @@ fn collection_requested_during_a_stop_keeps_the_foreign_region() {
         let (collect_tx, collect_rx) = mpsc::channel::<()>();
         let (collected_tx, collected_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let worker = std::thread::spawn(move || {
+        let worker = std::thread::spawn(crate::runtime::serving(move || {
             let _mutator = MutatorRegistration::new();
             let region = crate::rust_bridge_abi::willow_rust_bridge_region_enter();
             ready_tx.send(std::thread::current().id()).unwrap();
@@ -357,23 +357,23 @@ fn collection_requested_during_a_stop_keeps_the_foreign_region() {
             collected_tx.send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
             crate::rust_bridge_abi::willow_rust_bridge_region_exit(region);
-        });
+        }));
         let id = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         wait_until_parked(id);
         // The stop stays pending on a running mutator, which leaves the
         // coordination lock free for the collection request to meet it.
         let (running_tx, running_rx) = mpsc::channel();
         let (park_tx, park_rx) = mpsc::channel::<()>();
-        let straggler = std::thread::spawn(move || {
+        let straggler = std::thread::spawn(crate::runtime::serving(move || {
             let _mutator = MutatorRegistration::new();
             running_tx.send(()).unwrap();
             park_rx.recv_timeout(Duration::from_secs(30)).unwrap();
             willow_gc_safepoint();
-        });
+        }));
         running_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        let collector = std::thread::spawn(|| {
+        let collector = std::thread::spawn(crate::runtime::serving(|| {
             with_stw(crate::gc_telemetry::stops::StopReason::Minor, |_, _| {});
-        });
+        }));
         while !runtime().stop_requested.load(Ordering::Acquire) {
             std::thread::yield_now();
         }
@@ -393,7 +393,7 @@ fn collection_requested_during_a_stop_keeps_the_foreign_region() {
 #[cfg(unix)]
 #[test]
 fn blocked_fifo_read_leaves_collections_running_and_parks_on_return() {
-    let _test = runtime_test_guard();
+    let _test = isolated_runtime();
     let path = std::env::temp_dir().join(format!("willow_gc_fifo_{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let text = path.to_str().unwrap().to_string();
@@ -418,11 +418,11 @@ fn blocked_fifo_read_leaves_collections_running_and_parks_on_return() {
 
 #[test]
 fn deferred_publication_reads_parent_contexts_like_a_local_snapshot() {
-    let _test = runtime_test_guard();
+    let _test = isolated_runtime();
     reset_internal_for_test();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
+    let worker = std::thread::spawn(crate::runtime::serving(move || {
         let mutator = MutatorRegistration::new();
         let mut outer = willow_alloc_object(0, 8);
         let mut empty: *mut u8 = std::ptr::null_mut();
@@ -445,7 +445,7 @@ fn deferred_publication_reads_parent_contexts_like_a_local_snapshot() {
         crate::generated_context::replace(previous);
         willow_pop_roots(2);
         drop(mutator);
-    });
+    }));
     let (id, expected) = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     with_stw(crate::gc_telemetry::stops::StopReason::Minor, |coord, _| {
         assert_eq!(coord.mutators[&id].slots, expected);
@@ -453,4 +453,111 @@ fn deferred_publication_reads_parent_contexts_like_a_local_snapshot() {
     resume_tx.send(()).unwrap();
     worker.join().unwrap();
     reset_internal_for_test();
+}
+
+#[test]
+fn private_stop_coordination_resumes_only_its_owner_after_unwind() {
+    let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let barrier = std::sync::Barrier::new(2);
+    let reason = crate::gc_telemetry::stops::StopReason::Minor;
+    std::thread::scope(|scope| {
+        scope.spawn(crate::runtime::serving(|| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::with_stw_in(&first, reason, |coord, _| {
+                    assert!(coord.stop_requested);
+                    barrier.wait();
+                    panic!("private stop unwind");
+                });
+            }));
+            assert!(result.is_err());
+            assert!(
+                !first
+                    .gc
+                    .stop_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            assert!(
+                !first
+                    .gc
+                    .poll_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            assert!(
+                second
+                    .gc
+                    .stop_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            assert!(!first.gc.coord.0.lock().unwrap().stop_requested);
+            barrier.wait();
+        }));
+        scope.spawn(crate::runtime::serving(|| {
+            super::with_stw_in(&second, reason, |coord, _| {
+                barrier.wait();
+                barrier.wait();
+                assert!(coord.stop_requested);
+            });
+            assert!(
+                !second
+                    .gc
+                    .stop_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            assert!(
+                !second
+                    .gc
+                    .poll_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            assert!(!second.gc.coord.0.lock().unwrap().stop_requested);
+        }));
+    });
+}
+
+#[test]
+fn private_stops_use_owner_observation_setting_and_work_store() {
+    std::thread::scope(|scope| {
+        for enabled in [false, true] {
+            scope.spawn(crate::runtime::serving(move || {
+                let mut owner =
+                    crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+                owner.diagnostics.gc_measure = if enabled {
+                    std::sync::LazyLock::new(|| true)
+                } else {
+                    std::sync::LazyLock::new(|| false)
+                };
+                owner.diagnostics.gc_trace_version = std::sync::LazyLock::new(|| 0);
+                for _ in 0..8 {
+                    super::with_stw_in(
+                        &owner,
+                        crate::gc_telemetry::stops::StopReason::Minor,
+                        |_, work| {
+                            crate::gc_telemetry::observations::graph_work_in(
+                                &owner,
+                                crate::gc_telemetry::MarkWork {
+                                    objects: 5,
+                                    scanned_bytes: 64,
+                                    marked_bytes: 24,
+                                    ..Default::default()
+                                },
+                            );
+                            work.metadata_objects = 11;
+                            work.root_values = 17;
+                        },
+                    );
+                }
+                assert_eq!(owner.telemetry.measurements.snapshot().resume_samples, 8);
+                let stats = owner.telemetry.observations.snapshot();
+                assert_eq!(stats.work[2].objects, if enabled { 128 } else { 0 });
+                assert_eq!(stats.work[2].slots, if enabled { 200 } else { 0 });
+                assert_eq!(stats.active_intervals, 0);
+                assert_eq!(
+                    stats.intervals[crate::gc_telemetry::observations::Kind::Collector as usize]
+                        .count,
+                    if enabled { 8 } else { 0 }
+                );
+            }));
+        }
+    });
 }

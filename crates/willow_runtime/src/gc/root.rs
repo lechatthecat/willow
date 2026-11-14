@@ -1,8 +1,7 @@
 use super::*;
 
 thread_local! {
-    #[cfg(test)]
-    static OWNER_SLOW_PATHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static OWNER_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static OWNER_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ROOT_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -96,7 +95,11 @@ pub(crate) fn gc_thread_root_depth() -> usize {
 // Publication neither traces nor safepoints, so stack transfer stays indivisible
 // with respect to this thread's root handshake.
 pub(super) fn retain_transferred_roots(slots: impl IntoIterator<Item = *mut *mut u8>) {
-    if GC_MARK_PHASE.load(Ordering::Acquire) == 0 {
+    if crate::runtime::current()
+        .mark_phase()
+        .load(Ordering::Acquire)
+        == 0
+    {
         return;
     }
     let state = runtime().heap.lock().unwrap();
@@ -198,7 +201,10 @@ pub(crate) unsafe fn discard_parked_roots(token: u64) {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
-    add_address_root(object, |_| true);
+    if object.is_null() {
+        return;
+    }
+    add_address_root_in(runtime(), object, |_| true);
 }
 
 /// Register a task frame the caller still owns exclusively. A registration only
@@ -208,7 +214,11 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
 /// one remembered-owner scan in the serial stop, whether or not the task has
 /// already finished.
 pub(crate) fn add_task_frame_root(frame: *mut u8) {
-    add_address_root(frame, frame_has_initial_references);
+    add_task_frame_root_in(crate::runtime::current(), frame);
+}
+
+pub(crate) fn add_task_frame_root_in(owner: &crate::runtime::Runtime, frame: *mut u8) {
+    add_address_root_in(&owner.gc, frame, frame_has_initial_references);
 }
 
 /// Type id of frames from `willow_async_frame_alloc`; no trace hook can claim it.
@@ -229,7 +239,11 @@ fn frame_has_initial_references(frame: *mut u8) -> bool {
             .any(|slot| !unsafe { *slot }.is_null())
 }
 
-fn add_address_root(object: *mut u8, owes_initial_scan: impl FnOnce(*mut u8) -> bool) {
+fn add_address_root_in(
+    owner: &GcRuntime,
+    object: *mut u8,
+    owes_initial_scan: impl FnOnce(*mut u8) -> bool,
+) {
     if object.is_null() {
         return;
     }
@@ -238,20 +252,25 @@ fn add_address_root(object: *mut u8, owes_initial_scan: impl FnOnce(*mut u8) -> 
     // Registry publication cannot safepoint before the insertion finishes.
     // The activation handshake crosses it before taking runtime roots, just
     // as it crosses the corresponding phase-gated SATB deletion below.
-    let marking = GC_MARK_PHASE.load(Ordering::Acquire) != 0;
-    if runtime().root_tlabs.generation(object as usize) == Some(GC_GENERATION_YOUNG) {
+    // Only unregistered private service callers need explicit coordination.
+    // Enrolled mutators are crossed by their owner's stop handshake.
+    let _coord = (!owner.serves_current_thread()
+        && !safepoint::current_thread_is_registered_in(owner))
+    .then(|| owner.coord.0.lock().unwrap());
+    let marking = owner.mark_phase().load(Ordering::Acquire) != 0;
+    if owner.root_tlabs.generation(object as usize) == Some(GC_GENERATION_YOUNG) {
         crate::failure::fatal_invariant(
             "young object registered as an address runtime root; \
              use willow_gc_add_runtime_root_slot",
         );
     }
-    if marking && let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref() {
+    if marking && let Some(cycle) = owner.heap.lock().unwrap().concurrent_cycle.as_ref() {
         cycle.enqueue(object);
     }
-    if runtime().tlab_ever_allocated.load(Ordering::Acquire) && owes_initial_scan(object) {
-        runtime().runtime_roots.add_pending(object);
+    if owner.tlab_ever_allocated.load(Ordering::Acquire) && owes_initial_scan(object) {
+        owner.runtime_roots.add_pending(object);
     } else {
-        runtime().runtime_roots.add(object);
+        owner.runtime_roots.add(object);
     }
 }
 
@@ -260,13 +279,20 @@ fn add_address_root(object: *mut u8, owes_initial_scan: impl FnOnce(*mut u8) -> 
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_remove_runtime_root(object: *mut u8) {
+    remove_runtime_root_in(crate::runtime::current(), object);
+}
+
+pub(crate) fn remove_runtime_root_in(owner: &crate::runtime::Runtime, object: *mut u8) {
     if object.is_null() {
         return;
     }
 
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    satb_delete(object);
-    runtime().runtime_roots.remove(object);
+    let _coord = (!std::ptr::eq(owner, crate::runtime::current())
+        && !safepoint::current_thread_is_registered_in(&owner.gc))
+    .then(|| owner.gc.coord.0.lock().unwrap());
+    barrier::satb_delete_in(owner, object);
+    owner.gc.runtime_roots.remove(object);
 }
 
 /// Keep the object stored in `*slot` alive through runtime-owned storage that
@@ -279,21 +305,28 @@ pub extern "C" fn willow_gc_remove_runtime_root(object: *mut u8) {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_add_runtime_root_slot(slot: *mut *mut u8) {
+    add_runtime_root_slot_in(crate::runtime::current(), slot);
+}
+
+pub(crate) fn add_runtime_root_slot_in(owner: &crate::runtime::Runtime, slot: *mut *mut u8) {
     if slot.is_null() {
         return;
     }
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    let default_owner = std::ptr::eq(owner, crate::runtime::current());
+    let _coord = (!default_owner && !safepoint::current_thread_is_registered_in(&owner.gc))
+        .then(|| owner.gc.coord.0.lock().unwrap());
     // As for address roots: publication cannot cross a safepoint, and an
     // active cycle must see the referent even if the holder drops it later.
-    if GC_MARK_PHASE.load(Ordering::Acquire) != 0
-        && let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref()
+    let phase = owner.mark_phase();
+    if phase.load(Ordering::Acquire) != 0
+        && let Some(cycle) = owner.gc.heap.lock().unwrap().concurrent_cycle.as_ref()
     {
         // SAFETY: the caller guarantees a valid slot.
         cycle.enqueue(unsafe { *slot });
     }
-    #[cfg(test)]
-    RUNTIME_ROOT_SLOT_ADDS_FOR_TEST.set(RUNTIME_ROOT_SLOT_ADDS_FOR_TEST.get() + 1);
-    runtime().runtime_root_slots.add(slot.cast());
+    RuntimePathObservation::root_slot_registration(|| &owner.gc.path_observation);
+    owner.gc.runtime_root_slots.add(slot.cast());
 }
 
 /// Stop retaining the referent of a slot registered with
@@ -301,18 +334,29 @@ pub extern "C" fn willow_gc_add_runtime_root_slot(slot: *mut *mut u8) {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_remove_runtime_root_slot(slot: *mut *mut u8) {
+    remove_runtime_root_slot_in(crate::runtime::current(), slot);
+}
+
+pub(crate) fn remove_runtime_root_slot_in(owner: &crate::runtime::Runtime, slot: *mut *mut u8) {
     if slot.is_null() {
         return;
     }
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    let default_owner = std::ptr::eq(owner, crate::runtime::current());
+    let _coord = (!default_owner && !safepoint::current_thread_is_registered_in(&owner.gc))
+        .then(|| owner.gc.coord.0.lock().unwrap());
     // SAFETY: the slot stays valid until this removal returns.
-    satb_delete(unsafe { *slot });
-    runtime().runtime_root_slots.remove(slot.cast());
+    barrier::satb_delete_in(owner, unsafe { *slot });
+    owner.gc.runtime_root_slots.remove(slot.cast());
+}
+
+fn legacy_owner_is_current(gc: &GcRuntime) -> bool {
+    OWNER_ID.get() == gc.policy_identity
+        && OWNER_EPOCH.get() == gc.mutator_epoch.load(Ordering::Acquire)
 }
 
 pub(crate) fn generated_roots_admitted() -> bool {
-    current_thread_is_registered()
-        || OWNER_EPOCH.get() == safepoint::MUTATOR_EPOCH.load(Ordering::Acquire)
+    current_thread_is_registered() || legacy_owner_is_current(runtime())
 }
 pub(crate) fn leave_generated_roots() {
     release_root_stack_owner_if_empty();
@@ -326,7 +370,7 @@ pub(super) fn claim_root_stack_owner() {
     }
     // Only the owning thread clears its own claim, so an existing claim stays
     // valid without coord; collectors already defer to it.
-    if OWNER_EPOCH.get() == safepoint::MUTATOR_EPOCH.load(Ordering::Acquire) {
+    if legacy_owner_is_current(runtime()) {
         return;
     }
     let coord = runtime().coord.0.lock().unwrap();
@@ -336,13 +380,21 @@ pub(super) fn claim_root_stack_owner() {
 // Admission and collector election share coord. A raw, unpublished reference
 // cannot safely wait across a collection; reject misuse before publishing it.
 pub(super) fn claim_legacy_owner_locked(coord: &GcCoord, already_unregistered: bool) {
-    #[cfg(test)]
-    OWNER_SLOW_PATHS.set(OWNER_SLOW_PATHS.get() + 1);
+    claim_legacy_owner_locked_in(runtime(), coord, already_unregistered);
+}
+
+pub(super) fn claim_legacy_owner_locked_in(
+    gc: &GcRuntime,
+    coord: &GcCoord,
+    already_unregistered: bool,
+) {
+    RuntimePathObservation::root_owner_slow(|| &gc.path_observation);
     let current = std::thread::current().id();
-    let mut owner = runtime().root_stack_owner.lock().unwrap();
+    let mut owner = gc.root_stack_owner.lock().unwrap();
     // Existing legacy ownership already requires a foreign collector to defer.
     if already_unregistered && *owner == Some(current) {
-        OWNER_EPOCH.set(safepoint::MUTATOR_EPOCH.load(Ordering::Acquire));
+        OWNER_ID.set(gc.policy_identity);
+        OWNER_EPOCH.set(gc.mutator_epoch.load(Ordering::Acquire));
         return;
     }
     if coord
@@ -360,7 +412,8 @@ pub(super) fn claim_legacy_owner_locked(coord: &GcCoord, already_unregistered: b
         }
         _ => *owner = Some(current),
     }
-    OWNER_EPOCH.set(safepoint::MUTATOR_EPOCH.load(Ordering::Acquire));
+    OWNER_ID.set(gc.policy_identity);
+    OWNER_EPOCH.set(gc.mutator_epoch.load(Ordering::Acquire));
 }
 
 pub(super) fn release_root_stack_owner_if_empty() {
@@ -372,31 +425,46 @@ pub(super) fn release_root_stack_owner_if_empty() {
 
 // Does not reacquire coord: unregister calls this while holding that lock.
 pub(super) fn clear_root_stack_owner_if_empty() {
+    clear_root_stack_owner_if_empty_in(runtime());
+}
+
+pub(super) fn clear_root_stack_owner_if_empty_in(gc: &GcRuntime) {
     if crate::generated_context::has_active_bridge()
         || gc_thread_root_depth() != 0
-        || OWNER_EPOCH.get() != safepoint::MUTATOR_EPOCH.load(Ordering::Acquire)
+        || !legacy_owner_is_current(gc)
     {
         return;
     }
-    #[cfg(test)]
-    OWNER_SLOW_PATHS.set(OWNER_SLOW_PATHS.get() + 1);
+    RuntimePathObservation::root_owner_slow(|| &gc.path_observation);
     let current = std::thread::current().id();
-    let mut owner = runtime().root_stack_owner.lock().unwrap();
+    let mut owner = gc.root_stack_owner.lock().unwrap();
     if owner.as_ref().is_some_and(|existing| *existing == current) {
         *owner = None;
     }
+    OWNER_ID.set(0);
     OWNER_EPOCH.set(0);
 }
 
 pub(super) fn foreign_root_stack_owner_active() -> bool {
-    foreign_root_stack_owner_active_locked(&runtime().coord.0.lock().unwrap())
+    foreign_root_stack_owner_active_in(runtime())
+}
+
+pub(super) fn foreign_root_stack_owner_active_in(owner: &GcRuntime) -> bool {
+    foreign_root_stack_owner_active_locked_in(owner, &owner.coord.0.lock().unwrap())
 }
 
 /// Unregistration also runs under coord, so a collector that decides under the
 /// same lock hold cannot miss a legacy owner that leaves the registry in between.
 pub(super) fn foreign_root_stack_owner_active_locked(coord: &GcCoord) -> bool {
+    foreign_root_stack_owner_active_locked_in(runtime(), coord)
+}
+
+pub(super) fn foreign_root_stack_owner_active_locked_in(
+    owner: &GcRuntime,
+    coord: &GcCoord,
+) -> bool {
     let current = std::thread::current().id();
-    runtime()
+    owner
         .root_stack_owner
         .lock()
         .unwrap()
@@ -416,12 +484,16 @@ pub fn runtime_root_count() -> usize {
 /// registered runtime root slots, and the slots of parked native stacks.
 /// Marking consumers only need values.
 pub(super) fn runtime_roots_snapshot() -> Vec<*mut u8> {
-    let mut roots = runtime().runtime_roots.snapshot();
+    runtime_roots_snapshot_in(runtime())
+}
+
+pub(super) fn runtime_roots_snapshot_in(owner: &GcRuntime) -> Vec<*mut u8> {
+    let mut roots = owner.runtime_roots.snapshot();
     // SAFETY: runtime slot registration keeps each aligned slot alive until
     // removal; snapshot_slot_values holds the registry locks through atomic
     // reads so a concurrent handle Drop cannot free an enumerated cell.
-    roots.extend(unsafe { runtime().runtime_root_slots.snapshot_slot_values() });
-    let parked = runtime().parked_stack_roots.lock().unwrap();
+    roots.extend(unsafe { owner.runtime_root_slots.snapshot_slot_values() });
+    let parked = owner.parked_stack_roots.lock().unwrap();
     roots.extend(
         parked
             .values()
@@ -435,8 +507,8 @@ pub(super) fn runtime_roots_snapshot() -> Vec<*mut u8> {
 /// Slots registered with [`willow_gc_add_runtime_root_slot`]. A relocating
 /// collector rewrites them; address-registered roots are never young and are
 /// only scanned in place.
-pub(super) fn runtime_root_slots() -> Vec<*mut *mut u8> {
-    runtime()
+pub(super) fn runtime_root_slots(owner: &GcRuntime) -> Vec<*mut *mut u8> {
+    owner
         .runtime_root_slots
         .snapshot()
         .into_iter()
@@ -447,8 +519,8 @@ pub(super) fn runtime_root_slots() -> Vec<*mut *mut u8> {
 /// Roots of parked native stacks. The park contract keeps each slot allocated
 /// until its stack resumes or is discarded, and the stack cannot run while a
 /// stop-the-world collection rewrites it.
-pub(super) fn append_parked_roots(roots: &mut MinorRoots) {
-    let parked = runtime().parked_stack_roots.lock().unwrap();
+pub(super) fn append_parked_roots(owner: &GcRuntime, roots: &mut MinorRoots) {
+    let parked = owner.parked_stack_roots.lock().unwrap();
     for published in parked.values() {
         published.append_to(roots);
     }
@@ -468,8 +540,112 @@ mod inline_root_tests {
     use super::*;
 
     #[test]
+    fn private_root_slot_publication_and_removal_use_selected_cycle() {
+        for phase in [0, 1, 2] {
+            let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+            let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+            let cycle = Arc::new(ConcurrentCycle::new(
+                std::iter::empty(),
+                Default::default(),
+                Default::default(),
+                0,
+            ));
+            cycle.late_published.store(false, Ordering::Release);
+            marking::set_concurrent_cycle_in(
+                &first.gc,
+                &mut first.gc.heap.lock().unwrap(),
+                Some(cycle.clone()),
+            );
+            first.gc.mark_phase().store(phase, Ordering::Release);
+            let mut value = std::ptr::without_provenance_mut(0x1000);
+            let slot = &raw mut value;
+            add_runtime_root_slot_in(&first, slot);
+            add_runtime_root_slot_in(&second, slot);
+            assert_eq!(runtime_root_slots(&first.gc), vec![slot]);
+            assert_eq!(runtime_root_slots(&second.gc), vec![slot]);
+            assert_eq!(
+                cycle.unindexed.lock().unwrap().len(),
+                usize::from(phase != 0)
+            );
+            // Distinct deletion proves removal publishes, rather than merely
+            // observing the edge already queued at registration.
+            unsafe { *slot = std::ptr::without_provenance_mut(0x2000) };
+            remove_runtime_root_slot_in(&first, slot);
+            assert!(runtime_root_slots(&first.gc).is_empty());
+            assert_eq!(runtime_root_slots(&second.gc), vec![slot]);
+            assert_eq!(
+                cycle.unindexed.lock().unwrap().len(),
+                2 * usize::from(phase != 0)
+            );
+            remove_runtime_root_slot_in(&second, slot);
+            first.gc.mark_phase().store(0, Ordering::Release);
+            marking::set_concurrent_cycle_in(&first.gc, &mut first.gc.heap.lock().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn private_foreign_root_admission_uses_only_its_owner_registry() {
+        let first = GcRuntime::default();
+        let second = GcRuntime::default();
+        let foreign = std::thread::spawn(crate::runtime::serving(|| std::thread::current().id()))
+            .join()
+            .unwrap();
+        *first.root_stack_owner.lock().unwrap() = Some(foreign);
+        assert!(foreign_root_stack_owner_active_in(&first));
+        assert!(!foreign_root_stack_owner_active_in(&second));
+        second
+            .coord
+            .0
+            .lock()
+            .unwrap()
+            .mutators
+            .insert(foreign, Default::default());
+        assert!(foreign_root_stack_owner_active_in(&first));
+        first
+            .coord
+            .0
+            .lock()
+            .unwrap()
+            .mutators
+            .insert(foreign, Default::default());
+        assert!(!foreign_root_stack_owner_active_in(&first));
+        first.coord.0.lock().unwrap().mutators.remove(&foreign);
+        assert!(foreign_root_stack_owner_active_in(&first));
+        *first.root_stack_owner.lock().unwrap() = Some(std::thread::current().id());
+        assert!(!foreign_root_stack_owner_active_in(&first));
+    }
+
+    #[test]
+    fn private_runtime_root_snapshots_keep_owner_slots_separate() {
+        let first = GcRuntime::default();
+        let second = GcRuntime::default();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for owner in [&first, &second] {
+                let barrier = &barrier;
+                scope.spawn(crate::runtime::serving(move || {
+                    let mut payload = 0u8;
+                    let payload = &raw mut payload;
+                    let mut value = payload;
+                    let slot = &raw mut value;
+                    owner.runtime_roots.add(payload);
+                    owner.runtime_root_slots.add(slot.cast());
+                    barrier.wait();
+                    assert_eq!(runtime_root_slots(owner), vec![slot]);
+                    assert_eq!(runtime_roots_snapshot_in(owner), vec![payload, payload]);
+                    barrier.wait();
+                    owner.runtime_root_slots.remove(slot.cast());
+                    owner.runtime_roots.remove(payload);
+                    assert!(runtime_root_slots(owner).is_empty());
+                    assert!(runtime_roots_snapshot_in(owner).is_empty());
+                }));
+            }
+        });
+    }
+
+    #[test]
     fn runtime_root_registration_publishes_during_marking() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let object = willow_alloc_typed(8, 0);
         let index = epoch_index::RegionIndex::capture(&runtime().heap.lock().unwrap());
@@ -480,25 +656,34 @@ mod inline_root_tests {
             0,
         ));
         marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), Some(cycle.clone()));
-        GC_MARK_PHASE.store(1, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(1, Ordering::Release);
         assert!(!cycle.is_marked(object as usize));
         willow_gc_add_runtime_root(object);
         cycle.drain(usize::MAX);
         assert!(cycle.is_marked(object as usize));
         willow_gc_remove_runtime_root(object);
-        GC_MARK_PHASE.store(0, Ordering::Release);
+        crate::runtime::current()
+            .mark_phase()
+            .store(0, Ordering::Release);
         marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
         reset_internal_for_test();
     }
 
     #[test]
     fn runtime_root_registration_with_nursery_does_not_lock_heap() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let mut tls = Box::new(GcTlabState::new());
         willow_gc_alloc_slow(&mut *tls, 0, 0, 8, 0);
         let object = willow_alloc_typed(8, 0);
-        assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+        assert_eq!(
+            crate::runtime::current()
+                .mark_phase()
+                .load(Ordering::Acquire),
+            0
+        );
         // A recursive heap acquisition would deadlock: registration/removal
         // must finish while this caller already owns the mutex.
         let state = runtime().heap.lock().unwrap();
@@ -516,21 +701,33 @@ mod inline_root_tests {
 
     #[test]
     fn owner_cached_push_pop_has_two_slow_paths_per_live_stack() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for count in [1, 16, 256, 4096] {
             reset_internal_for_test();
-            OWNER_SLOW_PATHS.set(0);
+            runtime().path_observation.set_root_owner_slow_paths(0);
             let mut slots = vec![std::ptr::null_mut(); count];
             for slot in &mut slots {
                 willow_push_root(slot);
             }
-            assert_eq!(OWNER_SLOW_PATHS.get(), 1, "first claim only: {count}");
+            assert_eq!(
+                runtime().path_observation.root_owner_slow_paths(),
+                1,
+                "first claim only: {count}"
+            );
             for _ in 1..count {
                 willow_pop_root();
             }
-            assert_eq!(OWNER_SLOW_PATHS.get(), 1, "nonfinal pops: {count}");
+            assert_eq!(
+                runtime().path_observation.root_owner_slow_paths(),
+                1,
+                "nonfinal pops: {count}"
+            );
             willow_pop_root();
-            assert_eq!(OWNER_SLOW_PATHS.get(), 2, "final release: {count}");
+            assert_eq!(
+                runtime().path_observation.root_owner_slow_paths(),
+                2,
+                "final release: {count}"
+            );
         }
         reset_internal_for_test();
     }
@@ -540,16 +737,16 @@ mod inline_root_tests {
         for _ in 0..4096 {
             willow_push_root(&mut slot);
             willow_pop_root();
-            assert_eq!(OWNER_SLOW_PATHS.get(), 1);
+            assert_eq!(runtime().path_observation.root_owner_slow_paths(), 1);
         }
         1
     }
 
     #[test]
     fn owner_bridge_retains_one_claim_across_empty_scopes() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
-        OWNER_SLOW_PATHS.set(0);
+        runtime().path_observation.set_root_owner_slow_paths(0);
         assert_eq!(
             unsafe {
                 crate::generated_context::invoke(
@@ -559,22 +756,22 @@ mod inline_root_tests {
             },
             1
         );
-        assert_eq!(OWNER_SLOW_PATHS.get(), 2);
+        assert_eq!(runtime().path_observation.root_owner_slow_paths(), 2);
         assert!(!generated_roots_admitted());
         reset_internal_for_test();
     }
 
     #[test]
     fn owner_registered_push_pop_never_enters_owner_slow_path() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let _registration = MutatorRegistration::new();
-        OWNER_SLOW_PATHS.set(0);
+        runtime().path_observation.set_root_owner_slow_paths(0);
         let mut slot = std::ptr::null_mut();
         for _ in 0..4096 {
             willow_push_root(&mut slot);
             willow_pop_root();
         }
-        assert_eq!(OWNER_SLOW_PATHS.get(), 0);
+        assert_eq!(runtime().path_observation.root_owner_slow_paths(), 0);
     }
 }

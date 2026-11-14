@@ -1003,9 +1003,9 @@ mod tests {
     fn cross_thread_request_visible() {
         let flag = willow_preempt_flag_new();
         let addr = flag as usize;
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             willow_preempt_request(addr as *const c_void);
-        })
+        }))
         .join()
         .unwrap();
         assert_eq!(willow_preempt_requested(flag), 1);

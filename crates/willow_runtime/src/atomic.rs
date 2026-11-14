@@ -161,11 +161,11 @@ pub extern "C" fn willow_atomic_bool_compare_exchange(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::{runtime_test_guard, willow_gc_init};
+    use crate::gc::{isolated_runtime, willow_gc_init};
 
     #[test]
     fn atomic_payload_matches_shared_layout() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let integer = willow_atomic_i64_new(-17);
         let boolean = willow_atomic_bool_new(255);
@@ -189,12 +189,12 @@ mod tests {
         let winners = AtomicI64::new(0);
         std::thread::scope(|scope| {
             for _ in 0..16 {
-                scope.spawn(|| {
+                scope.spawn(crate::runtime::serving(|| {
                     let p = &integer as *const AtomicI64 as *mut c_void;
                     winners.fetch_add(willow_atomic_i64_compare_exchange(p, 0, 1) as i64, SeqCst);
                     let p = &boolean as *const AtomicBool as *mut c_void;
                     winners.fetch_add(willow_atomic_bool_compare_exchange(p, 0, 1) as i64, SeqCst);
-                });
+                }));
             }
         });
         assert_eq!(winners.load(SeqCst), 2);
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn i64_new_load_store_add_sub_swap() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let a = willow_atomic_i64_new(10);
         assert_eq!(willow_atomic_i64_load(a), 10);
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn bool_new_load_store_swap() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let b = willow_atomic_bool_new(0);
         assert_eq!(willow_atomic_bool_load(b), 0);

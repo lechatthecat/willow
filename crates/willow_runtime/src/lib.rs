@@ -102,6 +102,7 @@ pub mod net;
 pub mod netpoll;
 pub mod object;
 pub mod observability;
+mod observation;
 pub mod panic;
 pub mod panic_context;
 pub mod parallel;
@@ -109,6 +110,7 @@ pub mod plugin;
 pub mod preempt;
 pub mod print;
 pub mod reference_debug;
+mod runtime;
 pub mod scheduler;
 pub(crate) mod stack_overflow;
 pub mod stack_trace;
@@ -202,7 +204,7 @@ mod tests {
 
     #[test]
     fn runtime_start_stores_arguments_before_user_main() {
-        let _guard = gc::runtime_test_guard();
+        let _guard = gc::isolated_runtime();
         let program = std::ffi::CString::new("willow-test").unwrap();
         let first = std::ffi::CString::new("one").unwrap();
         let second = std::ffi::CString::new("two").unwrap();

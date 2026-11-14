@@ -198,7 +198,8 @@ impl Object {
     /// descriptor through the liveness bookkeeping and header conversion.
     pub(super) fn try_reclaim_permit(self) -> Option<ReclaimPermit> {
         if unsafe { (*self.as_ptr()).descriptor_owned } && self.allocated() {
-            super::layouts::try_release_guard().map(|guard| ReclaimPermit(Some(guard)))
+            super::layouts::try_release_guard(unsafe { (*self.as_ptr()).descriptor })
+                .map(|guard| ReclaimPermit(Some(guard)))
         } else {
             Some(ReclaimPermit(None))
         }
@@ -362,7 +363,7 @@ mod move_tests {
 
     #[test]
     fn moving_header_transfers_interned_descriptor_once() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let key = willow_abi::GcLayoutDescriptor {
             type_id: 789123,
             layout_id: 789123,

@@ -48,16 +48,14 @@ enum NetworkHandle {
 
 unsafe fn drop_network_handle(payload: *mut u8) {
     unsafe { std::ptr::drop_in_place(payload.cast::<NetworkHandle>()) };
-    #[cfg(test)]
-    NETWORK_HANDLE_DROP_COUNT.fetch_add(1, Ordering::SeqCst);
 }
 
 #[cfg(test)]
-static NETWORK_HANDLE_DROP_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+const NETWORK_HANDLE_DROP_COUNT: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::NetworkHandleDropCount);
 
-static NETWORK_REGISTRATION: crate::gc::NativeGcRegistration =
-    crate::gc::NativeGcRegistration::new();
+const NETWORK_REGISTRATION: crate::gc::NativeGcRegistration =
+    crate::gc::NativeGcRegistration::Network;
 const NETWORK_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
     NETWORK_HANDLE_TYPE_ID,
     None,
@@ -622,7 +620,7 @@ pub extern "C" fn willow_net_write_async(stream: *mut u8, contents: *const u8) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::{reset_internal_for_test, runtime_test_guard};
+    use crate::gc::{isolated_runtime, reset_internal_for_test};
     use crate::scheduler::{reset_global_scheduler_for_test, willow_sched_run_until};
     use crate::string::willow_string_from_str;
 
@@ -632,7 +630,7 @@ mod tests {
 
     #[test]
     fn bind_rejects_hostname_without_blocking_dns() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let result = willow_net_bind(willow_string_from_str("localhost:80"));
         assert_eq!(result_tag(result), 1);
@@ -641,7 +639,7 @@ mod tests {
 
     #[test]
     fn connect_error_is_delivered_through_task_result() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         reset_global_scheduler_for_test();
         let task = willow_net_connect_async(willow_string_from_str("invalid"));
@@ -655,7 +653,7 @@ mod tests {
 
     #[test]
     fn unreachable_listener_runs_socket_finalizer() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         NETWORK_HANDLE_DROP_COUNT.store(0, Ordering::SeqCst);
 

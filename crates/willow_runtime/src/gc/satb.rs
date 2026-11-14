@@ -37,10 +37,28 @@ fn capacity_from_setting(setting: Option<&str>) -> usize {
         .unwrap_or(256)
 }
 
+/// Deterministic operation-count probes. Outside tests they are empty inline
+/// functions, so production paths carry no test-only branch.
 #[cfg(test)]
-std::thread_local! {
-    static ENTRY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static LEGACY_EMPTY_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+mod probe {
+    std::thread_local! {
+        pub(super) static ENTRY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(super) static LEGACY_EMPTY_CHECKS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+    pub(super) fn entry_read() {
+        ENTRY_READS.set(ENTRY_READS.get() + 1);
+    }
+    pub(super) fn legacy_empty_check() {
+        LEGACY_EMPTY_CHECKS.set(LEGACY_EMPTY_CHECKS.get() + 1);
+    }
+}
+#[cfg(not(test))]
+mod probe {
+    #[inline(always)]
+    pub(super) fn entry_read() {}
+    #[inline(always)]
+    pub(super) fn legacy_empty_check() {}
 }
 
 /// Successfully published prefixes remain in place until the buffer empties.
@@ -57,8 +75,7 @@ struct EntryBuffer {
 impl std::ops::Deref for EntryBuffer {
     type Target = [usize];
     fn deref(&self) -> &[usize] {
-        #[cfg(test)]
-        ENTRY_READS.set(ENTRY_READS.get() + 1);
+        probe::entry_read();
         // Only the owner can append without this buffer's mutex. Foreign reads
         // require stopped ownership; the Vec allocation is stable while admitted.
         unsafe { std::slice::from_raw_parts(self.values.as_ptr(), self.length.get()) }
@@ -192,8 +209,7 @@ impl Default for SatbBuffers {
 
 impl SatbBuffers {
     pub(super) fn is_empty(&self) -> bool {
-        #[cfg(test)]
-        LEGACY_EMPTY_CHECKS.set(LEGACY_EMPTY_CHECKS.get() + 1);
+        probe::legacy_empty_check();
         self.pending_entries == 0
     }
 
@@ -338,8 +354,7 @@ pub(super) struct SatbShards {
     capacity: usize,
     sealed: AtomicBool,
     drained: AtomicBool,
-    #[cfg(test)]
-    drain_visits: AtomicUsize,
+    drain_visits: crate::observation::Value<AtomicUsize>,
     shards: Box<[Shard]>,
     seal_cursor: Mutex<(usize, bool)>,
 }
@@ -397,8 +412,7 @@ impl SatbShards {
             capacity,
             sealed: AtomicBool::new(false),
             drained: AtomicBool::new(false),
-            #[cfg(test)]
-            drain_visits: AtomicUsize::new(0),
+            drain_visits: crate::observation::Value::default(),
             shards: (0..SATB_SHARDS)
                 .map(|_| Shard(Mutex::new(BufferRegistry::default())))
                 .collect(),
@@ -414,6 +428,15 @@ impl SatbShards {
         valid: impl FnOnce() -> bool,
         publish: impl FnOnce(&mut ShardBuffer<'_>) -> R,
     ) -> Option<R> {
+        self.with_current_in(super::runtime(), valid, publish)
+    }
+
+    pub(super) fn with_current_in<R>(
+        &self,
+        gc: &super::GcRuntime,
+        valid: impl FnOnce() -> bool,
+        publish: impl FnOnce(&mut ShardBuffer<'_>) -> R,
+    ) -> Option<R> {
         let buffer = {
             let mut buffers = crate::gc_telemetry::collector_profile::lock(
                 &self.shards[SHARD.with(|shard| *shard)].0,
@@ -424,7 +447,7 @@ impl SatbShards {
             }
             let owner = std::thread::current().id();
             if buffers.get(&owner).is_none() {
-                let buffer = super::safepoint::current_satb_buffer().unwrap_or_default();
+                let buffer = super::safepoint::current_satb_buffer_in(gc).unwrap_or_default();
                 assert!(
                     buffer
                         .0
@@ -539,8 +562,9 @@ impl SatbShards {
                 if !budget.reserve(1, 0, now()) {
                     return false;
                 }
-                #[cfg(test)]
-                self.drain_visits.fetch_add(1, Ordering::Relaxed);
+                self.drain_visits.observe(|visits| {
+                    visits.fetch_add(1, Ordering::Relaxed);
+                });
                 let mut entries = buffers
                     .get(&owner)
                     .unwrap()
@@ -591,8 +615,9 @@ impl SatbShards {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             while let Some(owner) = buffers.owners.front() {
-                #[cfg(test)]
-                self.drain_visits.fetch_add(1, Ordering::Relaxed);
+                self.drain_visits.observe(|visits| {
+                    visits.fetch_add(1, Ordering::Relaxed);
+                });
                 let mut entries = buffers
                     .get(&owner)
                     .unwrap()
@@ -684,7 +709,8 @@ impl ShardBuffer<'_> {
 mod tests {
     use super::*;
 
-    static OPEN_EPOCH: AtomicBool = AtomicBool::new(false);
+    static OPEN_EPOCH: crate::runtime::PerRuntime<AtomicBool> =
+        crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
 
     // Execute the same ABI accesses as generated code, with no Rust Vec borrow.
     unsafe fn inline_pair(address: usize, pair: [usize; 2]) -> bool {
@@ -762,7 +788,7 @@ mod tests {
 
     #[test]
     fn inline_satb_bounded_seal_preserves_suffix_and_revokes_reused_storage() {
-        let _guard = super::super::runtime_test_guard();
+        let _guard = super::super::isolated_runtime();
         super::super::reset_internal_for_test();
         super::super::willow_gc_register_mutator();
         let buffers = SatbShards::new(256);
@@ -810,7 +836,7 @@ mod tests {
 
     #[test]
     fn foreign_drain_rejects_running_owners_and_accepts_parked_or_unregistered() {
-        let foreign = std::thread::spawn(|| std::thread::current().id())
+        let foreign = std::thread::spawn(crate::runtime::serving(|| std::thread::current().id()))
             .join()
             .unwrap();
         let mut coord = super::super::GcCoord {
@@ -847,7 +873,7 @@ mod tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let owner_buffers = buffers.clone();
-        let owner = std::thread::spawn(move || {
+        let owner = std::thread::spawn(crate::runtime::serving(move || {
             owner_buffers
                 .with_current(
                     || true,
@@ -859,7 +885,7 @@ mod tests {
                 .unwrap();
             ready_tx.send(std::thread::current().id()).unwrap();
             let _ = done_rx.recv_timeout(std::time::Duration::from_secs(5));
-        });
+        }));
         let foreign = ready_rx.recv().unwrap();
         let mut coord = super::super::GcCoord {
             stop_requested: true,
@@ -975,7 +1001,7 @@ mod tests {
     fn satb_registry_resume_scales_with_pending_owners_not_retry_prefixes() {
         let ids: Vec<_> = (0..257)
             .map(|_| {
-                std::thread::spawn(|| std::thread::current().id())
+                std::thread::spawn(crate::runtime::serving(|| std::thread::current().id()))
                     .join()
                     .unwrap()
             })
@@ -1089,7 +1115,7 @@ mod tests {
     fn satb_registry_resume_handles_unregister_reregister_and_reopen() {
         let ids: Vec<_> = (0..3)
             .map(|_| {
-                std::thread::spawn(|| std::thread::current().id())
+                std::thread::spawn(crate::runtime::serving(|| std::thread::current().id()))
                     .join()
                     .unwrap()
             })
@@ -1156,9 +1182,10 @@ mod tests {
             let mut legacy = SatbBuffers::new(256);
             let shards = SatbShards::new(256);
             for _ in 0..count {
-                let id = std::thread::spawn(|| std::thread::current().id())
-                    .join()
-                    .unwrap();
+                let id =
+                    std::thread::spawn(crate::runtime::serving(|| std::thread::current().id()))
+                        .join()
+                        .unwrap();
                 coord.mutators.insert(id, Default::default());
                 coord.parked.insert(id);
                 // Empty foreign buffers plus one retained nonempty owner.
@@ -1233,9 +1260,10 @@ mod tests {
             };
             let mut buffers = SatbBuffers::new(256);
             for _ in 0..count {
-                let id = std::thread::spawn(|| std::thread::current().id())
-                    .join()
-                    .unwrap();
+                let id =
+                    std::thread::spawn(crate::runtime::serving(|| std::thread::current().id()))
+                        .join()
+                        .unwrap();
                 buffers.entries.insert(id, EntryBuffer::default());
             }
             buffers.record(std::thread::current().id(), 99, |_| unreachable!());
@@ -1245,15 +1273,15 @@ mod tests {
             let mut budget = super::super::old_cycle::RemarkBudget::new(1, 1, 10, 0);
             // Models final remark: the maintained invariant reads no owner
             // record; deadline admission can reject immediately afterward.
-            let entry_reads = ENTRY_READS.get();
-            let empty_checks = LEGACY_EMPTY_CHECKS.get();
+            let entry_reads = probe::ENTRY_READS.get();
+            let empty_checks = probe::LEGACY_EMPTY_CHECKS.get();
             assert!(buffers.is_empty());
             assert_eq!(
-                ENTRY_READS.get() - entry_reads,
+                probe::ENTRY_READS.get() - entry_reads,
                 0,
                 "final invariant must not inspect any retained buffer"
             );
-            assert_eq!(LEGACY_EMPTY_CHECKS.get() - empty_checks, 1);
+            assert_eq!(probe::LEGACY_EMPTY_CHECKS.get() - empty_checks, 1);
             assert!(!budget.reserve(0, 0, {
                 visits.set(visits.get() + 1);
                 10
@@ -1400,7 +1428,7 @@ mod tests {
                         ready.clone(),
                         retire.clone(),
                     );
-                    scope.spawn(move || {
+                    scope.spawn(crate::runtime::serving(move || {
                         buffers
                             .with_current(
                                 || true,
@@ -1412,7 +1440,7 @@ mod tests {
                         buffers.retire_current(|values| {
                             published.lock().unwrap().extend_from_slice(values)
                         });
-                    });
+                    }));
                 }
                 ready.wait();
                 buffers.seal_without_drain();
@@ -1470,7 +1498,7 @@ mod tests {
                         ready.clone(),
                         finish.clone(),
                     );
-                    scope.spawn(move || {
+                    scope.spawn(crate::runtime::serving(move || {
                         buffers
                             .with_current(
                                 || true,
@@ -1502,7 +1530,7 @@ mod tests {
                             )
                             .unwrap();
                         buffers.retire_current(|_| panic!("owner flush must precede retirement"));
-                    });
+                    }));
                 }
                 ready.wait();
                 let registered_count: usize = buffers
@@ -1563,7 +1591,7 @@ mod tests {
     fn remark_drains_every_mutator_and_reuses_registered_buffers() {
         let ids: Vec<_> = (0..16)
             .map(|_| {
-                std::thread::spawn(|| std::thread::current().id())
+                std::thread::spawn(crate::runtime::serving(|| std::thread::current().id()))
                     .join()
                     .unwrap()
             })
@@ -1590,7 +1618,7 @@ mod m3_measurements {
     use super::*;
     #[test]
     fn m3_satb_contention_and_seal_capture_all_publications() {
-        let _guard = super::super::runtime_test_guard();
+        let _guard = super::super::isolated_runtime();
         for threads in [1, 8, 64, 128] {
             let shards = Arc::new(SatbShards::new(256));
             let start = Arc::new(std::sync::Barrier::new(threads));
@@ -1600,7 +1628,7 @@ mod m3_measurements {
             std::thread::scope(|scope| {
                 for _ in 0..threads {
                     let (shards, start, count) = (shards.clone(), start.clone(), count.clone());
-                    scope.spawn(move || {
+                    scope.spawn(crate::runtime::serving(move || {
                         start.wait();
                         for i in 0..4096 {
                             shards
@@ -1614,7 +1642,7 @@ mod m3_measurements {
                                 )
                                 .unwrap();
                         }
-                    });
+                    }));
                 }
             });
             let coord = super::super::GcCoord {

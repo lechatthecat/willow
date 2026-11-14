@@ -2,10 +2,6 @@ use super::*;
 
 const SMALL_OBJECT_SIZE: usize = GC_HEADER_SIZE + 8;
 
-fn stress_guard() -> std::sync::MutexGuard<'static, ()> {
-    runtime_test_guard()
-}
-
 fn reset_gc() {
     reset_internal();
 }
@@ -124,7 +120,7 @@ fn assert_local_region_valid(region: &OldRegion) {
 #[test]
 #[ignore = "explicit GC stress suite"]
 fn stress_region_01_middle_hole_churn_reuses_one_region() {
-    let _guard = stress_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut left = willow_alloc_object(1, 8);
     willow_push_root(&mut left);
@@ -178,7 +174,12 @@ fn stress_region_01_middle_hole_churn_reuses_one_region() {
 #[ignore = "explicit GC stress suite"]
 fn stress_region_02_randomized_free_span_allocator_preserves_invariants() {
     let capacity = 64 * 1024;
-    let mut region = OldRegion::new(RegionKind::Old, capacity).unwrap();
+    let mut region = OldRegion::new(
+        &RuntimeStorageAllocator::default(),
+        RegionKind::Old,
+        capacity,
+    )
+    .unwrap();
     let payload_sizes = [0usize, 1, 7, 8, 9, 17, 31, 64, 127, 255];
     let mut live = Vec::<HeapObject>::new();
     let mut seed = 0x4d59_5df4_d0f3_3173u64;
@@ -222,7 +223,7 @@ fn stress_region_02_randomized_free_span_allocator_preserves_invariants() {
 #[test]
 #[ignore = "explicit GC stress suite"]
 fn stress_region_03_sparse_survivors_across_many_regions_stay_stable() {
-    let _guard = stress_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     if skip_under_alloc_stress(
         "stress_region_03",
@@ -269,7 +270,7 @@ fn stress_region_03_sparse_survivors_across_many_regions_stay_stable() {
 #[test]
 #[ignore = "explicit GC stress suite"]
 fn stress_region_04_large_and_regular_cycles_release_every_region() {
-    let _guard = stress_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     for round in 0..100 {
         for _ in 0..64 {
@@ -307,7 +308,7 @@ fn stress_region_04_large_and_regular_cycles_release_every_region() {
 #[test]
 #[ignore = "explicit GC stress suite"]
 fn stress_region_05_minor_major_and_remembered_set_interleave() {
-    let _guard = stress_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     if skip_nursery_tlab_fixture("stress_region_05") {
         return;
@@ -388,7 +389,7 @@ fn assert_no_pinned_retention(context: &str) {
 #[test]
 #[ignore = "explicit GC stress suite"]
 fn stress_region_06_many_sparse_survivor_chunks_relocate_and_release() {
-    let _guard = stress_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     if skip_filled_tlab_fixture("stress_region_06") {
         return;
@@ -445,7 +446,7 @@ fn stress_region_06_many_sparse_survivor_chunks_relocate_and_release() {
 #[test]
 #[ignore = "explicit GC stress suite"]
 fn stress_region_07_deterministic_random_graph_matches_reachability_model() {
-    let _guard = stress_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     // Allocation stress collects before every allocation: retaining N roots
     // necessarily visits 1 + ... + N objects. Bound that mode's fixture size.
@@ -504,7 +505,7 @@ fn stress_region_07_deterministic_random_graph_matches_reachability_model() {
 #[test]
 #[ignore = "explicit GC stress suite"]
 fn stress_region_11_generated_graph_preserves_edges_through_moving_collection() {
-    let _guard = stress_guard();
+    let _guard = isolated_runtime();
     // Allocation stress deliberately bypasses the nursery. The runner also
     // runs this test without that mode so relocation cannot pass vacuously.
     if skip_filled_tlab_fixture("stress_region_11") {
@@ -596,11 +597,11 @@ fn stress_region_11_generated_graph_preserves_edges_through_moving_collection() 
 #[test]
 #[ignore = "explicit GC stress suite"]
 fn stress_region_08_five_mutators_allocate_and_collect_concurrently() {
-    let _guard = stress_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let handles: Vec<_> = (0..5)
         .map(|worker| {
-            std::thread::spawn(move || {
+            std::thread::spawn(crate::runtime::serving(move || {
                 let mutator = crate::gc::MutatorRegistration::new();
                 for iteration in 0..500 {
                     let object = willow_alloc_object(worker + 1, 8);
@@ -612,7 +613,7 @@ fn stress_region_08_five_mutators_allocate_and_collect_concurrently() {
                     }
                 }
                 drop(mutator);
-            })
+            }))
         })
         .collect();
     for handle in handles {
@@ -627,7 +628,7 @@ fn stress_region_08_five_mutators_allocate_and_collect_concurrently() {
 #[test]
 #[ignore = "explicit GC stress suite"]
 fn stress_region_09_sparse_survivor_waves_do_not_retain_source_capacity() {
-    let _guard = stress_guard();
+    let _guard = isolated_runtime();
     if skip_filled_tlab_fixture("stress_region_09") {
         return;
     }
@@ -710,7 +711,7 @@ fn stress_region_09_sparse_survivor_waves_do_not_retain_source_capacity() {
 #[test]
 #[ignore = "explicit GC stress suite"]
 fn stress_region_10_runtime_root_slots_relocate_bounded_lifetimes() {
-    let _guard = stress_guard();
+    let _guard = isolated_runtime();
     if skip_filled_tlab_fixture("stress_region_10") {
         return;
     }

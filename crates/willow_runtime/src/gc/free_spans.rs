@@ -3,16 +3,31 @@
 
 use super::RegionFreeSpan;
 
+/// Observation follows the index and is statically dispatched. The production
+/// observer has no storage or work, including on each tree descent/ascent.
+trait SpanObservation {
+    fn node(&mut self) {}
+    fn build(&mut self) {}
+}
+
+#[derive(Debug, Default)]
+struct NoObservation {
+    _private: (),
+}
+impl SpanObservation for NoObservation {}
+
+#[cfg(not(test))]
+type Observation = NoObservation;
+#[cfg(test)]
+type Observation = tests::Counts;
+
 #[derive(Debug, Default)]
 pub(super) struct FreeSpans {
     spans: Vec<Option<RegionFreeSpan>>,
     maxima: Vec<usize>,
     leaves: usize,
     bytes: usize,
-    #[cfg(test)]
-    node_visits: usize,
-    #[cfg(test)]
-    build_visits: usize,
+    observation: Observation,
 }
 
 impl From<Vec<RegionFreeSpan>> for FreeSpans {
@@ -23,32 +38,22 @@ impl From<Vec<RegionFreeSpan>> for FreeSpans {
         let leaves = spans.len().next_power_of_two();
         let mut maxima = vec![0; 2 * leaves];
         let mut bytes = 0;
-        #[cfg(test)]
-        let mut build_visits = 0;
+        let mut observation = Observation::default();
         for (index, span) in spans.iter().enumerate() {
             bytes += span.size;
             maxima[leaves + index] = span.size;
-            #[cfg(test)]
-            {
-                build_visits += 1;
-            }
+            observation.build();
         }
         for index in (1..leaves).rev() {
             maxima[index] = maxima[2 * index].max(maxima[2 * index + 1]);
-            #[cfg(test)]
-            {
-                build_visits += 1;
-            }
+            observation.build();
         }
         Self {
             spans: spans.into_iter().map(Some).collect(),
             maxima,
             leaves,
             bytes,
-            #[cfg(test)]
-            node_visits: 0,
-            #[cfg(test)]
-            build_visits,
+            observation,
         }
     }
 }
@@ -63,19 +68,13 @@ impl FreeSpans {
 
     pub(super) fn take(&mut self, size: usize) -> Option<usize> {
         debug_assert!(size > 0);
-        #[cfg(test)]
-        {
-            self.node_visits += 1;
-        }
+        self.observation.node();
         if self.largest() < size {
             return None;
         }
         let mut node = 1;
         while node < self.leaves {
-            #[cfg(test)]
-            {
-                self.node_visits += 1;
-            }
+            self.observation.node();
             node *= 2;
             if self.maxima[node] < size {
                 node += 1;
@@ -93,10 +92,7 @@ impl FreeSpans {
         }
         while node > 1 {
             node /= 2;
-            #[cfg(test)]
-            {
-                self.node_visits += 1;
-            }
+            self.observation.node();
             self.maxima[node] = self.maxima[2 * node].max(self.maxima[2 * node + 1]);
         }
         Some(offset)
@@ -211,10 +207,7 @@ impl Builder {
                 maxima: Vec::with_capacity(2 * leaves),
                 leaves,
                 bytes: 0,
-                #[cfg(test)]
-                node_visits: 0,
-                #[cfg(test)]
-                build_visits: 0,
+                observation: Observation::default(),
             },
             source,
             copied: 0,
@@ -231,19 +224,13 @@ impl Builder {
             self.result.bytes += span.size;
             self.result.maxima[self.result.leaves + self.copied] = span.size;
             self.copied += 1;
-            #[cfg(test)]
-            {
-                self.result.build_visits += 1;
-            }
+            self.result.observation.build();
         } else if self.parent != 0 {
             let index = self.parent;
             self.result.maxima[index] =
                 self.result.maxima[2 * index].max(self.result.maxima[2 * index + 1]);
             self.parent -= 1;
-            #[cfg(test)]
-            {
-                self.result.build_visits += 1;
-            }
+            self.result.observation.build();
         }
         self.result.maxima.len() == 2 * self.result.leaves
             && self.copied == self.source.len()
@@ -257,6 +244,22 @@ impl Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Default)]
+    pub(super) struct Counts {
+        node_visits: usize,
+        build_visits: usize,
+    }
+
+    impl SpanObservation for Counts {
+        fn node(&mut self) {
+            self.node_visits += 1;
+        }
+
+        fn build(&mut self) {
+            self.build_visits += 1;
+        }
+    }
 
     #[test]
     fn m0_free_bytes_follow_incremental_build_and_fragmented_allocation() {
@@ -351,21 +354,21 @@ mod tests {
                 .collect();
             let mut index = FreeSpans::from(spans);
             let requests = 2 * holes;
-            assert_eq!(index.build_visits, 2 * holes - 1);
+            assert_eq!(index.observation.build_visits, 2 * holes - 1);
             for i in 0..requests {
                 assert_eq!(index.take(64), Some((2 * (i / 4) + 1) * 512 + (i % 4) * 64));
             }
             let expected = requests * (1 + 2 * holes.ilog2() as usize);
-            assert_eq!(index.node_visits, expected);
+            assert_eq!(index.observation.node_visits, expected);
             assert_eq!(index.take(64), None);
-            assert_eq!(index.node_visits, expected + 1);
+            assert_eq!(index.observation.node_visits, expected + 1);
             assert_eq!(index.largest(), 8);
             // The old allocator inspected every remaining hole, including all
             // small holes, on each allocation to recompute the maximum.
             let linear_visits = (0..requests).map(|i| holes - i / 4).sum::<usize>();
             eprintln!(
                 "free_spans holes={holes} requests={requests} old_scan_visits={linear_visits} index_visits={expected} build_visits={}",
-                index.build_visits
+                index.observation.build_visits
             );
         }
     }

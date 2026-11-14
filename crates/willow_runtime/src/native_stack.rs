@@ -23,7 +23,7 @@ thread_local! {
     static IDLE_STACKS: std::cell::RefCell<Vec<Box<NativeStack>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-use crate::worker_affinity::{WorkerAffinity, acquire};
+use crate::worker_affinity::{WorkerAffinity, acquire_in};
 #[cfg(test)]
 pub(crate) use crate::worker_affinity::{affinity_counts_for_test, required_workers};
 
@@ -43,10 +43,13 @@ pub(crate) struct NativeStack {
     result: i32,
     suspended: bool,
     cancelled: bool,
-    /// Cancel-request epoch at this stack's last task-state look; 0 forces a
-    /// look. `cancelled()` re-reads the shared task table only when the epoch
-    /// has moved, so per-call checks stay thread-local.
+    /// Cancel-request epoch of the leasing task's table at this stack's last
+    /// task-state look; 0 forces a look. `cancelled()` re-reads the shared task
+    /// table only when that epoch has moved, so per-call checks stay
+    /// thread-local and requests in other runtimes never force a look.
     cancel_epoch: u64,
+    /// Epoch of the table that owns the leasing task.
+    cancel_epoch_source: *const crate::task_state::CancelEpoch,
     cleanup_depth: u32,
     /// Countdown that generated synchronous safepoints decrement inline; they
     /// enter `willow_sync_safepoint` only when it reaches zero. Generated code
@@ -82,17 +85,26 @@ unsafe impl Send for NativeStack {}
 
 impl NativeStack {
     pub(crate) fn acquire(poll: RuntimePollFn, frame: *mut c_void) -> Box<Self> {
+        Self::acquire_in(crate::runtime::current(), poll, frame)
+    }
+
+    pub(crate) fn acquire_in(
+        owner: &crate::runtime::Runtime,
+        poll: RuntimePollFn,
+        frame: *mut c_void,
+    ) -> Box<Self> {
         if let Some(mut stack) = IDLE_STACKS.with(|pool| pool.borrow_mut().pop()) {
-            stack.affinity = Some(acquire(stack.worker));
+            stack.affinity = Some(acquire_in(owner, stack.worker));
             stack.context.clear_helper();
+            stack.context.publish_gates(owner);
             stack.native_frames = 0;
             stack.poll = poll;
             stack.cancel_entry = None;
             stack.frame = frame;
-            let (epoch, cancelled) =
-                crate::scheduler::current_cancel_snapshot().unwrap_or((0, false));
-            stack.cancelled = cancelled;
-            stack.cancel_epoch = epoch;
+            let snapshot = cancel_snapshot();
+            stack.cancelled = snapshot.cancelled;
+            stack.cancel_epoch = snapshot.epoch;
+            stack.cancel_epoch_source = snapshot.source;
             stack.cleanup_depth = 0;
             stack.poll_countdown = 0;
             stack.poll_granted = 0;
@@ -102,7 +114,7 @@ impl NativeStack {
             stack.reference_context = Default::default();
             stack
         } else {
-            Self::new(poll, frame)
+            Self::new_in(owner, poll, frame)
         }
     }
 
@@ -114,12 +126,16 @@ impl NativeStack {
         self.entry_panic_depth
     }
 
-    pub(crate) fn acquire_cleanup(cancel: RuntimeCancelFn, frame: *mut c_void) -> Box<Self> {
+    pub(crate) fn acquire_cleanup_in(
+        owner: &crate::runtime::Runtime,
+        cancel: RuntimeCancelFn,
+        frame: *mut c_void,
+    ) -> Box<Self> {
         #[willow_runtime_macros::ffi_boundary]
         unsafe extern "C" fn unused_poll(_: *mut c_void) -> i32 {
             unreachable!()
         }
-        let mut stack = Self::acquire(unused_poll, frame);
+        let mut stack = Self::acquire_in(owner, unused_poll, frame);
         stack.cancel_entry = Some(cancel);
         stack.cancelled = true;
         stack.cleanup_depth = 1;
@@ -132,7 +148,16 @@ impl NativeStack {
         IDLE_STACKS.with(|pool| pool.borrow_mut().push(stack));
     }
 
+    #[cfg(test)]
     pub(crate) fn new(poll: RuntimePollFn, frame: *mut c_void) -> Box<Self> {
+        Self::new_in(crate::runtime::current(), poll, frame)
+    }
+
+    fn new_in(
+        owner: &crate::runtime::Runtime,
+        poll: RuntimePollFn,
+        frame: *mut c_void,
+    ) -> Box<Self> {
         // Windows stacks inherit the current thread's overflow guarantee.
         crate::stack_overflow::protect_current_thread();
         let storage = corosensei::stack::DefaultStack::new(8 * 1024 * 1024).unwrap_or_else(|_| {
@@ -144,12 +169,11 @@ impl NativeStack {
             let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
             (lower, lower + page)
         };
-        let (cancel_epoch, cancelled) =
-            crate::scheduler::current_cancel_snapshot().unwrap_or((0, false));
+        let snapshot = cancel_snapshot();
         Box::new(Self {
-            context: crate::generated_context::Context::new(),
+            context: crate::generated_context::Context::for_runtime(owner),
             worker: crate::scheduler::current_worker(),
-            affinity: Some(acquire(crate::scheduler::current_worker())),
+            affinity: Some(acquire_in(owner, crate::scheduler::current_worker())),
             owner_thread: std::thread::current().id(),
             native_frames: 0,
             coroutine: Coroutine::with_stack(storage, |yielder, ()| trampoline(yielder)),
@@ -161,8 +185,9 @@ impl NativeStack {
             frame,
             result: 0,
             suspended: false,
-            cancelled,
-            cancel_epoch,
+            cancelled: snapshot.cancelled,
+            cancel_epoch: snapshot.epoch,
+            cancel_epoch_source: snapshot.source,
             cleanup_depth: 0,
             poll_countdown: 0,
             poll_granted: 0,
@@ -447,7 +472,7 @@ pub(crate) fn cancelled() -> i32 {
         if !(*stack).cancelled {
             // Load the epoch BEFORE the state: a request that lands after this
             // load advances the epoch again, so the next call looks.
-            let epoch = crate::task_state::cancel_epoch();
+            let epoch = (*(*stack).cancel_epoch_source).load();
             if epoch != (*stack).cancel_epoch {
                 let task = crate::scheduler::willow_sched_current_task();
                 (*stack).cancelled = crate::scheduler::willow_sched_is_cancelled(task) != 0;
@@ -456,6 +481,18 @@ pub(crate) fn cancelled() -> i32 {
         }
         i32::from((*stack).cancelled)
     }
+}
+
+/// Without a claim snapshot, epoch 0 forces the first look in the task table
+/// of the runtime this thread serves.
+fn cancel_snapshot() -> crate::scheduler::CancelSnapshot {
+    crate::scheduler::current_cancel_snapshot().unwrap_or_else(|| {
+        crate::scheduler::CancelSnapshot {
+            source: crate::scheduler::current_cancel_epoch(),
+            epoch: 0,
+            cancelled: false,
+        }
+    })
 }
 
 pub(crate) fn cleanup_enter() {
@@ -500,7 +537,7 @@ mod tests {
             willow_sync_safepoint();
             RUNTIME_POLL_READY
         }
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let mut stack = NativeStack::new(helper, std::ptr::null_mut());
         for expected_owner in [Some(stack.worker), Some(stack.worker)] {
             begin_quantum(
@@ -542,7 +579,7 @@ mod tests {
             COMPLETED.store(result.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
             RUNTIME_POLL_READY
         }
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         for cancel in [false, true] {
             reset_global_scheduler_for_test();
             COMPLETED.store(999, std::sync::atomic::Ordering::SeqCst);
@@ -593,7 +630,7 @@ mod tests {
             );
             RUNTIME_POLL_READY
         }
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         for count in [1, 16, 64] {
             reset_global_scheduler_for_test();
             DROPS.store(0, Ordering::SeqCst);
@@ -644,7 +681,7 @@ mod tests {
             assert!(result == crate::task::RUNTIME_POLL_PENDING || result == RUNTIME_POLL_READY);
             result
         }
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         reset_global_scheduler_for_test();
         let task = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
         willow_sched_run_until(task);
@@ -662,7 +699,7 @@ mod tests {
             assert_ne!(cancelled(), 0);
             RUNTIME_POLL_READY
         }
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         reset_global_scheduler_for_test();
         let task = willow_sched_spawn(sleeper, std::ptr::null_mut());
         willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
@@ -681,7 +718,7 @@ mod tests {
             assert_ne!(cancelled(), 0);
             RUNTIME_POLL_READY
         }
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         reset_global_scheduler_for_test();
         let task = willow_sched_spawn(sleeper, std::ptr::null_mut());
         willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
@@ -693,7 +730,7 @@ mod tests {
 
     #[test]
     fn affinity_lease_is_released_by_recycle_and_drop() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::scheduler::reset_global_scheduler_for_test();
         unsafe extern "C" fn ready(_: *mut c_void) -> i32 {
             RUNTIME_POLL_READY
@@ -703,7 +740,11 @@ mod tests {
         assert_eq!(required_workers(), stack.worker + 1);
         NativeStack::recycle(stack);
         assert_eq!(required_workers(), 0);
-        let stack = NativeStack::acquire_cleanup(cleanup_noop, std::ptr::null_mut());
+        let stack = NativeStack::acquire_cleanup_in(
+            crate::runtime::current(),
+            cleanup_noop,
+            std::ptr::null_mut(),
+        );
         assert_eq!(required_workers(), stack.worker + 1);
         drop(stack);
         assert_eq!(required_workers(), 0);
@@ -753,7 +794,7 @@ mod tests {
 
     #[test]
     fn recycled_stack_preserves_float_locals_and_uses_the_new_frame() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         unsafe extern "C" fn poll(frame: *mut c_void) -> i32 {
             let initial = unsafe { *frame.cast::<f64>() };
             let locals = std::array::from_fn::<_, 32, _>(|i| initial + i as f64 * 0.25);
@@ -814,7 +855,7 @@ mod tests {
             assert_eq!(bounds().1, task_bounds.1);
             RUNTIME_POLL_READY
         }
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let parent = bounds();
         let mut task_bounds = (0usize, 0usize);
         let mut stack = NativeStack::new(poll, std::ptr::from_mut(&mut task_bounds).cast());
@@ -855,7 +896,7 @@ mod tests {
 
     #[test]
     fn native_recursion_resumes_values_without_growing_scheduler_stack() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let mut output = 0u64;
         let mut stack = NativeStack::new(recursive_poll, (&mut output as *mut u64).cast());
         let mut yields = 0;
@@ -929,7 +970,7 @@ mod tests {
     #[test]
     fn inline_countdown_bounds_runtime_calls_and_keeps_budget_trip_points() {
         use crate::preempt::SYNC_POLL_STRIDE;
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         for (budget, safepoints) in [(1000, 10_000), (1000, 100_000), (1, 50), (64, 640)] {
             let state = run_counted(budget, safepoints);
             // Unbatched checks trip at exactly every `budget`-th safepoint.
@@ -1021,7 +1062,7 @@ mod tests {
         use crate::scheduler::{
             reset_global_scheduler_for_test, willow_sched_run_until, willow_sched_spawn_cooperative,
         };
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         for (budget, async_prefix, helpers, polls_per_helper) in [
             (8, 0, 1, 3), // Reviewer reproducer: five checks, not seven.
             (8, 2, 1, 3), // Async -> sync -> async in one quantum.
@@ -1147,7 +1188,7 @@ mod tests {
 
     #[test]
     fn native_batched_no_preempt_preserves_partial_debt() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         for prefix in [0u64, 1, 20, 63, 64, 65, 99] {
             for suppressed in [0u64, 5, 63, 64, 65, 200] {
                 for nested in [false, true] {
@@ -1172,7 +1213,7 @@ mod tests {
 
     #[test]
     fn batched_async_and_sync_share_exact_budget() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         for budget in [1u64, 2, 3, 63, 64, 65, 127, 1024] {
             for sync_run in [0, 1, 2, 7, 63, 64, 100] {
                 let mut state = MixedPolls {
@@ -1232,7 +1273,7 @@ mod tests {
 
     #[test]
     fn mixed_sync_async_safepoints_share_exact_budget() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         for budget in [1u64, 3, 8, 64, 65, 1024] {
             for sync_run in [0, 1, 2, 7, 63, 64, 100] {
                 let mut state = MixedPolls {
@@ -1283,7 +1324,7 @@ mod tests {
 
     #[test]
     fn sync_inline_grant_is_invalidated_after_runtime_wait() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let mut finished = false;
         let mut stack = NativeStack::new(
             partial_grant_across_wait,
@@ -1339,7 +1380,7 @@ mod tests {
 
     #[test]
     fn sync_inline_grant_is_invalidated_after_nested_quantum() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let mut finished = false;
         let mut stack = NativeStack::new(
             partial_grant_across_nested_quantum,
@@ -1395,7 +1436,7 @@ mod tests {
 
     #[test]
     fn mixed_sync_async_no_preempt_region_preserves_budget() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let mut checks = [-1; 2];
         let mut stack = NativeStack::new(
             suppressed_mixed_poll,
@@ -1439,7 +1480,7 @@ mod tests {
 
     #[test]
     fn mixed_sync_async_share_deadline_without_rearming() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         for sync_last in [false, true] {
             for quantum_ms in ["1", "100000"] {
                 let mut state = MixedDeadline {
@@ -1494,7 +1535,7 @@ mod tests {
     #[test]
     fn inline_countdown_still_honors_the_time_quantum() {
         use crate::preempt::SYNC_POLL_STRIDE;
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let mut state = CountedLoop {
             safepoints: 0,
             runtime_calls: 0,
@@ -1550,7 +1591,7 @@ mod tests {
 
     #[test]
     fn suspended_stack_keeps_nested_reference_context_private() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         let saved = crate::reference_debug::replace_current(Default::default());
         let mut stack = NativeStack::new(reference_poll, std::ptr::null_mut());
@@ -1575,7 +1616,7 @@ mod tests {
 
     #[test]
     fn task_overflow_names_survive_suspend_peers_and_recycling() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         const NAMES: [&[u8]; 3] = [b"first", b"second_longer", b"third"];
         unsafe extern "C" fn poll(frame: *mut c_void) -> i32 {
             let name = NAMES[frame as usize % NAMES.len()];
@@ -1638,7 +1679,7 @@ mod tests {
 
     #[test]
     fn suspended_stack_keeps_trace_private_on_its_owner_thread() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let mut stack = NativeStack::new(trace_poll, std::ptr::null_mut());
         assert_eq!(
             unsafe { NativeStack::resume(&mut *stack) },
@@ -1666,7 +1707,7 @@ mod tests {
 
     #[test]
     fn parked_native_slots_survive_collection_and_leave_no_thread_roots() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let depth = crate::gc::gc_thread_root_depth();
         let mut stack = NativeStack::new(rooted_poll, std::ptr::null_mut());
         assert_eq!(
@@ -1685,7 +1726,7 @@ mod tests {
     fn unwind_reason_distinguishes_cancel_panic_and_cleanup_suppression() {
         use crate::panic_context::*;
         use willow_abi::unwind_reason::{CANCEL, NONE, PANIC};
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         let saved = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(901))));
         unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
@@ -1766,7 +1807,7 @@ mod tests {
             cleanup_leave();
             RUNTIME_POLL_READY
         }
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         let saved = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(902))));
         measure("sync-clean");
@@ -1779,9 +1820,12 @@ mod tests {
         replace_current_context(saved);
     }
 
-    static CANCEL_TARGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static DEFER_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static PEER_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static CANCEL_TARGET: crate::runtime::PerRuntime<std::sync::atomic::AtomicU64> =
+        crate::runtime::PerRuntime::new(|| std::sync::atomic::AtomicU64::new(0));
+    static DEFER_COUNT: crate::runtime::PerRuntime<std::sync::atomic::AtomicU64> =
+        crate::runtime::PerRuntime::new(|| std::sync::atomic::AtomicU64::new(0));
+    static PEER_RAN: crate::runtime::PerRuntime<std::sync::atomic::AtomicBool> =
+        crate::runtime::PerRuntime::new(|| std::sync::atomic::AtomicBool::new(false));
 
     unsafe extern "C" fn cancellable_poll(_: *mut c_void) -> i32 {
         fn helper(depth: usize) {
@@ -1824,7 +1868,7 @@ mod tests {
 
     #[test]
     fn synchronous_loop_yields_to_peer_and_cancellation_unwinds_every_frame() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let _single = crate::scheduler::single_worker_for_test();
         crate::scheduler::reset_global_scheduler_for_test();
         DEFER_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -1840,8 +1884,9 @@ mod tests {
         crate::scheduler::reset_global_scheduler_for_test();
     }
 
-    static AFFINITY_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> =
-        std::sync::Mutex::new(None);
+    static AFFINITY_THREAD: crate::runtime::PerRuntime<
+        std::sync::Mutex<Option<std::thread::ThreadId>>,
+    > = crate::runtime::PerRuntime::new(|| std::sync::Mutex::new(None));
     unsafe extern "C" fn affinity_poll(_: *mut c_void) -> i32 {
         let original = std::thread::current().id();
         *AFFINITY_THREAD.lock().unwrap() = Some(original);
@@ -1857,7 +1902,7 @@ mod tests {
 
     #[test]
     fn suspended_native_stack_keeps_os_owner_across_separate_scheduler_drives() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let _single = crate::scheduler::single_worker_for_test();
         crate::scheduler::reset_global_scheduler_for_test();
         *AFFINITY_THREAD.lock().unwrap() = None;
@@ -1890,7 +1935,7 @@ mod tests {
 
     #[test]
     fn initial_async_cancellation_cleanup_can_yield_its_native_helpers() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let _single = crate::scheduler::single_worker_for_test();
         crate::scheduler::reset_global_scheduler_for_test();
         PEER_RAN.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1914,7 +1959,7 @@ mod tests {
 
     #[test]
     fn runtime_poll_without_generated_epilogue_still_runs_registered_cleanup() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let _single = crate::scheduler::single_worker_for_test();
         crate::scheduler::reset_global_scheduler_for_test();
         DEFER_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);

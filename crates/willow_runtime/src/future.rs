@@ -18,7 +18,7 @@
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::trace::{GcRootSet, GcTrace, GcVisitor};
@@ -85,73 +85,102 @@ fn ready_future<T: Clone>(value: T) -> RuntimeFuture<T> {
 struct Entry {
     address: usize,
     ty: TypeId,
+    release: unsafe fn(usize),
+}
+impl Drop for Entry {
+    fn drop(&mut self) {
+        if self.address != 0 {
+            // SAFETY: an entry owns its Box until checked_address transfers it.
+            unsafe { (self.release)(self.address) };
+        }
+    }
 }
 
 #[derive(Default)]
-struct Handles {
+pub(crate) struct Handles {
     next: usize,
     live: HashMap<usize, Entry>,
+    operations: crate::observation::Value<HashMap<std::thread::ThreadId, [usize; 3]>>,
 }
 
 fn handles() -> &'static Mutex<Handles> {
-    static HANDLES: OnceLock<Mutex<Handles>> = OnceLock::new();
-    HANDLES.get_or_init(Mutex::default)
+    &crate::runtime::current().future_handles
 }
 
-#[cfg(test)]
-thread_local! {
-    // Per-thread counts isolate scaling evidence from concurrent test cases.
-    static HANDLE_OPERATIONS: std::cell::Cell<[usize; 3]> = const {
-        std::cell::Cell::new([0; 3])
-    };
-}
+impl Handles {
+    fn record(&mut self, insert: usize, lookup: usize, remove: usize) {
+        self.operations.observe_mut(|threads| {
+            let counts = threads.entry(std::thread::current().id()).or_default();
+            counts[0] += insert;
+            counts[1] += lookup;
+            counts[2] += remove;
+        });
+    }
 
-#[cfg(test)]
-fn record_handle_operations(insert: usize, lookup: usize, remove: usize) {
-    HANDLE_OPERATIONS.with(|counts| {
-        let old = counts.get();
-        counts.set([old[0] + insert, old[1] + lookup, old[2] + remove]);
-    });
+    #[cfg(test)]
+    fn counts(&self) -> [usize; 3] {
+        self.operations
+            .get(&std::thread::current().id())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn register<T: 'static>(&mut self, value: T) -> *mut c_void {
+        unsafe fn release<T>(address: usize) {
+            // SAFETY: the matching registration created this typed Box.
+            unsafe { drop(Box::from_raw(address as *mut T)) };
+        }
+        let owned = Box::new(value);
+        let Some(token) = self.next.checked_add(1) else {
+            crate::panic_context::fatal_invariant("legacy future handle space exhausted");
+        };
+        self.next = token;
+        self.live.insert(
+            token,
+            Entry {
+                address: Box::into_raw(owned) as usize,
+                ty: TypeId::of::<T>(),
+                release: release::<T>,
+            },
+        );
+        self.record(1, 0, 0);
+        std::ptr::without_provenance_mut(token)
+    }
+
+    fn checked_address<T: 'static>(&mut self, raw: *mut c_void, release: bool) -> *mut T {
+        if raw.is_null() {
+            crate::panic_context::fatal_invariant("null legacy future handle");
+        }
+        let token = raw.addr();
+        let Some(entry) = self.live.get(&token) else {
+            crate::panic_context::fatal_invariant("invalid or released legacy future handle");
+        };
+        if entry.ty != TypeId::of::<T>() {
+            crate::panic_context::fatal_invariant("legacy future handle type mismatch");
+        }
+        let address = entry.address as *mut T;
+        if release {
+            // Transfer ownership; the matching ABI release consumes the Box.
+            let mut transferred = self.live.remove(&token).unwrap();
+            transferred.address = 0;
+        }
+        self.record(0, 1, usize::from(release));
+        address
+    }
 }
 
 fn register<T: 'static>(value: T) -> *mut c_void {
-    let owned = Box::new(value);
-    let mut handles = handles().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(token) = handles.next.checked_add(1) else {
-        crate::panic_context::fatal_invariant("legacy future handle space exhausted");
-    };
-    handles.next = token;
-    handles.live.insert(
-        token,
-        Entry {
-            address: Box::into_raw(owned) as usize,
-            ty: TypeId::of::<T>(),
-        },
-    );
-    #[cfg(test)]
-    record_handle_operations(1, 0, 0);
-    std::ptr::without_provenance_mut(token)
+    handles()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .register(value)
 }
 
 fn checked_address<T: 'static>(raw: *mut c_void, release: bool) -> *mut T {
-    if raw.is_null() {
-        crate::panic_context::fatal_invariant("null legacy future handle");
-    }
-    let mut handles = handles().lock().unwrap_or_else(|e| e.into_inner());
-    let token = raw.addr();
-    let Some(entry) = handles.live.get(&token) else {
-        crate::panic_context::fatal_invariant("invalid or released legacy future handle");
-    };
-    if entry.ty != TypeId::of::<T>() {
-        crate::panic_context::fatal_invariant("legacy future handle type mismatch");
-    }
-    let address = entry.address as *mut T;
-    if release {
-        handles.live.remove(&token);
-    }
-    #[cfg(test)]
-    record_handle_operations(0, 1, usize::from(release));
-    address
+    handles()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .checked_address(raw, release)
 }
 
 fn into_raw<T: 'static>(future: RuntimeFuture<T>) -> *mut c_void {
@@ -621,7 +650,7 @@ mod tests {
         unsafe extern "C" fn cancel(_: *mut c_void) -> i32 {
             wait(60_000)
         }
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         reset_global_scheduler_for_test();
         DROPS.store(0, Ordering::SeqCst);
         for (index, callback) in [finish as crate::task::RuntimePollFn, cancel]
@@ -645,9 +674,50 @@ mod tests {
     }
 
     #[test]
+    fn private_legacy_handle_tables_release_only_their_owned_allocations() {
+        struct Owned(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+        let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+        let a = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let b = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token = first
+            .future_handles
+            .lock()
+            .unwrap()
+            .register(Owned(a.clone()));
+        let peer = second
+            .future_handles
+            .lock()
+            .unwrap()
+            .register(Owned(b.clone()));
+        assert_eq!(token, peer, "tokens are scoped by the selected table");
+        let address = first
+            .future_handles
+            .lock()
+            .unwrap()
+            .checked_address::<Owned>(token, true);
+        assert_eq!(a.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Explicit release transfers ownership exactly once.
+        unsafe { drop(Box::from_raw(address)) };
+        drop(first);
+        assert_eq!(a.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(b.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(second.future_handles.lock().unwrap().live.len(), 1);
+        drop(second);
+        assert_eq!(b.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(std::sync::Arc::strong_count(&a), 1);
+        assert_eq!(std::sync::Arc::strong_count(&b), 1);
+    }
+
+    #[test]
     fn legacy_registry_fragmentation_and_generation_counts() {
         for count in [1_usize, 16, 256, 1024] {
-            let before = HANDLE_OPERATIONS.with(|counts| counts.get());
+            let before = handles().lock().unwrap().counts();
             let tokens: Vec<_> = (0..count)
                 .map(|i| willow_future_ready_i64(i as i64))
                 .collect();
@@ -683,7 +753,7 @@ mod tests {
                     .chain(replacements.iter())
                     .all(|p| !registry.live.contains_key(&p.addr()))
             );
-            let after = HANDLE_OPERATIONS.with(|counts| counts.get());
+            let after = registry.counts();
             let operations = std::array::from_fn::<_, 3, _>(|i| after[i] - before[i]);
             let releases = count + replacements.len();
             assert_eq!(

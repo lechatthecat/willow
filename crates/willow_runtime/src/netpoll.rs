@@ -106,8 +106,7 @@ pub struct RuntimeNetPoll {
     by_task: HashMap<RuntimeTaskId, HashSet<RegistrationKey>>,
     by_fd: HashMap<RawFd, HashSet<RegistrationKey>>,
     interest_counts: HashMap<RawFd, [usize; 2]>,
-    #[cfg(test)]
-    ready_visits: std::cell::Cell<usize>,
+    ready_visits: crate::observation::Value<std::cell::Cell<usize>>,
     ready_tokens: VecDeque<usize>,
     backend: backend::Backend,
 }
@@ -144,8 +143,7 @@ impl RuntimeNetPoll {
             by_task: HashMap::new(),
             by_fd: HashMap::new(),
             interest_counts: HashMap::new(),
-            #[cfg(test)]
-            ready_visits: std::cell::Cell::new(0),
+            ready_visits: crate::observation::Value::default(),
             ready_tokens: VecDeque::new(),
             backend: backend::Backend::default(),
         }
@@ -366,8 +364,8 @@ impl RuntimeNetPoll {
             .into_iter()
             .flat_map(|waiters| waiters.range(..sequence_limit).map(|(_, key)| key))
         {
-            #[cfg(test)]
-            self.ready_visits.set(self.ready_visits.get() + 1);
+            self.ready_visits
+                .observe(|visits| visits.set(visits.get() + 1));
             let registration = &self.registrations[self.slots[key].position];
             if let Some(ready) = ready_interest
                 && !registration.interest.overlaps(ready)
@@ -443,29 +441,55 @@ struct ReadyEvent {
     interest: Option<IoInterest>,
 }
 
-static GLOBAL_NETPOLL: LazyLock<Mutex<RuntimeNetPoll>> =
-    LazyLock::new(|| Mutex::new(RuntimeNetPoll::new()));
+/// Native poll resources and registration indexes belong to one runtime.
+/// A borrowed service keeps the backend alive across unlocked OS waits.
+pub(crate) struct NetpollService {
+    poll: LazyLock<Mutex<RuntimeNetPoll>>,
+    has_waiters: AtomicBool,
+}
 
-/// Mirrors `GLOBAL_NETPOLL.has_waiters()`, written under its lock, so idle
-/// workers and the run loop ask without taking that lock.
-static HAS_WAITERS: AtomicBool = AtomicBool::new(false);
+impl NetpollService {
+    pub(crate) const fn new() -> Self {
+        Self {
+            poll: LazyLock::new(|| Mutex::new(RuntimeNetPoll::new())),
+            has_waiters: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut RuntimeNetPoll) -> R) -> R {
+        let mut guard = self.poll.lock().expect("netpoll mutex poisoned");
+        let result = f(&mut guard);
+        self.has_waiters
+            .store(guard.has_waiters(), Ordering::Release);
+        result
+    }
+
+    pub(crate) fn has_waiters(&self) -> bool {
+        self.has_waiters.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn purge_task(&self, task_id: RuntimeTaskId) {
+        self.with(|poll| poll.purge_task(task_id));
+    }
+
+    pub(crate) fn wait_ready_tasks(&self, timeout: Option<Duration>) -> Vec<RuntimeTaskId> {
+        let initial = self.with(|poll| {
+            let events = poll.drain_ready_tokens();
+            poll.tasks_for_ready_events(events)
+        });
+        if !initial.is_empty() {
+            return initial;
+        }
+        backend::wait_ready_tasks(self, timeout)
+    }
+}
 
 fn with_global<R>(f: impl FnOnce(&mut RuntimeNetPoll) -> R) -> R {
-    let mut guard = GLOBAL_NETPOLL.lock().expect("netpoll mutex poisoned");
-    let result = f(&mut guard);
-    HAS_WAITERS.store(guard.has_waiters(), Ordering::Release);
-    result
+    crate::runtime::current().netpoll.with(f)
 }
 
 pub(crate) fn has_waiters() -> bool {
-    HAS_WAITERS.load(Ordering::Acquire)
-}
-
-/// Purge every registration owned by a cancelled task. Safe
-/// to call with the scheduler lock held: the netpoll lock is only ever held
-/// briefly (never across `epoll_wait`), and no path nests netpoll -> scheduler.
-pub(crate) fn purge_task(task_id: RuntimeTaskId) {
-    with_global(|poll| poll.purge_task(task_id));
+    crate::runtime::current().netpoll.has_waiters()
 }
 
 /// Remove the running task's registration without disturbing other operations
@@ -505,15 +529,7 @@ pub(crate) fn wait_and_wake(timeout: Option<Duration>) -> usize {
 }
 
 fn wait_ready_tasks(timeout: Option<Duration>) -> Vec<RuntimeTaskId> {
-    let initial = with_global(|poll| {
-        let events = poll.drain_ready_tokens();
-        poll.tasks_for_ready_events(events)
-    });
-    if !initial.is_empty() {
-        return initial;
-    }
-
-    backend::wait_ready_tasks(timeout)
+    crate::runtime::current().netpoll.wait_ready_tasks(timeout)
 }
 
 #[unsafe(no_mangle)]
@@ -607,6 +623,70 @@ pub fn reset_global_netpoll_for_test() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn private_netpoll_services_keep_native_waits_and_teardown_independent() {
+        use std::io::{Read, Write};
+        #[cfg(unix)]
+        use std::os::fd::AsRawFd;
+        #[cfg(windows)]
+        use std::os::windows::io::AsRawSocket;
+        let start = std::sync::Barrier::new(2);
+        let peer_gone = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for rounds in [1, 3] {
+                let start = &start;
+                let peer_gone = &peer_gone;
+                scope.spawn(crate::runtime::serving(move || {
+                    let owner =
+                        crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+                    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                    let mut writer =
+                        std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                    let (mut reader, _) = listener.accept().unwrap();
+                    #[cfg(unix)]
+                    let fd = reader.as_raw_fd() as i64;
+                    #[cfg(windows)]
+                    let fd = reader.as_raw_socket() as i64;
+                    assert_eq!(
+                        owner
+                            .netpoll
+                            .with(|poll| poll.register_fd(fd, 7, IoInterest::Readable)),
+                        0
+                    );
+                    start.wait();
+                    for round in 0..rounds {
+                        if round == 1 {
+                            while !peer_gone.load(Ordering::Acquire) {
+                                std::thread::yield_now();
+                            }
+                        }
+                        writer.write_all(&[42]).unwrap();
+                        assert_eq!(
+                            owner.netpoll.wait_ready_tasks(Some(Duration::from_secs(2))),
+                            vec![7]
+                        );
+                        let mut byte = [0];
+                        reader.read_exact(&mut byte).unwrap();
+                        assert_eq!(byte, [42]);
+                        assert!(owner.netpoll.has_waiters());
+                    }
+                    owner.netpoll.purge_task(7);
+                    assert!(!owner.netpoll.has_waiters());
+                    assert!(
+                        owner
+                            .netpoll
+                            .wait_ready_tasks(Some(Duration::ZERO))
+                            .is_empty()
+                    );
+                    drop(owner);
+                    if rounds == 1 {
+                        peer_gone.store(true, Ordering::Release);
+                    }
+                }));
+            }
+        });
+    }
+
     #[cfg(target_os = "linux")]
     use super::backend::wait_platform_events;
     #[cfg(target_os = "windows")]
@@ -925,7 +1005,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     use crate::async_frame::{async_frame_slot_offset, willow_async_frame_alloc};
     #[cfg(any(unix, windows))]
-    use crate::gc::{reset_internal_for_test, runtime_test_guard};
+    use crate::gc::{isolated_runtime, reset_internal_for_test};
     #[cfg(any(unix, windows))]
     use crate::scheduler::{
         reset_global_scheduler_for_test, willow_sched_run, willow_sched_spawn,
@@ -939,7 +1019,8 @@ mod tests {
     #[cfg(any(unix, windows))]
     use std::sync::atomic::Ordering;
 
-    static NETPOLL_TEST_LAST_REGISTER: AtomicI32 = AtomicI32::new(0);
+    static NETPOLL_TEST_LAST_REGISTER: crate::runtime::PerRuntime<AtomicI32> =
+        crate::runtime::PerRuntime::new(|| AtomicI32::new(0));
 
     fn assert_indexes(poll: &RuntimeNetPoll) {
         assert_eq!(poll.slots.len(), poll.registrations.len());
@@ -1214,7 +1295,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn netpoll_wake_resumes_parked_task() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         reset_global_scheduler_for_test();
         reset_global_netpoll_for_test();
@@ -1231,12 +1312,12 @@ mod tests {
         }
         let id = willow_sched_spawn(poll_netpoll_manual_wake, frame as *mut c_void);
         let token = read_fd as i64;
-        let waker = std::thread::spawn(move || {
+        let waker = std::thread::spawn(crate::runtime::serving(move || {
             while NETPOLL_TEST_LAST_REGISTER.load(Ordering::SeqCst) == i32::MIN {
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert_eq!(willow_netpoll_wake(token), 1);
-        });
+        }));
 
         assert_eq!(willow_sched_run(), 1);
         assert_eq!(NETPOLL_TEST_LAST_REGISTER.load(Ordering::SeqCst), 0);
@@ -1276,7 +1357,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
     #[test]
     fn netpoll_unix_readiness_wakes_scheduler_idle_task() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         reset_global_scheduler_for_test();
         reset_global_netpoll_for_test();
@@ -1292,14 +1373,14 @@ mod tests {
             *((frame.add(async_frame_slot_offset(0))) as *mut i32) = read_fd;
         }
         let id = willow_sched_spawn(poll_pipe_readable, frame as *mut c_void);
-        let writer = std::thread::spawn(move || {
+        let writer = std::thread::spawn(crate::runtime::serving(move || {
             std::thread::sleep(Duration::from_millis(10));
             let byte = [b'x'];
             unsafe {
                 libc::write(write_fd, byte.as_ptr().cast::<libc::c_void>(), 1);
                 libc::close(write_fd);
             }
-        });
+        }));
 
         assert_eq!(willow_sched_run(), 1);
         assert_eq!(NETPOLL_TEST_LAST_REGISTER.load(Ordering::SeqCst), 0);
@@ -1336,7 +1417,7 @@ mod tests {
     fn netpoll_windows_socket_readiness_wakes_scheduler_idle_task() {
         use std::os::windows::io::AsRawSocket;
 
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         reset_global_scheduler_for_test();
         reset_global_netpoll_for_test();
@@ -1352,12 +1433,12 @@ mod tests {
                 receiver.as_raw_socket() as i64;
         }
         let id = willow_sched_spawn(poll_socket_readable, frame as *mut c_void);
-        let writer = std::thread::spawn(move || {
+        let writer = std::thread::spawn(crate::runtime::serving(move || {
             while NETPOLL_TEST_LAST_REGISTER.load(Ordering::SeqCst) == i32::MIN {
                 std::thread::sleep(Duration::from_millis(1));
             }
             sender.send(b"x").unwrap();
-        });
+        }));
 
         assert_eq!(willow_sched_run(), 1);
         assert_eq!(NETPOLL_TEST_LAST_REGISTER.load(Ordering::SeqCst), 0);

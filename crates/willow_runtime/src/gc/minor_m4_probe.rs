@@ -10,7 +10,7 @@ fn setting(name: &str, default: usize) -> usize {
 #[test]
 #[ignore = "explicit M4 release measurement, independent dimensions"]
 fn m4_pause_scaling_probe() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _stress = GcStressTestScope::normal();
     let chunks = setting("M4_CHUNKS", 16);
     let roots = setting("M4_ROOTS", 256);
@@ -37,7 +37,7 @@ fn m4_pause_scaling_probe() {
             .map(|_| {
                 let done = done.clone();
                 let ready = ready.clone();
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     willow_gc_register_mutator();
                     ready.wait();
                     while !done.load(Ordering::Acquire) {
@@ -45,7 +45,7 @@ fn m4_pause_scaling_probe() {
                         std::thread::yield_now();
                     }
                     willow_gc_unregister_mutator();
-                })
+                }))
             })
             .collect();
         ready.wait();

@@ -111,8 +111,6 @@ unsafe fn snapshot_blocking_cell(payload: *mut u8, children: &mut Vec<*mut u8>) 
 /// `payload` must point to an initialized [`WillowBlockingCell`].
 unsafe fn drop_blocking_cell(payload: *mut u8) {
     unsafe { std::ptr::drop_in_place(payload as *mut WillowBlockingCell) };
-    #[cfg(test)]
-    BLOCKING_CELL_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// # Safety
@@ -167,21 +165,19 @@ unsafe fn snapshot_blocking_rw_cell(payload: *mut u8, children: &mut Vec<*mut u8
 /// `payload` must point to an initialized [`WillowBlockingRwCell`].
 unsafe fn drop_blocking_rw_cell(payload: *mut u8) {
     unsafe { std::ptr::drop_in_place(payload as *mut WillowBlockingRwCell) };
-    #[cfg(test)]
-    BLOCKING_RW_CELL_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(test)]
-static BLOCKING_CELL_DROP_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+const BLOCKING_CELL_DROP_COUNT: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::BlockingCellDropCount);
 #[cfg(test)]
-static BLOCKING_RW_CELL_DROP_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+const BLOCKING_RW_CELL_DROP_COUNT: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::BlockingRwCellDropCount);
 #[cfg(test)]
-static BLOCKING_CELL_REGISTRATION_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+const BLOCKING_CELL_REGISTRATION_COUNT: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::BlockingCellRegistrationCount);
 
-static BLOCKING_CELL_REGISTRATION: NativeGcRegistration = NativeGcRegistration::new();
+const BLOCKING_CELL_REGISTRATION: NativeGcRegistration = NativeGcRegistration::BlockingCell;
 const BLOCKING_CELL_GC_TYPES: &[NativeGcType] = &[
     NativeGcType::new(
         BLOCKING_CELL_TYPE_ID,
@@ -200,11 +196,10 @@ const BLOCKING_CELL_GC_TYPES: &[NativeGcType] = &[
 ];
 
 /// Install both cells' GC hooks once per registry generation; the common
-/// allocation path pays one atomic load.
+/// allocation path pays two atomic loads.
 fn ensure_blocking_cells_registered() {
     if BLOCKING_CELL_REGISTRATION.ensure(BLOCKING_CELL_GC_TYPES) {
-        #[cfg(test)]
-        BLOCKING_CELL_REGISTRATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::observation::record(crate::observation::Event::BlockingCellRegistrationCount, 1);
     }
 }
 
@@ -335,7 +330,7 @@ pub extern "C" fn willow_blocking_rw_cell_write(raw: *mut c_void, value: i64) {
 mod tests {
     use super::*;
     use crate::gc::{
-        reset_internal_for_test, runtime_test_guard, total_frees_for_test, willow_alloc_typed,
+        isolated_runtime, reset_internal_for_test, total_frees_for_test, willow_alloc_typed,
         willow_gc_allocated_bytes, willow_gc_collect, willow_pop_roots, willow_push_root,
     };
     use std::sync::atomic::Ordering;
@@ -393,7 +388,7 @@ mod tests {
 
     #[test]
     fn mutex_get_set() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let m = willow_blocking_cell_new(7, 0);
         assert_eq!(willow_blocking_cell_get(m), 7);
@@ -403,7 +398,7 @@ mod tests {
 
     #[test]
     fn rwlock_read_write() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let r = willow_blocking_rw_cell_new(1, 0);
         assert_eq!(willow_blocking_rw_cell_read(r), 1);
@@ -415,7 +410,7 @@ mod tests {
 
     #[test]
     fn unreachable_cells_are_reclaimed_and_the_heap_returns_to_baseline() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let before = willow_gc_allocated_bytes();
         for i in 0..1000 {
@@ -435,7 +430,7 @@ mod tests {
 
     #[test]
     fn sweep_runs_the_cell_destructors() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let cells_before = BLOCKING_CELL_DROP_COUNT.load(Ordering::SeqCst);
         let rw_before = BLOCKING_RW_CELL_DROP_COUNT.load(Ordering::SeqCst);
@@ -459,7 +454,7 @@ mod tests {
 
     #[test]
     fn rooted_cell_keeps_its_reference_value_alive() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let kept = old_object(0x5EED);
         let mut cell = willow_blocking_cell_new(kept as i64, 1) as *mut u8;
@@ -480,7 +475,7 @@ mod tests {
 
     #[test]
     fn rooted_rw_cell_keeps_its_reference_value_alive() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let kept = old_object(0x2EAD);
         let mut cell = willow_blocking_rw_cell_new(kept as i64, 1) as *mut u8;
@@ -501,7 +496,7 @@ mod tests {
 
     #[test]
     fn value_stored_with_set_survives_collection() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let mut cell = willow_blocking_cell_new(0, 1) as *mut u8;
         willow_push_root(&mut cell as *mut *mut u8);
@@ -523,7 +518,7 @@ mod tests {
 
     #[test]
     fn scalar_cells_expose_no_gc_slots() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let cell = willow_blocking_cell_new(0x1234, 0) as *mut u8;
         let rw = willow_blocking_rw_cell_new(0x5678, 0) as *mut u8;
@@ -543,7 +538,7 @@ mod tests {
 
     #[test]
     fn reference_cells_expose_their_word_as_a_rewritable_slot() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let first = old_object(1);
         let second = old_object(2);
@@ -573,7 +568,7 @@ mod tests {
 
     #[test]
     fn null_reference_word_is_not_a_slot() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let cell = willow_blocking_cell_new(0, 1) as *mut u8;
         let rw = willow_blocking_rw_cell_new(0, 1) as *mut u8;
@@ -589,7 +584,7 @@ mod tests {
 
     #[test]
     fn gc_hooks_register_once_per_registry_generation() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         ensure_blocking_cells_registered();
         let generation = crate::gc::registry_generation();
@@ -616,7 +611,7 @@ mod tests {
 
     #[test]
     fn set_of_a_young_value_remembers_the_cell() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         crate::gc::set_gc_stress_for_test(Some(""));
         let mut tls = crate::gc::tlab_state_for_test();
@@ -653,7 +648,7 @@ mod tests {
 
     #[test]
     fn write_of_a_young_value_remembers_the_rw_cell() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         crate::gc::set_gc_stress_for_test(Some(""));
         let mut tls = crate::gc::tlab_state_for_test();
@@ -680,7 +675,7 @@ mod tests {
 
     #[test]
     fn scalar_stores_skip_the_write_barrier() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let cell = willow_blocking_cell_new(0, 0);
         let rw = willow_blocking_rw_cell_new(0, 0);
@@ -707,7 +702,7 @@ mod tests {
     #[test]
     fn initial_young_value_is_reloaded_after_collection_inside_new() {
         use std::time::{Duration, Instant};
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         crate::gc::willow_gc_init();
         crate::gc::willow_gc_register_mutator();
         crate::gc::set_gc_stress_for_test(Some(""));
@@ -717,7 +712,8 @@ mod tests {
         unsafe { *(young as *mut i64) = 4242 };
         let minor_before = crate::gc::willow_gc_minor_collections();
 
-        let collector = std::thread::spawn(crate::gc::minor_collect_internal);
+        let collector =
+            std::thread::spawn(crate::runtime::serving(crate::gc::minor_collect_internal));
         let deadline = Instant::now() + Duration::from_secs(30);
         while !crate::gc::stop_pending_for_test() {
             assert!(
@@ -755,7 +751,7 @@ mod tests {
 
     #[test]
     fn new_leaves_the_root_stack_balanced() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let depth = crate::gc::willow_root_depth();
         let child = old_object(9);

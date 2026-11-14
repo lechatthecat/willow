@@ -216,10 +216,10 @@ mod tests {
             let workers: Vec<_> = (0..8)
                 .map(|_| {
                     let (bits, start) = (bits.clone(), start.clone());
-                    std::thread::spawn(move || {
+                    std::thread::spawn(crate::runtime::serving(move || {
                         start.wait();
                         (0..objects).filter(|&index| bits.claim(index)).count()
-                    })
+                    }))
                 })
                 .collect();
             assert_eq!(

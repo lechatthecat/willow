@@ -5,35 +5,50 @@ use std::cell::{Cell, RefCell, RefMut};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-/// Storage belongs to the execution context, never to a worker TLS address.
-/// Only the running owner mutates it. Collectors consume parked snapshots, or
-/// read it through `visit_quiescent_roots` while the owner is in a safe region.
+/// Generated-code-visible root window. The slot storage it publishes belongs
+/// to the execution context, never to a worker TLS address. Only the running
+/// owner mutates it. Collectors consume parked snapshots, or read it through
+/// `visit_quiescent_roots` while the owner is in a safe region.
 #[repr(C)]
-pub(crate) struct ShadowRoots {
+pub(crate) struct RootWindow {
     base: Cell<*mut *mut *mut u8>,
     top: Cell<usize>,
     limit: Cell<usize>,
-    storage: RefCell<Vec<*mut *mut u8>>,
 }
 
-impl ShadowRoots {
+impl RootWindow {
     const fn new() -> Self {
         Self {
             base: Cell::new(std::ptr::null_mut()),
             top: Cell::new(0),
             limit: Cell::new(0),
-            storage: RefCell::new(Vec::new()),
         }
     }
+}
+
+/// The running context's root window and its runtime-owned slot storage.
+pub(crate) struct ShadowRoots<'a> {
+    window: &'a RootWindow,
+    storage: &'a RefCell<Vec<*mut *mut u8>>,
+}
+
+impl std::ops::Deref for ShadowRoots<'_> {
+    type Target = RootWindow;
+    fn deref(&self) -> &RootWindow {
+        self.window
+    }
+}
+
+impl<'a> ShadowRoots<'a> {
     #[cfg(test)]
     pub(crate) fn set_depth_for_test(&self, depth: usize) {
         self.top.set(depth);
     }
 
-    pub(crate) fn borrow(&self) -> RootBorrow<'_> {
+    pub(crate) fn borrow(&self) -> RootBorrow<'a> {
         self.borrow_mut()
     }
-    pub(crate) fn borrow_mut(&self) -> RootBorrow<'_> {
+    pub(crate) fn borrow_mut(&self) -> RootBorrow<'a> {
         let mut storage = self.storage.borrow_mut();
         // Generated pushes initialize each slot before publishing top.
         assert!(self.top.get() <= storage.capacity());
@@ -41,14 +56,14 @@ impl ShadowRoots {
             storage.set_len(self.top.get());
         }
         RootBorrow {
-            roots: self,
+            roots: self.window,
             storage,
         }
     }
 }
 
 pub(crate) struct RootBorrow<'a> {
-    roots: &'a ShadowRoots,
+    roots: &'a RootWindow,
     storage: RefMut<'a, Vec<*mut *mut u8>>,
 }
 impl std::ops::Deref for RootBorrow<'_> {
@@ -76,8 +91,8 @@ impl Drop for RootBorrow<'_> {
     }
 }
 
-pub(crate) fn with_roots<R>(f: impl FnOnce(&ShadowRoots) -> R) -> R {
-    f(&unsafe { &*active() }.roots)
+pub(crate) fn with_roots<R>(f: impl FnOnce(&ShadowRoots<'_>) -> R) -> R {
+    f(&unsafe { &*active() }.shadow_roots())
 }
 pub(crate) fn depth() -> usize {
     let context = unsafe { &*active() };
@@ -95,7 +110,7 @@ pub(crate) fn visit_roots(mut visit: impl FnMut(&[*mut *mut u8])) {
     let mut context = active();
     while !context.is_null() {
         let current = unsafe { &*context };
-        visit(&current.roots.borrow());
+        visit(&current.shadow_roots().borrow());
         context = current.parent.get();
     }
 }
@@ -143,7 +158,10 @@ pub(crate) struct Context {
     card_owner: Cell<usize>,
     card_index: Cell<usize>,
     card_epoch: Cell<u64>,
-    pub(crate) roots: ShadowRoots,
+    roots: RootWindow,
+    mark_phase: Cell<*const std::sync::atomic::AtomicU8>,
+    card_epoch_cell: Cell<*const std::sync::atomic::AtomicU64>,
+    root_storage: RefCell<Vec<*mut *mut u8>>,
     parent: Cell<*const Context>,
     parent_depth: Cell<usize>,
     parent_bridge_active: Cell<bool>,
@@ -162,11 +180,38 @@ impl Context {
             card_owner: Cell::new(0),
             card_index: Cell::new(0),
             card_epoch: Cell::new(0),
-            roots: ShadowRoots::new(),
+            roots: RootWindow::new(),
+            mark_phase: Cell::new(crate::gc::default_mark_phase()),
+            card_epoch_cell: Cell::new(crate::gc::default_card_epoch()),
+            root_storage: RefCell::new(Vec::new()),
             parent: Cell::new(std::ptr::null()),
             parent_depth: Cell::new(0),
             parent_bridge_active: Cell::new(false),
             bridge_depth: Cell::new(0),
+        }
+    }
+
+    /// A context whose generated barriers read `owner`'s phase and epoch.
+    /// Gates are fixed per owning runtime, so entry refresh never rereads them.
+    pub(crate) fn for_runtime(owner: &crate::runtime::Runtime) -> Self {
+        let context = Self::new();
+        context.publish_gates(owner);
+        context
+    }
+
+    /// Point generated stop polls and barriers at the owning runtime's stop
+    /// flag, phase and epoch. These cells live as long as the runtime, so they
+    /// are published once per owner instead of at every entry refresh.
+    pub(crate) fn publish_gates(&self, runtime: &crate::runtime::Runtime) {
+        self.gc_stop.set(crate::gc::stop_flag_in(&runtime.gc));
+        self.mark_phase.set(runtime.mark_phase());
+        self.card_epoch_cell.set(runtime.card_epoch());
+    }
+
+    fn shadow_roots(&self) -> ShadowRoots<'_> {
+        ShadowRoots {
+            window: &self.roots,
+            storage: &self.root_storage,
         }
     }
 
@@ -184,7 +229,14 @@ impl Context {
         // The pointees are task-owned (or null) and process-owned respectively.
         self.sync_counter
             .set(crate::preempt::willow_sync_poll_counter());
-        self.gc_stop.set(crate::gc::willow_gc_stop_flag());
+        // Stop flag and barrier gates are fixed by the owning runtime: task
+        // contexts get them at creation or stack reuse, the thread context at
+        // runtime selection. A thread context that never selected (it serves
+        // the process default) publishes them on its first entry; the const
+        // initializer cannot name the lazily built collector's flag.
+        if self.gc_stop.get().is_null() {
+            self.publish_gates(crate::runtime::current());
+        }
         if !crate::gc::generated_roots_admitted() {
             self.roots.limit.set(0);
         }
@@ -240,6 +292,10 @@ pub(crate) fn revoke_barrier_buffers() {
 
 const _: () = {
     assert!(
+        std::mem::offset_of!(Context, mark_phase)
+            == willow_abi::generated_context::MARK_PHASE_OFFSET as usize
+    );
+    assert!(
         std::mem::offset_of!(Context, card_owner)
             == willow_abi::generated_context::CARD_OWNER_OFFSET as usize
     );
@@ -283,22 +339,36 @@ const _: () = {
             == willow_abi::generated_context::ROOT_BASE_OFFSET as usize
     );
     assert!(
-        std::mem::offset_of!(Context, roots) + std::mem::offset_of!(ShadowRoots, top)
+        std::mem::offset_of!(Context, roots) + std::mem::offset_of!(RootWindow, top)
             == willow_abi::generated_context::ROOT_TOP_OFFSET as usize
     );
     assert!(
-        std::mem::offset_of!(Context, roots) + std::mem::offset_of!(ShadowRoots, limit)
+        std::mem::offset_of!(Context, roots) + std::mem::offset_of!(RootWindow, limit)
             == willow_abi::generated_context::ROOT_LIMIT_OFFSET as usize
     );
     assert!(
-        std::mem::offset_of!(Context, roots) + std::mem::offset_of!(ShadowRoots, storage)
-            == willow_abi::generated_context::SIZE
+        std::mem::offset_of!(Context, card_epoch_cell)
+            == willow_abi::generated_context::CARD_EPOCH_CELL_OFFSET as usize
     );
+    assert!(std::mem::offset_of!(Context, root_storage) == willow_abi::generated_context::SIZE);
 };
 
 thread_local! {
     static ACTIVE: Cell<*const Context> = const { Cell::new(std::ptr::null()) };
     static THREAD: Context = const { Context::new() };
+}
+
+/// Publish the newly selected runtime's barrier gates in this thread's
+/// contexts. Entry refresh does not reread gates, so the thread context (and
+/// any context already active) must carry the serving runtime's cells from
+/// selection on; task stacks get theirs from [`Context::for_runtime`].
+pub(crate) fn publish_selected_gates() {
+    let runtime = crate::runtime::current();
+    THREAD.with(|context| context.publish_gates(runtime));
+    let active = ACTIVE.get();
+    if !active.is_null() {
+        unsafe { &*active }.publish_gates(runtime);
+    }
 }
 
 // Only the running owner reads this pointer. CURRENT_CONTEXT retains its Arc
@@ -426,6 +496,7 @@ impl ScalarBridge {
 }
 
 impl Drop for ScalarBridge {
+    #[inline]
     fn drop(&mut self) {
         // A nested generated callee must not leak its name into the caller.
         let state = unsafe { &*self.context };
@@ -467,7 +538,7 @@ mod tests {
 
     #[test]
     fn remembered_card_proofs_are_context_owned_across_nesting_and_transfer() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let values = |context: &Context| {
             (
                 context.card_owner.get(),
@@ -487,7 +558,7 @@ mod tests {
         assert_eq!(values(unsafe { &*active() }), (123, 4, 5));
         set_remembered_card(saved.0, saved.1, saved.2);
         let address = Box::into_raw(Box::new(nested)) as usize;
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let context = unsafe { Box::from_raw(address as *mut Context) };
             context.refresh();
             // This is a value proof, not a pointer into the departed worker.
@@ -499,14 +570,14 @@ mod tests {
                 ),
                 (456, 7, 8)
             );
-        })
+        }))
         .join()
         .unwrap();
     }
 
     #[test]
     fn inline_satb_admission_is_revoked_across_nested_retirement_and_worker_transfer() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let outer = active();
         set_barrier_buffer(123);
         let nested = Context::new();
@@ -521,18 +592,18 @@ mod tests {
         // Transfer exclusive ownership as native scheduler contexts do. No
         // thread retains a reference while the receiving worker refreshes it.
         let address = Box::into_raw(context) as usize;
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let context = unsafe { Box::from_raw(address as *mut Context) };
             context.refresh();
             assert_eq!(context.barrier_buffer.get(), 0);
-        })
+        }))
         .join()
         .unwrap();
     }
 
     #[test]
     fn sync_gates_thread_nested_and_restored_contexts() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let outer = active();
         unsafe { &*outer }.refresh();
         let expected = (
@@ -551,8 +622,68 @@ mod tests {
         assert_eq!(published_sync_gates(), expected);
     }
 
+    type Gates = (
+        *const u8,
+        *const std::sync::atomic::AtomicU8,
+        *const std::sync::atomic::AtomicU64,
+    );
+
+    fn gates(context: &Context) -> Gates {
+        (
+            context.gc_stop.get(),
+            context.mark_phase.get(),
+            context.card_epoch_cell.get(),
+        )
+    }
+
+    fn gates_of(runtime: &crate::runtime::Runtime) -> Gates {
+        (
+            crate::gc::stop_flag_in(&runtime.gc),
+            runtime.mark_phase(),
+            runtime.card_epoch(),
+        )
+    }
+
+    /// Stop flag and barrier gates are fixed by the owning runtime, never by
+    /// entry refresh: thread selection publishes the thread context,
+    /// `for_runtime` and stack reuse publish task contexts, and refresh only
+    /// fills a context that has none yet.
+    #[test]
+    fn gates_follow_owning_runtime_not_refresh() {
+        let default = crate::runtime::process_default();
+        std::thread::spawn(move || {
+            let unselected = Context::new();
+            assert!(gates(&unselected).0.is_null());
+            unselected.refresh();
+            assert_eq!(gates(&unselected), gates_of(default));
+            unsafe { &*active() }.refresh();
+            assert_eq!(gates(unsafe { &*active() }), gates_of(default));
+            let fresh = Context::for_runtime(default);
+            assert_eq!(gates(&fresh), gates_of(default));
+            let guard = crate::gc::isolated_runtime();
+            let isolated = guard.runtime;
+            assert_ne!(gates_of(isolated).0, gates_of(default).0);
+            assert_ne!(gates_of(isolated).1, gates_of(default).1);
+            assert_ne!(gates_of(isolated).2, gates_of(default).2);
+            // Selection published the thread context before any refresh.
+            assert_eq!(gates(unsafe { &*active() }), gates_of(isolated));
+            let task = Context::for_runtime(isolated);
+            assert_eq!(gates(&task), gates_of(isolated));
+            // Refresh keeps whatever gates the owner published.
+            fresh.refresh();
+            assert_eq!(gates(&fresh), gates_of(default));
+            task.refresh();
+            assert_eq!(gates(&task), gates_of(isolated));
+            // Reuse for another owner republishes explicitly.
+            fresh.publish_gates(isolated);
+            assert_eq!(gates(&fresh), gates_of(isolated));
+        })
+        .join()
+        .unwrap();
+    }
+
     // Exact store/bump protocol emitted by the compiler, without a Rust Vec borrow.
-    unsafe fn inline_push(roots: &ShadowRoots, slot: *mut *mut u8) {
+    unsafe fn inline_push(roots: &RootWindow, slot: *mut *mut u8) {
         let top = roots.top.get();
         assert!(top < roots.limit.get());
         unsafe {
@@ -563,7 +694,7 @@ mod tests {
 
     #[test]
     fn shadow_roots_inline_and_runtime_mutations_share_storage() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::reset_internal_for_test();
         for count in [1, 16, 256, 4096] {
             let mut slots = vec![std::ptr::null_mut(); count + 1];
@@ -589,7 +720,7 @@ mod tests {
 
     #[test]
     fn shadow_roots_nested_contexts_preserve_parent_slots() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::reset_internal_for_test();
         let mut outer_slot = std::ptr::null_mut();
         crate::gc::willow_push_root(&mut outer_slot);
@@ -625,7 +756,7 @@ mod tests {
 
     #[test]
     fn shadow_roots_unregister_empty_bridge_keeps_admission() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::reset_internal_for_test();
         crate::gc::willow_gc_register_mutator();
         assert_eq!(
@@ -639,7 +770,7 @@ mod tests {
 
     #[test]
     fn shadow_roots_refresh_requires_new_legacy_admission() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::reset_internal_for_test();
         crate::gc::willow_reserve_roots(8);
         crate::gc::leave_generated_roots();

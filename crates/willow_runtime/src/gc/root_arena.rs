@@ -36,6 +36,7 @@ impl GcRootCell {
 #[must_use = "retain the handle while its GC reference must remain rooted"]
 pub(crate) struct GcRootHandle {
     cell: CellOwner,
+    owner: Option<Arc<crate::runtime::Runtime>>,
 }
 
 enum CellOwner {
@@ -62,7 +63,25 @@ impl GcRootHandle {
         willow_gc_add_runtime_root_slot(cell.0.as_ptr());
         Self {
             cell: CellOwner::Registered(cell),
+            owner: None,
         }
+    }
+
+    /// A private root keeps its owning heap alive until the slot is removed.
+    /// The registry retains only the slot address, so this does not form a cycle.
+    pub(crate) fn new_in(owner: Arc<crate::runtime::Runtime>, value: *mut u8) -> Self {
+        let cell = Arc::new(GcRootCell(std::sync::atomic::AtomicPtr::new(value)));
+        root::add_runtime_root_slot_in(&owner, cell.0.as_ptr());
+        Self {
+            cell: CellOwner::Registered(cell),
+            owner: Some(owner),
+        }
+    }
+
+    fn owner(&self) -> &crate::runtime::Runtime {
+        self.owner
+            .as_deref()
+            .unwrap_or_else(|| crate::runtime::current())
     }
 
     fn slot(&self) -> *mut *mut u8 {
@@ -77,7 +96,9 @@ impl GcRootHandle {
     pub(crate) fn store(&self, value: *mut u8) {
         let _no_preempt = crate::preempt::NoPreemptGuard::enter();
         self.cell.cell().replace(value, |old| {
-            willow_gc_write_barrier(
+            barrier::write_barrier_in(
+                self.owner(),
+                std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 old,
                 value,
@@ -97,7 +118,7 @@ impl Drop for GcRootHandle {
     fn drop(&mut self) {
         self.release();
         if matches!(self.cell, CellOwner::Registered(_)) {
-            willow_gc_remove_runtime_root_slot(self.slot());
+            root::remove_runtime_root_slot_in(self.owner(), self.slot());
         }
     }
 }
@@ -166,7 +187,11 @@ impl<T> PinLease<T> {
 impl<T> Drop for PinLease<T> {
     fn drop(&mut self) {
         let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-        runtime().pin_lease_slots.remove(self.root.slot().cast());
+        self.root
+            .owner()
+            .gc
+            .pin_lease_slots
+            .remove(self.root.slot().cast());
         // The handle's Drop performs the deletion barrier and unregisters.
     }
 }
@@ -243,6 +268,7 @@ impl GcRootArena {
         chunk[slot].0.store(value, Ordering::Release);
         cells.len += 1;
         GcRootHandle {
+            owner: None,
             cell: CellOwner::Arena {
                 chunk,
                 slot: slot as u8,

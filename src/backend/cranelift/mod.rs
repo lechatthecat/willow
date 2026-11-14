@@ -1456,6 +1456,18 @@ struct FuncGen<'a, 'b> {
     suspension: SuspensionState,
     locals: FunctionLocals<'a>,
     roots: FunctionRoots,
+    gates: BarrierGates,
+}
+
+/// The serving runtime's barrier gate cells, read from the pinned context once
+/// per function at its entry. The cells belong to the runtime, which a function
+/// invocation never changes, so every barrier reuses the entry values instead
+/// of copying the pinned register and reloading the cell pointer.
+#[derive(Default)]
+struct BarrierGates {
+    context: Option<cranelift_codegen::ir::Value>,
+    mark_phase: Option<cranelift_codegen::ir::Value>,
+    card_epoch: Option<cranelift_codegen::ir::Value>,
 }
 
 #[derive(Default)]
@@ -1777,6 +1789,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             suspension: SuspensionState::default(),
             locals: FunctionLocals::default(),
             roots: FunctionRoots::default(),
+            gates: BarrierGates::default(),
         }
     }
 }

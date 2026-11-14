@@ -122,7 +122,7 @@ pub extern "C" fn willow_debug_reference_call_clear() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::{runtime_test_guard, willow_gc_init};
+    use crate::gc::{isolated_runtime, willow_gc_init};
     use crate::string::willow_string_alloc;
 
     fn ws_ptr(s: &str) -> *mut u8 {
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn reference_debug_unit_01_records_and_clears_reference_context() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         willow_debug_reference_call(
             ws_ptr("main.wi"),
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn reference_debug_unit_02_nested_scope_restores_parent_context() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         willow_debug_reference_call_scope_push();
         willow_debug_reference_call(

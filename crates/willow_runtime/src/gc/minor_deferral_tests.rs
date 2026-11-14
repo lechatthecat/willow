@@ -11,7 +11,7 @@ fn roots(value: *mut u8) -> MinorRoots {
 
 #[test]
 fn minor_deferral_clock_boundaries_and_fixed_budget() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for start in [0, u32::MAX as u64 - 8, u32::MAX as u64 + 8, u64::MAX - 64] {
         reset_internal();
         let mut tls = tlab_state_for_test();
@@ -20,15 +20,17 @@ fn minor_deferral_clock_boundaries_and_fixed_budget() {
         retire_all_tlabs_unindexed(&mut state);
         state.young_allocation_clock = start;
         state.nursery_threshold_bytes = 32;
-        assert!(should_defer_minor(&mut state, &roots(root)));
+        assert!(!should_defer_minor(&mut state, &roots(root), true));
+        assert!(state.minor_deferral_start_bytes.is_none());
+        assert!(should_defer_minor(&mut state, &roots(root), false));
         state.nursery_threshold_bytes = usize::MAX;
         state.young_allocated_bytes = 0; // independent occupancy correction
         state.total_allocated_bytes = u64::MAX; // Old allocation is irrelevant
-        assert!(should_defer_minor(&mut state, &roots(root)));
+        assert!(should_defer_minor(&mut state, &roots(root), false));
         state.young_allocation_clock = start + 31;
-        assert!(should_defer_minor(&mut state, &roots(root)));
+        assert!(should_defer_minor(&mut state, &roots(root), false));
         state.young_allocation_clock += 1;
-        assert!(!should_defer_minor(&mut state, &roots(root)));
+        assert!(!should_defer_minor(&mut state, &roots(root), false));
         assert_eq!(minor_deferral_age(&state), 32);
         drop(state);
     }
@@ -37,17 +39,17 @@ fn minor_deferral_clock_boundaries_and_fixed_budget() {
 
 #[test]
 fn minor_deferral_saturation_and_monotonicity() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let mut tls = tlab_state_for_test();
     let root = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
     let mut state = runtime().heap.lock().unwrap();
     retire_all_tlabs_unindexed(&mut state);
     state.young_allocation_clock = u64::MAX - 1;
-    assert!(should_defer_minor(&mut state, &roots(root)));
+    assert!(should_defer_minor(&mut state, &roots(root), false));
     tlab::add_tlab_accounting(&mut state, 0, 10);
     assert_eq!(state.young_allocation_clock, u64::MAX);
-    assert!(!should_defer_minor(&mut state, &roots(root)));
+    assert!(!should_defer_minor(&mut state, &roots(root), false));
     state.young_allocation_clock = 1;
     state.minor_deferral_start_bytes = Some(2);
     #[cfg(debug_assertions)]
@@ -61,7 +63,7 @@ fn minor_deferral_saturation_and_monotonicity() {
 
 #[test]
 fn minor_deferral_concurrent_reclamation_and_pin_release() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let mut tls = tlab_state_for_test();
     let root = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
@@ -76,7 +78,15 @@ fn minor_deferral_concurrent_reclamation_and_pin_release() {
         retire_all_tlabs_unindexed(&mut state);
         state.nursery_threshold_bytes = 256;
     }
-    assert!(minor_collect_with_roots(roots(root), &mut Default::default()).is_none());
+    assert!(
+        minor_collect_with_roots(
+            crate::runtime::current(),
+            roots(root),
+            false,
+            &mut Default::default()
+        )
+        .is_none()
+    );
     let (clock, occupied, plan) = {
         let mut state = runtime().heap.lock().unwrap();
         // Only the permanently parked root survives the production major sweep.
@@ -87,7 +97,7 @@ fn minor_deferral_concurrent_reclamation_and_pin_release() {
             sweep::prepare(&mut state, None),
         )
     };
-    let freed = std::thread::spawn(move || sweep::concurrent(plan))
+    let freed = std::thread::spawn(crate::runtime::serving(move || sweep::concurrent(plan)))
         .join()
         .unwrap();
     assert!(freed > 0);
@@ -113,7 +123,7 @@ fn minor_deferral_concurrent_reclamation_and_pin_release() {
             unsafe { (*payload_to_header(root)).marked = true };
             sweep::prepare(&mut state, None)
         };
-        std::thread::spawn(move || sweep::concurrent(plan))
+        std::thread::spawn(crate::runtime::serving(move || sweep::concurrent(plan)))
             .join()
             .unwrap();
         let state = runtime().heap.lock().unwrap();
@@ -128,7 +138,15 @@ fn minor_deferral_concurrent_reclamation_and_pin_release() {
         "reclaim_rounds={attempts} fixed_budget=256 young_debt={}",
         minor_deferral_age(&runtime().heap.lock().unwrap())
     );
-    assert!(minor_collect_with_roots(roots(root), &mut Default::default()).is_some());
+    assert!(
+        minor_collect_with_roots(
+            crate::runtime::current(),
+            roots(root),
+            false,
+            &mut Default::default()
+        )
+        .is_some()
+    );
     let stats = crate::gc_telemetry::survivor_snapshot();
     assert_eq!(stats.pin_fallback_count, 1);
     assert_eq!(stats.active_pins, 1);
@@ -145,7 +163,7 @@ fn minor_deferral_concurrent_reclamation_and_pin_release() {
     assert!(records[0].major_epoch > 0);
     // Root is now released: the next major reclaims its promotion and record.
     let plan = sweep::prepare(&mut runtime().heap.lock().unwrap(), None);
-    std::thread::spawn(move || sweep::concurrent(plan))
+    std::thread::spawn(crate::runtime::serving(move || sweep::concurrent(plan)))
         .join()
         .unwrap();
     let stats = crate::gc_telemetry::survivor_snapshot();
@@ -158,13 +176,13 @@ fn minor_deferral_concurrent_reclamation_and_pin_release() {
 
 #[test]
 fn minor_deferral_parallel_tlab_refills_count_once() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for workers in [1, 4, 8] {
         reset_internal();
         runtime().heap.lock().unwrap().nursery_threshold_bytes = usize::MAX;
         std::thread::scope(|scope| {
             for _ in 0..workers {
-                scope.spawn(|| {
+                scope.spawn(crate::runtime::serving(|| {
                     let mut tls = tlab_state_for_test();
                     for _ in 0..16 {
                         assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0).is_null());
@@ -182,7 +200,7 @@ fn minor_deferral_parallel_tlab_refills_count_once() {
                             .store(cursor + GC_HEADER_SIZE + 8, Ordering::Release);
                     }
                     tlab::unregister_tlab_state(&raw mut tls as usize);
-                });
+                }));
             }
         });
         let mut state = runtime().heap.lock().unwrap();
@@ -205,7 +223,7 @@ fn minor_deferral_parallel_tlab_refills_count_once() {
 
 #[test]
 fn minor_deferral_hard_cap_and_saturation_clear_debt() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for saturated in [false, true] {
         reset_internal();
         let mut tls = tlab_state_for_test();
@@ -217,7 +235,15 @@ fn minor_deferral_hard_cap_and_saturation_clear_debt() {
                 state.young_allocation_clock = u64::MAX - 1;
             }
         }
-        assert!(minor_collect_with_roots(roots(root), &mut Default::default()).is_none());
+        assert!(
+            minor_collect_with_roots(
+                crate::runtime::current(),
+                roots(root),
+                false,
+                &mut Default::default()
+            )
+            .is_none()
+        );
         let reserved = {
             let mut state = runtime().heap.lock().unwrap();
             let reserved = state.tlab_reserved_bytes + state.old_reserved_bytes;
@@ -230,7 +256,15 @@ fn minor_deferral_hard_cap_and_saturation_clear_debt() {
             assert!(minor_allocation_due(&state));
             reserved
         };
-        assert!(minor_collect_with_roots(roots(root), &mut Default::default()).is_some());
+        assert!(
+            minor_collect_with_roots(
+                crate::runtime::current(),
+                roots(root),
+                false,
+                &mut Default::default()
+            )
+            .is_some()
+        );
         let state = runtime().heap.lock().unwrap();
         assert!(state.tlab_reserved_bytes + state.old_reserved_bytes <= reserved);
         assert_eq!(state.minor_deferral_start_bytes, None);
@@ -244,7 +278,7 @@ fn minor_deferral_hard_cap_and_saturation_clear_debt() {
 
 #[test]
 fn minor_deferral_exhausted_refill_waits_for_collector() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     {
         let mut state = runtime().heap.lock().unwrap();
@@ -253,24 +287,27 @@ fn minor_deferral_exhausted_refill_waits_for_collector() {
         state.minor_deferral_budget_bytes = 32;
         state.minor_retry_bytes = 32;
     }
-    cycle_wait::SLEEPS.store(0, Ordering::Release);
+    runtime()
+        .wait_observation
+        .sleeps
+        .store(0, Ordering::Release);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
-        let owner = scope.spawn(move || {
+        let owner = scope.spawn(crate::runtime::serving(move || {
             let _owner = cycle_wait::CollectorGuard::try_acquire().unwrap();
             // Same owner/wait protocol used while a concurrent sweep runs.
             ready_tx.send(()).unwrap();
             release_rx.recv().unwrap();
-        });
+        }));
         ready_rx.recv().unwrap();
-        let allocator = scope.spawn(|| {
+        let allocator = scope.spawn(crate::runtime::serving(|| {
             let mut tls = tlab_state_for_test();
             assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0).is_null());
             tlab::unregister_tlab_state(&raw mut tls as usize);
-        });
+        }));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while cycle_wait::SLEEPS.load(Ordering::Acquire) == 0 {
+        while runtime().wait_observation.sleeps.load(Ordering::Acquire) == 0 {
             if std::time::Instant::now() >= deadline {
                 release_tx.send(()).unwrap();
                 panic!("expired refill did not join collector");
@@ -294,7 +331,7 @@ fn minor_deferral_exhausted_refill_waits_for_collector() {
 
 #[test]
 fn minor_deferral_first_request_during_sweep_waits_before_refill() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let mut tls = tlab_state_for_test();
     let root = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
@@ -312,12 +349,15 @@ fn minor_deferral_first_request_during_sweep_waits_before_refill() {
         assert_eq!(state.minor_deferral_start_bytes, None);
         state.young_allocation_clock
     };
-    cycle_wait::SLEEPS.store(0, Ordering::Release);
+    runtime()
+        .wait_observation
+        .sleeps
+        .store(0, Ordering::Release);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         let root_address = root as usize;
-        let owner = scope.spawn(move || {
+        let owner = scope.spawn(crate::runtime::serving(move || {
             let root = root_address as *mut u8;
             let _owner = cycle_wait::CollectorGuard::try_acquire().unwrap();
             let plan = {
@@ -332,15 +372,15 @@ fn minor_deferral_first_request_during_sweep_waits_before_refill() {
             release_rx.recv().unwrap();
             sweep::concurrent(plan);
             service_pending();
-        });
+        }));
         ready_rx.recv().unwrap();
-        let allocator = scope.spawn(|| {
+        let allocator = scope.spawn(crate::runtime::serving(|| {
             let mut tls = tlab_state_for_test();
             assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0).is_null());
             tlab::unregister_tlab_state(&raw mut tls as usize);
-        });
+        }));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while cycle_wait::SLEEPS.load(Ordering::Acquire) == 0 {
+        while runtime().wait_observation.sleeps.load(Ordering::Acquire) == 0 {
             if allocator.is_finished() || std::time::Instant::now() >= deadline {
                 release_tx.send(()).unwrap();
                 owner.join().unwrap();
@@ -380,7 +420,7 @@ fn minor_deferral_first_request_during_sweep_waits_before_refill() {
 
 #[test]
 fn minor_deferral_pending_refill_budget_boundaries() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for budget in [
         1,
         GC_TLAB_CHUNK_SIZE - 1,
@@ -390,7 +430,7 @@ fn minor_deferral_pending_refill_budget_boundaries() {
         for hard_cap in [false, true] {
             for saturated in [false, true] {
                 reset_internal();
-                PENDING.store(true, Ordering::Release);
+                runtime().minor_pending.store(true, Ordering::Release);
                 let mut state = runtime().heap.lock().unwrap();
                 state.nursery_threshold_bytes = budget;
                 state.young_allocated_bytes = budget;
@@ -424,7 +464,7 @@ fn minor_deferral_pending_refill_budget_boundaries() {
     assert_eq!(state.minor_deferral_start_bytes, None);
     // A completed collection does not wait merely because its epoch is clear.
     state.young_allocated_bytes = 0;
-    PENDING.store(true, Ordering::Release);
+    runtime().minor_pending.store(true, Ordering::Release);
     assert!(!minor_refill_should_wait(&mut state));
     assert_eq!(state.minor_deferral_start_bytes, None);
     drop(state);
@@ -433,7 +473,7 @@ fn minor_deferral_pending_refill_budget_boundaries() {
 
 #[test]
 fn minor_deferral_pending_sweep_uses_fixed_runway_then_waits() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let mut tls = tlab_state_for_test();
     let payload = (GC_TLAB_MAX_OBJECT_SIZE - GC_HEADER_SIZE) as i64;
@@ -454,12 +494,15 @@ fn minor_deferral_pending_sweep_uses_fixed_runway_then_waits() {
         assert_eq!(state.young_allocated_bytes, GC_TLAB_CHUNK_SIZE);
         state.young_allocation_clock
     };
-    cycle_wait::SLEEPS.store(0, Ordering::Release);
+    runtime()
+        .wait_observation
+        .sleeps
+        .store(0, Ordering::Release);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         let root_address = root as usize;
-        let owner = scope.spawn(move || {
+        let owner = scope.spawn(crate::runtime::serving(move || {
             let _owner = cycle_wait::CollectorGuard::try_acquire().unwrap();
             let plan = {
                 let mut state = runtime().heap.lock().unwrap();
@@ -470,9 +513,9 @@ fn minor_deferral_pending_sweep_uses_fixed_runway_then_waits() {
             release_rx.recv().unwrap();
             sweep::concurrent(plan);
             service_pending();
-        });
+        }));
         ready_rx.recv().unwrap();
-        let allocator = scope.spawn(|| {
+        let allocator = scope.spawn(crate::runtime::serving(|| {
             let mut tls = tlab_state_for_test();
             // Exactly one captured budget can pass the held sweep. The next
             // refill must wait even though all these objects are dead.
@@ -480,9 +523,9 @@ fn minor_deferral_pending_sweep_uses_fixed_runway_then_waits() {
                 assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, payload, 0).is_null());
             }
             tlab::unregister_tlab_state(&raw mut tls as usize);
-        });
+        }));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while cycle_wait::SLEEPS.load(Ordering::Acquire) == 0 {
+        while runtime().wait_observation.sleeps.load(Ordering::Acquire) == 0 {
             if allocator.is_finished() || std::time::Instant::now() >= deadline {
                 release_tx.send(()).unwrap();
                 owner.join().unwrap();
@@ -525,7 +568,7 @@ fn minor_deferral_pending_sweep_uses_fixed_runway_then_waits() {
 
 #[test]
 fn minor_deferral_waiters_share_owner_collection() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for workers in [1, 4, 16, 64] {
         reset_internal();
         {
@@ -535,25 +578,28 @@ fn minor_deferral_waiters_share_owner_collection() {
             state.minor_deferral_budget_bytes = 32;
             state.minor_retry_bytes = 32;
         }
-        cycle_wait::SLEEPS.store(0, Ordering::Release);
+        runtime()
+            .wait_observation
+            .sleeps
+            .store(0, Ordering::Release);
         let owner = cycle_wait::CollectorGuard::try_acquire().unwrap();
         std::thread::scope(|scope| {
             for _ in 0..workers {
-                scope.spawn(|| {
+                scope.spawn(crate::runtime::serving(|| {
                     let mut tls = tlab_state_for_test();
                     assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0).is_null());
                     tlab::unregister_tlab_state(&raw mut tls as usize);
-                });
+                }));
             }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while cycle_wait::SLEEPS.load(Ordering::Acquire) < workers {
+            while runtime().wait_observation.sleeps.load(Ordering::Acquire) < workers {
                 if std::time::Instant::now() >= deadline {
                     drop(owner);
                     panic!("refill waiters did not join owner");
                 }
                 std::thread::yield_now();
             }
-            assert!(requested());
+            assert!(requested(runtime()));
             service_pending();
             drop(owner);
         });

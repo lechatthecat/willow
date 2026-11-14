@@ -29,6 +29,7 @@ struct PaddedShard(Mutex<RetirementShard>);
 
 #[derive(Debug)]
 pub(super) struct TerminalRetirements {
+    pub(super) reclaim: Arc<crate::frame_reclaim::Domain>,
     shards: Box<[PaddedShard]>,
     /// Terminal tasks whose channel/netpoll registrations must be purged
     /// outside every task lock. Channel addresses are captured before the
@@ -38,11 +39,13 @@ pub(super) struct TerminalRetirements {
     /// without it, so the run loop's per-iteration drain takes no lock when
     /// nothing is pending.
     pub(super) cleanups_pending: AtomicBool,
+    pub(super) frame_release_due: AtomicBool,
 }
 
 impl TerminalRetirements {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(reclaim: Arc<crate::frame_reclaim::Domain>) -> Self {
         Self {
+            reclaim,
             shards: (0..RETIREMENT_SHARDS)
                 .map(|_| {
                     PaddedShard(Mutex::new(RetirementShard {
@@ -53,6 +56,7 @@ impl TerminalRetirements {
                 .collect(),
             cleanups: Mutex::new(Vec::new()),
             cleanups_pending: AtomicBool::new(false),
+            frame_release_due: AtomicBool::new(false),
         }
     }
 
@@ -75,7 +79,7 @@ impl TerminalRetirements {
 
     pub(super) fn retire_frame(&self, frame: usize) {
         let mut shard = Self::lock(&self.shards[current_worker() % RETIREMENT_SHARDS]);
-        let tag = crate::frame_reclaim::retire_tag();
+        let tag = self.reclaim.retire_tag();
         crate::frame_lifetime::record(
             crate::frame_lifetime::FrameEventKind::Terminal,
             frame,
@@ -84,7 +88,7 @@ impl TerminalRetirements {
         );
         shard.frames.push_back(RetiredFrame { frame, tag });
         if shard.frames.len() >= shard.scan_at {
-            FRAME_RELEASE_DUE.store(true, Ordering::Release);
+            self.frame_release_due.store(true, Ordering::Release);
         }
     }
 

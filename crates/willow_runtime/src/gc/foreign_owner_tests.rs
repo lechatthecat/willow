@@ -3,13 +3,13 @@ use super::*;
 
 #[test]
 fn registered_then_unregistered_roots_defer_and_report_progress() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_gc_collect();
     let start = gc_progress();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let owner = std::thread::spawn(move || {
+    let owner = std::thread::spawn(crate::runtime::serving(move || {
         willow_gc_register_mutator();
         let mut slot = willow_alloc_object(2, 32);
         willow_push_root(&mut slot);
@@ -17,7 +17,7 @@ fn registered_then_unregistered_roots_defer_and_report_progress() {
         ready_tx.send(()).unwrap();
         done_rx.recv().unwrap();
         willow_pop_root();
-    });
+    }));
     ready_rx.recv().unwrap();
     willow_gc_collect();
     minor_collect_internal();
@@ -49,7 +49,7 @@ fn registered_then_unregistered_roots_defer_and_report_progress() {
 
 #[test]
 fn native_scope_nested_return_cancel_and_panic_release_roots() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for count in [1, 16, 256] {
         for panic in [false, true] {
             reset_gc();
@@ -75,7 +75,9 @@ fn native_scope_nested_return_cancel_and_panic_release_roots() {
             assert!(!current_thread_is_registered());
             assert_eq!(gc_thread_root_depth(), 0);
             assert_eq!(registered_mutator_count(), 0);
-            std::thread::spawn(|| willow_gc_collect()).join().unwrap();
+            std::thread::spawn(crate::runtime::serving(|| willow_gc_collect()))
+                .join()
+                .unwrap();
             assert_eq!(willow_gc_allocated_bytes(), 0);
         }
     }
@@ -84,12 +86,12 @@ fn native_scope_nested_return_cancel_and_panic_release_roots() {
 
 #[test]
 fn native_registration_and_gc_start_race_has_no_skips_or_stranded_roots() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let before = willow_gc_skipped_collections();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let worker_barrier = barrier.clone();
-    let worker = std::thread::spawn(move || {
+    let worker = std::thread::spawn(crate::runtime::serving(move || {
         for _ in 0..64 {
             worker_barrier.wait();
             let _scope = NativeGcScope::enter();
@@ -98,7 +100,7 @@ fn native_registration_and_gc_start_race_has_no_skips_or_stranded_roots() {
             willow_gc_safepoint();
             // Drop removes roots before unregistering, even during election.
         }
-    });
+    }));
     for _ in 0..64 {
         barrier.wait();
         willow_gc_collect();
@@ -116,10 +118,10 @@ fn legacy_admission_during_foreign_election_fails_safely() {
     const CHILD: &str = "WILLOW_GC04_ADMISSION_CHILD";
     if std::env::var_os(CHILD).is_some() {
         let _collector = cycle_wait::CollectorGuard::try_acquire().unwrap();
-        std::thread::spawn(|| {
+        std::thread::spawn(crate::runtime::serving(|| {
             let mut slot = std::ptr::null_mut();
             willow_push_root(&mut slot);
-        })
+        }))
         .join()
         .unwrap();
         panic!("unsafe admission accepted");
@@ -145,13 +147,16 @@ fn legacy_admission_during_foreign_election_fails_safely() {
 /// the legacy owner instead of aborting.
 #[test]
 fn registered_unregister_with_roots_waits_for_foreign_epoch() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
-    cycle_wait::SLEEPS.store(0, Ordering::Relaxed);
+    runtime()
+        .wait_observation
+        .sleeps
+        .store(0, Ordering::Relaxed);
     let collector = cycle_wait::CollectorGuard::try_acquire().unwrap();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let (pop_tx, pop_rx) = std::sync::mpsc::channel::<()>();
-    let worker = std::thread::spawn(move || {
+    let worker = std::thread::spawn(crate::runtime::serving(move || {
         willow_gc_register_mutator();
         let mut slot = willow_alloc_object(2, 8);
         willow_push_root(&mut slot);
@@ -159,9 +164,9 @@ fn registered_unregister_with_roots_waits_for_foreign_epoch() {
         done_tx.send(()).unwrap();
         pop_rx.recv().unwrap();
         willow_pop_root();
-    });
+    }));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while cycle_wait::SLEEPS.load(Ordering::Acquire) == 0 {
+    while runtime().wait_observation.sleeps.load(Ordering::Acquire) == 0 {
         assert!(
             std::time::Instant::now() < deadline,
             "unregister never waited"
@@ -186,12 +191,12 @@ fn registered_unregister_with_roots_waits_for_foreign_epoch() {
 
 #[test]
 fn existing_legacy_owner_can_extend_roots_during_election() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (go_tx, go_rx) = std::sync::mpsc::channel();
     let (pushed_tx, pushed_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
+    let worker = std::thread::spawn(crate::runtime::serving(move || {
         let mut first = std::ptr::null_mut();
         willow_push_root(&mut first);
         ready_tx.send(()).unwrap();
@@ -201,7 +206,7 @@ fn existing_legacy_owner_can_extend_roots_during_election() {
         pushed_tx.send(()).unwrap();
         go_rx.recv().unwrap();
         willow_pop_roots(2);
-    });
+    }));
     ready_rx.recv().unwrap();
     let collector = cycle_wait::CollectorGuard::try_acquire().unwrap();
     go_tx.send(()).unwrap();

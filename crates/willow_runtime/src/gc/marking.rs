@@ -35,6 +35,7 @@ pub(super) struct ConcurrentCycle {
     pub(super) sweep_publication_cursor: AtomicUsize,
     pub(super) termination: mark_termination::Termination,
     pub(super) mark_epoch: crate::gc_mark_queue::MarkEpoch,
+    discovery_owner: Arc<crate::gc_telemetry::workers::WorkerTelemetry>,
     pointer_checks: AtomicU64,
     duplicate_discoveries: AtomicU64,
     unindexed_discoveries: AtomicU64,
@@ -75,7 +76,7 @@ pub(super) struct ConcurrentCycle {
 // once when the last reader/owner releases the epoch, never per graph edge.
 impl Drop for ConcurrentCycle {
     fn drop(&mut self) {
-        crate::gc_telemetry::workers::record_discoveries(
+        self.discovery_owner.record_discoveries(
             self.pointer_checks.load(Ordering::Relaxed),
             self.duplicate_discoveries.load(Ordering::Relaxed),
             self.unindexed_discoveries.load(Ordering::Relaxed),
@@ -86,10 +87,11 @@ impl Drop for ConcurrentCycle {
 // Publish accounting and legacy/unindexed exceptions once per bounded drain,
 // including unwind. Ordinary object tracing takes no cycle-global mutex.
 pub(super) struct MarkBatch<'a> {
+    pub(super) owner: &'a crate::runtime::Runtime,
     pub(super) cycle: &'a ConcurrentCycle,
     pub(super) work: crate::gc_telemetry::MarkWork,
     pub(super) deferred: Vec<usize>,
-    pub(super) native_counts: crate::gc_telemetry::native_trace::Counts,
+    pub(super) native_counts: crate::gc_telemetry::native_trace::Counts<'a>,
     pub(super) unindexed: HashSet<usize>,
     pub(super) cpu_start: Option<u64>,
     pub(super) inline_children: bool,
@@ -136,8 +138,9 @@ impl Drop for MarkBatch<'_> {
             self.cycle.worker_failed.store(true, Ordering::Release);
         }
         self.publish_branches();
-        if crate::gc_telemetry::collector_profile::enabled() {
-            crate::gc_telemetry::collector_profile::graph(
+        if self.owner.diagnostics.gc_profile.one {
+            crate::gc_telemetry::collector_profile::graph_for_runtime(
+                self.owner,
                 self.work,
                 self.discovery_counts[1],
                 self.cycle.queue.snapshot().outstanding,
@@ -158,7 +161,7 @@ impl Drop for MarkBatch<'_> {
             && self.work.scanned_bytes == 0
             && self.work.descriptor_bytes == 0;
         if !idle {
-            crate::gc_telemetry::observations::graph_work(self.work);
+            crate::gc_telemetry::observations::graph_work_in(self.owner, self.work);
             let cpu = self.cpu_start.and_then(|start| {
                 crate::gc_telemetry::workers::thread_cpu_ns()?.checked_sub(start)
             });
@@ -241,8 +244,14 @@ impl ConcurrentCycle {
         traces: IdMap<u32, ConcurrentTraceFn>,
         roots: usize,
     ) -> Self {
-        let cycle =
-            Self::with_epoch_index(objects, legacy_traces, traces, roots, Self::reserve_epoch());
+        let cycle = Self::with_epoch_index(
+            objects,
+            legacy_traces,
+            traces,
+            roots,
+            Self::reserve_epoch(),
+            crate::runtime::current(),
+        );
         cycle
             .phase
             .lock()
@@ -268,10 +277,11 @@ impl ConcurrentCycle {
         traces: IdMap<u32, ConcurrentTraceFn>,
         roots: usize,
         identity: (u64, Mutex<old_cycle::State>),
+        owner: &crate::runtime::Runtime,
     ) -> Self {
         // One slot per allowed background worker, plus the collector. Assists
         // beyond these slots use the queue's existing slotless consumer path.
-        let queue = crate::gc_mark_queue::MarkWorkQueue::new(mark_workers::configured_count() + 1);
+        let queue = crate::gc_mark_queue::MarkWorkQueue::new(*owner.marker_count + 1);
         let (assist_epoch, phase) = identity;
         let mark_epoch = queue.begin_reserved_epoch(crate::gc_mark_queue::MarkEpoch(assist_epoch));
         Self {
@@ -280,6 +290,7 @@ impl ConcurrentCycle {
             sweep_publication_cursor: AtomicUsize::new(0),
             termination: mark_termination::Termination::default(),
             mark_epoch,
+            discovery_owner: Arc::clone(&owner.telemetry.workers),
             pointer_checks: AtomicU64::new(0),
             duplicate_discoveries: AtomicU64::new(0),
             unindexed_discoveries: AtomicU64::new(0),
@@ -729,20 +740,29 @@ impl ConcurrentCycle {
 
     #[cfg(test)]
     pub(super) fn drain_checked(&self, limit: usize) -> u64 {
-        self.drain_checked_until(limit, None)
+        self.drain_checked_until_in(crate::runtime::current(), limit, None)
     }
 
-    pub(super) fn drain_checked_until(
+    pub(super) fn drain_checked_until_in(
         &self,
+        owner: &crate::runtime::Runtime,
         limit: usize,
         deadline: Option<std::time::Instant>,
     ) -> u64 {
-        self.drain_recovering(|| self.drain_until(limit, deadline))
+        self.drain_recovering_in(owner, || self.drain_until_in(owner, limit, deadline))
     }
 
     /// Unwinding retires the queue consumer and publishes MarkBatch before
     /// requesting authoritative stopped tracing. Never continue partial scans.
     pub(super) fn drain_recovering<T: Default>(&self, drain: impl FnOnce() -> T) -> T {
+        self.drain_recovering_in(crate::runtime::current(), drain)
+    }
+
+    pub(super) fn drain_recovering_in<T: Default>(
+        &self,
+        owner: &crate::runtime::Runtime,
+        drain: impl FnOnce() -> T,
+    ) -> T {
         if self.worker_failed.load(Ordering::Acquire) {
             return T::default();
         }
@@ -754,21 +774,26 @@ impl ConcurrentCycle {
                     .copied()
                     .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                     .unwrap_or("marker panicked with a non-string payload");
-                crate::gc_telemetry::failure_record::emit("marker_panic", reason);
+                crate::gc_telemetry::failure_record::emit_in(owner, "marker_panic", reason);
                 self.worker_failed.store(true, Ordering::Release);
-                crate::gc_telemetry::workers::record_failure(
-                    crate::gc_telemetry::workers::Failure::MarkerPanic,
-                );
+                self.discovery_owner
+                    .record_failure(crate::gc_telemetry::workers::Failure::MarkerPanic);
                 T::default()
             }
         }
     }
 
+    #[cfg(test)]
     pub(super) fn drain(&self, limit: usize) -> u64 {
-        self.drain_until(limit, None)
+        self.drain_until_in(crate::runtime::current(), limit, None)
     }
 
-    pub(super) fn drain_until(&self, limit: usize, deadline: Option<std::time::Instant>) -> u64 {
+    fn drain_until_in(
+        &self,
+        owner: &crate::runtime::Runtime,
+        limit: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> u64 {
         // Concurrent hooks may neither allocate GC memory nor reach a safepoint,
         // so marking cannot reenter this thread's scratch-buffer borrow. Keep
         // capacity across bounded assists; successful drains leave the buffer empty.
@@ -779,12 +804,21 @@ impl ConcurrentCycle {
         let _owner = self.termination.enter();
         CHILDREN.with_borrow_mut(|children| {
             let mut worker = self.queue.register_assist();
-            self.drain_worker_until(limit, children, &mut worker, deadline)
+            self.drain_worker_until_stride(owner, limit, children, &mut worker, deadline, 1)
                 .1
         })
     }
 
     pub(super) fn drain_background(&self, limit: usize, children: &mut Vec<*mut u8>) -> usize {
+        self.drain_background_in(crate::runtime::current(), limit, children)
+    }
+
+    pub(super) fn drain_background_in(
+        &self,
+        owner: &crate::runtime::Runtime,
+        limit: usize,
+        children: &mut Vec<*mut u8>,
+    ) -> usize {
         let _owner = self.termination.enter();
         let Some(mut worker) = self.queue.register_worker() else {
             // Mutator assists may temporarily occupy every slot. The collector
@@ -795,10 +829,11 @@ impl ConcurrentCycle {
         // a bounded return to the worker safepoint. Minor requests are checked
         // between every object as before; native callbacks stay indivisible.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1);
-        self.drain_worker_until_stride(limit, children, &mut worker, Some(deadline), 16)
+        self.drain_worker_until_stride(owner, limit, children, &mut worker, Some(deadline), 16)
             .0
     }
 
+    #[cfg(test)]
     pub(super) fn drain_worker(
         &self,
         limit: usize,
@@ -808,12 +843,13 @@ impl ConcurrentCycle {
         self.drain_worker_until(limit, children, worker, None)
     }
 
-    fn assist_stop_requested(&self, is_collector: bool) -> bool {
+    fn assist_stop_requested(&self, owner: &GcRuntime, is_collector: bool) -> bool {
         !is_collector
             && (self.closing.load(Ordering::Acquire)
-                || runtime().poll_requested.load(Ordering::Acquire))
+                || owner.poll_requested.load(Ordering::Acquire))
     }
 
+    #[cfg(test)]
     pub(super) fn drain_worker_until(
         &self,
         limit: usize,
@@ -821,11 +857,19 @@ impl ConcurrentCycle {
         worker: &mut crate::gc_mark_queue::MarkWorker,
         deadline: Option<std::time::Instant>,
     ) -> (usize, u64) {
-        self.drain_worker_until_stride(limit, children, worker, deadline, 1)
+        self.drain_worker_until_stride(
+            crate::runtime::current(),
+            limit,
+            children,
+            worker,
+            deadline,
+            1,
+        )
     }
 
     fn drain_worker_until_stride(
         &self,
+        owner: &crate::runtime::Runtime,
         limit: usize,
         children: &mut Vec<*mut u8>,
         worker: &mut crate::gc_mark_queue::MarkWorker,
@@ -857,10 +901,11 @@ impl ConcurrentCycle {
         self.active_drains.fetch_add(1, Ordering::AcqRel);
         let mut scanned = 0;
         let mut batch = MarkBatch {
+            owner,
             cycle: self,
             work: Default::default(),
             deferred: Vec::new(),
-            native_counts: crate::gc_telemetry::native_trace::Counts::default(),
+            native_counts: owner.telemetry.native_trace.counts(),
             unindexed: HashSet::new(),
             // Started at the first work item: an empty drain pays no clock read.
             cpu_start: None,
@@ -895,7 +940,9 @@ impl ConcurrentCycle {
             }
             // Always permit one work item, even after descheduling at entry.
             if scanned != 0
-                && (expired() || minor::requested() || self.assist_stop_requested(is_collector))
+                && (expired()
+                    || minor::requested(&owner.gc)
+                    || self.assist_stop_requested(&owner.gc, is_collector))
             {
                 break;
             }
@@ -984,8 +1031,8 @@ impl ConcurrentCycle {
                         }
                         scanned += 1;
                         if (expired()
-                            || minor::requested()
-                            || self.assist_stop_requested(is_collector))
+                            || minor::requested(&owner.gc)
+                            || self.assist_stop_requested(&owner.gc, is_collector))
                             && objects.len() != 0
                         {
                             // Publish the unfinished tail before completing the
@@ -1051,14 +1098,18 @@ impl ConcurrentCycle {
     }
 }
 
-pub(super) static MARK_WORKERS: Mutex<Option<mark_workers::Pool>> = Mutex::new(None);
-
 pub(crate) fn shutdown_mark_workers() {
-    coordinator::shutdown();
+    shutdown_mark_workers_in(crate::runtime::current());
+}
+
+pub(super) fn shutdown_mark_workers_in(owner: &crate::runtime::Runtime) {
+    coordinator::shutdown_in(owner);
     // Called after user main returns, or by isolated runtime reset. No active
     // cycle can outlive Pool::run(), which holds this mutex until readers leave.
-    let pool = MARK_WORKERS.lock().unwrap().take();
-    drop(pool);
+    let pool = owner.gc.marker_workers.lock().unwrap().take();
+    if let Some(mut pool) = pool {
+        pool.stop(std::time::Duration::from_secs(2));
+    }
 }
 
 /// Enumerate allocation headers only, never payload graph edges. All generated
@@ -1094,40 +1145,53 @@ pub(super) fn epoch_objects(
     objects
 }
 
-/// Bumped under the heap lock whenever the concurrent cycle is installed or
-/// cleared (`set_concurrent_cycle`), so a thread revalidates its cached cycle
-/// with one atomic load instead of taking the heap lock.
-pub(super) static ASSIST_CYCLE_GENERATION: AtomicU64 = AtomicU64::new(0);
-
 /// The only writer of `GcState::concurrent_cycle`. A removed cycle's shard
 /// buffers are sealed (any entries are dropped: every finishing path flushes
 /// them first), so a thread still holding it can no longer publish into it.
 pub(super) fn set_concurrent_cycle(state: &mut GcState, cycle: Option<Arc<ConcurrentCycle>>) {
+    set_concurrent_cycle_in(runtime(), state, cycle);
+}
+
+pub(super) fn set_concurrent_cycle_in(
+    owner: &GcRuntime,
+    state: &mut GcState,
+    cycle: Option<Arc<ConcurrentCycle>>,
+) {
     if let Some(previous) = state.concurrent_cycle.take() {
         previous.satb_shards.seal_without_drain();
     }
     state.concurrent_cycle = cycle;
-    publish_collection_busy(state);
-    ASSIST_CYCLE_GENERATION.fetch_add(1, Ordering::Release);
+    publish_collection_busy_in(owner, state);
+    owner
+        .assist_cycle_generation
+        .fetch_add(1, Ordering::Release);
 }
 
 thread_local! {
     // Weak: a finished cycle's index is freed even if this thread never
     // allocates again.
-    static ASSIST_CYCLE: std::cell::RefCell<Option<(u64, std::sync::Weak<ConcurrentCycle>)>> =
+    static ASSIST_CYCLE: std::cell::RefCell<Option<(u64, u64, std::sync::Weak<ConcurrentCycle>)>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// The installed cycle and the generation it was read at; the heap lock is
 /// taken only when the generation moved since this thread last looked.
 pub(super) fn cached_cycle() -> Option<(u64, Arc<ConcurrentCycle>)> {
-    let generation = ASSIST_CYCLE_GENERATION.load(Ordering::Acquire);
+    cached_cycle_in(runtime())
+}
+
+pub(super) fn cached_cycle_in(owner: &GcRuntime) -> Option<(u64, Arc<ConcurrentCycle>)> {
+    let generation = owner.assist_cycle_generation.load(Ordering::Acquire);
     // The cache holds a `Weak` (a destructor): during TLS teardown, where
     // runtime allocation and barriers still run, fall back to the locked
     // lookup instead of panicking across the C ABI.
     let cached = ASSIST_CYCLE
         .try_with(|cached| match &*cached.borrow() {
-            Some((cached, cycle)) if *cached == generation => Some(cycle.upgrade()),
+            Some((identity, cached, cycle))
+                if *identity == owner.policy_identity && *cached == generation =>
+            {
+                Some(cycle.upgrade())
+            }
             _ => None,
         })
         .ok()
@@ -1136,22 +1200,27 @@ pub(super) fn cached_cycle() -> Option<(u64, Arc<ConcurrentCycle>)> {
         return cycle.map(|cycle| (generation, cycle));
     }
     let (generation, cycle) = {
-        let state = runtime().heap.lock().unwrap();
+        let state = owner.heap.lock().unwrap();
         (
-            ASSIST_CYCLE_GENERATION.load(Ordering::Relaxed),
+            owner.assist_cycle_generation.load(Ordering::Relaxed),
             state.concurrent_cycle.clone(),
         )
     };
     let weak = cycle
         .as_ref()
         .map_or_else(std::sync::Weak::new, Arc::downgrade);
-    let _ = ASSIST_CYCLE.try_with(|cached| *cached.borrow_mut() = Some((generation, weak)));
+    let _ = ASSIST_CYCLE
+        .try_with(|cached| *cached.borrow_mut() = Some((owner.policy_identity, generation, weak)));
     cycle.map(|cycle| (generation, cycle))
 }
 
 /// Bounded allocation assistance. Only call outside runtime container locks.
 pub(super) fn assist_concurrent_mark(allocated: u64) {
-    if GC_MARK_PHASE.load(Ordering::Acquire) != 1 {
+    assist_concurrent_mark_in(crate::runtime::current(), allocated);
+}
+
+pub(super) fn assist_concurrent_mark_in(owner: &crate::runtime::Runtime, allocated: u64) {
+    if owner.gc.mark_phase().load(Ordering::Acquire) != 1 {
         assist::reset();
         return;
     }
@@ -1159,7 +1228,7 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
         assist::reset();
         return;
     }
-    if let Some((generation, cycle)) = cached_cycle()
+    if let Some((generation, cycle)) = cached_cycle_in(&owner.gc)
         && let Some(pacing) = &cycle.assist_pacing
     {
         if !cycle.closing.load(Ordering::Acquire) {
@@ -1174,13 +1243,13 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
             // elsewhere) keeps its debt for the next allocation: a retrying
             // slice may wait on this very mutator.
             while due && pending {
-                if assist_batch(&cycle) == 0 {
+                if assist_batch(owner, &cycle) == 0 {
                     break;
                 }
                 due = assist::due(cycle.assist_epoch);
-                pending = assist_open(&cycle) && !cycle.queue.snapshot().is_drained();
+                pending = assist_open(&owner.gc, &cycle) && !cycle.queue.snapshot().is_drained();
                 if due && pending {
-                    willow_gc_safepoint();
+                    safepoint::safepoint_in(owner);
                 }
             }
         } else {
@@ -1192,7 +1261,8 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
         // like an allocation-budget waiter, helping while assists are open.
         // The collector never waits on its own cycle.
         if pacing.exhausted() && std::thread::current().id() != cycle.collector {
-            let _stall = crate::gc_telemetry::observations::Span::new(
+            let _stall = crate::gc_telemetry::observations::Span::for_runtime(
+                owner,
                 crate::gc_telemetry::observations::Kind::AllocationStall,
             );
             // Phase 0 or a reinstalled cycle ends the wait: a later cycle's
@@ -1207,8 +1277,8 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
                 completed_work(&cycle),
                 cycle.native_retries.load(Ordering::Acquire),
             );
-            while GC_MARK_PHASE.load(Ordering::Acquire) != 0
-                && ASSIST_CYCLE_GENERATION.load(Ordering::Acquire) == generation
+            while owner.gc.mark_phase().load(Ordering::Acquire) != 0
+                && owner.gc.assist_cycle_generation.load(Ordering::Acquire) == generation
             {
                 let drained = cycle.queue.snapshot().is_drained();
                 // A drained queue before `closing` means the collector is about
@@ -1217,10 +1287,13 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
                 if !cycle.closing.load(Ordering::Acquire) && drained {
                     break;
                 }
-                if !drained && assist_open(&cycle) && !cycle.recovering.load(Ordering::Acquire) {
-                    assist_batch(&cycle);
+                if !drained
+                    && assist_open(&owner.gc, &cycle)
+                    && !cycle.recovering.load(Ordering::Acquire)
+                {
+                    assist_batch(owner, &cycle);
                 }
-                willow_gc_safepoint();
+                safepoint::safepoint_in(owner);
                 std::thread::yield_now();
                 let completed = completed_work(&cycle);
                 let retries = cycle.native_retries.load(Ordering::Acquire);
@@ -1239,7 +1312,7 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
     }
     // All queue claims/readers and the assist CPU span are released before
     // entering a handshake. A stop must not wait for an owner parked here.
-    willow_gc_safepoint();
+    safepoint::safepoint_in(owner);
 }
 
 /// Consecutive native Retry results without mark progress after which a
@@ -1255,8 +1328,8 @@ fn completed_work(cycle: &ConcurrentCycle) -> u64 {
         .saturating_add(work.descriptor_bytes)
 }
 
-fn assist_open(cycle: &ConcurrentCycle) -> bool {
-    GC_MARK_PHASE.load(Ordering::Acquire) == 1 && !cycle.closing.load(Ordering::Acquire)
+fn assist_open(owner: &GcRuntime, cycle: &ConcurrentCycle) -> bool {
+    owner.mark_phase().load(Ordering::Acquire) == 1 && !cycle.closing.load(Ordering::Acquire)
 }
 
 /// Releases cycle-local assist admission on return and unwind.
@@ -1283,22 +1356,20 @@ impl Drop for AssistPermit<'_> {
 /// One bounded assist batch; empty queues never block or manufacture credit.
 /// Legacy callbacks are indivisible and measured by native telemetry.
 /// Returns the credited work.
-fn assist_batch(cycle: &ConcurrentCycle) -> u64 {
+fn assist_batch(owner: &crate::runtime::Runtime, cycle: &ConcurrentCycle) -> u64 {
     let deadline = std::time::Instant::now() + std::time::Duration::from_micros(250);
     let cpu = assist::CpuScope::new();
     let work = {
-        let _assist = crate::gc_telemetry::measurement::Span::new(
+        let _assist = crate::gc_telemetry::measurement::Span::for_runtime(
+            owner,
             crate::gc_telemetry::measurement::Phase::Assist,
         );
         // Extra allocating mutators must not create unbounded marker parallelism.
         // Failed admission remains inside both CPU and Assist observation scopes.
-        let permit = AssistPermit::acquire(
-            &cycle.active_assists,
-            mark_workers::configured_count().max(1),
-        );
+        let permit = AssistPermit::acquire(&cycle.active_assists, (*owner.marker_count).max(1));
         if let Some(_permit) = permit {
             // Amortize registration while retaining per-object stop/deadline checks.
-            let work = cycle.drain_checked_until(256, Some(deadline));
+            let work = cycle.drain_checked_until_in(owner, 256, Some(deadline));
             assist::credit(cycle.assist_epoch, work);
             work
         } else {
@@ -1326,16 +1397,17 @@ fn assist_batch(cycle: &ConcurrentCycle) -> u64 {
 }
 
 pub(super) fn mark_worklist(
+    owner: &crate::runtime::Runtime,
     mut worklist: Vec<*mut u8>,
     completed: Option<(&epoch_index::EpochIndex, &HashSet<usize>)>,
 ) -> crate::gc_telemetry::MarkWork {
     let started = std::time::Instant::now();
     let mut work = crate::gc_telemetry::MarkWork::roots(worklist.len());
     let mut hooks = IdMap::default();
-    let mut native_counts = crate::gc_telemetry::native_trace::Counts::default();
+    let mut native_counts = owner.telemetry.native_trace.counts();
     let cpu_start = crate::gc_telemetry::workers::thread_cpu_ns();
     while let Some(obj_ptr) = worklist.pop() {
-        let header = checked_payload_to_header(obj_ptr, "GC root graph");
+        let header = checked_payload_to_header(owner, obj_ptr, "GC root graph");
         let object = HeapObject::from_raw(header).expect("validated payload has a header");
         let Some(metadata) = object.begin_trace() else {
             continue; // already visited — handles cycles
@@ -1371,7 +1443,7 @@ pub(super) fn mark_worklist(
         }
         let hook = *hooks
             .entry(metadata.type_id)
-            .or_insert_with(|| registry::lookup_trace_contract(metadata.type_id));
+            .or_insert_with(|| registry::lookup_trace_contract_in(&owner.gc, metadata.type_id));
         if let Some((trace, mode)) = hook {
             let mut child_slots: Vec<*mut *mut u8> = Vec::new();
             // SAFETY: trace is the registered function for this type_id.
@@ -1401,7 +1473,7 @@ pub(super) fn mark_worklist(
         .and_then(|(a, b)| b.checked_sub(a));
     work.cpu_ns = cpu.unwrap_or(0);
     work.cpu_incomplete = cpu.is_none();
-    crate::gc_telemetry::observations::graph_work(work);
+    crate::gc_telemetry::observations::graph_work_in(owner, work);
     work
 }
 
@@ -1410,8 +1482,62 @@ mod assist_admission_tests {
     use super::*;
 
     #[test]
+    fn cycle_discoveries_keep_their_owner_after_runtime_teardown() {
+        let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+        let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+        let first_stats = Arc::clone(&first.telemetry.workers);
+        let second_stats = Arc::clone(&second.telemetry.workers);
+        let make_cycle = |owner: &crate::runtime::Runtime| {
+            ConcurrentCycle::with_epoch_index(
+                epoch_index::EpochIndex::synthetic(std::iter::empty()),
+                IdSet::default(),
+                IdMap::default(),
+                0,
+                ConcurrentCycle::reserve_epoch(),
+                owner,
+            )
+        };
+        let first_cycle = make_cycle(&first);
+        let second_cycle = make_cycle(&second);
+        // The worker recovery adapter has no explicit runtime argument. Its
+        // failure counter must still follow the cycle that supplied the job.
+        assert_eq!(
+            first_cycle.drain_recovering::<u64>(|| panic!("private marker failure")),
+            0
+        );
+        assert_eq!(first_stats.snapshot().marker_panics, 1);
+        assert_eq!(second_stats.snapshot().marker_panics, 0);
+        assert_eq!(first_cycle.drain_recovering(|| 42_u64), 0);
+        assert_eq!(first_stats.snapshot().marker_panics, 1);
+        first_cycle.pointer_checks.store(7, Ordering::Relaxed);
+        first_cycle
+            .duplicate_discoveries
+            .store(3, Ordering::Relaxed);
+        second_cycle.pointer_checks.store(11, Ordering::Relaxed);
+        second_cycle
+            .unindexed_discoveries
+            .store(2, Ordering::Relaxed);
+        drop(first);
+        drop(second);
+        std::thread::scope(|scope| {
+            scope.spawn(crate::runtime::serving(move || drop(first_cycle)));
+            scope.spawn(crate::runtime::serving(move || drop(second_cycle)));
+        });
+        let first = first_stats.discovery_snapshot();
+        let second = second_stats.discovery_snapshot();
+        assert_eq!(
+            (first.pointer_checks, first.duplicates, first.unindexed),
+            (7, 3, 0)
+        );
+        assert_eq!(
+            (second.pointer_checks, second.duplicates, second.unindexed),
+            (11, 0, 2)
+        );
+    }
+
+    #[test]
     fn collector_yields_to_admitted_assist_without_losing_queue_work() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         let cycle = ConcurrentCycle::new(
             (1..=64).map(|address| {
                 (
@@ -1450,7 +1576,7 @@ mod assist_admission_tests {
             std::thread::scope(|scope| {
                 for _ in 0..16 {
                     let (active, peak, barrier) = (&active, &peak, &barrier);
-                    scope.spawn(move || {
+                    scope.spawn(crate::runtime::serving(move || {
                         barrier.wait();
                         for _ in 0..32 {
                             loop {
@@ -1465,7 +1591,7 @@ mod assist_admission_tests {
                                 std::thread::yield_now();
                             }
                         }
-                    });
+                    }));
                 }
             });
             assert_eq!(active.load(Ordering::Acquire), 0);

@@ -15,31 +15,44 @@ pub(super) fn cpu_capacity() -> usize {
     *CPUS
 }
 
-fn publish_decision(decision: Decision) {
-    crate::gc_telemetry::pacing::publish(crate::gc_telemetry::pacing::Decision {
-        goal_bytes: decision.goal,
-        trigger_bytes: decision.trigger,
-        runway_bytes: decision.runway,
-        expected_work_bytes: decision.expected_work,
-        dedicated_workers: decision.workers,
-        fractional_duty_ppm: decision.fractional_duty_ppm,
-        assist_work_per_byte_ppm: decision.assist_work_per_byte_ppm,
-        overshoot_budget_bytes: decision.overshoot_budget,
-        reasons: decision.reasons | UNCONTROLLED_PHASES,
-        start_now: decision.start_now,
-    });
+fn publish_decision_in(owner: &crate::runtime::Runtime, decision: Decision) {
+    owner
+        .telemetry
+        .pacing
+        .publish(crate::gc_telemetry::pacing::Decision {
+            goal_bytes: decision.goal,
+            trigger_bytes: decision.trigger,
+            runway_bytes: decision.runway,
+            expected_work_bytes: decision.expected_work,
+            dedicated_workers: decision.workers,
+            fractional_duty_ppm: decision.fractional_duty_ppm,
+            assist_work_per_byte_ppm: decision.assist_work_per_byte_ppm,
+            overshoot_budget_bytes: decision.overshoot_budget,
+            reasons: decision.reasons | UNCONTROLLED_PHASES,
+            start_now: decision.start_now,
+        });
 }
 
 /// Sole writer of goals and triggers; reservation budgets remain separate.
 fn publish(state: &mut super::GcState, goal: u64, trigger: u64, reason: &str) {
+    publish_in(crate::runtime::current(), state, goal, trigger, reason);
+}
+
+fn publish_in(
+    owner: &crate::runtime::Runtime,
+    state: &mut super::GcState,
+    goal: u64,
+    trigger: u64,
+    reason: &str,
+) {
     let goal = goal.min(usize::MAX as u64) as usize;
     let trigger = trigger.min(goal as u64);
     // Inputs (including live bytes) may change even if the thresholds do not.
-    super::invalidate_external_headroom();
+    owner.gc.headroom.invalidate();
     if state.threshold_bytes == goal && state.pacer_trigger == trigger {
         return;
     }
-    if crate::diagnostic_settings::GC_LOG.unicode {
+    if owner.diagnostics.gc_log.unicode {
         eprintln!(
             "[gc] threshold goal={} trigger={} previous_goal={} previous_trigger={} reason={}",
             goal, trigger, state.threshold_bytes, state.pacer_trigger, reason
@@ -58,39 +71,57 @@ pub(super) fn scheduler_start(state: &mut super::GcState, budget: u64) {
 }
 
 pub(super) fn sample_threshold(state: &mut super::GcState) {
+    sample_threshold_in(crate::runtime::current(), state);
+}
+
+pub(super) fn sample_threshold_in(owner: &crate::runtime::Runtime, state: &mut super::GcState) {
     let input = Inputs {
         fixed_goal: true,
-        ..super::pacer_inputs(state)
+        ..super::pacer_inputs_in(owner, state)
     };
     let decision = state.pacer.decision(input);
-    publish_decision(decision);
-    publish(state, decision.goal, decision.trigger, "allocation_sample");
+    publish_decision_in(owner, decision);
+    publish_in(
+        owner,
+        state,
+        decision.goal,
+        decision.trigger,
+        "allocation_sample",
+    );
 }
 
 pub(super) fn allocation_failure(state: &super::GcState) {
-    let mut input = super::pacer_inputs(state);
+    allocation_failure_in(crate::runtime::current(), state);
+}
+
+pub(super) fn allocation_failure_in(owner: &crate::runtime::Runtime, state: &super::GcState) {
+    let mut input = super::pacer_inputs_in(owner, state);
     input.feedback.allocator_failed = true;
     let mut decision = state.pacer.decision(input);
     decision.reasons |= ALLOCATOR_FAILED;
     decision.start_now = true;
-    publish_decision(decision);
+    publish_decision_in(owner, decision);
 }
 
-pub(super) fn complete_threshold(state: &mut super::GcState, previous_goal: u64) {
+pub(super) fn complete_threshold_in(
+    owner: &crate::runtime::Runtime,
+    state: &mut super::GcState,
+    previous_goal: u64,
+) {
     let input = Inputs {
         previous_goal,
-        ..super::pacer_inputs(state)
+        ..super::pacer_inputs_in(owner, state)
     };
     let (goal, trigger, reason) = if state.pacer.enabled() {
         let decision = state.pacer.decision(input);
-        publish_decision(decision);
+        publish_decision_in(owner, decision);
         (decision.goal, decision.trigger, "cycle_paced")
     } else {
         let decision = state.pacer.decision(input);
-        publish_decision(decision);
+        publish_decision_in(owner, decision);
         (decision.goal, decision.trigger, "cycle_fixed")
     };
-    publish(state, goal, trigger, reason);
+    publish_in(owner, state, goal, trigger, reason);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -425,6 +456,40 @@ impl Sampler {
 mod tests {
     use super::*;
     #[test]
+    fn private_threshold_publication_invalidates_only_its_owner() {
+        use std::sync::atomic::Ordering;
+        let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+        let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+        first.gc.headroom.external.store(19, Ordering::Release);
+        first.gc.headroom.policy.store(23, Ordering::Release);
+        second.gc.headroom.external.store(29, Ordering::Release);
+        second.gc.headroom.policy.store(31, Ordering::Release);
+        let mut state = first.gc.heap.lock().unwrap();
+        publish_in(&first, &mut state, 1024, 2048, "owner_test");
+        assert_eq!(state.threshold_bytes, 1024);
+        assert_eq!(state.pacer_trigger, 1024);
+        assert_eq!(first.gc.headroom.external.load(Ordering::Acquire), 0);
+        assert_eq!(first.gc.headroom.policy.load(Ordering::Acquire), 0);
+        assert_eq!(second.gc.headroom.external.load(Ordering::Acquire), 29);
+        assert_eq!(second.gc.headroom.policy.load(Ordering::Acquire), 31);
+        first.gc.headroom.external.store(7, Ordering::Release);
+        publish_in(&first, &mut state, 1024, 1024, "same_goal");
+        assert_eq!(first.gc.headroom.external.load(Ordering::Acquire), 0);
+        sample_threshold_in(&first, &mut state);
+        assert_eq!(first.telemetry.pacing.snapshot().publications, 1);
+        assert_eq!(second.telemetry.pacing.snapshot().publications, 0);
+        complete_threshold_in(&first, &mut state, MIN_GOAL);
+        assert_eq!(first.telemetry.pacing.snapshot().publications, 2);
+        allocation_failure_in(&first, &state);
+        let failure = first.telemetry.pacing.snapshot();
+        assert_eq!(failure.publications, 3);
+        assert_ne!(failure.decision.reasons & ALLOCATOR_FAILED, 0);
+        assert!(failure.decision.start_now);
+        assert_eq!(second.telemetry.pacing.snapshot().publications, 0);
+        assert_eq!(second.gc.headroom.external.load(Ordering::Acquire), 29);
+    }
+
+    #[test]
     fn collection_pauses_do_not_decay_mutator_allocation_rate() {
         let mut sampler = Sampler::default();
         sampler.allocation(0, 0);
@@ -457,7 +522,7 @@ mod tests {
     #[test]
     fn completed_barrier_calls_do_not_inflate_trace_work_or_heap_goal() {
         use super::super::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         let mut state = runtime().heap.lock().unwrap();
         state.pacer.set_enabled_for_test(true);
@@ -485,12 +550,12 @@ mod tests {
     #[test]
     fn threshold_policy_completion_reset_and_samples() {
         use super::super::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         let mut state = runtime().heap.lock().unwrap();
         state.pacer.disable_for_test();
         state.last_major_policy_live_bytes = 3 * MIN_GOAL;
-        complete_threshold(&mut state, MIN_GOAL);
+        complete_threshold_in(crate::runtime::current(), &mut state, MIN_GOAL);
         assert_eq!(state.threshold_bytes as u64, 6 * MIN_GOAL);
         assert_eq!(state.pacer_trigger, 6 * MIN_GOAL);
         sample_threshold(&mut state);
@@ -747,7 +812,7 @@ mod tests {
     #[test]
     fn disabled_pacer_preserves_soft_memory_trigger() {
         use super::super::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         {
             let mut state = runtime().heap.lock().unwrap();
@@ -757,11 +822,20 @@ mod tests {
         }
         let mut root = willow_alloc(1024);
         willow_push_root(&mut root);
-        assert!(!allocation_should_collect());
+        assert!(!allocation_should_collect_with_sync_in(
+            crate::runtime::current(),
+            true
+        ));
         willow_gc_set_memory_limit(1);
-        assert!(allocation_should_collect());
+        assert!(allocation_should_collect_with_sync_in(
+            crate::runtime::current(),
+            true
+        ));
         collect_internal();
-        assert!(!allocation_should_collect());
+        assert!(!allocation_should_collect_with_sync_in(
+            crate::runtime::current(),
+            true
+        ));
         willow_pop_root();
         reset_internal();
     }
@@ -769,7 +843,7 @@ mod tests {
     fn runtime_completed_cpu_excess_adjusts_next_goal() {
         use super::super::*;
         use crate::gc_telemetry::{pacing, with_completed_cpu_for_test};
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for (cpu, expected_flags, expected_goal) in [
             (Some(0), 0, MIN_GOAL),
             (Some(u64::MAX / 64), CPU_NORMAL | CPU_HARD, 2 * MIN_GOAL),
@@ -928,24 +1002,27 @@ mod tests {
     #[test]
     fn decision_publication_is_a_coherent_group() {
         use super::super::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            scope.spawn(crate::runtime::serving(|| {
                 for n in 1..=10_000 {
-                    publish_decision(Decision {
-                        goal: n * 2,
-                        trigger: n,
-                        ..Decision::default()
-                    });
+                    publish_decision_in(
+                        crate::runtime::current(),
+                        Decision {
+                            goal: n * 2,
+                            trigger: n,
+                            ..Decision::default()
+                        },
+                    );
                 }
-            });
-            scope.spawn(|| {
+            }));
+            scope.spawn(crate::runtime::serving(|| {
                 for _ in 0..10_000 {
                     let s = crate::gc_telemetry::pacing::snapshot();
                     assert_eq!(s.decision.goal_bytes, s.decision.trigger_bytes * 2);
                 }
-            });
+            }));
         });
         reset_internal();
     }
@@ -954,19 +1031,22 @@ mod tests {
     fn nested_cpu_window_preserves_hard_budget_and_missing_reasons() {
         use super::super::*;
         use crate::gc_telemetry::pacing;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for missing in [None, Some(0), Some(8)] {
             reset_internal();
-            pacing::begin_major(100);
+            crate::runtime::current().telemetry.pacing.begin_major(100);
             for i in 0..9 {
-                pacing::cycle(
+                crate::runtime::current().telemetry.pacing.cycle(
                     100 + i * 10,
                     106 + i * 10,
                     (missing != Some(i)).then_some(6),
                     true,
                 );
             }
-            pacing::cycle(100, 200, Some(1), false);
+            crate::runtime::current()
+                .telemetry
+                .pacing
+                .cycle(100, 200, Some(1), false);
             let snapshot = pacing::snapshot();
             let d = decide(Inputs {
                 feedback: Feedback {
@@ -1046,7 +1126,7 @@ mod tests {
     #[ignore = "reference-host measurement; run explicitly with --ignored --nocapture"]
     fn pacer_reference_measurement() {
         use super::super::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for n in [10_000, 100_000, 1_000_000] {
             let start = std::time::Instant::now();
             for _ in 0..n {

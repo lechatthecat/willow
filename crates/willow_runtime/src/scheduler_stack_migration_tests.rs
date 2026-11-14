@@ -3,13 +3,20 @@
 use super::*;
 use crate::gc::*;
 
-static MODE: AtomicUsize = AtomicUsize::new(0);
-static ROOTS: AtomicUsize = AtomicUsize::new(0);
-static DEPTH: AtomicUsize = AtomicUsize::new(0);
-static FINISHED: AtomicBool = AtomicBool::new(false);
-static VISITED: AtomicUsize = AtomicUsize::new(0);
-static COUNTER: AtomicUsize = AtomicUsize::new(0);
-static ORIGINAL_THREAD: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+static MODE: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static ROOTS: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static DEPTH: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static FINISHED: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+static VISITED: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static COUNTER: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static ORIGINAL_THREAD: crate::runtime::PerRuntime<Mutex<Option<std::thread::ThreadId>>> =
+    crate::runtime::PerRuntime::new(|| Mutex::new(None));
 
 // This fixture models generated frames: no TLS reference, thread-bound native
 // borrow or lock guard crosses the safepoint. Each pointer is reloaded from its
@@ -211,11 +218,11 @@ fn run_claim(id: u64, worker: usize, prefix: usize, terminal: bool) {
 
 #[test]
 fn generated_stack_preserves_affinity_roots_and_context_after_moving_collection() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for mode in 0..3 {
         for count in [0, 1, 8, 64] {
             for depth in [0, 7] {
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     reset_global_scheduler_for_test();
                     replace_global_scheduler_for_test(3);
                     MODE.store(mode, Ordering::Relaxed);
@@ -235,10 +242,10 @@ fn generated_stack_preserves_affinity_roots_and_context_after_moving_collection(
                     if mode == 2 {
                         willow_sched_cancel(id);
                     }
-                    std::thread::spawn(|| {
+                    std::thread::spawn(crate::runtime::serving(|| {
                         CURRENT_WORKER.with(|slot| slot.set(2));
                         assert!(claim_global_ready_for_worker(2, None).is_none());
-                    })
+                    }))
                     .join()
                     .unwrap();
                     run_claim(id, 1, 5, true);
@@ -250,7 +257,7 @@ fn generated_stack_preserves_affinity_roots_and_context_after_moving_collection(
                         "mode={mode} depth={depth} roots_per_frame={count} rewritten_slots={}",
                         VISITED.load(Ordering::Relaxed)
                     );
-                })
+                }))
                 .join()
                 .unwrap();
             }

@@ -572,12 +572,12 @@ mod tests {
         std::thread::scope(|scope| {
             for thread in 0..8u64 {
                 let queue = Arc::clone(&queue);
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     for step in 0..250u64 {
                         let id = thread * 1_000 + step + 1;
                         queue.push(id, base + Duration::from_millis(id));
                     }
-                });
+                }));
             }
         });
         assert_eq!(queue.len(), 8 * 250);
@@ -600,11 +600,11 @@ mod tests {
             for _ in 0..8 {
                 let queue = Arc::clone(&queue);
                 let woken = Arc::clone(&woken);
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     queue.wake_due(observed, all_live, |_| {
                         woken.fetch_add(1, Ordering::Relaxed);
                     });
-                });
+                }));
             }
         });
         assert_eq!(woken.load(Ordering::Relaxed), 2_000);
@@ -622,20 +622,20 @@ mod tests {
             let woken = Arc::new(AtomicUsize::new(0));
             std::thread::scope(|scope| {
                 let pusher = Arc::clone(&queue);
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     for id in 1..=100u64 {
                         pusher.push(id, base);
                     }
-                });
+                }));
                 let drainer = Arc::clone(&queue);
                 let counter = Arc::clone(&woken);
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     for _ in 0..100 {
                         drainer.wake_due(observed, all_live, |_| {
                             counter.fetch_add(1, Ordering::Relaxed);
                         });
                     }
-                });
+                }));
             });
             let remaining = queue.len();
             assert_eq!(
@@ -785,12 +785,12 @@ mod tests {
         queue.push(1, now);
         std::thread::scope(|scope| {
             let queue = &queue;
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 queue.wake_due(now, all_live, |_| {
                     entered_tx.send(()).unwrap();
                     finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 });
-            });
+            }));
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             queue.push(2, now);
             assert_eq!(collect_woken(queue, now), vec![2]);

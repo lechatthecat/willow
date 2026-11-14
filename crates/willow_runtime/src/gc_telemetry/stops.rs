@@ -13,7 +13,6 @@ pub(crate) const MAX_EVENT_CAPACITY: usize = 16384;
 fn configured_capacity(value: Option<&str>) -> Option<usize> {
     super::bounded_capacity(value, EVENT_CAPACITY, MAX_EVENT_CAPACITY)
 }
-use crate::diagnostic_settings::GC_STOP_TRACE_CAPACITY as CONFIGURED_CAPACITY;
 pub const STOP_COUNTERS_VALID: u64 = 1;
 pub const STOP_EVENTS_LOST: u64 = 2;
 pub const STOP_COUNTERS_SATURATED: u64 = 4;
@@ -75,7 +74,7 @@ pub struct StopTotalsV2 {
 pub struct StopStatsV2 {
     pub flags: u64,
     pub reset_generation: u64,
-    /// Monotonic process-lifetime identity; reset does not reuse identities.
+    /// Monotonic owner-lifetime identity; reset does not reuse identities.
     pub last_sequence: u64,
     /// Nonzero until that request has actually released the world.
     pub active_sequence: u64,
@@ -99,9 +98,7 @@ pub struct WillowGcStatsV2 {
     pub workers: super::workers::MarkWorkerStatsV2,
 }
 
-/// Exactly one cache line. `STOPS` is a static, so its size sets the cache-line
-/// phase of the runtime statics linked after it, and a shift of half a line
-/// measurably slows spawn-heavy programs that never reach a stop.
+/// Keep pause totals compact at one cache line.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PauseTotals {
     pub(crate) count: u64,
@@ -128,6 +125,7 @@ struct StopTelemetry {
     pauses: PauseTotals,
     pending: VecDeque<StopEventV2>,
     capacity: usize,
+    configured: Option<usize>,
 }
 
 impl Default for StopTelemetry {
@@ -151,6 +149,7 @@ impl StopTelemetry {
             pauses: PauseTotals::default(),
             pending: VecDeque::with_capacity(capacity),
             capacity,
+            configured,
         }
     }
 }
@@ -248,35 +247,72 @@ impl StopTelemetry {
     }
 }
 
-static STOPS: LazyLock<Mutex<StopTelemetry>> =
-    LazyLock::new(|| Mutex::new(StopTelemetry::with_capacity(*CONFIGURED_CAPACITY)));
+pub(crate) struct Stops {
+    state: LazyLock<Mutex<StopTelemetry>>,
+}
+impl Stops {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: LazyLock::new(|| {
+                Mutex::new(StopTelemetry::with_capacity(
+                    crate::diagnostic_settings::stop_trace_capacity(),
+                ))
+            }),
+        }
+    }
+}
+fn default_owner() -> &'static Stops {
+    &super::telemetry().stops
+}
 
-pub(crate) struct StopMeasurement {
+pub(crate) struct StopMeasurement<'a> {
+    runtime: &'a crate::runtime::Runtime,
+    owner: &'a Stops,
+    pause: &'a super::pause::PauseTelemetry,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
     event: StopEventV2,
     finished: bool,
 }
 
-impl StopMeasurement {
+impl StopMeasurement<'static> {
     pub(crate) fn begin(reason: StopReason) -> Self {
-        let event = STOPS
+        Self::begin_in(crate::runtime::current(), reason)
+    }
+}
+
+impl<'a> StopMeasurement<'a> {
+    pub(crate) fn begin_in(runtime: &'a crate::runtime::Runtime, reason: StopReason) -> Self {
+        let telemetry = &runtime.telemetry;
+        let owner = &telemetry.stops;
+        let event = owner
+            .state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .request(reason, timestamp_ns());
-        super::pause::begin(event.sequence, event.reason, event.requested_ns);
+        telemetry
+            .pause
+            .begin(event.sequence, event.reason, event.requested_ns);
         Self {
+            runtime,
+            owner,
+            pause: &telemetry.pause,
+            _thread: std::marker::PhantomData,
             event,
             finished: false,
         }
     }
+}
+impl StopMeasurement<'_> {
     pub(crate) fn stopped(&mut self) {
         self.event.stopped_ns = timestamp_ns();
-        super::pause::switch(super::pause::Component::Metadata);
+        self.pause.switch(super::pause::Component::Metadata);
     }
     pub(crate) fn work(&mut self) -> &mut StopWorkV2 {
         &mut self.event.work
     }
     pub(crate) fn finish(mut self, aborted: bool) {
-        super::observations::work(
+        super::observations::work_in(
+            self.runtime,
             self.event.reason as usize - 1,
             super::observations::Work {
                 objects: self
@@ -291,8 +327,9 @@ impl StopMeasurement {
         );
         self.event.outcome = u32::from(aborted);
         self.event.released_ns = timestamp_ns();
-        super::pause::finish(self.event.released_ns, aborted);
-        STOPS
+        self.pause.finish(self.event.released_ns, aborted);
+        self.owner
+            .state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .complete(self.event);
@@ -300,13 +337,14 @@ impl StopMeasurement {
     }
 }
 
-impl Drop for StopMeasurement {
+impl Drop for StopMeasurement<'_> {
     fn drop(&mut self) {
         if !self.finished {
             self.event.outcome = 2;
             self.event.released_ns = timestamp_ns();
-            super::pause::finish(self.event.released_ns, true);
-            STOPS
+            self.pause.finish(self.event.released_ns, true);
+            self.owner
+                .state
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .complete(self.event);
@@ -314,48 +352,64 @@ impl Drop for StopMeasurement {
     }
 }
 
-/// Finite predeclared stop history; overflow still invalidates the measurement.
+impl Stops {
+    /// Finite predeclared stop history; overflow still invalidates the measurement.
+    pub fn transport_capacity(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .capacity
+    }
+
+    pub fn snapshot_stops(&self) -> StopStatsV2 {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).stats
+    }
+
+    /// Every completed stop, whatever its cause, measured from request to release.
+    pub(crate) fn snapshot_pauses(&self) -> PauseTotals {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).pauses
+    }
+
+    /// Drain under a short telemetry-only lock. Formatting and I/O occur after the
+    /// lock is released, and only after collector election is released by caller.
+    pub(super) fn take_events(&self) -> Vec<StopEventV2> {
+        let mut telemetry = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let events = telemetry.pending.drain(..).collect();
+        telemetry.stats.events_pending = 0;
+        events
+    }
+
+    pub(super) fn discard_events(&self) {
+        let mut telemetry = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        telemetry.pending.clear();
+        telemetry.stats.events_pending = 0;
+    }
+
+    pub(super) fn reset_for_test(&self) {
+        let mut telemetry = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let sequence = telemetry.stats.last_sequence;
+        let generation = telemetry.stats.reset_generation.saturating_add(1);
+        *telemetry = StopTelemetry::with_capacity(telemetry.configured);
+        telemetry.stats.last_sequence = sequence;
+        telemetry.stats.reset_generation = generation;
+    }
+}
 pub fn transport_capacity() -> usize {
-    STOPS.lock().unwrap_or_else(|p| p.into_inner()).capacity
+    default_owner().transport_capacity()
 }
-
 pub fn snapshot_stops() -> StopStatsV2 {
-    STOPS.lock().unwrap_or_else(|p| p.into_inner()).stats
+    default_owner().snapshot_stops()
 }
-
-/// Every completed stop, whatever its cause, measured from request to release.
 pub(crate) fn snapshot_pauses() -> PauseTotals {
-    STOPS.lock().unwrap_or_else(|p| p.into_inner()).pauses
+    default_owner().snapshot_pauses()
 }
-
-/// Drain under a short telemetry-only lock. Formatting and I/O occur after the
-/// lock is released, and only after collector election is released by caller.
-pub(super) fn take_events() -> Vec<StopEventV2> {
-    let mut telemetry = STOPS.lock().unwrap_or_else(|p| p.into_inner());
-    let events = telemetry.pending.drain(..).collect();
-    telemetry.stats.events_pending = 0;
-    events
-}
-
-pub(super) fn discard_events() {
-    let mut telemetry = STOPS.lock().unwrap_or_else(|p| p.into_inner());
-    telemetry.pending.clear();
-    telemetry.stats.events_pending = 0;
-}
-
 pub(super) fn reset_for_test() {
-    let mut telemetry = STOPS.lock().unwrap_or_else(|p| p.into_inner());
-    let sequence = telemetry.stats.last_sequence;
-    let generation = telemetry.stats.reset_generation.saturating_add(1);
-    *telemetry = StopTelemetry::with_capacity(*CONFIGURED_CAPACITY);
-    telemetry.stats.last_sequence = sequence;
-    telemetry.stats.reset_generation = generation;
+    default_owner().reset_for_test();
 }
-
 #[cfg(test)]
 #[path = "stops_tests.rs"]
 mod tests;
 
 pub(crate) fn diagnostic_stop() -> Option<StopEventV2> {
-    Some(STOPS.try_lock().ok()?.stats.last_event)
+    Some(default_owner().state.try_lock().ok()?.stats.last_event)
 }

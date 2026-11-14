@@ -42,11 +42,30 @@ impl Default for MarkWorkerStatsV2 {
     }
 }
 
-static STATS: std::sync::LazyLock<Mutex<MarkWorkerStatsV2>> =
-    std::sync::LazyLock::new(|| Mutex::new(MarkWorkerStatsV2::default()));
-
+pub(crate) struct WorkerTelemetry {
+    stats: std::sync::LazyLock<Mutex<MarkWorkerStatsV2>>,
+    discoveries: Mutex<MarkDiscoveryStats>,
+}
+impl WorkerTelemetry {
+    pub(crate) const fn new() -> Self {
+        Self {
+            stats: std::sync::LazyLock::new(|| Mutex::new(MarkWorkerStatsV2::default())),
+            discoveries: Mutex::new(MarkDiscoveryStats {
+                pointer_checks: 0,
+                duplicates: 0,
+                unindexed: 0,
+            }),
+        }
+    }
+    pub(crate) fn snapshot(&self) -> MarkWorkerStatsV2 {
+        *self.stats.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+fn default_owner() -> &'static WorkerTelemetry {
+    &super::telemetry().workers
+}
 pub fn snapshot() -> MarkWorkerStatsV2 {
-    *STATS.lock().unwrap_or_else(|p| p.into_inner())
+    default_owner().snapshot()
 }
 
 /// Cumulative discovery diagnostics, without changing either versioned C ABI.
@@ -58,19 +77,19 @@ pub struct MarkDiscoveryStats {
     pub duplicates: u64,
     pub unindexed: u64,
 }
-static DISCOVERIES: Mutex<MarkDiscoveryStats> = Mutex::new(MarkDiscoveryStats {
-    pointer_checks: 0,
-    duplicates: 0,
-    unindexed: 0,
-});
-pub fn discovery_snapshot() -> MarkDiscoveryStats {
-    *DISCOVERIES.lock().unwrap_or_else(|p| p.into_inner())
+impl WorkerTelemetry {
+    pub(crate) fn discovery_snapshot(&self) -> MarkDiscoveryStats {
+        *self.discoveries.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    pub(crate) fn record_discoveries(&self, checks: u64, duplicates: u64, unindexed: u64) {
+        let mut stats = self.discoveries.lock().unwrap_or_else(|p| p.into_inner());
+        stats.pointer_checks = stats.pointer_checks.saturating_add(checks);
+        stats.duplicates = stats.duplicates.saturating_add(duplicates);
+        stats.unindexed = stats.unindexed.saturating_add(unindexed);
+    }
 }
-pub(crate) fn record_discoveries(checks: u64, duplicates: u64, unindexed: u64) {
-    let mut stats = DISCOVERIES.lock().unwrap_or_else(|p| p.into_inner());
-    stats.pointer_checks = stats.pointer_checks.saturating_add(checks);
-    stats.duplicates = stats.duplicates.saturating_add(duplicates);
-    stats.unindexed = stats.unindexed.saturating_add(unindexed);
+pub fn discovery_snapshot() -> MarkDiscoveryStats {
+    default_owner().discovery_snapshot()
 }
 
 impl MarkWorkerStatsV2 {
@@ -108,41 +127,58 @@ pub(crate) enum Failure {
     DropPanic,
 }
 
-pub(crate) fn record_failure(failure: Failure) {
-    let mut stats = STATS.lock().unwrap_or_else(|p| p.into_inner());
-    let field = match failure {
-        Failure::MarkerPanic => &mut stats.marker_panics,
-        Failure::Spawn => &mut stats.spawn_failures,
-        Failure::JoinTimeout => &mut stats.join_timeouts,
-        Failure::Fallback => &mut stats.fallback_cycles,
-        Failure::DropPanic => &mut stats.drop_hook_panics,
-    };
-    if add(field, 1) {
-        stats.flags |= SATURATED;
+impl WorkerTelemetry {
+    pub(crate) fn record_failure(&self, failure: Failure) {
+        let mut stats = self.stats.lock().unwrap_or_else(|p| p.into_inner());
+        let field = match failure {
+            Failure::MarkerPanic => &mut stats.marker_panics,
+            Failure::Spawn => &mut stats.spawn_failures,
+            Failure::JoinTimeout => &mut stats.join_timeouts,
+            Failure::Fallback => &mut stats.fallback_cycles,
+            Failure::DropPanic => &mut stats.drop_hook_panics,
+        };
+        if add(field, 1) {
+            stats.flags |= SATURATED;
+        }
     }
 }
+pub(crate) fn record_failure(failure: Failure) {
+    default_owner().record_failure(failure);
+}
 
-pub(crate) struct JobMeasurement {
+pub(crate) struct JobMeasurement<'a> {
+    owner: &'a WorkerTelemetry,
+    busy: Option<super::measurement::BusyWorker<'a>>,
+    // Creation and completion must sample the same thread CPU clock.
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
     start: Instant,
     cpu: Option<u64>,
 }
-impl JobMeasurement {
+impl JobMeasurement<'static> {
     pub(crate) fn begin() -> Self {
-        super::measurement::worker_busy();
+        Self::begin_in(super::telemetry())
+    }
+}
+impl<'a> JobMeasurement<'a> {
+    pub(crate) fn begin_in(owner: &'a super::Telemetry) -> Self {
+        let busy = owner.measurements.worker_busy();
         Self {
+            owner: &owner.workers,
+            busy: Some(busy),
+            _thread: std::marker::PhantomData,
             start: Instant::now(),
             cpu: thread_cpu_ns(),
         }
     }
 }
-impl Drop for JobMeasurement {
+impl Drop for JobMeasurement<'_> {
     fn drop(&mut self) {
         let cpu = self
             .cpu
             .zip(thread_cpu_ns())
             .and_then(|(a, b)| b.checked_sub(a));
         let wall = self.start.elapsed().as_nanos();
-        let mut stats = STATS.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stats = self.owner.stats.lock().unwrap_or_else(|p| p.into_inner());
         let mut saturated = wall > u64::MAX as u128;
         saturated |= add(&mut stats.completed_jobs, 1);
         saturated |= add(&mut stats.wall_ns, wall.min(u64::MAX as u128) as u64);
@@ -156,7 +192,7 @@ impl Drop for JobMeasurement {
         if saturated {
             stats.flags |= SATURATED;
         }
-        super::measurement::worker_idle();
+        drop(self.busy.take());
     }
 }
 
@@ -231,6 +267,56 @@ pub fn thread_cpu_ns() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_job_owners_isolate_completion_failure_discoveries_and_unwind() {
+        let first = super::super::Telemetry::new();
+        let second = super::super::Telemetry::new();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = [(&first, 1), (&second, 3)]
+                .into_iter()
+                .map(|(owner, stride)| {
+                    let barrier = &barrier;
+                    scope.spawn(crate::runtime::serving(move || {
+                        for round in 1..=64 {
+                            let job = JobMeasurement::begin_in(owner);
+                            owner.workers.record_discoveries(stride, 1, 0);
+                            owner.workers.record_failure(Failure::Fallback);
+                            barrier.wait();
+                            assert_eq!(owner.measurements.snapshot().worker_busy, 1);
+                            drop(job);
+                            barrier.wait();
+                            assert_eq!(owner.measurements.snapshot().worker_busy, 0);
+                            assert_eq!(owner.workers.snapshot().completed_jobs, round);
+                            assert_eq!(owner.workers.snapshot().fallback_cycles, round);
+                            assert_eq!(
+                                owner.workers.discovery_snapshot().pointer_checks,
+                                round * stride
+                            );
+                        }
+                    }))
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _job = JobMeasurement::begin_in(&first);
+            panic!("owned worker job unwind");
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(first.measurements.snapshot().worker_busy, 0);
+        assert_eq!(first.workers.snapshot().completed_jobs, 65);
+        assert_eq!(second.workers.snapshot().completed_jobs, 64);
+        assert_eq!(first.workers.discovery_snapshot().pointer_checks, 64);
+        assert_eq!(second.workers.discovery_snapshot().pointer_checks, 192);
+        first.workers.stats.lock().unwrap().spawn_failures = u64::MAX;
+        first.workers.record_failure(Failure::Spawn);
+        assert_ne!(first.workers.snapshot().flags & SATURATED, 0);
+        assert_eq!(second.workers.snapshot().flags & SATURATED, 0);
+    }
+
     #[test]
     fn thread_cpu_measurement_is_monotonic_when_available() {
         let before = thread_cpu_ns();

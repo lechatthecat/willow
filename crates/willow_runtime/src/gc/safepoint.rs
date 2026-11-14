@@ -14,17 +14,22 @@ pub(super) fn snapshot_local_roots() -> Vec<usize> {
     result
 }
 
-/// Registration epoch; `reset_internal` advances it when it clears the
-/// mutator registry, invalidating every thread's cached registration.
-pub(super) static MUTATOR_EPOCH: AtomicU64 = AtomicU64::new(1);
-
 std::thread_local! {
-    /// `MUTATOR_EPOCH` at this thread's registration, or zero when it is not
-    /// registered. Only the owning thread inserts or removes its own registry
-    /// entry, so this cache answers `current_thread_is_registered` without the
-    /// coordination lock that every root push/pop would otherwise contend on.
     static SATB_BUFFER: std::cell::RefCell<Option<Arc<satb::MutatorBuffer>>> = const { std::cell::RefCell::new(None) };
+    /// The registering runtime's epoch cell, or null when this thread is not
+    /// registered, and the epoch it held at registration. Only the owning
+    /// thread inserts or removes its own registry entry, so this cache answers
+    /// `current_thread_is_registered` without the coordination lock that every
+    /// root push/pop would otherwise contend on. The cell address identifies
+    /// the owner; it is compared by address before any dereference, and a
+    /// registration is retired before its runtime can be dropped.
+    static REGISTERED_EPOCH_CELL: std::cell::Cell<*const std::sync::atomic::AtomicU64> = const { std::cell::Cell::new(std::ptr::null()) };
     static REGISTERED_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// `REGISTERED_EPOCH_CELL` when the registration belongs to the runtime
+    /// this thread serves, else null. Selected runtimes are `'static` and a
+    /// registered thread cannot change selection, so a non-null value stays
+    /// dereferenceable and keeps identifying `runtime()` while registered.
+    static SERVED_EPOCH_CELL: std::cell::Cell<*const std::sync::atomic::AtomicU64> = const { std::cell::Cell::new(std::ptr::null()) };
     /// Whether every native frame on this thread that holds a managed pointer
     /// keeps it only in registered root slots and reloads it after a GC point.
     /// Generated code does; runtime Rust frames may keep raw copies, so the
@@ -59,8 +64,12 @@ impl Drop for RelocationSafeScope {
 /// root slots: scheduler drivers between task polls, and spin-waits entered
 /// directly from generated code. Roots published here are relocatable.
 pub(crate) fn relocatable_safepoint() {
+    relocatable_safepoint_in(crate::runtime::current());
+}
+
+pub(crate) fn relocatable_safepoint_in(owner: &crate::runtime::Runtime) {
     let _relocation = RelocationSafeScope::enter();
-    willow_gc_safepoint();
+    safepoint_in(owner);
 }
 
 pub(super) fn relocation_safe() -> bool {
@@ -164,14 +173,54 @@ fn append_live_root_slots(slots: &[*mut *mut u8], result: &mut Vec<usize>) {
 /// Registered mutators each legitimately own their own thread-local root stack;
 /// cross-thread safety is handled by stop-the-world scanning, so they bypass the
 /// legacy single-mutator `runtime().root_stack_owner` guard.
+///
+/// A thread may hold a registration with a runtime it does not serve (shared
+/// runtime workers and drivers start without selecting their owner), so only
+/// a registration with `runtime()` counts. Registration records that case in
+/// `SERVED_EPOCH_CELL`, which avoids a runtime lookup on root push/pop.
 pub(super) fn current_thread_is_registered() -> bool {
-    let epoch = REGISTERED_EPOCH.get();
-    epoch != 0 && epoch == MUTATOR_EPOCH.load(Ordering::Acquire)
+    let cell = SERVED_EPOCH_CELL.get();
+    // SAFETY: non-null only while registered with the selected runtime, which
+    // is `'static` and cannot be deselected while this thread is registered.
+    !cell.is_null() && REGISTERED_EPOCH.get() == unsafe { &*cell }.load(Ordering::Acquire)
+}
+
+pub(super) fn current_thread_is_registered_in(owner: &GcRuntime) -> bool {
+    std::ptr::eq(REGISTERED_EPOCH_CELL.get(), &owner.mutator_epoch)
+        && REGISTERED_EPOCH.get() == owner.mutator_epoch.load(Ordering::Acquire)
+}
+
+/// Whether this thread may start serving `next`: a thread that still holds a
+/// mutator registration must keep serving the runtime it registered with.
+pub(crate) fn registration_permits_selection(next: &crate::runtime::Runtime) -> bool {
+    let cell = REGISTERED_EPOCH_CELL.get();
+    cell.is_null() || std::ptr::eq(cell, &next.gc.mutator_epoch)
+}
+
+/// Re-derive `SERVED_EPOCH_CELL` after this thread starts serving `next`.
+/// Selection is permitted only when unregistered or registered with `next`
+/// (see [`registration_permits_selection`]); the latter case must start
+/// counting as served because `next` is now `runtime()` and `'static`.
+pub(crate) fn refresh_served_registration(next: &'static crate::runtime::Runtime) {
+    let cell = REGISTERED_EPOCH_CELL.get();
+    SERVED_EPOCH_CELL.set(if std::ptr::eq(cell, &next.gc.mutator_epoch) {
+        cell
+    } else {
+        std::ptr::null()
+    });
 }
 
 pub(super) fn current_satb_buffer() -> Option<Arc<satb::MutatorBuffer>> {
+    current_satb_buffer_in(runtime())
+}
+
+pub(super) fn current_satb_buffer_in(owner: &GcRuntime) -> Option<Arc<satb::MutatorBuffer>> {
     let epoch = REGISTERED_EPOCH.try_with(|epoch| epoch.get()).ok()?;
-    if epoch == 0 || epoch != MUTATOR_EPOCH.load(Ordering::Acquire) {
+    if !std::ptr::eq(
+        REGISTERED_EPOCH_CELL.try_with(|cell| cell.get()).ok()?,
+        &owner.mutator_epoch,
+    ) || epoch != owner.mutator_epoch.load(Ordering::Acquire)
+    {
         return None;
     }
     SATB_BUFFER
@@ -183,7 +232,7 @@ pub(super) fn current_satb_buffer() -> Option<Arc<satb::MutatorBuffer>> {
 /// Called with the coordination lock held after the registry is cleared.
 pub(super) fn invalidate_mutator_registrations() {
     crate::generated_context::revoke_barrier_buffers();
-    MUTATOR_EPOCH.fetch_add(1, Ordering::AcqRel);
+    runtime().mutator_epoch.fetch_add(1, Ordering::AcqRel);
 }
 
 /// True when at least one mutator OTHER than the current thread is registered,
@@ -205,15 +254,29 @@ pub(super) fn multi_mutator_active() -> bool {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_register_mutator() {
-    crate::gc_telemetry::observations::register();
-    let (lock, _) = &runtime().coord;
+    register_mutator_in(crate::runtime::current());
+}
+
+fn register_mutator_in(owner: &crate::runtime::Runtime) {
+    assert!(
+        registration_permits_selection(owner),
+        "a thread must retire its previous mutator before changing runtime"
+    );
+    crate::gc_telemetry::observations::register_for_runtime(owner);
+    let (lock, _) = &owner.gc.coord;
     {
         let mut coord = lock.lock().unwrap();
         let id = std::thread::current().id();
         let record = coord.mutators.entry(id).or_default();
         let buffer = record.satb_buffer.get_or_insert_with(Default::default);
         SATB_BUFFER.with(|local| *local.borrow_mut() = Some(Arc::clone(buffer)));
-        REGISTERED_EPOCH.set(MUTATOR_EPOCH.load(Ordering::Acquire));
+        REGISTERED_EPOCH_CELL.set(&owner.gc.mutator_epoch);
+        SERVED_EPOCH_CELL.set(if std::ptr::eq(owner, crate::runtime::current()) {
+            &owner.gc.mutator_epoch
+        } else {
+            std::ptr::null()
+        });
+        REGISTERED_EPOCH.set(owner.gc.mutator_epoch.load(Ordering::Acquire));
         if coord.stop_requested {
             coord.stw_pending.insert(id);
         }
@@ -221,7 +284,7 @@ pub extern "C" fn willow_gc_register_mutator() {
     // Registration can race with a collection that has already requested a
     // stop. Join that stop before executing any mutator work so the collector
     // never waits on a newly registered thread that has not published roots.
-    willow_gc_safepoint();
+    safepoint_in(owner);
 }
 
 /// Unregister the current thread as a GC mutator. Must be called before the
@@ -229,11 +292,19 @@ pub extern "C" fn willow_gc_register_mutator() {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_unregister_mutator() {
+    unregister_mutator_in(crate::runtime::current());
+}
+
+fn unregister_mutator_in(owner: &crate::runtime::Runtime) {
+    assert!(
+        registration_permits_selection(owner),
+        "cannot retire a mutator belonging to another runtime"
+    );
     assist::reset();
-    flush_satb_current(true);
+    barrier::flush_satb_current_in(owner, true);
     crate::generated_context::revoke_barrier_buffers();
     let id = std::thread::current().id();
-    let (lock, cv) = &runtime().coord;
+    let (lock, cv) = &owner.gc.coord;
     let mut coord = lock.lock().unwrap();
     // A previously registered stack must not disappear from both registries.
     // Empty-stack shutdown remains legal during a collection. Nonempty raw
@@ -247,25 +318,28 @@ pub extern "C" fn willow_gc_unregister_mutator() {
             .is_some_and(|collector| collector != id)
         {
             let generation = coord.cycle_generation;
-            super::cycle_wait::wait_for_cycle(coord, generation);
+            super::cycle_wait::wait_for_cycle_in(owner, coord, generation);
             coord = lock.lock().unwrap();
         }
-        claim_legacy_owner_locked(&coord, false);
+        root::claim_legacy_owner_locked_in(&owner.gc, &coord, false);
     }
-    crate::gc_telemetry::observations::unregister();
+    crate::gc_telemetry::observations::unregister_for_runtime(owner);
     coord.mutators.remove(&id);
     coord.stw_pending.remove(&id);
     REGISTERED_EPOCH.set(0);
+    REGISTERED_EPOCH_CELL.set(std::ptr::null());
+    SERVED_EPOCH_CELL.set(std::ptr::null());
     SATB_BUFFER.with(|local| *local.borrow_mut() = None);
     coord.parked.remove(&id);
     // A legacy owner can register, then empty its stack while registered.
     // Retire that ownership before releasing coord, using coord -> owner order.
     // Nonempty legacy stacks must still block foreign collections.
-    clear_root_stack_owner_if_empty();
+    root::clear_root_stack_owner_if_empty_in(&owner.gc);
     // Keep the coordination lock while retiring TLS state: collectors acquire
     // coord then heap, so this preserves lock ordering and prevents a collector
     // from missing this thread while it still mutates its chunk metadata.
-    retire_tlabs_for_thread(id);
+    old_lab::retire_private_current_in(owner);
+    tlab::retire_tlabs_for_thread_in(owner, id);
     // A collector may be waiting for this thread to park; it no longer needs to.
     cv.notify_all();
 }
@@ -280,36 +354,44 @@ pub extern "C" fn willow_gc_unregister_mutator() {
 /// path as well. Prefer it over the bare pair wherever the registered region
 /// can panic.
 #[must_use = "dropping the guard unregisters the mutator immediately"]
-pub struct MutatorRegistration {
+pub struct MutatorRegistration<'a> {
+    owner: &'a crate::runtime::Runtime,
     owned: bool,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-impl MutatorRegistration {
+impl MutatorRegistration<'static> {
     /// Register the calling thread, joining a collection that has already
     /// requested a stop exactly as `willow_gc_register_mutator` does.
     pub fn new() -> Self {
-        let owned = !current_thread_is_registered();
+        Self::new_in(crate::runtime::current())
+    }
+}
+
+impl<'a> MutatorRegistration<'a> {
+    pub(crate) fn new_in(owner: &'a crate::runtime::Runtime) -> Self {
+        let owned = !current_thread_is_registered_in(&owner.gc);
         if owned {
-            willow_gc_register_mutator();
+            register_mutator_in(owner);
         }
         Self {
+            owner,
             owned,
             _thread: std::marker::PhantomData,
         }
     }
 }
 
-impl Default for MutatorRegistration {
+impl Default for MutatorRegistration<'static> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Drop for MutatorRegistration {
+impl Drop for MutatorRegistration<'_> {
     fn drop(&mut self) {
         if self.owned {
-            willow_gc_unregister_mutator();
+            unregister_mutator_in(self.owner);
         }
     }
 }
@@ -328,7 +410,7 @@ impl Drop for MutatorRegistration {
 #[must_use]
 pub struct NativeGcScope {
     depth: usize,
-    _registration: MutatorRegistration,
+    _registration: MutatorRegistration<'static>,
 }
 
 impl NativeGcScope {
@@ -363,7 +445,7 @@ impl Drop for NativeGcScope {
 ///
 /// Read once: `std::env::var` allocates for the key on Windows.
 fn handshake_timeout() -> Option<std::time::Duration> {
-    *crate::diagnostic_settings::GC_HANDSHAKE_TIMEOUT
+    *crate::runtime::current().diagnostics.gc_handshake_timeout
 }
 
 /// Wait on the coordination condvar until `ready` holds.
@@ -376,12 +458,23 @@ fn handshake_timeout() -> Option<std::time::Duration> {
 /// report the ids and abort rather than block with no diagnostic.
 pub(super) fn wait_for_mutators<'a>(
     cv: &GcCondvar,
+    coord: std::sync::MutexGuard<'a, GcCoord>,
+    phase: &str,
+    ready: impl Fn(&GcCoord) -> bool,
+    outstanding: impl Fn(&GcCoord) -> Vec<ThreadId>,
+) -> std::sync::MutexGuard<'a, GcCoord> {
+    wait_for_mutators_with_timeout(handshake_timeout(), cv, coord, phase, ready, outstanding)
+}
+
+fn wait_for_mutators_with_timeout<'a>(
+    timeout: Option<std::time::Duration>,
+    cv: &GcCondvar,
     mut coord: std::sync::MutexGuard<'a, GcCoord>,
     phase: &str,
     ready: impl Fn(&GcCoord) -> bool,
     outstanding: impl Fn(&GcCoord) -> Vec<ThreadId>,
 ) -> std::sync::MutexGuard<'a, GcCoord> {
-    let deadline = handshake_timeout().map(|limit| std::time::Instant::now() + limit);
+    let deadline = timeout.map(|limit| std::time::Instant::now() + limit);
     while !ready(&coord) {
         let Some(deadline) = deadline else {
             coord = cv.wait(coord).unwrap_or_else(|poison| poison.into_inner());
@@ -395,7 +488,7 @@ pub(super) fn wait_for_mutators<'a>(
                  through gc::MutatorRegistration, which unregisters on the unwind path too. \
                  Raise or disable the bound with WILLOW_GC_HANDSHAKE_TIMEOUT_SECS (0 waits \
                  indefinitely) if a mutator legitimately needs longer to reach a safepoint.",
-                handshake_timeout().unwrap_or_default().as_secs(),
+                timeout.unwrap_or_default().as_secs(),
                 stuck.len(),
             );
             crate::failure::fatal_invariant("registered mutator handshake timed out");
@@ -415,7 +508,13 @@ pub(super) fn wait_for_mutators<'a>(
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_stop_flag() -> *const u8 {
-    runtime().poll_requested.as_ptr().cast::<u8>()
+    stop_flag_in(runtime())
+}
+
+/// The stop flag generated polls of `owner`'s mutators read. Its address is
+/// fixed for the runtime's life.
+pub(crate) fn stop_flag_in(owner: &GcRuntime) -> *const u8 {
+    owner.poll_requested.as_ptr().cast::<u8>()
 }
 
 /// A cooperative GC safepoint. Cheap when no collection is
@@ -426,11 +525,16 @@ pub extern "C" fn willow_gc_stop_flag() -> *const u8 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_safepoint() {
-    crate::gc_telemetry::observations::progress();
-    flush_satb_current(false);
+    safepoint_in(crate::runtime::current());
+}
+
+pub(super) fn safepoint_in(owner: &crate::runtime::Runtime) {
+    crate::gc_telemetry::observations::progress_for_runtime(owner);
+    barrier::flush_satb_current_in(owner, false);
     // Hot-path: a single relaxed atomic load. No collection pending → return
     // immediately without touching the coordination lock.
-    if !runtime()
+    if !owner
+        .gc
         .poll_requested
         .load(std::sync::atomic::Ordering::Acquire)
     {
@@ -442,10 +546,11 @@ pub extern "C" fn willow_gc_safepoint() {
     // the world restarts. Checking here makes that rule enforced rather than
     // merely documented, and costs one TLS read on the already-slow path.
     crate::gc_mark_queue::assert_no_queue_lock_held("willow_gc_safepoint");
-    let _interval = crate::gc_telemetry::observations::Span::new(
+    let _interval = crate::gc_telemetry::observations::Span::for_runtime(
+        owner,
         crate::gc_telemetry::observations::Kind::Handshake,
     );
-    let (lock, cv) = &runtime().coord;
+    let (lock, cv) = &owner.gc.coord;
     let mut coord = lock.lock().unwrap();
     if !coord.stop_requested {
         return;
@@ -453,7 +558,8 @@ pub extern "C" fn willow_gc_safepoint() {
     let id = std::thread::current().id();
     // Publish our roots so the collector can scan them while we are parked, then
     // park until the world resumes.
-    let roots = PublishedRoots::current(snapshot_local_root_slots());
+    let mut roots = PublishedRoots::current(snapshot_local_root_slots());
+    roots.satb_buffer = current_satb_buffer_in(&owner.gc);
     if let Some(slot) = coord.mutators.get_mut(&id) {
         *slot = roots;
     }
@@ -468,33 +574,110 @@ pub extern "C" fn willow_gc_safepoint() {
     coord.parked.remove(&id);
 }
 
+/// A dedicated marker has no mutator roots or allocation buffers. Its queue
+/// consumer is retired before polling; enrollment exists solely for stop rounds.
+pub(super) struct MarkerRegistration<'a> {
+    owner: &'a crate::runtime::Runtime,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl<'a> MarkerRegistration<'a> {
+    pub(super) fn new(owner: &'a crate::runtime::Runtime) -> Self {
+        crate::gc_telemetry::observations::register_for_runtime(owner);
+        let id = std::thread::current().id();
+        {
+            let mut coord = owner.gc.coord.0.lock().unwrap();
+            assert!(
+                coord
+                    .mutators
+                    .insert(id, PublishedRoots::default())
+                    .is_none()
+            );
+            if coord.stop_requested {
+                coord.stw_pending.insert(id);
+            }
+        }
+        let registration = Self {
+            owner,
+            _thread: std::marker::PhantomData,
+        };
+        registration.poll();
+        registration
+    }
+
+    pub(super) fn poll(&self) {
+        crate::gc_telemetry::observations::progress_for_runtime(self.owner);
+        if !self.owner.gc.poll_requested.load(Ordering::Acquire) {
+            return;
+        }
+        crate::gc_mark_queue::assert_no_queue_lock_held("marker safepoint");
+        let (lock, cv) = &self.owner.gc.coord;
+        let mut coord = lock.lock().unwrap();
+        if !coord.stop_requested {
+            return;
+        }
+        let id = std::thread::current().id();
+        coord.parked.insert(id);
+        coord.stw_pending.remove(&id);
+        if coord.stw_pending.is_empty() {
+            cv.notify_all();
+        }
+        while coord.stop_requested {
+            coord = cv.wait(coord).unwrap();
+        }
+        coord.parked.remove(&id);
+    }
+}
+impl Drop for MarkerRegistration<'_> {
+    fn drop(&mut self) {
+        crate::gc_telemetry::observations::unregister_for_runtime(self.owner);
+        let (lock, cv) = &self.owner.gc.coord;
+        let mut coord = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let id = std::thread::current().id();
+        coord.mutators.remove(&id);
+        coord.stw_pending.remove(&id);
+        coord.parked.remove(&id);
+        cv.notify_all();
+    }
+}
+
 /// Keeps a waiting thread visible to collectors without waking it for every
 /// stop. The owner publishes its context in O(1); the first stop reads the
 /// slots, and later stops reuse them until Drop takes the same coordination
 /// lock and observes the world running again.
-pub(crate) struct IdleMutator {
+pub(crate) struct IdleMutator<'a> {
+    owner: &'a crate::runtime::Runtime,
     registered: bool,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-impl IdleMutator {
+impl IdleMutator<'static> {
     /// # Safety
     /// Until this guard is dropped, the caller must not access managed objects,
     /// root slots, TLAB state, or SATB buffers, or call back into managed code.
     /// It may only wait on native synchronization or OS calls. Relocation safety
     /// is inherited from the caller; raw runtime references remain pinned.
     pub(crate) unsafe fn enter() -> Self {
-        let registered = current_thread_is_registered();
+        unsafe { Self::enter_in(crate::runtime::current()) }
+    }
+}
+
+impl<'a> IdleMutator<'a> {
+    /// The same exclusion contract as `enter`, for the selected runtime.
+    pub(crate) unsafe fn enter_in(owner: &'a crate::runtime::Runtime) -> Self {
+        let registered = current_thread_is_registered_in(&owner.gc);
         if registered {
-            flush_satb_current(false);
+            barrier::flush_satb_current_in(owner, false);
             crate::gc_mark_queue::assert_no_queue_lock_held("idle mutator");
-            let (lock, cv) = &runtime().coord;
+            let (lock, cv) = &owner.gc.coord;
             let mut coord = lock.lock().unwrap();
             let id = std::thread::current().id();
             *coord
                 .mutators
                 .get_mut(&id)
-                .expect("registered idle mutator") = PublishedRoots::deferred();
+                .expect("registered idle mutator") = PublishedRoots {
+                satb_buffer: current_satb_buffer_in(&owner.gc),
+                ..PublishedRoots::deferred()
+            };
             assert!(coord.parked.insert(id), "nested idle mutator guard");
             coord.stw_pending.remove(&id);
             if coord.stop_requested && coord.stw_pending.is_empty() {
@@ -502,13 +685,17 @@ impl IdleMutator {
             }
         }
         Self {
+            owner,
             registered,
             _thread: std::marker::PhantomData,
         }
     }
+}
 
-    /// Hand the region to a caller across an ABI boundary.
+impl IdleMutator<'static> {
+    /// Hand the process-default region to a caller across an ABI boundary.
     pub(crate) fn into_raw(self) -> bool {
+        assert!(std::ptr::eq(self.owner, crate::runtime::current()));
         let registered = self.registered;
         std::mem::forget(self);
         registered
@@ -518,19 +705,20 @@ impl IdleMutator {
     /// `registered` must come from `into_raw` on this thread, exactly once.
     pub(crate) unsafe fn from_raw(registered: bool) -> Self {
         Self {
+            owner: crate::runtime::current(),
             registered,
             _thread: std::marker::PhantomData,
         }
     }
 }
 
-impl Drop for IdleMutator {
+impl Drop for IdleMutator<'_> {
     fn drop(&mut self) {
         if !self.registered {
             return;
         }
         // This also runs while foreign code unwinds; a second panic would abort.
-        let (lock, cv) = &runtime().coord;
+        let (lock, cv) = &self.owner.gc.coord;
         let mut coord = lock.lock().unwrap_or_else(|poison| poison.into_inner());
         while coord.stop_requested {
             coord = cv.wait(coord).unwrap_or_else(|poison| poison.into_inner());
@@ -593,15 +781,24 @@ pub(super) fn with_stw<R>(
     reason: crate::gc_telemetry::stops::StopReason,
     collect: impl FnOnce(&GcCoord, &mut crate::gc_telemetry::stops::StopWorkV2) -> R,
 ) -> R {
-    let mut measurement = crate::gc_telemetry::stops::StopMeasurement::begin(reason);
-    let (lock, cv) = &runtime().coord;
+    with_stw_in(crate::runtime::current(), reason, collect)
+}
+
+pub(super) fn with_stw_in<R>(
+    owner: &crate::runtime::Runtime,
+    reason: crate::gc_telemetry::stops::StopReason,
+    collect: impl FnOnce(&GcCoord, &mut crate::gc_telemetry::stops::StopWorkV2) -> R,
+) -> R {
+    let mut measurement = crate::gc_telemetry::stops::StopMeasurement::begin_in(owner, reason);
+    let (lock, cv) = &owner.gc.coord;
     let me = std::thread::current().id();
     // Publish the stop request on the lock-free gate first so mutators on the
     // hot path observe it at their next safepoint.
-    runtime()
+    owner
+        .gc
         .stop_requested
         .store(true, std::sync::atomic::Ordering::Release);
-    runtime().poll_requested.store(true, Ordering::Release);
+    owner.gc.poll_requested.store(true, Ordering::Release);
     let mut coord = lock.lock().unwrap_or_else(|poison| poison.into_inner());
     coord.stop_requested = true;
     coord.stw_pending = coord
@@ -610,8 +807,9 @@ pub(super) fn with_stw<R>(
         .copied()
         .filter(|id| *id != me && !coord.parked.contains(id))
         .collect();
-    runtime().budget_cv.notify_all();
-    coord = wait_for_mutators(
+    owner.gc.budget_cv.notify_all();
+    coord = wait_for_mutators_with_timeout(
+        *owner.diagnostics.gc_handshake_timeout,
         cv,
         coord,
         "stop-the-world park",
@@ -626,8 +824,12 @@ pub(super) fn with_stw<R>(
     measurement.stopped();
     let collector_start = crate::gc_telemetry::timestamp_ns();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _phase = crate::gc_telemetry::observations::StopPhase::new(reason as usize - 1);
-        let _interval = crate::gc_telemetry::observations::Span::new(
+        let _phase = crate::gc_telemetry::observations::StopPhase::new(
+            &owner.telemetry.observations,
+            reason as usize - 1,
+        );
+        let _interval = crate::gc_telemetry::observations::Span::for_runtime(
+            owner,
             crate::gc_telemetry::observations::Kind::Collector,
         );
         for published in coord.mutators.values_mut() {
@@ -636,21 +838,32 @@ pub(super) fn with_stw<R>(
         collect(&coord, measurement.work())
     }));
     let collector_end = crate::gc_telemetry::timestamp_ns();
-    crate::gc_telemetry::pause::switch(crate::gc_telemetry::pause::Component::Wakeup);
-    let resume = crate::gc_telemetry::measurement::Span::new(
+    owner
+        .telemetry
+        .pause
+        .switch(crate::gc_telemetry::pause::Component::Wakeup);
+    let resume = crate::gc_telemetry::measurement::Span::for_runtime(
+        owner,
         crate::gc_telemetry::measurement::Phase::Resume,
     );
     coord.stop_requested = false;
-    runtime()
+    owner
+        .gc
         .stop_requested
         .store(false, std::sync::atomic::Ordering::Release);
-    runtime().poll_requested.store(false, Ordering::Release);
+    owner.gc.poll_requested.store(false, Ordering::Release);
     cv.notify_all();
     drop(coord);
     let unlocked = crate::gc_telemetry::timestamp_ns();
     drop(resume);
     measurement.finish(result.is_err());
-    old_cycle::record_stop(reason as u32, collector_start, collector_end, unlocked);
+    old_cycle::record_stop(
+        &owner.gc,
+        reason as u32,
+        collector_start,
+        collector_end,
+        unlocked,
+    );
     match result {
         Ok(value) => value,
         Err(payload) => std::panic::resume_unwind(payload),
@@ -702,3 +915,7 @@ pub(super) fn all_registered_stack_roots(coord: &GcCoord) -> Vec<*mut u8> {
 #[cfg(test)]
 #[path = "idle_tests.rs"]
 mod idle_tests;
+
+#[cfg(test)]
+#[path = "mutator_owner_tests.rs"]
+mod mutator_owner_tests;

@@ -303,14 +303,17 @@ mod tests {
     #[test]
     fn runtime_soft_pressure_collects_without_changing_hard_cap() {
         use super::super::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         let root = willow_alloc(1024);
         assert!(!root.is_null());
         willow_gc_add_runtime_root(root);
         assert_eq!(willow_gc_set_memory_limit(1), 0);
-        assert!(allocation_should_collect());
+        assert!(allocation_should_collect_with_sync_in(
+            crate::runtime::current(),
+            true
+        ));
         collect_internal();
         let state = runtime().heap.lock().unwrap();
         assert!(state.memory_limit_bytes.is_none());
@@ -443,7 +446,7 @@ mod tests {
     #[test]
     fn process_pressure_reaches_pacer_but_relief_does_not() {
         use super::super::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         assert!(!willow_alloc(8).is_null());
         let mut state = runtime().heap.lock().unwrap();
@@ -557,7 +560,7 @@ mod tests {
     #[test]
     fn cached_process_pressure_relief_preserves_live_runtime_root() {
         use super::super::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         let root = willow_alloc((4096 - GC_HEADER_SIZE) as i64);
         willow_gc_add_runtime_root(root);
@@ -628,7 +631,7 @@ mod tests {
     #[test]
     fn concurrent_updates_preserve_roots_and_relief() {
         use super::super::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         let root = willow_alloc(8);
         willow_gc_add_runtime_root(root);
@@ -641,11 +644,11 @@ mod tests {
         let before = runtime().heap.lock().unwrap().major_collections;
         std::thread::scope(|scope| {
             for _ in 0..4 {
-                scope.spawn(|| {
+                scope.spawn(crate::runtime::serving(|| {
                     for n in 0..100 {
                         willow_gc_set_memory_limit(1 + n % 2);
                     }
-                });
+                }));
             }
             for _ in 0..100 {
                 assert!(!willow_alloc(8).is_null());
@@ -663,12 +666,12 @@ mod tests {
     #[test]
     fn allocator_failure_gets_exactly_one_recovery_and_one_retry() {
         use super::super::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for nursery in [false, true] {
             reset_internal();
             willow_gc_set_memory_limit(u64::MAX);
-            STORAGE_FAILURES.set(1);
-            STORAGE_ATTEMPTS.set(0);
+            runtime().storage_allocator.set_failures(1);
+            runtime().storage_allocator.set_attempts(0);
             let mut tls = tlab_state_for_test();
             let result = if nursery {
                 willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0)
@@ -676,8 +679,8 @@ mod tests {
                 willow_alloc(GC_LARGE_OBJECT_THRESHOLD as i64)
             };
             assert!(!result.is_null());
-            assert_eq!(STORAGE_ATTEMPTS.get(), 2);
-            assert_eq!(STORAGE_FAILURES.get(), 0);
+            assert_eq!(runtime().storage_allocator.attempts(), 2);
+            assert_eq!(runtime().storage_allocator.failures(), 0);
             assert_eq!(runtime().heap.lock().unwrap().major_collections, 1);
             reset_internal(); // TLS is still alive here.
         }

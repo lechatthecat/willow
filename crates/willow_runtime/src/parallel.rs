@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn parallel_06_scalar_loop_exact_work_and_poll_bounds() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::reset_internal_for_test();
         // Growing, non-aligned lengths include both countdown and poll edges.
         for len in [
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn parallel_07_pending_preemption_stops_within_one_batch() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::reset_internal_for_test();
         MAPPED_ELEMENTS.set(0);
         let input = crate::array::new_old_array(1024, 0);
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn parallel_05_coordinator_registers_each_child_waiter_once() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::reset_internal_for_test();
         crate::scheduler::reset_global_scheduler_for_test();
 

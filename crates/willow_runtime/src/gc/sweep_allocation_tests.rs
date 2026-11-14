@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn sweep_allocation_runway_boundaries_and_saturating_clock() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let mut state = runtime().heap.lock().unwrap();
     for start in [0, 17, u64::MAX - sweep::ALLOCATION_RUNWAY] {
@@ -26,11 +26,17 @@ fn sweep_allocation_runway_boundaries_and_saturating_clock() {
 
 #[test]
 fn sweep_allocation_waits_cooperatively_and_collector_is_reentrant() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1, 4, 16] {
         reset_internal_for_test();
-        cycle_wait::SLEEPS.store(0, Ordering::Relaxed);
-        cycle_wait::CHECKS.store(0, Ordering::Relaxed);
+        runtime()
+            .wait_observation
+            .sleeps
+            .store(0, Ordering::Relaxed);
+        runtime()
+            .wait_observation
+            .checks
+            .store(0, Ordering::Relaxed);
         let owner = cycle_wait::CollectorGuard::try_acquire().unwrap();
         {
             let mut state = runtime().heap.lock().unwrap();
@@ -42,7 +48,7 @@ fn sweep_allocation_waits_cooperatively_and_collector_is_reentrant() {
         assert!(!allocate_old(0, 0, 8192, 0).is_null());
         let workers: Vec<_> = (0..count)
             .map(|i| {
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     let _registration = MutatorRegistration::new();
                     let size = if i % 2 == 0 {
                         8192
@@ -54,11 +60,11 @@ fn sweep_allocation_waits_cooperatively_and_collector_is_reentrant() {
                     unsafe {
                         *object = 42;
                     }
-                })
+                }))
             })
             .collect();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while cycle_wait::SLEEPS.load(Ordering::Acquire) < count {
+        while runtime().wait_observation.sleeps.load(Ordering::Acquire) < count {
             assert!(Instant::now() < deadline, "allocators did not join sweep");
             std::thread::yield_now();
         }
@@ -74,8 +80,8 @@ fn sweep_allocation_waits_cooperatively_and_collector_is_reentrant() {
         }
         println!(
             "sweep waiters={count} condition_checks={} sleeps={}",
-            cycle_wait::CHECKS.load(Ordering::Relaxed),
-            cycle_wait::SLEEPS.load(Ordering::Relaxed)
+            runtime().wait_observation.checks.load(Ordering::Relaxed),
+            runtime().wait_observation.sleeps.load(Ordering::Relaxed)
         );
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
@@ -85,14 +91,14 @@ fn sweep_allocation_waits_cooperatively_and_collector_is_reentrant() {
 
 #[test]
 fn large_runtime_allocations_service_initial_handshake_without_loop_polls() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker = {
         let ready = ready.clone();
         let done = done.clone();
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let _registration = MutatorRegistration::new();
             let mut object = std::ptr::null_mut();
             willow_push_root(&mut object);
@@ -105,7 +111,7 @@ fn large_runtime_allocations_service_initial_handshake_without_loop_polls() {
             }
             assert_eq!(unsafe { *object }, 42);
             willow_pop_root();
-        })
+        }))
     };
     while !ready.load(Ordering::Acquire) {
         std::thread::yield_now();
@@ -123,11 +129,14 @@ fn large_runtime_allocations_service_initial_handshake_without_loop_polls() {
 
 #[test]
 fn sweep_allocation_shared_runway_scales_with_bytes_not_waiter_count() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for size in [8192, 65536, 262144, 2 * 1024 * 1024] {
         for count in [1, 4, 16] {
             reset_internal_for_test();
-            cycle_wait::SLEEPS.store(0, Ordering::Relaxed);
+            runtime()
+                .wait_observation
+                .sleeps
+                .store(0, Ordering::Relaxed);
             let owner = cycle_wait::CollectorGuard::try_acquire().unwrap();
             {
                 let mut state = runtime().heap.lock().unwrap();
@@ -138,16 +147,16 @@ fn sweep_allocation_shared_runway_scales_with_bytes_not_waiter_count() {
             let workers: Vec<_> = (0..count)
                 .map(|_| {
                     let done = done.clone();
-                    std::thread::spawn(move || {
+                    std::thread::spawn(crate::runtime::serving(move || {
                         let _registration = MutatorRegistration::new();
                         while !done.load(Ordering::Acquire) {
                             assert!(!allocate_old(0, 0, size as i64, 0).is_null());
                         }
-                    })
+                    }))
                 })
                 .collect();
             let deadline = Instant::now() + Duration::from_secs(10);
-            while cycle_wait::SLEEPS.load(Ordering::Acquire) < count {
+            while runtime().wait_observation.sleeps.load(Ordering::Acquire) < count {
                 assert!(Instant::now() < deadline);
                 std::thread::yield_now();
             }
@@ -170,7 +179,7 @@ fn sweep_allocation_shared_runway_scales_with_bytes_not_waiter_count() {
 
 #[test]
 fn large_allocation_bounds_unelected_request_runway() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     // Model a delayed coordinator without depending on OS scheduling timing.
     // The allocation slow path must start a collector without another request.
@@ -195,11 +204,12 @@ fn large_allocation_bounds_unelected_request_runway() {
     reset_internal_for_test();
 }
 
-static ALLOCATION_RELEASED_TRACE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static ALLOCATION_TRACE_RETRIES: AtomicUsize = AtomicUsize::new(0);
-static ELECTED_BEFORE_HANDSHAKE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static ALLOCATION_RELEASED_TRACE: crate::runtime::PerRuntime<std::sync::atomic::AtomicBool> =
+    crate::runtime::PerRuntime::new(|| std::sync::atomic::AtomicBool::new(false));
+static ALLOCATION_TRACE_RETRIES: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static ELECTED_BEFORE_HANDSHAKE: crate::runtime::PerRuntime<std::sync::atomic::AtomicBool> =
+    crate::runtime::PerRuntime::new(|| std::sync::atomic::AtomicBool::new(false));
 
 unsafe fn allocation_retry_legacy(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     assert!(
@@ -226,8 +236,12 @@ unsafe fn allocation_retry_slice(
 fn hold_election_until_allocation_joins() {
     ELECTED_BEFORE_HANDSHAKE.store(true, Ordering::Release);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while cycle_wait::INITIAL_ALLOCATION_WAITS.load(Ordering::Acquire) == 0
-        && cycle_wait::SLEEPS.load(Ordering::Acquire) == 0
+    while runtime()
+        .wait_observation
+        .initial_waits
+        .load(Ordering::Acquire)
+        == 0
+        && runtime().wait_observation.sleeps.load(Ordering::Acquire) == 0
     {
         assert!(
             Instant::now() < deadline,
@@ -235,17 +249,23 @@ fn hold_election_until_allocation_joins() {
         );
         std::thread::yield_now();
     }
-    cycle_wait::BEFORE_INITIAL_HANDSHAKE.set(None);
+    runtime().wait_observation.set_initial_hook(None);
 }
 
 fn allocation_retry_before_initial_handshake(elected: bool) {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     ALLOCATION_RELEASED_TRACE.store(false, Ordering::Relaxed);
     ALLOCATION_TRACE_RETRIES.store(0, Ordering::Relaxed);
     ELECTED_BEFORE_HANDSHAKE.store(false, Ordering::Relaxed);
-    cycle_wait::INITIAL_ALLOCATION_WAITS.store(0, Ordering::Relaxed);
-    cycle_wait::SLEEPS.store(0, Ordering::Relaxed);
+    runtime()
+        .wait_observation
+        .initial_waits
+        .store(0, Ordering::Relaxed);
+    runtime()
+        .wait_observation
+        .sleeps
+        .store(0, Ordering::Relaxed);
     const TYPE: u32 = 0xFA9B;
     willow_register_type_capability(
         TYPE,
@@ -264,11 +284,13 @@ fn allocation_retry_before_initial_handshake(elected: bool) {
     assert!(!allocate_old(0, 0, 3 * 1024 * 1024, 0).is_null());
     runtime().heap.lock().unwrap().threshold_bytes = 1024 * 1024;
     let collector = elected.then(|| {
-        std::thread::spawn(|| {
+        std::thread::spawn(crate::runtime::serving(|| {
             let _registration = MutatorRegistration::new();
-            cycle_wait::BEFORE_INITIAL_HANDSHAKE.set(Some(hold_election_until_allocation_joins));
+            let _hook = runtime()
+                .wait_observation
+                .initial_hook(hold_election_until_allocation_joins);
             collect_internal();
-        })
+        }))
     });
     if elected {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -323,7 +345,7 @@ fn large_allocation_retry_progress_joining_elected_before_initial_handshake() {
 
 #[test]
 fn stale_sweep_budget_does_not_join_a_later_mark() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let old = cycle_wait::CollectorGuard::try_acquire().unwrap();
     {
@@ -338,10 +360,10 @@ fn stale_sweep_budget_does_not_join_a_later_mark() {
     drop(old);
     let next = cycle_wait::CollectorGuard::try_acquire().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
+    let worker = std::thread::spawn(crate::runtime::serving(move || {
         let _registration = MutatorRegistration::new();
         tx.send(cycle_wait::wait_for_sweep_budget()).unwrap();
-    });
+    }));
     let result = rx.recv_timeout(Duration::from_secs(5));
     drop(next);
     worker.join().unwrap();

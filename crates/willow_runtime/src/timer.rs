@@ -212,7 +212,7 @@ mod tests {
         let before = willow_time_now_ns();
         assert!(before >= 0);
         std::thread::sleep(Duration::from_millis(2));
-        let other = std::thread::spawn(willow_time_now_ns_wrapper)
+        let other = std::thread::spawn(crate::runtime::serving(willow_time_now_ns_wrapper))
             .join()
             .unwrap();
         let after = willow_time_now_ns();

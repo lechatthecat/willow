@@ -4,10 +4,11 @@ use willow_abi::ffi::{WillowBridgeValue, WillowSliceU8};
 use willow_abi::{EnumVariantLayout, SlotKind};
 
 #[cfg(test)]
-std::thread_local! {
-    static INPUT_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static OUTPUT_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+const INPUT_COPIES: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::InputCopies);
+#[cfg(test)]
+const OUTPUT_COPIES: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::OutputCopies);
 
 #[derive(Default)]
 struct Frame {
@@ -77,8 +78,7 @@ pub extern "C" fn willow_rust_bridge_bytes_copy(object: u64, out: *mut u8, len: 
         unsafe {
             *out.add(index) = byte;
         }
-        #[cfg(test)]
-        INPUT_COPIES.set(INPUT_COPIES.get() + 1);
+        crate::observation::record(crate::observation::Event::InputCopies, 1);
     }
 }
 
@@ -102,8 +102,7 @@ pub extern "C" fn willow_rust_bridge_buffer(
     if is_string == 0 {
         for index in 0..len {
             array::willow_array_set(object, index as i64, unsafe { *bytes.add(index) } as i64);
-            #[cfg(test)]
-            OUTPUT_COPIES.set(OUTPUT_COPIES.get() + 1);
+            crate::observation::record(crate::observation::Event::OutputCopies, 1);
         }
     }
     object as u64
@@ -362,15 +361,13 @@ pub extern "C" fn willow_rust_bridge_array_new(frame: *mut u8, len: usize, refer
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_rust_bridge_array_get(object: u64, index: usize) -> u64 {
-    #[cfg(test)]
-    INPUT_COPIES.set(INPUT_COPIES.get() + 1);
+    crate::observation::record(crate::observation::Event::InputCopies, 1);
     array::willow_array_get(object as *mut u8, index as i64) as u64
 }
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_rust_bridge_array_set(object: u64, index: usize, value: u64) {
-    #[cfg(test)]
-    OUTPUT_COPIES.set(OUTPUT_COPIES.get() + 1);
+    crate::observation::record(crate::observation::Event::OutputCopies, 1);
     array::willow_array_set(object as *mut u8, index as i64, value as i64);
 }
 
@@ -411,8 +408,7 @@ pub extern "C" fn willow_rust_bridge_record_get(
             high: if pair != 0 { *field.add(1) } else { 0 },
         };
     }
-    #[cfg(test)]
-    INPUT_COPIES.set(INPUT_COPIES.get() + 1);
+    crate::observation::record(crate::observation::Event::InputCopies, 1);
 }
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
@@ -445,6 +441,5 @@ pub extern "C" fn willow_rust_bridge_record_set(
             *field.add(1) = value.high;
         }
     }
-    #[cfg(test)]
-    OUTPUT_COPIES.set(OUTPUT_COPIES.get() + 1);
+    crate::observation::record(crate::observation::Event::OutputCopies, 1);
 }

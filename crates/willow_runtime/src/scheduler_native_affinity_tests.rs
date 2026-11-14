@@ -1,15 +1,19 @@
 use super::*;
 use std::sync::atomic::AtomicU64;
 
-static ENTERED: AtomicUsize = AtomicUsize::new(0);
-static FINISH: AtomicBool = AtomicBool::new(false);
+static ENTERED: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static FINISH: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
 // Preserve the failure cause without unwinding through the C callback.
 const RENDEZVOUS_FAILED: usize = 1;
 const SUSPEND_FAILED: usize = 2;
 const OWNER_CHANGED: usize = 4;
 const RECURSION_FAILED: usize = 8;
-static CALLBACK_FAILURES: AtomicUsize = AtomicUsize::new(0);
-static RENDEZVOUS_MILLIS: AtomicU64 = AtomicU64::new(5000);
+static CALLBACK_FAILURES: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static RENDEZVOUS_MILLIS: crate::runtime::PerRuntime<AtomicU64> =
+    crate::runtime::PerRuntime::new(|| AtomicU64::new(5000));
 
 unsafe extern "C" fn deep_affinity_poll(_: *mut c_void) -> i32 {
     fn recurse(depth: usize) -> usize {
@@ -149,7 +153,7 @@ fn native_affinity_survives_worker_shrink_and_clears_on_completion_or_cancel() {
         );
         return;
     }
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for cancel in [false, true] {
         check_affinity_case(cancel, 4, 5000);
     }
@@ -164,7 +168,7 @@ fn native_affinity_rendezvous_failure_reports_without_secondary_abort() {
         );
         return;
     }
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     // Deliberately omit the fourth participant. This must report an ordinary
     // test failure after cleanup, not panic across the callback's C ABI.
     check_affinity_case(false, 3, 20);
@@ -172,7 +176,7 @@ fn native_affinity_rendezvous_failure_reports_without_secondary_abort() {
 
 #[test]
 fn native_affinity_queries_scale_with_drives_not_resident_tasks() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     println!("resident_tasks,drives,affinity_queries,affinity_updates");
     for residents in [16, 128, 1024] {
         for drives in [1, 8, 64] {
@@ -205,7 +209,7 @@ fn native_affinity_queries_scale_with_drives_not_resident_tasks() {
 
 #[test]
 fn affinity_reroute_keeps_claim_visible_until_idle_snapshot_finishes() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     reset_global_scheduler_for_test();
     replace_global_scheduler_for_test(2);
     let task = willow_sched_spawn(deep_affinity_poll, std::ptr::null_mut());
@@ -222,10 +226,10 @@ fn affinity_reroute_keeps_claim_visible_until_idle_snapshot_finishes() {
     state.stop_intent.store(true, Ordering::SeqCst);
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let claim_state = Arc::clone(&state);
-    let claimer = std::thread::spawn(move || {
+    let claimer = std::thread::spawn(crate::runtime::serving(move || {
         let no_work = claim_global_ready_for_worker(owner + 1, Some(&claim_state)).is_none();
         done_tx.send(no_work).unwrap();
-    });
+    }));
     // Before the fix the foreign worker rerouted the task and dropped its
     // in-flight marker while this gate (the idle snapshot) was still held.
     let deadline = Instant::now() + Duration::from_secs(5);

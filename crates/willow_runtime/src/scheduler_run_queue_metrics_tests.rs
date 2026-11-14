@@ -175,12 +175,12 @@ fn concurrent_publishers_and_stealers_do_not_lose_events() {
     std::thread::scope(|scope| {
         for worker in 0..8 {
             let queues = &queues;
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 for id in 1..=256 {
                     queues.push_local(worker, (worker * 256 + id) as u64);
                     queues.push_global((2048 + worker * 256 + id) as u64);
                 }
-            });
+            }));
         }
     });
     let popped = std::sync::atomic::AtomicU64::new(0);
@@ -188,11 +188,11 @@ fn concurrent_publishers_and_stealers_do_not_lose_events() {
         for worker in 0..8 {
             let queues = &queues;
             let popped = &popped;
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 while queues.pop_for_worker(worker).is_some() {
                     popped.fetch_add(1, Ordering::Relaxed);
                 }
-            });
+            }));
         }
     });
     let metrics = queues.metrics_snapshot();
@@ -215,7 +215,7 @@ fn concurrent_publishers_and_stealers_do_not_lose_events() {
 
 #[test]
 fn public_snapshot_and_scalar_getters_read_active_queue() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     reset_global_scheduler_for_test();
     let queues = global_run_queues();
     queues.push_global(1);
@@ -283,10 +283,10 @@ fn empty_global_batch_returns_while_global_mutex_is_held() {
     let guard = queues.locals[0].owner.lock().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
-        scope.spawn(|| {
+        scope.spawn(crate::runtime::serving(|| {
             queues.push_global_batch(&[]);
             tx.send(()).unwrap();
-        });
+        }));
         let completed = rx.recv_timeout(Duration::from_secs(5));
         // Release before asserting so a regression cannot strand the scoped thread.
         drop(guard);
@@ -327,12 +327,12 @@ fn global_batch_tokens_are_popped_exactly_once_by_concurrent_workers() {
                 let queues = &queues;
                 let seen = &seen;
                 let states = &states;
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     while let Some(id) = queues.pop_for_worker(worker) {
                         assert_eq!(seen[id as usize].fetch_add(1, Ordering::Relaxed), 0);
                         assert_eq!(states[id as usize].claim_for_poll(), ClaimOutcome::Poll);
                     }
-                });
+                }));
             }
         });
         assert!(seen.iter().all(|count| count.load(Ordering::Relaxed) == 1));
@@ -423,10 +423,22 @@ fn global_burst_notifies_once_and_refill_shares_with_one_successor() {
             }
             SCHED_RUN_DEPTH.with(|depth| depth.set(saved_depth));
             let initial = usize::from(!worker_publisher || size >= 2);
-            assert_eq!(queues.idle_notifications.load(Ordering::Relaxed), initial);
+            assert_eq!(
+                queues
+                    .observation
+                    .idle_notifications
+                    .load(Ordering::Relaxed),
+                initial
+            );
             queues.with_owner(0, || assert_eq!(queues.pop_for_worker(0), Some(0)));
             let expected = initial + usize::from(size > 2);
-            assert_eq!(queues.idle_notifications.load(Ordering::Relaxed), expected);
+            assert_eq!(
+                queues
+                    .observation
+                    .idle_notifications
+                    .load(Ordering::Relaxed),
+                expected
+            );
             println!(
                 "burst={size} worker_publisher={worker_publisher} notifications={initial} refill_notifications={}",
                 expected - initial
@@ -445,7 +457,9 @@ fn global_priority_probe_does_not_lock_local_for_refill() {
     let local = queues.locals[0].owner.lock().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
-        scope.spawn(|| tx.send(queues.pop_for_worker(0)).unwrap());
+        scope.spawn(crate::runtime::serving(|| {
+            tx.send(queues.pop_for_worker(0)).unwrap()
+        }));
         let result = rx.recv_timeout(Duration::from_secs(5));
         // Release before asserting so a regression cannot strand the thread.
         drop(local);
@@ -462,7 +476,13 @@ fn drained_injection_queue_rearms_external_single_task_notification() {
         queues.push_global(id);
         assert_eq!(queues.pop_for_worker(0), Some(id));
     }
-    assert_eq!(queues.idle_notifications.load(Ordering::Relaxed), 1000);
+    assert_eq!(
+        queues
+            .observation
+            .idle_notifications
+            .load(Ordering::Relaxed),
+        1000
+    );
 }
 
 #[test]
@@ -480,7 +500,13 @@ fn worker_spawn_burst_defers_one_notification_until_scheduler_boundary() {
         SCHED_RUN_DEPTH.with(|depth| depth.set(saved_depth));
         assert!(pending);
         assert!(!second);
-        assert_eq!(queues.idle_notifications.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            queues
+                .observation
+                .idle_notifications
+                .load(Ordering::Relaxed),
+            0
+        );
         assert_eq!(queues.len(), size as usize);
         println!("spawn_burst={size} publication_notifications=0 boundary_notifications=1");
     }
@@ -541,11 +567,11 @@ fn t8hq4_19_empty_probes_take_no_queue_lock() {
     std::thread::scope(|scope| {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let queues = &queues;
-        let prober = scope.spawn(move || {
+        let prober = scope.spawn(crate::runtime::serving(move || {
             for _ in 0..8 {
                 done_tx.send(queues.pop_for_worker(0)).unwrap();
             }
-        });
+        }));
         for _ in 0..8 {
             let popped = done_rx.recv_timeout(Duration::from_secs(2));
             assert_eq!(popped, Ok(None), "an empty probe blocked on a lock");
@@ -613,7 +639,10 @@ fn owner_and_foreign_inbox_preserve_fifo_after_owner_handoff() {
         queues.push_local(0, 1);
         queues.push_local(0, 2);
         std::thread::scope(|scope| {
-            scope.spawn(|| queues.push_local(0, 3)).join().unwrap();
+            scope
+                .spawn(crate::runtime::serving(|| queues.push_local(0, 3)))
+                .join()
+                .unwrap();
         });
         assert_eq!(queues.pop_for_worker(0), Some(1));
         assert_eq!(queues.pop_for_worker(0), Some(2));
@@ -635,11 +664,11 @@ fn concurrent_thieves_take_every_owner_deque_token_once() {
             for worker in 1..8 {
                 let queues = &queues;
                 let seen = &seen;
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     while let Some(id) = queues.pop_for_worker(worker) {
                         assert_eq!(seen[id as usize].fetch_add(1, Ordering::Relaxed), 0);
                     }
-                });
+                }));
             }
         });
     });
@@ -692,7 +721,12 @@ fn snapshot_preserves_current_thread_owner_and_inbox() {
     queues.with_owner(0, || {
         queues.push_local(0, 1);
         queues.push_local(0, 2);
-        std::thread::scope(|scope| scope.spawn(|| queues.push_local(0, 3)).join().unwrap());
+        std::thread::scope(|scope| {
+            scope
+                .spawn(crate::runtime::serving(|| queues.push_local(0, 3)))
+                .join()
+                .unwrap()
+        });
         assert_eq!(queues.snapshot(), vec![1, 2, 3]);
         assert_eq!(queues.snapshot(), vec![1, 2, 3]);
         assert_eq!(
@@ -741,7 +775,11 @@ fn active_owner_removal_preserves_mixed_source_fifo() {
             for id in [1, 2, 3] {
                 queues.push_local(0, id);
             }
-            std::thread::scope(|s| s.spawn(|| queues.push_local(0, 4)).join().unwrap());
+            std::thread::scope(|s| {
+                s.spawn(crate::runtime::serving(|| queues.push_local(0, 4)))
+                    .join()
+                    .unwrap()
+            });
             assert_eq!(queues.remove(removed), removed != 99);
             let expected = (1..=4).filter(|id| *id != removed).collect::<Vec<_>>();
             assert_eq!(queues.snapshot(), expected);
@@ -759,7 +797,7 @@ fn foreign_active_owner_removal_leaves_both_sources_untouched() {
         let queues = RunQueues::new(1);
         let gate = std::sync::Barrier::new(2);
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            scope.spawn(crate::runtime::serving(|| {
                 queues.with_owner(0, || {
                     for id in [1, 2, 3] {
                         queues.push_local(0, id);
@@ -767,7 +805,7 @@ fn foreign_active_owner_removal_leaves_both_sources_untouched() {
                     gate.wait();
                     gate.wait();
                 })
-            });
+            }));
             gate.wait();
             queues.push_local(0, 4);
             assert!(!queues.remove(removed));
@@ -791,13 +829,13 @@ fn foreign_owner_placeholder_transition_discards_stale_token_on_claim() {
     let queues = Arc::clone(&scheduler.run_queues);
     let gate = std::sync::Barrier::new(2);
     std::thread::scope(|scope| {
-        scope.spawn(|| {
+        scope.spawn(crate::runtime::serving(|| {
             queues.with_owner(0, || {
                 queues.push_local(0, id);
                 gate.wait();
                 gate.wait();
             })
-        });
+        }));
         gate.wait();
         scheduler.set_running(id);
         assert_eq!(queues.len(), 1);

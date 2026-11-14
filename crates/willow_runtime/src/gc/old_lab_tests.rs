@@ -4,19 +4,18 @@
 use super::*;
 use std::time::Instant;
 
-/// Enables buffers for one test and restores the default even on panic.
-struct LabsOn;
+/// Enables buffers for one test and restores its prior policy even on panic.
+struct LabsOn(bool);
 
 impl LabsOn {
     fn new() -> Self {
-        OLD_LABS_FOR_TEST.store(true, Ordering::Release);
-        LabsOn
+        Self(runtime().old_lab_policy.swap(true, Ordering::AcqRel))
     }
 }
 
 impl Drop for LabsOn {
     fn drop(&mut self) {
-        OLD_LABS_FOR_TEST.store(false, Ordering::Release);
+        runtime().old_lab_policy.store(self.0, Ordering::Release);
     }
 }
 
@@ -30,7 +29,7 @@ fn indexed(state: &GcState, payload: *mut u8) -> bool {
 
 #[test]
 fn pending_objects_are_found_by_exact_and_interior_lookup_until_flushed() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let _labs = LabsOn::new();
     let objects: Vec<_> = [8i64, 40, 200]
@@ -84,7 +83,7 @@ fn pending_objects_are_found_by_exact_and_interior_lookup_until_flushed() {
 
 #[test]
 fn buffer_allocations_survive_mark_closure_and_a_pending_sweep() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for paced in [false, true] {
         for limit_kind in [0, 1, 2] {
             reset_internal_for_test();
@@ -170,11 +169,11 @@ fn buffer_allocations_survive_mark_closure_and_a_pending_sweep() {
 
 #[test]
 fn exited_thread_buffers_are_indexed_and_pruned() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let _labs = LabsOn::new();
     let mine = willow_alloc(8);
-    let theirs = std::thread::spawn(|| willow_alloc(48) as usize)
+    let theirs = std::thread::spawn(crate::runtime::serving(|| willow_alloc(48) as usize))
         .join()
         .unwrap() as *mut u8;
     {
@@ -228,7 +227,7 @@ fn default_budgets_complete_small_allocations_and_cap_full_buffer_recovery() {
     if !default_budgets_child() {
         return;
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1, 128, 4096, OLD_LAB_BYTES / GC_HEADER_SIZE] {
         reset_internal_for_test();
         let _labs = LabsOn::new();
@@ -283,7 +282,13 @@ fn default_budgets_complete_small_allocations_and_cap_full_buffer_recovery() {
                 stops.by_reason[1].requests + stops.by_reason[3].requests
                     <= (mark_closure::MAX_REMARK_ROUNDS - 1) as u64 + recovery_cap
             );
-            for sample in mark_closure::RECOVERY_SAMPLES.lock().unwrap().iter() {
+            for sample in runtime()
+                .wait_observation
+                .recovery_samples
+                .lock()
+                .unwrap()
+                .iter()
+            {
                 assert!(sample[0] <= mark_closure::RECOVERY_SLOTS);
                 assert!(sample[1] <= mark_closure::RECOVERY_BYTES);
             }
@@ -317,7 +322,7 @@ fn default_budgets_complete_small_allocations_and_cap_full_buffer_recovery() {
 
 #[test]
 fn bounded_retirement_fake_clock_keeps_prefix_and_indexes_each_entry_once() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let _labs = LabsOn::new();
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -338,6 +343,7 @@ fn bounded_retirement_fake_clock_keeps_prefix_and_indexes_each_entry_once() {
     let now = std::cell::Cell::new(0);
     let mut budget = old_cycle::RemarkBudget::new(100, 10000, 4, 0);
     assert!(!retire_bounded_with_clock(
+        runtime(),
         &mut state,
         &mut budget,
         &mut work,
@@ -361,7 +367,8 @@ fn bounded_retirement_fake_clock_keeps_prefix_and_indexes_each_entry_once() {
     LOCAL.with(|lab| assert_eq!(lab.inner.lock().unwrap().pending_index, 2));
     for completed in 3..=5 {
         let mut budget = old_cycle::RemarkBudget::new(3, 1000, 100, 0);
-        let finished = retire_bounded_with_clock(&mut state, &mut budget, &mut work, || 0);
+        let finished =
+            retire_bounded_with_clock(runtime(), &mut state, &mut budget, &mut work, || 0);
         assert_eq!(finished, completed == 5);
         assert_eq!(work.metadata_objects, completed);
         assert_eq!(
@@ -385,7 +392,7 @@ fn bounded_retirement_fake_clock_keeps_prefix_and_indexes_each_entry_once() {
     assert_eq!(state.total_allocs, 5);
     let mut budget = old_cycle::RemarkBudget::new(1, 1, 1, 0);
     assert!(
-        retire_bounded_with_clock(&mut state, &mut budget, &mut work, || 0),
+        retire_bounded_with_clock(runtime(), &mut state, &mut budget, &mut work, || 0),
         "empty retired record has no carve charge"
     );
     assert_eq!(work.metadata_objects, 5);
@@ -398,7 +405,7 @@ fn bounded_retirement_fake_clock_keeps_prefix_and_indexes_each_entry_once() {
 
 #[test]
 fn partial_retirement_refill_flushes_only_remaining_suffix_without_double_accounting() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let _labs = LabsOn::new();
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -410,6 +417,7 @@ fn partial_retirement_refill_flushes_only_remaining_suffix_without_double_accoun
     let mut work = crate::gc_telemetry::stops::StopWorkV2::default();
     let mut budget = old_cycle::RemarkBudget::new(3, 1000, 100, 0);
     assert!(!retire_bounded_with_clock(
+        runtime(),
         &mut state,
         &mut budget,
         &mut work,
@@ -459,7 +467,7 @@ fn partial_retirement_refill_flushes_only_remaining_suffix_without_double_accoun
 
 #[test]
 fn threshold_policy_old_lab_pressure_matrix() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for paced in [false, true] {
         for limit_kind in [0, 1, 2] {
             for count in [1usize, 128, 4096] {
@@ -487,7 +495,7 @@ fn threshold_policy_old_lab_pressure_matrix() {
                     } else if limit_kind == 2 {
                         state.memory_limit_bytes = Some(1);
                     }
-                    sync_bytes(&mut state);
+                    sync_bytes_in(runtime(), &mut state);
                     assert_eq!(state.threshold_bytes, 1);
                     flush_all(&mut state);
                     assert_eq!(state.threshold_bytes, 1);
@@ -496,7 +504,7 @@ fn threshold_policy_old_lab_pressure_matrix() {
                     state.threshold_bytes
                 };
                 assert!(
-                    allocation_should_collect(),
+                    allocation_should_collect_with_sync_in(crate::runtime::current(), true),
                     "paced={paced} limit={limit_kind} count={count}"
                 );
                 assert_eq!(runtime().heap.lock().unwrap().threshold_bytes, goal);
@@ -511,7 +519,7 @@ fn threshold_policy_old_lab_pressure_matrix() {
 
 #[test]
 fn foreign_owner_progress_sampling_does_not_index_pending_objects() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1, 16, 256] {
         reset_internal_for_test();
         let _labs = LabsOn::new();
@@ -542,7 +550,7 @@ fn foreign_owner_progress_sampling_does_not_index_pending_objects() {
 
 #[test]
 fn cumulative_allocation_bytes_merge_old_lab_without_indexing() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let _labs = LabsOn::new();
     for count in [1, 8, 64, 512] {
@@ -572,17 +580,17 @@ fn cumulative_allocation_bytes_merge_old_lab_without_indexing() {
 
 #[test]
 fn bounded_retirement_registry_resume_scales_without_prefix_visits() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _labs = LabsOn::new();
     for count in [1, 16, 257] {
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         let owners: Vec<_> = (0..count)
             .map(|_| {
-                std::thread::spawn(|| {
+                std::thread::spawn(crate::runtime::serving(|| {
                     let object = willow_alloc(8) as usize;
                     (object, LOCAL.with(Arc::clone))
-                })
+                }))
                 .join()
                 .unwrap()
             })
@@ -596,6 +604,7 @@ fn bounded_retirement_registry_resume_scales_without_prefix_visits() {
             assert!(rounds <= count + 1);
             let before = work.metadata_objects;
             let done = retire_bounded_with_clock(
+                runtime(),
                 &mut state,
                 &mut old_cycle::RemarkBudget::new(3, 1024, 10, 0),
                 &mut work,
@@ -627,18 +636,21 @@ fn bounded_retirement_registry_resume_scales_without_prefix_visits() {
 
 #[test]
 fn bounded_retirement_fifo_keeps_refilled_prefix_behind_pending_owner() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let _labs = LabsOn::new();
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
     let first = willow_alloc(8);
-    let (second, owner) = std::thread::spawn(|| (willow_alloc(8) as usize, LOCAL.with(Arc::clone)))
-        .join()
-        .unwrap();
+    let (second, owner) = std::thread::spawn(crate::runtime::serving(|| {
+        (willow_alloc(8) as usize, LOCAL.with(Arc::clone))
+    }))
+    .join()
+    .unwrap();
     let mut work = crate::gc_telemetry::stops::StopWorkV2::default();
     {
         let mut state = runtime().heap.lock().unwrap();
         assert!(!retire_bounded_with_clock(
+            runtime(),
             &mut state,
             &mut old_cycle::RemarkBudget::new(3, 1024, 10, 0),
             &mut work,
@@ -650,6 +662,7 @@ fn bounded_retirement_fifo_keeps_refilled_prefix_behind_pending_owner() {
     let third = willow_alloc(8); // Reactivates record zero, behind record one.
     let mut state = runtime().heap.lock().unwrap();
     assert!(!retire_bounded_with_clock(
+        runtime(),
         &mut state,
         &mut old_cycle::RemarkBudget::new(3, 1024, 10, 0),
         &mut work,
@@ -661,6 +674,7 @@ fn bounded_retirement_fifo_keeps_refilled_prefix_behind_pending_owner() {
     // Prune the completed peer while another owner remains pending.
     prune(&mut state);
     assert!(retire_bounded_with_clock(
+        runtime(),
         &mut state,
         &mut old_cycle::RemarkBudget::new(3, 1024, 10, 0),
         &mut work,
@@ -674,20 +688,21 @@ fn bounded_retirement_fifo_keeps_refilled_prefix_behind_pending_owner() {
 
 #[test]
 fn bounded_retirement_pending_key_follows_pruned_record_swap() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let _labs = LabsOn::new();
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
-    let owner = std::thread::spawn(|| {
+    let owner = std::thread::spawn(crate::runtime::serving(|| {
         willow_alloc(8);
         LOCAL.with(Arc::clone)
-    })
+    }))
     .join()
     .unwrap();
     let local = willow_alloc(8);
     let mut state = runtime().heap.lock().unwrap();
     let mut work = crate::gc_telemetry::stops::StopWorkV2::default();
     assert!(!retire_bounded_with_clock(
+        runtime(),
         &mut state,
         &mut old_cycle::RemarkBudget::new(3, 1024, 10, 0),
         &mut work,
@@ -699,6 +714,7 @@ fn bounded_retirement_pending_key_follows_pruned_record_swap() {
     assert_eq!(state.old_labs.len(), 1);
     assert_eq!(state.old_lab_pending.front(), Some(0));
     assert!(retire_bounded_with_clock(
+        runtime(),
         &mut state,
         &mut old_cycle::RemarkBudget::new(3, 1024, 10, 0),
         &mut work,
@@ -708,4 +724,97 @@ fn bounded_retirement_pending_key_follows_pruned_record_swap() {
     assert_eq!(work.metadata_objects, 2);
     drop(state);
     reset_internal_for_test();
+}
+
+#[test]
+fn old_lab_policy_is_owned_and_constant_policy_skips_lookup() {
+    let first = GcRuntime::default();
+    let second = GcRuntime::default();
+    assert!(!RuntimeAllocationPolicy::enabled(|| &first.old_lab_policy));
+    assert!(!RuntimeAllocationPolicy::enabled(|| &second.old_lab_policy));
+    first.old_lab_policy.store(true, Ordering::Release);
+    assert!(RuntimeAllocationPolicy::enabled(|| &first.old_lab_policy));
+    assert!(!RuntimeAllocationPolicy::enabled(|| &second.old_lab_policy));
+    assert!(<()>::enabled(|| panic!(
+        "constant policy must not resolve the GC owner"
+    )));
+}
+
+#[test]
+fn old_lab_scoped_override_restores_nested_and_unwound_policy() {
+    let _guard = isolated_runtime();
+    assert!(!enabled());
+    let outer = LabsOn::new();
+    assert!(enabled());
+    let unwound = std::panic::catch_unwind(|| {
+        let _inner = LabsOn::new();
+        assert!(enabled());
+        panic!("unwind scoped old-LAB policy");
+    });
+    assert!(unwound.is_err());
+    assert!(enabled());
+    drop(outer);
+    assert!(!enabled());
+}
+
+#[test]
+fn private_old_lab_accounting_consumes_only_owner_headroom() {
+    let first = GcRuntime::default();
+    let second = GcRuntime::default();
+    first.headroom.policy.store(100, Ordering::Release);
+    second.headroom.policy.store(200, Ordering::Release);
+    let mut state = first.heap.lock().unwrap();
+    add_counts(&first, &mut state, 32, 2);
+    assert_eq!(first.headroom.policy.load(Ordering::Acquire), 68);
+    assert_eq!(second.headroom.policy.load(Ordering::Acquire), 200);
+    assert_eq!(state.total_allocated_bytes, 32);
+    assert_eq!(state.total_allocs, 2);
+    assert_eq!(state.old_region_allocations, 2);
+}
+
+#[test]
+fn private_old_lab_flush_and_prune_account_once() {
+    let first = GcRuntime::default();
+    let second = GcRuntime::default();
+    first.headroom.policy.store(100, Ordering::Release);
+    second.headroom.policy.store(200, Ordering::Release);
+    let lab = Arc::new(OldLab {
+        inner: Mutex::new(Inner {
+            active: false,
+            region: 0,
+            base: 0,
+            cursor: 0,
+            limit: 0,
+            reused: false,
+            sweep_pending: false,
+            starts: None,
+            marks: None,
+            pending: Vec::new(),
+            pending_index: 0,
+            pending_live: 0,
+        }),
+        bytes: AtomicU64::new(32),
+        objects: AtomicU64::new(2),
+    });
+    let mut state = first.heap.lock().unwrap();
+    state.old_labs.push(OldLabRecord {
+        lab: Arc::clone(&lab),
+        observed_bytes: 0,
+        observed_objects: 0,
+    });
+    flush_all_in(&first, &mut state);
+    assert_eq!(state.old_labs.len(), 1);
+    assert_eq!(state.total_allocated_bytes, 32);
+    assert_eq!(state.total_allocs, 2);
+    assert_eq!(first.headroom.policy.load(Ordering::Acquire), 68);
+    lab.bytes.store(48, Ordering::Release);
+    lab.objects.store(3, Ordering::Release);
+    drop(lab);
+    flush_all_in(&first, &mut state);
+    assert!(state.old_labs.is_empty());
+    flush_all_in(&first, &mut state);
+    assert_eq!(state.total_allocated_bytes, 48);
+    assert_eq!(state.total_allocs, 3);
+    assert_eq!(first.headroom.policy.load(Ordering::Acquire), 52);
+    assert_eq!(second.headroom.policy.load(Ordering::Acquire), 200);
 }

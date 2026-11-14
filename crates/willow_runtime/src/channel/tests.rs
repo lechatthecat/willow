@@ -140,7 +140,7 @@ fn channel_unit_10_recv_after_close_drains_existing_value() {
 
 #[test]
 fn channel_unit_11_abi_i64_send_recv_fifo() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     let ch = willow_channel_new(0);
     willow_channel_send_i64(ch, 10);
     willow_channel_send_i64(ch, 20);
@@ -150,7 +150,7 @@ fn channel_unit_11_abi_i64_send_recv_fifo() {
 
 #[test]
 fn channel_unit_12_abi_bool_send_recv() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     let ch = willow_channel_new(0);
     willow_channel_send_bool(ch, 1);
     assert_eq!(willow_channel_recv_bool(ch), 1);
@@ -158,7 +158,7 @@ fn channel_unit_12_abi_bool_send_recv() {
 
 #[test]
 fn channel_unit_13_abi_f64_send_recv() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     let ch = willow_channel_new(0);
     willow_channel_send_f64(ch, 2.5);
     assert_eq!(willow_channel_recv_f64(ch), 2.5);
@@ -166,7 +166,7 @@ fn channel_unit_13_abi_f64_send_recv() {
 
 #[test]
 fn channel_unit_14_abi_recv_closed_empty_raises_and_returns_neutral_word() {
-    let _heap = crate::gc::runtime_test_guard();
+    let _heap = crate::gc::isolated_runtime();
     crate::gc::willow_gc_init();
     let previous = crate::panic_context::replace_current_context(Some(std::sync::Arc::new(
         crate::panic_context::PanicContext::new(14),
@@ -191,7 +191,7 @@ fn channel_unit_14_abi_recv_closed_empty_raises_and_returns_neutral_word() {
 // answers `None` without raising.
 #[test]
 fn channel_unit_15_abi_recv_opt_drains_then_reports_closed() {
-    let _heap = crate::gc::runtime_test_guard();
+    let _heap = crate::gc::isolated_runtime();
     crate::gc::willow_gc_init();
     let previous = crate::panic_context::replace_current_context(Some(std::sync::Arc::new(
         crate::panic_context::PanicContext::new(15),
@@ -218,7 +218,7 @@ fn channel_unit_15_abi_recv_opt_drains_then_reports_closed() {
 // uninitialized upper bytes.
 #[test]
 fn channel_unit_16_abi_recv_opt_bool_payload_is_a_full_word() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     let ch = willow_channel_new(0);
     willow_channel_send_bool(ch, 1);
     assert_eq!(willow_channel_try_send_bool(ch, 0), 1);
@@ -235,7 +235,7 @@ fn channel_unit_16_abi_recv_opt_bool_payload_is_a_full_word() {
 // must not swallow the single wake and starve live consumers).
 #[test]
 fn send_reserves_one_value_and_wakes_one_receiver() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::scheduler::reset_global_scheduler_for_test();
     let raw = willow_channel_new(0);
     let (first, second) = crate::scheduler::with_global_for_test(|s| {
@@ -272,7 +272,7 @@ fn send_reserves_one_value_and_wakes_one_receiver() {
 // rooted ones survive collection with their queued values intact.
 #[test]
 fn unreachable_channels_are_reclaimed() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     let before = crate::gc::willow_gc_allocated_bytes();
     for _ in 0..1000 {
@@ -290,7 +290,7 @@ fn unreachable_channels_are_reclaimed() {
 
 #[test]
 fn gc_sweep_drops_channel_owned_queue_buffers() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     let before = CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst);
     const CHANNELS: usize = 256;
@@ -317,7 +317,7 @@ fn gc_sweep_drops_channel_owned_queue_buffers() {
 
 #[test]
 fn gc_reset_drops_channel_native_owners_at_increasing_sizes() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::scheduler::reset_global_scheduler_for_test();
     crate::gc::reset_internal_for_test();
     for count in [1usize, 32, 256] {
@@ -356,7 +356,7 @@ fn gc_reset_drops_channel_native_owners_at_increasing_sizes() {
 
 #[test]
 fn channel_gc_hooks_register_once_per_registry_generation() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     ensure_channel_registered();
     let generation = crate::gc::registry_generation();
@@ -392,9 +392,9 @@ fn poison_channel(channel: &WillowAbiChannel) {
 
 #[test]
 fn poisoned_channel_gc_hooks_visit_each_queued_reference() {
-    // Channel storage is charged to the global external-byte counter that the
-    // exact accounting tests compare; serialize with them.
-    let _guard = crate::gc::runtime_test_guard();
+    // Channel storage is charged to the external-byte counter of the runtime
+    // this thread serves, so exact accounting tests elsewhere stay unaffected.
+    let _guard = crate::gc::isolated_runtime();
     for count in [0, 1, 16, 256, 4096] {
         let mut channel = WillowAbiChannel::new(true);
         let mut values = vec![0u8; count];
@@ -450,7 +450,7 @@ fn poisoned_channel_gc_hooks_visit_each_queued_reference() {
 
 #[test]
 fn poisoned_channel_keeps_queued_child_alive_during_collection() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     let mut root = willow_channel_new(1).cast::<u8>();
     crate::gc::willow_push_root(&mut root);
@@ -474,7 +474,7 @@ fn poisoned_channel_keeps_queued_child_alive_during_collection() {
 
 #[test]
 fn rooted_channel_survives_collection_with_values() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     let mut slot = willow_channel_new(0) as *mut u8;
     crate::gc::willow_push_root(&mut slot as *mut *mut u8);
@@ -494,7 +494,7 @@ fn rooted_channel_survives_collection_with_values() {
 
 #[test]
 fn cancelled_task_is_purged_from_all_waiter_queues() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::scheduler::reset_global_scheduler_for_test();
     // Purge now walks the task-side REVERSE references, so
     // the fixture must register the way recv_ready does: waiter queue
@@ -526,7 +526,7 @@ fn cancelled_task_is_purged_from_all_waiter_queues() {
 
 #[test]
 fn normal_waiter_removal_clears_task_reverse_references() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     crate::scheduler::reset_global_scheduler_for_test();
     let (unregister_task, send_task, close_task) =
@@ -620,7 +620,7 @@ fn send_waiter_ids(raw: *mut c_void) -> Vec<u64> {
 
 #[test]
 fn bounded_unit_01_new_is_unbounded_and_with_capacity_is_bounded() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     assert_eq!(capacity_of(willow_channel_new(0)), None);
     assert_eq!(capacity_of(willow_channel_new_bounded(0, 3)), Some(3));
@@ -628,7 +628,7 @@ fn bounded_unit_01_new_is_unbounded_and_with_capacity_is_bounded() {
 
 #[test]
 fn bounded_unit_02_try_send_fills_then_reports_full() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     let ch = willow_channel_new_bounded(0, 2);
     assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
@@ -639,7 +639,7 @@ fn bounded_unit_02_try_send_fills_then_reports_full() {
 
 #[test]
 fn bounded_unit_03_recv_frees_a_slot_for_the_next_send() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     let ch = willow_channel_new_bounded(0, 1);
     assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
@@ -651,7 +651,7 @@ fn bounded_unit_03_recv_frees_a_slot_for_the_next_send() {
 
 #[test]
 fn bounded_unit_04_send_ready_tracks_fullness() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     let ch = willow_channel_new_bounded(0, 1);
     assert_eq!(willow_channel_send_ready(ch), 1);
@@ -663,7 +663,7 @@ fn bounded_unit_04_send_ready_tracks_fullness() {
 
 #[test]
 fn bounded_unit_05_unbounded_send_ready_is_always_one() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     let ch = willow_channel_new(0);
     for value in 0..64 {
@@ -675,7 +675,7 @@ fn bounded_unit_05_unbounded_send_ready_is_always_one() {
 
 #[test]
 fn bounded_unit_06_closed_full_channel_accepts_sends_as_noops() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     let ch = willow_channel_new_bounded(0, 1);
     willow_channel_try_send_i64(ch, 1);
@@ -689,7 +689,7 @@ fn bounded_unit_06_closed_full_channel_accepts_sends_as_noops() {
 
 #[test]
 fn bounded_unit_07_close_drains_send_waiters() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
@@ -713,7 +713,7 @@ fn bounded_unit_07_close_drains_send_waiters() {
 
 #[test]
 fn bounded_unit_08_recv_wakes_exactly_one_send_waiter() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     crate::scheduler::reset_global_scheduler_for_test();
     let (first, second) = crate::scheduler::with_global_for_test(|sched| {
@@ -766,7 +766,7 @@ fn bounded_unit_08_recv_wakes_exactly_one_send_waiter() {
 
 #[test]
 fn bounded_unit_09_select_defection_compensates_the_wake_one_handoff() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     crate::scheduler::reset_global_scheduler_for_test();
     let (first, second) = crate::scheduler::with_global_for_test(|sched| {
@@ -816,7 +816,7 @@ fn bounded_unit_09_select_defection_compensates_the_wake_one_handoff() {
 
 #[test]
 fn bounded_unit_10_cancelled_handoff_wakes_the_next_producer() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     // The drive below must reap `first` and nothing else. Cancelling `first`
     // compensates the handoff and leaves `second` READY, and a worker pool
     // would race to claim and complete that placeholder before the run loop
@@ -862,7 +862,7 @@ fn bounded_unit_10_cancelled_handoff_wakes_the_next_producer() {
 
 #[test]
 fn bounded_unit_11_successful_retry_consumes_the_handoff_reference() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_parked_placeholder());
@@ -885,7 +885,7 @@ fn bounded_unit_11_successful_retry_consumes_the_handoff_reference() {
 
 #[test]
 fn bounded_unit_12_purge_clears_send_waiters_too() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
@@ -908,7 +908,7 @@ fn bounded_unit_12_purge_clears_send_waiters_too() {
 
 #[test]
 fn bounded_unit_13_unregister_waiter_clears_send_side() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
@@ -933,7 +933,7 @@ fn bounded_unit_13_unregister_waiter_clears_send_side() {
 
 #[test]
 fn bounded_unit_14_ptr_elements_are_traced_while_buffer_is_full() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     let ch = willow_channel_new_bounded(1, 1);
     let text = "queued";
@@ -947,7 +947,7 @@ fn bounded_unit_14_ptr_elements_are_traced_while_buffer_is_full() {
 
 #[test]
 fn bounded_unit_15_bool_and_f64_elements_respect_capacity() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     let flags = willow_channel_new_bounded(0, 1);
     assert_eq!(willow_channel_try_send_bool(flags, 1), 1);
@@ -962,7 +962,7 @@ fn bounded_unit_15_bool_and_f64_elements_respect_capacity() {
 
 #[test]
 fn bounded_unit_16_stale_head_does_not_swallow_the_single_wake() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     crate::scheduler::reset_global_scheduler_for_test();
     let (stale, live) = crate::scheduler::with_global_for_test(|sched| {
@@ -1164,7 +1164,7 @@ fn wq_10_compaction_preserves_live_waiters_and_order() {
 
 #[test]
 fn wq_11_recv_ready_registers_each_task_once() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
@@ -1193,7 +1193,7 @@ fn wq_11_recv_ready_registers_each_task_once() {
 
 #[test]
 fn wq_12_send_ready_registers_each_producer_once() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
@@ -1223,7 +1223,7 @@ fn wq_12_send_ready_registers_each_producer_once() {
 
 #[test]
 fn wq_13_purge_task_clears_both_queues() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     crate::scheduler::reset_global_scheduler_for_test();
     let (victim, other) = crate::scheduler::with_global_for_test(|sched| {
@@ -1261,7 +1261,7 @@ fn wq_13_purge_task_clears_both_queues() {
 
 #[test]
 fn wq_14_unregister_waiter_clears_both_queues_and_reverse_reference() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
@@ -1294,7 +1294,7 @@ fn wq_14_unregister_waiter_clears_both_queues_and_reverse_reference() {
 
 #[test]
 fn wq_15_close_wakes_a_dual_registered_task_once() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     crate::scheduler::reset_global_scheduler_for_test();
     // A select with a recv case AND a send case on the same channel parks
@@ -1362,7 +1362,7 @@ fn wq_15_close_wakes_a_dual_registered_task_once() {
 fn ready_select_cleanup_does_not_relock_empty_wait_queues() {
     use std::sync::atomic::Ordering;
 
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::scheduler::reset_global_scheduler_for_test();
     let owner = crate::scheduler::with_global_for_test(|s| s.spawn_parked_placeholder());
     let channels = std::array::from_fn::<_, 4, _>(|_| willow_channel_new_bounded(0, 1));
@@ -1393,7 +1393,7 @@ fn ready_select_cleanup_does_not_relock_empty_wait_queues() {
 
 #[test]
 fn receive_select_retains_winner_and_compensates_losing_claim() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::scheduler::reset_global_scheduler_for_test();
     let (owner, peer) = crate::scheduler::with_global_for_test(|s| {
         (s.spawn_parked_placeholder(), s.spawn_parked_placeholder())
@@ -1425,7 +1425,7 @@ fn receive_select_retains_winner_and_compensates_losing_claim() {
 
 #[test]
 fn close_preserves_reserved_value_and_cancel_reoffers_it() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::scheduler::reset_global_scheduler_for_test();
     let (first, second) = crate::scheduler::with_global_for_test(|s| {
         (s.spawn_parked_placeholder(), s.spawn_parked_placeholder())
@@ -1455,7 +1455,7 @@ fn close_preserves_reserved_value_and_cancel_reoffers_it() {
 
 #[test]
 fn stale_cleanup_cannot_erase_new_registration_or_other_role() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|s| s.spawn_parked_placeholder());
     let raw = willow_channel_new_bounded(0, 1);
@@ -1506,7 +1506,7 @@ fn stale_cleanup_cannot_erase_new_registration_or_other_role() {
 
 #[test]
 fn shared_channel_ten_and_hundred_thousand_sends_have_linear_wakes() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for count in [10_000usize, 100_000] {
         crate::scheduler::reset_global_scheduler_for_test();
         let raw = willow_channel_new(0);
@@ -1545,7 +1545,7 @@ fn shared_channel_ten_and_hundred_thousand_sends_have_linear_wakes() {
 }
 #[test]
 fn same_channel_select_keeps_only_winning_direction() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for direction in [0, 1] {
         crate::scheduler::reset_global_scheduler_for_test();
         let task = crate::scheduler::with_global_for_test(|s| s.spawn_placeholder());
@@ -1576,7 +1576,7 @@ fn same_channel_select_keeps_only_winning_direction() {
 
 #[test]
 fn simultaneous_claims_release_only_losing_channel() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::scheduler::reset_global_scheduler_for_test();
     let owner = crate::scheduler::with_global_for_test(|s| s.spawn_placeholder());
     let a = willow_channel_new(0);
@@ -1602,7 +1602,7 @@ fn simultaneous_claims_release_only_losing_channel() {
 }
 #[test]
 fn cancellation_tokens_follow_native_core_when_gc_wrappers_move() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for count in [1, 32, 256] {
         crate::gc::reset_internal_for_test();
         crate::scheduler::reset_global_scheduler_for_test();
@@ -1667,7 +1667,7 @@ fn cancellation_tokens_follow_native_core_when_gc_wrappers_move() {
 
 #[test]
 fn native_channel_storage_counts_boxes_buffers_waiters_and_handoffs() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::willow_gc_init();
     let baseline = crate::gc_telemetry::external_bytes();
     for count in [1, 32, 1024] {
@@ -1710,7 +1710,7 @@ fn native_channel_storage_counts_boxes_buffers_waiters_and_handoffs() {
 
 #[test]
 fn native_channel_gc_finalizer_and_reset_release_storage() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::willow_gc_init();
     let baseline = crate::gc_telemetry::external_bytes();
     for reset in [false, true] {
@@ -1730,7 +1730,7 @@ fn native_channel_gc_finalizer_and_reset_release_storage() {
 
 #[test]
 fn native_table_tombstones_do_not_hide_growth_in_another_buffer() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::willow_gc_init();
     let baseline = crate::gc_telemetry::external_bytes();
     let channel = WillowAbiChannel::new(false);

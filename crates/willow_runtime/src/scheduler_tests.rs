@@ -9,7 +9,7 @@ fn channel_token(channel: usize) -> crate::task::ChannelOwnershipToken {
 use super::*;
 use crate::async_frame::{async_frame_slot_offset, willow_async_frame_alloc};
 use crate::gc::{
-    reset_internal_for_test, runtime_test_guard, willow_alloc_typed, willow_gc_allocated_bytes,
+    isolated_runtime, reset_internal_for_test, willow_alloc_typed, willow_gc_allocated_bytes,
     willow_gc_collect,
 };
 use crate::task::RUNTIME_POLL_PENDING;
@@ -18,10 +18,12 @@ use std::sync::atomic::{
     AtomicBool as TestAtomicBool, AtomicU64 as TestAtomicU64, AtomicUsize as TestAtomicUsize,
     Ordering as TestOrdering,
 };
-use std::sync::{Barrier, LazyLock as TestLazyLock, Mutex as TestMutex};
+use std::sync::{Barrier, Mutex as TestMutex};
 
-static NESTED_QUANTUM_TARGET: TestAtomicU64 = TestAtomicU64::new(0);
-static NESTED_QUANTUM_RESTORED: TestAtomicBool = TestAtomicBool::new(false);
+static NESTED_QUANTUM_TARGET: crate::runtime::PerRuntime<TestAtomicU64> =
+    crate::runtime::PerRuntime::new(|| TestAtomicU64::new(0));
+static NESTED_QUANTUM_RESTORED: crate::runtime::PerRuntime<TestAtomicBool> =
+    crate::runtime::PerRuntime::new(|| TestAtomicBool::new(false));
 
 #[test]
 fn idle_wait_observes_wake_between_snapshot_and_wait() {
@@ -47,7 +49,7 @@ unsafe extern "C" fn poll_nested_then_check_quantum(_frame: *mut c_void) -> i32 
 
 #[test]
 fn nested_scheduler_restores_outer_task_quantum() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     NESTED_QUANTUM_RESTORED.store(false, TestOrdering::SeqCst);
@@ -64,7 +66,188 @@ fn nested_scheduler_restores_outer_task_quantum() {
     reset_internal_for_test();
 }
 
+#[test]
+fn owned_scheduler_services_retain_borrows_and_release_all_generations() {
+    for replacements in [1, 8, 64] {
+        let runtime = crate::runtime::Runtime::new(environment_worker_config);
+        let services = runtime.scheduler();
+        let original = services.components();
+        let original_id = original.spawn_target().reserve_task_id();
+        let mut weak_components = Vec::new();
+        let mut weak_tables = Vec::new();
+        for _ in 0..replacements {
+            {
+                let generations = services._retained_generations.lock().unwrap();
+                let last = generations.last().unwrap();
+                weak_components.push(Arc::downgrade(last));
+                weak_tables.push(Arc::downgrade(&last.tasks));
+            }
+            SchedulerServices::with_scheduler(
+                || services,
+                |scheduler| {
+                    *scheduler = RuntimeScheduler::from_components(services.replace_components(1));
+                },
+            );
+            assert_eq!(services.components().spawn_target().reserve_task_id(), 1);
+            // Replacements must not invalidate an outstanding component borrow.
+            assert_eq!(
+                original.next_task_id.load(Ordering::Relaxed),
+                original_id + 1
+            );
+        }
+        {
+            let generations = services._retained_generations.lock().unwrap();
+            let last = generations.last().unwrap();
+            weak_components.push(Arc::downgrade(last));
+            weak_tables.push(Arc::downgrade(&last.tasks));
+        }
+        assert!(weak_components.iter().all(|weak| weak.upgrade().is_some()));
+        drop(runtime);
+        assert!(weak_components.iter().all(|weak| weak.upgrade().is_none()));
+        assert!(weak_tables.iter().all(|weak| weak.upgrade().is_none()));
+    }
+}
+
+#[test]
+fn owned_scheduler_services_publish_without_invalidating_concurrent_readers() {
+    let runtime = crate::runtime::Runtime::new(environment_worker_config);
+    let services = runtime.scheduler();
+    let rendezvous = Barrier::new(2);
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(crate::runtime::serving(|| {
+            let original = services.components();
+            let original_table = Arc::as_ptr(&original.tasks);
+            let mut stable = true;
+            for _ in 0..64 {
+                rendezvous.wait();
+                rendezvous.wait();
+                stable &= Arc::as_ptr(&original.tasks) == original_table;
+                stable &= original.next_task_id.load(Ordering::Relaxed) == 1;
+                stable &= services.components().next_task_id.load(Ordering::Relaxed) == 2;
+                rendezvous.wait();
+            }
+            stable
+        }));
+        let mut correct = true;
+        for _ in 0..64 {
+            rendezvous.wait();
+            SchedulerServices::with_scheduler(
+                || services,
+                |scheduler| {
+                    *scheduler = RuntimeScheduler::from_components(services.replace_components(1));
+                    correct &= scheduler.spawn_placeholder() == 1;
+                },
+            );
+            rendezvous.wait();
+            rendezvous.wait();
+        }
+        assert!(reader.join().unwrap());
+        assert!(correct);
+    });
+}
+
 // ── Work-stealing run queues ────────────────────────────
+
+#[test]
+fn local_scheduler_running_contexts_are_independent_across_threads() {
+    let rendezvous = Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let rendezvous = &rendezvous;
+                scope.spawn(crate::runtime::serving(move || {
+                    let mut scheduler = RuntimeScheduler::with_worker_count(1);
+                    let id = scheduler.spawn_placeholder();
+                    let expected = scheduler.with_task(id, RuntimeTask::panic_context).unwrap();
+                    rendezvous.wait();
+                    scheduler.set_running(id);
+                    rendezvous.wait();
+                    let installed = crate::panic_context::current_context()
+                        .is_some_and(|context| Arc::ptr_eq(&context, &expected));
+                    // Reinstalling a running task must preserve its own context too.
+                    scheduler.set_running(id);
+                    let repeated = crate::panic_context::current_context()
+                        .is_some_and(|context| Arc::ptr_eq(&context, &expected));
+                    scheduler.clear_running();
+                    let cleared = crate::panic_context::current_context().is_none();
+                    (id, installed, repeated, cleared)
+                }))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results, [(1, true, true, true); 2]);
+}
+
+#[test]
+fn local_scheduler_same_id_reentry_restores_its_execution_owner() {
+    let mut first = RuntimeScheduler::with_worker_count(1);
+    let mut second = RuntimeScheduler::with_worker_count(1);
+    let first_id = first.spawn_placeholder();
+    let second_id = second.spawn_placeholder();
+    assert_eq!(first_id, second_id);
+    first.with_task(first_id, |task| {
+        task.state.request_cancel(&first.tasks.cancel_epoch)
+    });
+    first.set_running(first_id);
+    first.clear_running();
+    second.set_running(second_id);
+    assert!(!current_cancel_snapshot().unwrap().cancelled);
+    first.set_running(first_id);
+    let restored_cancel = current_cancel_snapshot().unwrap().cancelled;
+    let first_context = first
+        .with_task(first_id, RuntimeTask::panic_context)
+        .unwrap();
+    let restored_context = crate::panic_context::current_context()
+        .is_some_and(|context| Arc::ptr_eq(&context, &first_context));
+    first.clear_running();
+
+    second.set_running(second_id);
+    // Publishing another scheduler's same-numbered task must not consume the
+    // second task's execution state or transfer its native stack.
+    first.finish_pending_poll(first_id);
+    let second_still_owned = current_cancel_snapshot().map(|snapshot| snapshot.cancelled);
+    second.clear_running();
+    assert!(restored_context);
+    assert!(restored_cancel);
+    assert_eq!(second_still_owned, Some(false));
+}
+
+#[test]
+fn local_scheduler_reinstalls_its_cancelling_context_after_clear() {
+    let mut scheduler = RuntimeScheduler::with_worker_count(1);
+    let id = scheduler.spawn_placeholder();
+    let expected = scheduler.with_task(id, RuntimeTask::panic_context).unwrap();
+    scheduler.with_task(id, |task| {
+        task.state.request_cancel(&scheduler.tasks.cancel_epoch)
+    });
+    scheduler.set_running(id);
+    assert_eq!(
+        scheduler.with_task(id, |task| task.state.lifecycle()),
+        Some(TaskLifecycle::Cancelling)
+    );
+    for _ in 0..2 {
+        scheduler.set_running(id);
+        assert!(
+            crate::panic_context::current_context()
+                .is_some_and(|context| Arc::ptr_eq(&context, &expected))
+        );
+        assert!(current_cancel_snapshot().unwrap().cancelled);
+        scheduler.clear_running();
+    }
+    scheduler.finalize_cancelled(id);
+    let previous = crate::panic_context::replace_current_context(Some(Arc::clone(&expected)));
+    scheduler.set_running(id);
+    assert!(
+        crate::panic_context::current_context()
+            .is_some_and(|context| Arc::ptr_eq(&context, &expected)),
+        "a retired task must not replace the installed context"
+    );
+    crate::panic_context::replace_current_context(previous);
+}
 
 #[test]
 fn workqueue_pops_local_before_global() {
@@ -541,7 +724,7 @@ fn runq_22_mixed_transition_sequence_keeps_queues_consistent() {
 
 #[test]
 fn runq_23_cancel_publishes_parked_task_once() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let id = with_global_for_test(|sched| sched.spawn_parked_placeholder());
@@ -632,7 +815,7 @@ fn bsq_18_completion_wake_clears_the_count() {
 
 #[test]
 fn bsq_19_cancel_of_a_blocked_task_clears_the_count() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let id = with_global_for_test(|s| {
         let id = s.spawn_placeholder();
@@ -796,7 +979,7 @@ fn bsq_28_blocked_presence_suppresses_the_idle_decision() {
 
 #[test]
 fn bsq_29_global_block_and_wake_do_not_need_scheduler_metadata_lock() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let id = with_global_for_test(RuntimeScheduler::spawn_placeholder);
     assert_eq!(
@@ -807,29 +990,31 @@ fn bsq_29_global_block_and_wake_do_not_need_scheduler_metadata_lock() {
     // Hold the old global accounting lock across both operations. The
     // sharded implementation must still be able to enter BlockedSyscall,
     // publish a wake queue entry, and leave the blocked count.
-    let scheduler_lock = GLOBAL_SCHEDULER
+    let scheduler_lock = crate::runtime::current()
+        .scheduler()
+        .scheduler
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
-    let blocker = std::thread::spawn(move || {
+    let blocker = std::thread::spawn(crate::runtime::serving(move || {
         finish_global_poll_boundary(id, GlobalPollBoundary::BlockedSyscall);
         blocked_tx.send(()).unwrap();
-    });
-    blocked_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("BlockedSyscall publication must not take GLOBAL_SCHEDULER");
+    }));
+    blocked_rx.recv_timeout(Duration::from_secs(1)).expect(
+        "BlockedSyscall publication must not take crate::runtime::current().scheduler().scheduler",
+    );
     blocker.join().unwrap();
     assert_eq!(global_task_table().blocked_syscall_count(), 1);
     assert_eq!(global_run_queues().len(), 0);
 
     let (wake_tx, wake_rx) = std::sync::mpsc::channel();
-    let waker = std::thread::spawn(move || {
+    let waker = std::thread::spawn(crate::runtime::serving(move || {
         wake_tx.send(wake_global_task(id)).unwrap();
-    });
+    }));
     assert!(
         wake_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("blocked wake must not take GLOBAL_SCHEDULER")
+            .expect("blocked wake must not take crate::runtime::current().scheduler().scheduler")
     );
     waker.join().unwrap();
     assert_eq!(
@@ -845,7 +1030,7 @@ fn bsq_29_global_block_and_wake_do_not_need_scheduler_metadata_lock() {
 
 #[test]
 fn sched_run_registers_driver_as_mutator_without_leaking() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     crate::gc::reset_internal_for_test();
     let before = crate::gc::registered_mutator_count();
@@ -859,9 +1044,10 @@ fn sched_run_registers_driver_as_mutator_without_leaking() {
     );
 }
 
-static PARALLEL_POLL_THREADS: TestLazyLock<TestMutex<Vec<std::thread::ThreadId>>> =
-    TestLazyLock::new(|| TestMutex::new(Vec::new()));
-static PARALLEL_POLL_ENTERED: TestAtomicUsize = TestAtomicUsize::new(0);
+static PARALLEL_POLL_THREADS: crate::runtime::PerRuntime<TestMutex<Vec<std::thread::ThreadId>>> =
+    crate::runtime::PerRuntime::new(|| TestMutex::new(Vec::new()));
+static PARALLEL_POLL_ENTERED: crate::runtime::PerRuntime<TestAtomicUsize> =
+    crate::runtime::PerRuntime::new(|| TestAtomicUsize::new(0));
 
 unsafe extern "C" fn poll_record_parallel_worker(_frame: *mut c_void) -> i32 {
     PARALLEL_POLL_THREADS
@@ -880,7 +1066,7 @@ unsafe extern "C" fn poll_record_parallel_worker(_frame: *mut c_void) -> i32 {
 
 #[test]
 fn parallel_worker_pool_polls_tasks_on_multiple_threads() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     replace_global_scheduler_for_test(2);
@@ -913,7 +1099,7 @@ fn parallel_worker_pool_polls_tasks_on_multiple_threads() {
 
 #[test]
 fn parallel_completion_retains_early_notifications() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for workers in [1, 2, 8, 32, 128] {
         let completion = ParallelCompletion::new(workers);
         for completed in 1..=workers {
@@ -929,17 +1115,17 @@ fn parallel_completion_retains_early_notifications() {
 
 #[test]
 fn parallel_completion_wakes_promptly() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let mut latencies = Vec::new();
     for _ in 0..16 {
         let completion = Arc::new(ParallelCompletion::new(1));
         let worker_completion = Arc::clone(&completion);
-        let worker = std::thread::spawn(move || {
+        let worker = std::thread::spawn(crate::runtime::serving(move || {
             std::thread::sleep(Duration::from_millis(10));
             let sent = Instant::now();
             worker_completion.finish();
             sent
-        });
+        }));
         completion.wait();
         let returned = Instant::now();
         latencies.push(returned.duration_since(worker.join().unwrap()));
@@ -966,7 +1152,7 @@ unsafe extern "C" fn poll_collect_and_nested_drive(_frame: *mut c_void) -> i32 {
 
 #[test]
 fn parallel_completion_allows_worker_gc_and_nested_drive() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     crate::gc::reset_internal_for_test();
@@ -1000,7 +1186,7 @@ fn parallel_completion_driver_cpu_below_five_percent() {
         (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
             + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 / 1_000_000.0
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     replace_global_scheduler_for_test(2);
@@ -1021,7 +1207,8 @@ fn parallel_completion_driver_cpu_below_five_percent() {
     reset_internal_for_test();
 }
 
-static WAKE_RACE_WAITER_REGISTERED: TestAtomicUsize = TestAtomicUsize::new(0);
+static WAKE_RACE_WAITER_REGISTERED: crate::runtime::PerRuntime<TestAtomicUsize> =
+    crate::runtime::PerRuntime::new(|| TestAtomicUsize::new(0));
 
 unsafe extern "C" fn poll_complete_after_waiter_registered(_frame: *mut c_void) -> i32 {
     let start = Instant::now();
@@ -1050,7 +1237,7 @@ unsafe extern "C" fn poll_await_with_running_wake_race(frame: *mut c_void) -> i3
 
 #[test]
 fn parallel_wake_while_waiter_running_requeues_after_pending() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     replace_global_scheduler_for_test(2);
@@ -1126,7 +1313,7 @@ fn initialized_spawn_runs_initializer_before_task_or_queue_publication() {
 
 #[test]
 fn global_initialized_spawn_allows_scheduler_reentry_before_publication() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let mut nested = 0;
@@ -1155,7 +1342,7 @@ fn global_initialized_spawn_allows_scheduler_reentry_before_publication() {
 
 #[test]
 fn global_initialized_spawn_panic_rolls_back_unpublished_frame_root() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
@@ -1178,7 +1365,7 @@ fn global_initialized_spawn_panic_rolls_back_unpublished_frame_root() {
 
 #[test]
 fn async_chain_text_walks_awaiter_links() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     // main(id=1) awaits inner(id=2): register main as a waiter of inner, then
     // mark inner the running task. The chain is inner -> main.
@@ -1204,7 +1391,7 @@ fn async_chain_text_walks_awaiter_links() {
 
 #[test]
 fn async_chain_reads_awaiter_site_persisted_at_registration() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let (inner, main) = with_global(|sched| {
         let inner = sched.spawn_task(poll_ready_now, std::ptr::null_mut());
@@ -1240,7 +1427,7 @@ fn async_chain_reads_awaiter_site_persisted_at_registration() {
 
 #[test]
 fn async_chain_inspection_handles_depth_fanout_tombstones_and_cycles() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for depth in [1, 32, 256] {
         for fanout in [0, 32, 256] {
             reset_global_scheduler_for_test();
@@ -1288,7 +1475,7 @@ fn cooperative_poll_runs_without_an_active_native_stack() {
         assert!(crate::preempt::willow_sync_poll_counter().is_null());
         RUNTIME_POLL_READY
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let id = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
     assert!(
@@ -1311,7 +1498,7 @@ fn cooperative_boundary_returns_callback_result_and_releases_stack() {
         assert!(crate::preempt::willow_sync_poll_counter().is_null());
         RUNTIME_POLL_READY
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let id = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
     willow_sched_run_until(id);
@@ -1349,7 +1536,7 @@ fn cooperative_boundary_resumes_helper_without_restarting_it() {
         assert_eq!(ENTRIES.load(Ordering::SeqCst), 1);
         RUNTIME_POLL_READY
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     ENTRIES.store(0, Ordering::SeqCst);
     let id = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
@@ -1364,7 +1551,7 @@ fn cooperative_cancel_bounded_cleanup_avoids_native_stack() {
         assert!(crate::preempt::willow_sync_poll_counter().is_null());
         CALLED.fetch_add(1, Ordering::SeqCst);
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     CALLED.store(0, Ordering::SeqCst);
     let frame = willow_async_frame_alloc(0, 0).cast();
@@ -1394,7 +1581,7 @@ fn cooperative_cancel_unbounded_cleanup_retains_native_stack() {
         assert!(!crate::preempt::willow_sync_poll_counter().is_null());
         CALLED.fetch_add(1, Ordering::SeqCst);
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     CALLED.store(0, Ordering::SeqCst);
     let frame = willow_async_frame_alloc(0, 0).cast();
@@ -1407,7 +1594,7 @@ fn cooperative_cancel_unbounded_cleanup_retains_native_stack() {
 
 #[test]
 fn cooperative_spawn_publishes_call_site_before_first_poll() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let previous = crate::stack_trace::replace_current(Default::default());
     crate::stack_trace::willow_callstack_push(b"child".as_ptr(), 5, b"spawn.wi".as_ptr(), 8, 42, 3);
@@ -1427,7 +1614,7 @@ fn cooperative_spawn_publishes_call_site_before_first_poll() {
 #[test]
 fn cooperative_cancel_without_cleanup_reports_terminal_cancellation_once() {
     use crate::observability::{WillowRuntimeMetricsV1, willow_runtime_metrics_snapshot_v1};
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let mut before = WillowRuntimeMetricsV1::default();
     willow_runtime_metrics_snapshot_v1(&mut before);
@@ -1461,7 +1648,7 @@ unsafe extern "C" fn poll_ready_on_second(frame: *mut c_void) -> i32 {
 
 #[test]
 fn coop_01_ready_task_runs_to_completion() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
@@ -1471,7 +1658,7 @@ fn coop_01_ready_task_runs_to_completion() {
 
 #[test]
 fn coop_02_pending_parks_then_wake_resumes() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     // A frame with just the [state, slot_count] header; poll uses the state word.
@@ -1521,7 +1708,7 @@ unsafe extern "C" fn poll_yield_then_ready(frame: *mut c_void) -> i32 {
 fn coop_timer_wake_resumes_parked_task() {
     // a task that parks with a wake-deadline (sleep) is woken
     // by the timer-aware run loop and resumes to completion — no manual wake.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
@@ -1541,7 +1728,7 @@ fn coop_timer_wake_resumes_parked_task() {
 
 #[test]
 fn coop_yield_requeues_running_task_without_manual_wake() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
@@ -1574,7 +1761,7 @@ fn coop_dependency_wake_resumes_awaiter() {
     // task A awaits task B. B sleeps then completes (timer
     // wake); B's completion wakes A (dependency wake); A resumes. No manual
     // wake — the scheduler drives both to completion in one run.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     // B: sleeps 5ms on the first poll, ready on the second.
@@ -1603,7 +1790,7 @@ fn coop_clear_running_prevents_stale_sleep() {
     // willow_sched_sleep called OUTSIDE a poll does not attach a phantom
     // wake-deadline to the just-parked (now stale) task and spuriously wake
     // it on the next run.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
@@ -1625,7 +1812,7 @@ fn coop_clear_running_prevents_stale_sleep() {
 fn coop_parked_without_deadline_stays_idle() {
     // A task parked WITHOUT a deadline is not spuriously woken by the timer
     // loop (regression guard for the cooperative suspension run-loop change).
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
@@ -1639,7 +1826,7 @@ fn coop_parked_without_deadline_stays_idle() {
 
 #[test]
 fn coop_03_suspended_frame_keeps_referenced_object_alive() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
 
@@ -1686,14 +1873,14 @@ fn coop_03_suspended_frame_keeps_referenced_object_alive() {
 
 #[test]
 fn coop_04_unknown_task_state_is_minus_one() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     assert_eq!(willow_sched_task_state(999), -1);
 }
 
 #[test]
 fn coop_05_multiple_ready_tasks_all_complete() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let a = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
@@ -1807,8 +1994,8 @@ fn scheduler_worker_config_rejects_zero_and_invalid_override() {
 // 16. the cancelled task is gone from the table afterwards
 // 17. the guard is RAII, so a panicking test cannot leak the override
 // 18. the guard leaves task ids/state transitions otherwise unchanged
-// 19. the override is invisible outside `cfg(test)` (compile-time: the
-//     static, the guard, and the branch are all `#[cfg(test)]`)
+// 19. policy and leases belong to the runtime instance; only the legacy test
+//     helper selecting the default instance is restricted to `cfg(test)`
 // 20. repeated guarded drives stay deterministic under stress
 // -----------------------------------------------------------------------
 
@@ -1818,7 +2005,7 @@ unsafe extern "C" fn poll_ready_noop(_frame: *mut c_void) -> i32 {
 
 #[test]
 fn single_worker_guard_reports_one_active_and_requested_worker() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     let config = runtime_worker_config();
     assert_eq!(config.active_workers(), 1, "perspective 1");
@@ -1829,7 +2016,7 @@ fn single_worker_guard_reports_one_active_and_requested_worker() {
 
 #[test]
 fn single_worker_guard_is_scoped_and_nestable() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let previous = runtime_worker_config();
 
     {
@@ -1856,7 +2043,7 @@ fn single_worker_guard_is_scoped_and_nestable() {
 
 #[test]
 fn single_worker_guard_does_not_change_env_parsing() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     // Perspective 7: only `runtime_worker_config()` consults the override;
     // the parser still honors explicit positive counts.
@@ -1874,7 +2061,7 @@ fn single_worker_guard_does_not_change_env_parsing() {
 
 #[test]
 fn single_worker_guard_sizes_fresh_run_queues_for_one_worker() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     reset_global_scheduler_for_test();
     // Perspective 9: install the guard BEFORE the reset and the fresh
@@ -1890,7 +2077,7 @@ fn single_worker_guard_reuses_the_same_os_worker_across_drives() {
         THREADS.lock().unwrap().push(std::thread::current().id());
         RUNTIME_POLL_READY
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     reset_global_scheduler_for_test();
     THREADS.lock().unwrap().clear();
@@ -1913,7 +2100,7 @@ fn single_worker_run_until_does_not_reap_a_task_the_drive_woke() {
         RUNTIME_POLL_READY
     }
 
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     reset_global_scheduler_for_test();
 
@@ -1945,7 +2132,7 @@ fn single_worker_run_until_does_not_reap_a_task_the_drive_woke() {
 
 #[test]
 fn single_worker_drive_reaps_a_cancelled_placeholder_without_counting_it() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     reset_global_scheduler_for_test();
 
@@ -1961,7 +2148,7 @@ fn single_worker_drive_reaps_a_cancelled_placeholder_without_counting_it() {
 
 #[test]
 fn single_worker_guard_is_released_when_a_scope_unwinds() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     // Perspective 17: the override is RAII, so a panicking test body cannot
     // leave every later test pinned to one worker.
     let previous = runtime_worker_config();
@@ -1980,7 +2167,7 @@ fn single_worker_guard_is_released_when_a_scope_unwinds() {
 
 #[test]
 fn single_worker_drives_are_repeatable() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     // Perspective 20: the determinism is not a one-shot fluke.
     for _ in 0..32 {
@@ -1993,7 +2180,7 @@ fn single_worker_drives_are_repeatable() {
 
 #[test]
 fn scheduler_active_worker_abi_reports_requested_workers() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let expected = parse_worker_count(std::env::var("WILLOW_WORKERS").ok().as_deref())
         .unwrap_or_else(default_worker_count) as u64;
     assert_eq!(willow_sched_active_workers(), expected);
@@ -2119,8 +2306,8 @@ fn scheduler_due_timer_transition_publishes_ready_task_atomically() {
 //     12 timers are no longer part of the scheduler metadata snapshot
 //
 //   Lock decomposition (the point of the issue)
-//     13 registration completes while GLOBAL_SCHEDULER is held elsewhere
-//     14 promotion completes while GLOBAL_SCHEDULER is held elsewhere
+//     13 registration completes while crate::runtime::current().scheduler().scheduler is held elsewhere
+//     14 promotion completes while crate::runtime::current().scheduler().scheduler is held elsewhere
 //     15 the earliest-deadline query completes while it is held elsewhere
 //     16 the empty-queue sweep answers from one atomic load while it is held
 //     17 the per-test reset installs a fresh, empty timer queue
@@ -2438,16 +2625,19 @@ fn t9ha4_12_timers_are_not_part_of_the_scheduler_metadata_snapshot() {
 /// Every timer-lock decomposition timer operation must complete here; before the split
 /// they all serialized on the lock this helper is squatting on.
 fn without_scheduler_lock<T: Send>(what: &str, body: impl FnOnce() -> T + Send) -> T {
-    let scheduler_lock = GLOBAL_SCHEDULER
+    let scheduler_lock = crate::runtime::current()
+        .scheduler()
+        .scheduler
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (tx, rx) = std::sync::mpsc::channel();
     let result = std::thread::scope(|scope| {
-        scope.spawn(|| {
+        scope.spawn(crate::runtime::serving(|| {
             tx.send(body()).unwrap();
-        });
-        rx.recv_timeout(Duration::from_secs(5))
-            .unwrap_or_else(|_| panic!("{what} must not need GLOBAL_SCHEDULER"))
+        }));
+        rx.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| {
+            panic!("{what} must not need crate::runtime::current().scheduler().scheduler")
+        })
     });
     drop(scheduler_lock);
     result
@@ -2455,7 +2645,7 @@ fn without_scheduler_lock<T: Send>(what: &str, body: impl FnOnce() -> T + Send) 
 
 #[test]
 fn t9ha4_13_sleep_registration_does_not_need_the_scheduler_lock() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let id = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
 
@@ -2473,7 +2663,7 @@ fn t9ha4_13_sleep_registration_does_not_need_the_scheduler_lock() {
 
 #[test]
 fn t9ha4_14_timer_promotion_does_not_need_the_scheduler_lock() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let id = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
     with_current_task_for_test(id, || set_global_wake_after_millis(0));
@@ -2489,7 +2679,7 @@ fn t9ha4_14_timer_promotion_does_not_need_the_scheduler_lock() {
 
 #[test]
 fn t9ha4_15_earliest_deadline_query_does_not_need_the_scheduler_lock() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let id = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
     with_current_task_for_test(id, || set_global_wake_after_millis(50));
@@ -2506,7 +2696,7 @@ fn t9ha4_15_earliest_deadline_query_does_not_need_the_scheduler_lock() {
 
 #[test]
 fn t9ha4_16_empty_sweep_is_an_atomic_load_even_while_the_scheduler_lock_is_held() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     assert_eq!(
         global_timers().earliest_hint_nanos(),
@@ -2524,7 +2714,7 @@ fn t9ha4_16_empty_sweep_is_an_atomic_load_even_while_the_scheduler_lock_is_held(
 
 #[test]
 fn t9ha4_17_reset_installs_a_fresh_empty_timer_queue() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let id = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
     with_current_task_for_test(id, || set_global_wake_after_millis(5_000));
@@ -2550,7 +2740,7 @@ fn t9ha4_17_reset_installs_a_fresh_empty_timer_queue() {
 
 #[test]
 fn t8hq4_18_component_access_is_stable_until_reset() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let (queues, tasks, timers) = (global_run_queues(), global_task_table(), global_timers());
     assert!(Arc::ptr_eq(queues, global_run_queues()));
@@ -2622,7 +2812,7 @@ fn pending_cleanup_count() -> usize {
 
 #[test]
 fn t8hq4_19_cleanup_flag_follows_the_pending_list() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     assert!(!terminal_cleanups_pending(), "a fresh scheduler has none");
     complete_executable_without_drain();
@@ -2643,36 +2833,38 @@ fn t8hq4_19_cleanup_flag_follows_the_pending_list() {
 
 #[test]
 fn t8hq4_19_empty_drain_does_not_take_the_scheduler_mutex() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
-    let held = GLOBAL_SCHEDULER
+    let held = crate::runtime::current()
+        .scheduler()
+        .scheduler
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let drainer = std::thread::spawn(move || {
+    let drainer = std::thread::spawn(crate::runtime::serving(move || {
         drain_terminal_cleanups();
         done_tx.send(()).unwrap();
-    });
+    }));
     let finished = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
     drop(held);
     drainer.join().unwrap();
     assert!(
         finished,
-        "a drain with nothing pending blocked on GLOBAL_SCHEDULER"
+        "a drain with nothing pending blocked on crate::runtime::current().scheduler().scheduler"
     );
 }
 
 #[test]
 fn t8hq4_19_pending_drain_still_takes_the_list() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     complete_executable_without_drain();
     let held = global_components().retirements.hold_cleanup_list_for_test();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let drainer = std::thread::spawn(move || {
+    let drainer = std::thread::spawn(crate::runtime::serving(move || {
         drain_terminal_cleanups();
         done_tx.send(()).unwrap();
-    });
+    }));
     let early = done_rx.recv_timeout(Duration::from_millis(100)).is_ok();
     drop(held);
     done_rx
@@ -2686,7 +2878,7 @@ fn t8hq4_19_pending_drain_still_takes_the_list() {
 
 #[test]
 fn t8hq4_19_reset_installs_a_clear_flag() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     complete_executable_without_drain();
     assert!(terminal_cleanups_pending());
@@ -2697,7 +2889,7 @@ fn t8hq4_19_reset_installs_a_clear_flag() {
 
 #[test]
 fn t8hq4_19_a_private_scheduler_does_not_touch_the_global_flag() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let mut scheduler = RuntimeScheduler::with_worker_count(TEST_WORKERS);
     let id = scheduler.spawn_task(poll_ready_now, std::ptr::null_mut());
@@ -2721,16 +2913,16 @@ fn t8hq4_19_a_private_scheduler_does_not_touch_the_global_flag() {
 
 #[test]
 fn t8hq4_19_cleanups_published_during_drains_are_never_lost() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     const TASKS: usize = 2_000;
     let stop = Arc::new(AtomicBool::new(false));
     let drainer_stop = Arc::clone(&stop);
-    let drainer = std::thread::spawn(move || {
+    let drainer = std::thread::spawn(crate::runtime::serving(move || {
         while !drainer_stop.load(Ordering::Acquire) {
             drain_terminal_cleanups();
         }
-    });
+    }));
     for _ in 0..TASKS {
         complete_executable_without_drain();
     }
@@ -2771,7 +2963,7 @@ fn finishes_without_shard<R: Send>(id: RuntimeTaskId, f: impl FnOnce() -> R + Se
     let held = table.lock_shard(table.shard_index(id));
     std::thread::scope(|scope| {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let worker = scope.spawn(move || done_tx.send(f()).unwrap());
+        let worker = scope.spawn(crate::runtime::serving(move || done_tx.send(f()).unwrap()));
         let result = done_rx.recv_timeout(Duration::from_secs(2)).ok();
         drop(held);
         worker.join().unwrap();
@@ -2781,7 +2973,7 @@ fn finishes_without_shard<R: Send>(id: RuntimeTaskId, f: impl FnOnce() -> R + Se
 
 #[test]
 fn t8hq4_19_terminal_epoch_advances_on_terminal_transitions_and_removals_only() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let start = terminal_epoch();
     let parked = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
@@ -2805,7 +2997,7 @@ fn t8hq4_19_terminal_epoch_advances_on_terminal_transitions_and_removals_only() 
 
 #[test]
 fn t8hq4_19_target_watch_looks_again_only_after_the_epoch_moves() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let target = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
     let mut watch = TargetWatch::new(Some(target), None);
@@ -2840,7 +3032,7 @@ fn t8hq4_19_target_watch_looks_again_only_after_the_epoch_moves() {
 
 #[test]
 fn t8hq4_19_a_removed_target_is_done() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let target = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
     let mut watch = TargetWatch::new(Some(target), None);
@@ -2852,7 +3044,7 @@ fn t8hq4_19_a_removed_target_is_done() {
 
 #[test]
 fn t8hq4_19_pool_workers_share_one_look_per_epoch() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let target = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
     let shared = SharedTargetCheck::default();
@@ -2884,7 +3076,7 @@ fn t8hq4_19_pool_workers_share_one_look_per_epoch() {
 
 #[test]
 fn t8hq4_19_racing_pool_watchers_never_miss_the_target() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     const WATCHERS: usize = 4;
     for _ in 0..200 {
         reset_global_scheduler_for_test();
@@ -2895,7 +3087,7 @@ fn t8hq4_19_racing_pool_watchers_never_miss_the_target() {
             let watchers = (0..WATCHERS)
                 .map(|_| {
                     let (shared, start) = (&shared, &start);
-                    scope.spawn(move || {
+                    scope.spawn(crate::runtime::serving(move || {
                         let mut watch = TargetWatch::new(Some(target), Some(shared));
                         start.wait();
                         let give_up = Instant::now() + Duration::from_secs(10);
@@ -2903,7 +3095,7 @@ fn t8hq4_19_racing_pool_watchers_never_miss_the_target() {
                             assert!(Instant::now() < give_up, "a watcher missed the target");
                             std::hint::spin_loop();
                         }
-                    })
+                    }))
                 })
                 .collect::<Vec<_>>();
             start.wait();
@@ -2926,13 +3118,13 @@ fn t8hq4_19_racing_pool_watchers_never_miss_the_target() {
 
 #[test]
 fn t8hq4_19_a_draining_worker_holds_a_claim_in_flight() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     complete_executable_without_drain();
     let before = claim_word();
     let state = ParallelRunState::default();
     let held = global_components().retirements.hold_cleanup_list_for_test();
-    let drainer = std::thread::spawn(drain_terminal_cleanups);
+    let drainer = std::thread::spawn(crate::runtime::serving(drain_terminal_cleanups));
     let deadline = Instant::now() + Duration::from_secs(5);
     while terminal_cleanups_pending() && Instant::now() < deadline {
         std::thread::yield_now();
@@ -2941,10 +3133,10 @@ fn t8hq4_19_a_draining_worker_holds_a_claim_in_flight() {
     // The drainer won the swap; a second caller returns without the list
     // while the winner's marker is still in the claim word.
     let (loser_tx, loser_rx) = std::sync::mpsc::channel();
-    let loser = std::thread::spawn(move || {
+    let loser = std::thread::spawn(crate::runtime::serving(move || {
         drain_terminal_cleanups();
         loser_tx.send(claims_in_flight()).unwrap();
-    });
+    }));
     let loser_saw_marker = loser_rx.recv_timeout(Duration::from_secs(5));
     let refused = !state.publish_stop_if(|_| true);
     drop(held);
@@ -2966,7 +3158,7 @@ fn t8hq4_19_a_draining_worker_holds_a_claim_in_flight() {
 
 #[test]
 fn t8hq4_19_an_empty_drain_leaves_the_claim_word_alone() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let before = claim_word();
     drain_terminal_cleanups();
@@ -2975,7 +3167,7 @@ fn t8hq4_19_an_empty_drain_leaves_the_claim_word_alone() {
 
 #[test]
 fn t9ha4_18_concurrent_registration_and_drain_fire_every_timer_once() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
     const SLEEPERS: usize = 256;
@@ -2994,16 +3186,16 @@ fn t9ha4_18_concurrent_registration_and_drain_fire_every_timer_once() {
     std::thread::scope(|scope| {
         for chunk in ids.chunks(SLEEPERS / REGISTRARS) {
             let start = &start;
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 start.wait();
                 for &id in chunk {
                     with_current_task_for_test(id, || set_global_wake_after_millis(0));
                 }
-            });
+            }));
         }
         for _ in 0..DRAINERS {
             let (woken, start) = (&woken, &start);
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 start.wait();
                 let give_up = Instant::now() + Duration::from_secs(10);
                 while woken.load(Ordering::Acquire) < SLEEPERS && Instant::now() < give_up {
@@ -3011,7 +3203,7 @@ fn t9ha4_18_concurrent_registration_and_drain_fire_every_timer_once() {
                     woken.fetch_add(fired, Ordering::AcqRel);
                     std::hint::spin_loop();
                 }
-            });
+            }));
         }
     });
 
@@ -3029,7 +3221,7 @@ fn t9ha4_18_concurrent_registration_and_drain_fire_every_timer_once() {
 fn t9ha4_19_promotion_never_exposes_a_window_with_neither_timer_nor_ready_entry() {
     // Popped batches must remain visible to idle detection until the task
     // is Ready, even though wake callbacks run outside the heap lock.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let id = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
     with_current_task_for_test(id, || set_global_wake_after_millis(0));
@@ -3038,7 +3230,7 @@ fn t9ha4_19_promotion_never_exposes_a_window_with_neither_timer_nor_ready_entry(
     let done = TestAtomicBool::new(false);
     std::thread::scope(|scope| {
         let (violated, done) = (&violated, &done);
-        scope.spawn(move || {
+        scope.spawn(crate::runtime::serving(move || {
             while !done.load(TestOrdering::Acquire) {
                 if global_next_timer_deadline().is_none()
                     && global_run_queues().len() == 0
@@ -3047,7 +3239,7 @@ fn t9ha4_19_promotion_never_exposes_a_window_with_neither_timer_nor_ready_entry(
                     violated.store(true, TestOrdering::Release);
                 }
             }
-        });
+        }));
         assert_eq!(wake_global_due_timers(Instant::now()), 1);
         done.store(true, TestOrdering::Release);
     });
@@ -3064,7 +3256,7 @@ fn t9ha4_20_blocking_completion_wake_releases_the_idle_waiter_without_spinning()
     // Acceptance criterion: moving timers off the metadata mutex must not
     // disturb the BlockedSyscall keep-alive arm, which parks on the
     // generation counter instead of polling at 1ms.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let id = with_global_for_test(RuntimeScheduler::spawn_placeholder);
     assert_eq!(
@@ -3079,10 +3271,10 @@ fn t9ha4_20_blocking_completion_wake_releases_the_idle_waiter_without_spinning()
     let generation = current_wake_generation();
     let start = Instant::now();
     std::thread::scope(|scope| {
-        scope.spawn(move || {
+        scope.spawn(crate::runtime::serving(move || {
             std::thread::sleep(Duration::from_millis(30));
             assert!(try_wake_parked_task(id));
-        });
+        }));
         assert!(
             wait_for_wake_since(generation, Duration::from_secs(5)),
             "the completion wake must release the waiter before the fallback timeout"
@@ -3109,7 +3301,7 @@ fn t9ha4_21_wake_between_snapshot_and_wait_is_not_lost() {
     // state, then waits. A completion landing in that gap must be observed
     // immediately — otherwise the worker sleeps out the 50ms fallback with
     // runnable work already queued.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let id = with_global_for_test(RuntimeScheduler::spawn_placeholder);
     assert_eq!(
@@ -3132,7 +3324,7 @@ fn t9ha4_21_wake_between_snapshot_and_wait_is_not_lost() {
 
 #[test]
 fn t9ha4_22_sleeping_task_completes_under_run_and_leaves_no_entry() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
@@ -3156,7 +3348,7 @@ fn t9ha4_22_sleeping_task_completes_under_run_and_leaves_no_entry() {
 
 #[test]
 fn t9ha4_23_run_until_returns_when_the_sleeping_target_completes() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
@@ -3177,7 +3369,7 @@ fn t9ha4_23_run_until_returns_when_the_sleeping_target_completes() {
 
 #[test]
 fn t9ha4_24_cancelling_a_sleeper_clears_its_deadline_and_the_drive_terminates() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
@@ -3217,7 +3409,7 @@ fn t9ha4_24_cancelling_a_sleeper_clears_its_deadline_and_the_drive_terminates() 
 fn t9ha4_25_drive_deadline_still_wins_over_a_far_off_sleeper() {
     // The idle wait is computed from the timer queue; clamping it to the
     // caller's deadline must survive the move to the separate lock.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
@@ -3240,7 +3432,8 @@ fn t9ha4_25_drive_deadline_still_wins_over_a_far_off_sleeper() {
     reset_internal_for_test();
 }
 
-static T9HA4_COMPLETION_ORDER: TestMutex<Vec<i64>> = TestMutex::new(Vec::new());
+static T9HA4_COMPLETION_ORDER: crate::runtime::PerRuntime<TestMutex<Vec<i64>>> =
+    crate::runtime::PerRuntime::new(|| TestMutex::new(Vec::new()));
 
 /// Slot 0: poll count. Slot 1: tag. Slot 2: sleep duration in ms.
 /// Records its tag on completion so a test can assert the order.
@@ -3264,7 +3457,7 @@ unsafe extern "C" fn poll_tagged_sleep_then_ready(frame: *mut c_void) -> i32 {
 
 #[test]
 fn t9ha4_26_staggered_sleepers_complete_in_deadline_order() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     T9HA4_COMPLETION_ORDER
@@ -3308,7 +3501,9 @@ fn cancel_finalize_wakes_parked_awaiter() {
 
     // Cancel-request the target, then let the claim boundary finalize it.
     assert_eq!(
-        s.with_task_mut(target, |task| task.state.request_cancel()),
+        s.with_task_mut(target, |task| task
+            .state
+            .request_cancel(&s.tasks.cancel_epoch)),
         Some(CancelOutcome::Deferred)
     );
     // The claim boundary finalizes the target (never claims it), wakes
@@ -3335,7 +3530,10 @@ fn cancel_cleared_deadline_invalidates_stale_timer_entry() {
     s.timers.push(id, deadline);
     // Cancellation clears the deadline (willow_sched_cancel behavior).
     s.tasks.with_mut(id, |task| {
-        assert_eq!(task.state.request_cancel(), CancelOutcome::Enqueue);
+        assert_eq!(
+            task.state.request_cancel(&s.tasks.cancel_epoch),
+            CancelOutcome::Enqueue
+        );
         task.wake_deadline = None;
     });
     // The wheel's stale entry must be revalidated away, not fire a wake.
@@ -3387,7 +3585,7 @@ unsafe extern "C" fn poll_long_sleep_then_ready(frame: *mut c_void) -> i32 {
 fn deadline_01_empty_scheduler_returns_immediately() {
     // The deadline is a CEILING, not a sleep: with nothing to run the drive
     // must return at once so the caller can decide how to wait.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let start = Instant::now();
@@ -3405,7 +3603,7 @@ fn deadline_01_empty_scheduler_returns_immediately() {
 
 #[test]
 fn deadline_02_ready_work_still_runs_before_the_deadline() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
@@ -3423,7 +3621,7 @@ fn deadline_02_ready_work_still_runs_before_the_deadline() {
 fn deadline_03_run_returns_at_deadline_not_after_long_task() {
     // The bug this guards: an unbounded `willow_sched_run` inside sync
     // select drains a 2s task before ever re-checking a 30ms timeout.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
@@ -3450,7 +3648,7 @@ fn deadline_03_run_returns_at_deadline_not_after_long_task() {
 
 #[test]
 fn deadline_04_past_deadline_returns_promptly() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
@@ -3469,7 +3667,7 @@ fn deadline_04_past_deadline_returns_promptly() {
 fn deadline_05_bounded_drive_leaves_no_scheduler_state_behind() {
     // The bound is caller-local: it must not register timers or tasks that
     // a later unbounded drive would then wait on.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     willow_sched_run_until_deadline(willow_monotonic_millis() + 10);
@@ -3491,7 +3689,7 @@ fn deadline_05_bounded_drive_leaves_no_scheduler_state_behind() {
 fn deadline_06_parked_task_timer_still_fires_before_a_far_deadline() {
     // Clamping idle waits must not SKIP a nearer task timer: a 5ms sleeper
     // still runs to completion under a 5s drive deadline.
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
@@ -3534,13 +3732,13 @@ fn sharded_relationships_take_opposite_requests_in_one_lock_order() {
         for (awaitee, waiter) in [(1, 2), (2, 1)] {
             let tasks = Arc::clone(&tasks);
             let start = Arc::clone(&start);
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 start.wait();
                 for _ in 0..2_000 {
                     assert!(register_waiter_sharded(&tasks, awaitee, waiter));
                     unregister_waiter_sharded(&tasks, awaitee, waiter);
                 }
-            });
+            }));
         }
         start.wait();
     });
@@ -4126,7 +4324,7 @@ fn fst_07_null_frame_task_completes_safely() {
 
 #[test]
 fn fst_08_cancel_request_is_mirrored_into_the_frame() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     reset_global_scheduler_for_test();
     let mut frame = status_frame();
     let id = with_global_for_test(|s| {
@@ -4153,7 +4351,7 @@ fn fst_08_cancel_request_is_mirrored_into_the_frame() {
 
 #[test]
 fn fst_09_cancel_then_finalize_keeps_both_bits() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     reset_global_scheduler_for_test();
     let mut frame = status_frame();
     let id = with_global_for_test(|s| {
@@ -4180,7 +4378,7 @@ fn fst_09_cancel_then_finalize_keeps_both_bits() {
 
 #[test]
 fn fst_10_cancelling_a_completed_task_keeps_completed() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     reset_global_scheduler_for_test();
     let mut frame = status_frame();
     let id = with_global_for_test(|s| {
@@ -4206,7 +4404,7 @@ fn fst_10_cancelling_a_completed_task_keeps_completed() {
 
 #[test]
 fn fst_11_await_of_a_terminal_frame_needs_no_task_record() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     reset_global_scheduler_for_test();
     let mut frame = status_frame();
     crate::async_frame::frame_publish_terminal(
@@ -4221,7 +4419,7 @@ fn fst_11_await_of_a_terminal_frame_needs_no_task_record() {
 
 #[test]
 fn fst_12_await_of_a_pending_frame_registers_a_waiter() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     reset_global_scheduler_for_test();
     let mut frame = status_frame();
     let (awaitee, waiter) = with_global_for_test(|s| {
@@ -4254,7 +4452,7 @@ fn fst_12_await_of_a_pending_frame_registers_a_waiter() {
 
 #[test]
 fn frame_await_repolling_does_not_duplicate_wait_relationships() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for waiters in [1, 16, 64] {
         for polls in [1, 16, 256] {
             reset_global_scheduler_for_test();
@@ -4298,7 +4496,7 @@ fn frame_await_repolling_does_not_duplicate_wait_relationships() {
 
 #[test]
 fn fst_13_null_frame_await_falls_back_to_the_id_path() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     reset_global_scheduler_for_test();
     // Unknown id on the id path is treated as ready, so no permanent park.
     assert_eq!(willow_frame_await(std::ptr::null_mut(), 9_999), 1);
@@ -4317,7 +4515,7 @@ fn fst_13_null_frame_await_falls_back_to_the_id_path() {
 
 #[test]
 fn fst_14_await_check_passes_for_non_cancelled_frames() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     reset_global_scheduler_for_test();
     // Pending, Completed and Panicked frames must all return normally; only
     // a Cancelled frame aborts (an abort cannot be exercised in-process).
@@ -4344,7 +4542,7 @@ fn fst_14_await_check_passes_for_non_cancelled_frames() {
 
 #[test]
 fn fst_15_task_state_stays_the_id_only_diagnostic() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     reset_global_scheduler_for_test();
     let mut frame = status_frame();
     let id = with_global_for_test(|s| {
@@ -4380,7 +4578,7 @@ fn fst_16_terminal_transition_holds_shard_through_frame_publication() {
     let (transitioned_tx, transitioned_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let publisher_tasks = Arc::clone(&tasks);
-    let publisher = std::thread::spawn(move || {
+    let publisher = std::thread::spawn(crate::runtime::serving(move || {
         publisher_tasks
             .finish_terminal_and_remove_after(
                 awaitee,
@@ -4391,7 +4589,7 @@ fn fst_16_terminal_transition_holds_shard_through_frame_publication() {
                 },
             )
             .is_some()
-    });
+    }));
 
     transitioned_rx.recv().unwrap();
     assert_eq!(
@@ -4403,12 +4601,12 @@ fn fst_16_terminal_transition_holds_shard_through_frame_publication() {
     let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
     let (registered_tx, registered_rx) = std::sync::mpsc::channel();
     let observer_tasks = Arc::clone(&tasks);
-    let observer = std::thread::spawn(move || {
+    let observer = std::thread::spawn(crate::runtime::serving(move || {
         attempted_tx.send(()).unwrap();
         registered_tx
             .send(register_waiter_sharded(&observer_tasks, awaitee, waiter))
             .unwrap();
-    });
+    }));
     attempted_rx.recv().unwrap();
     assert!(
         registered_rx
@@ -4542,7 +4740,7 @@ fn reaping_02_finish_terminal_captures_cleanup_before_task_removal() {
 fn reaping_02b_terminal_cleanup_carries_lock_link_past_task_removal() {
     use crate::async_mutex::{AsyncMutex, MutexAcquire, MutexRelease};
 
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let mutex = AsyncMutex::new(0, false);
     let (owner, victim) = with_global_for_test(|scheduler| {
@@ -4579,8 +4777,10 @@ fn reaping_02b_terminal_cleanup_carries_lock_link_past_task_removal() {
     ));
 }
 
-static NESTED_ROOT_TARGET: TestAtomicU64 = TestAtomicU64::new(0);
-static NESTED_ROOTS_RETAINED: TestAtomicBool = TestAtomicBool::new(false);
+static NESTED_ROOT_TARGET: crate::runtime::PerRuntime<TestAtomicU64> =
+    crate::runtime::PerRuntime::new(|| TestAtomicU64::new(0));
+static NESTED_ROOTS_RETAINED: crate::runtime::PerRuntime<TestAtomicBool> =
+    crate::runtime::PerRuntime::new(|| TestAtomicBool::new(false));
 
 unsafe extern "C" fn poll_nested_then_observe_frame_roots(_frame: *mut c_void) -> i32 {
     willow_sched_run_until(NESTED_ROOT_TARGET.load(TestOrdering::SeqCst));
@@ -4590,7 +4790,7 @@ unsafe extern "C" fn poll_nested_then_observe_frame_roots(_frame: *mut c_void) -
 
 #[test]
 fn reaping_03_nested_drive_retains_terminal_frame_until_outer_quiescence() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_stress_fixture();
     NESTED_ROOTS_RETAINED.store(false, TestOrdering::SeqCst);
 
@@ -4631,7 +4831,7 @@ fn reaping_04_executable_task_keeps_netpoll_cleanup_even_without_channels() {
 
 #[test]
 fn stress_10k_sleeping_tasks_reap_all_scheduler_metadata() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_stress_fixture();
 
     for _ in 0..STRESS_TASKS {
@@ -4647,7 +4847,7 @@ fn stress_10k_sleeping_tasks_reap_all_scheduler_metadata() {
 
 #[test]
 fn stress_10k_tasks_on_one_channel_reap_all_scheduler_metadata() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_stress_fixture();
     let channel = crate::channel::willow_channel_new(0);
     let task_ids = with_global_for_test(|scheduler| {
@@ -4674,7 +4874,7 @@ fn stress_10k_tasks_on_one_channel_reap_all_scheduler_metadata() {
 
 #[test]
 fn stress_10k_bounded_send_waiters_pass_on_defected_handoffs() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_stress_fixture();
     let channel = crate::channel::willow_channel_new_bounded(0, 1);
     assert_eq!(crate::channel::willow_channel_try_send_i64(channel, 1), 1);
@@ -4711,7 +4911,7 @@ fn stress_10k_bounded_send_waiters_pass_on_defected_handoffs() {
 
 #[test]
 fn stress_10k_yield_preempt_tasks_reap_all_scheduler_metadata() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_stress_fixture();
 
     for _ in 0..STRESS_TASKS {
@@ -4768,7 +4968,7 @@ fn stress_10k_blocked_syscall_tasks_reap_all_scheduler_metadata() {
 
 #[test]
 fn stress_repeated_10k_short_task_batches_plateau_at_zero() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_stress_fixture();
 
     for batch in 0..3 {
@@ -4827,7 +5027,7 @@ fn take_test_panic_message() -> String {
 /// Perspective 01. A quiet scheduler has no claim in flight.
 #[test]
 fn sched_wake_01_no_claim_in_flight_when_idle() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     assert!(!claims_in_flight());
 }
@@ -4836,7 +5036,7 @@ fn sched_wake_01_no_claim_in_flight_when_idle() {
 /// retracted on drop.
 #[test]
 fn sched_wake_02_guard_publishes_and_retracts() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     {
         let _claim = ClaimInFlight::enter();
@@ -4849,7 +5049,7 @@ fn sched_wake_02_guard_publishes_and_retracts() {
 /// marker counts rather than latches.
 #[test]
 fn sched_wake_03_guards_nest() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let outer = ClaimInFlight::enter();
     let inner = ClaimInFlight::enter();
@@ -4864,17 +5064,17 @@ fn sched_wake_03_guards_nest() {
 /// worker that observes idleness is never the one holding the claim.
 #[test]
 fn sched_wake_04_marker_is_visible_across_threads() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let entered = Arc::new(Barrier::new(2));
     let observed = Arc::new(Barrier::new(2));
     let holder_entered = Arc::clone(&entered);
     let holder_observed = Arc::clone(&observed);
-    let holder = std::thread::spawn(move || {
+    let holder = std::thread::spawn(crate::runtime::serving(move || {
         let _claim = ClaimInFlight::enter();
         holder_entered.wait();
         holder_observed.wait();
-    });
+    }));
     entered.wait();
     let seen = claims_in_flight();
     observed.wait();
@@ -4886,7 +5086,7 @@ fn sched_wake_04_marker_is_visible_across_threads() {
 /// Perspective 05. An empty scheduler genuinely has no wake source.
 #[test]
 fn sched_wake_05_no_wake_source_when_empty() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     assert!(!scheduler_has_wake_source());
 }
@@ -4895,7 +5095,7 @@ fn sched_wake_05_no_wake_source_when_empty() {
 /// is the exact state that used to read as "nothing left to do".
 #[test]
 fn sched_wake_06_in_flight_claim_is_a_wake_source() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let _claim = ClaimInFlight::enter();
     assert!(
@@ -4906,7 +5106,7 @@ fn sched_wake_06_in_flight_claim_is_a_wake_source() {
 
 #[test]
 fn sched_wake_running_peer_is_a_wake_source_but_current_poll_is_not() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let current = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
     let state = Arc::new(ParallelRunState::default());
@@ -4929,7 +5129,7 @@ fn sched_wake_running_peer_is_a_wake_source_but_current_poll_is_not() {
 /// Perspective 07. Queued work is a wake source.
 #[test]
 fn sched_wake_07_queued_task_is_a_wake_source() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
     assert!(scheduler_has_wake_source());
@@ -4939,7 +5139,7 @@ fn sched_wake_07_queued_task_is_a_wake_source() {
 /// Perspective 08. An armed timer is a wake source even with empty queues.
 #[test]
 fn sched_wake_08_armed_timer_is_a_wake_source() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let id = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
     with_current_task_for_test(id, || set_global_wake_after_millis(50));
@@ -4954,11 +5154,19 @@ fn sched_wake_08_armed_timer_is_a_wake_source() {
 /// in flight instead of reporting quiescence.
 #[test]
 fn sched_wake_09_idle_step_waits_for_an_in_flight_claim() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let _claim = ClaimInFlight::enter();
     assert!(
-        scheduler_idle_step(0, None, false, None, current_wake_generation()),
+        scheduler_idle_step(
+            crate::runtime::current(),
+            global_components(),
+            0,
+            None,
+            false,
+            None,
+            current_wake_generation()
+        ),
         "the run loop must keep going while a claim is in flight"
     );
 }
@@ -4967,10 +5175,18 @@ fn sched_wake_09_idle_step_waits_for_an_in_flight_claim() {
 /// idle — the fix must not turn every drive into a spin.
 #[test]
 fn sched_wake_10_idle_step_still_reports_genuine_idle() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     assert!(
-        !scheduler_idle_step(0, None, false, None, current_wake_generation()),
+        !scheduler_idle_step(
+            crate::runtime::current(),
+            global_components(),
+            0,
+            None,
+            false,
+            None,
+            current_wake_generation()
+        ),
         "an empty scheduler with no claim is genuinely idle"
     );
 }
@@ -4979,7 +5195,7 @@ fn sched_wake_10_idle_step_still_reports_genuine_idle() {
 /// so the marker cannot leak into later drives.
 #[test]
 fn sched_wake_11_empty_drive_leaves_no_claim() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     assert_eq!(willow_sched_run(), 0);
     assert!(!claims_in_flight());
@@ -4989,7 +5205,7 @@ fn sched_wake_11_empty_drive_leaves_no_claim() {
 /// marker: a completed batch ends at zero.
 #[test]
 fn sched_wake_12_completed_batch_leaves_no_claim() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     for _ in 0..64 {
         willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
@@ -5003,7 +5219,7 @@ fn sched_wake_12_completed_batch_leaves_no_claim() {
 /// one test cannot make every later test's scheduler look busy.
 #[test]
 fn sched_wake_13_reset_clears_the_marker() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     std::mem::forget(ClaimInFlight::enter());
     assert!(claims_in_flight());
     reset_global_scheduler_for_test();
@@ -5014,7 +5230,7 @@ fn sched_wake_13_reset_clears_the_marker() {
 /// quietly so the caller re-probes.
 #[test]
 fn sched_wake_14_select_idle_wait_returns_when_work_is_queued() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let _context = install_test_panic_context(101);
     willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
@@ -5031,7 +5247,7 @@ fn sched_wake_14_select_idle_wait_returns_when_work_is_queued() {
 /// must not be mistaken for a deadlocked select.
 #[test]
 fn sched_wake_15_select_idle_wait_returns_for_an_in_flight_claim() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let _context = install_test_panic_context(102);
     let _claim = ClaimInFlight::enter();
@@ -5044,7 +5260,7 @@ fn sched_wake_15_select_idle_wait_returns_for_an_in_flight_claim() {
 /// before) falling through and running no case at all.
 #[test]
 fn sched_wake_16_select_idle_wait_raises_on_real_deadlock() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     crate::gc::willow_gc_init();
     reset_global_scheduler_for_test();
     let _context = install_test_panic_context(103);
@@ -5061,7 +5277,7 @@ fn sched_wake_16_select_idle_wait_raises_on_real_deadlock() {
 /// program it is meant to explain.
 #[test]
 fn sched_wake_17_select_idle_wait_is_bounded() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     crate::gc::willow_gc_init();
     reset_global_scheduler_for_test();
     let _context = install_test_panic_context(104);
@@ -5080,7 +5296,7 @@ fn sched_wake_17_select_idle_wait_is_bounded() {
 /// returns is either completed or still queued, never lost.
 #[test]
 fn sched_wake_18_concurrent_spawns_are_never_stranded() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     const ROUNDS: usize = 16;
     const PER_ROUND: usize = 32;
@@ -5101,7 +5317,7 @@ fn sched_wake_18_concurrent_spawns_are_never_stranded() {
 /// pending, and the caller then read an unwritten result slot.
 #[test]
 fn sched_wake_19_run_until_never_returns_with_a_pending_target() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     for round in 0..64 {
         // Background load so several workers are claiming concurrently.
@@ -5125,7 +5341,7 @@ fn sched_wake_19_run_until_never_returns_with_a_pending_target() {
 /// leave queued work behind, so the fix adds no steady-state cost.
 #[test]
 fn sched_wake_20_repeated_parallel_drives_settle_at_zero() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     for _ in 0..32 {
         for _ in 0..16 {
@@ -5140,7 +5356,7 @@ fn sched_wake_20_repeated_parallel_drives_settle_at_zero() {
 
 #[test]
 fn idle_timer_wait_observes_work_published_after_empty_probe() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let timer = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
     with_current_task_for_test(timer, || set_global_wake_after_millis(5_000));
@@ -5148,7 +5364,15 @@ fn idle_timer_wait_observes_work_published_after_empty_probe() {
     let generation = current_wake_generation();
     assert!(try_wake_parked_task(task));
     let start = Instant::now();
-    assert!(scheduler_idle_step(0, None, false, None, generation));
+    assert!(scheduler_idle_step(
+        crate::runtime::current(),
+        global_components(),
+        0,
+        None,
+        false,
+        None,
+        generation
+    ));
     assert!(start.elapsed() < Duration::from_secs(1));
     assert!(global_run_queues().contains(task));
     reset_global_scheduler_for_test();
@@ -5163,13 +5387,15 @@ fn unwind_at_drive_entry() {
 
 #[test]
 fn sched_drive_unwind_restores_state_and_can_drive_again() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     reset_internal_for_test();
     let _context = install_test_panic_context(303);
     let context = crate::panic_context::current_context().unwrap();
     let before = crate::gc::registered_mutator_count();
-    DRIVE_ENTRY_HOOK.with(|hook| hook.set(Some(unwind_at_drive_entry)));
+    crate::runtime::current()
+        .scheduler_hooks
+        .with_drive_hook(|hook| hook.set(Some(unwind_at_drive_entry)));
     assert!(std::panic::catch_unwind(|| sched_run_with_mutator(None, None)).is_err());
     assert_eq!(SCHED_RUN_DEPTH.with(Cell::get), 0);
     assert_eq!(current_task_id(), None);
@@ -5179,12 +5405,14 @@ fn sched_drive_unwind_restores_state_and_can_drive_again() {
     ));
     assert_eq!(crate::gc::registered_mutator_count(), before);
 
-    DRIVE_ENTRY_HOOK.with(|hook| {
-        hook.set(Some(|| {
-            assert_eq!(SCHED_RUN_DEPTH.with(Cell::get), 1);
-            assert!(crate::gc::registered_mutator_count() > 0);
-        }))
-    });
+    crate::runtime::current()
+        .scheduler_hooks
+        .with_drive_hook(|hook| {
+            hook.set(Some(|| {
+                assert_eq!(SCHED_RUN_DEPTH.with(Cell::get), 1);
+                assert!(crate::gc::registered_mutator_count() > 0);
+            }))
+        });
     willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
     assert_eq!(willow_sched_run(), 1);
     assert_eq!(SCHED_RUN_DEPTH.with(Cell::get), 0);
@@ -5198,7 +5426,7 @@ fn sched_drive_unwind_restores_state_and_can_drive_again() {
 
 #[test]
 fn sched_drive_nested_unwind_restores_poll_and_outer_task() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     reset_internal_for_test();
     let outer = SchedulerDriveGuard::new();
@@ -5212,17 +5440,19 @@ fn sched_drive_nested_unwind_restores_poll_and_outer_task() {
     // pause/resume pair per drive, independent of depth.
     for depth in [1, 2, 16, 256] {
         SCHED_RUN_DEPTH.with(|slot| slot.set(depth));
-        DRIVE_ENTRY_HOOK.with(|hook| {
-            hook.set(Some(|| {
-                CURRENT_RUN_STATE.with(|slot| {
-                    let state = slot.borrow();
-                    let state = state.as_ref().unwrap();
-                    assert_eq!(state.active_polls(), 0);
-                    assert_eq!(state.paused_polls(), 1);
-                });
-                unwind_at_drive_entry();
-            }))
-        });
+        crate::runtime::current()
+            .scheduler_hooks
+            .with_drive_hook(|hook| {
+                hook.set(Some(|| {
+                    CURRENT_RUN_STATE.with(|slot| {
+                        let state = slot.borrow();
+                        let state = state.as_ref().unwrap();
+                        assert_eq!(state.active_polls(), 0);
+                        assert_eq!(state.paused_polls(), 1);
+                    });
+                    unwind_at_drive_entry();
+                }))
+            });
         assert!(std::panic::catch_unwind(|| sched_run_with_mutator(None, None)).is_err());
         assert_eq!(SCHED_RUN_DEPTH.with(Cell::get), depth);
         assert_eq!(current_task_id(), Some(task));
@@ -5267,7 +5497,8 @@ fn sched_drive_nested_unwind_restores_poll_and_outer_task() {
 // 11. the test reset drops queued retired frames
 
 const FRAME_RECLAIM_LONG_DRIVE_TASKS: i64 = 2_000;
-static FRAME_RECLAIM_MAX_FRAME_ROOTS: TestAtomicU64 = TestAtomicU64::new(0);
+static FRAME_RECLAIM_MAX_FRAME_ROOTS: crate::runtime::PerRuntime<TestAtomicU64> =
+    crate::runtime::PerRuntime::new(|| TestAtomicU64::new(0));
 
 fn frame_reclaim_note_frame_roots() {
     FRAME_RECLAIM_MAX_FRAME_ROOTS.fetch_max(willow_sched_frame_root_count(), TestOrdering::SeqCst);
@@ -5301,7 +5532,7 @@ fn run_long_drive() -> u64 {
 
 #[test]
 fn frame_reclaim_01_long_single_worker_drive_keeps_one_release_batch() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     reset_stress_fixture();
     let peak = run_long_drive();
@@ -5318,7 +5549,7 @@ fn frame_reclaim_01_long_single_worker_drive_keeps_one_release_batch() {
 
 #[test]
 fn frame_reclaim_02_long_parallel_drive_stays_bounded() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_stress_fixture();
     let peak = run_long_drive();
     // Concurrent polls can each hold back what finishes during them, and the
@@ -5333,7 +5564,8 @@ fn frame_reclaim_02_long_parallel_drive_stays_bounded() {
     reset_stress_fixture();
 }
 
-static FRAME_RECLAIM_MAX_LIVE_BYTES: TestAtomicU64 = TestAtomicU64::new(0);
+static FRAME_RECLAIM_MAX_LIVE_BYTES: crate::runtime::PerRuntime<TestAtomicU64> =
+    crate::runtime::PerRuntime::new(|| TestAtomicU64::new(0));
 
 /// Like `poll_spawn_child_then_yield`, but collects every 100 children and
 /// records the live heap, so released frames must actually be freed.
@@ -5355,7 +5587,7 @@ unsafe extern "C" fn poll_spawn_child_collect_then_yield(frame: *mut c_void) -> 
 
 #[test]
 fn frame_reclaim_03_released_frames_are_collected_during_the_drive() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     reset_stress_fixture();
     FRAME_RECLAIM_MAX_LIVE_BYTES.store(0, TestOrdering::SeqCst);
@@ -5381,8 +5613,10 @@ fn frame_reclaim_03_released_frames_are_collected_during_the_drive() {
 }
 
 const FRAME_RECLAIM_NESTED_CHILDREN: u64 = 3 * FRAME_RELEASE_MIN_BATCH as u64;
-static FRAME_RECLAIM_NESTED_HELD: TestAtomicU64 = TestAtomicU64::new(0);
-static FRAME_RECLAIM_ROOTS_AFTER_OUTER: TestAtomicU64 = TestAtomicU64::new(u64::MAX);
+static FRAME_RECLAIM_NESTED_HELD: crate::runtime::PerRuntime<TestAtomicU64> =
+    crate::runtime::PerRuntime::new(|| TestAtomicU64::new(0));
+static FRAME_RECLAIM_ROOTS_AFTER_OUTER: crate::runtime::PerRuntime<TestAtomicU64> =
+    crate::runtime::PerRuntime::new(|| TestAtomicU64::new(u64::MAX));
 
 /// Starts many ready children, drives them to completion in a nested drive,
 /// and records how many frame roots are still held while this poll runs.
@@ -5414,7 +5648,7 @@ unsafe extern "C" fn poll_observe_after_outer(frame: *mut c_void) -> i32 {
 
 #[test]
 fn frame_reclaim_04_nested_drive_holds_frames_until_the_paused_poll_ends() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     reset_stress_fixture();
     FRAME_RECLAIM_NESTED_HELD.store(0, TestOrdering::SeqCst);
@@ -5450,7 +5684,7 @@ unsafe extern "C" fn poll_write_result(frame: *mut c_void) -> i32 {
 
 #[test]
 fn frame_reclaim_06_handle_keeps_released_frame_and_result_alive() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_stress_fixture();
     // The holder's slot 0 is a GC reference, like an awaiter's `Task` slot.
     let holder = willow_async_frame_alloc(1, 0b1) as *mut u8;
@@ -5487,7 +5721,8 @@ fn frame_reclaim_06_handle_keeps_released_frame_and_result_alive() {
     reset_stress_fixture();
 }
 
-static FRAME_RECLAIM_CANCEL_CLEANUPS: TestAtomicU64 = TestAtomicU64::new(0);
+static FRAME_RECLAIM_CANCEL_CLEANUPS: crate::runtime::PerRuntime<TestAtomicU64> =
+    crate::runtime::PerRuntime::new(|| TestAtomicU64::new(0));
 
 unsafe extern "C" fn frame_reclaim_count_cancel(_frame: *mut c_void) {
     FRAME_RECLAIM_CANCEL_CLEANUPS.fetch_add(1, TestOrdering::SeqCst);
@@ -5495,7 +5730,7 @@ unsafe extern "C" fn frame_reclaim_count_cancel(_frame: *mut c_void) {
 
 #[test]
 fn frame_reclaim_07_cancelled_frames_are_released_too() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _single = single_worker_for_test();
     reset_stress_fixture();
     FRAME_RECLAIM_CANCEL_CLEANUPS.store(0, TestOrdering::SeqCst);
@@ -5541,7 +5776,7 @@ fn frame_reclaim_retire(s: &mut RuntimeScheduler, count: usize) -> Vec<usize> {
 
 #[test]
 fn frame_reclaim_08_release_pops_only_the_prefix_below_the_bound() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_stress_fixture();
     let mut s = RuntimeScheduler::with_worker_count(1);
     let frames = frame_reclaim_retire(&mut s, 3);
@@ -5571,15 +5806,22 @@ fn frame_reclaim_08_release_pops_only_the_prefix_below_the_bound() {
 
 #[test]
 fn frame_reclaim_09_release_threshold_doubles_over_kept_frames() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_stress_fixture();
     let mut s = RuntimeScheduler::with_worker_count(1);
-    FRAME_RELEASE_DUE.store(false, Ordering::SeqCst);
+    s.retirements
+        .frame_release_due
+        .store(false, Ordering::SeqCst);
     frame_reclaim_retire(&mut s, FRAME_RELEASE_MIN_BATCH - 1);
-    assert!(!FRAME_RELEASE_DUE.load(Ordering::SeqCst), "below the batch");
+    assert!(
+        !s.retirements.frame_release_due.load(Ordering::SeqCst),
+        "below the batch"
+    );
     frame_reclaim_retire(&mut s, 1);
     assert!(
-        FRAME_RELEASE_DUE.swap(false, Ordering::SeqCst),
+        s.retirements
+            .frame_release_due
+            .swap(false, Ordering::SeqCst),
         "at the batch"
     );
     // A scan blocked by a unit keeps everything: the next scan waits for
@@ -5588,9 +5830,13 @@ fn frame_reclaim_09_release_threshold_doubles_over_kept_frames() {
     assert!(s.take_quiescent_frame_unroots(first_tag).is_empty());
     assert_eq!(s.retirements.scan_threshold(0), 2 * FRAME_RELEASE_MIN_BATCH);
     frame_reclaim_retire(&mut s, FRAME_RELEASE_MIN_BATCH - 1);
-    assert!(!FRAME_RELEASE_DUE.load(Ordering::SeqCst));
+    assert!(!s.retirements.frame_release_due.load(Ordering::SeqCst));
     frame_reclaim_retire(&mut s, 1);
-    assert!(FRAME_RELEASE_DUE.swap(false, Ordering::SeqCst));
+    assert!(
+        s.retirements
+            .frame_release_due
+            .swap(false, Ordering::SeqCst)
+    );
     assert_eq!(
         s.take_quiescent_frame_unroots(u64::MAX).len(),
         2 * FRAME_RELEASE_MIN_BATCH
@@ -5602,7 +5848,7 @@ fn frame_reclaim_09_release_threshold_doubles_over_kept_frames() {
 
 #[test]
 fn frame_reclaim_10_outermost_drive_end_releases_a_partial_batch() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_stress_fixture();
     for _ in 0..3 {
         willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0));
@@ -5614,7 +5860,7 @@ fn frame_reclaim_10_outermost_drive_end_releases_a_partial_batch() {
 
 #[test]
 fn frame_reclaim_11_reset_drops_queued_retired_frames() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_stress_fixture();
     let frame = willow_async_frame_alloc(0, 0);
     let id = willow_sched_spawn(poll_ready_now, frame);
@@ -5639,23 +5885,40 @@ fn static_mut_policy_uses_effective_worker_count() {
 
 // M2 lifetime cases: snapshots are taken after a joined drive or while the
 // enclosing unit pins the whole nested batch. No sleep/grace constants.
-struct M2Workers;
+struct M2Workers(usize);
 impl M2Workers {
     fn set(workers: usize) -> Self {
-        TEST_WORKER_OVERRIDE.store(workers, Ordering::Release);
-        Self
+        Self(crate::runtime::current().workers.replace_override(workers))
     }
 }
 impl Drop for M2Workers {
     fn drop(&mut self) {
-        TEST_WORKER_OVERRIDE.store(0, Ordering::Release);
+        crate::runtime::current().workers.replace_override(self.0);
     }
+}
+
+#[test]
+fn worker_override_guards_restore_nested_configuration() {
+    let _guard = isolated_runtime();
+    let initial = runtime_worker_config();
+    {
+        let _outer = M2Workers::set(4);
+        assert_eq!(runtime_worker_config().active_workers(), 4);
+        {
+            let _inner = M2Workers::set(8);
+            assert_eq!(runtime_worker_config().active_workers(), 8);
+            let _single = single_worker_for_test();
+            assert_eq!(runtime_worker_config().active_workers(), 1);
+        }
+        assert_eq!(runtime_worker_config().active_workers(), 4);
+    }
+    assert_eq!(runtime_worker_config(), initial);
 }
 
 #[test]
 fn striped_poll_counters_sum_across_threads_and_shard_wraparound() {
     use crate::frame_lifetime::PollLifetime;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     // More threads than stripes, so some stripes are shared.
     for (threads, polls) in [(1, 1), (8, 100), (70, 25)] {
         reset_stress_fixture();
@@ -5664,7 +5927,7 @@ fn striped_poll_counters_sum_across_threads_and_shard_wraparound() {
         std::thread::scope(|scope| {
             for thread in 0..threads {
                 let (held, release) = (&held, &release);
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     // Frame identity 0 means "no frame" and is not counted.
                     let frame = thread + 1;
                     let _outer = PollLifetime::enter(frame);
@@ -5673,7 +5936,7 @@ fn striped_poll_counters_sum_across_threads_and_shard_wraparound() {
                     }
                     held.wait();
                     release.wait();
-                });
+                }));
             }
             held.wait();
             // Assert only after releasing, so a failure cannot strand workers.
@@ -5714,7 +5977,7 @@ fn m2_wait_reclaimed(expected: u64) {
 
 #[test]
 fn m2_lifetime_worker_batch_frame_and_handle_matrix() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for workers in [1, 4, 8] {
         let _workers = M2Workers::set(workers);
         for batch in [1, 7, 63, 65, 257] {
@@ -5819,7 +6082,7 @@ unsafe extern "C" fn m2_nested_last_poll(_frame: *mut c_void) -> i32 {
 
 #[test]
 fn m2_inflight_last_poll_and_subthreshold_release_events() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for workers in [1, 4, 8] {
         let _workers = M2Workers::set(workers);
         reset_stress_fixture();
@@ -5855,8 +6118,10 @@ fn m2_inflight_last_poll_and_subthreshold_release_events() {
     reset_stress_fixture();
 }
 
-static M2_CANCELLED: TestAtomicU64 = TestAtomicU64::new(0);
-static M2_COMPLETED: TestAtomicU64 = TestAtomicU64::new(0);
+static M2_CANCELLED: crate::runtime::PerRuntime<TestAtomicU64> =
+    crate::runtime::PerRuntime::new(|| TestAtomicU64::new(0));
+static M2_COMPLETED: crate::runtime::PerRuntime<TestAtomicU64> =
+    crate::runtime::PerRuntime::new(|| TestAtomicU64::new(0));
 unsafe extern "C" fn m2_race_poll(frame: *mut c_void) -> i32 {
     let phase = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
     if *phase == 0 {
@@ -5877,7 +6142,7 @@ unsafe extern "C" fn m2_race_cancel(frame: *mut c_void) {
 }
 #[test]
 fn m2_detached_cancel_completion_allocation_race() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for workers in [1, 4, 8] {
         let _workers = M2Workers::set(workers);
         for count in [7, 65, 257] {
@@ -5894,7 +6159,7 @@ fn m2_detached_cancel_completion_allocation_race() {
             let start = Arc::new(Barrier::new(2));
             let requester = {
                 let start = Arc::clone(&start);
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     start.wait();
                     // Reverse and interleaved order, including repeated cancel.
                     for id in ids.into_iter().rev().step_by(2) {
@@ -5902,7 +6167,7 @@ fn m2_detached_cancel_completion_allocation_race() {
                         willow_sched_cancel(id);
                         std::thread::yield_now();
                     }
-                })
+                }))
             };
             start.wait();
             willow_sched_run();
@@ -5943,7 +6208,7 @@ unsafe extern "C" fn m2_subthreshold_driver(frame: *mut c_void) -> i32 {
 }
 #[test]
 fn m2_collect_advances_subthreshold_grace_mid_drive() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for workers in [1, 4, 8] {
         let _workers = M2Workers::set(workers);
         reset_stress_fixture();
@@ -5964,7 +6229,7 @@ unsafe extern "C" fn m2_park_repeatedly(frame: *mut c_void) -> i32 {
 }
 #[test]
 fn m2_running_parked_handoff_preserves_runtime_root() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for workers in [1, 4, 8] {
         let _workers = M2Workers::set(workers);
         for count in [1, 7, 65] {
@@ -5992,7 +6257,7 @@ fn m2_running_parked_handoff_preserves_runtime_root() {
 }
 #[test]
 fn m2_live_handle_after_scope_finish_survives_and_scope_releases_owners() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for workers in [1, 4, 8] {
         let _workers = M2Workers::set(workers);
         reset_stress_fixture();
@@ -6037,7 +6302,7 @@ fn m2_live_handle_after_scope_finish_survives_and_scope_releases_owners() {
 
 #[test]
 fn m2_event_history_bounded_and_lifetime_operation_counts_linear() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _workers = M2Workers::set(1);
     for count in [64, 256, 1024, 4096] {
         reset_stress_fixture();
@@ -6074,7 +6339,8 @@ fn m2_event_history_bounded_and_lifetime_operation_counts_linear() {
     reset_stress_fixture();
 }
 
-static M2_FRAME_DROPS: TestAtomicU64 = TestAtomicU64::new(0);
+static M2_FRAME_DROPS: crate::runtime::PerRuntime<TestAtomicU64> =
+    crate::runtime::PerRuntime::new(|| TestAtomicU64::new(0));
 unsafe fn m2_frame_drop(payload: *mut u8) {
     let count = unsafe { &mut *(payload.add(async_frame_slot_offset(1)) as *mut i64) };
     *count += 1;
@@ -6089,7 +6355,7 @@ unsafe fn m2_frame_drop(payload: *mut u8) {
 }
 #[test]
 fn m2_pending_drop_quarantine_reusable_and_at_most_once_drop() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for workers in [1, 4, 8] {
         let _workers = M2Workers::set(workers);
         reset_stress_fixture();
@@ -6126,7 +6392,7 @@ fn m2_pending_drop_quarantine_reusable_and_at_most_once_drop() {
 
 #[test]
 fn m2_scope_finalization_reports_owner_release_without_finish() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _workers = M2Workers::set(1);
     reset_stress_fixture();
     let mut scope = crate::cancellation::willow_task_scope_new();
@@ -6184,7 +6450,7 @@ fn stable_borrow_frame_address_survives_poll_resume_and_gc() {
             RUNTIME_POLL_READY
         }
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     reset_internal_for_test();
     POLLS.store(0, Ordering::SeqCst);
@@ -6212,4 +6478,82 @@ fn stable_borrow_frame_address_survives_poll_resume_and_gc() {
     assert_eq!(POLLS.load(Ordering::SeqCst), 16);
     reset_global_scheduler_for_test();
     reset_internal_for_test();
+}
+
+// ── Independent runtime instances ───────────────────────
+
+static INSTANCE_POLLS: crate::runtime::PerRuntime<TestAtomicUsize> =
+    crate::runtime::PerRuntime::new(|| TestAtomicUsize::new(0));
+
+/// Pending on the first poll after waking itself, so every task passes through
+/// the wake path and the run queue twice.
+unsafe extern "C" fn poll_counted_after_self_wake(frame: *mut c_void) -> i32 {
+    INSTANCE_POLLS.fetch_add(1, TestOrdering::SeqCst);
+    let state = frame.cast::<u64>();
+    unsafe {
+        if *state == 0 {
+            *state = 1;
+            willow_sched_wake(willow_sched_current_task());
+            return RUNTIME_POLL_PENDING;
+        }
+    }
+    RUNTIME_POLL_READY
+}
+
+/// Two runtime instances run their own task sets at the same time on separate
+/// threads: task ids, polls, completions and the table are per instance.
+#[test]
+fn concurrent_runtime_instances_schedule_independent_task_sets() {
+    let rendezvous = Barrier::new(2);
+    let drive = |tasks: usize| {
+        let _runtime = isolated_runtime();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        // Async frames: the scheduler reads the `[state, slot_count]` header.
+        let mut frames: Vec<*mut u8> = (0..tasks)
+            .map(|_| willow_async_frame_alloc(0, 0).cast())
+            .collect();
+        for frame in &mut frames {
+            crate::gc::willow_push_root(frame);
+        }
+        let ids: Vec<u64> = frames
+            .iter()
+            .map(|frame| willow_sched_spawn(poll_counted_after_self_wake, frame.cast()))
+            .collect();
+        let before = INSTANCE_POLLS.load(TestOrdering::SeqCst);
+        rendezvous.wait();
+        let completed = willow_sched_run();
+        rendezvous.wait();
+        let polls = INSTANCE_POLLS.load(TestOrdering::SeqCst) - before;
+        let remaining = willow_sched_queue_entry_count();
+        let states: Vec<u64> = frames
+            .iter()
+            .map(|frame| unsafe { frame.cast::<u64>().read() })
+            .collect();
+        crate::gc::willow_pop_roots(tasks as i32);
+        reset_global_scheduler_for_test();
+        reset_internal_for_test();
+        (
+            std::ptr::from_ref(crate::runtime::current()) as usize,
+            ids,
+            completed,
+            polls,
+            remaining,
+            states,
+        )
+    };
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| drive(3));
+        let second = scope.spawn(|| drive(40));
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_ne!(first.0, second.0);
+    for (tasks, side) in [(3usize, first), (40, second)] {
+        // Each instance numbers its own tasks from one.
+        assert_eq!(side.1, (1..=tasks as u64).collect::<Vec<_>>());
+        assert_eq!(side.2, tasks as i64, "tasks={tasks}");
+        assert_eq!(side.3, 2 * tasks, "tasks={tasks}");
+        assert_eq!(side.4, 0, "tasks={tasks}");
+        assert!(side.5.iter().all(|state| *state == 1));
+    }
 }

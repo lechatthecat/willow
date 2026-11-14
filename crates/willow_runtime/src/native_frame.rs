@@ -138,7 +138,7 @@ impl<S: NativeFrameSpec> NativeTaskFrame<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::{reset_internal_for_test, runtime_test_guard};
+    use crate::gc::{isolated_runtime, reset_internal_for_test};
 
     struct TestFrame;
 
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn typed_native_frame_initializes_layout_and_round_trips_slot_kinds() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let frame = NativeTaskFrame::<TestFrame>::allocate().expect("frame allocation");
         assert_eq!(
@@ -175,7 +175,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "accessed as Word")]
     fn typed_native_frame_rejects_slot_kind_confusion() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let frame = NativeTaskFrame::<TestFrame>::allocate().expect("frame allocation");
         frame.store_word(0, 1);

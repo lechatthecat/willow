@@ -82,13 +82,13 @@ fn gc_mark_queue_walkthrough() {
             let queue = Arc::clone(&queue);
             let traced = Arc::clone(&traced);
             let stop = Arc::clone(&stop);
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 let mut worker = queue
                     .register_worker()
                     .expect("the pool is sized to the slot count");
                 mark_loop(&mut worker, &traced, &stop);
                 println!("worker {id} finished");
-            });
+            }));
         }
 
         // A mutator that allocated too fast repays its debt by marking. It uses
@@ -97,11 +97,11 @@ fn gc_mark_queue_walkthrough() {
             let queue = Arc::clone(&queue);
             let traced = Arc::clone(&traced);
             let stop = Arc::clone(&stop);
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 let mut assist = queue.register_assist();
                 println!("assist joined (slot: {:?})", assist.slot());
                 mark_loop(&mut assist, &traced, &stop);
-            });
+            }));
         }
 
         // Stand-in for termination detection: force every

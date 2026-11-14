@@ -18,7 +18,10 @@ fn configured_capacity(value: Option<&str>) -> Option<usize> {
 }
 /// Preallocated event storage, excluding the bounded drained batch held by a sink.
 pub fn transport_capacity() -> usize {
-    let s = STATE.lock().unwrap_or_else(|p| p.into_inner());
+    let s = default_owner()
+        .state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     if s.discard { 0 } else { s.capacity }
 }
 pub const ENABLED: u64 = 1;
@@ -183,49 +186,63 @@ impl State {
 }
 // Initialized before the mutex is first taken, so opening the sink is not I/O
 // under the observation lock.
-static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
-    let history = super::observation_history();
-    let configured = *crate::diagnostic_settings::GC_TRACE_CAPACITY;
-    let capacity = configured.unwrap_or(CAPACITY);
-    Mutex::new(State {
-        stats: Stats {
-            flags: if enabled() {
-                ENABLED
-                    | if configured.is_none() {
-                        CONFIG_INVALID
+pub(crate) struct Observations {
+    state: LazyLock<Mutex<State>>,
+    progress: AtomicU64,
+    pub(super) epoch: AtomicU64,
+}
+impl Observations {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: LazyLock::new(|| {
+                let history = super::observation_history();
+                let configured = *crate::runtime::current().diagnostics.gc_trace_capacity;
+                let capacity = configured.unwrap_or(CAPACITY);
+                Mutex::new(State {
+                    stats: Stats {
+                        flags: if enabled() {
+                            ENABLED
+                                | if configured.is_none() {
+                                    CONFIG_INVALID
+                                } else {
+                                    0
+                                }
+                        } else {
+                            0
+                        },
+                        ..Default::default()
+                    },
+                    events: if history {
+                        VecDeque::with_capacity(capacity)
                     } else {
-                        0
-                    }
-            } else {
-                0
-            },
-            ..Default::default()
-        },
-        events: if history {
-            VecDeque::with_capacity(capacity)
-        } else {
-            VecDeque::new()
-        },
-        discard: !history,
-        capacity,
-    })
-});
-/// Safepoint polls are counted without the observation mutex.
-static PROGRESS: AtomicU64 = AtomicU64::new(0);
-static EPOCH: AtomicU64 = AtomicU64::new(0);
+                        VecDeque::new()
+                    },
+                    discard: !history,
+                    capacity,
+                })
+            }),
+            progress: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+        }
+    }
+}
+fn default_owner() -> &'static Observations {
+    &super::telemetry().observations
+}
 static THREAD: AtomicU64 = AtomicU64::new(1);
 thread_local! {
     static ROLE: Cell<u64> = const { Cell::new(0) };
     static ID: Cell<u64> = const { Cell::new(0) };
-    static REGISTERED: Cell<bool> = const { Cell::new(false) };
+    // Identity only, never dereferenced. Registration keeps its owner alive.
+    static REGISTERED: Cell<*const Observations> = const { Cell::new(std::ptr::null()) };
     static LOCAL_PROGRESS: Cell<u64> = const { Cell::new(0) };
-    static STOP_PHASE: Cell<Option<usize>> = const { Cell::new(None) };
+    static STOP_PHASE: Cell<Option<(*const Observations, usize)>> = const { Cell::new(None) };
     static PENDING_PROGRESS: Cell<u64> = const { Cell::new(0) };
 }
 pub fn enabled() -> bool {
-    *crate::diagnostic_settings::GC_OBSERVATIONS
+    crate::runtime::current().diagnostics.gc_observations()
 }
-fn thread() -> u64 {
+fn thread(owner: &Observations) -> u64 {
     ID.with(|id| {
         if id.get() == 0 {
             // Saturation is explicit; do not reuse a thread identity.
@@ -234,7 +251,12 @@ fn thread() -> u64 {
             match next {
                 Ok(n) => id.set(n),
                 Err(_) => {
-                    STATE.lock().unwrap_or_else(|p| p.into_inner()).stats.flags |= SATURATED;
+                    owner
+                        .state
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .stats
+                        .flags |= SATURATED;
                     id.set(u64::MAX);
                 }
             }
@@ -242,37 +264,54 @@ fn thread() -> u64 {
         id.get()
     })
 }
+impl Observations {
+    fn event(&self, event: u64, kind: u64) -> Event {
+        Event {
+            event,
+            kind,
+            timestamp_ns: timestamp_ns(),
+            epoch: self.epoch.load(Ordering::Relaxed),
+            thread: thread(self),
+            role: ROLE.get(),
+            progress: if std::ptr::eq(REGISTERED.get(), self) {
+                LOCAL_PROGRESS.get()
+            } else {
+                0
+            },
+            ..Default::default()
+        }
+    }
+    pub(crate) fn epoch(&self, epoch: u64) -> u64 {
+        self.epoch.swap(epoch, Ordering::Relaxed)
+    }
+}
 fn event(event: u64, kind: u64) -> Event {
-    Event {
-        event,
-        kind,
-        timestamp_ns: timestamp_ns(),
-        epoch: EPOCH.load(Ordering::Relaxed),
-        thread: thread(),
-        role: ROLE.get(),
-        progress: LOCAL_PROGRESS.get(),
-        ..Default::default()
-    }
+    default_owner().event(event, kind)
 }
-pub(crate) fn epoch(epoch: u64) -> u64 {
-    EPOCH.swap(epoch, Ordering::Relaxed)
-}
-fn checkpoint(s: &State) -> Stats {
-    let mut stats = s.stats;
-    stats.progress = PROGRESS.load(Ordering::Relaxed);
-    if stats.progress == u64::MAX {
-        stats.flags |= SATURATED;
+impl Observations {
+    fn checkpoint(&self, s: &State) -> Stats {
+        let mut stats = s.stats;
+        stats.progress = self.progress.load(Ordering::Relaxed);
+        if stats.progress == u64::MAX {
+            stats.flags |= SATURATED;
+        }
+        stats
     }
-    stats
+    pub fn snapshot(&self) -> Stats {
+        self.checkpoint(&self.state.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+    /// Drain and checkpoint atomically. A consumer must retain the previous sequence
+    /// and reject loss, gaps, active intervals at finalization and truncated output.
+    pub fn take_events(&self) -> (Vec<Event>, Stats) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        (s.events.drain(..).collect(), self.checkpoint(&s))
+    }
 }
 pub fn snapshot() -> Stats {
-    checkpoint(&STATE.lock().unwrap_or_else(|p| p.into_inner()))
+    default_owner().snapshot()
 }
-/// Drain and checkpoint atomically. A consumer must retain the previous sequence
-/// and reject loss, gaps, active intervals at finalization and truncated output.
 pub fn take_events() -> (Vec<Event>, Stats) {
-    let mut s = STATE.lock().unwrap_or_else(|p| p.into_inner());
-    (s.events.drain(..).collect(), checkpoint(&s))
+    default_owner().take_events()
 }
 /// Set before a marker thread registers; retain through its final unregister.
 /// Application threads doing Assist or elected collection keep role 0.
@@ -288,72 +327,117 @@ impl Drop for MarkerRole {
     }
 }
 pub(crate) fn register() {
-    if !enabled() || REGISTERED.replace(true) {
+    register_for_runtime(crate::runtime::current());
+}
+pub(crate) fn register_for_runtime(runtime: &crate::runtime::Runtime) {
+    if !runtime.diagnostics.gc_observations() || !REGISTERED.get().is_null() {
         return;
     }
-    let e = event(3, 0);
-    let mut s = STATE.lock().unwrap_or_else(|p| p.into_inner());
+    let owner = &runtime.telemetry.observations;
+    REGISTERED.set(owner);
+    let e = owner.event(3, 0);
+    let mut s = owner.state.lock().unwrap_or_else(|p| p.into_inner());
     let State { stats, .. } = &mut *s;
     add(&mut stats.registered, 1, &mut stats.flags);
     s.event(e);
 }
 pub(crate) fn unregister() {
-    if !enabled() || !REGISTERED.replace(false) {
+    unregister_for_runtime(crate::runtime::current());
+}
+pub(crate) fn unregister_for_runtime(runtime: &crate::runtime::Runtime) {
+    let owner = &runtime.telemetry.observations;
+    if !std::ptr::eq(REGISTERED.get(), owner) {
         return;
     }
-    flush_progress();
-    let e = event(4, 0);
-    let mut s = STATE.lock().unwrap_or_else(|p| p.into_inner());
+    flush_progress(owner);
+    let e = owner.event(4, 0);
+    REGISTERED.set(std::ptr::null());
+    let mut s = owner.state.lock().unwrap_or_else(|p| p.into_inner());
     let State { stats, .. } = &mut *s;
     add(&mut stats.unregistered, 1, &mut stats.flags);
     s.event(e);
 }
 pub(crate) fn progress() {
-    if !enabled() || !REGISTERED.get() {
+    progress_for_runtime(crate::runtime::current());
+}
+
+pub(crate) fn progress_for_runtime(runtime: &crate::runtime::Runtime) {
+    if runtime.diagnostics.gc_observations() {
+        progress_in(&runtime.telemetry.observations);
+    }
+}
+
+fn progress_in(owner: &Observations) {
+    if !std::ptr::eq(REGISTERED.get(), owner) {
         return;
     }
     LOCAL_PROGRESS.set(LOCAL_PROGRESS.get().saturating_add(1));
     let pending = PENDING_PROGRESS.get() + 1;
     PENDING_PROGRESS.set(pending);
     if pending == 256 {
-        flush_progress();
+        flush_progress(owner);
     }
 }
+
 fn accumulate_progress(counter: &AtomicU64, increment: u64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_add(increment))
     });
 }
-fn flush_progress() {
+fn flush_progress(owner: &Observations) {
+    if !std::ptr::eq(REGISTERED.get(), owner) {
+        return;
+    }
     let pending = PENDING_PROGRESS.replace(0);
     if pending != 0 {
-        accumulate_progress(&PROGRESS, pending);
+        accumulate_progress(&owner.progress, pending);
     }
 }
 
 pub(crate) fn work(kind: usize, work: Work) {
-    if !enabled() {
+    work_in(crate::runtime::current(), kind, work);
+}
+
+pub(crate) fn work_in(runtime: &crate::runtime::Runtime, kind: usize, work: Work) {
+    if !runtime.diagnostics.gc_observations() {
         return;
     }
-    let mut e = event(6, kind as u64);
+    let owner = &runtime.telemetry.observations;
+    let mut e = owner.event(6, kind as u64);
     e.work = work;
-    STATE.lock().unwrap_or_else(|p| p.into_inner()).work(e);
+    owner
+        .state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .work(e);
 }
 /// Collector-local attribution; worker threads never inherit another thread's
 /// stopped phase. Restoration is unwind-safe and supports nested scopes.
-pub(crate) struct StopPhase(Option<usize>);
-impl StopPhase {
-    pub(crate) fn new(reason: usize) -> Self {
-        Self(STOP_PHASE.replace(Some(reason)))
+pub(crate) struct StopPhase<'a> {
+    previous: Option<(*const Observations, usize)>,
+    _owner: &'a Observations,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl<'a> StopPhase<'a> {
+    pub(crate) fn new(owner: &'a Observations, reason: usize) -> Self {
+        Self {
+            previous: STOP_PHASE.replace(Some((owner, reason))),
+            _owner: owner,
+            _thread: std::marker::PhantomData,
+        }
     }
 }
-impl Drop for StopPhase {
+impl Drop for StopPhase<'_> {
     fn drop(&mut self) {
-        STOP_PHASE.set(self.0);
+        STOP_PHASE.set(self.previous);
     }
 }
 pub(crate) fn graph_work(mark: super::MarkWork) {
-    if !enabled() {
+    graph_work_in(crate::runtime::current(), mark);
+}
+
+pub(crate) fn graph_work_in(runtime: &crate::runtime::Runtime, mark: super::MarkWork) {
+    if !runtime.diagnostics.gc_observations() {
         return;
     }
     let w = Work {
@@ -363,42 +447,73 @@ pub(crate) fn graph_work(mark: super::MarkWork) {
         metadata_bytes: mark.descriptor_bytes,
         ..Default::default()
     };
-    if let Some(phase) = STOP_PHASE.get() {
-        work(phase, w);
+    if let Some((_, phase)) = STOP_PHASE
+        .get()
+        .filter(|(owner, _)| std::ptr::eq(*owner, &runtime.telemetry.observations))
+    {
+        work_in(runtime, phase, w);
     } else {
         // Completed concurrent batch event. V4 cumulative completed-cycle groups
         // remain unchanged; consumers can sum these separately from stopped work.
-        let mut e = event(7, 0);
+        let owner = &runtime.telemetry.observations;
+        let mut e = owner.event(7, 0);
         e.work = w;
-        STATE.lock().unwrap_or_else(|p| p.into_inner()).event(e);
+        owner
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .event(e);
     }
 }
 /// RAII interval endpoints survive Rust unwinding; no trace I/O on Drop.
-pub struct Span(Option<Event>);
-impl Span {
-    pub(crate) fn abort(&mut self) {
-        if let Some(event) = &mut self.0 {
-            event.aborted = 1;
-        }
-    }
+pub struct Span<'a>(Option<(Event, &'a Observations)>);
+impl Span<'static> {
     pub fn new(kind: Kind) -> Self {
         if !enabled() {
             return Self(None);
         }
-        flush_progress();
-        let mut e = event(1, kind as u64);
-        e.identity = STATE.lock().unwrap_or_else(|p| p.into_inner()).begin(e);
-        Self(Some(e))
+        Self::start_in(default_owner(), kind)
     }
 }
-impl Drop for Span {
+impl<'a> Span<'a> {
+    pub(crate) fn for_runtime(runtime: &'a crate::runtime::Runtime, kind: Kind) -> Self {
+        if !runtime.diagnostics.gc_observations() {
+            return Self(None);
+        }
+        Self::start_in(&runtime.telemetry.observations, kind)
+    }
+
+    pub(crate) fn abort(&mut self) {
+        if let Some((event, _)) = &mut self.0 {
+            event.aborted = 1;
+        }
+    }
+    pub(crate) fn new_in(owner: &'a Observations, kind: Kind) -> Self {
+        if !enabled() {
+            return Self(None);
+        }
+        Self::start_in(owner, kind)
+    }
+    fn start_in(owner: &'a Observations, kind: Kind) -> Self {
+        flush_progress(owner);
+        let mut e = owner.event(1, kind as u64);
+        e.identity = owner
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .begin(e);
+        Self(Some((e, owner)))
+    }
+}
+impl Drop for Span<'_> {
     fn drop(&mut self) {
-        if let Some(mut e) = self.0 {
+        if let Some((mut e, owner)) = self.0 {
             let start = e.timestamp_ns;
             e.event = 2;
             e.timestamp_ns = timestamp_ns();
             e.aborted |= u64::from(std::thread::panicking());
-            STATE
+            owner
+                .state
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .end(e, start);

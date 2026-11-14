@@ -1,7 +1,12 @@
 use super::*;
 
 fn regular_region(capacity: usize) -> OldRegion {
-    OldRegion::new(RegionKind::Old, capacity).expect("test region allocation must succeed")
+    OldRegion::new(
+        &RuntimeStorageAllocator::default(),
+        RegionKind::Old,
+        capacity,
+    )
+    .expect("test region allocation must succeed")
 }
 
 fn region_alloc(region: &mut OldRegion, payload_size: usize) -> HeapObject {
@@ -19,10 +24,6 @@ fn span_size(payload_size: usize) -> usize {
 
 fn reset_gc() {
     reset_internal();
-}
-
-fn global_gc_guard() -> std::sync::MutexGuard<'static, ()> {
-    runtime_test_guard()
 }
 
 fn state_with_regular_object(payload_size: usize) -> (GcState, HeapObject) {
@@ -121,7 +122,12 @@ fn old_region_01_regular_region_starts_empty() {
 
 #[test]
 fn old_region_02_large_region_starts_empty() {
-    let region = OldRegion::new(RegionKind::LargeObject, 256).unwrap();
+    let region = OldRegion::new(
+        &RuntimeStorageAllocator::default(),
+        RegionKind::LargeObject,
+        256,
+    )
+    .unwrap();
     assert_eq!(region.kind, RegionKind::LargeObject);
     assert_eq!(region.capacity, 256);
     assert_eq!(region.used, 0);
@@ -595,7 +601,7 @@ fn region_verify_12_requires_one_allocation_in_large_region() {
 
 #[test]
 fn region_metrics_01_empty_heap_reports_zeroes() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     assert_eq!(willow_gc_old_region_count(), 0);
     assert_eq!(willow_gc_old_region_reserved_bytes(), 0);
@@ -611,7 +617,7 @@ fn region_metrics_01_empty_heap_reports_zeroes() {
 
 #[test]
 fn region_metrics_02_regular_reserved_and_live_bytes_are_distinct() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let _object = willow_alloc_object(1, 8);
     assert_eq!(
@@ -627,7 +633,7 @@ fn region_metrics_02_regular_reserved_and_live_bytes_are_distinct() {
 
 #[test]
 fn region_metrics_03_odd_payload_reports_alignment_fragmentation() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let _object = willow_alloc_object(1, 1);
     assert_eq!(
@@ -639,7 +645,7 @@ fn region_metrics_03_odd_payload_reports_alignment_fragmentation() {
 
 #[test]
 fn region_metrics_04_empty_major_collection_is_counted() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_gc_collect();
     willow_gc_collect();
@@ -649,7 +655,7 @@ fn region_metrics_04_empty_major_collection_is_counted() {
 
 #[test]
 fn large_region_01_threshold_is_based_on_total_object_size() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let at_threshold = GC_LARGE_OBJECT_THRESHOLD - GC_HEADER_SIZE;
     let _regular = willow_alloc_object(1, at_threshold as i64);
@@ -661,7 +667,7 @@ fn large_region_01_threshold_is_based_on_total_object_size() {
 
 #[test]
 fn large_region_02_multiple_large_objects_get_dedicated_regions() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     for type_id in 1..=3 {
         let object = willow_alloc_object(type_id, GC_LARGE_OBJECT_THRESHOLD as i64);
@@ -674,7 +680,7 @@ fn large_region_02_multiple_large_objects_get_dedicated_regions() {
 
 #[test]
 fn large_region_03_reserved_bytes_include_regular_and_large_regions() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let _regular = willow_alloc_object(1, 8);
     let _large = willow_alloc_object(2, GC_LARGE_OBJECT_THRESHOLD as i64);
@@ -687,7 +693,7 @@ fn large_region_03_reserved_bytes_include_regular_and_large_regions() {
 
 #[test]
 fn major_region_01_releases_only_completely_dead_regions() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let count = GC_OLD_REGION_SIZE / (GC_HEADER_SIZE + 8) + 10;
     let mut objects = Vec::with_capacity(count);
@@ -713,7 +719,7 @@ fn major_region_01_releases_only_completely_dead_regions() {
 
 #[test]
 fn major_region_02_cross_region_cycle_survives_from_one_root() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut first = willow_alloc_typed(8, 0b1);
     let mut second = first;
@@ -738,7 +744,7 @@ fn major_region_02_cross_region_cycle_survives_from_one_root() {
 
 #[test]
 fn major_region_03_rootless_cross_region_cycle_is_reclaimed() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let first = willow_alloc_typed(8, 0b1);
     let mut second = first;
@@ -757,7 +763,7 @@ fn major_region_03_rootless_cross_region_cycle_is_reclaimed() {
 
 #[test]
 fn major_region_04_regular_object_keeps_large_child_alive() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let large = willow_alloc_object(2, GC_LARGE_OBJECT_THRESHOLD as i64);
     let mut parent = willow_alloc_typed(8, 0b1);
@@ -774,7 +780,7 @@ fn major_region_04_regular_object_keeps_large_child_alive() {
 
 #[test]
 fn major_region_05_large_object_keeps_regular_child_alive() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let child = willow_alloc_object(1, 8);
     let mut large = willow_alloc_typed(GC_LARGE_OBJECT_THRESHOLD as i64, 0b1);
@@ -794,7 +800,7 @@ fn major_region_05_large_object_keeps_regular_child_alive() {
 
 #[test]
 fn pinned_region_01_metrics_include_in_place_survivor() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
@@ -821,7 +827,7 @@ fn pinned_region_01_metrics_include_in_place_survivor() {
 
 #[test]
 fn pinned_region_02_major_collection_releases_unrooted_chunk() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
@@ -840,7 +846,7 @@ fn pinned_region_02_major_collection_releases_unrooted_chunk() {
 
 #[test]
 fn pinned_region_03_verifier_rejects_missing_mark() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
@@ -867,7 +873,7 @@ fn pinned_region_03_verifier_rejects_missing_mark() {
 
 #[test]
 fn pinned_region_04_verifier_rejects_live_byte_mismatch() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
@@ -894,7 +900,7 @@ fn pinned_region_04_verifier_rejects_live_byte_mismatch() {
 
 #[test]
 fn pinned_region_05_one_survivor_retains_chunk_and_reports_sparse_liveness() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
@@ -943,7 +949,7 @@ fn pinned_region_05_one_survivor_retains_chunk_and_reports_sparse_liveness() {
 
 #[test]
 fn pinned_region_06_dead_holes_are_not_reused_for_new_tlab_allocations() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
@@ -984,7 +990,7 @@ fn pinned_region_06_dead_holes_are_not_reused_for_new_tlab_allocations() {
 
 #[test]
 fn remembered_region_01_duplicate_barrier_hits_only_once() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
@@ -1012,7 +1018,7 @@ fn remembered_region_01_duplicate_barrier_hits_only_once() {
 
 #[test]
 fn remembered_region_02_two_owners_can_share_one_card() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let owners: Vec<*mut u8> = (0..16).map(|_| willow_alloc_typed(8, 0b1)).collect();
     let pair = owners
@@ -1040,7 +1046,7 @@ fn remembered_region_02_two_owners_can_share_one_card() {
 
 #[test]
 fn remembered_region_03_sweeping_one_shared_card_owner_keeps_card_dirty() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let owners: Vec<*mut u8> = (0..16).map(|_| willow_alloc_typed(8, 0b1)).collect();
     let pair = owners
@@ -1084,7 +1090,7 @@ fn remembered_region_03_sweeping_one_shared_card_owner_keeps_card_dirty() {
 
 #[test]
 fn remembered_region_04_global_destination_is_not_remembered() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
@@ -1106,7 +1112,7 @@ fn remembered_region_04_global_destination_is_not_remembered() {
 
 #[test]
 fn remembered_region_05_pinned_owner_tracks_new_young_child() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
@@ -1152,7 +1158,7 @@ fn old_region_index_allocation_attempts_scale_linearly() {
             state
                 .old_regions
                 .iter()
-                .map(|region| region.allocation_attempts)
+                .map(|region| region.observation.allocation_attempts)
                 .sum::<usize>(),
             n
         );
@@ -1174,7 +1180,7 @@ fn old_region_index_allocation_attempts_scale_linearly() {
             state
                 .old_regions
                 .iter()
-                .map(|region| region.allocation_attempts)
+                .map(|region| region.observation.allocation_attempts)
                 .sum::<usize>()
         );
     }
@@ -1205,7 +1211,7 @@ fn old_region_index_mixed_sizes_reuse_small_tails_at_memory_limit() {
         state
             .old_regions
             .iter()
-            .map(|region| region.allocation_attempts)
+            .map(|region| region.observation.allocation_attempts)
             .sum::<usize>(),
         16
     );
@@ -1214,7 +1220,7 @@ fn old_region_index_mixed_sizes_reuse_small_tails_at_memory_limit() {
 
 #[test]
 fn old_region_index_sweep_rebuilds_holes_and_compacted_indices() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let payload_size = GC_OLD_REGION_SIZE / 4 - GC_HEADER_SIZE;
     let mut objects = Vec::new();
@@ -1275,7 +1281,7 @@ fn old_region_index_large_objects_and_overflow_do_not_enter_index() {
 
 #[test]
 fn old_region_index_fragmented_regions_remain_candidates() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     for n in [32, 64, 128, 256] {
         reset_gc();
         {
@@ -1319,7 +1325,7 @@ fn old_region_index_fragmented_regions_remain_candidates() {
                 state
                     .old_regions
                     .iter()
-                    .map(|r| r.allocation_attempts)
+                    .map(|r| r.observation.allocation_attempts)
                     .sum::<usize>(),
                 6 * n
             );
@@ -1337,7 +1343,7 @@ fn old_region_index_fragmented_regions_remain_candidates() {
 
 #[test]
 fn barrier_region_index_survives_fragmented_region_compaction() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [16usize, 64, 256] {
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -1351,7 +1357,7 @@ fn barrier_region_index_survives_fragmented_region_compaction() {
         }
         for round in 0..2 {
             let state = runtime().heap.lock().unwrap();
-            address_index::take_comparisons();
+            take_address_comparisons(&state);
             for (index, &address) in addresses.iter().enumerate() {
                 let alive = round == 0 || index % 2 == 0;
                 assert_eq!(
@@ -1376,7 +1382,7 @@ fn barrier_region_index_survives_fragmented_region_compaction() {
                 None
             );
             assert_eq!(payload_generation(&state, usize::MAX as *mut u8), None);
-            let comparisons = address_index::take_comparisons();
+            let comparisons = take_address_comparisons(&state);
             assert!(comparisons < count * 36 * (count.ilog2() as usize + 1));
             println!("barrier-index regions={count} round={round} comparisons={comparisons}");
             drop(state);
@@ -1393,7 +1399,7 @@ fn barrier_region_index_survives_fragmented_region_compaction() {
 
 #[test]
 fn retired_tlab_header_index_bounds_lookup_work_and_rejects_dead_headers() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [16usize, 64, 256] {
         reset_internal_for_test();
         let mut tls = tlab_state_for_test();
@@ -1410,14 +1416,14 @@ fn retired_tlab_header_index_bounds_lookup_work_and_rejects_dead_headers() {
         let mut state = runtime().heap.lock().unwrap();
         assert_eq!(retire_all_tlabs_locked(&mut state), count);
         let chunk = &state.tlab_chunks[0];
-        RETIRED_LOOKUP_COMPARISONS.set(0);
+        chunk.lookup_comparisons.store(0, Ordering::Relaxed);
         for index in 0..count {
             let address = unsafe { base.add(index * size + GC_HEADER_SIZE) } as usize;
             assert!(object_in_retired_chunk(chunk, address, false).is_some());
             assert!(object_in_retired_chunk(chunk, address + 1, true).is_some());
             assert!(object_in_retired_chunk(chunk, address + 1, false).is_none());
         }
-        let comparisons = RETIRED_LOOKUP_COMPARISONS.get();
+        let comparisons = chunk.lookup_comparisons.load(Ordering::Relaxed);
         assert!(comparisons <= count * 3 * (count.ilog2() as usize + 2));
         println!(
             "retired-lookup headers={count} queries={} comparisons={comparisons}",
@@ -1436,7 +1442,7 @@ fn retired_tlab_header_index_bounds_lookup_work_and_rejects_dead_headers() {
 /// from its start bits, never from the index, and is indexed once later.
 #[test]
 fn unindexed_retired_tlab_lookups_use_start_bits() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1usize, 16, 256] {
         reset_internal_for_test();
         let mut tls = tlab_state_for_test();
@@ -1453,7 +1459,7 @@ fn unindexed_retired_tlab_lookups_use_start_bits() {
         retire_all_tlabs_unindexed(&mut state);
         let chunk = &state.tlab_chunks[0];
         assert!(chunk.needs_index());
-        RETIRED_LOOKUP_COMPARISONS.set(0);
+        chunk.lookup_comparisons.store(0, Ordering::Relaxed);
         for index in 0..count {
             let address = unsafe { base.add(index * size + GC_HEADER_SIZE) } as usize;
             let object = object_in_retired_chunk(chunk, address, false).unwrap();
@@ -1467,7 +1473,7 @@ fn unindexed_retired_tlab_lookups_use_start_bits() {
             assert!(object_in_retired_chunk(chunk, address + 1, false).is_none());
             assert!(object_in_retired_chunk(chunk, address - GC_HEADER_SIZE + 8, true).is_none());
         }
-        assert_eq!(RETIRED_LOOKUP_COMPARISONS.get(), 0);
+        assert_eq!(chunk.lookup_comparisons.load(Ordering::Relaxed), 0);
         assert!(tlab_payload_generation(&state, first as usize) == Some(GC_GENERATION_YOUNG));
         let dead = HeapObject::from_raw(base.cast()).unwrap();
         dead.reclaim_in_place();
@@ -1484,12 +1490,12 @@ fn unindexed_retired_tlab_lookups_use_start_bits() {
 
 #[test]
 fn barrier_without_nursery_needs_no_heap_lock_and_keeps_counters() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let value = willow_alloc(8) as usize;
     let state = runtime().heap.lock().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
+    let worker = std::thread::spawn(crate::runtime::serving(move || {
         for _ in 0..1024 {
             willow_gc_add_runtime_root(value as *mut u8);
             willow_gc_write_barrier(
@@ -1501,7 +1507,7 @@ fn barrier_without_nursery_needs_no_heap_lock_and_keeps_counters() {
             willow_gc_remove_runtime_root(value as *mut u8);
         }
         tx.send(()).unwrap();
-    });
+    }));
     let completed = rx.recv_timeout(std::time::Duration::from_secs(2));
     // Release before asserting/joining so a regression reports a failure,
     // rather than leaving the worker permanently blocked behind this test.
@@ -1543,7 +1549,7 @@ fn barrier_without_nursery_needs_no_heap_lock_and_keeps_counters() {
 
 #[test]
 fn barrier_young_test_skips_old_indexes_and_preserves_tlab_classification() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for regions in [4usize, 16, 64, 256] {
         reset_internal_for_test();
         let old: Vec<_> = {
@@ -1567,7 +1573,7 @@ fn barrier_young_test_skips_old_indexes_and_preserves_tlab_classification() {
                 .collect()
         };
         for repetitions in [1usize, 4] {
-            address_index::take_comparisons();
+            take_address_comparisons(&runtime().heap.lock().unwrap());
             {
                 let state = runtime().heap.lock().unwrap();
                 for _ in 0..repetitions {
@@ -1578,7 +1584,7 @@ fn barrier_young_test_skips_old_indexes_and_preserves_tlab_classification() {
                     }
                 }
             }
-            let previous_comparisons = address_index::take_comparisons();
+            let previous_comparisons = take_address_comparisons(&runtime().heap.lock().unwrap());
             assert!(previous_comparisons > 0);
             for _ in 0..repetitions {
                 for &value in &old {
@@ -1593,7 +1599,7 @@ fn barrier_young_test_skips_old_indexes_and_preserves_tlab_classification() {
                     }
                 }
             }
-            let comparisons = address_index::take_comparisons();
+            let comparisons = take_address_comparisons(&runtime().heap.lock().unwrap());
             assert_eq!(
                 comparisons, 0,
                 "old-only barriers must not search old indexes"
@@ -1607,7 +1613,7 @@ fn barrier_young_test_skips_old_indexes_and_preserves_tlab_classification() {
         let mut young = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
         willow_push_root(&mut young);
         assert!(runtime().tlab_ever_allocated.load(Ordering::Acquire));
-        address_index::take_comparisons();
+        take_address_comparisons(&runtime().heap.lock().unwrap());
         for &value in &old {
             willow_gc_write_barrier(
                 old[0],
@@ -1616,7 +1622,7 @@ fn barrier_young_test_skips_old_indexes_and_preserves_tlab_classification() {
                 GcStoreDestination::AsyncFrameSlot as i64,
             );
         }
-        let comparisons = address_index::take_comparisons();
+        let comparisons = take_address_comparisons(&runtime().heap.lock().unwrap());
         assert!(
             comparisons <= regions,
             "only the single TLAB index may be searched"
@@ -1663,7 +1669,7 @@ fn barrier_young_test_skips_old_indexes_and_preserves_tlab_classification() {
 
 #[test]
 fn old_region_lookup_bounds_work_for_hits_misses_nursery_and_pinned_pointers() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [16usize, 64, 256, 1024] {
         reset_internal_for_test();
         {
@@ -1693,7 +1699,7 @@ fn old_region_lookup_bounds_work_for_hits_misses_nursery_and_pinned_pointers() {
             );
             let mut single_pass_comparisons = 0;
             for repetitions in [1, 4] {
-                address_index::take_comparisons();
+                take_address_comparisons(&state);
                 for query in 0..count * repetitions {
                     let address = old[query % count] as usize;
                     assert_eq!(
@@ -1708,7 +1714,7 @@ fn old_region_lookup_bounds_work_for_hits_misses_nursery_and_pinned_pointers() {
                     assert!(find_old_region_object(&state, usize::MAX, true).is_none());
                 }
                 let queries = count * repetitions * 6;
-                let comparisons = address_index::take_comparisons();
+                let comparisons = take_address_comparisons(&state);
                 assert!(comparisons > 0, "lookup must exercise the address index");
                 assert!(comparisons <= queries * 12 * (count.ilog2() as usize + 1));
                 if repetitions == 1 {
@@ -1730,7 +1736,7 @@ fn old_region_lookup_bounds_work_for_hits_misses_nursery_and_pinned_pointers() {
 
 #[test]
 fn barrier_tlab_range_index_survives_minor_swap_removal() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [16usize, 64, 256] {
         reset_internal_for_test();
         let mut tls = tlab_state_for_test();
@@ -1774,7 +1780,7 @@ fn barrier_tlab_range_index_survives_minor_swap_removal() {
 
 #[test]
 fn zero_payload_at_region_end_remains_a_valid_exact_root() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     willow_alloc((GC_OLD_REGION_SIZE / 2 - GC_HEADER_SIZE) as i64);
     willow_alloc((GC_OLD_REGION_SIZE / 2 - 2 * GC_HEADER_SIZE) as i64);
@@ -1813,7 +1819,7 @@ fn pending_sweep_colors_reused_holes_before_publication() {
 #[test]
 #[cfg(debug_assertions)]
 fn active_tlab_validation_requires_publication_not_just_an_advanced_cursor() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let mut tls = tlab_state_for_test();
     let first = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
@@ -1829,11 +1835,11 @@ fn active_tlab_validation_requires_publication_not_just_an_advanced_cursor() {
     tls.cursor.store(header as usize + bytes, Ordering::Release);
     let address = payload as usize;
     assert!(
-        std::thread::spawn(move || validate_payload_pointer(
+        std::thread::spawn(crate::runtime::serving(move || validate_payload_pointer(
             address as *mut u8,
             "unpublished tail"
         )
-        .is_err())
+        .is_err()))
         .join()
         .unwrap()
     );
@@ -1841,9 +1847,11 @@ fn active_tlab_validation_requires_publication_not_just_an_advanced_cursor() {
     assert!(validate_payload_pointer(payload, "initialized but unpublished").is_err());
     publish_tlab_start_for_test(&tls, header);
     assert!(
-        std::thread::spawn(
-            move || validate_payload_pointer(address as *mut u8, "published tail").is_ok()
+        std::thread::spawn(crate::runtime::serving(move || validate_payload_pointer(
+            address as *mut u8,
+            "published tail"
         )
+        .is_ok()))
         .join()
         .unwrap()
     );
@@ -1858,7 +1866,7 @@ fn active_tlab_validation_requires_publication_not_just_an_advanced_cursor() {
 }
 
 fn dirty_released_storage(kind: RegionKind, capacity: usize) -> *mut u8 {
-    let mut region = OldRegion::new(kind, capacity).unwrap();
+    let mut region = OldRegion::new(&RuntimeStorageAllocator::default(), kind, capacity).unwrap();
     let base = region.take_storage();
     // SAFETY: the released storage is owned here.
     unsafe { std::ptr::write_bytes(base, 0xAB, capacity) };
@@ -1867,7 +1875,7 @@ fn dirty_released_storage(kind: RegionKind, capacity: usize) -> *mut u8 {
 
 #[test]
 fn region_cache_02_limit_evicts_retained_storage_instead_of_refusing() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut state = GcState {
         memory_limit_bytes: Some(4 * GC_OLD_REGION_SIZE),
@@ -1900,7 +1908,7 @@ fn region_cache_02_limit_evicts_retained_storage_instead_of_refusing() {
 
 #[test]
 fn region_cache_03_reservation_reuses_or_frees_the_retained_block() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut state = GcState::default();
     let base = dirty_released_storage(RegionKind::Old, GC_OLD_REGION_SIZE);
@@ -1971,7 +1979,7 @@ fn assert_released_storage_retained_and_reused((reserved, retained_before): (usi
 
 #[test]
 fn region_cache_04_stopped_sweep_retains_released_storage() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let before = allocate_dead_regions();
     // Nothing is marked: the stopped sweep's `finish` releases every region.
@@ -1981,7 +1989,7 @@ fn region_cache_04_stopped_sweep_retains_released_storage() {
 
 #[test]
 fn region_cache_05_concurrent_sweep_retains_released_storage() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let before = allocate_dead_regions();
     let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
@@ -1993,9 +2001,13 @@ fn region_cache_05_concurrent_sweep_retains_released_storage() {
 
 #[test]
 fn region_cache_06_explicit_collection_retains_released_storage() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let before = allocate_dead_regions();
     willow_gc_collect();
     assert_released_storage_retained_and_reused(before);
+}
+
+fn take_address_comparisons(state: &GcState) -> usize {
+    state.old_addresses.take_comparisons() + state.tlab_addresses.take_comparisons()
 }

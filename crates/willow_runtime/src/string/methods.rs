@@ -22,8 +22,7 @@ fn fail(message: &str) -> *mut u8 {
 // Instrument the actual copy operations, rather than expected output lengths.
 #[inline]
 unsafe fn copy_bytes(source: *const u8, destination: *mut u8, len: usize) {
-    #[cfg(test)]
-    COPIED_BYTES.with(|bytes| bytes.set(bytes.get() + len));
+    crate::observation::record(crate::observation::Event::CopiedBytes, len);
     unsafe { std::ptr::copy_nonoverlapping(source, destination, len) };
 }
 
@@ -97,15 +96,13 @@ pub extern "C" fn willow_string_byte_at(value: *const u8, index: i64) -> i64 {
         ));
         return 0;
     }
-    #[cfg(test)]
-    BYTE_READS.with(|reads| reads.set(reads.get() + 1));
+    crate::observation::record(crate::observation::Event::ByteReads, 1);
     unsafe { i64::from(*bytes.add(index as usize)) }
 }
 
 #[cfg(test)]
-thread_local! {
-    static BYTE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+const BYTE_READS: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::ByteReads);
 
 /// First byte offset, or -1 when absent. Empty needles match at zero.
 #[unsafe(no_mangle)]
@@ -359,8 +356,7 @@ pub extern "C" fn willow_array_join(array: *mut u8, separator: *mut u8) -> *mut 
 }
 
 fn join_element(array: *mut u8, index: i64) -> *mut u8 {
-    #[cfg(test)]
-    JOIN_VISITS.set(JOIN_VISITS.get() + 1);
+    crate::observation::record(crate::observation::Event::JoinVisits, 1);
     crate::array::willow_array_get(array, index) as *mut u8
 }
 
@@ -404,10 +400,11 @@ pub extern "C" fn willow_string_split(value: *mut u8, separator: *const u8) -> *
 }
 
 #[cfg(test)]
-thread_local! {
-    static JOIN_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static COPIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+const JOIN_VISITS: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::JoinVisits);
+#[cfg(test)]
+const COPIED_BYTES: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::CopiedBytes);
 
 #[cfg(test)]
 mod tests {
@@ -417,7 +414,7 @@ mod tests {
 
     #[test]
     fn string_transforms_copy_counts_and_aliases() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         for count in [1, 8, 64, 512, 4096] {
             let input = "aé\0".repeat(count);
@@ -473,7 +470,7 @@ mod tests {
 
     #[test]
     fn string_bytes_measured_constant_access_and_linear_iteration() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         for count in [1, 8, 64, 512, 4096] {
             let input = "é\0🌲".repeat(count);
@@ -495,7 +492,7 @@ mod tests {
 
     #[test]
     fn array_join_measured_linear_work() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         for word in ["", "é\0日", "a moderately long field"] {
             for count in [0, 1, 8, 64, 512, 4096, 20000] {
@@ -526,7 +523,7 @@ mod tests {
 
     #[test]
     fn string_methods_copy_work_scales_with_output() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         for count in [1, 8, 64, 512] {
             let mut source = willow_string_from_str(&"日,".repeat(count));
@@ -564,7 +561,7 @@ mod tests {
 
     #[test]
     fn string_methods_embedded_nul_and_null_runtime_inputs() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         let mut source = willow_string_from_str("a\0日本\0b");
         willow_push_root(&mut source);

@@ -2,7 +2,8 @@
 use super::*;
 
 const OWNER_TYPE: u32 = 98762;
-static LIVE: AtomicUsize = AtomicUsize::new(0);
+static LIVE: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
 unsafe fn drop_owner(payload: *mut u8) {
     unsafe { drop(Box::from_raw(*payload.cast::<*mut usize>())) };
@@ -17,7 +18,7 @@ fn initialize_owner(payload: *mut u8) {
 
 #[test]
 fn reset_finalizes_native_owners_in_every_storage_kind() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     for kind in ["old", "large", "young", "survivor", "tenured", "fragmented"] {
         for count in [1usize, 8, 32] {
@@ -115,7 +116,7 @@ fn native_drop_panics_terminate_reset_and_collection() {
 
 #[test]
 fn reset_recovers_runtime_locks_poisoned_by_a_failed_test() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     // A test that panics while asserting under these locks poisons them.
     let poison = || {

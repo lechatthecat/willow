@@ -5,7 +5,6 @@
 //! timer, netpoll, and channel locks. A hook must still be fast and must not
 //! panic across the C ABI.
 
-use crate::diagnostic_settings::{SCHED_TRACE, TASK_TRACE};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
@@ -206,32 +205,56 @@ struct HookState {
 }
 
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-static HOOK_ENABLED: AtomicBool = AtomicBool::new(false);
-static HOOK_STATE: LazyLock<Mutex<HookState>> = LazyLock::new(|| Mutex::new(HookState::default()));
 
 // Fixed thread shards keep always-on poll/park metrics off a shared hot line.
 const EVENT_SHARDS: usize = 64;
 const EVENT_KINDS: usize = RuntimeEventKind::BlockingQueueFull as usize;
 #[repr(align(128))]
 struct EventCounters([AtomicU64; EVENT_KINDS]);
-static EVENT_COUNTERS: [EventCounters; EVENT_SHARDS] =
-    [const { EventCounters([const { AtomicU64::new(0) }; EVENT_KINDS]) }; EVENT_SHARDS];
+
+/// One runtime's event metrics and native hook registration. Each runtime
+/// reports its own counters and drives only its own registered sink.
+pub(crate) struct RuntimeEvents {
+    counters: [EventCounters; EVENT_SHARDS],
+    hook_enabled: AtomicBool,
+    hook_state: Mutex<HookState>,
+}
+
+impl RuntimeEvents {
+    pub(crate) const fn new() -> Self {
+        Self {
+            counters: [const { EventCounters([const { AtomicU64::new(0) }; EVENT_KINDS]) };
+                EVENT_SHARDS],
+            hook_enabled: AtomicBool::new(false),
+            hook_state: Mutex::new(HookState { registration: None }),
+        }
+    }
+
+    fn counter(&self, kind: RuntimeEventKind) -> &AtomicU64 {
+        &self.counters[EVENT_SHARD.with(|index| *index)].0[kind as usize - 1]
+    }
+
+    fn counter_total(&self, kind: RuntimeEventKind) -> u64 {
+        self.counters.iter().fold(0u64, |sum, counters| {
+            sum.wrapping_add(counters.0[kind as usize - 1].load(Ordering::Relaxed))
+        })
+    }
+
+    fn hook_state(&self) -> std::sync::MutexGuard<'_, HookState> {
+        self.hook_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+// Shard assignment is a per-thread spreading index, not runtime state.
 static NEXT_EVENT_SHARD: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     static EVENT_SHARD: usize = NEXT_EVENT_SHARD.fetch_add(1, Ordering::Relaxed) % EVENT_SHARDS;
 }
 #[cfg(test)]
-static BUILT_EVENTS: AtomicU64 = AtomicU64::new(0);
-
-fn counter(kind: RuntimeEventKind) -> &'static AtomicU64 {
-    &EVENT_COUNTERS[EVENT_SHARD.with(|index| *index)].0[kind as usize - 1]
-}
-
-fn counter_total(kind: RuntimeEventKind) -> u64 {
-    EVENT_COUNTERS.iter().fold(0u64, |sum, counters| {
-        sum.wrapping_add(counters.0[kind as usize - 1].load(Ordering::Relaxed))
-    })
-}
+const BUILT_EVENTS: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::BuiltEvents);
 
 pub(crate) fn record(kind: RuntimeEventKind, worker: Option<usize>, task_id: u64, value: i64) {
     let increment = if matches!(
@@ -242,19 +265,19 @@ pub(crate) fn record(kind: RuntimeEventKind, worker: Option<usize>, task_id: u64
     } else {
         1
     };
-    counter(kind).fetch_add(increment, Ordering::Relaxed);
+    let owner = crate::runtime::current();
+    owner
+        .events
+        .counter(kind)
+        .fetch_add(increment, Ordering::Relaxed);
 
-    let sched_trace = *SCHED_TRACE;
-    let task_trace = *TASK_TRACE && kind.is_task_event();
-    let registration = if HOOK_ENABLED.load(Ordering::Acquire) {
-        let registration = HOOK_STATE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .registration
-            .clone();
+    let sched_trace = *owner.diagnostics.sched_trace;
+    let task_trace = *owner.diagnostics.task_trace && kind.is_task_event();
+    let registration = if owner.events.hook_enabled.load(Ordering::Acquire) {
+        let registration = owner.events.hook_state().registration.clone();
         if let Some(registration) = &registration {
             // Increment while the registration is still protected by
-            // HOOK_STATE. A concurrent clear removes it under the same lock and
+            // the hook state. A concurrent clear removes it under the same lock and
             // then waits for this lease to reach zero.
             registration.active_callbacks.fetch_add(1, Ordering::AcqRel);
         }
@@ -269,8 +292,7 @@ pub(crate) fn record(kind: RuntimeEventKind, worker: Option<usize>, task_id: u64
         return;
     }
 
-    #[cfg(test)]
-    BUILT_EVENTS.fetch_add(1, Ordering::Relaxed);
+    crate::observation::record(crate::observation::Event::BuiltEvents, 1);
 
     let event = WillowRuntimeEventV1 {
         version: RUNTIME_EVENT_VERSION,
@@ -317,7 +339,8 @@ pub(crate) fn record(kind: RuntimeEventKind, worker: Option<usize>, task_id: u64
     }
 }
 
-/// Register or clear a process-global native profiling callback.
+/// Register or clear the serving runtime's native profiling callback (the
+/// process-default runtime for generated programs).
 ///
 /// Passing `None` clears the callback. The caller owns `context` and must keep
 /// it alive until the hook is cleared. Clearing/replacing the hook waits for
@@ -329,10 +352,9 @@ pub extern "C" fn willow_runtime_set_event_hook_v1(
     hook: Option<RuntimeEventHookV1>,
     context: *mut c_void,
 ) {
-    HOOK_ENABLED.store(false, Ordering::Release);
-    let mut state = HOOK_STATE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let events = &crate::runtime::current().events;
+    events.hook_enabled.store(false, Ordering::Release);
+    let mut state = events.hook_state();
     let previous = state.registration.take();
     if let Some(previous) = previous {
         let mut wait = previous
@@ -354,7 +376,7 @@ pub extern "C" fn willow_runtime_set_event_hook_v1(
             wait_lock: Mutex::new(()),
             quiescent: Condvar::new(),
         }));
-        HOOK_ENABLED.store(true, Ordering::Release);
+        events.hook_enabled.store(true, Ordering::Release);
     }
 }
 
@@ -366,25 +388,26 @@ pub extern "C" fn willow_runtime_metrics_snapshot_v1(out: *mut WillowRuntimeMetr
     let Some(out) = (unsafe { out.as_mut() }) else {
         return -1;
     };
+    let events = &crate::runtime::current().events;
     *out = WillowRuntimeMetricsV1 {
         version: RUNTIME_METRICS_VERSION,
         struct_size: std::mem::size_of::<WillowRuntimeMetricsV1>() as u32,
-        task_spawns: counter_total(RuntimeEventKind::TaskSpawn),
-        task_wakes: counter_total(RuntimeEventKind::TaskWake),
-        task_polls: counter_total(RuntimeEventKind::TaskPoll),
-        task_parks: counter_total(RuntimeEventKind::TaskPark),
-        task_yields: counter_total(RuntimeEventKind::TaskYield),
-        task_preempts: counter_total(RuntimeEventKind::TaskPreempt),
-        task_completions: counter_total(RuntimeEventKind::TaskComplete),
-        task_cancel_requests: counter_total(RuntimeEventKind::TaskCancelRequested),
-        task_cancellations: counter_total(RuntimeEventKind::TaskCancelled),
-        task_panics: counter_total(RuntimeEventKind::TaskPanicked),
-        timer_wakes: counter_total(RuntimeEventKind::TimerWake),
-        netpoll_waits: counter_total(RuntimeEventKind::NetpollWait),
-        netpoll_wakes: counter_total(RuntimeEventKind::NetpollWake),
-        channel_waits: counter_total(RuntimeEventKind::ChannelWait),
-        blocking_detaches: counter_total(RuntimeEventKind::BlockingDetach),
-        blocking_queue_full: counter_total(RuntimeEventKind::BlockingQueueFull),
+        task_spawns: events.counter_total(RuntimeEventKind::TaskSpawn),
+        task_wakes: events.counter_total(RuntimeEventKind::TaskWake),
+        task_polls: events.counter_total(RuntimeEventKind::TaskPoll),
+        task_parks: events.counter_total(RuntimeEventKind::TaskPark),
+        task_yields: events.counter_total(RuntimeEventKind::TaskYield),
+        task_preempts: events.counter_total(RuntimeEventKind::TaskPreempt),
+        task_completions: events.counter_total(RuntimeEventKind::TaskComplete),
+        task_cancel_requests: events.counter_total(RuntimeEventKind::TaskCancelRequested),
+        task_cancellations: events.counter_total(RuntimeEventKind::TaskCancelled),
+        task_panics: events.counter_total(RuntimeEventKind::TaskPanicked),
+        timer_wakes: events.counter_total(RuntimeEventKind::TimerWake),
+        netpoll_waits: events.counter_total(RuntimeEventKind::NetpollWait),
+        netpoll_wakes: events.counter_total(RuntimeEventKind::NetpollWake),
+        channel_waits: events.counter_total(RuntimeEventKind::ChannelWait),
+        blocking_detaches: events.counter_total(RuntimeEventKind::BlockingDetach),
+        blocking_queue_full: events.counter_total(RuntimeEventKind::BlockingQueueFull),
     };
     0
 }
@@ -394,7 +417,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static HOOK_TASK: AtomicU64 = AtomicU64::new(0);
+    static HOOK_TASK: crate::runtime::PerRuntime<AtomicU64> =
+        crate::runtime::PerRuntime::new(|| AtomicU64::new(0));
 
     struct BlockingHookContext {
         entered: AtomicBool,
@@ -433,7 +457,7 @@ mod tests {
 
     #[test]
     fn observability_02_record_updates_counter_and_hook() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let mut before = WillowRuntimeMetricsV1::default();
         willow_runtime_metrics_snapshot_v1(&mut before);
         let calls = AtomicU64::new(0);
@@ -453,7 +477,7 @@ mod tests {
 
     #[test]
     fn observability_03_count_events_add_the_reported_batch() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let mut before = WillowRuntimeMetricsV1::default();
         willow_runtime_metrics_snapshot_v1(&mut before);
         record(RuntimeEventKind::TimerWake, None, 0, 5);
@@ -466,7 +490,7 @@ mod tests {
 
     #[test]
     fn observability_04_clearing_hook_waits_for_active_context_user() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let context = BlockingHookContext {
             entered: AtomicBool::new(false),
             release: AtomicBool::new(false),
@@ -477,14 +501,16 @@ mod tests {
             (&context as *const BlockingHookContext).cast_mut().cast(),
         );
         std::thread::scope(|scope| {
-            scope.spawn(|| record(RuntimeEventKind::TaskPoll, Some(0), 91, 0));
+            scope.spawn(crate::runtime::serving(|| {
+                record(RuntimeEventKind::TaskPoll, Some(0), 91, 0)
+            }));
             while !context.entered.load(Ordering::Acquire) {
                 std::thread::yield_now();
             }
-            scope.spawn(|| {
+            scope.spawn(crate::runtime::serving(|| {
                 willow_runtime_set_event_hook_v1(None, std::ptr::null_mut());
                 cleared.store(true, Ordering::Release);
-            });
+            }));
             std::thread::sleep(std::time::Duration::from_millis(5));
             assert!(!cleared.load(Ordering::Acquire));
             context.release.store(true, Ordering::Release);
@@ -494,9 +520,11 @@ mod tests {
 
     #[test]
     fn observability_05_no_sink_updates_metrics_without_building_an_event() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         willow_runtime_set_event_hook_v1(None, std::ptr::null_mut());
-        if *SCHED_TRACE || *TASK_TRACE {
+        if *crate::runtime::current().diagnostics.sched_trace
+            || *crate::runtime::current().diagnostics.task_trace
+        {
             return;
         }
         let before = BUILT_EVENTS.load(Ordering::Relaxed);
@@ -505,7 +533,7 @@ mod tests {
     }
     #[test]
     fn observability_shards_preserve_all_event_totals_after_thread_exit_and_collision() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         let kinds = [
             RuntimeEventKind::TaskSpawn,
             RuntimeEventKind::TaskWake,
@@ -524,21 +552,21 @@ mod tests {
             RuntimeEventKind::BlockingDetach,
             RuntimeEventKind::BlockingQueueFull,
         ];
-        let before = kinds.map(counter_total);
+        let before = kinds.map(|kind| crate::runtime::current().events.counter_total(kind));
         std::thread::scope(|scope| {
             for _ in 0..(EVENT_SHARDS + 8) {
-                scope.spawn(|| {
+                scope.spawn(crate::runtime::serving(|| {
                     for _ in 0..100 {
                         for kind in kinds {
                             record(kind, None, 0, 1);
                         }
                     }
-                });
+                }));
             }
         });
         for (index, kind) in kinds.into_iter().enumerate() {
             assert_eq!(
-                counter_total(kind) - before[index],
+                crate::runtime::current().events.counter_total(kind) - before[index],
                 (EVENT_SHARDS as u64 + 8) * 100
             );
         }

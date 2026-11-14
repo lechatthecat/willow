@@ -1,6 +1,7 @@
 //! The oracle consumes generated adjacency, never collector layout/tracing code.
 use super::*;
-static CALLBACK_TRACES: AtomicU64 = AtomicU64::new(0);
+static CALLBACK_TRACES: crate::runtime::PerRuntime<AtomicU64> =
+    crate::runtime::PerRuntime::new(|| AtomicU64::new(0));
 unsafe fn reference_callback(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     CALLBACK_TRACES.fetch_add(1, Ordering::Relaxed);
     slots.push(payload.cast());
@@ -28,7 +29,7 @@ unsafe fn reference_slice(
 
 #[test]
 fn m0_all_destination_barriers_publish_deletions_in_open_and_sealed_marking() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _stress = GcStressTestScope::with_modes("all");
     let destinations = [
         GcStoreDestination::ObjectField,
@@ -71,7 +72,9 @@ fn m0_all_destination_barriers_publish_deletions_in_open_and_sealed_marking() {
             };
             let before = barrier_variant_counts().0;
             super::concurrent_tests::assert_satb_mutation_retains(old, || {
-                GC_MARK_PHASE.store(phase, Ordering::Release);
+                crate::runtime::current()
+                    .mark_phase()
+                    .store(phase, Ordering::Release);
                 willow_gc_write_barrier(
                     owner_or_slot,
                     old,
@@ -97,7 +100,7 @@ fn m0_all_destination_barriers_publish_deletions_in_open_and_sealed_marking() {
 
 #[test]
 fn m0_measurement_pending_reclaimed_reusable_and_phase_samples_are_distinct() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _normal = GcStressTestScope::normal();
     reset_internal_for_test();
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -112,13 +115,15 @@ fn m0_measurement_pending_reclaimed_reusable_and_phase_samples_are_distinct() {
     struct RestoreHook;
     impl Drop for RestoreHook {
         fn drop(&mut self) {
-            *sweep::SWEEP_TEST_HOOK
+            *runtime()
+                .sweep_observation
+                .hook
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = None;
         }
     }
     let _restore = RestoreHook;
-    *sweep::SWEEP_TEST_HOOK.lock().unwrap() = Some(|index| {
+    *runtime().sweep_observation.hook.lock().unwrap() = Some(|index| {
         let (m, _) = telemetry_memory_snapshot();
         assert_eq!(m.reusable_bytes, 0, "{m:?}");
         assert!(m.quarantined_bytes > 0, "{m:?}");
@@ -131,7 +136,7 @@ fn m0_measurement_pending_reclaimed_reusable_and_phase_samples_are_distinct() {
         );
     });
     willow_gc_collect();
-    *sweep::SWEEP_TEST_HOOK.lock().unwrap() = None;
+    *runtime().sweep_observation.hook.lock().unwrap() = None;
     let (memory, _) = telemetry_memory_snapshot();
     assert_eq!(memory.pending_sweep_bytes, 0);
     assert!(memory.quarantined_bytes > 0, "{memory:?}");
@@ -176,18 +181,20 @@ fn m0_measurement_pending_reclaimed_reusable_and_phase_samples_are_distinct() {
 
 #[test]
 fn m0_milestones_are_distinct_during_real_sweep_and_election_skip() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     struct RestoreHook;
     impl Drop for RestoreHook {
         fn drop(&mut self) {
-            *sweep::SWEEP_TEST_HOOK
+            *runtime()
+                .sweep_observation
+                .hook
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = None;
         }
     }
     let _restore = RestoreHook;
-    *sweep::SWEEP_TEST_HOOK.lock().unwrap() = Some(|_| {
+    *runtime().sweep_observation.hook.lock().unwrap() = Some(|_| {
         use crate::gc_telemetry::milestones::*;
         let record = snapshot();
         assert_eq!(record.stage, GcStage::MarkComplete as u32);
@@ -235,7 +242,7 @@ fn reachable(edges: &[Vec<usize>], roots: &[usize]) -> (Vec<bool>, usize) {
 
 #[test]
 fn m0_differential_reference_tracer_randomized_heaps() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _stress = GcStressTestScope::with_modes("all");
     const SEED: u64 = 0x6f_07_01;
     static BITMAP: [u64; 3] = [2, 2, 2];

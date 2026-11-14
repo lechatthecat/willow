@@ -20,7 +20,7 @@ fn drain_jobs() -> usize {
 
 #[test]
 fn deferred_terminal_compensation_bounds_receive_independent_of_messages_and_waiters() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for messages in [1_000, 10_000, 100_000, 1_000_000] {
         for waiters in [33, 1_024, 4_096] {
             reset();
@@ -85,7 +85,7 @@ fn deferred_terminal_compensation_bounds_receive_independent_of_messages_and_wai
 
 #[test]
 fn deferred_closed_final_receive_bounds_fanout_independent_of_messages_and_waiters() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for messages in [1_000, 10_000, 100_000, 1_000_000] {
         for waiters in [33, 1_024, 4_096] {
             reset();
@@ -150,7 +150,7 @@ fn deferred_closed_final_receive_bounds_fanout_independent_of_messages_and_waite
 
 #[test]
 fn deferred_job_roots_channel_and_value_after_initiator_cancellation() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     reset();
     let raw = willow_channel_new(1);
     let root = crate::gc::GcRootHandle::new(raw.cast());
@@ -206,7 +206,7 @@ fn deferred_job_roots_channel_and_value_after_initiator_cancellation() {
 
 #[test]
 fn deferred_cleanup_scales_with_cases_and_restarts_after_quiescence() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for cases in [1, 4, 16] {
         for waiters in [33, 1_024] {
             reset();
@@ -287,7 +287,7 @@ fn deferred_cleanup_scales_with_cases_and_restarts_after_quiescence() {
 
 #[test]
 fn deferred_fragmented_fifo_has_bounded_physical_unlink_and_receive_work() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for messages in [1_000, 10_000, 100_000, 1_000_000] {
         for waiters in [33usize, 1_024, 4_096] {
             reset();
@@ -301,21 +301,21 @@ fn deferred_fragmented_fifo_has_bounded_physical_unlink_and_receive_work() {
                 // The old FIFO retained this entire removed prefix just below
                 // its compaction threshold, hiding W visits in the first pop.
                 for id in 0..waiters {
-                    let before = waiters::LINK_VISITS.get();
+                    let before = state.send_waiters.link_visits.get();
                     assert!(state.send_waiters.remove(u64::MAX - id as u64));
-                    assert!(waiters::LINK_VISITS.get() - before <= 3);
+                    assert!(state.send_waiters.link_visits.get() - before <= 3);
                 }
                 // Cross the old compaction threshold from the middle as well.
-                let before = waiters::LINK_VISITS.get();
+                let before = state.send_waiters.link_visits.get();
                 assert!(state.send_waiters.remove(u64::MAX - (waiters + 1) as u64));
-                assert_eq!(waiters::LINK_VISITS.get() - before, 3);
+                assert_eq!(state.send_waiters.link_visits.get() - before, 3);
             }
             let mut maximum = 0;
             for _ in 0..messages {
                 assert_eq!(willow_channel_try_send_i64(raw, 1), 1);
-                let before = waiters::LINK_VISITS.get();
+                let before = channel.state.lock().unwrap().send_waiters.link_visits.get();
                 assert_eq!(willow_channel_recv_i64(raw), 1);
-                let visits = waiters::LINK_VISITS.get() - before;
+                let visits = channel.state.lock().unwrap().send_waiters.link_visits.get() - before;
                 maximum = maximum.max(visits);
                 assert!(visits <= 2, "one head and at most one next link");
             }

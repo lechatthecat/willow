@@ -24,7 +24,10 @@ impl Backend {
     pub(super) fn close_platform(&mut self) {}
 }
 
-pub(super) fn wait_ready_tasks(timeout: Option<Duration>) -> Vec<RuntimeTaskId> {
+pub(super) fn wait_ready_tasks(
+    _service: &super::NetpollService,
+    timeout: Option<Duration>,
+) -> Vec<RuntimeTaskId> {
     if let Some(timeout) = timeout {
         if !timeout.is_zero() {
             std::thread::sleep(timeout);

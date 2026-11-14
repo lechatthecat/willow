@@ -209,7 +209,7 @@ pub extern "C" fn willow_format_f64_6f(value: f64) -> *mut u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::{runtime_test_guard, willow_gc_init};
+    use crate::gc::{isolated_runtime, willow_gc_init};
     use crate::string::{willow_string_as_str, willow_string_from_str};
 
     fn ws_text(ptr: *mut u8) -> String {
@@ -297,21 +297,21 @@ mod tests {
 
     #[test]
     fn math_unit_09_exported_to_string_returns_willow_string() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         assert_eq!(ws_text(willow_f64_to_string(3.14)), "3.14");
     }
 
     #[test]
     fn math_unit_10_format_17g_returns_willow_string() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         assert_eq!(ws_text(willow_format_f64_17g(3.14)), "3.1400000000000001");
     }
 
     #[test]
     fn math_unit_11_parse_ok_returns_result_ok_f64_bits() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let input = willow_string_from_str("3.5");
         let result = willow_f64_parse(input);
@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn math_unit_12_parse_err_returns_parse_float_error() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let input = willow_string_from_str("not-a-number");
         let result = willow_f64_parse(input);
@@ -338,7 +338,7 @@ mod tests {
     }
     #[test]
     fn i64_parse_runtime_whitespace_and_payloads() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         for input in ["\t1", "1\n", "\r1", "1\0", "1\t2", "\u{a0}1"] {
             let result = willow_i64_parse(willow_string_from_str(input));
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn i64_parse_long_leading_zeros() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         // Increasing lengths exercise full scans without overflowing early.
         for n in [32, 256, 2048, 16384] {

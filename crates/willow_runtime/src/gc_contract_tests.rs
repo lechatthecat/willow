@@ -25,7 +25,8 @@ use std::sync::Mutex;
 /// Payload addresses passed to the test drop hook, in call order. The hook runs
 /// with the heap lock held, so this must stay a leaf lock: never touch GC state
 /// from inside it.
-static DROP_LOG: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static DROP_LOG: crate::runtime::PerRuntime<Mutex<Vec<usize>>> =
+    crate::runtime::PerRuntime::new(|| Mutex::new(Vec::new()));
 
 /// Type id whose drop hook records the reclamation. Distinct from the ids the
 /// runtime registers for its own containers.
@@ -38,10 +39,6 @@ unsafe fn record_drop(payload: *mut u8) {
 fn reset_gc() {
     reset_internal();
     DROP_LOG.lock().unwrap().clear();
-}
-
-fn global_gc_guard() -> std::sync::MutexGuard<'static, ()> {
-    runtime_test_guard()
 }
 
 /// Registers the recording hook. Must run after `reset_gc`, which clears the
@@ -84,7 +81,7 @@ fn region_start_bit(payload: *mut u8) -> bool {
 //     survivor down into the hole.
 #[test]
 fn contract_c1_old_object_address_survives_a_major_collection() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
 
     let low = willow_alloc_object(CONTRACT_TYPE_ID, 24);
@@ -130,7 +127,7 @@ fn contract_c1_old_object_address_survives_a_major_collection() {
 //     addresses only because of this.
 #[test]
 fn contract_c2_old_object_address_survives_minor_collection_and_promotion() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
 
     // gc_ref_mask 0b1: payload word 0 is a GC reference.
@@ -200,7 +197,7 @@ fn contract_c2_old_object_address_survives_minor_collection_and_promotion() {
 //     reclaims. One object dies, one survives, in the same cycle.
 #[test]
 fn contract_c3_drop_hook_runs_exactly_once_per_reclaimed_object() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     arm_drop_recorder();
 
@@ -231,7 +228,7 @@ fn contract_c3_drop_hook_runs_exactly_once_per_reclaimed_object() {
 //     live object.
 #[test]
 fn contract_c4_drop_hook_does_not_run_for_a_survivor() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     arm_drop_recorder();
 
@@ -264,7 +261,7 @@ fn contract_c4_drop_hook_does_not_run_for_a_survivor() {
 //     of whatever Rust payload the hook owns.
 #[test]
 fn contract_c5_drop_hook_is_not_repeated_by_later_cycles() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     arm_drop_recorder();
 
@@ -302,7 +299,7 @@ fn contract_c5_drop_hook_is_not_repeated_by_later_cycles() {
 //     been merged and D5 needs rewriting before the mark engine lands.
 #[test]
 fn contract_c7_region_bitmap_tracks_object_starts_not_reachability() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
 
     let anchor = willow_alloc_object(CONTRACT_TYPE_ID, 16);
@@ -403,7 +400,14 @@ fn panicking_payload_is_not_dropped_after_native_hook_panic() {
         unsafe fn hook(_: *mut u8) {
             std::panic::panic_any(BadPayload);
         }
-        unsafe { run_drop_hook(hook, std::ptr::null_mut()) };
+        unsafe {
+            run_drop_hook(
+                runtime(),
+                hook,
+                std::ptr::null_mut(),
+                crate::observation::Value::new(|| 0),
+            )
+        };
         eprintln!("GC_PANIC_RETURNED");
         return;
     }
@@ -415,8 +419,8 @@ fn panicking_payload_is_not_dropped_after_native_hook_panic() {
     assert!(!stderr.contains("GC_PAYLOAD_DROP_RAN"));
 }
 
-static DROP_WITHOUT_HEAP_LOCK: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static DROP_WITHOUT_HEAP_LOCK: crate::runtime::PerRuntime<std::sync::atomic::AtomicBool> =
+    crate::runtime::PerRuntime::new(|| std::sync::atomic::AtomicBool::new(false));
 
 unsafe fn verify_concurrent_drop_context(_: *mut u8) {
     assert!(!runtime().stop_requested.load(Ordering::Acquire));
@@ -429,7 +433,7 @@ unsafe fn verify_concurrent_drop_context(_: *mut u8) {
 
 #[test]
 fn normal_old_drop_runs_after_world_resume_without_heap_mutex() {
-    let _guard = global_gc_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     DROP_WITHOUT_HEAP_LOCK.store(false, Ordering::Relaxed);
     willow_register_drop(CONTRACT_TYPE_ID as u32, verify_concurrent_drop_context);

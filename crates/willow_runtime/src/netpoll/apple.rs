@@ -1,5 +1,5 @@
+use super::ReadyEvent;
 use super::{IoInterest, RawFd, RuntimeTaskId};
-use super::{ReadyEvent, with_global};
 use std::time::Duration;
 
 #[derive(Debug, Default)]
@@ -128,8 +128,11 @@ fn apple_kevent(ident: usize, filter: i16, flags: u16, fflags: u32) -> libc::kev
     }
 }
 
-pub(super) fn wait_ready_tasks(timeout: Option<Duration>) -> Vec<RuntimeTaskId> {
-    let kqueue_fd = with_global(|poll| {
+pub(super) fn wait_ready_tasks(
+    service: &super::NetpollService,
+    timeout: Option<Duration>,
+) -> Vec<RuntimeTaskId> {
+    let kqueue_fd = service.with(|poll| {
         if !poll.has_waiters() || poll.init() != 0 {
             None
         } else {
@@ -140,7 +143,7 @@ pub(super) fn wait_ready_tasks(timeout: Option<Duration>) -> Vec<RuntimeTaskId> 
         return Vec::new();
     };
     let events = wait_apple_events(kqueue_fd, timeout);
-    with_global(|poll| {
+    service.with(|poll| {
         let mut ready = Vec::new();
         for event in events {
             if event.token == WAKE_TOKEN {

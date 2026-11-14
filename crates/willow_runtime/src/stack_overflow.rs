@@ -657,10 +657,10 @@ mod platform {
                 }
                 std::thread::Builder::new()
                     .stack_size(1024 * 1024)
-                    .spawn(|| {
+                    .spawn(crate::runtime::serving(|| {
                         super::super::protect_current_thread();
                         std::hint::black_box(recurse(1_000_000));
-                    })
+                    }))
                     .unwrap()
                     .join()
                     .unwrap();
@@ -741,7 +741,7 @@ mod platform {
                 super::super::protect_current_thread();
                 let mut first = None;
                 for _ in 0..8 {
-                    let slot = std::thread::spawn(|| {
+                    let slot = std::thread::spawn(crate::runtime::serving(|| {
                         super::super::protect_current_thread();
                         let first = super::super::PROTECTION
                             .with(|protection| protection.borrow().as_ref().unwrap().slot as usize);
@@ -750,7 +750,7 @@ mod platform {
                             .with(|protection| protection.borrow().as_ref().unwrap().slot as usize);
                         assert_eq!(first, second);
                         first
-                    })
+                    }))
                     .join()
                     .unwrap();
                     assert_eq!(

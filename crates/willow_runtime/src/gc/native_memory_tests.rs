@@ -33,7 +33,7 @@ fn short_lived_string_churn_bounds_reservations_and_rss() {
         print!("{}", String::from_utf8_lossy(&output.stdout));
         return;
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     // Regular old regions, crossing the dedicated-region boundary, then only
     // dedicated regions. Increasing N keeps the live set fixed.
     for (size, n) in [
@@ -122,7 +122,7 @@ fn short_lived_string_churn_bounds_reservations_and_rss() {
 
 #[test]
 fn native_bytes_participate_in_reservation_and_trigger_inputs() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     let mut map = crate::map::willow_map_new(0, 0, 0);
     willow_push_root(&mut map);
@@ -142,7 +142,10 @@ fn native_bytes_participate_in_reservation_and_trigger_inputs() {
         assert_eq!(inputs.occupied, (state.allocated_bytes + external) as u64);
         assert_eq!(inputs.live, state.last_major_live_bytes + external as u64);
     }
-    assert!(allocation_should_collect());
+    assert!(allocation_should_collect_with_sync_in(
+        crate::runtime::current(),
+        true
+    ));
     runtime().heap.lock().unwrap().memory_limit_bytes = None;
     willow_pop_root();
     willow_gc_collect();
@@ -151,7 +154,7 @@ fn native_bytes_participate_in_reservation_and_trigger_inputs() {
 
 #[test]
 fn native_growth_requests_collection_without_a_managed_allocation() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     let mut map = crate::map::willow_map_new(0, 0, 0);
     willow_push_root(&mut map);
@@ -182,7 +185,7 @@ fn native_growth_requests_collection_without_a_managed_allocation() {
 
 #[test]
 fn native_allocation_progress_reaches_soft_controller_without_managed_allocations() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     let map = crate::map::willow_map_new(0, 0, 0);
     let before = {
@@ -207,7 +210,7 @@ fn native_allocation_progress_reaches_soft_controller_without_managed_allocation
 
 #[test]
 fn gc_owned_async_lock_finalizers_release_the_boxed_states() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     for reset in [false, true] {
         crate::async_mutex::willow_async_mutex_new(42, 0);
@@ -224,7 +227,7 @@ fn gc_owned_async_lock_finalizers_release_the_boxed_states() {
 
 #[test]
 fn managed_growth_crosses_pacer_trigger_with_constant_native_storage() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     let mut map = crate::map::willow_map_new(0, 0, 0);
     willow_push_root(&mut map);
@@ -240,7 +243,10 @@ fn managed_growth_crosses_pacer_trigger_with_constant_native_storage() {
         state.pacer.allocation(0, total);
         state.pacer_trigger = (state.allocated_bytes + native + 128) as u64;
     }
-    assert!(!allocation_should_collect());
+    assert!(!allocation_should_collect_with_sync_in(
+        crate::runtime::current(),
+        true
+    ));
     assert!(!willow_alloc(128).is_null());
     assert_eq!(external_bytes(), native, "native growth has stopped");
     {
@@ -250,7 +256,7 @@ fn managed_growth_crosses_pacer_trigger_with_constant_native_storage() {
         assert!(!state.soft_memory.decide(memory_inputs(&state)).collect);
     }
     assert!(
-        allocation_should_collect(),
+        allocation_should_collect_with_sync_in(crate::runtime::current(), true),
         "combined occupancy crossed the pacer trigger"
     );
     willow_pop_root();
@@ -259,7 +265,7 @@ fn managed_growth_crosses_pacer_trigger_with_constant_native_storage() {
 
 #[test]
 fn native_growth_is_included_in_allocation_path_pacer_sample() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     let mut map = crate::map::willow_map_new(0, 0, 0);
     willow_push_root(&mut map);
@@ -283,7 +289,7 @@ fn native_growth_is_included_in_allocation_path_pacer_sample() {
         assert!(!state.pacer.sample_due(state.total_allocated_bytes));
         total
     };
-    allocation_should_collect();
+    allocation_should_collect_with_sync_in(crate::runtime::current(), true);
     {
         let state = runtime().heap.lock().unwrap();
         assert!(
@@ -298,7 +304,7 @@ fn native_growth_is_included_in_allocation_path_pacer_sample() {
 
 #[test]
 fn cycle_completion_pacer_sample_keeps_cumulative_native_growth_after_drop() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     let map = crate::map::willow_map_new(0, 0, 0);
     for key in 0..128 {
@@ -322,7 +328,7 @@ fn cycle_completion_pacer_sample_keeps_cumulative_native_growth_after_drop() {
 
 #[test]
 fn unchanged_high_reservations_do_not_collect_per_managed_allocation() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [16, 128, 1024] {
         willow_gc_init();
         runtime().heap.lock().unwrap().memory_limit_bytes = Some(300 * 1024);
@@ -359,7 +365,7 @@ fn unchanged_high_reservations_do_not_collect_per_managed_allocation() {
 
 #[test]
 fn reservation_pressure_hysteresis_rearms_after_reclamation_and_reset() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     let mut state = GcState {
         memory_limit_bytes: Some(400),
@@ -390,8 +396,14 @@ fn reservation_pressure_hysteresis_rearms_after_reclamation_and_reset() {
         runtime().heap.lock().unwrap().memory_limit_bytes = Some(300 * 1024);
         let mut root = willow_alloc(8);
         willow_push_root(&mut root);
-        assert!(allocation_should_collect());
-        assert!(!allocation_should_collect());
+        assert!(allocation_should_collect_with_sync_in(
+            crate::runtime::current(),
+            true
+        ));
+        assert!(!allocation_should_collect_with_sync_in(
+            crate::runtime::current(),
+            true
+        ));
         willow_pop_root();
         willow_gc_collect();
         let state = runtime().heap.lock().unwrap();
@@ -408,7 +420,7 @@ fn reservation_pressure_hysteresis_rearms_after_reclamation_and_reset() {
 
 #[test]
 fn reservation_latch_does_not_suppress_occupied_pacer_pressure() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     let mut root = willow_alloc(8);
     willow_push_root(&mut root);
@@ -421,7 +433,7 @@ fn reservation_latch_does_not_suppress_occupied_pacer_pressure() {
     state.pacer_trigger = state.allocated_bytes as u64;
     drop(state);
     assert!(
-        allocation_should_collect(),
+        allocation_should_collect_with_sync_in(crate::runtime::current(), true),
         "occupancy must still trigger while reservation pressure is latched"
     );
     willow_pop_root();
@@ -430,7 +442,7 @@ fn reservation_latch_does_not_suppress_occupied_pacer_pressure() {
 
 #[test]
 fn managed_growth_consumes_lock_free_native_headroom_before_pacer_crossing() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     willow_gc_register_mutator();
     let room = 4096u64;
@@ -447,7 +459,7 @@ fn managed_growth_consumes_lock_free_native_headroom_before_pacer_crossing() {
     invalidate_runtime_policy_budgets();
     // A locked charge publishes headroom just below the trigger.
     charge_external(1);
-    let published = EXTERNAL_HEADROOM.load(Ordering::Acquire) as u64;
+    let published = runtime().headroom.external.load(Ordering::Acquire) as u64;
     assert_eq!(published, room - 2);
     // Managed growth (a TLAB sync) uses most of that room without a charge.
     let managed = room - 100;
@@ -457,7 +469,7 @@ fn managed_growth_consumes_lock_free_native_headroom_before_pacer_crossing() {
         assert!(memory_inputs(&state).occupied < state.pacer_trigger);
     }
     assert_eq!(
-        EXTERNAL_HEADROOM.load(Ordering::Acquire) as u64,
+        runtime().headroom.external.load(Ordering::Acquire) as u64,
         published - managed
     );
     // This native charge crosses the trigger: it must take the locked path
@@ -485,7 +497,7 @@ fn managed_growth_consumes_lock_free_native_headroom_before_pacer_crossing() {
 
 #[test]
 fn native_charges_far_below_a_hard_cap_skip_the_heap_lock() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     let cap = 1usize << 40;
     {
@@ -497,14 +509,14 @@ fn native_charges_far_below_a_hard_cap_skip_the_heap_lock() {
     invalidate_runtime_policy_budgets();
     // A locked charge publishes headroom bounded by the cap watermark.
     charge_external(1);
-    let room = EXTERNAL_HEADROOM.load(Ordering::Acquire);
+    let room = runtime().headroom.external.load(Ordering::Acquire);
     assert!(room > 4096, "far below the cap: headroom {room}");
     let heap = runtime().heap.lock().unwrap();
     let (sender, receiver) = std::sync::mpsc::channel();
-    let charger = std::thread::spawn(move || {
+    let charger = std::thread::spawn(crate::runtime::serving(move || {
         charge_external(4096);
         sender.send(()).unwrap();
-    });
+    }));
     let lock_free = receiver
         .recv_timeout(std::time::Duration::from_secs(10))
         .is_ok();
@@ -514,24 +526,27 @@ fn native_charges_far_below_a_hard_cap_skip_the_heap_lock() {
         lock_free,
         "charge far below the cap waited for the heap lock"
     );
-    assert_eq!(EXTERNAL_HEADROOM.load(Ordering::Acquire), room - 4096);
+    assert_eq!(
+        runtime().headroom.external.load(Ordering::Acquire),
+        room - 4096
+    );
     {
         // Near the cap (past the 3/4 watermark) every charge is exact.
         let mut state = runtime().heap.lock().unwrap();
         let committed = memory_inputs(&state).pressure_bytes as usize;
         state.memory_limit_bytes = Some(committed + committed / 4);
-        assert_eq!(external_headroom(&state), 0);
+        assert_eq!(external_headroom_in(runtime(), &state), 0);
         // Exactly one byte below the watermark leaves no room either.
         let watermark_limit = (committed + 1).div_ceil(3) * 4;
         state.memory_limit_bytes = Some(watermark_limit);
         let watermark = (watermark_limit / 4) * 3;
         assert_eq!(
-            external_headroom(&state),
+            external_headroom_in(runtime(), &state),
             watermark.saturating_sub(committed).saturating_sub(1)
         );
         // A reservation check stops lock-free charging until republished.
         assert!(can_reserve(&mut state, 0));
-        assert_eq!(EXTERNAL_HEADROOM.load(Ordering::Acquire), 0);
+        assert_eq!(runtime().headroom.external.load(Ordering::Acquire), 0);
         state.memory_limit_bytes = None;
     }
     release_external(1 + 4096);
@@ -540,7 +555,7 @@ fn native_charges_far_below_a_hard_cap_skip_the_heap_lock() {
 
 #[test]
 fn native_pressure_is_estimated_separately_from_managed_telemetry() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     let map = crate::map::willow_map_new(0, 0, 0);
     let root = GcRootHandle::new(map);
@@ -587,7 +602,7 @@ fn native_pressure_is_estimated_separately_from_managed_telemetry() {
 
 #[test]
 fn native_accounting_underflow_does_not_wrap_or_change_the_gauge() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     let before = external_bytes();
     assert!(std::panic::catch_unwind(|| release_external(before + 1)).is_err());
@@ -598,7 +613,7 @@ fn native_accounting_underflow_does_not_wrap_or_change_the_gauge() {
 fn m0_threshold_locked_sample_reports_actual_limit_and_categories() {
     const CHILD: &str = "WILLOW_TEST_CAPTURED_THRESHOLD";
     if std::env::var_os(CHILD).is_some() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         std::panic::set_hook(Box::new(|_| {}));
         willow_alloc(8);
@@ -641,7 +656,7 @@ fn m0_threshold_locked_sample_reports_actual_limit_and_categories() {
 /// retained past the hard-pressure watermark.
 #[test]
 fn lock_free_native_headroom_counts_retained_region_storage() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     {
         let mut state = runtime().heap.lock().unwrap();
@@ -671,7 +686,7 @@ fn lock_free_native_headroom_counts_retained_region_storage() {
     let (watermark, pressure) = set_watermark(retained + 4096);
     assert!(watermark - pressure >= retained + 4096);
     charge_external(1);
-    let room = EXTERNAL_HEADROOM.load(Ordering::Acquire);
+    let room = runtime().headroom.external.load(Ordering::Acquire);
     {
         let state = runtime().heap.lock().unwrap();
         assert_eq!(
@@ -681,8 +696,8 @@ fn lock_free_native_headroom_counts_retained_region_storage() {
         );
         assert_eq!(room, watermark - (pressure + 1) - retained - 1);
     }
-    assert!(!charge_external_lock_free(room + 1));
-    assert!(charge_external_lock_free(room));
+    assert!(!charge_external_lock_free_in(runtime(), room + 1));
+    assert!(charge_external_lock_free_in(runtime(), room));
     let footprint = {
         let state = runtime().heap.lock().unwrap();
         memory_inputs(&state).pressure_bytes as usize + state.region_cache.retained_bytes()
@@ -694,8 +709,8 @@ fn lock_free_native_headroom_counts_retained_region_storage() {
     // charge instead of closing the lock-free path or overshooting the cap.
     let (watermark, _) = set_watermark(retained / 2);
     charge_external(1);
-    let room = EXTERNAL_HEADROOM.load(Ordering::Acquire);
-    assert!(charge_external_lock_free(room));
+    let room = runtime().headroom.external.load(Ordering::Acquire);
+    assert!(charge_external_lock_free_in(runtime(), room));
     {
         let state = runtime().heap.lock().unwrap();
         let retained_now = state.region_cache.retained_bytes();
@@ -713,7 +728,7 @@ fn lock_free_native_headroom_counts_retained_region_storage() {
 /// cannot reclaim it, so it is evicted instead of counted as soft pressure.
 #[test]
 fn soft_limit_bounds_retained_region_storage() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     willow_gc_init();
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX / 2;
     invalidate_runtime_policy_budgets();
@@ -788,4 +803,277 @@ fn soft_limit_bounds_retained_region_storage() {
     );
     willow_gc_set_memory_limit(0);
     reset_internal();
+}
+
+#[test]
+fn private_native_charge_paths_keep_gauges_and_allowances_independent() {
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = [32usize, 128]
+            .into_iter()
+            .map(|stride| {
+                let barrier = &barrier;
+                scope.spawn(crate::runtime::serving(move || {
+                    let owner = GcRuntime::default();
+                    owner.headroom.external.store(stride * 4, Ordering::Release);
+                    owner
+                        .headroom
+                        .policy
+                        .store((stride * 4) as u64, Ordering::Release);
+                    for round in 1..=4 {
+                        assert!(charge_external_lock_free_in(&owner, stride));
+                        barrier.wait();
+                        assert_eq!(
+                            owner.native_accounting.bytes.load(Ordering::Relaxed),
+                            stride * round
+                        );
+                        assert_eq!(
+                            owner
+                                .native_accounting
+                                .allocated_bytes
+                                .load(Ordering::Relaxed),
+                            (stride * round) as u64
+                        );
+                        assert_eq!(owner.native_accounting.in_flight.load(Ordering::SeqCst), 0);
+                        assert_eq!(
+                            owner.headroom.external.load(Ordering::Acquire),
+                            stride * (4 - round)
+                        );
+                        barrier.wait();
+                    }
+                    assert!(!charge_external_lock_free_in(&owner, 1));
+                    assert_eq!(
+                        owner.native_accounting.bytes.load(Ordering::Relaxed),
+                        stride * 4
+                    );
+                    assert_eq!(owner.native_accounting.in_flight.load(Ordering::SeqCst), 0);
+                }))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+}
+
+#[test]
+fn private_native_quiescence_and_release_use_only_the_supplied_owner() {
+    let first = GcRuntime::default();
+    let second = GcRuntime::default();
+    first.headroom.external.store(64, Ordering::SeqCst);
+    second.headroom.external.store(128, Ordering::SeqCst);
+    assert!(charge_external_lock_free_in(&first, 32));
+    assert!(charge_external_lock_free_in(&second, 64));
+    // A foreign charge must not prevent the first owner from quiescing.
+    second
+        .native_accounting
+        .in_flight
+        .store(1, Ordering::SeqCst);
+    quiesce_external_charges_in(&first);
+    assert_eq!(first.headroom.external.load(Ordering::SeqCst), 0);
+    assert_eq!(second.headroom.external.load(Ordering::SeqCst), 64);
+    assert_eq!(second.native_accounting.in_flight.load(Ordering::SeqCst), 1);
+    release_external_in(&first, 32);
+    assert_eq!(first.native_accounting.bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(second.native_accounting.bytes.load(Ordering::Relaxed), 64);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| release_external_in(
+            &first, 1
+        )))
+        .is_err()
+    );
+    assert_eq!(first.native_accounting.bytes.load(Ordering::Relaxed), 0);
+    second
+        .native_accounting
+        .in_flight
+        .store(0, Ordering::SeqCst);
+    quiesce_external_charges_in(&second);
+    release_external_in(&second, 64);
+    assert_eq!(second.native_accounting.bytes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn private_native_reconciliation_observers_are_independent() {
+    use crate::native_memory::ObserveReconciliation;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = [8usize, 64]
+            .into_iter()
+            .map(|count| {
+                scope.spawn(crate::runtime::serving(move || {
+                    let owner = GcRuntime::default();
+                    for _ in 0..count {
+                        owner.native_accounting._reconciliation.record();
+                    }
+                    assert_eq!(
+                        owner
+                            .native_accounting
+                            ._reconciliation
+                            .load(Ordering::Relaxed),
+                        count
+                    );
+                }))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+}
+
+#[test]
+fn private_reservation_admission_uses_owner_native_pressure() {
+    let first = GcRuntime::default();
+    let second = GcRuntime::default();
+    first.native_accounting.bytes.store(80, Ordering::Relaxed);
+    second.native_accounting.bytes.store(20, Ordering::Relaxed);
+    second.headroom.external.store(12, Ordering::SeqCst);
+    let mut first_heap = first.heap.lock().unwrap();
+    let mut second_heap = second.heap.lock().unwrap();
+    first_heap.memory_limit_bytes = Some(100);
+    second_heap.memory_limit_bytes = Some(100);
+    assert_eq!(region_cache_budget_in(&first, &first_heap), 20);
+    assert_eq!(region_cache_budget_in(&second, &second_heap), 80);
+    assert!(!can_reserve_in(&first, &mut first_heap, 21));
+    assert_eq!(second.headroom.external.load(Ordering::SeqCst), 12);
+    assert!(can_reserve_in(&second, &mut second_heap, 21));
+    assert!(can_reserve_in(&first, &mut first_heap, 20));
+    assert!(!can_reserve_in(&second, &mut second_heap, usize::MAX));
+}
+
+#[test]
+fn private_memory_policy_inputs_keep_native_domains_separate() {
+    for (bytes, allocated) in [(17usize, 41u64), (83, 197)] {
+        let owner = GcRuntime::default();
+        owner
+            .native_accounting
+            .bytes
+            .store(bytes, Ordering::Relaxed);
+        owner
+            .native_accounting
+            .allocated_bytes
+            .store(allocated, Ordering::Relaxed);
+        let state = owner.heap.lock().unwrap();
+        let inputs = memory_inputs_in(&owner, &state);
+        assert_eq!(inputs.occupied, bytes as u64);
+        assert_eq!(inputs.pressure_bytes, bytes as u64);
+        assert_eq!(inputs.allocated_total, allocated);
+        assert_eq!(policy_allocated_total_in(&owner, &state), allocated);
+    }
+}
+
+#[test]
+fn private_slow_native_charges_publish_only_owner_gauges() {
+    for bytes in [16usize, 128] {
+        let owner = GcRuntime::default();
+        assert!(!charge_external_in(&owner, bytes));
+        assert_eq!(owner.native_accounting.bytes.load(Ordering::Relaxed), bytes);
+        assert_eq!(
+            owner
+                .native_accounting
+                .allocated_bytes
+                .load(Ordering::Relaxed),
+            bytes as u64
+        );
+        assert!(owner.headroom.external.load(Ordering::Acquire) > 0);
+        assert!(!charge_external_in(&owner, bytes));
+        release_external_in(&owner, bytes * 2);
+        assert_eq!(owner.native_accounting.bytes.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn private_failure_accounting_uses_the_supplied_native_owner() {
+    let first = GcRuntime::default();
+    let second = GcRuntime::default();
+    first.native_accounting.bytes.store(13, Ordering::Relaxed);
+    second.native_accounting.bytes.store(97, Ordering::Relaxed);
+    let state = first.heap.lock().unwrap();
+    assert_eq!(
+        heap_snapshot::accounting_from_state_in(&first, &state).external_bytes,
+        13
+    );
+    assert_eq!(
+        heap_snapshot::accounting_from_state_in(&second, &state).external_bytes,
+        97
+    );
+}
+
+#[test]
+fn private_headroom_calculation_uses_owner_occupancy_and_cap() {
+    for bytes in [16usize, 128] {
+        let owner = GcRuntime::default();
+        owner
+            .native_accounting
+            .bytes
+            .store(bytes, Ordering::Relaxed);
+        let mut state = owner.heap.lock().unwrap();
+        state.threshold_bytes = 1024;
+        state.memory_limit_bytes = None;
+        assert_eq!(policy_headroom_in(&owner, &state), (1024 - bytes) as u64);
+        assert_eq!(external_headroom_in(&owner, &state), 1023 - bytes);
+        state.memory_limit_bytes = Some(1024);
+        assert_eq!(policy_headroom_in(&owner, &state), 0);
+        assert_eq!(external_headroom_in(&owner, &state), 767 - bytes);
+    }
+}
+
+#[test]
+fn private_collection_busy_publication_preserves_other_owner_gate() {
+    let first = GcRuntime::default();
+    let second = GcRuntime::default();
+    first.collection_busy.store(true, Ordering::Release);
+    second.collection_busy.store(true, Ordering::Release);
+    publish_collection_busy_in(&first, &first.heap.lock().unwrap());
+    assert!(!first.collection_busy.load(Ordering::Acquire));
+    assert!(second.collection_busy.load(Ordering::Acquire));
+    publish_collection_busy_in(&second, &second.heap.lock().unwrap());
+    assert!(!second.collection_busy.load(Ordering::Acquire));
+}
+
+#[test]
+fn private_pressure_latches_follow_owner_native_reclamation() {
+    let first = GcRuntime::default();
+    let second = GcRuntime::default();
+    let mut first_state = first.heap.lock().unwrap();
+    let mut second_state = second.heap.lock().unwrap();
+    first_state.memory_limit_bytes = Some(100);
+    second_state.memory_limit_bytes = Some(100);
+    first.native_accounting.bytes.store(75, Ordering::Relaxed);
+    second.native_accounting.bytes.store(49, Ordering::Relaxed);
+    assert!(hard_reservation_pressure_in(&first, &mut first_state));
+    assert!(!hard_reservation_pressure_in(&first, &mut first_state));
+    assert!(!hard_reservation_pressure_in(&second, &mut second_state));
+    second.native_accounting.bytes.store(75, Ordering::Relaxed);
+    assert!(hard_reservation_pressure_in(&second, &mut second_state));
+    first.native_accounting.bytes.store(50, Ordering::Relaxed);
+    assert!(!hard_reservation_pressure_in(&first, &mut first_state));
+    assert!(!first_state.hard_pressure_triggered);
+    assert!(second_state.hard_pressure_triggered);
+    first.native_accounting.bytes.store(75, Ordering::Relaxed);
+    assert!(hard_reservation_pressure_in(&first, &mut first_state));
+}
+
+#[test]
+fn private_allocation_policy_publishes_only_owner_headroom() {
+    let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    second.gc.headroom.policy.store(77, Ordering::Release);
+    let mut state = first.gc.heap.lock().unwrap();
+    assert!(!allocation_policy_due_in(&first, &mut state, true, false));
+    assert!(first.gc.headroom.policy.load(Ordering::Acquire) > 0);
+    assert_eq!(second.gc.headroom.policy.load(Ordering::Acquire), 77);
+    assert!(allocation_policy_due_in(&first, &mut state, true, true));
+    assert_eq!(second.gc.headroom.policy.load(Ordering::Acquire), 77);
+}
+
+#[test]
+fn private_allocation_gate_uses_owner_stress_and_busy_state() {
+    let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    *first.diagnostics.stress_override.lock().unwrap() = Some(vec!["alloc".into()]);
+    *second.diagnostics.stress_override.lock().unwrap() = Some(Vec::new());
+    first.gc.collection_busy.store(true, Ordering::Release);
+    second.gc.collection_busy.store(true, Ordering::Release);
+    assert!(allocation_should_collect_with_sync_in(&first, false));
+    assert!(!allocation_should_collect_with_sync_in(&second, false));
 }

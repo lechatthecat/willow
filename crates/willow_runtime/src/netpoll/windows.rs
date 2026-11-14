@@ -1,6 +1,6 @@
+use super::ReadyEvent;
 use super::windows_snapshot::{WSA_POLL_READ, WSA_POLL_WRITE, WsaPollFd, fill_windows_sockets};
 use super::{IoInterest, RawFd, RuntimeTaskId};
-use super::{ReadyEvent, with_global};
 use std::collections::HashSet;
 use std::os::windows::io::AsRawSocket;
 use std::time::Duration;
@@ -96,8 +96,11 @@ impl Backend {
     }
 }
 
-pub(super) fn wait_ready_tasks(timeout: Option<Duration>) -> Vec<RuntimeTaskId> {
-    let snapshot = with_global(|poll| {
+pub(super) fn wait_ready_tasks(
+    service: &super::NetpollService,
+    timeout: Option<Duration>,
+) -> Vec<RuntimeTaskId> {
+    let snapshot = service.with(|poll| {
         if !poll.has_waiters() || poll.init() != 0 {
             None
         } else {
@@ -112,7 +115,7 @@ pub(super) fn wait_ready_tasks(timeout: Option<Duration>) -> Vec<RuntimeTaskId> 
         return Vec::new();
     };
     let events = wait_windows_events(&mut sockets, timeout);
-    with_global(|poll| {
+    service.with(|poll| {
         let mut tasks = Vec::new();
         let mut seen = HashSet::new();
         for event in events {

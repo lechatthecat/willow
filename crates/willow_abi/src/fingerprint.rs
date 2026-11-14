@@ -35,6 +35,8 @@ const CONTRACT_CONSTANTS: &[u64] = &[
     generated_context::ROOT_BASE_OFFSET as u64,
     generated_context::ROOT_TOP_OFFSET as u64,
     generated_context::ROOT_LIMIT_OFFSET as u64,
+    generated_context::MARK_PHASE_OFFSET as u64,
+    generated_context::CARD_EPOCH_CELL_OFFSET as u64,
     generated_context::HELPER_DESCRIPTOR_SIZE as u64,
     generated_context::HELPER_LENGTH_OFFSET as u64,
     OBJECT_LAYOUT_REVISION as u64,

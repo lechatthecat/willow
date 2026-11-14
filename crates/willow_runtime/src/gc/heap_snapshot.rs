@@ -66,10 +66,17 @@ pub(crate) fn survivor_snapshot() -> crate::gc_telemetry::GcSurvivorStats {
 pub(super) fn accounting_from_state(
     state: &GcState,
 ) -> crate::gc_telemetry::measurement::GcMemoryV3 {
+    accounting_from_state_in(runtime(), state)
+}
+
+pub(super) fn accounting_from_state_in(
+    owner: &GcRuntime,
+    state: &GcState,
+) -> crate::gc_telemetry::measurement::GcMemoryV3 {
     use crate::gc_telemetry::measurement::GcMemoryV3;
     GcMemoryV3 {
         managed_bytes: state.allocated_bytes as u64,
-        external_bytes: external_bytes() as u64,
+        external_bytes: owner.native_accounting.bytes.load(Ordering::Relaxed) as u64,
         old_reserved_bytes: state.old_reserved_bytes as u64,
         young_reserved_bytes: state.tlab_reserved_bytes as u64,
         last_major_retained_bytes: state.last_major_live_bytes,
@@ -139,16 +146,25 @@ pub(crate) fn telemetry_memory_threshold_snapshot() -> crate::gc_telemetry::meas
 /// Failure path never merges LABs, follows native locks, or waits for heap.
 /// None explicitly marks an unavailable sample, never fabricated zero bytes.
 pub(crate) fn diagnostic_memory_snapshot() -> Option<crate::gc_telemetry::measurement::GcMemoryV3> {
-    if !DIAGNOSTIC_READY.load(Ordering::Acquire) {
+    if !crate::runtime::current()
+        .diagnostic_ready
+        .load(Ordering::Acquire)
+    {
         return None;
     }
-    let state = match runtime().heap.try_lock() {
+    diagnostic_memory_snapshot_in(runtime())
+}
+
+pub(crate) fn diagnostic_memory_snapshot_in(
+    owner: &GcRuntime,
+) -> Option<crate::gc_telemetry::measurement::GcMemoryV3> {
+    let state = match owner.heap.try_lock() {
         Ok(s) => s,
         Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return None,
     };
     // A bounded record must also have bounded sampling work: no region walk.
-    Some(accounting_from_state(&state))
+    Some(accounting_from_state_in(owner, &state))
 }
 
 #[unsafe(no_mangle)]
@@ -483,7 +499,10 @@ pub(crate) fn pin_snapshot() -> Vec<crate::gc_telemetry::GcPinRecord> {
 
 /// Failure-only scalar samples: try-locks never wait or traverse root storage.
 pub(crate) fn diagnostic_coordination() -> Option<(u64, u64, u64)> {
-    if !DIAGNOSTIC_READY.load(Ordering::Acquire) {
+    if !crate::runtime::current()
+        .diagnostic_ready
+        .load(Ordering::Acquire)
+    {
         return None;
     }
     let coord = runtime().coord.0.try_lock().ok()?;
@@ -494,7 +513,10 @@ pub(crate) fn diagnostic_coordination() -> Option<(u64, u64, u64)> {
     ))
 }
 pub(crate) fn diagnostic_survivors() -> Option<crate::gc_telemetry::GcSurvivorStats> {
-    if !DIAGNOSTIC_READY.load(Ordering::Acquire) {
+    if !crate::runtime::current()
+        .diagnostic_ready
+        .load(Ordering::Acquire)
+    {
         return None;
     }
     let state = runtime().heap.try_lock().ok()?;
@@ -505,7 +527,11 @@ pub(crate) fn diagnostic_survivors() -> Option<crate::gc_telemetry::GcSurvivorSt
 
 #[cfg(all(test, debug_assertions))]
 pub(crate) fn diagnostic_invalid_pointer_for_test() {
-    checked_payload_to_header(8usize as *mut u8, "diagnostic regression");
+    checked_payload_to_header(
+        crate::runtime::current(),
+        8usize as *mut u8,
+        "diagnostic regression",
+    );
 }
 
 /// Separately coherent survivor admission counters; region reservation bytes

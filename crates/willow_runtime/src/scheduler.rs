@@ -1,10 +1,22 @@
+#[path = "scheduler_mutex_observation.rs"]
+mod mutex_observation;
+use mutex_observation::{MutexObservation, RuntimeMutexObservation};
+
+#[path = "scheduler_retry_observation.rs"]
+mod retry_observation;
+use retry_observation::{RetryObservation, RetrySample, RuntimeRetryObservation};
+
+#[path = "scheduler_queue_observation.rs"]
+mod queue_observation;
+use queue_observation::{QueueObservation, RuntimeQueueObservation};
+
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use willow_abi::workers::{default_worker_count, parse_worker_count};
 
@@ -27,11 +39,6 @@ struct RetiredFrame {
 /// The ordinary run loop scans only once this batch is reached. Explicit
 /// major collection and outermost drive exit also release smaller batches.
 const FRAME_RELEASE_MIN_BATCH: usize = 64;
-
-/// Raised under the scheduler mutex when the retired-frame queue reaches its
-/// scan threshold, read without it so the run loop's per-iteration check
-/// costs one atomic load.
-static FRAME_RELEASE_DUE: AtomicBool = AtomicBool::new(false);
 
 /// Lock-free half of terminal task cleanup. The task record is already gone
 /// when this runs, so channel addresses and the exact lock reverse link must be
@@ -123,11 +130,10 @@ impl RuntimeWorkerConfig {
         self.active_workers
     }
 
-    #[cfg(test)]
-    fn single_worker() -> Self {
+    pub(crate) fn with_workers(workers: usize) -> Self {
         Self {
-            requested_workers: 1,
-            active_workers: 1,
+            requested_workers: workers.max(1),
+            active_workers: workers.max(1),
         }
     }
 }
@@ -139,16 +145,17 @@ impl RuntimeWorkerConfig {
 /// claim path must stop handing out work first, or a sibling worker runs
 /// ordinary code past `await <panicked task>` in the window before the abort.
 ///
-static FATAL_PANIC_PENDING: AtomicBool = AtomicBool::new(false);
-
+/// The gate is `Runtime::fatal_panic_pending`: the siblings that must stop are
+/// that runtime's workers.
+///
 /// Close the claim gate. Only the fatal path calls this, and that path always
 /// ends in `std::process::abort`, so the gate is never reopened.
-fn begin_fatal_panic() {
-    FATAL_PANIC_PENDING.store(true, Ordering::Release);
+fn begin_fatal_panic(owner: &crate::runtime::Runtime) {
+    owner.fatal_panic_pending.store(true, Ordering::Release);
 }
 
-fn fatal_panic_pending() -> bool {
-    FATAL_PANIC_PENDING.load(Ordering::Acquire)
+fn fatal_panic_pending(owner: &crate::runtime::Runtime) -> bool {
+    owner.fatal_panic_pending.load(Ordering::Acquire)
 }
 
 /// Stop this worker for good: the thread that closed the gate is formatting an
@@ -159,12 +166,6 @@ fn park_until_fatal_abort() -> ! {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
-
-/// Nesting depth of live `SingleWorkerForTest` guards.
-#[cfg(test)]
-static TEST_SINGLE_WORKER: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static TEST_WORKER_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 
 /// Test-only: make the worker config report a single worker while the guard is
 /// alive, so process-global drives dispatch to one persistent worker.
@@ -177,38 +178,22 @@ static TEST_WORKER_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 /// run loop observes that its target is already done, so the drive returns a
 /// completion count the test never asked for.
 ///
-/// Hold this alongside `crate::gc::runtime_test_guard()`, and install it before
+/// Hold this alongside `crate::gc::isolated_runtime()`, and install it before
 /// `reset_global_scheduler_for_test()` so the fresh run queues are sized for one
 /// worker.
 #[cfg(test)]
-pub struct SingleWorkerForTest(());
+pub type SingleWorkerForTest = crate::runtime::SingleWorkerLease<'static>;
 
 #[cfg(test)]
 pub fn single_worker_for_test() -> SingleWorkerForTest {
-    TEST_SINGLE_WORKER.fetch_add(1, Ordering::AcqRel);
-    SingleWorkerForTest(())
-}
-
-#[cfg(test)]
-impl Drop for SingleWorkerForTest {
-    fn drop(&mut self) {
-        let previous = TEST_SINGLE_WORKER.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "single-worker test guard depth underflow");
-    }
+    crate::runtime::current().workers.single_worker()
 }
 
 pub fn runtime_worker_config() -> RuntimeWorkerConfig {
-    #[cfg(test)]
-    if TEST_SINGLE_WORKER.load(Ordering::Acquire) > 0 {
-        return RuntimeWorkerConfig::single_worker();
-    }
-    #[cfg(test)]
-    if let workers @ 1.. = TEST_WORKER_OVERRIDE.load(Ordering::Acquire) {
-        return RuntimeWorkerConfig {
-            requested_workers: workers,
-            active_workers: workers,
-        };
-    }
+    crate::runtime::current().workers.effective()
+}
+
+pub(crate) fn environment_worker_config() -> RuntimeWorkerConfig {
     RuntimeWorkerConfig::from_env_value(
         std::env::var("WILLOW_WORKERS").ok().as_deref(),
         default_worker_count(),
@@ -221,19 +206,14 @@ pub fn runtime_worker_config() -> RuntimeWorkerConfig {
 /// source. The global injection queue accepts concurrent foreign publishers.
 #[derive(Debug)]
 struct RunQueues {
+    parking: Arc<parking::Parking>,
+    retry_observation: RuntimeRetryObservation,
     locals: Vec<LocalRunQueue>,
     global: Injector<RuntimeTaskId>,
     global_len: AtomicUsize,
     metrics: crate::observability::RunQueueMetrics,
     worker_metrics: Vec<crate::observability::RunQueueMetrics>,
-    #[cfg(test)]
-    idle_notifications: AtomicUsize,
-    #[cfg(test)]
-    owner_notifications: AtomicUsize,
-    #[cfg(test)]
-    pause_global_publish: AtomicBool,
-    #[cfg(test)]
-    global_publish_gate: Mutex<()>,
+    observation: RuntimeQueueObservation,
 }
 
 /// Keep independently updated worker state apart. The owner is taken once per
@@ -242,6 +222,7 @@ struct RunQueues {
 #[repr(align(128))]
 #[derive(Debug)]
 struct LocalRunQueue {
+    retry_observation: RuntimeRetryObservation,
     inbox: Injector<RuntimeTaskId>,
     owner: Mutex<Option<Worker<RuntimeTaskId>>>,
     stealer: Stealer<RuntimeTaskId>,
@@ -256,12 +237,13 @@ struct LocalRunQueue {
 }
 
 impl LocalRunQueue {
-    fn new() -> Self {
+    fn new(retry_observation: RuntimeRetryObservation) -> Self {
         let owner = Worker::new_fifo();
         let stealer = owner.stealer();
         let spawned = Worker::new_lifo();
         let spawned_stealer = spawned.stealer();
         Self {
+            retry_observation,
             inbox: Injector::new(),
             owner: Mutex::new(Some(owner)),
             stealer,
@@ -361,12 +343,11 @@ impl LocalRunQueue {
                 .as_ref()
                 .filter(|context| context.queue == self as *const _ as usize)?;
             let fifo = || {
-                owner
-                    .worker
-                    .pop()
-                    .or_else(|| steal_retry_batch(&self.inbox, &owner.worker))
+                owner.worker.pop().or_else(|| {
+                    steal_retry_batch(&self.inbox, &owner.worker, &self.retry_observation)
+                })
             };
-            let oldest_spawned = || steal_retry(&self.spawned_stealer);
+            let oldest_spawned = || steal_retry(&self.spawned_stealer, &self.retry_observation);
             let turn = owner.pops.get().wrapping_add(1);
             owner.pops.set(turn);
             // Newest-first alone could starve older spawns and the FIFO deque
@@ -387,9 +368,9 @@ impl LocalRunQueue {
     }
 
     fn steal_without_count(&self) -> Option<RuntimeTaskId> {
-        steal_retry(&self.spawned_stealer)
-            .or_else(|| steal_retry(&self.stealer))
-            .or_else(|| steal_retry(&self.inbox))
+        steal_retry(&self.spawned_stealer, &self.retry_observation)
+            .or_else(|| steal_retry(&self.stealer, &self.retry_observation))
+            .or_else(|| steal_retry(&self.inbox, &self.retry_observation))
     }
 }
 
@@ -398,15 +379,17 @@ impl LocalRunQueue {
 /// order, so frequent turns would give up the bounded live set.
 const OLDEST_SPAWN_TURN: u32 = 1024;
 
-fn steal_retry_batch<T>(inbox: &Injector<T>, owner: &Worker<T>) -> Option<T> {
-    #[cfg(test)]
-    let mut probe = retry_measurements::RetryProbe::new(1);
+fn steal_retry_batch<T>(
+    inbox: &Injector<T>,
+    owner: &Worker<T>,
+    observation: &RuntimeRetryObservation,
+) -> Option<T> {
+    let mut probe = observation.begin(1);
     loop {
         match inbox.steal_batch_and_pop(owner) {
             Steal::Success(id) => return Some(id),
             Steal::Empty => return None,
             Steal::Retry => {
-                #[cfg(test)]
                 probe.retry();
                 std::hint::spin_loop();
             }
@@ -414,15 +397,13 @@ fn steal_retry_batch<T>(inbox: &Injector<T>, owner: &Worker<T>) -> Option<T> {
     }
 }
 
-fn steal_retry<T>(stealer: &impl FnSteal<T>) -> Option<T> {
-    #[cfg(test)]
-    let mut probe = retry_measurements::RetryProbe::new(0);
+fn steal_retry<T>(stealer: &impl FnSteal<T>, observation: &RuntimeRetryObservation) -> Option<T> {
+    let mut probe = observation.begin(0);
     loop {
         match stealer.steal_one() {
             Steal::Success(id) => return Some(id),
             Steal::Empty => return None,
             Steal::Retry => {
-                #[cfg(test)]
                 probe.retry();
                 std::hint::spin_loop();
             }
@@ -480,17 +461,19 @@ impl Drop for LocalOwnerGuard<'_> {
 
 impl RunQueues {
     fn new(worker_count: usize) -> Self {
+        Self::with_parking(worker_count, Arc::clone(&crate::runtime::current().parking))
+    }
+
+    fn with_parking(worker_count: usize, parking: Arc<parking::Parking>) -> Self {
         let worker_count = worker_count.max(1);
+        let retry_observation = RuntimeRetryObservation::default();
         Self {
-            #[cfg(test)]
-            idle_notifications: AtomicUsize::new(0),
-            #[cfg(test)]
-            owner_notifications: AtomicUsize::new(0),
-            #[cfg(test)]
-            pause_global_publish: AtomicBool::new(false),
-            #[cfg(test)]
-            global_publish_gate: Mutex::new(()),
-            locals: (0..worker_count).map(|_| LocalRunQueue::new()).collect(),
+            parking,
+            observation: RuntimeQueueObservation::default(),
+            locals: (0..worker_count)
+                .map(|_| LocalRunQueue::new(retry_observation.clone()))
+                .collect(),
+            retry_observation,
             global: Injector::new(),
             global_len: AtomicUsize::new(0),
             metrics: crate::observability::RunQueueMetrics::default(),
@@ -544,9 +527,8 @@ impl RunQueues {
     }
 
     fn notify_idle(&self) {
-        #[cfg(test)]
-        self.idle_notifications.fetch_add(1, Ordering::Relaxed);
-        notify_idle_waiters();
+        self.observation.idle_notification();
+        self.parking.notify_idle();
     }
 
     fn push_global(&self, id: RuntimeTaskId) {
@@ -581,14 +563,7 @@ impl RunQueues {
         if ids.is_empty() {
             return;
         }
-        #[cfg(test)]
-        if self.pause_global_publish.load(Ordering::Acquire) {
-            drop(
-                self.global_publish_gate
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            );
-        }
+        self.observation.before_global_publish();
         let previous_len = self.global_len.fetch_add(ids.len(), Ordering::AcqRel);
         for &id in ids {
             self.global.push(id);
@@ -619,7 +594,7 @@ impl RunQueues {
                         // deferred batch; do not notify twice at its boundary.
                         LOCAL_WAKE_NOTIFICATION_PENDING.with(|pending| pending.set(false));
                     }
-                    notify_local_work(backlog);
+                    self.parking.notify_local(backlog);
                 } else {
                     self.notify_idle();
                 }
@@ -656,9 +631,8 @@ impl RunQueues {
         match self.locals.get(owner) {
             Some(queue) => {
                 queue.publish(id);
-                #[cfg(test)]
-                self.owner_notifications.fetch_add(1, Ordering::Relaxed);
-                notify_worker_waiter(owner);
+                self.observation.owner_notification();
+                self.parking.notify_worker(owner);
                 self.worker_metrics[owner]
                     .local_pushes
                     .fetch_add(1, Ordering::Relaxed);
@@ -686,7 +660,7 @@ impl RunQueues {
             // Coalesce thief notifications until its boundary; all tasks are
             // already published and stealable. Large fanouts notify promptly.
             if backlog >= 32 {
-                notify_local_work(backlog);
+                self.parking.notify_local(backlog);
             } else if backlog > 1 {
                 LOCAL_WAKE_NOTIFICATION_PENDING.with(|pending| pending.set(true));
             }
@@ -701,7 +675,7 @@ impl RunQueues {
                 .locals
                 .get(worker)
                 .map_or(0, |queue| queue.len.load(Ordering::Acquire));
-            notify_local_work(backlog);
+            self.parking.notify_local(backlog);
             return backlog > 1;
         }
         false
@@ -726,7 +700,7 @@ impl RunQueues {
         if self.global_len.load(Ordering::Acquire) == 0 {
             return None;
         }
-        let id = steal_retry(&self.global)?;
+        let id = steal_retry(&self.global, &self.retry_observation)?;
         self.global_len.fetch_sub(1, Ordering::AcqRel);
         if refill
             && self.locals.len() > 1
@@ -742,7 +716,7 @@ impl RunQueues {
                     let count = (self.global_len.load(Ordering::Acquire) / 2).min(31);
                     let mut transferred = 0;
                     for _ in 0..count {
-                        let Some(next) = steal_retry(&self.global) else {
+                        let Some(next) = steal_retry(&self.global, &self.retry_observation) else {
                             break;
                         };
                         self.global_len.fetch_sub(1, Ordering::AcqRel);
@@ -817,6 +791,7 @@ impl RunQueues {
 
     fn remove(&self, id: RuntimeTaskId) -> bool {
         if Self::remove_from(
+            &self.retry_observation,
             &self.global,
             &self.global,
             self.global.len(),
@@ -850,6 +825,7 @@ impl RunQueues {
             };
             removed_from_owner
                 || Self::remove_from(
+                    &self.retry_observation,
                     &queue.inbox,
                     &queue.inbox,
                     queue.inbox.len(),
@@ -880,6 +856,7 @@ impl RunQueues {
     // Placeholder-only maintenance. Length stays elevated while retained
     // tokens are in transit, preserving the idle-stop invariant.
     fn remove_from(
+        observation: &RuntimeRetryObservation,
         source: &impl FnSteal<RuntimeTaskId>,
         destination: &Injector<RuntimeTaskId>,
         count: usize,
@@ -888,7 +865,7 @@ impl RunQueues {
     ) -> bool {
         let mut found = false;
         for _ in 0..count {
-            let Some(next) = steal_retry(source) else {
+            let Some(next) = steal_retry(source, observation) else {
                 break;
             };
             if next == id && !found {
@@ -917,6 +894,7 @@ impl RunQueues {
     #[cfg(test)]
     fn snapshot(&self) -> Vec<RuntimeTaskId> {
         fn inspect(
+            observation: &RuntimeRetryObservation,
             source: &impl FnSteal<RuntimeTaskId>,
             dest: &Injector<RuntimeTaskId>,
             n: usize,
@@ -924,7 +902,9 @@ impl RunQueues {
         ) {
             let start = out.len();
             for _ in 0..n {
-                let Some(id) = steal_retry(source) else { break };
+                let Some(id) = steal_retry(source, observation) else {
+                    break;
+                };
                 out.push(id);
             }
             for &id in &out[start..] {
@@ -932,7 +912,13 @@ impl RunQueues {
             }
         }
         let mut ids = Vec::with_capacity(self.len());
-        inspect(&self.global, &self.global, self.global.len(), &mut ids);
+        inspect(
+            &self.retry_observation,
+            &self.global,
+            &self.global,
+            self.global.len(),
+            &mut ids,
+        );
         for queue in &self.locals {
             // Test-only, quiescent inspection: restore each source in place.
             // A Stealer cannot restore an active foreign owner's deque.
@@ -975,13 +961,19 @@ impl RunQueues {
                     }
                 }
             });
-            inspect(&queue.inbox, &queue.inbox, queue.inbox.len(), &mut ids);
+            inspect(
+                &self.retry_observation,
+                &queue.inbox,
+                &queue.inbox,
+                queue.inbox.len(),
+                &mut ids,
+            );
         }
         ids
     }
 
     fn clear(&self) {
-        while steal_retry(&self.global).is_some() {
+        while steal_retry(&self.global, &self.retry_observation).is_some() {
             self.global_len.fetch_sub(1, Ordering::AcqRel);
         }
         for queue in &self.locals {
@@ -1028,6 +1020,7 @@ struct TerminalEpoch(AtomicU64);
 /// table's ownership lock.
 #[derive(Debug)]
 struct ShardedTaskTable {
+    lock_observation: RuntimeMutexObservation,
     shards: Vec<PaddedTaskShard>,
     /// Exact O(1) summary of tasks in `BlockedSyscall`.
     ///
@@ -1047,16 +1040,21 @@ struct ShardedTaskTable {
     /// read sees the transition, or its epoch read precedes the advance and
     /// the next iteration looks again.
     terminal_epoch: TerminalEpoch,
+    /// Cancel requests recorded in this table; running tasks cache their
+    /// cancellation against it, so other runtimes' requests never invalidate it.
+    cancel_epoch: crate::task_state::CancelEpoch,
 }
 
 impl ShardedTaskTable {
     fn new() -> Self {
         Self {
+            lock_observation: RuntimeMutexObservation::default(),
             shards: (0..TASK_TABLE_SHARDS)
                 .map(|_| PaddedTaskShard(Mutex::new(TaskShard::default())))
                 .collect(),
             blocked_syscall: AtomicUsize::new(0),
             terminal_epoch: TerminalEpoch(AtomicU64::new(0)),
+            cancel_epoch: crate::task_state::CancelEpoch::new(),
         }
     }
 
@@ -1073,8 +1071,7 @@ impl ShardedTaskTable {
     }
 
     fn lock_shard(&self, index: usize) -> std::sync::MutexGuard<'_, TaskShard> {
-        #[cfg(test)]
-        switch_lock_tests::record_mutex();
+        self.lock_observation.acquired();
         self.shards[index]
             .0
             .lock()
@@ -1457,12 +1454,12 @@ impl RuntimeScheduler {
     fn with_task_state<R>(
         &mut self,
         id: RuntimeTaskId,
-        mutate: impl FnOnce(&mut RuntimeTask) -> R,
+        mutate: impl FnOnce(&mut RuntimeTask, &ShardedTaskTable) -> R,
     ) -> Option<R> {
         let tasks = Arc::clone(&self.tasks);
         tasks.with_mut(id, |task| {
             let before = task.state.lifecycle();
-            let result = mutate(task);
+            let result = mutate(task, &tasks);
             let after = task.state.lifecycle();
             tasks.reconcile_blocked_transition(before, after);
             result
@@ -1556,7 +1553,7 @@ impl RuntimeScheduler {
             let has_cleanup =
                 outcome == ClaimOutcome::Cancel && task.cancel.is_some() && !task.frame.is_null();
             if outcome == ClaimOutcome::Poll || (outcome == ClaimOutcome::Cancel && has_cleanup) {
-                TaskExecution::claim(task);
+                TaskExecution::claim(task, &self.tasks.cancel_epoch);
             }
             (outcome, has_cleanup, task.panic_context())
         })?;
@@ -1609,7 +1606,7 @@ impl RuntimeScheduler {
                 ))]
                 if CURRENT_EXECUTION.with(|slot| {
                     let current = slot.borrow();
-                    if current.owner == Some(task.id) {
+                    if current.owns(task) {
                         current
                             .stack
                             .as_ref()
@@ -1695,7 +1692,7 @@ impl RuntimeScheduler {
         if lifecycle == TaskLifecycle::Ready && is_queued {
             self.remove_placeholder_queue_entry(id);
         }
-        let _ = self.with_task_state(id, |task| {
+        let _ = self.with_task_state(id, |task, _| {
             match task.state.lifecycle() {
                 TaskLifecycle::Ready => {
                     if !task.state.load().is_queued() {
@@ -1852,8 +1849,8 @@ impl RuntimeScheduler {
         {
             self.remove_placeholder_queue_entry(id);
         }
-        let claimed = self
-            .with_task_state(id, |task| {
+        let context = self
+            .with_task_state(id, |task, tasks| {
                 match task.state.lifecycle() {
                     TaskLifecycle::Ready => {
                         if !task.state.load().is_queued() {
@@ -1863,8 +1860,13 @@ impl RuntimeScheduler {
                     TaskLifecycle::Parked | TaskLifecycle::BlockedSyscall => {
                         let _ = task.state.wake();
                     }
-                    TaskLifecycle::Running | TaskLifecycle::Cancelling => return true,
-                    TaskLifecycle::Terminal => return false,
+                    TaskLifecycle::Running | TaskLifecycle::Cancelling => {
+                        if !CURRENT_EXECUTION.with(|slot| slot.borrow().owns(task)) {
+                            TaskExecution::claim(task, &tasks.cancel_epoch);
+                        }
+                        return Some(task.panic_context());
+                    }
+                    TaskLifecycle::Terminal => return None,
                 }
                 task.yield_requested = false;
                 task.started = true;
@@ -1873,13 +1875,17 @@ impl RuntimeScheduler {
                     ClaimOutcome::Poll | ClaimOutcome::Cancel
                 );
                 if claimed {
-                    TaskExecution::claim(task);
+                    TaskExecution::claim(task, &tasks.cancel_epoch);
+                    Some(task.panic_context())
+                } else {
+                    None
                 }
-                claimed
             })
-            .unwrap_or(false);
-        if claimed {
-            set_current_task(Some(id));
+            .flatten();
+        if let Some(context) = context {
+            // Resolve through this scheduler while its task shard is held.
+            // Independent schedulers may have the same numeric task id.
+            set_current_task_context(id, context);
         }
     }
 
@@ -2002,7 +2008,7 @@ impl RuntimeScheduler {
         {
             self.set_running(id);
         }
-        self.with_task_state(id, |task| {
+        self.with_task_state(id, |task, _| {
             TaskExecution::publish(task);
             let _ = task.state.park_after_poll();
         });
@@ -2095,23 +2101,16 @@ impl RuntimeScheduler {
 // the task is pending/running, so a parked/ready task's live values survive
 // collection even though no native stack frame holds them (spec §8.2 / §9).
 
-/// The run queues, task table and timers every scheduler entry point shares.
-///
-///
-/// Only test reset replaces them. The hot path runs once per task poll on every
-/// worker, so reaching the components must not write a shared cache line: a
-/// `RwLock` read bumps its reader count and an `Arc` clone bumps its refcount,
-/// and either one bounces between cores. The pointer is published once from
-/// `Box::into_raw` and read with one acquire load. A replaced set is leaked
-/// rather than freed, because callers hold `&'static` borrows without any
-/// guard; that happens only under `cfg(test)`.
+/// The run queues, task table and timers shared within one scheduler service.
 struct SchedulerComponents {
+    affinities: crate::worker_affinity::Registry,
     run_queues: Arc<RunQueues>,
     tasks: Arc<ShardedTaskTable>,
     timers: Arc<TimerQueue>,
     retirements: Arc<TerminalRetirements>,
     next_task_id: Arc<AtomicU64>,
     frame_roots: Arc<AtomicUsize>,
+    claims: Arc<AccountingWords>,
 }
 
 impl SchedulerComponents {
@@ -2122,13 +2121,27 @@ impl SchedulerComponents {
     /// Task ids start at 1 (id 0 is the `willow_sched_current_task()` "no
     /// running task" sentinel).
     fn with_run_queues(run_queues: Arc<RunQueues>) -> Self {
+        Self::with_domain(
+            run_queues,
+            Arc::clone(&crate::runtime::current().frame_reclaim),
+            crate::worker_affinity::Registry::Default,
+        )
+    }
+
+    fn with_domain(
+        run_queues: Arc<RunQueues>,
+        reclaim: Arc<crate::frame_reclaim::Domain>,
+        affinities: crate::worker_affinity::Registry,
+    ) -> Self {
         Self {
+            affinities,
             run_queues,
             tasks: Arc::new(ShardedTaskTable::new()),
             timers: Arc::new(TimerQueue::new()),
-            retirements: Arc::new(TerminalRetirements::new()),
+            retirements: Arc::new(TerminalRetirements::new(reclaim)),
             next_task_id: Arc::new(AtomicU64::new(1)),
             frame_roots: Arc::new(AtomicUsize::new(0)),
+            claims: Arc::new(AccountingWords::new()),
         }
     }
 
@@ -2147,10 +2160,6 @@ impl SchedulerComponents {
             run_queues: &self.run_queues,
             retirements: &self.retirements,
         }
-    }
-
-    fn publish(self) -> *mut Self {
-        Box::into_raw(Box::new(self))
     }
 }
 
@@ -2225,24 +2234,97 @@ impl SpawnTarget<'_> {
     }
 }
 
-static GLOBAL_COMPONENTS: LazyLock<AtomicPtr<SchedulerComponents>> = LazyLock::new(|| {
-    AtomicPtr::new(SchedulerComponents::new(runtime_worker_config().active_workers()).publish())
-});
-
-fn global_components() -> &'static SchedulerComponents {
-    // SAFETY: every stored pointer comes from `SchedulerComponents::publish`
-    // and is never freed, so the referent lives for the rest of the process.
-    unsafe { &*GLOBAL_COMPONENTS.load(Ordering::Acquire) }
+/// Owns scheduler storage and its metadata facade. Readers borrow the service,
+/// not a process-lifetime leaked allocation. The hot lookup is one acquire
+/// load, without a mutex or shared reference-count write.
+///
+/// Compatibility resets retain prior generations until this service drops:
+/// an outstanding reader may still borrow one. Production creates one
+/// generation. A private instance releases all generations at teardown.
+pub(crate) struct SchedulerServices {
+    scheduler: Mutex<RuntimeScheduler>,
+    current: AtomicPtr<SchedulerComponents>,
+    _retained_generations: Mutex<Vec<Arc<SchedulerComponents>>>,
 }
 
-/// Install fresh components and return them. The old set is leaked (see
-/// [`SchedulerComponents`]).
+impl SchedulerServices {
+    pub(crate) fn new(worker_count: usize) -> Self {
+        Self::new_in(
+            worker_count,
+            Arc::clone(&crate::runtime::current().frame_reclaim),
+            Arc::clone(&crate::runtime::current().parking),
+            crate::worker_affinity::Registry::Default,
+        )
+    }
+
+    pub(crate) fn new_in(
+        worker_count: usize,
+        reclaim: Arc<crate::frame_reclaim::Domain>,
+        parking: Arc<parking::Parking>,
+        affinities: crate::worker_affinity::Registry,
+    ) -> Self {
+        let components = Arc::new(SchedulerComponents::with_domain(
+            Arc::new(RunQueues::with_parking(worker_count, parking)),
+            reclaim,
+            affinities,
+        ));
+        Self {
+            scheduler: Mutex::new(RuntimeScheduler::from_components(&components)),
+            current: AtomicPtr::new(Arc::as_ptr(&components).cast_mut()),
+            _retained_generations: Mutex::new(vec![components]),
+        }
+    }
+
+    fn components(&self) -> &SchedulerComponents {
+        // SAFETY: every published pointer is retained in `_retained_generations` until
+        // self drops. Moving the Vec or its Arcs never moves their allocations.
+        // The return lifetime is bounded by self, excluding owner destruction.
+        unsafe { &*self.current.load(Ordering::Acquire) }
+    }
+
+    fn with_scheduler<'a, R>(
+        owner: impl FnOnce() -> &'a Self,
+        f: impl FnOnce(&mut RuntimeScheduler) -> R,
+    ) -> R {
+        // Lazy initialization, as well as the metadata lock, must happen with
+        // preemption disabled: reentry during initialization could deadlock.
+        let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+        let mut scheduler = owner().scheduler.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut scheduler)
+    }
+
+    #[cfg(test)]
+    fn replace_components(&self, worker_count: usize) -> &SchedulerComponents {
+        let fresh = Arc::new(SchedulerComponents::with_domain(
+            Arc::new(RunQueues::with_parking(
+                worker_count,
+                Arc::clone(&self.components().run_queues.parking),
+            )),
+            Arc::clone(&self.components().retirements.reclaim),
+            self.components().affinities.clone(),
+        ));
+        let pointer = Arc::as_ptr(&fresh).cast_mut();
+        let mut generations = self
+            ._retained_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        generations.push(fresh);
+        self.current.store(pointer, Ordering::Release);
+        // SAFETY: the owning Arc was retained before publication, and will not
+        // be removed while any borrow of this service can exist.
+        unsafe { &*pointer }
+    }
+}
+
+fn global_components() -> &'static SchedulerComponents {
+    crate::runtime::current().scheduler().components()
+}
+
 #[cfg(test)]
 fn replace_global_components(worker_count: usize) -> &'static SchedulerComponents {
-    let fresh = SchedulerComponents::new(worker_count).publish();
-    GLOBAL_COMPONENTS.store(fresh, Ordering::Release);
-    // SAFETY: `fresh` was just produced by `publish` and is never freed.
-    unsafe { &*fresh }
+    crate::runtime::current()
+        .scheduler()
+        .replace_components(worker_count)
 }
 
 pub(crate) fn run_queue_global_pushes() -> u64 {
@@ -2287,8 +2369,9 @@ fn global_task_table() -> &'static Arc<ShardedTaskTable> {
 /// reporting quiescence. That is the lost-wakeup behind an `await` returning
 /// early and a `select` giving up.
 ///
-/// Counted globally rather than per `ParallelRunState` so a nested drive and a
-/// foreign driver thread observe each other's claims too.
+/// Counted per scheduler rather than per `ParallelRunState` so nested drives
+/// and foreign driver threads using that scheduler observe each other's claims.
+/// Independent schedulers never participate in each other's stop decisions.
 ///
 /// Each shard's low [`CLAIM_COUNT_BITS`] bits count claims in flight. The high
 /// bits are an epoch advanced by popped claims and active/paused transfers. A
@@ -2335,7 +2418,9 @@ impl AccountingWords {
     }
 }
 
-static CLAIM_WORD: AccountingWords = AccountingWords::new();
+fn global_claim_words() -> &'static Arc<AccountingWords> {
+    &global_components().claims
+}
 
 const CLAIM_COUNT_BITS: u32 = 32;
 const CLAIM_COUNT_MASK: u64 = (1 << CLAIM_COUNT_BITS) - 1;
@@ -2344,21 +2429,31 @@ const CLAIM_RESOLVE: u64 = (1 << CLAIM_COUNT_BITS) - 1;
 
 #[cfg(test)]
 fn claim_word() -> u64 {
-    CLAIM_WORD.snapshot().into_iter().fold(0, u64::wrapping_add)
+    global_claim_words()
+        .snapshot()
+        .into_iter()
+        .fold(0, u64::wrapping_add)
 }
 
 /// RAII marker for the pop→claim window. Dropped only after the claim has
 /// resolved: either `active_polls` has been incremented, or the id has been
 /// pushed back / dropped, so idleness is never observable between the two
 /// states.
-struct ClaimInFlight {
-    word: &'static AtomicU64,
+struct ClaimInFlight<'a> {
+    word: &'a AtomicU64,
     advance_epoch: bool,
 }
 
-impl ClaimInFlight {
+#[cfg(test)]
+impl ClaimInFlight<'static> {
     fn enter() -> Self {
-        let word = CLAIM_WORD.local();
+        Self::enter_in(global_claim_words())
+    }
+}
+
+impl<'a> ClaimInFlight<'a> {
+    fn enter_in(claims: &'a AccountingWords) -> Self {
+        let word = claims.local();
         word.fetch_add(1, Ordering::SeqCst);
         Self {
             word,
@@ -2369,8 +2464,8 @@ impl ClaimInFlight {
     /// A paused/active transfer can invalidate a liveness scan without
     /// popping a task. Publish the in-flight marker before changing the poll
     /// word and advance the epoch after it, just like a resolved claim.
-    fn poll_transition() -> Self {
-        let mut transition = Self::enter();
+    fn poll_transition(claims: &'a AccountingWords) -> Self {
+        let mut transition = Self::enter_in(claims);
         transition.advance_epoch = true;
         transition
     }
@@ -2383,7 +2478,7 @@ impl ClaimInFlight {
     }
 }
 
-impl Drop for ClaimInFlight {
+impl Drop for ClaimInFlight<'_> {
     fn drop(&mut self) {
         let delta = if self.advance_epoch {
             CLAIM_RESOLVE
@@ -2400,15 +2495,17 @@ impl Drop for ClaimInFlight {
 /// treat this as pending work. A concurrent resolution may conservatively
 /// report work too; a subsequent quiet scan returns false.
 fn claims_in_flight() -> bool {
-    let before = CLAIM_WORD.snapshot();
-    claims_changed_or_in_flight(&before)
+    global_claim_words().in_flight()
 }
 
-/// A scan may straddle a handoff from a later shard to an earlier one. A
-/// popped claim advances its epoch, so a second collect detects that handoff
-/// even if the first collect happened to see every count at zero.
-fn claims_changed_or_in_flight(before: &[u64; ACCOUNTING_SHARDS]) -> bool {
-    before.iter().any(|word| word & CLAIM_COUNT_MASK > 0) || CLAIM_WORD.snapshot() != *before
+impl AccountingWords {
+    fn in_flight(&self) -> bool {
+        self.changed_or_in_flight(&self.snapshot())
+    }
+
+    fn changed_or_in_flight(&self, before: &[u64; ACCOUNTING_SHARDS]) -> bool {
+        before.iter().any(|word| word & CLAIM_COUNT_MASK > 0) || self.snapshot() != *before
+    }
 }
 
 /// Wake-deadlines, shared with the scheduler instance the same way the run
@@ -2419,15 +2516,8 @@ fn global_timers() -> &'static Arc<TimerQueue> {
     &global_components().timers
 }
 
-static GLOBAL_SCHEDULER: LazyLock<Mutex<RuntimeScheduler>> =
-    LazyLock::new(|| Mutex::new(RuntimeScheduler::from_components(global_components())));
-
 fn with_global<R>(f: impl FnOnce(&mut RuntimeScheduler) -> R) -> R {
-    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    let mut sched = GLOBAL_SCHEDULER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    f(&mut sched)
+    SchedulerServices::with_scheduler(|| crate::runtime::current().scheduler(), f)
 }
 
 /// Hot wake path: state, blocked-syscall accounting, and queue publication are
@@ -2450,8 +2540,13 @@ fn set_global_wake_after_millis(millis: i64) {
 /// decision. Always reads the heap under its own lock — never the lock-free
 /// hint, which is allowed to be transiently stale-empty.
 fn global_next_timer_deadline() -> Option<(RuntimeTaskId, Instant)> {
-    let tasks = global_task_table();
-    global_timers().next_deadline(|wake| timer_entry_is_current(tasks, wake))
+    next_timer_deadline_in(global_components())
+}
+
+fn next_timer_deadline_in(components: &SchedulerComponents) -> Option<(RuntimeTaskId, Instant)> {
+    components
+        .timers
+        .next_deadline(|wake| timer_entry_is_current(&components.tasks, wake))
 }
 
 /// Promote every timer due at `now` onto a run queue.
@@ -2462,21 +2557,25 @@ fn global_next_timer_deadline() -> Option<(RuntimeTaskId, Instant)> {
 /// process-global mutex acquisition. Missing a just-pushed timer
 /// here is harmless: the idle path re-reads the heap under its lock before it
 /// can conclude that the scheduler has nothing to do.
-fn wake_global_due_timers_now() -> usize {
-    if global_timers().maybe_armed() {
-        wake_global_due_timers(Instant::now())
+fn wake_due_timers_now_in(components: &SchedulerComponents) -> usize {
+    if components.timers.maybe_armed() {
+        wake_due_timers_in(components, Instant::now())
     } else {
         0
     }
 }
 
 fn wake_global_due_timers(now: Instant) -> usize {
-    let timers = global_timers();
+    wake_due_timers_in(global_components(), now)
+}
+
+fn wake_due_timers_in(components: &SchedulerComponents, now: Instant) -> usize {
+    let timers = &components.timers;
     if !timers.maybe_due(now) {
         return 0;
     }
-    let tasks = global_task_table();
-    let run_queues = global_run_queues();
+    let tasks = &components.tasks;
+    let run_queues = &components.run_queues;
     let woken = timers.wake_due(
         now,
         |wake| timer_entry_is_current(tasks, wake),
@@ -2507,9 +2606,18 @@ enum GlobalPollBoundary {
 /// mutex. Only the blocked-syscall aggregate needs reconciliation afterwards;
 /// ordinary Pending/yield/preempt transitions are task-shard + run-queue
 /// operations.
+#[cfg(test)]
 fn finish_global_poll_boundary(id: RuntimeTaskId, boundary: GlobalPollBoundary) {
-    let tasks = global_task_table();
-    let run_queues = global_run_queues();
+    finish_poll_boundary_in(global_components(), id, boundary);
+}
+
+fn finish_poll_boundary_in(
+    components: &SchedulerComponents,
+    id: RuntimeTaskId,
+    boundary: GlobalPollBoundary,
+) {
+    let tasks = &components.tasks;
+    let run_queues = &components.run_queues;
     tasks.with_mut(id, |task| {
         TaskExecution::publish(task);
         let before = task.state.lifecycle();
@@ -2522,7 +2630,7 @@ fn finish_global_poll_boundary(id: RuntimeTaskId, boundary: GlobalPollBoundary) 
         match boundary {
             GlobalPollBoundary::Preempted => {
                 task.worker_affinity
-                    .get_or_insert_with(|| crate::worker_affinity::acquire(current_worker()));
+                    .get_or_insert_with(|| components.affinities.acquire(current_worker()));
             }
             GlobalPollBoundary::Pending | GlobalPollBoundary::Runnable => {
                 task.worker_affinity = None
@@ -2556,7 +2664,10 @@ fn finish_global_poll_boundary(id: RuntimeTaskId, boundary: GlobalPollBoundary) 
 /// claimed, cancellation requests cannot move a running poll to Cancelling;
 /// they are reconciled at its boundary. Native stack ownership is likewise
 /// exclusive to the worker that claims the task.
-fn claimed_task_work(task: &mut RuntimeTask) -> ClaimedTaskWork {
+fn claimed_task_work(
+    task: &mut RuntimeTask,
+    cancel_epoch: &crate::task_state::CancelEpoch,
+) -> ClaimedTaskWork {
     let mut suspended = false;
     let mut cleanup = false;
     #[cfg(any(
@@ -2587,7 +2698,7 @@ fn claimed_task_work(task: &mut RuntimeTask) -> ClaimedTaskWork {
         direct_poll: task.cooperative_poll && !cleanup,
         direct_cancel: task.cooperative_poll && !task.native_cancel_cleanup,
     };
-    TaskExecution::claim(task);
+    TaskExecution::claim(task, cancel_epoch);
     work
 }
 
@@ -2597,6 +2708,12 @@ fn claimed_task_work(task: &mut RuntimeTask) -> ClaimedTaskWork {
 #[derive(Default)]
 struct TaskExecution {
     owner: Option<RuntimeTaskId>,
+    /// Address identity only: the panic context's allocation stays fixed while
+    /// its task lives. Numeric ids alone can alias between scheduler instances.
+    owner_identity: usize,
+    /// Epoch of the claimed task's table. The table outlives every poll it
+    /// claims; nested drives save and restore it with the rest of this state.
+    cancel_epoch_source: *const crate::task_state::CancelEpoch,
     cancel_epoch: u64,
     cancelled: bool,
     #[cfg(any(
@@ -2618,6 +2735,8 @@ impl TaskExecution {
     const fn new() -> Self {
         Self {
             owner: None,
+            owner_identity: 0,
+            cancel_epoch_source: std::ptr::null(),
             cancel_epoch: 0,
             cancelled: false,
             #[cfg(any(
@@ -2636,7 +2755,11 @@ impl TaskExecution {
         }
     }
 
-    fn claim(task: &mut RuntimeTask) {
+    fn owns(&self, task: &RuntimeTask) -> bool {
+        self.owner == Some(task.id) && self.owner_identity == task.preempt_flag_ptr() as usize
+    }
+
+    fn claim(task: &mut RuntimeTask, cancel_epoch: &crate::task_state::CancelEpoch) {
         CURRENT_EXECUTION.with(|slot| {
             let mut current = slot.borrow_mut();
             #[cfg(any(
@@ -2659,9 +2782,11 @@ impl TaskExecution {
                 current.stack = task.native_stack.take();
             }
             current.owner = Some(task.id);
+            current.owner_identity = task.preempt_flag_ptr() as usize;
             // Observe the epoch before the state, so a later request always
             // invalidates this snapshot before a helper trusts it.
-            current.cancel_epoch = crate::task_state::cancel_epoch();
+            current.cancel_epoch_source = cancel_epoch;
+            current.cancel_epoch = cancel_epoch.load();
             let state = task.state.load();
             current.cancelled =
                 state.cancel_requested() || state.lifecycle() == TaskLifecycle::Cancelling;
@@ -2673,7 +2798,7 @@ impl TaskExecution {
     fn publish(task: &mut RuntimeTask) {
         CURRENT_EXECUTION.with(|slot| {
             let mut current = slot.borrow_mut();
-            if current.owner != Some(task.id) {
+            if !current.owns(task) {
                 return;
             }
             #[cfg(any(
@@ -2693,6 +2818,7 @@ impl TaskExecution {
                 task.native_stack = current.stack.take();
             }
             current.owner = None;
+            current.owner_identity = 0;
         });
     }
 }
@@ -2718,13 +2844,30 @@ fn current_task_id() -> Option<RuntimeTaskId> {
     CURRENT_TASK.with(Cell::get)
 }
 
+/// Claim-time cancellation snapshot of the running task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CancelSnapshot {
+    /// Epoch of the task's own table; valid while the task's poll runs.
+    pub(crate) source: *const crate::task_state::CancelEpoch,
+    pub(crate) epoch: u64,
+    pub(crate) cancelled: bool,
+}
+
+/// Cancel epoch of the task table of the runtime this thread serves.
+pub(crate) fn current_cancel_epoch() -> *const crate::task_state::CancelEpoch {
+    &global_task_table().cancel_epoch
+}
+
 /// Claim-time snapshot; callers compare the epoch before reusing it. Stack
 /// leases acquired repeatedly in one poll need no repeated task-table lookup.
-pub(crate) fn current_cancel_snapshot() -> Option<(u64, bool)> {
+pub(crate) fn current_cancel_snapshot() -> Option<CancelSnapshot> {
     CURRENT_EXECUTION.with(|slot| {
         let current = slot.borrow();
-        (current.owner.is_some() && current.owner == current_task_id())
-            .then_some((current.cancel_epoch, current.cancelled))
+        (current.owner.is_some() && current.owner == current_task_id()).then_some(CancelSnapshot {
+            source: current.cancel_epoch_source,
+            epoch: current.cancel_epoch,
+            cancelled: current.cancelled,
+        })
     })
 }
 
@@ -2736,9 +2879,10 @@ fn set_current_task(id: Option<RuntimeTaskId>) {
     crate::panic_context::willow_fault_site_clear();
     CURRENT_TASK.with(|current| current.set(id));
     let context = id.and_then(|task_id| {
-        global_task_table().with_mut(task_id, |task| {
-            if CURRENT_EXECUTION.with(|slot| slot.borrow().owner) != Some(task_id) {
-                TaskExecution::claim(task);
+        let tasks = global_task_table();
+        tasks.with_mut(task_id, |task| {
+            if !CURRENT_EXECUTION.with(|slot| slot.borrow().owns(task)) {
+                TaskExecution::claim(task, &tasks.cancel_epoch);
             }
             task.panic_context()
         })
@@ -2813,7 +2957,7 @@ fn spawn_global_task_initialized_inner(
     // runtime root back.
     let target = global_components().spawn_target();
     let id = target.reserve_task_id();
-    let mut root = PendingSpawnRoot::new(frame as *mut u8);
+    let mut root = PendingSpawnRoot::new(crate::runtime::current(), frame as *mut u8);
     initialize(id);
     target.publish(id, poll, frame, cancel, cooperative_poll);
     root.publish();
@@ -2830,15 +2974,17 @@ fn spawn_global_task_initialized_inner(
 /// Owns the runtime root between id reservation and task publication.
 /// Published tasks transfer that ownership to `RuntimeTask::frame_rooted`;
 /// unwinding initializers drop it here instead.
-struct PendingSpawnRoot {
+struct PendingSpawnRoot<'a> {
+    owner: &'a crate::runtime::Runtime,
     frame: *mut u8,
     published: bool,
 }
 
-impl PendingSpawnRoot {
-    fn new(frame: *mut u8) -> Self {
-        crate::gc::add_task_frame_root(frame);
+impl<'a> PendingSpawnRoot<'a> {
+    fn new(owner: &'a crate::runtime::Runtime, frame: *mut u8) -> Self {
+        crate::gc::add_task_frame_root_in(owner, frame);
         Self {
+            owner,
             frame,
             published: false,
         }
@@ -2849,10 +2995,10 @@ impl PendingSpawnRoot {
     }
 }
 
-impl Drop for PendingSpawnRoot {
+impl Drop for PendingSpawnRoot<'_> {
     fn drop(&mut self) {
         if !self.published {
-            crate::gc::willow_gc_remove_runtime_root(self.frame);
+            crate::gc::remove_runtime_root_in(self.owner, self.frame);
         }
     }
 }
@@ -2931,7 +3077,7 @@ pub extern "C" fn willow_sched_cancel(id: u64) {
     let changed = tasks
         .with_mut(id, |task| {
             let before = task.state.lifecycle();
-            let outcome = task.state.request_cancel();
+            let outcome = task.state.request_cancel(&tasks.cancel_epoch);
             if outcome != CancelOutcome::NoChange {
                 // Mirror the request into the frame header so
                 // `Task::is_cancelled()` is a plain load.
@@ -3176,7 +3322,7 @@ fn sched_await_check(id: u64) {
     // id-only path cannot tell Panicked from Completed. The gate answers the
     // question that matters: an unhandled panic is being published, and no
     // awaiter may resume before the abort.
-    if fatal_panic_pending() {
+    if fatal_panic_pending(crate::runtime::current()) {
         park_until_fatal_abort();
     }
     let id = id as RuntimeTaskId;
@@ -3267,11 +3413,10 @@ pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) 
 
 #[path = "scheduler_parking.rs"]
 mod parking;
-use parking::{
-    completion_wake_generation, current_wake_generation, notify_all_idle_waiters,
-    notify_idle_waiters, notify_local_work, notify_worker_waiter, wait_for_completion_event,
-    wait_for_event_since, wait_for_wake_since,
-};
+pub(crate) use parking::Parking;
+#[cfg(test)]
+use parking::notify_all_idle_waiters;
+use parking::{current_wake_generation, wait_for_wake_since};
 
 /// Record an explicit panic location for the current task (cold path).
 pub(crate) fn set_current_execution_site(frame: crate::stack_trace::RuntimeFrame) {
@@ -3468,7 +3613,7 @@ pub extern "C" fn willow_frame_await_check(frame: *mut c_void, id: u64) {
         sched_await_check(id);
         return;
     }
-    if fatal_panic_pending() {
+    if fatal_panic_pending(crate::runtime::current()) {
         // Awaiting a task whose panic escaped is not recoverable and has no
         // result to read: the process is aborting, so this task stops here
         // instead of running its continuation. The gate closes before the
@@ -3719,7 +3864,7 @@ struct SchedulerDriveGuard {
     saved_panic_context: Option<Arc<crate::panic_context::PanicContext>>,
     shared_state: Option<Arc<ParallelRunState>>,
     paused_parallel_poll: bool,
-    mutator: Option<crate::gc::MutatorRegistration>,
+    mutator: Option<crate::gc::MutatorRegistration<'static>>,
 }
 
 impl SchedulerDriveGuard {
@@ -3772,12 +3917,6 @@ impl Drop for SchedulerDriveGuard {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    // Inject a Rust unwind without crossing an extern "C" task-poll boundary.
-    static DRIVE_ENTRY_HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
-}
-
 fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instant>) -> i64 {
     crate::gc::scheduler_start(runtime_worker_config().active_workers());
     crate::stack_overflow::protect_current_thread();
@@ -3791,12 +3930,7 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
     // have exactly one registered thread, so `multi_mutator_active()` stays false
     // and GC behavior is unchanged.
     let drive = SchedulerDriveGuard::new();
-    #[cfg(test)]
-    DRIVE_ENTRY_HOOK.with(|hook| {
-        if let Some(hook) = hook.take() {
-            hook();
-        }
-    });
+    crate::observation::SchedulerHooks::drive(crate::runtime::current);
     let outermost = drive.mutator.is_some();
     let shared_state = drive.shared_state.as_deref();
     let active_workers = runtime_worker_config().active_workers();
@@ -3835,19 +3969,23 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
 /// so a stop decision that follows the loser's poll sees the drain as a claim
 /// in flight, or its epoch advance, and refuses.
 fn drain_terminal_cleanups() {
-    let retirements = &global_components().retirements;
+    drain_terminal_cleanups_in(crate::runtime::current(), global_components());
+}
+
+fn drain_terminal_cleanups_in(owner: &crate::runtime::Runtime, components: &SchedulerComponents) {
+    let retirements = &components.retirements;
     let pending = &retirements.cleanups_pending;
     if !pending.load(Ordering::Acquire) {
         return;
     }
-    let mut in_flight = ClaimInFlight::enter();
+    let mut in_flight = ClaimInFlight::enter_in(&components.claims);
     if !pending.swap(false, Ordering::AcqRel) {
         return;
     }
     in_flight.popped();
     let cleanups = retirements.take_cleanups();
     for cleanup in cleanups {
-        crate::netpoll::purge_task(cleanup.task_id);
+        owner.netpoll.purge_task(cleanup.task_id);
         crate::channel::purge_task_from_tokens(cleanup.task_id, cleanup.channel_waits);
         // A task that dies while queued on (or holding a reservation for) a
         // scheduler-aware lock must not strand it: phase-driven cleanup removes
@@ -3858,42 +3996,51 @@ fn drain_terminal_cleanups() {
 }
 
 /// Unroot the retired frames whose grace period has ended.
-/// Unless `force`d, runs only once a retirement raised [`FRAME_RELEASE_DUE`],
+/// Unless `force`d, runs only once a retirement raised `TerminalRetirements::frame_release_due`,
 /// so the run loop's empty case takes no lock. The run loop calls outside its
 /// execution unit. Explicit GC may call inside a unit: that conservatively
 /// keeps covered retirements while allowing older, quiescent ones to progress.
 pub(crate) fn release_quiescent_frame_roots(force: bool) {
-    // Load before swapping: the common case must not write the shared line.
-    let due = FRAME_RELEASE_DUE.load(Ordering::Acquire)
-        && FRAME_RELEASE_DUE.swap(false, Ordering::AcqRel);
+    let owner = crate::runtime::current();
+    release_quiescent_frame_roots_in(owner, global_components(), force);
+}
+
+fn release_quiescent_frame_roots_in(
+    owner: &crate::runtime::Runtime,
+    components: &SchedulerComponents,
+    force: bool,
+) {
+    let retirements = &components.retirements;
+    let due = retirements.frame_release_due.load(Ordering::Acquire)
+        && retirements.frame_release_due.swap(false, Ordering::AcqRel);
     if !due && !force {
         return;
     }
-    let bound = crate::frame_reclaim::release_bound();
-    let components = global_components();
-    let frames = components
-        .retirements
-        .take_quiescent_frames(bound, &components.frame_roots);
+    let bound = retirements.reclaim.release_bound();
+    let frames = retirements.take_quiescent_frames(bound, &components.frame_roots);
     for retired in frames {
-        crate::gc::willow_gc_remove_runtime_root(retired.frame as *mut u8);
-        crate::frame_lifetime::record(
+        crate::gc::remove_runtime_root_in(owner, retired.frame as *mut u8);
+        owner.frame_lifetime.record_with_sweep(
             crate::frame_lifetime::FrameEventKind::SchedulerRootReleased,
             retired.frame,
             retired.tag,
+            0,
             0,
         );
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ParallelRunState {
+    parking: Arc<parking::Parking>,
+    claims: Arc<AccountingWords>,
     stop: AtomicBool,
     /// Serializes stop decisions. A claim takes it only while
     /// `stop_intent` is raised, so the claim hot path writes no shared lock
     /// word.
     claim_gate: Mutex<()>,
     /// Raised by a stop decision, under `claim_gate`, for the whole snapshot.
-    /// With [`CLAIM_WORD`] it forms a store/load handshake: a claim increments
+    /// With the scheduler’s claim words it forms a store/load handshake: a claim increments
     /// the word and then reads this flag, a decision raises this flag and then
     /// reads the word, all `SeqCst`. Either the decision sees the claim, or
     /// the claim sees the flag and waits on `claim_gate` for the decision.
@@ -3927,7 +4074,30 @@ const POLL_ACTIVE_MASK: u64 = (1 << POLL_ACTIVE_BITS) - 1;
 /// back.
 const POLL_PAUSE: u64 = (1 << POLL_ACTIVE_BITS) - 1;
 
+impl Default for ParallelRunState {
+    fn default() -> Self {
+        Self::new(Arc::clone(global_claim_words()))
+    }
+}
+
 impl ParallelRunState {
+    fn new(claims: Arc<AccountingWords>) -> Self {
+        Self::new_in(claims, Arc::clone(&crate::runtime::current().parking))
+    }
+
+    fn new_in(claims: Arc<AccountingWords>, parking: Arc<parking::Parking>) -> Self {
+        Self {
+            parking,
+            claims,
+            stop: AtomicBool::new(false),
+            claim_gate: Mutex::new(()),
+            stop_intent: AtomicBool::new(false),
+            polls: AccountingWords::new(),
+            target: SharedTargetCheck::default(),
+            completed: AtomicI64::new(0),
+        }
+    }
+
     /// Publish `stop` if `quiescent` holds with every claim excluded. Returns
     /// whether the stop was published.
     ///
@@ -3950,13 +4120,13 @@ impl ParallelRunState {
         // changes its epoch; a claim entering after its first read sees the
         // raised intent before claiming. Thus no coherent all-shard instant
         // is needed. Never sum epochs here: compare each shard independently.
-        let before = CLAIM_WORD.snapshot();
+        let before = self.claims.snapshot();
         let stop = before.iter().all(|word| word & CLAIM_COUNT_MASK == 0)
             && quiescent(self)
-            && CLAIM_WORD.snapshot() == before;
+            && self.claims.snapshot() == before;
         if stop {
             self.stop.store(true, Ordering::SeqCst);
-            notify_all_idle_waiters();
+            self.parking.notify_all();
         }
         self.stop_intent.store(false, Ordering::SeqCst);
         stop
@@ -3980,8 +4150,8 @@ impl ParallelRunState {
     }
 
     fn has_active_peer_during(&self, caller: usize, scan: impl FnOnce() -> usize) -> bool {
-        let before = CLAIM_WORD.snapshot();
-        scan() > caller || claims_changed_or_in_flight(&before)
+        let before = self.claims.snapshot();
+        scan() > caller || self.claims.changed_or_in_flight(&before)
     }
 
     fn paused_polls(&self) -> usize {
@@ -4014,7 +4184,7 @@ impl ParallelRunState {
 
     /// Move the current poll from active to paused for a nested drive.
     fn pause_active_poll(&self) {
-        let _transition = ClaimInFlight::poll_transition();
+        let _transition = ClaimInFlight::poll_transition(&self.claims);
         let previous = self.polls.local().fetch_add(POLL_PAUSE, Ordering::AcqRel);
         debug_assert!(
             previous & POLL_ACTIVE_MASK > 0,
@@ -4023,7 +4193,7 @@ impl ParallelRunState {
     }
 
     fn resume_paused_poll(&self) {
-        let _transition = ClaimInFlight::poll_transition();
+        let _transition = ClaimInFlight::poll_transition(&self.claims);
         let previous = self.polls.local().fetch_sub(POLL_PAUSE, Ordering::AcqRel);
         debug_assert!(
             previous >> POLL_ACTIVE_BITS > 0,
@@ -4050,25 +4220,26 @@ struct WorkerDrive {
     state: Arc<ParallelRunState>,
     deadline: Option<Instant>,
     finished: Arc<ParallelCompletion>,
-    #[cfg(test)]
-    entry_hook: Option<fn()>,
 }
 
-fn persistent_worker_loop(worker: usize, receiver: std::sync::mpsc::Receiver<WorkerDrive>) {
+fn persistent_worker_loop(
+    worker: usize,
+    receiver: std::sync::mpsc::Receiver<WorkerDrive>,
+    run: impl FnMut(usize, Option<RuntimeTaskId>, Arc<ParallelRunState>, Option<Instant>),
+) {
     // A Rust invariant panic cannot leave this thread: its driver is waiting
     // for completion, and the runtime may already be partially unwound. Willow
     // language panics use task outcomes and never unwind through this boundary.
     // The panic hook emits the original diagnostic before we terminate. Do not
     // drop the panic payload (its destructor can itself panic).
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut run = run;
         while let Ok(drive) = receiver.recv() {
-            #[cfg(test)]
-            if let Some(hook) = drive.entry_hook {
-                hook();
-            }
-            run_parallel_worker(worker, drive.target, drive.state, drive.deadline);
+            run(worker, drive.target, drive.state, drive.deadline);
             drive.finished.finish();
         }
+        // Captured service owners are part of the worker failure boundary too.
+        drop(run);
     }));
     if result.is_err() {
         std::process::abort();
@@ -4079,66 +4250,146 @@ fn persistent_worker_loop(worker: usize, receiver: std::sync::mpsc::Receiver<Wor
 #[path = "scheduler_worker_failure_tests.rs"]
 mod worker_failure_tests;
 
+/// The driver owns this pool; runners may own services, but not the pool itself.
+/// Keeping that ownership acyclic lets teardown disconnect and join every worker.
 #[derive(Default)]
-struct PersistentWorkers {
+pub(crate) struct PersistentWorkers {
     senders: Vec<std::sync::mpsc::Sender<WorkerDrive>>,
+    handles: Vec<std::thread::JoinHandle<()>>,
 }
 
-// Set once by the build-wide static initializer before any user code runs.
-static SINGLE_WORKER_STATICS: AtomicBool = AtomicBool::new(false);
+impl PersistentWorkers {
+    pub(crate) const fn new() -> Self {
+        Self {
+            senders: Vec::new(),
+            handles: Vec::new(),
+        }
+    }
 
+    /// The runner owns the services used by this worker. Production supplies
+    /// the runtime driver; isolated fixtures can supply their own executor.
+    /// A `serving` runtime is selected on the worker thread, so its implicit
+    /// default paths and thread-local caches belong to that runtime.
+    fn start_worker(
+        &mut self,
+        serving: Option<&'static crate::runtime::Runtime>,
+        run: impl FnMut(usize, Option<RuntimeTaskId>, Arc<ParallelRunState>, Option<Instant>)
+        + Send
+        + 'static,
+    ) {
+        let worker = self.senders.len();
+        let (sender, receiver) = std::sync::mpsc::channel::<WorkerDrive>();
+        let handle = std::thread::Builder::new()
+            .name(format!("willow-worker-{worker}"))
+            .spawn(move || {
+                if let Some(serving) = serving {
+                    serving.select_for_thread();
+                }
+                persistent_worker_loop(worker, receiver, run)
+            })
+            .unwrap_or_else(|_| {
+                crate::failure::resource_exhausted(format_args!(
+                    "cannot start persistent scheduler worker"
+                ))
+            });
+        self.senders.push(sender);
+        self.handles.push(handle);
+    }
+}
+
+impl Drop for PersistentWorkers {
+    fn drop(&mut self) {
+        // Disconnect every inbox before joining any worker. Queued drives
+        // finish in FIFO order; each worker then releases its captured owner.
+        self.senders.clear();
+        for handle in self.handles.drain(..) {
+            // A queued drive can collect. A registered joining thread must
+            // publish its roots rather than block that collection in join().
+            while !handle.is_finished() {
+                crate::gc::relocatable_safepoint();
+                std::thread::yield_now();
+            }
+            handle.join().unwrap_or_else(|_| {
+                crate::panic_context::fatal_invariant("persistent scheduler worker teardown failed")
+            });
+        }
+    }
+}
+
+/// Set once by the build-wide static initializer before any user code runs,
+/// on the thread that serves the program's runtime.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_require_single_worker_statics() {
-    SINGLE_WORKER_STATICS.store(true, Ordering::Release);
+    crate::runtime::current()
+        .single_worker_statics
+        .store(true, Ordering::Release);
 }
 
 fn static_mut_workers_allowed(has_static_mut: bool, workers: usize) -> bool {
     !has_static_mut || workers <= 1
 }
 
-static PERSISTENT_WORKERS: std::sync::LazyLock<Mutex<PersistentWorkers>> =
-    std::sync::LazyLock::new(|| Mutex::new(PersistentWorkers::default()));
-
 fn willow_sched_run_parallel(
     target: Option<RuntimeTaskId>,
     workers: usize,
     deadline: Option<Instant>,
 ) -> i64 {
+    sched_run_parallel_in(crate::runtime::current(), target, workers, deadline)
+}
+
+fn sched_run_parallel_in(
+    owner: &crate::runtime::Runtime,
+    target: Option<RuntimeTaskId>,
+    workers: usize,
+    deadline: Option<Instant>,
+) -> i64 {
+    let _mutator = crate::gc::MutatorRegistration::new_in(owner);
     // Hold drive ownership until all workers finish. Wait cooperatively because
     // another driver may be collecting while this caller is a registered mutator.
     let mut pool = loop {
-        match PERSISTENT_WORKERS.try_lock() {
+        match owner.worker_pool.try_lock() {
             Ok(pool) => break pool,
             Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                crate::gc::relocatable_safepoint();
+                crate::gc::relocatable_safepoint_in(owner);
                 std::thread::yield_now();
             }
         }
     };
     let workers = workers.max(1);
-    let workers = workers.max(crate::worker_affinity::required_workers());
-    if !static_mut_workers_allowed(SINGLE_WORKER_STATICS.load(Ordering::Acquire), workers) {
+    let workers = workers.max(owner.affinities.required_workers());
+    if !static_mut_workers_allowed(owner.single_worker_statics.load(Ordering::Acquire), workers) {
         crate::panic_context::fatal_invariant(
             "static mut requires single-worker execution; set WILLOW_WORKERS=1 or use immutable static Atomic/Mutex values",
         );
     }
     while pool.senders.len() < workers {
-        let worker = pool.senders.len();
-        let (sender, receiver) = std::sync::mpsc::channel::<WorkerDrive>();
-        std::thread::Builder::new()
-            .name(format!("willow-worker-{worker}"))
-            .spawn(move || persistent_worker_loop(worker, receiver))
-            .unwrap_or_else(|_| {
-                crate::failure::resource_exhausted(format_args!(
-                    "cannot start persistent scheduler worker"
-                ))
+        if std::ptr::eq(owner, crate::runtime::current()) {
+            pool.start_worker(Some(crate::runtime::current()), run_parallel_worker);
+        } else {
+            let weak = owner
+                .service_owner
+                .get()
+                .expect("persistent workers require a shared runtime")
+                .clone();
+            pool.start_worker(None, move |worker, target, state, deadline| {
+                // The synchronous drive keeps its owner alive until every
+                // callback returns. Idle workers hold only a Weak, so the
+                // runtime does not own a strong cycle through its own pool.
+                let owner = weak.upgrade().expect("active drive retains its runtime");
+                run_parallel_worker_in(&owner, worker, target, state, deadline);
             });
-        pool.senders.push(sender);
+        }
     }
-    let state = Arc::new(ParallelRunState::default());
-    let finished = Arc::new(ParallelCompletion::new(workers));
+    let state = Arc::new(ParallelRunState::new_in(
+        Arc::clone(&owner.scheduler().components().claims),
+        Arc::clone(&owner.parking),
+    ));
+    let finished = Arc::new(ParallelCompletion::new_in(
+        workers,
+        Arc::clone(&owner.parking),
+    ));
     for sender in pool.senders.iter().take(workers) {
         sender
             .send(WorkerDrive {
@@ -4146,12 +4397,10 @@ fn willow_sched_run_parallel(
                 state: Arc::clone(&state),
                 deadline,
                 finished: Arc::clone(&finished),
-                #[cfg(test)]
-                entry_hook: None,
             })
             .expect("scheduler worker terminated");
     }
-    finished.wait();
+    finished.wait_in(owner);
     state.completed.load(Ordering::Acquire)
 }
 
@@ -4159,32 +4408,42 @@ fn willow_sched_run_parallel(
 /// samples the wake generation before the counter, so the final wake (a
 /// generation bump) cannot be lost between the check and the park.
 struct ParallelCompletion {
+    parking: Arc<parking::Parking>,
     remaining: AtomicUsize,
 }
 
 impl ParallelCompletion {
     fn new(workers: usize) -> Self {
+        Self::new_in(workers, Arc::clone(&crate::runtime::current().parking))
+    }
+
+    fn new_in(workers: usize, parking: Arc<parking::Parking>) -> Self {
         Self {
+            parking,
             remaining: AtomicUsize::new(workers),
         }
     }
 
     fn finish(&self) {
         if self.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
-            notify_all_idle_waiters();
+            self.parking.notify_all();
         }
     }
 
     fn wait(&self) {
+        self.wait_in(crate::runtime::current());
+    }
+
+    fn wait_in(&self, owner: &crate::runtime::Runtime) {
         loop {
             // The waiter publishes its roots for the whole idle interval, so
             // only completion needs to interrupt its park.
-            let generation = completion_wake_generation();
-            crate::gc::relocatable_safepoint();
+            let generation = self.parking.completion_generation();
+            crate::gc::relocatable_safepoint_in(owner);
             if self.remaining.load(Ordering::SeqCst) == 0 {
                 return;
             }
-            wait_for_completion_event(generation);
+            self.parking.wait_completion(owner, generation);
         }
     }
 }
@@ -4195,16 +4454,30 @@ fn run_parallel_worker(
     state: Arc<ParallelRunState>,
     deadline: Option<Instant>,
 ) {
+    run_parallel_worker_in(crate::runtime::current(), worker, target, state, deadline);
+}
+
+fn run_parallel_worker_in(
+    owner: &crate::runtime::Runtime,
+    worker: usize,
+    target: Option<RuntimeTaskId>,
+    state: Arc<ParallelRunState>,
+    deadline: Option<Instant>,
+) {
     crate::stack_overflow::protect_current_thread();
     SCHED_RUN_DEPTH.with(|depth| depth.set(1));
     // An unwind out of the run loop must still unregister: a worker that dies
     // registered blocks every later collection forever.
-    let mutator = crate::gc::MutatorRegistration::new();
+    let mutator = crate::gc::MutatorRegistration::new_in(owner);
     let worker_state = Arc::clone(&state);
     with_parallel_context(worker, worker_state, || {
-        global_run_queues().with_owner(worker, || {
-            scheduler_run_loop(target, worker, Some(state.as_ref()), true, deadline);
-        });
+        owner
+            .scheduler()
+            .components()
+            .run_queues
+            .with_owner(worker, || {
+                scheduler_run_loop_in(owner, target, worker, Some(state.as_ref()), true, deadline);
+            });
     });
     set_current_task(None);
     drop(mutator);
@@ -4231,10 +4504,14 @@ fn with_parallel_context<R>(
 }
 
 fn target_is_done(target: Option<RuntimeTaskId>) -> bool {
+    target_is_done_in(global_task_table(), target)
+}
+
+fn target_is_done_in(tasks: &ShardedTaskTable, target: Option<RuntimeTaskId>) -> bool {
     let Some(t) = target else {
         return false;
     };
-    !global_task_table()
+    !tasks
         .with(t, |task| !task.state.lifecycle().is_terminal())
         .unwrap_or(false)
 }
@@ -4249,6 +4526,7 @@ fn target_is_done(target: Option<RuntimeTaskId>) -> bool {
 /// epoch advances. The pool workers of one drive share one look per epoch
 /// through [`SharedTargetCheck`].
 struct TargetWatch<'a> {
+    tasks: &'a ShardedTaskTable,
     target: Option<RuntimeTaskId>,
     shared: Option<&'a SharedTargetCheck>,
     checked_at: Option<u64>,
@@ -4256,8 +4534,18 @@ struct TargetWatch<'a> {
 }
 
 impl<'a> TargetWatch<'a> {
+    #[cfg(test)]
     fn new(target: Option<RuntimeTaskId>, shared: Option<&'a SharedTargetCheck>) -> Self {
+        Self::new_in(global_task_table(), target, shared)
+    }
+
+    fn new_in(
+        tasks: &'a ShardedTaskTable,
+        target: Option<RuntimeTaskId>,
+        shared: Option<&'a SharedTargetCheck>,
+    ) -> Self {
         Self {
+            tasks,
             target,
             shared,
             checked_at: None,
@@ -4277,7 +4565,7 @@ impl<'a> TargetWatch<'a> {
         }
         // Read the epoch BEFORE the state: a transition after this read
         // advances the epoch past it, so a later call looks again.
-        let epoch = global_task_table().terminal_epoch();
+        let epoch = self.tasks.terminal_epoch();
         if self.checked_at == Some(epoch) {
             return false;
         }
@@ -4293,7 +4581,7 @@ impl<'a> TargetWatch<'a> {
                 return false;
             }
         }
-        self.done = target_is_done(self.target);
+        self.done = target_is_done_in(self.tasks, self.target);
         if self.done
             && let Some(shared) = self.shared
         {
@@ -4362,7 +4650,16 @@ pub extern "C" fn willow_sync_poll_cancel_cleanup() {
 
 /// Pop/steal without the scheduler metadata mutex, then take only the task
 /// shard needed for atomic state validation and task-work lookup.
+#[cfg(test)]
 fn claim_global_ready_for_worker(
+    worker: usize,
+    shared: Option<&ParallelRunState>,
+) -> Option<(RuntimeTaskId, ClaimedTaskWork)> {
+    claim_ready_for_worker_in(crate::runtime::current().scheduler(), worker, shared)
+}
+
+fn claim_ready_for_worker_in(
+    services: &SchedulerServices,
     worker: usize,
     shared: Option<&ParallelRunState>,
 ) -> Option<(RuntimeTaskId, ClaimedTaskWork)> {
@@ -4374,13 +4671,14 @@ fn claim_global_ready_for_worker(
         Drop,
     }
 
-    let queues = global_run_queues();
-    let tasks = global_task_table();
+    let components = services.components();
+    let queues = &components.run_queues;
+    let tasks = &components.tasks;
     loop {
         // Publish the claim BEFORE the pop removes the id from every queue, and
         // keep it published until the claim has resolved into an active poll or
         // a requeue.
-        let mut in_flight = ClaimInFlight::enter();
+        let mut in_flight = ClaimInFlight::enter_in(&components.claims);
         let id = queues.pop_for_worker(worker)?;
         in_flight.popped();
         // Only a stop decision in progress sends the claim through the gate. Outside one, the
@@ -4484,11 +4782,15 @@ fn claim_global_ready_for_worker(
                         }
                         task.yield_requested = false;
                         task.started = true;
-                        Claim::Work(claimed_task_work(task), task.panic_context())
+                        Claim::Work(
+                            claimed_task_work(task, &tasks.cancel_epoch),
+                            task.panic_context(),
+                        )
                     }
-                    ClaimOutcome::Cancel if task_requires_cancel_poll(task) => {
-                        Claim::Work(claimed_task_work(task), task.panic_context())
-                    }
+                    ClaimOutcome::Cancel if task_requires_cancel_poll(task) => Claim::Work(
+                        claimed_task_work(task, &tasks.cancel_epoch),
+                        task.panic_context(),
+                    ),
                     ClaimOutcome::Cancel => Claim::FinalizeCancelled,
                 }
             })
@@ -4505,7 +4807,10 @@ fn claim_global_ready_for_worker(
                 return Some((id, work));
             }
             Claim::FinalizeCancelled => {
-                with_global(|sched| sched.finalize_cancelled(id));
+                SchedulerServices::with_scheduler(
+                    || services,
+                    |sched| sched.finalize_cancelled(id),
+                );
                 crate::observability::record(
                     crate::observability::RuntimeEventKind::TaskCancelled,
                     Some(worker),
@@ -4608,8 +4913,8 @@ fn deadline_bounded(wait: Duration, deadline: Option<Instant>) -> Duration {
 
 // Timed/event-source and transient-claim fallback. Idle waiters publish GC
 // roots across their wait; pure compute needs no periodic fallback.
-fn idle_wait_bound(deadline: Option<Instant>) -> Duration {
-    let wait = global_next_timer_deadline()
+fn idle_wait_bound(components: &SchedulerComponents, deadline: Option<Instant>) -> Duration {
+    let wait = next_timer_deadline_in(components)
         .map(|(_, timer)| bounded_parallel_wait(duration_until(timer)))
         .unwrap_or(Duration::from_millis(1));
     deadline_bounded(wait, deadline)
@@ -4620,19 +4925,52 @@ fn idle_wait_bound(deadline: Option<Instant>) -> Duration {
 // whose readiness is supplied by the OS rather than the scheduler wait list.
 // Nested drives also retain bounded waits: a peer completion targets worker 0,
 // whereas their awaited target can belong to any worker.
-fn wait_for_scheduler_event(generation: u64, deadline: Option<Instant>) {
+fn wait_for_scheduler_event(
+    owner: &crate::runtime::Runtime,
+    components: &SchedulerComponents,
+    generation: u64,
+    deadline: Option<Instant>,
+) {
     if SCHED_RUN_DEPTH.with(Cell::get) > 1
         || deadline.is_some()
-        || global_next_timer_deadline().is_some()
-        || crate::netpoll::has_waiters()
+        || next_timer_deadline_in(components).is_some()
+        || owner.netpoll.has_waiters()
     {
-        wait_for_wake_since(generation, idle_wait_bound(deadline));
+        parking::wait_for_owner_event(
+            owner,
+            generation,
+            Some(idle_wait_bound(components, deadline)),
+        );
     } else {
-        wait_for_event_since(generation);
+        parking::wait_for_owner_event(owner, generation, None);
     }
 }
 
+fn wake_netpoll_in(
+    owner: &crate::runtime::Runtime,
+    components: &SchedulerComponents,
+    timeout: Option<Duration>,
+) -> usize {
+    let tasks = owner.netpoll.wait_ready_tasks(timeout);
+    let count = tasks.len();
+    for task in tasks {
+        crate::observability::record(
+            crate::observability::RuntimeEventKind::NetpollWake,
+            None,
+            task,
+            1,
+        );
+        wake_task_in(&components.tasks, &components.run_queues, task);
+    }
+    if count > 0 {
+        crate::gc::stress_collect_in(owner, "scheduler");
+    }
+    count
+}
+
 fn scheduler_idle_step(
+    owner: &crate::runtime::Runtime,
+    components: &SchedulerComponents,
     worker: usize,
     shared: Option<&ParallelRunState>,
     keep_alive_for_paused: bool,
@@ -4640,6 +4978,7 @@ fn scheduler_idle_step(
     generation: u64,
 ) -> bool {
     let parallel = shared.is_some();
+    let claims = shared.map_or_else(|| components.claims.as_ref(), |state| state.claims.as_ref());
 
     // A worker may have claimed the last ready task immediately before this
     // worker observed an empty queue. Read the poll count only after that queue
@@ -4648,28 +4987,36 @@ fn scheduler_idle_step(
     // A claim that has popped its task but not yet reached `active_polls` is
     // equally in-flight work, and is invisible in every other check.
     //
-    if claims_in_flight() {
+    if claims.in_flight() {
         // Empty claims publish no event when they finish. Reprobe this short
         // transition instead of waiting indefinitely for a nonexistent poll.
-        wait_for_wake_since(generation, idle_wait_bound(deadline));
+        parking::wait_for_owner_event(
+            owner,
+            generation,
+            Some(idle_wait_bound(components, deadline)),
+        );
         return true;
     }
     if let Some(state) = shared {
-        let before = CLAIM_WORD.snapshot();
+        let before = claims.snapshot();
         // Scan once, distinguishing an observed poll from a racing empty
         // claim. Only a poll promises a future boundary notification.
         if state.active_polls() > 0 {
-            wait_for_scheduler_event(generation, deadline);
+            wait_for_scheduler_event(owner, components, generation, deadline);
             return true;
         }
-        if claims_changed_or_in_flight(&before) {
-            wait_for_wake_since(generation, idle_wait_bound(deadline));
+        if claims.changed_or_in_flight(&before) {
+            parking::wait_for_owner_event(
+                owner,
+                generation,
+                Some(idle_wait_bound(components, deadline)),
+            );
             return true;
         }
     }
 
-    let earliest = global_next_timer_deadline();
-    if crate::netpoll::has_waiters() {
+    let earliest = next_timer_deadline_in(components);
+    if owner.netpoll.has_waiters() {
         if !parallel || worker == 0 {
             let timeout = if parallel {
                 Some(
@@ -4686,8 +5033,8 @@ fn scheduler_idle_step(
                 (None, Some(d)) => Some(duration_until(d)),
                 (None, None) => None,
             };
-            if crate::netpoll::wait_and_wake(timeout) > 0 {
-                crate::gc::stress_collect("scheduler");
+            if wake_netpoll_in(owner, components, timeout) > 0 {
+                crate::gc::stress_collect_in(owner, "scheduler");
                 return true;
             }
             // Parallel polling uses a bounded wait so worker 0 can also service
@@ -4697,7 +5044,11 @@ fn scheduler_idle_step(
                 return true;
             }
         } else {
-            wait_for_wake_since(generation, idle_wait_bound(deadline));
+            parking::wait_for_owner_event(
+                owner,
+                generation,
+                Some(idle_wait_bound(components, deadline)),
+            );
             return true;
         }
     }
@@ -4713,12 +5064,12 @@ fn scheduler_idle_step(
                 };
                 let wait = deadline_bounded(wait, deadline);
                 if !wait.is_zero() {
-                    wait_for_wake_since(generation, wait);
+                    parking::wait_for_owner_event(owner, generation, Some(wait));
                 }
             }
-            let woken = wake_global_due_timers(Instant::now());
+            let woken = wake_due_timers_in(components, Instant::now());
             for _ in 0..woken {
-                crate::gc::stress_collect("scheduler");
+                crate::gc::stress_collect_in(owner, "scheduler");
             }
             true
         }
@@ -4726,28 +5077,33 @@ fn scheduler_idle_step(
             && keep_alive_for_paused
             && shared.is_some_and(|state| state.paused_polls() > 0) =>
         {
-            wait_for_wake_since(generation, idle_wait_bound(deadline));
+            parking::wait_for_owner_event(
+                owner,
+                generation,
+                Some(idle_wait_bound(components, deadline)),
+            );
             true
         }
         None => {
             // Snapshot BEFORE checking BlockedSyscall state. If completion
             // races after the check, wait_for_wake_since observes the changed
             // generation and returns immediately instead of sleeping 50ms.
-            let generation = current_wake_generation();
+            let generation = owner.parking.generation();
             // Wake publishes its queue entry before decrementing the blocked
             // count. Observe those in the matching order: if the count is
             // already zero, the subsequent queue read must see the handoff.
-            let has_blocked_syscall = global_task_table().blocked_syscall_count() > 0;
+            let has_blocked_syscall = components.tasks.blocked_syscall_count() > 0;
             if has_blocked_syscall {
                 // The blocking-pool completion wake is the only signal, so
                 // keep the scheduler alive. The 50ms bound is only a portable
                 // fallback for missed/foreign notifications.
-                wait_for_wake_since(
+                parking::wait_for_owner_event(
+                    owner,
                     generation,
-                    deadline_bounded(Duration::from_millis(50), deadline),
+                    Some(deadline_bounded(Duration::from_millis(50), deadline)),
                 );
                 true
-            } else if global_run_queues().len() > 0 {
+            } else if components.run_queues.len() > 0 {
                 // Completion moved the task to Ready after this idle worker's
                 // earlier empty-queue observation.
                 true
@@ -4817,14 +5173,29 @@ const IDLE_READ_ORDER: [WorkSource; 6] = [
     WorkSource::Netpoll,
 ];
 
+#[cfg(test)]
 fn work_source_is_live(state: &ParallelRunState, source: WorkSource) -> bool {
+    work_source_is_live_in(
+        crate::runtime::current(),
+        global_components(),
+        state,
+        source,
+    )
+}
+
+fn work_source_is_live_in(
+    owner: &crate::runtime::Runtime,
+    components: &SchedulerComponents,
+    state: &ParallelRunState,
+    source: WorkSource,
+) -> bool {
     match source {
         WorkSource::Poll => state.has_live_poll(),
-        WorkSource::Timer => global_next_timer_deadline().is_some(),
-        WorkSource::BlockedSyscall => global_task_table().blocked_syscall_count() > 0,
-        WorkSource::RunQueue => global_run_queues().len() > 0,
-        WorkSource::Claim => claims_in_flight() || state.has_live_poll(),
-        WorkSource::Netpoll => crate::netpoll::has_waiters(),
+        WorkSource::Timer => next_timer_deadline_in(components).is_some(),
+        WorkSource::BlockedSyscall => components.tasks.blocked_syscall_count() > 0,
+        WorkSource::RunQueue => components.run_queues.len() > 0,
+        WorkSource::Claim => state.claims.in_flight() || state.has_live_poll(),
+        WorkSource::Netpoll => owner.netpoll.has_waiters(),
     }
 }
 
@@ -4835,10 +5206,19 @@ fn work_source_is_live(state: &ParallelRunState, source: WorkSource) -> bool {
 /// [`ParallelRunState::publish_stop_if`], which also validates the claim
 /// word around it and publishes the stop. See [`IDLE_READ_ORDER`] for why the
 /// order of the reads is what makes this answer trustworthy.
+#[cfg(test)]
 fn parallel_run_is_idle_locked(state: &ParallelRunState) -> bool {
+    parallel_run_is_idle_in(crate::runtime::current(), global_components(), state)
+}
+
+fn parallel_run_is_idle_in(
+    owner: &crate::runtime::Runtime,
+    components: &SchedulerComponents,
+    state: &ParallelRunState,
+) -> bool {
     !IDLE_READ_ORDER
         .iter()
-        .any(|source| work_source_is_live(state, *source))
+        .any(|source| work_source_is_live_in(owner, components, state, *source))
 }
 
 #[allow(clippy::too_many_lines, reason = "split pending")]
@@ -4849,8 +5229,32 @@ fn scheduler_run_loop(
     stop_pool_on_exit: bool,
     deadline: Option<Instant>,
 ) -> i64 {
+    scheduler_run_loop_in(
+        crate::runtime::current(),
+        target,
+        worker,
+        shared,
+        stop_pool_on_exit,
+        deadline,
+    )
+}
+
+#[allow(clippy::too_many_lines, reason = "split pending")]
+fn scheduler_run_loop_in(
+    owner: &crate::runtime::Runtime,
+    target: Option<RuntimeTaskId>,
+    worker: usize,
+    shared: Option<&ParallelRunState>,
+    stop_pool_on_exit: bool,
+    deadline: Option<Instant>,
+) -> i64 {
+    let _mutator = crate::gc::MutatorRegistration::new_in(owner);
+    let services = owner.scheduler();
+    let components = services.components();
+    let frame_participant = components.retirements.reclaim.participant();
     let mut completed = 0i64;
-    let mut target_watch = TargetWatch::new(
+    let mut target_watch = TargetWatch::new_in(
+        &components.tasks,
         target,
         shared
             .filter(|_| stop_pool_on_exit)
@@ -4859,12 +5263,12 @@ fn scheduler_run_loop(
     loop {
         // Snapshot before stop/target/GC observations: their notifications
         // must remain visible even if they race the later registration.
-        let wake_generation = current_wake_generation();
+        let wake_generation = owner.parking.generation();
         if SPAWN_NOTIFICATION_PENDING.with(|pending| pending.replace(false)) {
-            notify_idle_waiters();
+            owner.parking.notify_idle();
         }
-        global_run_queues().flush_local_wake_notification(worker);
-        if fatal_panic_pending() {
+        components.run_queues.flush_local_wake_notification(worker);
+        if fatal_panic_pending(owner) {
             park_until_fatal_abort();
         }
         if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
@@ -4897,7 +5301,7 @@ fn scheduler_run_loop(
                 if !stopped && !state.has_live_poll() {
                     // Only a claim was in flight. It resolves within a few
                     // instructions, so retry without the poll back-off.
-                    crate::gc::relocatable_safepoint();
+                    crate::gc::relocatable_safepoint_in(owner);
                     std::thread::yield_now();
                     continue;
                 }
@@ -4905,7 +5309,7 @@ fn scheduler_run_loop(
                     // Never enter the GC while holding `claim_gate`: a
                     // collector can be waiting for a worker that needs this
                     // gate before it reaches its own safepoint.
-                    crate::gc::relocatable_safepoint();
+                    crate::gc::relocatable_safepoint_in(owner);
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
@@ -4915,32 +5319,31 @@ fn scheduler_run_loop(
         // Cooperative GC safepoint: cheap (one atomic load) when no collection is
         // pending; lets a parallel collector stop this driver between task polls.
         //
-        crate::gc::relocatable_safepoint();
+        crate::gc::relocatable_safepoint_in(owner);
         // A runnable CPU task can keep the ready queue non-empty forever.
         // Promote expired timers before selecting work so those tasks still get
         // a turn without waiting for the scheduler to become idle. This runs on
         // every worker on every iteration, so it must stay cheap when no timer
         // exists: `wake_global_due_timers` answers that case with one atomic
         // load and takes no lock at all.
-        let woken_timers = wake_global_due_timers_now();
+        let woken_timers = wake_due_timers_now_in(components);
         let next = if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
             None
         } else {
-            claim_global_ready_for_worker(worker, shared)
+            claim_ready_for_worker_in(services, worker, shared)
         };
         // A claim can finalize a cancel-requested task. Purge its captured
         // external registrations outside the scheduler lock before selecting
         // more work.
-        drain_terminal_cleanups();
+        drain_terminal_cleanups_in(owner, components);
         // Outside any unit of this worker, so its own last poll no longer
         // holds back the frames retired during it.
-        release_quiescent_frame_roots(false);
+        release_quiescent_frame_roots_in(owner, components, false);
         for _ in 0..woken_timers {
-            crate::gc::stress_collect("scheduler");
+            crate::gc::stress_collect_in(owner, "scheduler");
         }
         let Some((id, work)) = next else {
-            #[cfg(test)]
-            idle_backoff_tests::record_failed_probe();
+            crate::observation::SchedulerHooks::idle(|| owner, 0);
             // No ready task. If a parked task has a wake-deadline (e.g. it is
             // sleeping), block until the earliest one and wake it, then keep
             // running. If netpoll has parked I/O waiters, wait for readiness
@@ -4951,7 +5354,7 @@ fn scheduler_run_loop(
             // Letting any worker stop the pool races with another worker that
             // is publishing a timer/netpoll waiter as its poll returns Pending.
             if stop_pool_on_exit && shared.is_some() && worker != 0 {
-                wait_for_scheduler_event(wake_generation, deadline);
+                wait_for_scheduler_event(owner, components, wake_generation, deadline);
                 continue;
             }
             // A nested run_until may wait on a target whose poll is itself
@@ -4959,6 +5362,8 @@ fn scheduler_run_loop(
             // any such target chain is paused instead of returning a zero/
             // uninitialized result to its awaiter.
             if scheduler_idle_step(
+                owner,
+                components,
                 worker,
                 shared,
                 stop_pool_on_exit || target.is_some(),
@@ -4977,7 +5382,8 @@ fn scheduler_run_loop(
                 // inside that rollback window left the pool for good, and any
                 // claim that read it requeued the task it was holding and went
                 // idle.
-                if !state.publish_stop_if(parallel_run_is_idle_locked) {
+                if !state.publish_stop_if(|state| parallel_run_is_idle_in(owner, components, state))
+                {
                     continue;
                 }
             }
@@ -4986,13 +5392,13 @@ fn scheduler_run_loop(
         // The gate can close between the check above and this claim, and the
         // task in hand may be exactly the awaiter that the fatal publication
         // just woke. Re-check before dispatching any work.
-        if fatal_panic_pending() {
+        if fatal_panic_pending(owner) {
             park_until_fatal_abort();
         }
         // Poll, cleanup and their post-poll boundaries form one unit: frames
         // retired while it runs keep their roots until it ends.
         // Idle waits stay outside it so a parked worker never delays release.
-        let _unit = crate::frame_reclaim::ExecutionUnit::enter();
+        let _unit = frame_participant.enter();
         // A task the claim moved to Cancelling: run its cleanup entry WITHOUT
         // the scheduler lock (poll-like), then finalize as Cancelled. The frame stays rooted
         // until finalization.
@@ -5002,7 +5408,8 @@ fn scheduler_run_loop(
             .map(|(_, frame)| *frame as usize)
             .or_else(|| work.poll.as_ref().map(|(_, frame, _)| *frame as usize))
             .unwrap_or(0);
-        let _poll_lifetime = crate::frame_lifetime::PollLifetime::enter(frame_identity);
+        let _poll_lifetime =
+            crate::frame_lifetime::PollLifetime::enter_in(&owner.frame_lifetime, frame_identity);
         if let Some((cancel_fn, cancel_frame)) = cancel_work {
             #[cfg(any(
                 all(
@@ -5022,9 +5429,13 @@ fn scheduler_run_loop(
                         crate::generated_context::invoke(cancel_fn as *const (), cancel_frame)
                     };
                 } else {
-                    let mut stack =
-                        crate::native_stack::NativeStack::acquire_cleanup(cancel_fn, cancel_frame);
-                    let flag = global_task_table()
+                    let mut stack = crate::native_stack::NativeStack::acquire_cleanup_in(
+                        owner,
+                        cancel_fn,
+                        cancel_frame,
+                    );
+                    let flag = components
+                        .tasks
                         .with(id, RuntimeTask::preempt_flag_ptr)
                         .unwrap_or(std::ptr::null());
                     crate::preempt::willow_preempt_begin(flag);
@@ -5038,7 +5449,7 @@ fn scheduler_run_loop(
                             RUNTIME_POLL_PREEMPTED => GlobalPollBoundary::Preempted,
                             _ => GlobalPollBoundary::Runnable,
                         };
-                        finish_global_poll_boundary(id, boundary);
+                        finish_poll_boundary_in(components, id, boundary);
                         let event = match result {
                             RUNTIME_POLL_PENDING => {
                                 crate::observability::RuntimeEventKind::TaskPark
@@ -5052,7 +5463,7 @@ fn scheduler_run_loop(
                         set_current_task(None);
                         finish_active_poll(shared);
                         if matches!(result, RUNTIME_POLL_PENDING | RUNTIME_POLL_BLOCKED_SYSCALL) {
-                            notify_worker_waiter(0);
+                            owner.parking.notify_worker(0);
                         }
                         continue;
                     }
@@ -5079,15 +5490,18 @@ fn scheduler_run_loop(
             if cleanup_panicked {
                 // Same ordering rule as the poll path: close the claim gate
                 // before the terminal publication wakes any awaiter.
-                begin_fatal_panic();
+                begin_fatal_panic(owner);
             }
-            with_global(|sched| {
-                if cleanup_panicked {
-                    sched.finalize_panicked(id);
-                } else {
-                    sched.finalize_cancelled(id);
-                }
-            });
+            SchedulerServices::with_scheduler(
+                || services,
+                |sched| {
+                    if cleanup_panicked {
+                        sched.finalize_panicked(id);
+                    } else {
+                        sched.finalize_cancelled(id);
+                    }
+                },
+            );
             crate::observability::record(
                 if cleanup_panicked {
                     crate::observability::RuntimeEventKind::TaskPanicked
@@ -5098,10 +5512,10 @@ fn scheduler_run_loop(
                 id,
                 0,
             );
-            drain_terminal_cleanups();
-            crate::gc::stress_collect("scheduler");
+            drain_terminal_cleanups_in(owner, components);
+            crate::gc::stress_collect_in(owner, "scheduler");
             finish_active_poll(shared);
-            notify_worker_waiter(0);
+            owner.parking.notify_worker(0);
             if cleanup_panicked {
                 crate::panic_context::finish_unhandled_with_async_chain(
                     panic_chain.as_deref().unwrap_or_default(),
@@ -5112,25 +5526,28 @@ fn scheduler_run_loop(
         }
         let Some((poll, frame, preempt_flag)) = work.poll else {
             // Placeholder task with no executable work: just complete it.
-            with_global(|sched| {
-                sched.complete(id);
-                sched.clear_running();
-            });
+            SchedulerServices::with_scheduler(
+                || services,
+                |sched| {
+                    sched.complete(id);
+                    sched.clear_running();
+                },
+            );
             crate::observability::record(
                 crate::observability::RuntimeEventKind::TaskComplete,
                 Some(worker),
                 id,
                 0,
             );
-            drain_terminal_cleanups();
-            crate::gc::stress_collect("await");
-            crate::gc::stress_collect("scheduler");
+            drain_terminal_cleanups_in(owner, components);
+            crate::gc::stress_collect_in(owner, "await");
+            crate::gc::stress_collect_in(owner, "scheduler");
             finish_active_poll(shared);
-            notify_worker_waiter(0);
+            owner.parking.notify_worker(0);
             record_completed_task(&mut completed, shared);
             continue;
         };
-        crate::gc::stress_collect("await");
+        crate::gc::stress_collect_in(owner, "await");
         crate::observability::record(
             crate::observability::RuntimeEventKind::TaskPoll,
             Some(worker),
@@ -5159,7 +5576,9 @@ fn scheduler_run_loop(
             } else {
                 let mut stack = CURRENT_EXECUTION
                     .with(|slot| slot.borrow_mut().stack.take())
-                    .unwrap_or_else(|| crate::native_stack::NativeStack::acquire(poll, frame));
+                    .unwrap_or_else(|| {
+                        crate::native_stack::NativeStack::acquire_in(owner, poll, frame)
+                    });
                 let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
                 let cancelled = stack.is_cancelled();
                 if stack.is_suspended() {
@@ -5192,7 +5611,8 @@ fn scheduler_run_loop(
         // cleanup callback and requeue into the ordinary cancellation entry.
         let result = if native_cancelled
             && result != RUNTIME_POLL_PANICKED
-            && global_task_table()
+            && components
+                .tasks
                 .with(id, |task| task.cancel.is_some())
                 .unwrap_or(false)
         {
@@ -5205,13 +5625,16 @@ fn scheduler_run_loop(
             .then(async_chain_text);
         match outcome {
             PollOutcome::Ready if native_cancelled => {
-                with_global(|sched| sched.finalize_cancelled(id));
+                SchedulerServices::with_scheduler(
+                    || services,
+                    |sched| sched.finalize_cancelled(id),
+                );
             }
             PollOutcome::Ready => {
                 // An executable task owns its frame here, so the placeholder
                 // preparation of `RuntimeScheduler::complete` does not apply.
                 let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-                global_components()
+                components
                     .terminal_target()
                     .finish(id, RuntimeTaskState::Completed);
             }
@@ -5219,7 +5642,8 @@ fn scheduler_run_loop(
                 // Runnable outcome (spec §7): gave up the worker but is not
                 // waiting on an event. This hot boundary stays off the global
                 // scheduler metadata lock.
-                finish_global_poll_boundary(
+                finish_poll_boundary_in(
+                    components,
                     id,
                     if matches!(outcome, PollOutcome::Preempted) {
                         GlobalPollBoundary::Preempted
@@ -5229,10 +5653,10 @@ fn scheduler_run_loop(
                 );
             }
             PollOutcome::BlockedSyscall => {
-                finish_global_poll_boundary(id, GlobalPollBoundary::BlockedSyscall);
+                finish_poll_boundary_in(components, id, GlobalPollBoundary::BlockedSyscall);
             }
             PollOutcome::Pending => {
-                finish_global_poll_boundary(id, GlobalPollBoundary::Pending);
+                finish_poll_boundary_in(components, id, GlobalPollBoundary::Pending);
             }
             PollOutcome::Panicked | PollOutcome::Invalid(_) => {
                 // Close the claim gate BEFORE the terminal publication. Spec
@@ -5241,8 +5665,8 @@ fn scheduler_run_loop(
                 // wakes this task's awaiters — without the gate another worker
                 // claims one and runs ordinary code past `await <panicked
                 // task>` in the window before the abort lands.
-                begin_fatal_panic();
-                with_global(|sched| sched.finalize_panicked(id));
+                begin_fatal_panic(owner);
+                SchedulerServices::with_scheduler(|| services, |sched| sched.finalize_panicked(id));
             }
         }
         let event = match outcome {
@@ -5268,10 +5692,10 @@ fn scheduler_run_loop(
             // Only terminal outcomes can have appended cleanup work. Pending,
             // blocked, yield, and preempt boundaries therefore stay entirely
             // off the scheduler metadata mutex.
-            drain_terminal_cleanups();
+            drain_terminal_cleanups_in(owner, components);
         }
-        crate::gc::stress_collect("await");
-        crate::gc::stress_collect("scheduler");
+        crate::gc::stress_collect_in(owner, "await");
+        crate::gc::stress_collect_in(owner, "scheduler");
         // Keep this worker visible as active through the post-poll GC
         // boundaries. Otherwise worker 0 can leave the scoped pool and wait to
         // join this worker while its collection is waiting for worker 0 to
@@ -5280,7 +5704,7 @@ fn scheduler_run_loop(
         if !matches!(outcome, PollOutcome::Yield | PollOutcome::Preempted) {
             // Only the coordinator must recheck timers/netpoll/idleness.
             // Waking the whole pool here would cost tasks * workers.
-            notify_worker_waiter(0);
+            owner.parking.notify_worker(0);
         }
         if outcome == PollOutcome::Ready {
             record_completed_task(&mut completed, shared);
@@ -5352,12 +5776,9 @@ pub fn reset_global_scheduler_for_test() {
     // In a real process the fatal gate is one-way (the closer aborts), but a
     // unit test can drive a panicking poll without the abort. Reopen it so the
     // next test is not parked forever.
-    FATAL_PANIC_PENDING.store(false, Ordering::Release);
-    // Claims are strictly scoped to a pop; a leftover count would make every
-    // later test's idle detection report pending work.
-    for word in &CLAIM_WORD.0 {
-        word.0.store(0, Ordering::SeqCst);
-    }
+    crate::runtime::current()
+        .fatal_panic_pending
+        .store(false, Ordering::Release);
 }
 
 #[cfg(test)]

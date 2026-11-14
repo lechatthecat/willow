@@ -214,9 +214,13 @@ mod tests {
     use super::*;
 
     fn block(capacity: usize) -> *mut u8 {
-        OldRegion::new(RegionKind::Old, capacity)
-            .expect("test region allocation must succeed")
-            .take_storage()
+        OldRegion::new(
+            &RuntimeStorageAllocator::default(),
+            RegionKind::Old,
+            capacity,
+        )
+        .expect("test region allocation must succeed")
+        .take_storage()
     }
 
     fn retain(cache: &mut RegionStorageCache, base: *mut u8, capacity: usize) {

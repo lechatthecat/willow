@@ -1,78 +1,8 @@
 //! Opt-in measurements of the actual retry helpers; no release-build hooks.
 use super::*;
 
-#[derive(Clone)]
-struct Distribution {
-    bins: [u64; 256],
-    retries: u64,
-    max: usize,
-}
-impl Default for Distribution {
-    fn default() -> Self {
-        Self {
-            bins: [0; 256],
-            retries: 0,
-            max: 0,
-        }
-    }
-}
-impl Distribution {
-    fn record(&mut self, retries: usize) {
-        self.bins[retries.min(255)] += 1;
-        self.retries += retries as u64;
-        self.max = self.max.max(retries);
-    }
-    #[cfg(target_os = "linux")]
-    fn merge(&mut self, other: &Self) {
-        for (a, b) in self.bins.iter_mut().zip(other.bins) {
-            *a += b;
-        }
-        self.retries += other.retries;
-        self.max = self.max.max(other.max);
-    }
-    #[cfg(target_os = "linux")]
-    fn report(&self, label: &str) {
-        let calls: u64 = self.bins.iter().sum();
-        let rank = (calls * 99).div_ceil(100);
-        let mut sum = 0;
-        let p99 = self
-            .bins
-            .iter()
-            .position(|n| {
-                sum += n;
-                sum >= rank
-            })
-            .unwrap();
-        println!(
-            "retry kind={label} calls={calls} retries={} p99={p99} max={} overflow_ge255={}",
-            self.retries, self.max, self.bins[255]
-        );
-    }
-}
-thread_local! {
-    static STATS: RefCell<Option<[Distribution; 2]>> = const { RefCell::new(None) };
-}
-pub(super) struct RetryProbe {
-    kind: usize,
-    retries: usize,
-}
-impl RetryProbe {
-    pub(super) fn new(kind: usize) -> Self {
-        Self { kind, retries: 0 }
-    }
-    pub(super) fn retry(&mut self) {
-        self.retries += 1;
-    }
-}
-impl Drop for RetryProbe {
-    fn drop(&mut self) {
-        STATS.with_borrow_mut(|stats| {
-            if let Some(stats) = stats {
-                stats[self.kind].record(self.retries);
-            }
-        });
-    }
-}
+#[cfg(target_os = "linux")]
+use super::retry_observation::Distribution;
 
 #[test]
 fn retry_measurement_counts_terminal_success_and_empty() {
@@ -97,28 +27,30 @@ fn retry_measurement_counts_terminal_success_and_empty() {
                     }
                 }
             }
-            STATS.with_borrow_mut(|s| *s = Some(Default::default()));
+            let observation = RuntimeRetryObservation::default();
+            observation.enable_current();
             let script = Script {
                 left: Cell::new(count),
                 success,
                 calls: Cell::new(0),
             };
-            assert_eq!(steal_retry(&script), success.then_some(7));
+            assert_eq!(steal_retry(&script, &observation), success.then_some(7));
             assert_eq!(script.calls.get(), count + 1);
-            let stats = STATS.take().unwrap();
+            let stats = observation.take_current();
             assert_eq!(stats[0].retries, count as u64);
             assert_eq!(stats[0].max, count);
             assert_eq!(stats[0].bins[count.min(255)], 1);
             assert_eq!(stats[0].bins.iter().sum::<u64>(), 1);
         }
     }
-    STATS.with_borrow_mut(|s| *s = Some(Default::default()));
+    let observation = RuntimeRetryObservation::default();
+    observation.enable_current();
     let inbox = Injector::new();
     let owner = Worker::new_fifo();
-    assert_eq!(steal_retry_batch(&inbox, &owner), None);
+    assert_eq!(steal_retry_batch(&inbox, &owner, &observation), None);
     inbox.push(9);
-    assert_eq!(steal_retry_batch(&inbox, &owner), Some(9));
-    assert_eq!(STATS.take().unwrap()[1].bins[0], 2);
+    assert_eq!(steal_retry_batch(&inbox, &owner, &observation), Some(9));
+    assert_eq!(observation.take_current()[1].bins[0], 2);
 }
 
 // Thread CPU excludes waiting, producer CPU, and verification. Linux native
@@ -156,12 +88,12 @@ fn retry_contention_measurement() {
                         let mut consumers = Vec::new();
                         for index in 0..workers {
                             let (queues, gate, left) = (&queues, &gate, &left);
-                            consumers.push(scope.spawn(move || {
+                            consumers.push(scope.spawn(crate::runtime::serving(move || {
                                 let worker = if mode == "inbox" { index } else { index + 1 };
                                 CURRENT_WORKER.set(worker);
                                 SCHED_RUN_DEPTH.set(1);
                                 let mut output = Vec::with_capacity(total.div_ceil(workers));
-                                STATS.with_borrow_mut(|s| *s = Some(Default::default()));
+                                queues.retry_observation.enable_current();
                                 gate.wait();
                                 let start = thread_cpu_ns();
                                 let deadline = Instant::now() + Duration::from_secs(30);
@@ -181,12 +113,12 @@ fn retry_contention_measurement() {
                                 });
                                 let cpu = thread_cpu_ns() - start;
                                 SCHED_RUN_DEPTH.set(0);
-                                (output, cpu, STATS.take().unwrap())
-                            }));
+                                (output, cpu, queues.retry_observation.take_current())
+                            })));
                         }
                         for producer in 0..producers {
                             let (queues, gate, left) = (&queues, &gate, &left);
-                            scope.spawn(move || {
+                            scope.spawn(crate::runtime::serving(move || {
                                 let publish = || {
                                     gate.wait();
                                     for offset in (0..per_producer).step_by(8) {
@@ -209,7 +141,7 @@ fn retry_contention_measurement() {
                                 } else {
                                     publish();
                                 }
-                            });
+                            }));
                         }
                         let start = Instant::now();
                         gate.wait();
@@ -266,4 +198,32 @@ fn retry_contention_measurement() {
         "single_task_queue_latency_ns p50={} p99={} max={}",
         latency[4999], latency[9899], latency[9999]
     );
+}
+
+#[test]
+fn retry_observation_owners_and_threads_are_independent() {
+    struct Empty;
+    impl FnSteal<usize> for Empty {
+        fn steal_one(&self) -> Steal<usize> {
+            Steal::Empty
+        }
+    }
+    let first = RuntimeRetryObservation::default();
+    let second = RuntimeRetryObservation::default();
+    std::thread::scope(|scope| {
+        for count in [7, 31] {
+            let (first, second) = (&first, &second);
+            scope.spawn(crate::runtime::serving(move || {
+                first.enable_current();
+                second.enable_current();
+                for _ in 0..count {
+                    assert_eq!(steal_retry(&Empty, first), None);
+                    assert_eq!(steal_retry(&Empty, second), None);
+                    assert_eq!(steal_retry(&Empty, second), None);
+                }
+                assert_eq!(first.take_current()[0].bins[0], count);
+                assert_eq!(second.take_current()[0].bins[0], count * 2);
+            }));
+        }
+    });
 }

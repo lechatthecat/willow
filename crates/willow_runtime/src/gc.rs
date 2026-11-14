@@ -22,9 +22,14 @@
 // outside a `RelocationSafeScope` defers the minor collection while it
 // publishes a young referent; only a hard memory budget pins instead.
 
+mod path_observation;
+use path_observation::{PathObservation, RuntimePathObservation};
+
 mod condition;
 mod cycle_wait;
+mod wait_observation;
 pub(crate) use condition::GcCondvar;
+use wait_observation::{RuntimeWaitObservation, WaitObservation};
 
 mod safepoint;
 pub use safepoint::*;
@@ -51,6 +56,9 @@ use validation::*;
 
 pub(crate) use marking::shutdown_mark_workers;
 
+mod storage_allocator;
+use storage_allocator::{RuntimeStorageAllocator, StorageAllocation};
+
 mod region;
 use region::*;
 
@@ -59,15 +67,18 @@ mod assist;
 mod concurrent_bitmap;
 mod coordinator;
 mod epoch_index;
+mod epoch_observation;
 mod free_spans;
 mod mark_closure;
 mod mark_termination;
 mod mark_workers;
+pub(crate) use mark_workers::marker_configuration;
 mod memory_control;
 mod minor;
 mod nursery;
 mod old_cycle;
 mod old_lab;
+pub(crate) use old_lab::retire_served_in as retire_served_old_lab_in;
 pub mod opportunity;
 mod pacer;
 mod pending_registry;
@@ -87,7 +98,7 @@ pub(crate) use minor::{deferred_minor_collections_for_test, minor_collect_pinnin
 use runtime_roots::RuntimeRootSet;
 
 use crate::id_hash::{IdMap, IdSet};
-use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::alloc::{Layout, dealloc};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
@@ -350,6 +361,8 @@ use raw_heap::{Object as HeapObject, Payload as GcPayload, RootSlot};
 // ---------------------------------------------------------------------------
 
 struct GcState {
+    storage_allocator: RuntimeStorageAllocator,
+    epoch_views: epoch_observation::ViewObservation,
     concurrent_cycle: Option<Arc<ConcurrentCycle>>,
     sweeping: Option<ThreadId>,
     pending_sweep_chunks: std::ops::Range<usize>,
@@ -375,9 +388,12 @@ struct GcState {
     region_cache: region_cache::RegionStorageCache,
     /// Per-thread old allocation buffers used by runtime-side allocation.
     old_labs: Vec<old_lab::OldLabRecord>,
+    old_lab_indices: IdMap<usize, usize>,
     old_lab_pending: pending_registry::Pending<usize>,
     /// Generated TLS states observed on allocation slow paths.
     tlab_states: HashMap<usize, TlabStateRecord>,
+    tlab_accounting_observation: tlab::RuntimeAccountingObservation,
+    minor_observation: minor::RuntimeMinorObservation,
     tlab_owners: HashMap<ThreadId, HashSet<usize>>,
     /// Total bytes currently allocated (header + payload).
     allocated_bytes: usize,
@@ -458,66 +474,89 @@ fn gc_memory_limit_from_env() -> Option<usize> {
     )
 }
 
-// Native owners can outlive a test/reset epoch. Never zero this counter at reset:
-// each owner releases its own charge, including non-GC lock state.
-static EXTERNAL_BYTES: AtomicUsize = AtomicUsize::new(0);
-static EXTERNAL_ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+#[derive(Default)]
+struct NativeAccounting {
+    _reconciliation: crate::native_memory::ReconciliationObservation,
+    // Owners can outlive a reset epoch; only their release removes this charge.
+    bytes: AtomicUsize,
+    allocated_bytes: AtomicU64,
+    // A quiescing collector closes headroom before waiting for this to drain.
+    in_flight: AtomicUsize,
+}
+
+#[cfg(test)]
+pub(crate) fn native_reconciliation_observation()
+-> &'static crate::native_memory::ReconciliationObservation {
+    &runtime().native_accounting._reconciliation
+}
 
 pub(crate) fn external_bytes() -> usize {
-    EXTERNAL_BYTES.load(Ordering::Relaxed)
+    runtime().native_accounting.bytes.load(Ordering::Relaxed)
 }
 
-/// Native bytes that may still be charged without the heap lock because no
-/// collection-request decision can change before they are used up. Zero under
-/// a soft memory limit and within a quarter of a hard reservation cap, so those
-/// charges stay exact; recomputed under the heap lock by every slow-path charge and
-/// capped like `POLICY_HEADROOM`. Managed growth consumes it too
-/// (`consume_headrooms`), so native and managed bytes since publication never
-/// cross a trigger unobserved.
-static EXTERNAL_HEADROOM: AtomicUsize = AtomicUsize::new(0);
+/// Coupled native and managed allowances between locked policy checks.
+/// Both are invalidated when a policy input can lower a collection threshold.
+#[derive(Default)]
+struct AllocationHeadroom {
+    // Native charges may skip the heap lock only while no trigger can fire.
+    // Zero under a soft limit or within a quarter of a hard reservation cap.
+    // Managed growth consumes this allowance too.
+    external: AtomicUsize,
+    // Runtime-allocation policy checks may skip the heap lock below triggers.
+    // Zero under hard/soft limits; capped to bound allocation-rate sample lag.
+    policy: AtomicU64,
+}
 
-/// Runtime-allocation bytes whose collection-policy check may skip the heap
-/// lock: no trigger can fire before they are used up. Zero under a hard
-/// reservation cap or a soft memory limit, at or past the pacer trigger, and
-/// after any policy-input change; recomputed by every locked check that finds
-/// nothing to do. Capped so the pacer's allocation-rate
-/// samples, taken by locked checks, stay at most this many bytes apart.
-static POLICY_HEADROOM: AtomicU64 = AtomicU64::new(0);
+impl AllocationHeadroom {
+    fn invalidate(&self) {
+        self.external.store(0, Ordering::Release);
+        self.policy.store(0, Ordering::Release);
+    }
+
+    /// Charge occupied growth before publishing it. Exhausted allowances stay
+    /// zero until a locked policy check republishes them.
+    fn consume(&self, bytes: usize) {
+        if self.external.load(Ordering::Acquire) != 0 {
+            let _ = self
+                .external
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |room| {
+                    Some(room.saturating_sub(bytes))
+                });
+        }
+        self.consume_policy(bytes as u64);
+    }
+
+    fn consume_policy(&self, bytes: u64) {
+        if self.policy.load(Ordering::Acquire) != 0 {
+            let _ = self
+                .policy
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |room| {
+                    Some(room.saturating_sub(bytes))
+                });
+        }
+    }
+}
+
+// Bound the interval between locked allocation-rate/policy samples.
 const POLICY_HEADROOM_CAP: u64 = 1 << 20;
 
-/// Invalidate both lock-free headrooms; every write that can lower a goal or
-/// trigger calls this.
 fn invalidate_external_headroom() {
-    EXTERNAL_HEADROOM.store(0, Ordering::Release);
-    POLICY_HEADROOM.store(0, Ordering::Release);
+    runtime().headroom.invalidate();
 }
 
-/// Charge `bytes` of `occupied` growth against both lock-free headrooms.
-/// Called before the growth becomes visible, by every heap-locked site that
-/// raises `allocated_bytes`, so one headroom's room never ignores growth
-/// through the other path. O(1); a no-op once both are exhausted.
 pub(super) fn consume_headrooms(bytes: usize) {
-    if EXTERNAL_HEADROOM.load(Ordering::Acquire) != 0 {
-        let _ = EXTERNAL_HEADROOM.fetch_update(Ordering::AcqRel, Ordering::Acquire, |room| {
-            Some(room.saturating_sub(bytes))
-        });
-    }
-    consume_policy_room(bytes as u64);
-}
-
-fn consume_policy_room(bytes: u64) {
-    if POLICY_HEADROOM.load(Ordering::Acquire) != 0 {
-        let _ = POLICY_HEADROOM.fetch_update(Ordering::AcqRel, Ordering::Acquire, |room| {
-            Some(room.saturating_sub(bytes))
-        });
-    }
+    runtime().headroom.consume(bytes);
 }
 
 fn policy_headroom(state: &GcState) -> u64 {
+    policy_headroom_in(runtime(), state)
+}
+
+fn policy_headroom_in(owner: &GcRuntime, state: &GcState) -> u64 {
     if state.memory_limit_bytes.is_some() || state.soft_memory.enabled() {
         return 0;
     }
-    let input = memory_inputs(state);
+    let input = memory_inputs_in(owner, state);
     let mut trigger = input.unlimited_goal.max(input.live);
     if state.pacer.enabled() {
         trigger = trigger.min(state.pacer_trigger);
@@ -528,8 +567,10 @@ fn policy_headroom(state: &GcState) -> u64 {
 }
 
 /// Whether `bytes` of runtime allocation fit the lock-free policy headroom.
-fn consume_policy_headroom(bytes: u64) -> bool {
-    POLICY_HEADROOM
+fn consume_policy_headroom(owner: &GcRuntime, bytes: u64) -> bool {
+    owner
+        .headroom
+        .policy
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |room| {
             room.checked_sub(bytes)
         })
@@ -544,11 +585,11 @@ fn consume_policy_headroom(bytes: u64) -> bool {
 /// region storage occupies the cap too: it shares the room below the
 /// watermark, and sweep only moves reserved bytes into it. Zero at or past the
 /// watermark and under a soft limit, whose controller decides on every charge.
-fn external_headroom(state: &GcState) -> usize {
+fn external_headroom_in(owner: &GcRuntime, state: &GcState) -> usize {
     if state.soft_memory.enabled() {
         return 0;
     }
-    let input = memory_inputs(state);
+    let input = memory_inputs_in(owner, state);
     let below = |trigger: u64| trigger.saturating_sub(input.occupied).saturating_sub(1);
     let mut room = below(input.unlimited_goal.max(input.live));
     if let Some(watermark) = hard_pressure_watermark(state) {
@@ -576,20 +617,16 @@ fn hard_pressure_watermark(state: &GcState) -> Option<u64> {
 /// headroom below the hard-pressure watermark. Locked charges call this before
 /// republishing, so the cache never forces every later charge onto the heap
 /// lock. O(1) unless storage is evicted.
-fn trim_region_cache_to_watermark(state: &mut GcState) {
+fn trim_region_cache_to_watermark(owner: &GcRuntime, state: &mut GcState) {
     if let Some(watermark) = hard_pressure_watermark(state) {
         let keep = watermark
-            .saturating_sub(memory_inputs(state).pressure_bytes)
+            .saturating_sub(memory_inputs_in(owner, state).pressure_bytes)
             .saturating_sub(1);
         state
             .region_cache
             .shrink_to(usize::try_from(keep).unwrap_or(usize::MAX));
     }
 }
-
-/// Lock-free native charges between their headroom check and completion.
-/// [`quiesce_external_charges`] waits for zero so `external_bytes()` is exact.
-static EXTERNAL_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// Close the lock-free native path and wait out charges already inside it.
 /// After this, `external_bytes()` holds no transient (rolled-back) bytes and
@@ -598,75 +635,103 @@ static EXTERNAL_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// load: either the charger sees zero headroom, or this sees it in flight.
 /// O(1) plus a spin over at most a few atomics per in-flight charge.
 fn quiesce_external_charges() {
-    EXTERNAL_HEADROOM.store(0, Ordering::SeqCst);
-    while EXTERNAL_IN_FLIGHT.load(Ordering::SeqCst) != 0 {
+    quiesce_external_charges_in(runtime());
+}
+
+fn quiesce_external_charges_in(owner: &GcRuntime) {
+    owner.headroom.external.store(0, Ordering::SeqCst);
+    while owner.native_accounting.in_flight.load(Ordering::SeqCst) != 0 {
         std::hint::spin_loop();
     }
 }
 
 /// Lock-free native charge; false (with nothing charged) when the headroom
 /// cannot cover `bytes`.
-fn charge_external_lock_free(bytes: usize) -> bool {
-    EXTERNAL_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
-    let charged = EXTERNAL_HEADROOM.load(Ordering::SeqCst) >= bytes && {
+fn charge_external_lock_free_in(owner: &GcRuntime, bytes: usize) -> bool {
+    owner
+        .native_accounting
+        .in_flight
+        .fetch_add(1, Ordering::SeqCst);
+    let charged = owner.headroom.external.load(Ordering::SeqCst) >= bytes && {
         // Publish the bytes BEFORE claiming headroom: a locked charge that
-        // republishes `EXTERNAL_HEADROOM` in between then already counts them
+        // republishes `owner.headroom.external` in between then already counts them
         // in `occupied`. A failed claim rolls the add back.
-        EXTERNAL_BYTES
+        owner
+            .native_accounting
+            .bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(bytes)
             })
             .unwrap_or_else(|_| {
                 crate::failure::resource_exhausted(format_args!("native byte accounting overflow"))
             });
-        let claimed = EXTERNAL_HEADROOM
+        let claimed = owner
+            .headroom
+            .external
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |room| {
                 room.checked_sub(bytes)
             })
             .is_ok();
         if !claimed {
-            EXTERNAL_BYTES.fetch_sub(bytes, Ordering::AcqRel);
+            owner
+                .native_accounting
+                .bytes
+                .fetch_sub(bytes, Ordering::AcqRel);
         }
         claimed
     };
-    EXTERNAL_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    owner
+        .native_accounting
+        .in_flight
+        .fetch_sub(1, Ordering::SeqCst);
     if !charged {
         return false;
     }
     // Within the headroom no crossing or cap check can fire: account without
     // serializing native-heavy pipelines on the heap mutex. The policy
     // headroom must also see this `occupied` growth.
-    consume_policy_room(bytes as u64);
-    let _ =
-        EXTERNAL_ALLOCATED_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_add(bytes as u64))
-        });
+    owner.headroom.consume_policy(bytes as u64);
+    let _ = owner.native_accounting.allocated_bytes.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |current| Some(current.saturating_add(bytes as u64)),
+    );
     true
 }
 
 pub(crate) fn charge_external(bytes: usize) {
-    if charge_external_lock_free(bytes) {
-        return;
+    if charge_external_in(runtime(), bytes) {
+        coordinator::request();
+    }
+}
+
+// Returns whether the owner needs a collection request, after releasing its heap.
+fn charge_external_in(owner: &GcRuntime, bytes: usize) -> bool {
+    if charge_external_lock_free_in(owner, bytes) {
+        return false;
     }
     // Serialize increases with region reservations. Releases need no heap lock,
     // so finalizers also work during reset and stop-the-world collection.
-    let mut state = runtime().heap.lock().unwrap();
+    let mut state = owner.heap.lock().unwrap();
     // Exact inputs for the crossing checks below.
-    quiesce_external_charges();
-    if !can_reserve(&mut state, bytes) {
-        allocation_failure(&state);
+    quiesce_external_charges_in(owner);
+    if !can_reserve_in(owner, &mut state, bytes) {
+        allocation_failure_in(owner, &state);
     }
-    let previous_external = EXTERNAL_BYTES
+    let previous_external = owner
+        .native_accounting
+        .bytes
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(bytes)
         })
         .unwrap_or_else(|_| {
             crate::failure::resource_exhausted(format_args!("native byte accounting overflow"))
         });
-    let _ =
-        EXTERNAL_ALLOCATED_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_add(bytes as u64))
-        });
+    let _ = owner.native_accounting.allocated_bytes.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |current| Some(current.saturating_add(bytes as u64)),
+    );
     let previous_footprint = state
         .old_reserved_bytes
         .saturating_add(state.tlab_reserved_bytes)
@@ -688,19 +753,27 @@ pub(crate) fn charge_external(bytes: usize) {
         && state.sweeping.is_none()
         && (hard_crossing
             || paced_crossing
-            || state.soft_memory.decide(memory_inputs(&state)).collect);
-    trim_region_cache_to_watermark(&mut state);
-    EXTERNAL_HEADROOM.store(external_headroom(&state), Ordering::Release);
+            || state
+                .soft_memory
+                .decide(memory_inputs_in(owner, &state))
+                .collect);
+    trim_region_cache_to_watermark(owner, &mut state);
+    owner
+        .headroom
+        .external
+        .store(external_headroom_in(owner, &state), Ordering::Release);
     drop(state);
-    if pressure {
-        // Request only; never collect or park while a native guard is held.
-        // Unregistered compatibility callers collect on their next GC allocation.
-        coordinator::request();
-    }
+    pressure
 }
 
 pub(crate) fn release_external(bytes: usize) {
-    EXTERNAL_BYTES
+    release_external_in(runtime(), bytes);
+}
+
+fn release_external_in(owner: &GcRuntime, bytes: usize) {
+    owner
+        .native_accounting
+        .bytes
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_sub(bytes)
         })
@@ -709,34 +782,43 @@ pub(crate) fn release_external(bytes: usize) {
 
 /// Retained region storage counts toward the hard cap and the soft limit but
 /// never refuses a reservation: it is freed first, so admission ignores it.
+#[cfg(test)]
 fn can_reserve(state: &mut GcState, additional: usize) -> bool {
+    can_reserve_in(runtime(), state, additional)
+}
+
+fn can_reserve_in(owner: &GcRuntime, state: &mut GcState, additional: usize) -> bool {
     let Some(limit) = state.memory_limit_bytes else {
         if state.soft_memory.enabled() {
-            evict_region_cache_for(state, additional);
+            evict_region_cache_for_in(owner, state, additional);
         }
         return true;
     };
     // Every reservation passes here first: stop lock-free native charges
     // (their headroom predates this reservation) and drop their transient
     // bytes before the exact cap check.
-    quiesce_external_charges();
+    quiesce_external_charges_in(owner);
     if state
         .old_reserved_bytes
         .checked_add(state.tlab_reserved_bytes)
-        .and_then(|total| total.checked_add(external_bytes()))
+        .and_then(|total| total.checked_add(owner.native_accounting.bytes.load(Ordering::Relaxed)))
         .and_then(|total| total.checked_add(additional))
         .is_none_or(|total| total > limit)
     {
         return false;
     }
-    evict_region_cache_for(state, additional);
+    evict_region_cache_for_in(owner, state, additional);
     true
 }
 
 /// Free retained storage that would leave less than `additional` bytes below
 /// either limit. O(1) unless storage is freed.
 fn evict_region_cache_for(state: &mut GcState, additional: usize) {
-    let keep = region_cache_budget(state).saturating_sub(additional);
+    evict_region_cache_for_in(runtime(), state, additional);
+}
+
+fn evict_region_cache_for_in(owner: &GcRuntime, state: &mut GcState, additional: usize) {
+    let keep = region_cache_budget_in(owner, state).saturating_sub(additional);
     state.region_cache.shrink_to(keep);
 }
 
@@ -744,10 +826,14 @@ fn evict_region_cache_for(state: &mut GcState, additional: usize) {
 /// soft limit. Under a soft limit retained storage is evicted rather than
 /// counted as collection pressure: no collection could reclaim it.
 fn region_cache_budget(state: &GcState) -> usize {
+    region_cache_budget_in(runtime(), state)
+}
+
+fn region_cache_budget_in(owner: &GcRuntime, state: &GcState) -> usize {
     let footprint = state
         .old_reserved_bytes
         .saturating_add(state.tlab_reserved_bytes)
-        .saturating_add(external_bytes());
+        .saturating_add(owner.native_accounting.bytes.load(Ordering::Relaxed));
     let room = |limit: usize| limit.saturating_sub(footprint);
     let soft = state.soft_memory.limit().map_or(usize::MAX, |limit| {
         room(usize::try_from(limit).unwrap_or(usize::MAX))
@@ -758,8 +844,17 @@ fn region_cache_budget(state: &GcState) -> usize {
 /// Admit a new old region, reusing retained storage of the same capacity.
 /// The caller accounts the returned region as reserved.
 fn reserve_old_region(state: &mut GcState, kind: RegionKind, capacity: usize) -> Option<OldRegion> {
+    reserve_old_region_in(runtime(), state, kind, capacity)
+}
+
+fn reserve_old_region_in(
+    owner: &GcRuntime,
+    state: &mut GcState,
+    kind: RegionKind,
+    capacity: usize,
+) -> Option<OldRegion> {
     let retained = state.region_cache.take(capacity);
-    if !can_reserve(state, capacity) {
+    if !can_reserve_in(owner, state, capacity) {
         if let Some(base) = retained {
             // SAFETY: the block left the cache and is owned here.
             unsafe { region_cache::free_region_storage(base, capacity) };
@@ -769,16 +864,9 @@ fn reserve_old_region(state: &mut GcState, kind: RegionKind, capacity: usize) ->
     match retained {
         // SAFETY: the cache held this released block of exactly `capacity`.
         Some(base) => Some(unsafe { OldRegion::reuse(kind, capacity, base) }),
-        None => OldRegion::new(kind, capacity),
+        None => OldRegion::new(&state.storage_allocator, kind, capacity),
     }
 }
-
-#[cfg(test)]
-static SWEEP_BUDGET_WAITING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
-static ELECTION_BUDGET_WAITING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Collections one failed allocation may wait for while each still releases
 /// storage that concurrent allocators claim first. Bounded so a request that
@@ -792,16 +880,25 @@ const BUDGET_COLLECTION_RETRIES: usize = 8;
 /// Waiting mutators cooperate with remark and wait through sweep.
 /// Allocation-failure path only; explicit `gc()` uses `cycle_wait` directly.
 fn collect_for_budget() {
-    pacer::allocation_failure(&runtime().heap.lock().unwrap());
-    let _interval = crate::gc_telemetry::observations::Span::new(
+    collect_for_budget_in(crate::runtime::current());
+}
+
+fn collect_for_budget_in(owner: &crate::runtime::Runtime) {
+    pacer::allocation_failure_in(owner, &owner.gc.heap.lock().unwrap());
+    let _interval = crate::gc_telemetry::observations::Span::for_runtime(
+        owner,
         crate::gc_telemetry::observations::Kind::AllocationStall,
     );
-    cycle_wait::collect_for_budget();
+    cycle_wait::collect_for_budget_in(owner);
 }
 
 fn allocation_failure(state: &GcState) -> *mut u8 {
+    allocation_failure_in(runtime(), state)
+}
+
+fn allocation_failure_in(owner: &GcRuntime, state: &GcState) -> *mut u8 {
     if let Some(limit) = state.memory_limit_bytes {
-        let memory = heap_snapshot::accounting_from_state(state);
+        let memory = heap_snapshot::accounting_from_state_in(owner, state);
         crate::gc_telemetry::failure_record::emit_with(
             "reservation_threshold",
             "reservation admission failed",
@@ -838,9 +935,13 @@ fn major_trigger(state: &GcState) -> usize {
 }
 
 fn pacer_inputs(state: &GcState) -> pacer::Inputs {
-    let history = crate::gc_telemetry::pacing_cycle_snapshot();
-    let cpu = crate::gc_telemetry::pacing::snapshot();
-    let memory = memory_inputs(state);
+    pacer_inputs_in(crate::runtime::current(), state)
+}
+
+fn pacer_inputs_in(owner: &crate::runtime::Runtime, state: &GcState) -> pacer::Inputs {
+    let history = crate::gc_telemetry::pacing_cycle_snapshot_in(&owner.telemetry);
+    let cpu = owner.telemetry.pacing.snapshot();
+    let memory = memory_inputs_in(&owner.gc, state);
     pacer::Inputs {
         live: memory.live,
         previous_goal: state.threshold_bytes as u64,
@@ -851,7 +952,7 @@ fn pacer_inputs(state: &GcState) -> pacer::Inputs {
         allocation_per_second: 0,
         mark_per_cpu_second: None,
         cpu_capacity: pacer::cpu_capacity(),
-        max_workers: mark_workers::configured_count(),
+        max_workers: *owner.marker_count,
         feedback: pacer::Feedback {
             occupied: memory.occupied,
             pressure: state.soft_memory.enabled() && state.soft_memory.decide(memory).collect,
@@ -874,11 +975,20 @@ fn pacer_inputs(state: &GcState) -> pacer::Inputs {
 // the rest, so a high young allocation rate alone must not shorten the major
 // runway.
 fn policy_allocated_total(state: &GcState) -> u64 {
+    policy_allocated_total_in(runtime(), state)
+}
+
+fn policy_allocated_total_in(owner: &GcRuntime, state: &GcState) -> u64 {
     state
         .total_allocated_bytes
         .saturating_sub(state.young_allocation_clock)
         .saturating_add(state.promoted_bytes)
-        .saturating_add(EXTERNAL_ALLOCATED_BYTES.load(Ordering::Relaxed))
+        .saturating_add(
+            owner
+                .native_accounting
+                .allocated_bytes
+                .load(Ordering::Relaxed),
+        )
 }
 
 /// Managed bytes the major policy is responsible for. Minor collections own
@@ -895,6 +1005,10 @@ fn major_policy_managed_bytes(state: &GcState) -> usize {
 }
 
 fn memory_inputs(state: &GcState) -> memory_control::Inputs {
+    memory_inputs_in(runtime(), state)
+}
+
+fn memory_inputs_in(owner: &GcRuntime, state: &GcState) -> memory_control::Inputs {
     // A soft limit budgets every managed byte: excluding the nursery would let
     // the heap exceed the limit by up to one nursery budget.
     // Its relief runway likewise measures all allocation.
@@ -902,25 +1016,30 @@ fn memory_inputs(state: &GcState) -> memory_control::Inputs {
         (
             state.last_major_live_bytes,
             state.allocated_bytes,
-            state
-                .total_allocated_bytes
-                .saturating_add(EXTERNAL_ALLOCATED_BYTES.load(Ordering::Relaxed)),
+            state.total_allocated_bytes.saturating_add(
+                owner
+                    .native_accounting
+                    .allocated_bytes
+                    .load(Ordering::Relaxed),
+            ),
         )
     } else {
         (
             state.last_major_policy_live_bytes,
             major_policy_managed_bytes(state),
-            policy_allocated_total(state),
+            policy_allocated_total_in(owner, state),
         )
     };
     memory_control::Inputs {
         unlimited_goal: state.threshold_bytes as u64,
-        live: live.saturating_add(external_bytes() as u64),
-        occupied: occupied.saturating_add(external_bytes()) as u64,
+        live: live.saturating_add(owner.native_accounting.bytes.load(Ordering::Relaxed) as u64),
+        occupied: occupied.saturating_add(owner.native_accounting.bytes.load(Ordering::Relaxed))
+            as u64,
         pressure_bytes: state
             .old_reserved_bytes
             .saturating_add(state.tlab_reserved_bytes)
-            .saturating_add(external_bytes()) as u64,
+            .saturating_add(owner.native_accounting.bytes.load(Ordering::Relaxed))
+            as u64,
         allocated_total,
         // Our process provider reports RSS, not a compatible commit scope.
         non_heap_commit: None,
@@ -933,6 +1052,8 @@ impl Default for GcState {
         let memory_limit_bytes = gc_memory_limit_from_env();
         let nursery_policy = nursery::Policy::from_env();
         Self {
+            storage_allocator: RuntimeStorageAllocator::default(),
+            epoch_views: Default::default(),
             concurrent_cycle: None,
             sweeping: None,
             pending_sweep_chunks: 0..0,
@@ -948,8 +1069,11 @@ impl Default for GcState {
             old_reserved_bytes: 0,
             region_cache: Default::default(),
             old_labs: Vec::new(),
+            old_lab_indices: IdMap::default(),
             old_lab_pending: Default::default(),
             tlab_states: HashMap::new(),
+            tlab_accounting_observation: tlab::RuntimeAccountingObservation::default(),
+            minor_observation: minor::RuntimeMinorObservation::default(),
             tlab_owners: HashMap::new(),
             allocated_bytes: 0,
             threshold_bytes: 1024 * 1024,
@@ -1004,9 +1128,6 @@ impl Default for GcState {
 // initialized headers through atomic start bits; relocation is serialized.
 unsafe impl Send for GcState {}
 
-#[cfg(test)]
-static RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
-
 // Compatibility facade: runtime roots and generated roots share context storage.
 struct RootStackAccess;
 impl RootStackAccess {
@@ -1049,11 +1170,33 @@ struct GcCoord {
     recovery_requested_for: Option<u64>,
 }
 
-/// Process-wide GC services. Keeping the heap, roots, registries, and STW
+/// Collector-owned GC services. Keeping the heap, roots, registries, and STW
 /// coordinator behind one explicit owner makes lock ordering visible and keeps
 /// runtime entry points from reaching into unrelated globals.
-struct GcRuntime {
+pub(crate) struct GcRuntime {
+    // Drop marker readers before collector storage. Active-cycle shutdown still
+    // requires coordinator quiescence before destroying this owner.
+    marker_workers: Mutex<Option<mark_workers::Pool>>,
+    coordinator: Mutex<Option<coordinator::Coordinator>>,
+    active_sweep: sweep::ActiveSweep,
+    collection_busy: std::sync::atomic::AtomicBool,
+    headroom: AllocationHeadroom,
+    policy_identity: u64,
+    policy_epoch: AtomicU64,
+    mutator_epoch: AtomicU64,
+    assist_cycle_generation: AtomicU64,
+    mark_phase: MarkPhase,
+    card_epoch: remembered::CardEpoch,
+    native_accounting: NativeAccounting,
+    pub(crate) native_observation: crate::observation::Native,
+    progress: Mutex<progress::Progress>,
+    stop_diagnostics: Mutex<std::collections::VecDeque<old_cycle::StopDiagnostic>>,
+    preparation_diagnostic: Mutex<old_cycle::PreparationDiagnostic>,
+    storage_allocator: RuntimeStorageAllocator,
     heap: crate::gc_telemetry::observations::GcMutex<GcState>,
+    /// Interned runtime-allocation descriptors referenced by this heap's
+    /// headers; declared after `heap` so it outlives every header reference.
+    layouts: layouts::Layouts,
     write_barrier_calls: AtomicU64,
     /// Conservative nursery-presence gate: set before the first TLAB can
     /// publish an object, and cleared only by the quiescent runtime reset.
@@ -1080,6 +1223,7 @@ struct GcRuntime {
     /// acknowledgements use coord.1, avoiding quadratic wakeup fan-out.
     budget_cv: GcCondvar,
     /// Lock-free fast-path mirror of `GcCoord::stop_requested`.
+    minor_pending: std::sync::atomic::AtomicBool,
     stop_requested: std::sync::atomic::AtomicBool,
     poll_requested: std::sync::atomic::AtomicBool,
     trace_registry: Mutex<HashMap<u32, TraceFn>>,
@@ -1091,12 +1235,55 @@ struct GcRuntime {
     /// types use this to cache per-generation registration without taking the
     /// registry mutex on every allocation.
     registry_generation: std::sync::atomic::AtomicU64,
+    native_registrations: NativeGcRegistrations,
+    path_observation: RuntimePathObservation,
+    marker_observation: mark_workers::RuntimeMarkerObservation,
+    old_lab_policy: old_lab::RuntimeAllocationPolicy,
+    handshake_policy: root_handshake::RuntimeHandshakePolicy,
+    sweep_observation: sweep::RuntimeSweepObservation,
+    remark_observation: old_cycle::RuntimeBudgetObservation,
+    wait_observation: RuntimeWaitObservation,
 }
 
 impl Default for GcRuntime {
     fn default() -> Self {
+        Self::with_phase(MarkPhase::Owned(std::sync::atomic::AtomicU8::new(0)))
+    }
+}
+
+impl GcRuntime {
+    fn with_phase(mark_phase: MarkPhase) -> Self {
+        // The default runtime keeps both exported ABI gates; every other
+        // runtime owns both, so its collections affect only its own caches.
+        let card_epoch = match mark_phase {
+            MarkPhase::DefaultAbi => remembered::CardEpoch::DefaultAbi,
+            MarkPhase::Owned(_) => remembered::CardEpoch::default(),
+        };
+        let heap = GcState {
+            remembered_set: remembered::RememberedSet::with_epoch(card_epoch.clone()),
+            ..GcState::default()
+        };
+        let storage_allocator = heap.storage_allocator.share();
         Self {
-            heap: crate::gc_telemetry::observations::GcMutex::new(GcState::default()),
+            marker_workers: Mutex::new(None),
+            coordinator: Mutex::new(None),
+            active_sweep: sweep::ActiveSweep::default(),
+            collection_busy: std::sync::atomic::AtomicBool::new(false),
+            headroom: AllocationHeadroom::default(),
+            policy_identity: next_policy_identity(),
+            policy_epoch: AtomicU64::new(1),
+            mutator_epoch: AtomicU64::new(1),
+            assist_cycle_generation: AtomicU64::new(0),
+            mark_phase,
+            card_epoch,
+            native_accounting: NativeAccounting::default(),
+            native_observation: crate::observation::Native::new(),
+            progress: Mutex::new(progress::Progress::default()),
+            stop_diagnostics: Mutex::new(std::collections::VecDeque::new()),
+            preparation_diagnostic: Mutex::new(old_cycle::PreparationDiagnostic::default()),
+            storage_allocator,
+            heap: crate::gc_telemetry::observations::GcMutex::new(heap),
+            layouts: layouts::Layouts::default(),
             write_barrier_calls: AtomicU64::new(0),
             tlab_ever_allocated: std::sync::atomic::AtomicBool::new(false),
             collect_lock: Mutex::new(()),
@@ -1113,6 +1300,7 @@ impl Default for GcRuntime {
                 GcCondvar::new(),
             ),
             budget_cv: GcCondvar::new(),
+            minor_pending: std::sync::atomic::AtomicBool::new(false),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
             poll_requested: std::sync::atomic::AtomicBool::new(false),
             trace_registry: Mutex::new(HashMap::new()),
@@ -1121,18 +1309,138 @@ impl Default for GcRuntime {
             drop_registry: Mutex::new(HashMap::new()),
             minor_registry_cache: Mutex::new(MinorRegistryCache::default()),
             registry_generation: std::sync::atomic::AtomicU64::new(1),
+            native_registrations: NativeGcRegistrations::new(),
+            path_observation: RuntimePathObservation::default(),
+            marker_observation: mark_workers::RuntimeMarkerObservation::default(),
+            old_lab_policy: old_lab::RuntimeAllocationPolicy::default(),
+            handshake_policy: root_handshake::RuntimeHandshakePolicy::default(),
+            sweep_observation: sweep::RuntimeSweepObservation::default(),
+            remark_observation: old_cycle::RuntimeBudgetObservation::default(),
+            wait_observation: RuntimeWaitObservation::default(),
         }
     }
 }
 
-static GC_RUNTIME: LazyLock<GcRuntime> = LazyLock::new(|| {
-    progress::initialize();
-    GcRuntime::default()
-});
-static DIAGNOSTIC_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+enum MarkPhase {
+    Owned(std::sync::atomic::AtomicU8),
+    DefaultAbi,
+}
+
+pub(crate) use remembered::default_card_epoch;
+
+/// The process-default runtime's phase gate: the exported ABI data symbol.
+#[inline]
+pub(crate) const fn default_mark_phase() -> &'static std::sync::atomic::AtomicU8 {
+    &GC_MARK_PHASE
+}
+
+impl GcRuntime {
+    /// Whether this collector belongs to the runtime the calling thread
+    /// serves, so its thread-local mutator caches may be used.
+    #[inline]
+    pub(crate) fn serves_current_thread(&self) -> bool {
+        std::ptr::eq(self.mark_phase(), crate::runtime::current().mark_phase())
+    }
+
+    pub(crate) fn mark_phase(&self) -> &std::sync::atomic::AtomicU8 {
+        match &self.mark_phase {
+            MarkPhase::Owned(phase) => phase,
+            MarkPhase::DefaultAbi => &GC_MARK_PHASE,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn card_epoch(&self) -> &AtomicU64 {
+        self.card_epoch.cell()
+    }
+
+    pub(crate) fn initialize_default() -> Self {
+        Self::with_phase(MarkPhase::DefaultAbi)
+    }
+
+    pub(crate) fn initialize() -> Self {
+        Self::default()
+    }
+}
+
+impl Drop for GcRuntime {
+    fn drop(&mut self) {
+        // Background jobs retain their runtime until all heap readers leave.
+        // At final ownership release only idle workers can remain.
+        if let Some(mut pool) = self
+            .marker_workers
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            pool.stop(std::time::Duration::from_secs(2));
+        }
+        self.coordinator
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        old_lab::forget_private_owner(self.policy_identity);
+        let mut state = self.heap.lock().unwrap_or_else(|p| p.into_inner());
+        let drops = self.drop_registry.lock().unwrap_or_else(|p| p.into_inner());
+        let finalize = |object: HeapObject| {
+            if !object.allocated() || object.forwarded_to().is_some() {
+                return;
+            }
+            if let Some(drop_fn) = drops.get(&object.type_id()) {
+                // Native destructors are leaf operations; this owner is
+                // quiescent and still retains the payload and its descriptor.
+                unsafe {
+                    run_drop_hook(
+                        self,
+                        *drop_fn,
+                        object.payload().as_ptr(),
+                        crate::observation::Value::new(|| object.type_id()),
+                    )
+                };
+            }
+            object.reclaim_in_place();
+        };
+        old_lab::finalize_unindexed(&state, finalize);
+        for region in &state.old_regions {
+            for &offset in region.allocations.keys() {
+                finalize(HeapObject::from_raw(unsafe { region.base.add(offset) }.cast()).unwrap());
+            }
+        }
+        for chunk in state.tlab_chunks.drain(..) {
+            // Start bits cover active chunks too, without reading a mutator's
+            // expired TLS cursor or constructing an index during teardown.
+            if chunk.header_offsets.is_empty() {
+                chunk.mark_bitmap.bits.for_each_set(|index| {
+                    finalize(
+                        HeapObject::from_raw(
+                            unsafe { chunk.base.add(index * GC_REGION_MARK_GRANULE) }.cast(),
+                        )
+                        .unwrap(),
+                    );
+                });
+            } else {
+                for &offset in &chunk.header_offsets {
+                    finalize(
+                        HeapObject::from_raw(unsafe { chunk.base.add(usize::from(offset)) }.cast())
+                            .unwrap(),
+                    );
+                }
+            }
+            let layout =
+                Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>()).unwrap();
+            unsafe { dealloc(chunk.base, layout) };
+        }
+        // Unused survivor reserves contain no initialized payloads.
+        for chunk in state.survivor_reserve.drain(..) {
+            let layout =
+                Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>()).unwrap();
+            unsafe { dealloc(chunk.base, layout) };
+        }
+    }
+}
 
 fn runtime() -> &'static GcRuntime {
-    &GC_RUNTIME
+    &crate::runtime::current().gc
 }
 
 /// Model the generated bump path in tests, including its static descriptor
@@ -1196,6 +1504,10 @@ fn initialize_object_at(
 /// pressure latch across cycles; normal occupancy/pacer triggers and reservation
 /// admission still operate independently while the latch is set.
 fn hard_reservation_pressure(state: &mut GcState) -> bool {
+    hard_reservation_pressure_in(runtime(), state)
+}
+
+fn hard_reservation_pressure_in(owner: &GcRuntime, state: &mut GcState) -> bool {
     let Some(limit) = state.memory_limit_bytes else {
         state.hard_pressure_triggered = false;
         return false;
@@ -1203,7 +1515,7 @@ fn hard_reservation_pressure(state: &mut GcState) -> bool {
     let reserved = state
         .old_reserved_bytes
         .saturating_add(state.tlab_reserved_bytes)
-        .saturating_add(external_bytes());
+        .saturating_add(owner.native_accounting.bytes.load(Ordering::Relaxed));
     if reserved <= limit / 2 {
         state.hard_pressure_triggered = false;
     }
@@ -1218,68 +1530,77 @@ fn hard_reservation_pressure(state: &mut GcState) -> bool {
 /// the heap lock by every change to either, so allocation can skip a policy
 /// check that would only report "busy" without contending on the heap lock. A stale read only
 /// shifts the check to the next slow path.
-static COLLECTION_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 fn publish_collection_busy(state: &GcState) {
-    COLLECTION_BUSY.store(
+    publish_collection_busy_in(runtime(), state);
+}
+
+fn publish_collection_busy_in(owner: &GcRuntime, state: &GcState) {
+    owner.collection_busy.store(
         state.concurrent_cycle.is_some() || state.sweeping.is_some(),
         Ordering::Release,
     );
 }
 
-fn allocation_should_collect() -> bool {
-    allocation_should_collect_with_sync(true)
-}
-
 // TLAB refills already publish their own bytes; other live buffers may lag by
 // at most their current chunk. Telemetry and non-TLAB callers retain full sync.
-fn allocation_should_collect_with_sync(sync: bool) -> bool {
-    let stress = gc_stress_enabled("alloc");
-    if !stress && COLLECTION_BUSY.load(Ordering::Acquire) {
+fn allocation_should_collect_with_sync_in(owner: &crate::runtime::Runtime, sync: bool) -> bool {
+    let stress = owner.diagnostics.stress_enabled("alloc");
+    if !stress && owner.gc.collection_busy.load(Ordering::Acquire) {
         return false;
     }
-    let mut state = runtime().heap.lock().unwrap();
-    allocation_policy_due(&mut state, sync, stress)
+    let mut state = owner.gc.heap.lock().unwrap();
+    allocation_policy_due_in(owner, &mut state, sync, stress)
 }
 
-fn allocation_policy_due(state: &mut GcState, sync: bool, stress: bool) -> bool {
+fn allocation_policy_due_in(
+    owner: &crate::runtime::Runtime,
+    state: &mut GcState,
+    sync: bool,
+    stress: bool,
+) -> bool {
     if !stress && (state.concurrent_cycle.is_some() || state.sweeping.is_some()) {
         return false;
     }
     if sync {
-        sync_tlab_bytes(state);
+        tlab::sync_tlab_bytes_in(&owner.gc, state);
     }
-    let bytes = policy_allocated_total(state);
+    let bytes = policy_allocated_total_in(&owner.gc, state);
     if state.pacer.sample_due(bytes) {
         state
             .pacer
             .allocation(crate::gc_telemetry::timestamp_ns(), bytes);
-        pacer::sample_threshold(state);
+        pacer::sample_threshold_in(owner, state);
     }
-    let hard_pressure = hard_reservation_pressure(state);
+    let hard_pressure = hard_reservation_pressure_in(&owner.gc, state);
     state.soft_memory.sample_process();
-    let memory_input = memory_inputs(state);
+    let memory_input = memory_inputs_in(&owner.gc, state);
     let memory = state.soft_memory.decide(memory_input);
     // The pacer trigger lives in the major-policy domain even when a soft
     // limit makes the memory inputs count every young byte.
     let paced = state.pacer.enabled()
-        && major_policy_managed_bytes(state).saturating_add(external_bytes()) as u64
+        && major_policy_managed_bytes(state)
+            .saturating_add(owner.gc.native_accounting.bytes.load(Ordering::Relaxed))
+            as u64
             >= state.pacer_trigger
         && memory.reason != memory_control::Reason::Relief;
     let collect = stress || hard_pressure || paced || memory.collect;
     if !collect {
-        POLICY_HEADROOM.store(policy_headroom(state), Ordering::Release);
+        owner
+            .gc
+            .headroom
+            .policy
+            .store(policy_headroom_in(&owner.gc, state), Ordering::Release);
     }
     collect
 }
 
-fn minor_stress_enabled() -> bool {
-    gc_stress_enabled("minor") || gc_stress_enabled("relocate")
+fn minor_stress_enabled_in(owner: &crate::runtime::Runtime) -> bool {
+    owner.diagnostics.stress_enabled("minor") || owner.diagnostics.stress_enabled("relocate")
 }
 
-fn allocation_should_minor_collect() -> bool {
-    let stress = minor_stress_enabled();
-    let state = runtime().heap.lock().unwrap();
+fn allocation_should_minor_collect_in(owner: &crate::runtime::Runtime) -> bool {
+    let stress = minor_stress_enabled_in(owner);
+    let state = owner.gc.heap.lock().unwrap();
     stress || minor_allocation_due(&state)
 }
 
@@ -1307,11 +1628,15 @@ fn minor_deferral_age(state: &GcState) -> u64 {
 /// Start the clock at the request, not at the eventual root scan: otherwise
 /// repeated refills during a major sweep would have unbounded, uncharged debt.
 fn minor_refill_should_wait(state: &mut GcState) -> bool {
+    minor_refill_should_wait_in(runtime(), state)
+}
+
+fn minor_refill_should_wait_in(owner: &GcRuntime, state: &mut GcState) -> bool {
     if !minor_allocation_due(state) {
         return false;
     }
     if state.minor_deferral_start_bytes.is_none()
-        && minor::requested()
+        && minor::requested(owner)
         && state.memory_limit_bytes.is_none()
         // Do not grant an unassessed refill whose full runway exceeds the budget.
         && state.nursery_threshold_bytes >= GC_TLAB_CHUNK_SIZE
@@ -1352,9 +1677,8 @@ pub extern "C" fn willow_gc_set_memory_limit(bytes: u64) -> u64 {
 /// Production code calls this once at process startup, before any allocation.
 /// Calling it again resets the single process-global heap and invalidates
 /// existing GC pointers, so it is not a general-purpose runtime reset API.
-/// Unit tests may intentionally reset the heap, but they must hold
-/// `runtime_test_guard()` while doing so because the Rust test harness runs
-/// tests in parallel in one process.
+/// Unit tests may intentionally reset the heap of the runtime their thread
+/// serves; `isolated_runtime()` gives each test thread its own runtime.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_init() {
@@ -1362,7 +1686,9 @@ pub extern "C" fn willow_gc_init() {
     // Generated array fast paths can allocate a reference buffer before any
     // runtime array call. Re-register after every heap/registry reset.
     crate::array::ensure_trace_registered();
-    DIAGNOSTIC_READY.store(true, Ordering::Release);
+    crate::runtime::current()
+        .diagnostic_ready
+        .store(true, Ordering::Release);
 }
 
 /// Allocate a GC-managed object of `payload_size` bytes with the given
@@ -1449,7 +1775,8 @@ pub extern "C" fn willow_gc_alloc_slow(
     if tlab_state.is_null() || payload_size < 0 {
         crate::failure::fatal_invariant("invalid TLAB allocation arguments");
     }
-    tlab_alloc_slow(
+    tlab_alloc_slow_in(
+        crate::runtime::current(),
         tlab_state as usize,
         layout_id,
         type_id,
@@ -1468,26 +1795,44 @@ fn tlab_alloc_slow(
     payload_size: i64,
     gc_ref_mask: u64,
 ) -> *mut u8 {
+    tlab_alloc_slow_in(
+        crate::runtime::current(),
+        state_address,
+        layout_id,
+        type_id,
+        payload_size,
+        gc_ref_mask,
+    )
+}
+
+fn tlab_alloc_slow_in(
+    owner: &crate::runtime::Runtime,
+    state_address: usize,
+    layout_id: u64,
+    type_id: i64,
+    payload_size: i64,
+    gc_ref_mask: u64,
+) -> *mut u8 {
     let Some(total_size) = (GC_HEADER_SIZE)
         .checked_add(payload_size as usize)
         .and_then(|size| size.checked_next_multiple_of(std::mem::align_of::<GcHeader>()))
     else {
         crate::failure::resource_exhausted(format_args!("TLAB allocation size overflow"));
     };
-    let stress = gc_stress_enabled("alloc");
+    let stress = owner.diagnostics.stress_enabled("alloc");
     let small = total_size <= GC_TLAB_MAX_OBJECT_SIZE;
-    let (fast_bytes, minor_due, cached, major_due) = {
-        let mut state = runtime().heap.lock().unwrap();
-        register_tlab_state(&mut state, state_address);
+    let (fast_bytes, minor_due, cached, major_due, storage_allocator) = {
+        let mut state = owner.gc.heap.lock().unwrap();
+        tlab::register_tlab_state_in(&owner.gc, &mut state, state_address);
         let record = state.tlab_states.get_mut(&state_address).unwrap();
         let fast = fast_bytes_total(record);
         let fast_bytes = fast.saturating_sub(record.assist_observed_fast_bytes);
         record.assist_observed_fast_bytes = fast;
-        sync_tlab_record_bytes(&mut state, state_address);
+        tlab::sync_tlab_record_bytes_in(&owner.gc, &mut state, state_address);
         if small {
             // A small-object miss means the active chunk has insufficient tail
             // space. Seal it before collection/refill.
-            retire_tlab_locked(&mut state, state_address);
+            tlab::retire_tlab_locked_in(&owner.telemetry.footprint, &mut state, state_address);
         }
         // The refilling record is current; other owners publish at their own
         // refill, bounding unobserved nursery bytes by one chunk per TLAB.
@@ -1497,67 +1842,78 @@ fn tlab_alloc_slow(
             None
         };
         let minor_due = minor_allocation_due(&state);
-        let major_due = if !stress && !minor_due && !minor_stress_enabled() {
-            Some(allocation_policy_due(&mut state, false, false))
+        let major_due = if !stress && !minor_due && !minor_stress_enabled_in(owner) {
+            Some(allocation_policy_due_in(owner, &mut state, false, false))
         } else {
             None
         };
-        (fast_bytes, minor_due, cached, major_due)
+        (
+            fast_bytes,
+            minor_due,
+            cached,
+            major_due,
+            state.storage_allocator.share(),
+        )
     };
     let cached_storage = cached.map(tlab::ChunkStorage::from_cached);
-    sweep::assist();
-    assist_concurrent_mark(fast_bytes.saturating_add(total_size as u64));
+    sweep::assist_in(owner);
+    marking::assist_concurrent_mark_in(owner, fast_bytes.saturating_add(total_size as u64));
 
-    if !stress && (minor_due || minor_stress_enabled()) && allocation_should_minor_collect() {
-        minor_collect_internal();
+    if !stress
+        && (minor_due || minor_stress_enabled_in(owner))
+        && allocation_should_minor_collect_in(owner)
+    {
+        minor::minor_collect_in(owner);
         // A busy owner may only have queued the request. Account for its debt
         // immediately; join only when no bounded refill runway remains.
         while small
             && {
-                let mut state = runtime().heap.lock().unwrap();
-                minor_refill_should_wait(&mut state)
+                let mut state = owner.gc.heap.lock().unwrap();
+                minor_refill_should_wait_in(&owner.gc, &mut state)
             }
-            && cycle_wait::wait_for_minor_budget()
+            && cycle_wait::wait_for_minor_budget_in(owner)
         {
             // The owner can satisfy the request before publishing completion.
             // Recheck rather than start another minor for every waiting refill.
-            if allocation_should_minor_collect() {
-                minor_collect_internal();
+            if allocation_should_minor_collect_in(owner) {
+                minor::minor_collect_in(owner);
             }
         }
     }
 
-    if stress || major_due.unwrap_or_else(|| allocation_should_collect_with_sync(false)) {
-        automatic_collect(stress);
+    if stress {
+        let _ = try_collect_internal_in(owner);
+    } else if major_due.unwrap_or_else(|| allocation_should_collect_with_sync_in(owner, false)) {
+        automatic_collect_in(owner, false);
     }
 
     if stress || !small {
-        return allocate_old(layout_id, type_id as u32, payload_size, gc_ref_mask);
+        return allocate_old_in(owner, layout_id, type_id as u32, payload_size, gc_ref_mask);
     }
 
-    let mut storage = cached_storage.or_else(tlab::ChunkStorage::allocate);
-    let mut state = runtime().heap.lock().unwrap();
-    register_tlab_state(&mut state, state_address);
-    let mut base = tlab::install_tlab_chunk(&mut state, state_address, &mut storage);
+    let mut storage = cached_storage.or_else(|| tlab::ChunkStorage::allocate(&storage_allocator));
+    let mut state = owner.gc.heap.lock().unwrap();
+    tlab::register_tlab_state_in(&owner.gc, &mut state, state_address);
+    let mut base = tlab::install_tlab_chunk(owner, &mut state, state_address, &mut storage);
     for _ in 0..BUDGET_COLLECTION_RETRIES {
         if base.is_some() || (state.memory_limit_bytes.is_none() && !state.soft_memory.enabled()) {
             break;
         }
         let released = state.released_bytes;
         drop(state);
-        collect_for_budget();
+        collect_for_budget_in(owner);
         if storage.is_none() {
-            storage = tlab::ChunkStorage::allocate();
+            storage = tlab::ChunkStorage::allocate(&storage_allocator);
         }
-        state = runtime().heap.lock().unwrap();
-        register_tlab_state(&mut state, state_address);
-        base = tlab::install_tlab_chunk(&mut state, state_address, &mut storage);
+        state = owner.gc.heap.lock().unwrap();
+        tlab::register_tlab_state_in(&owner.gc, &mut state, state_address);
+        base = tlab::install_tlab_chunk(owner, &mut state, state_address, &mut storage);
         if state.released_bytes == released {
             break;
         }
     }
     let Some(base) = base else {
-        return allocation_failure(&state);
+        return allocation_failure_in(&owner.gc, &state);
     };
     let Some(header) =
         initialize_object_at(base, total_size, type_id as u32, layout_id, gc_ref_mask)
@@ -1571,7 +1927,7 @@ fn tlab_alloc_slow(
     let tls = unsafe { tlab_state_at(state_address) };
     // Relocation stress closes the TLAB after one object, so every generated
     // allocation returns here and runs a moving minor collection first.
-    let limit = if gc_stress_enabled("relocate") {
+    let limit = if owner.diagnostics.stress_enabled("relocate") {
         total_size
     } else {
         GC_TLAB_CHUNK_SIZE
@@ -1585,7 +1941,7 @@ fn tlab_alloc_slow(
         .get_mut(&state_address)
         .expect("TLAB state is registered before refill")
         .chunk_fast_start = base as usize + total_size;
-    consume_headrooms(total_size);
+    owner.gc.headroom.consume(total_size);
     state.allocated_bytes = state.allocated_bytes.saturating_add(total_size);
     state.young_allocated_bytes = state.young_allocated_bytes.saturating_add(total_size);
     state.young_allocation_clock = state
@@ -1615,9 +1971,6 @@ fn chunk_used_bytes(state: &GcState, chunk: &BumpChunk) -> usize {
         })
         .unwrap_or(chunk.used)
 }
-
-#[cfg(test)]
-thread_local! { static RETIRED_LOOKUP_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 fn object_in_retired_chunk(
     chunk: &BumpChunk,
@@ -1657,8 +2010,9 @@ fn indexed_header_offset(chunk: &BumpChunk, relative: usize, interior: bool) -> 
         chunk
             .header_offsets
             .partition_point(|&offset| {
-                #[cfg(test)]
-                RETIRED_LOOKUP_COMPARISONS.set(RETIRED_LOOKUP_COMPARISONS.get() + 1);
+                chunk.lookup_comparisons.observe(|count| {
+                    count.fetch_add(1, Ordering::Relaxed);
+                });
                 usize::from(offset) <= relative
             })
             .checked_sub(1)?
@@ -1666,8 +2020,9 @@ fn indexed_header_offset(chunk: &BumpChunk, relative: usize, interior: bool) -> 
         chunk
             .header_offsets
             .binary_search_by(|offset| {
-                #[cfg(test)]
-                RETIRED_LOOKUP_COMPARISONS.set(RETIRED_LOOKUP_COMPARISONS.get() + 1);
+                chunk.lookup_comparisons.observe(|count| {
+                    count.fetch_add(1, Ordering::Relaxed);
+                });
                 usize::from(*offset).cmp(&relative)
             })
             .ok()?
@@ -1705,35 +2060,45 @@ fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask:
         crate::failure::fatal_invariant("negative managed allocation size");
     }
     let total_size = (payload_size as u64).saturating_add(GC_HEADER_SIZE as u64);
-    sweep::assist();
-    assist_concurrent_mark(total_size);
-    let stress = gc_stress_enabled("alloc");
+    let owner = crate::runtime::current();
+    sweep::assist_in(owner);
+    assist_concurrent_mark_in(owner, total_size);
+    let stress = owner.diagnostics.stress_enabled("alloc");
     // A due check charges the chunk it covers against the lock-free headroom
     // first; only an exhausted headroom consults the policy under the lock.
     if (stress
-        || (runtime_policy_check_due(total_size)
-            && !consume_policy_headroom(GC_TLAB_CHUNK_SIZE as u64 + total_size)))
-        && allocation_should_collect()
+        || (runtime_policy_check_due_in(&owner.gc, total_size)
+            && !consume_policy_headroom(&owner.gc, GC_TLAB_CHUNK_SIZE as u64 + total_size)))
+        && allocation_should_collect_with_sync_in(owner, true)
     {
         automatic_collect(stress);
     }
     allocate_old(layout_id, type_id, payload_size, gc_ref_mask)
 }
 
-/// Bumped when collection-policy inputs change outside allocation, so every
-/// thread's [`RUNTIME_POLICY_DEBT`] budget expires and its next runtime
-/// allocation consults the policy immediately.
-static RUNTIME_POLICY_EPOCH: AtomicU64 = AtomicU64::new(1);
+// Process-wide identity allocation prevents a reused owner address or equal
+// epochs from accepting another collector's cached allocation budget.
+static NEXT_POLICY_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn next_policy_identity() -> u64 {
+    NEXT_POLICY_IDENTITY
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("collector policy identities exhausted")
+}
 
 std::thread_local! {
-    /// `(epoch, bytes)` this thread's runtime allocations have made since its
-    /// last collection-policy check.
-    static RUNTIME_POLICY_DEBT: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    /// Last collector identity, epoch and bytes since the policy check.
+    /// This cache contains no owner pointer and cannot prolong its lifetime.
+    static RUNTIME_POLICY_DEBT: std::cell::Cell<(u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 fn invalidate_runtime_policy_budgets() {
-    RUNTIME_POLICY_EPOCH.fetch_add(1, Ordering::AcqRel);
-    invalidate_external_headroom();
+    invalidate_runtime_policy_budgets_in(runtime());
+}
+
+fn invalidate_runtime_policy_budgets_in(owner: &GcRuntime) {
+    owner.policy_epoch.fetch_add(1, Ordering::AcqRel);
+    owner.headroom.invalidate();
 }
 
 /// Record growth of reserved heap storage. Under a hard reservation cap the
@@ -1741,12 +2106,17 @@ fn invalidate_runtime_policy_budgets() {
 /// reservation re-arms every thread's next policy check and the trigger fires
 /// at the same allocation as without the per-thread budget. Reservations grow
 /// once per region or chunk, so this costs one check per thread per growth.
+#[cfg(test)]
 fn note_reservation_growth(state: &GcState) {
-    crate::gc_telemetry::footprint::reservation(
+    note_reservation_growth_in(crate::runtime::current(), state);
+}
+
+fn note_reservation_growth_in(owner: &crate::runtime::Runtime, state: &GcState) {
+    owner.telemetry.footprint.reservation(
         (state.old_reserved_bytes as u64).saturating_add(state.tlab_reserved_bytes as u64),
     );
     if state.memory_limit_bytes.is_some() {
-        invalidate_runtime_policy_budgets();
+        invalidate_runtime_policy_budgets_in(&owner.gc);
     }
 }
 
@@ -1759,17 +2129,17 @@ fn note_reservation_growth(state: &GcState) {
 /// Reservation limits stay exact because `allocate_old` enforces them under
 /// the heap lock; pacing and soft-limit triggers may fire up to one chunk of
 /// runtime allocation per thread later, as for generated code.
-fn runtime_policy_check_due(bytes: u64) -> bool {
-    let epoch = RUNTIME_POLICY_EPOCH.load(Ordering::Acquire);
+fn runtime_policy_check_due_in(owner: &GcRuntime, bytes: u64) -> bool {
+    let epoch = owner.policy_epoch.load(Ordering::Acquire);
     RUNTIME_POLICY_DEBT.with(|debt| {
-        let (seen, owed) = debt.get();
-        let owed = if seen == epoch {
+        let (identity, seen, owed) = debt.get();
+        let owed = if identity == owner.policy_identity && seen == epoch {
             owed.saturating_add(bytes)
         } else {
             u64::MAX
         };
         let due = owed >= GC_TLAB_CHUNK_SIZE as u64;
-        debt.set((epoch, if due { 0 } else { owed }));
+        debt.set((owner.policy_identity, epoch, if due { 0 } else { owed }));
         due
     })
 }
@@ -1793,26 +2163,48 @@ fn allocate_old_region_object_locked(
     gc_ref_mask: u64,
     count_logical_allocation: bool,
 ) -> Option<HeapObject> {
-    allocate_old_region_object_for_move(
+    allocate_old_region_object_locked_in(
+        crate::runtime::current(),
         state,
         layout_id,
         type_id,
         payload_size,
         gc_ref_mask,
         count_logical_allocation,
-        None,
     )
 }
 
-fn allocate_old_region_object_for_move(
+fn allocate_old_region_object_locked_in(
+    owner: &crate::runtime::Runtime,
     state: &mut GcState,
     layout_id: u64,
     type_id: u32,
     payload_size: usize,
     gc_ref_mask: u64,
     count_logical_allocation: bool,
+) -> Option<HeapObject> {
+    allocate_old_region_object_for_move_in(
+        owner,
+        state,
+        raw_heap::TraceMetadata {
+            layout_id,
+            type_id,
+            payload_size,
+            gc_ref_mask,
+        },
+        count_logical_allocation,
+        None,
+    )
+}
+
+fn allocate_old_region_object_for_move_in(
+    owner: &crate::runtime::Runtime,
+    state: &mut GcState,
+    metadata: raw_heap::TraceMetadata,
+    count_logical_allocation: bool,
     source: Option<HeapObject>,
 ) -> Option<HeapObject> {
+    let payload_size = metadata.payload_size;
     let total_size = GC_HEADER_SIZE.checked_add(payload_size)?;
     let span_size = total_size.checked_next_multiple_of(GC_REGION_MARK_GRANULE)?;
     let large = total_size > GC_LARGE_OBJECT_THRESHOLD;
@@ -1831,12 +2223,11 @@ fn allocate_old_region_object_for_move(
         .copied()
         .filter(|(available, _)| !large && *available >= span_size);
     let (object, reused) = if let Some((_, index)) = candidate {
-        let allocated = state.old_regions[index].allocate_object_for_move(
-            type_id,
-            layout_id,
-            gc_ref_mask,
-            payload_size,
+        let allocated = state.old_regions[index].allocate_object_for_move_buffered(
+            owner.gc.mark_phase(),
+            metadata,
             source,
+            None,
         )?;
         let available = state.old_regions[index].available_span();
         state.old_region_candidates.pop_last();
@@ -1851,25 +2242,30 @@ fn allocate_old_region_object_for_move(
         } else {
             RegionKind::Old
         };
-        let mut region = reserve_old_region(state, kind, capacity)?;
-        let allocated = region.allocate_object_for_move(
-            type_id,
-            layout_id,
-            gc_ref_mask,
-            payload_size,
+        let mut region = reserve_old_region_in(&owner.gc, state, kind, capacity)?;
+        let allocated = region.allocate_object_for_move_buffered(
+            owner.gc.mark_phase(),
+            metadata,
             source,
+            None,
         )?;
         state
             .old_addresses
             .insert(region.base as usize, state.old_regions.len());
         state.old_regions.push(region);
         state.old_reserved_bytes += capacity;
-        note_reservation_growth(state);
+        note_reservation_growth_in(owner, state);
         index_old_region(state, state.old_regions.len() - 1);
         allocated
     };
 
-    account_old_region_allocation(state, object.size(), reused, count_logical_allocation);
+    account_old_region_allocation_in(
+        &owner.gc,
+        state,
+        object.size(),
+        reused,
+        count_logical_allocation,
+    );
     Some(object)
 }
 
@@ -1880,7 +2276,18 @@ fn account_old_region_allocation(
     reused: bool,
     count_logical_allocation: bool,
 ) {
-    consume_headrooms(size);
+    account_old_region_allocation_in(runtime(), state, size, reused, count_logical_allocation);
+}
+
+#[inline]
+fn account_old_region_allocation_in(
+    owner: &GcRuntime,
+    state: &mut GcState,
+    size: usize,
+    reused: bool,
+    count_logical_allocation: bool,
+) {
+    owner.headroom.consume(size);
     state.allocated_bytes = state.allocated_bytes.saturating_add(size);
     state.old_region_allocations = state.old_region_allocations.saturating_add(1);
     if reused {
@@ -1892,18 +2299,24 @@ fn account_old_region_allocation(
     }
 }
 
-#[cfg(test)]
-std::thread_local! {
-    /// Old-generation allocations this thread requested (test evidence for
-    /// which allocation path runtime entries take).
-    pub(crate) static OLD_ALLOCATIONS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Runtime-root slot registrations made by this thread.
-    pub(crate) static RUNTIME_ROOT_SLOT_ADDS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
+    allocate_old_in(
+        crate::runtime::current(),
+        layout_id,
+        type_id,
+        payload_size,
+        gc_ref_mask,
+    )
 }
 
-fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
-    #[cfg(test)]
-    OLD_ALLOCATIONS_FOR_TEST.set(OLD_ALLOCATIONS_FOR_TEST.get() + 1);
+fn allocate_old_in(
+    owner: &crate::runtime::Runtime,
+    layout_id: u64,
+    type_id: u32,
+    payload_size: i64,
+    gc_ref_mask: u64,
+) -> *mut u8 {
+    RuntimePathObservation::old_allocation(|| &owner.gc.path_observation);
     if payload_size < 0 {
         crate::failure::fatal_invariant("negative managed allocation size");
     }
@@ -1914,21 +2327,31 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
     if payload_size > GC_TLAB_MAX_OBJECT_SIZE.saturating_sub(GC_HEADER_SIZE)
         && !cycle_wait::is_collector()
     {
-        willow_gc_safepoint();
+        safepoint::safepoint_in(owner);
     }
-    if old_lab::enabled()
+    if old_lab::enabled_in(owner)
         && let Some((total, span)) = old_lab::span_for(payload_size)
         && total <= GC_TLAB_MAX_OBJECT_SIZE
-        && old_lab::available()
+        && old_lab::available_in(owner)
     {
         // Small runtime objects bump-allocate in this thread's old buffer and
         // take the heap mutex only to refill it.
-        if let Some(object) = old_lab::try_allocate(type_id, layout_id, gc_ref_mask, total, span) {
+        if let Some(object) =
+            old_lab::try_allocate_in(owner, type_id, layout_id, gc_ref_mask, total, span)
+        {
             return object.payload().as_ptr();
         }
-        let mut state = runtime().heap.lock().unwrap();
+        let mut state = owner.gc.heap.lock().unwrap();
         let refill = |state: &mut GcState| {
-            old_lab::refill_and_allocate(state, type_id, layout_id, gc_ref_mask, total, span)
+            old_lab::refill_and_allocate_in(
+                owner,
+                state,
+                type_id,
+                layout_id,
+                gc_ref_mask,
+                total,
+                span,
+            )
         };
         let mut object = refill(&mut state);
         for _ in 0..BUDGET_COLLECTION_RETRIES {
@@ -1939,21 +2362,21 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
             }
             let released = state.released_bytes;
             drop(state);
-            collect_for_budget();
-            state = runtime().heap.lock().unwrap();
+            collect_for_budget_in(owner);
+            state = owner.gc.heap.lock().unwrap();
             object = refill(&mut state);
             if state.released_bytes == released {
                 break;
             }
         }
         let Some(object) = object else {
-            return allocation_failure(&state);
+            return allocation_failure_in(&owner.gc, &state);
         };
         return object.payload().as_ptr();
     }
     // TLAB byte merging is O(TLABs); the policy checks and TLAB slow path that
     // read those bytes merge them, so the per-object path does not.
-    let mut state = runtime().heap.lock().unwrap();
+    let mut state = owner.gc.heap.lock().unwrap();
     // A coordinator request can still be queued before collector election.
     // Large allocations must not turn OS scheduling latency into unbounded
     // heap growth. Request/join initial publication once the fixed request
@@ -1968,8 +2391,8 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
         && !cycle_wait::is_collector()
     {
         drop(state);
-        cycle_wait::start_for_allocation();
-        state = runtime().heap.lock().unwrap();
+        cycle_wait::start_for_allocation_in(owner);
+        state = owner.gc.heap.lock().unwrap();
     }
     // New objects are outside the sweep snapshot. Bound this floating garbage
     // rather than feeding unlimited sweep-time growth into the next live goal.
@@ -1977,13 +2400,14 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
     // budget and overshoot by at most one admitted object.
     while sweep::allocation_budget_exhausted(&state) {
         drop(state);
-        if !cycle_wait::wait_for_sweep_budget() {
-            state = runtime().heap.lock().unwrap();
+        if !cycle_wait::wait_for_sweep_budget_in(owner) {
+            state = owner.gc.heap.lock().unwrap();
             break;
         }
-        state = runtime().heap.lock().unwrap();
+        state = owner.gc.heap.lock().unwrap();
     }
-    let mut header = allocate_old_region_object_locked(
+    let mut header = allocate_old_region_object_locked_in(
+        owner,
         &mut state,
         layout_id,
         type_id,
@@ -1998,9 +2422,10 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
         }
         let released = state.released_bytes;
         drop(state);
-        collect_for_budget();
-        state = runtime().heap.lock().unwrap();
-        header = allocate_old_region_object_locked(
+        collect_for_budget_in(owner);
+        state = owner.gc.heap.lock().unwrap();
+        header = allocate_old_region_object_locked_in(
+            owner,
             &mut state,
             layout_id,
             type_id,
@@ -2013,7 +2438,7 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
         }
     }
     let Some(header) = header else {
-        return allocation_failure(&state);
+        return allocation_failure_in(&owner.gc, &state);
     };
     state.tlab_slow_allocations = state.tlab_slow_allocations.saturating_add(1);
     if header.size() > GC_TLAB_MAX_OBJECT_SIZE {
@@ -2100,27 +2525,17 @@ pub extern "C" fn willow_gc_minor_collect() {
 /// times, and `std::env::var` costs a `getenv` scan plus, on Windows, a heap
 /// allocation for the key on each call.
 pub(crate) fn gc_stress_enabled(kind: &str) -> bool {
-    #[cfg(test)]
-    if let Some(modes) = &*gc_stress_override()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-    {
-        return modes.iter().any(|mode| mode == "all" || mode == kind);
-    }
-    crate::diagnostic_settings::GC_STRESS_MODES
-        .iter()
-        .any(|mode| mode == "all" || mode == kind)
+    crate::runtime::current().diagnostics.stress_enabled(kind)
 }
 
 #[cfg(test)]
 use crate::diagnostic_settings::parse_gc_stress_modes;
 
-/// Process-wide stress-mode override for tests that cannot restart the process
+/// Default-runtime stress-mode override for tests that cannot restart the process
 /// with a different `WILLOW_GC_STRESS`. `None` restores the environment value.
 #[cfg(test)]
 fn gc_stress_override() -> &'static Mutex<Option<Vec<String>>> {
-    static OVERRIDE: Mutex<Option<Vec<String>>> = Mutex::new(None);
-    &OVERRIDE
+    &crate::runtime::current().diagnostics.stress_override
 }
 
 #[cfg(test)]
@@ -2130,7 +2545,7 @@ pub(crate) fn set_gc_stress_for_test(modes: Option<&str>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = modes.map(parse_gc_stress_modes);
 }
 
-/// Scoped override; callers must hold `runtime_test_guard` until this drops.
+/// Scoped override; callers must hold `isolated_runtime` until this drops.
 #[cfg(test)]
 struct GcStressTestScope(Option<Vec<String>>);
 
@@ -2160,8 +2575,12 @@ impl Drop for GcStressTestScope {
 }
 
 pub(crate) fn stress_collect(kind: &str) {
-    if gc_stress_enabled(kind) {
-        collect_internal();
+    stress_collect_in(crate::runtime::current(), kind);
+}
+
+pub(crate) fn stress_collect_in(owner: &crate::runtime::Runtime, kind: &str) {
+    if owner.diagnostics.stress_enabled(kind) {
+        let _ = try_collect_internal_in(owner);
     }
 }
 
@@ -2250,8 +2669,12 @@ fn append_object_reference_slots(
 }
 
 fn automatic_collect(stress: bool) {
-    if stress || !coordinator::request() {
-        collect_internal();
+    automatic_collect_in(crate::runtime::current(), stress);
+}
+
+fn automatic_collect_in(owner: &crate::runtime::Runtime, stress: bool) {
+    if stress || !coordinator::request_in(owner) {
+        let _ = try_collect_internal_in(owner);
     }
 }
 
@@ -2264,11 +2687,6 @@ fn collect_internal() {
     let _ = try_collect_internal();
 }
 
-// Route a real legacy owner to the definitive handshake check in regressions.
-#[cfg(test)]
-static RECEIPT_TEST_HANDSHAKE_ONLY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CollectionAttempt {
     Completed,
@@ -2279,42 +2697,49 @@ enum CollectionAttempt {
 /// Only Completed proves collection; both contention and unsafe foreign roots
 /// defer the attempt without satisfying a request.
 fn try_collect_internal() -> CollectionAttempt {
+    try_collect_internal_in(crate::runtime::current())
+}
+
+fn try_collect_internal_in(owner: &crate::runtime::Runtime) -> CollectionAttempt {
     // Collector election: only one thread collects at a time.
     // A thread that cannot become the collector must NOT block on runtime().collect_lock —
     // if a stop-the-world collection is in progress, the holder is waiting for
     // this thread to reach a safepoint, so blocking here would deadlock. Instead
     // reach a safepoint (parking if a STW is pending) and let the active
     // collector proceed.
-    if runtime()
+    if owner
+        .gc
         .stop_requested
         .load(std::sync::atomic::Ordering::Acquire)
     {
-        willow_gc_safepoint();
+        safepoint::safepoint_in(owner);
         return CollectionAttempt::ElectionLost;
     }
-    let Some(_serialize) = cycle_wait::CollectorGuard::try_acquire() else {
-        willow_gc_safepoint();
+    let Some(_serialize) = cycle_wait::CollectorGuard::try_acquire_in(owner) else {
+        safepoint::safepoint_in(owner);
         return CollectionAttempt::ElectionLost;
     };
     // A legacy root owner outside the registry cannot publish a snapshot.
     // Other registered workers do not make that foreign stack safe to scan.
-    #[cfg(test)]
-    let check_early = !RECEIPT_TEST_HANDSHAKE_ONLY.load(Ordering::Relaxed);
-    #[cfg(not(test))]
-    let check_early = true;
-    if check_early && foreign_root_stack_owner_active() {
-        progress::record_skip(GcSkipReason::ForeignOwner);
+    use root_handshake::HandshakePolicy;
+    let check_early =
+        root_handshake::RuntimeHandshakePolicy::check_early(|| &owner.gc.handshake_policy);
+    if check_early && root::foreign_root_stack_owner_active_in(&owner.gc) {
+        progress::record_skip(&owner.gc, GcSkipReason::ForeignOwner);
         return CollectionAttempt::ForeignOwner;
     }
-    let gc_log = crate::diagnostic_settings::GC_LOG.unicode;
+    let gc_log = owner.diagnostics.gc_log.unicode;
 
-    let cycle = crate::gc_telemetry::Cycle::begin(crate::gc_telemetry::CycleKind::Major);
+    let cycle = crate::gc_telemetry::Cycle::begin_in(
+        &owner.telemetry,
+        crate::gc_telemetry::CycleKind::Major,
+    );
 
     // Initial STW completes all pre-activation stores, retires TLAB metadata,
     // snapshots roots, and publishes the active mark epoch before resuming.
     let started = std::time::Instant::now();
     let coordination_ns = || {
-        let stops = crate::gc_telemetry::stops::snapshot_stops();
+        let stops = owner.telemetry.stops.snapshot_stops();
         [0, 1, 3].into_iter().fold(0u64, |total, index| {
             total
                 .saturating_add(stops.by_reason[index].rendezvous.total_ns)
@@ -2322,39 +2747,41 @@ fn try_collect_internal() -> CollectionAttempt {
         })
     };
     let pause_before = coordination_ns();
-    let external_before = external_bytes() as u64;
-    #[cfg(test)]
-    if let Some(hook) = cycle_wait::BEFORE_INITIAL_HANDSHAKE.get() {
-        hook();
-    }
-    let Some((heap_before, marking)) = root_handshake::begin() else {
-        progress::record_skip(GcSkipReason::ForeignOwnerAtHandshake);
+    let external_before = owner.gc.native_accounting.bytes.load(Ordering::Relaxed) as u64;
+    RuntimeWaitObservation::before_initial(|| &owner.gc.wait_observation);
+    let Some((heap_before, marking)) = root_handshake::begin_in(owner) else {
+        progress::record_skip(&owner.gc, GcSkipReason::ForeignOwnerAtHandshake);
         return CollectionAttempt::ForeignOwner;
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(debug_assertions)]
         if let Some(message) = marking.invalid_root.lock().unwrap().take() {
-            crate::gc_telemetry::failure_record::emit("invariant", &message);
+            crate::gc_telemetry::failure_record::emit_in(owner, "invariant", &message);
             panic!("willow gc: invalid GC pointer in root snapshot: {message}");
         }
         // Bounded chunks allow a producer-heavy workload to reach remark;
         // finishing relies on quiescing producers, never a racy empty sample.
         let budget = marking.objects.len().saturating_mul(4).max(1024);
         {
-            let mut workers = MARK_WORKERS.lock().unwrap();
-            if workers.is_none() {
-                *workers = mark_workers::Pool::new(mark_workers::configured_count()).ok();
+            // A stack-owned test runtime cannot lend itself to persistent
+            // threads. Its elected collector still drains the same bounded
+            // mark work, without fabricating a static lifetime or panicking.
+            let shareable = coordinator::Lease::for_runtime(owner).is_some();
+            let mut workers = owner.gc.marker_workers.lock().unwrap();
+            if shareable && workers.is_none() {
+                *workers = mark_workers::Pool::new_for_runtime(*owner.marker_count, owner).ok();
             }
             if let Some(pool) = workers
                 .as_ref()
-                .filter(|pool| pool.count() != 0 && old_cycle::concurrent_enabled())
+                .filter(|pool| shareable && pool.count() != 0 && old_cycle::concurrent_enabled())
             {
-                pool.run(&marking, budget);
+                pool.run(owner, &marking, budget);
             } else {
                 // The elected collector is a registered, slotless queue reader.
                 // Missing background workers must not force unrestricted STW work.
                 if old_cycle::concurrent_enabled() {
-                    marking.drain_checked_until(
+                    marking.drain_checked_until_in(
+                        owner,
                         256,
                         Some(std::time::Instant::now() + std::time::Duration::from_millis(1)),
                     );
@@ -2363,24 +2790,24 @@ fn try_collect_internal() -> CollectionAttempt {
                 }
             }
         }
-        minor::service_pending();
-        let closed = mark_closure::finish(&marking, started);
+        minor::service_pending_in(owner);
+        let closed = mark_closure::finish_in(owner, &marking, started);
         let concurrent_closed = closed.is_some();
         let result = if let Some((work, plan)) = closed {
             (work, Some(plan), 0)
         } else {
-            mark_closure::finish_stopped(&marking, started)
+            mark_closure::finish_stopped_in(owner, &marking, started)
         };
         let (mut work, plan, stopped_freed) = result;
-        let freed = plan.map_or(stopped_freed, sweep::concurrent);
+        let freed = plan.map_or(stopped_freed, |plan| sweep::concurrent_in(owner, plan));
         {
             let swept = marking.work.lock().unwrap();
             work.sweep_assist_cpu_ns = swept.sweep_assist_cpu_ns;
             work.sweep_cpu_incomplete = swept.sweep_cpu_incomplete;
         }
-        minor::service_pending();
-        let mut state = runtime().heap.lock().unwrap();
-        sync_tlab_bytes(&mut state);
+        minor::service_pending_in(owner);
+        let mut state = owner.gc.heap.lock().unwrap();
+        tlab::sync_tlab_bytes_in(&owner.gc, &mut state);
         let after = state.allocated_bytes as u64;
         state.last_major_live_bytes = after;
         state.last_major_policy_live_bytes = major_policy_managed_bytes(&state) as u64;
@@ -2405,20 +2832,21 @@ fn try_collect_internal() -> CollectionAttempt {
         Ok(result) => result,
         Err(payload) => {
             if old_cycle::concurrent_enabled() {
-                mark_closure::cancel(&marking);
+                mark_closure::cancel_in(owner, &marking);
                 std::panic::resume_unwind(payload);
             }
             // Failure leaves the graph allocated. Remove transient marks under
             // another stop so the next collection can safely retry.
-            with_stw(
+            safepoint::with_stw_in(
+                owner,
                 crate::gc_telemetry::stops::StopReason::Recovery,
                 |coord, stop_work| {
-                    let mut state = runtime().heap.lock().unwrap();
+                    let mut state = owner.gc.heap.lock().unwrap();
                     flush_satb_all_locked(coord, &mut state);
-                    old_lab::retire_all(&mut state);
-                    GC_MARK_PHASE.store(0, Ordering::Release);
-                    marking::set_concurrent_cycle(&mut state, None);
-                    retire_tlabs_with_work(&mut state, stop_work);
+                    old_lab::retire_all_in(&owner.gc, &mut state);
+                    owner.gc.mark_phase().store(0, Ordering::Release);
+                    marking::set_concurrent_cycle_in(&owner.gc, &mut state, None);
+                    tlab::retire_tlabs_with_work_in(owner, &mut state, stop_work);
                     for object in epoch_objects(&state, stop_work) {
                         object.clear_mark();
                     }
@@ -2434,20 +2862,20 @@ fn try_collect_internal() -> CollectionAttempt {
     // finish_concurrent may emit telemetry: never call it with the heap locked.
     // Collector serialization remains held until all next-cycle policy is ready.
     {
-        let mut state = runtime().heap.lock().unwrap();
-        sync_tlab_bytes(&mut state);
+        let mut state = owner.gc.heap.lock().unwrap();
+        tlab::sync_tlab_bytes_in(&owner.gc, &mut state);
         let previous_goal = state.threshold_bytes as u64;
-        let bytes = policy_allocated_total(&state);
+        let bytes = policy_allocated_total_in(&owner.gc, &state);
         state
             .pacer
             .resume_allocation(crate::gc_telemetry::timestamp_ns(), bytes);
-        pacer::complete_threshold(&mut state, previous_goal);
+        pacer::complete_threshold_in(owner, &mut state, previous_goal);
         // A completed full cycle services any high reservation pressure. If
         // reclamation crossed the low watermark, rearm before new allocations
         // can reserve a region again (even within the same allocation call).
-        hard_reservation_pressure(&mut state);
+        hard_reservation_pressure_in(&owner.gc, &mut state);
         state.soft_memory.sample_process();
-        let memory_input = memory_inputs(&state);
+        let memory_input = memory_inputs_in(&owner.gc, &state);
         state
             .soft_memory
             .completed(heap_before.saturating_add(external_before), memory_input);
@@ -2459,30 +2887,25 @@ fn try_collect_internal() -> CollectionAttempt {
                 decision.trigger,
                 decision.overshoot,
                 decision.reason,
-                external_bytes(),
+                owner.gc.native_accounting.bytes.load(Ordering::Relaxed),
                 memory_input.process_resident.unwrap_or(0),
                 memory_input.process_resident.is_some()
             );
         }
-        progress::record_success(state.total_allocated_bytes);
+        progress::record_success(&owner.gc, state.total_allocated_bytes);
     }
 
     if gc_log {
-        let state = runtime().heap.lock().unwrap();
+        let state = owner.gc.heap.lock().unwrap();
         eprintln!(
             "gc: heap_before={}B freed={}B heap_after={}B total_allocs={} total_frees={}",
             heap_before, freed, state.allocated_bytes, state.total_allocs, state.total_frees,
         );
     }
     drop(_serialize);
-    crate::gc_telemetry::emit_cycle(event);
+    crate::gc_telemetry::emit_cycle_in(owner, event);
     CollectionAttempt::Completed
 }
-
-#[cfg(test)]
-static SWEEP_REGION_VISITS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static SWEEP_OBJECT_VISITS: AtomicUsize = AtomicUsize::new(0);
 
 /// Sweep the region-backed old-object index and nursery/pinned regions without
 /// moving survivors. Dead old spans return to their owning region's free list;
@@ -2508,19 +2931,28 @@ fn payload_to_header(payload: *mut u8) -> *mut GcHeader {
 }
 
 #[cfg(debug_assertions)]
-fn checked_payload_to_header(payload: *mut u8, context: &str) -> *mut GcHeader {
-    validate_payload_pointer(payload, context).unwrap_or_else(|message| {
-        crate::gc_telemetry::failure_record::emit("invariant", &message);
+fn checked_payload_to_header(
+    owner: &crate::runtime::Runtime,
+    payload: *mut u8,
+    context: &str,
+) -> *mut GcHeader {
+    let result = validate_payload_pointer_locked(&owner.gc.heap.lock().unwrap(), payload);
+    result.unwrap_or_else(|message| {
+        crate::gc_telemetry::failure_record::emit_in(owner, "invariant", &message);
         panic!("willow gc: invalid GC pointer in {context}: {message}");
     })
 }
 
 #[cfg(not(debug_assertions))]
-fn checked_payload_to_header(payload: *mut u8, _context: &str) -> *mut GcHeader {
+fn checked_payload_to_header(
+    _owner: &crate::runtime::Runtime,
+    payload: *mut u8,
+    _context: &str,
+) -> *mut GcHeader {
     payload_to_header(payload)
 }
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, test))]
 fn validate_payload_pointer(payload: *mut u8, _context: &str) -> Result<*mut GcHeader, String> {
     validate_payload_pointer_locked(&runtime().heap.lock().unwrap(), payload)
 }
@@ -2589,14 +3021,15 @@ fn reset_internal() {
     // Coordinator shutdown waits on `coord`; recover it before that wait.
     drop(reset_lock(&runtime().coord.0));
     coordinator::shutdown();
-    #[cfg(test)]
-    minor::reset_pending();
+    runtime().minor_pending.store(false, Ordering::Release);
     // Exclude a concurrent collection (see runtime().collect_lock).
     let _serialize = runtime()
         .collect_lock
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    GC_MARK_PHASE.store(0, Ordering::Release);
+    crate::runtime::current()
+        .mark_phase()
+        .store(0, Ordering::Release);
     let mut state = reset_lock(&runtime().heap);
     marking::set_concurrent_cycle(&mut state, None);
     state.sweeping = None;
@@ -2632,7 +3065,14 @@ fn reset_internal() {
             let object = HeapObject::from_raw(unsafe { region.base.add(offset) }.cast()).unwrap();
             if let Some(drop_fn) = lookup_drop(object.type_id()) {
                 // SAFETY: reset is quiescent and this indexed payload is live.
-                unsafe { run_drop_hook(drop_fn, object.payload().as_ptr()) };
+                unsafe {
+                    run_drop_hook(
+                        runtime(),
+                        drop_fn,
+                        object.payload().as_ptr(),
+                        crate::observation::Value::new(|| object.type_id()),
+                    )
+                };
             }
             object.reclaim_in_place();
         }
@@ -2655,7 +3095,14 @@ fn reset_internal() {
                 && let Some(drop_fn) = lookup_drop(object.type_id())
             {
                 // SAFETY: reset owns the remaining initialized payload.
-                unsafe { run_drop_hook(drop_fn, object.payload().as_ptr()) };
+                unsafe {
+                    run_drop_hook(
+                        runtime(),
+                        drop_fn,
+                        object.payload().as_ptr(),
+                        crate::observation::Value::new(|| object.type_id()),
+                    )
+                };
             }
             object.reclaim_in_place();
         }
@@ -2689,7 +3136,10 @@ fn reset_internal() {
     state.minor_retry_bytes = 0;
     state.total_allocs = 0;
     state.total_allocated_bytes = 0;
-    EXTERNAL_ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    runtime()
+        .native_accounting
+        .allocated_bytes
+        .store(0, Ordering::Relaxed);
     state.released_bytes = 0;
     crate::gc_telemetry::reset_for_test();
     state.total_frees = 0;
@@ -2723,7 +3173,7 @@ fn reset_internal() {
     runtime().pin_lease_slots.clear();
     reset_lock(&runtime().parked_stack_roots).clear();
     *reset_lock(&runtime().root_stack_owner) = None;
-    progress::reset();
+    progress::reset(runtime());
     // Collectors and TLS-block unregistration take coord before heap; never
     // wait for coord while holding heap.
     drop(state);
@@ -2767,9 +3217,14 @@ pub fn header_size_for_test() -> usize {
 #[cfg(test)]
 pub fn reset_internal_for_test() {
     reset_internal();
-    DIAGNOSTIC_READY.store(true, Ordering::Release);
+    crate::runtime::current()
+        .diagnostic_ready
+        .store(true, Ordering::Release);
     crate::frame_lifetime::reset();
-    old_cycle::REMARK_WORK_NS_FOR_TEST.store(0, Ordering::Relaxed);
+    runtime()
+        .remark_observation
+        .work_ns
+        .store(0, Ordering::Relaxed);
 }
 
 /// A fresh, empty generated-TLS block for tests in sibling modules that need a
@@ -2817,19 +3272,10 @@ pub fn total_frees_for_test() -> u64 {
     runtime().heap.lock().unwrap().total_frees
 }
 
-/// Hold this for runtime tests that touch the process-global GC heap or other
-/// runtime globals that allocate on it.
-///
-/// This lock is test-only and is not part of production synchronization. It
-/// prevents one test from resetting the shared heap with `willow_gc_init` while
-/// another test is still using pointers allocated from that heap.
+/// Test fixture re-exported beside the GC test helpers: each test thread
+/// serves an independent runtime instead of locking the process default.
 #[cfg(test)]
-pub fn runtime_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    crate::gc_telemetry::failure_record::install_test_panic_hook();
-    RUNTIME_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+pub(crate) use crate::runtime::isolated_runtime;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2852,6 +3298,9 @@ mod contract_viewpoint_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod instance_isolation_tests;
 
 #[cfg(test)]
 mod m0_reference_tests;
@@ -2908,7 +3357,7 @@ pub fn acceptance_inject(kind: &str) {
     use crate::gc_telemetry::stops::StopReason;
     // Stop initiators must own collector election, like real cycles, so an
     // injected stop never races a background sweep or another stop request.
-    fn elected() -> cycle_wait::CollectorGuard {
+    fn elected() -> cycle_wait::CollectorGuard<'static> {
         loop {
             if let Some(guard) = cycle_wait::CollectorGuard::try_acquire() {
                 break guard;
@@ -2931,7 +3380,7 @@ pub fn acceptance_inject(kind: &str) {
         "mark_wait" => {
             let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let signal = ready.clone();
-            let owner = std::thread::spawn(move || {
+            let owner = std::thread::spawn(crate::runtime::serving(move || {
                 let _role = crate::gc_telemetry::observations::MarkerRole::new();
                 let _registration = MutatorRegistration::new();
                 let _election = elected();
@@ -2942,7 +3391,7 @@ pub fn acceptance_inject(kind: &str) {
                     willow_gc_safepoint();
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
-            });
+            }));
             while !ready.load(Ordering::Acquire) && !owner.is_finished() {
                 willow_gc_safepoint();
                 std::thread::yield_now();
@@ -2955,11 +3404,11 @@ pub fn acceptance_inject(kind: &str) {
         }
         "lock_stall" => {
             let heap = runtime().heap.lock().unwrap();
-            let worker = std::thread::spawn(|| {
+            let worker = std::thread::spawn(crate::runtime::serving(|| {
                 let _registration = MutatorRegistration::new();
                 std::hint::black_box(willow_alloc(64));
                 willow_gc_safepoint();
-            });
+            }));
             std::thread::sleep(std::time::Duration::from_millis(40));
             drop(heap);
             while !worker.is_finished() {

@@ -10,8 +10,26 @@ pub(super) unsafe fn tlab_state_at(address: usize) -> &'static GcTlabState {
     unsafe { &*(address as *const GcTlabState) }
 }
 
+pub(super) trait AccountingObservation {
+    fn visited(&mut self) {}
+}
+#[cfg(not(test))]
+#[derive(Default)]
+pub(super) struct NoAccountingObservation {
+    _disabled: (),
+}
+#[cfg(not(test))]
+impl AccountingObservation for NoAccountingObservation {}
+#[cfg(not(test))]
+pub(super) type RuntimeAccountingObservation = NoAccountingObservation;
 #[cfg(test)]
-pub(super) static TLAB_ACCOUNTING_RECORD_VISITS: AtomicUsize = AtomicUsize::new(0);
+pub(super) type RuntimeAccountingObservation = usize;
+#[cfg(test)]
+impl AccountingObservation for usize {
+    fn visited(&mut self) {
+        *self += 1;
+    }
+}
 
 /// Fast-path bytes this TLAB has allocated so far: retired chunks plus the
 /// active chunk's bump distance past its slow-path first object. O(1).
@@ -46,9 +64,11 @@ fn fast_allocations_total(
 }
 
 /// Bytes-only delta for allocation-path pacing; never scans start words.
-fn read_tlab_bytes_delta(record: &mut TlabStateRecord) -> u64 {
-    #[cfg(test)]
-    TLAB_ACCOUNTING_RECORD_VISITS.fetch_add(1, Ordering::Relaxed);
+fn read_tlab_bytes_delta(
+    record: &mut TlabStateRecord,
+    observation: &mut RuntimeAccountingObservation,
+) -> u64 {
+    observation.visited();
     let bytes = fast_bytes_total(record);
     let delta = bytes.saturating_sub(record.observed_fast_allocated_bytes);
     record.observed_fast_allocated_bytes = bytes;
@@ -67,12 +87,16 @@ fn read_tlab_allocations_delta(
 }
 
 pub(super) fn add_tlab_accounting(state: &mut GcState, allocations: u64, bytes: u64) {
+    add_tlab_accounting_in(runtime(), state, allocations, bytes);
+}
+
+fn add_tlab_accounting_in(owner: &GcRuntime, state: &mut GcState, allocations: u64, bytes: u64) {
     state.total_allocs = state.total_allocs.saturating_add(allocations);
     state.total_allocated_bytes = state.total_allocated_bytes.saturating_add(bytes);
     state.young_allocation_clock = state.young_allocation_clock.saturating_add(bytes);
     state.tlab_fast_allocations = state.tlab_fast_allocations.saturating_add(allocations);
     state.tlab_fast_allocated_bytes = state.tlab_fast_allocated_bytes.saturating_add(bytes);
-    consume_headrooms(bytes as usize);
+    owner.headroom.consume(bytes as usize);
     state.allocated_bytes = state.allocated_bytes.saturating_add(bytes as usize);
     state.young_allocated_bytes = state.young_allocated_bytes.saturating_add(bytes as usize);
 }
@@ -83,54 +107,73 @@ pub(super) fn add_tlab_accounting(state: &mut GcState, allocations: u64, bytes: 
 /// Old buffers likewise publish at refill/retirement and have one carve of lag.
 /// Exact telemetry and collection snapshots still merge all records.
 pub(super) fn sync_tlab_record_bytes(state: &mut GcState, address: usize) {
+    sync_tlab_record_bytes_in(runtime(), state, address);
+}
+pub(super) fn sync_tlab_record_bytes_in(owner: &GcRuntime, state: &mut GcState, address: usize) {
     let record = state
         .tlab_states
         .get_mut(&address)
         .expect("registered TLAB");
-    let bytes = read_tlab_bytes_delta(record);
-    add_tlab_accounting(state, 0, bytes);
+    let bytes = read_tlab_bytes_delta(record, &mut state.tlab_accounting_observation);
+    add_tlab_accounting_in(owner, state, 0, bytes);
 }
 
 /// Merge fast-path bytes for pacing and nursery triggers: O(TLABs), one cursor
 /// load each. Object counts lag until [`sync_tlab_accounting`] or retirement.
 pub(super) fn sync_tlab_bytes(state: &mut GcState) {
+    sync_tlab_bytes_in(runtime(), state);
+}
+
+pub(super) fn sync_tlab_bytes_in(owner: &GcRuntime, state: &mut GcState) {
     let mut bytes = 0u64;
     for record in state.tlab_states.values_mut() {
-        bytes = bytes.saturating_add(read_tlab_bytes_delta(record));
+        bytes = bytes.saturating_add(read_tlab_bytes_delta(
+            record,
+            &mut state.tlab_accounting_observation,
+        ));
     }
-    add_tlab_accounting(state, 0, bytes);
-    old_lab::sync_bytes(state);
+    add_tlab_accounting_in(owner, state, 0, bytes);
+    old_lab::sync_bytes_in(owner, state);
 }
 
 /// Merge fast-path bytes and object counts, for telemetry readers.
 pub(super) fn sync_tlab_accounting(state: &mut GcState) {
-    sync_tlab_counters(state);
+    sync_tlab_accounting_in(runtime(), state);
+}
+
+pub(super) fn sync_tlab_accounting_in(owner: &GcRuntime, state: &mut GcState) {
+    sync_tlab_counters(owner, state);
     // Index consumers retain the baseline full flush.
-    old_lab::flush_all(state);
+    old_lab::flush_all_in(owner, state);
 }
 
 pub(super) fn sync_tlab_accounting_unindexed(state: &mut GcState) {
-    sync_tlab_counters(state);
-    old_lab::sync_records(state);
+    sync_tlab_accounting_unindexed_in(runtime(), state);
 }
 
-fn sync_tlab_counters(state: &mut GcState) {
+pub(super) fn sync_tlab_accounting_unindexed_in(owner: &GcRuntime, state: &mut GcState) {
+    sync_tlab_counters(owner, state);
+    old_lab::sync_records_in(owner, state);
+}
+
+fn sync_tlab_counters(owner: &GcRuntime, state: &mut GcState) {
     let (mut allocations, mut bytes) = (0u64, 0u64);
     let GcState {
         tlab_states,
         tlab_chunks,
         tlab_addresses,
+        tlab_accounting_observation,
         ..
     } = state;
     for record in tlab_states.values_mut() {
-        bytes = bytes.saturating_add(read_tlab_bytes_delta(record));
+        bytes = bytes.saturating_add(read_tlab_bytes_delta(record, tlab_accounting_observation));
         allocations = allocations.saturating_add(read_tlab_allocations_delta(
             record,
             tlab_chunks,
             tlab_addresses,
         ));
     }
-    add_tlab_accounting(state, allocations, bytes);
+    add_tlab_accounting_in(owner, state, allocations, bytes);
 }
 
 thread_local! {
@@ -139,8 +182,15 @@ thread_local! {
     pub(super) static HAS_REGISTERED_TLAB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
 pub(super) fn register_tlab_state(state: &mut GcState, address: usize) {
-    HAS_REGISTERED_TLAB.set(true);
+    register_tlab_state_in(runtime(), state, address);
+}
+
+pub(super) fn register_tlab_state_in(gc: &GcRuntime, state: &mut GcState, address: usize) {
+    if gc.serves_current_thread() {
+        HAS_REGISTERED_TLAB.set(true);
+    }
     state.tlab_states.entry(address).or_insert_with(|| {
         state
             .tlab_owners
@@ -163,6 +213,18 @@ pub(super) fn register_tlab_state(state: &mut GcState, address: usize) {
 }
 
 pub(super) fn retire_tlab_locked(state: &mut GcState, address: usize) {
+    retire_tlab_locked_in(
+        &crate::runtime::current().telemetry.footprint,
+        state,
+        address,
+    );
+}
+
+pub(super) fn retire_tlab_locked_in(
+    footprint: &crate::gc_telemetry::footprint::Counters,
+    state: &mut GcState,
+    address: usize,
+) {
     let Some(record) = state.tlab_states.get_mut(&address) else {
         return;
     };
@@ -182,7 +244,7 @@ pub(super) fn retire_tlab_locked(state: &mut GcState, address: usize) {
         let start = chunk.base as usize;
         let end = start.saturating_add(chunk.capacity);
         chunk.used = cursor.clamp(start, end).saturating_sub(start);
-        crate::gc_telemetry::footprint::retired_tail((chunk.capacity - chunk.used) as u64);
+        footprint.retired_tail((chunk.capacity - chunk.used) as u64);
         chunk.owner_state = None;
         assert!(
             chunk.header_offsets.is_empty(),
@@ -243,20 +305,34 @@ pub(super) fn index_retired_chunk(chunk: &mut BumpChunk) -> usize {
 /// indexes only the chunks it touches; other callers use
 /// `retire_all_tlabs_locked`.
 pub(super) fn retire_all_tlabs_unindexed(state: &mut GcState) {
-    sync_tlab_accounting(state);
-    retire_all_tlab_cursors(state);
+    retire_all_tlabs_unindexed_in(crate::runtime::current(), state);
+}
+
+pub(super) fn retire_all_tlabs_unindexed_in(owner: &crate::runtime::Runtime, state: &mut GcState) {
+    sync_tlab_accounting_in(&owner.gc, state);
+    retire_all_tlab_cursors(&owner.telemetry.footprint, state);
 }
 
 /// Initial mark captures start maps and must not index old-LAB objects while
 /// retiring nursery cursors. Minor and baseline index consumers keep their flush.
 pub(super) fn retire_all_tlabs_unindexed_for_mark(state: &mut GcState) {
-    // Retirement keeps the derived totals continuous, so one sync afterwards
-    // also publishes the fast allocations folded in from retired chunks.
-    retire_all_tlab_cursors(state);
-    sync_tlab_accounting_unindexed(state);
+    retire_all_tlabs_unindexed_for_mark_in(crate::runtime::current(), state);
 }
 
-fn retire_all_tlab_cursors(state: &mut GcState) {
+pub(super) fn retire_all_tlabs_unindexed_for_mark_in(
+    owner: &crate::runtime::Runtime,
+    state: &mut GcState,
+) {
+    // Retirement keeps the derived totals continuous, so one sync afterwards
+    // also publishes the fast allocations folded in from retired chunks.
+    retire_all_tlab_cursors(&owner.telemetry.footprint, state);
+    sync_tlab_accounting_unindexed_in(&owner.gc, state);
+}
+
+fn retire_all_tlab_cursors(
+    footprint: &crate::gc_telemetry::footprint::Counters,
+    state: &mut GcState,
+) {
     // An allocator may have sealed its exhausted chunk before joining this
     // stop. Remember its minor epoch rather than counting only live cursors.
     // Non-minor stops preserve the evidence until the next minor consumes it.
@@ -268,14 +344,18 @@ fn retire_all_tlab_cursors(state: &mut GcState) {
     state.young_allocators = state.young_allocators.max(allocators);
     let addresses: Vec<usize> = state.tlab_states.keys().copied().collect();
     for address in addresses {
-        retire_tlab_locked(state, address);
+        retire_tlab_locked_in(footprint, state, address);
     }
 }
 
 /// Seal every active TLAB and index every retired chunk that still lacks its
 /// header index. Returns the headers indexed. O(chunks + newly indexed headers).
 pub(super) fn retire_all_tlabs_locked(state: &mut GcState) -> usize {
-    retire_all_tlabs_unindexed(state);
+    retire_all_tlabs_locked_in(crate::runtime::current(), state)
+}
+
+fn retire_all_tlabs_locked_in(owner: &crate::runtime::Runtime, state: &mut GcState) -> usize {
+    retire_all_tlabs_unindexed_in(owner, state);
     state.tlab_chunks.iter_mut().map(index_retired_chunk).sum()
 }
 
@@ -283,12 +363,25 @@ pub(super) fn retire_tlabs_with_work(
     state: &mut GcState,
     work: &mut crate::gc_telemetry::stops::StopWorkV2,
 ) {
-    let headers = retire_all_tlabs_locked(state) as u64;
+    retire_tlabs_with_work_in(crate::runtime::current(), state, work);
+}
+
+pub(super) fn retire_tlabs_with_work_in(
+    owner: &crate::runtime::Runtime,
+    state: &mut GcState,
+    work: &mut crate::gc_telemetry::stops::StopWorkV2,
+) {
+    let headers = retire_all_tlabs_locked_in(owner, state) as u64;
     work.metadata_objects += headers;
     work.metadata_bytes += headers * GC_HEADER_SIZE as u64;
 }
 
-pub(super) fn retire_owned_tlabs_locked(state: &mut GcState, owner: ThreadId, unregister: bool) {
+fn retire_owned_tlabs_locked_in(
+    runtime: &crate::runtime::Runtime,
+    state: &mut GcState,
+    owner: ThreadId,
+    unregister: bool,
+) {
     let addresses: Vec<_> = state
         .tlab_owners
         .get(&owner)
@@ -296,7 +389,7 @@ pub(super) fn retire_owned_tlabs_locked(state: &mut GcState, owner: ThreadId, un
         .flat_map(|addresses| addresses.iter().copied())
         .collect();
     for address in addresses {
-        retire_tlab_record_locked(state, address, unregister);
+        retire_tlab_record_locked_in(runtime, state, address, unregister);
     }
     if unregister {
         state.tlab_owners.remove(&owner);
@@ -305,17 +398,22 @@ pub(super) fn retire_owned_tlabs_locked(state: &mut GcState, owner: ThreadId, un
 
 /// Retire one registered TLS block, folding its counters into the totals, and
 /// optionally forget the record. The caller fixes up `tlab_owners`.
-fn retire_tlab_record_locked(state: &mut GcState, address: usize, unregister: bool) {
+fn retire_tlab_record_locked_in(
+    runtime: &crate::runtime::Runtime,
+    state: &mut GcState,
+    address: usize,
+    unregister: bool,
+) {
     let record = state
         .tlab_states
         .get_mut(&address)
         .expect("owner index has a TLS record");
-    let bytes = read_tlab_bytes_delta(record);
+    let bytes = read_tlab_bytes_delta(record, &mut state.tlab_accounting_observation);
     // Retirement at the initial root handshake starts this owner's epoch
     // after all pre-snapshot allocation. Do not bill it to the new cycle.
     record.assist_observed_fast_bytes = record.observed_fast_allocated_bytes;
-    add_tlab_accounting(state, 0, bytes);
-    retire_tlab_locked(state, address);
+    add_tlab_accounting_in(&runtime.gc, state, 0, bytes);
+    retire_tlab_locked_in(&runtime.telemetry.footprint, state, address);
     // With no active chunk this merges only the retired count: O(1).
     let GcState {
         tlab_states,
@@ -325,7 +423,7 @@ fn retire_tlab_record_locked(state: &mut GcState, address: usize, unregister: bo
     } = &mut *state;
     let record = tlab_states.get_mut(&address).expect("retired record");
     let allocations = read_tlab_allocations_delta(record, tlab_chunks, tlab_addresses);
-    add_tlab_accounting(state, allocations, 0);
+    add_tlab_accounting_in(&runtime.gc, state, allocations, 0);
     if unregister {
         state.tlab_states.remove(&address);
     }
@@ -334,32 +432,42 @@ fn retire_tlab_record_locked(state: &mut GcState, address: usize, unregister: bo
 /// Retire and forget the TLS block at `address` if it is registered, e.g.
 /// before the block's thread-local storage is destroyed. O(1) expected.
 pub(super) fn unregister_tlab_state(address: usize) {
+    unregister_tlab_state_in(crate::runtime::current(), address);
+}
+
+pub(super) fn unregister_tlab_state_in(owner: &crate::runtime::Runtime, address: usize) {
     // Same coord -> heap order as mutator unregistration, so a collector never
     // observes a half-retired record.
-    let (lock, _) = &runtime().coord;
+    let (lock, _) = &owner.gc.coord;
     let _coord = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut state = runtime()
+    let mut state = owner
+        .gc
         .heap
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(owner) = state.tlab_states.get(&address).map(|record| record.owner) else {
+    let Some(thread) = state.tlab_states.get(&address).map(|record| record.owner) else {
         return;
     };
-    retire_tlab_record_locked(&mut state, address, true);
-    if let Some(addresses) = state.tlab_owners.get_mut(&owner) {
+    retire_tlab_record_locked_in(owner, &mut state, address, true);
+    if let Some(addresses) = state.tlab_owners.get_mut(&thread) {
         addresses.remove(&address);
         if addresses.is_empty() {
-            state.tlab_owners.remove(&owner);
+            state.tlab_owners.remove(&thread);
         }
     }
 }
 
+#[cfg(test)]
 pub(super) fn retire_tlabs_for_thread(owner: ThreadId) {
+    retire_tlabs_for_thread_in(crate::runtime::current(), owner);
+}
+
+pub(super) fn retire_tlabs_for_thread_in(runtime: &crate::runtime::Runtime, owner: ThreadId) {
     debug_assert_eq!(owner, std::thread::current().id());
-    if !HAS_REGISTERED_TLAB.replace(false) {
+    if std::ptr::eq(runtime, crate::runtime::current()) && !HAS_REGISTERED_TLAB.replace(false) {
         return;
     }
-    retire_owned_tlabs_locked(&mut runtime().heap.lock().unwrap(), owner, true);
+    retire_owned_tlabs_locked_in(runtime, &mut runtime.gc.heap.lock().unwrap(), owner, true);
 }
 
 /// Zeroed storage and start bitmaps for one TLAB chunk, prepared before the
@@ -413,10 +521,10 @@ impl ChunkStorage {
     }
 
     /// `None` when the system allocator fails; no heap lock is needed.
-    pub(super) fn allocate() -> Option<Self> {
+    pub(super) fn allocate(allocator: &RuntimeStorageAllocator) -> Option<Self> {
         // SAFETY: the layout is nonzero and valid. Fresh zeroing makes every
         // unallocated payload byte safe before generated code publishes a header.
-        let base = unsafe { allocate_region_storage(StorageBlock::layout()) };
+        let base = unsafe { allocate_region_storage(allocator, StorageBlock::layout()) };
         (!base.is_null()).then(|| Self {
             block: StorageBlock(base),
             header_offsets: Vec::new(),
@@ -430,17 +538,19 @@ impl ChunkStorage {
 
 #[cfg(test)]
 pub(super) fn allocate_tlab_chunk(state: &mut GcState, owner_state: usize) -> Option<*mut u8> {
-    install_tlab_chunk(state, owner_state, &mut ChunkStorage::allocate())
+    let mut storage = ChunkStorage::allocate(&state.storage_allocator);
+    install_tlab_chunk(crate::runtime::current(), state, owner_state, &mut storage)
 }
 
 /// Install `storage` as `owner_state`'s current chunk, taking it only when
 /// the reservation admits it. O(1) expected under the heap lock.
 pub(super) fn install_tlab_chunk(
+    owner: &crate::runtime::Runtime,
     state: &mut GcState,
     owner_state: usize,
     storage: &mut Option<ChunkStorage>,
 ) -> Option<*mut u8> {
-    if storage.is_none() || !can_reserve(state, GC_TLAB_CHUNK_SIZE) {
+    if storage.is_none() || !can_reserve_in(&owner.gc, state, GC_TLAB_CHUNK_SIZE) {
         return None;
     }
     let ChunkStorage {
@@ -450,11 +560,12 @@ pub(super) fn install_tlab_chunk(
         concurrent_marks,
     } = storage.take().unwrap();
     let base = block.into_raw();
-    runtime().tlab_ever_allocated.store(true, Ordering::Release);
+    owner.gc.tlab_ever_allocated.store(true, Ordering::Release);
     state
         .tlab_addresses
         .insert(base as usize, state.tlab_chunks.len());
     state.tlab_chunks.push(BumpChunk {
+        lookup_comparisons: crate::observation::Value::default(),
         base,
         capacity: GC_TLAB_CHUNK_SIZE,
         used: 0,
@@ -466,16 +577,16 @@ pub(super) fn install_tlab_chunk(
         header_offsets,
     });
     let chunk = state.tlab_chunks.last().unwrap();
-    runtime().root_tlabs.insert(chunk);
+    owner.gc.root_tlabs.insert(chunk);
     // SAFETY: the generated TLS is owned by this allocation's mutator.
     unsafe { tlab_state_at(owner_state) }.start_bits.store(
         chunk.mark_bitmap.bits.words_ptr() as usize,
         Ordering::Release,
     );
     state.tlab_reserved_bytes = state.tlab_reserved_bytes.saturating_add(GC_TLAB_CHUNK_SIZE);
-    note_reservation_growth(state);
+    note_reservation_growth_in(owner, state);
     state.tlab_refills = state.tlab_refills.saturating_add(1);
-    super::minor::admit_refill_survivor(state);
+    super::minor::admit_refill_survivor(owner, state);
     let record = state
         .tlab_states
         .get_mut(&owner_state)

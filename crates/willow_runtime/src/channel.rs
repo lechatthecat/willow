@@ -204,15 +204,14 @@ unsafe fn drop_channel(payload: *mut u8) {
     unsafe {
         std::ptr::drop_in_place(payload as *mut WillowAbiChannel);
     }
-    #[cfg(test)]
-    CHANNEL_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(test)]
-static CHANNEL_DROP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const CHANNEL_DROP_COUNT: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::ChannelDropCount);
 
-static CHANNEL_REGISTRATION: crate::gc::NativeGcRegistration =
-    crate::gc::NativeGcRegistration::new();
+const CHANNEL_REGISTRATION: crate::gc::NativeGcRegistration =
+    crate::gc::NativeGcRegistration::Channel;
 const CHANNEL_GC_TYPES: &[crate::gc::NativeGcType] =
     &[
         crate::gc::NativeGcType::new(CHANNEL_TYPE_ID, Some(trace_channel), Some(drop_channel))
@@ -221,16 +220,15 @@ const CHANNEL_GC_TYPES: &[crate::gc::NativeGcType] =
     ];
 
 #[cfg(test)]
-static CHANNEL_REGISTRATION_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+const CHANNEL_REGISTRATION_COUNT: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::ChannelRegistrationCount);
 
 /// Register both GC hooks once per registry generation. The common channel
 /// allocation path performs only two atomic loads; the mutex and registry
 /// HashMap locks are taken only after a GC reset/unregister invalidates hooks.
 fn ensure_channel_registered() {
     if CHANNEL_REGISTRATION.ensure(CHANNEL_GC_TYPES) {
-        #[cfg(test)]
-        CHANNEL_REGISTRATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::observation::record(crate::observation::Event::ChannelRegistrationCount, 1);
     }
 }
 
@@ -463,8 +461,7 @@ fn reserve_waiter_batch<const N: usize>(
     receive: bool,
     candidates: &mut [WakeCandidate; N],
 ) -> (usize, bool, bool) {
-    #[cfg(test)]
-    CHANNEL_RESERVE_LOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::observation::record(crate::observation::Event::ChannelReserveLocks, 1);
     let mut state = channel.state.lock().expect("channel mutex poisoned");
     reserve_waiter_batch_locked(channel, &mut state, receive, candidates)
 }
@@ -492,8 +489,7 @@ fn reserve_waiter_batch_locked<const N: usize>(
         let Some((task, wait)) = queue.pop_front_ticket() else {
             return (count, state.closed, true);
         };
-        #[cfg(test)]
-        CHANNEL_WAITER_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::observation::record(crate::observation::Event::ChannelWaiterVisits, 1);
         let generation = next_generation(state);
         let (wait_role, owned_role) = if receive {
             (ChannelRole::RecvWait, ChannelRole::RecvClaim)
@@ -532,13 +528,14 @@ fn publish_waiter_batch(
     candidates: &[WakeCandidate],
     scratch: &mut crate::scheduler::WakeBatchScratch,
 ) -> bool {
-    #[cfg(test)]
-    CHANNEL_WAKE_ATTEMPTS.fetch_add(candidates.len(), std::sync::atomic::Ordering::Relaxed);
+    crate::observation::record(
+        crate::observation::Event::ChannelWakeAttempts,
+        candidates.len(),
+    );
     if candidates.is_empty() {
         return false;
     }
-    #[cfg(test)]
-    CHANNEL_WAKE_BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::observation::record(crate::observation::Event::ChannelWakeBatches, 1);
     // Keep the common ping-pong path allocation-free, without shard partitioning.
     if let [(task, owner)] = candidates {
         if crate::scheduler::wake_channel_owner(*task) {
@@ -644,20 +641,20 @@ fn wake_reserved_batches(channel: &ChannelCore, receive: bool) {
 }
 
 #[cfg(test)]
-static CHANNEL_WAKE_ATTEMPTS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+const CHANNEL_WAKE_ATTEMPTS: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::ChannelWakeAttempts);
 
 #[cfg(test)]
-static CHANNEL_WAKE_BATCHES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+const CHANNEL_WAKE_BATCHES: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::ChannelWakeBatches);
 
 #[cfg(test)]
-static CHANNEL_RESERVE_LOCKS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+const CHANNEL_RESERVE_LOCKS: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::ChannelReserveLocks);
 
 #[cfg(test)]
-static CHANNEL_WAITER_VISITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+const CHANNEL_WAITER_VISITS: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::ChannelWaiterVisits);
 
 fn wake_recv_waiters(channel: &ChannelCore) {
     wake_reserved_waiters(channel, true);

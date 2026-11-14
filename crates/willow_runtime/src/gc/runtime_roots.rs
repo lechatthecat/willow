@@ -385,7 +385,7 @@ mod tests {
         let barrier = Barrier::new(WORKERS + 1);
         std::thread::scope(|scope| {
             for _ in 0..WORKERS {
-                scope.spawn(|| {
+                scope.spawn(crate::runtime::serving(|| {
                     for index in 1..=DISTINCT {
                         roots.add((index * 16) as *mut u8);
                     }
@@ -394,7 +394,7 @@ mod tests {
                     for index in 1..=DISTINCT {
                         roots.remove((index * 16) as *mut u8);
                     }
-                });
+                }));
             }
             barrier.wait();
             assert_eq!(roots.len(), DISTINCT);

@@ -120,8 +120,7 @@ unsafe impl Sync for WordStorage {}
 
 impl WordStorage {
     fn lock(&self) -> WordGuard<'_> {
-        #[cfg(test)]
-        WORD_SHARED_ACQUIRES.with(|count| count.set(count.get() + 1));
+        crate::observation::record(crate::observation::Event::WordSharedAcquires, 1);
         let no_preempt = crate::preempt::NoPreemptGuard::enter();
         if self
             .state
@@ -183,13 +182,20 @@ impl Drop for WordGuard<'_> {
 }
 
 #[cfg(test)]
-thread_local! {
-    static STRING_HASH_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static SNAPSHOT_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static COMPACT_MOVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static WORD_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static WORD_SHARED_ACQUIRES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+const STRING_HASH_BYTES: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::StringHashBytes);
+#[cfg(test)]
+const SNAPSHOT_COMPARISONS: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::SnapshotComparisons);
+#[cfg(test)]
+const COMPACT_MOVES: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::CompactMoves);
+#[cfg(test)]
+const WORD_HASH_CALLS: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::WordHashCalls);
+#[cfg(test)]
+const WORD_SHARED_ACQUIRES: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::WordSharedAcquires);
 
 /// Fixed, non-cryptographic integer mixer. Both the bucket index and SwissTable
 /// fingerprint see mixed bits, including for consecutive/strided integer keys.
@@ -200,8 +206,7 @@ impl Hasher for WordHasher {
         self.0
     }
     fn write_u64(&mut self, word: u64) {
-        #[cfg(test)]
-        WORD_HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
+        crate::observation::record(crate::observation::Event::WordHashCalls, 1);
         let mut x = word;
         x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -304,8 +309,7 @@ impl MapData {
         }
         let mut values = Vec::with_capacity(self.entries.len());
         for index in self.entries.values_mut() {
-            #[cfg(test)]
-            COMPACT_MOVES.with(|count| count.set(count.get() + 1));
+            crate::observation::record(crate::observation::Event::CompactMoves, 1);
             let value = self.values[*index];
             if self.layout.value_is_ref {
                 write_barrier_object_owner(
@@ -345,8 +349,7 @@ impl Hash for KeyRef<'_> {
                 word.hash(state);
             }
             Self::Str(text) => {
-                #[cfg(test)]
-                STRING_HASH_BYTES.with(|bytes| bytes.set(bytes.get() + text.len()));
+                crate::observation::record(crate::observation::Event::StringHashBytes, text.len());
                 // MapKey is a standalone, private key, never a component of
                 // a compound hash. The byte hasher incorporates its length;
                 // equality still distinguishes key kinds and all content.
@@ -513,7 +516,7 @@ unsafe fn drop_map(payload: *mut u8) {
 /// (idempotent): `willow_gc_init` clears the type registry, so a process-global
 /// `Once` would fail to re-register after the first reset (e.g. in multi-init
 /// test runs). Real programs init once, so the repeated insert is harmless.
-static MAP_REGISTRATION: crate::gc::NativeGcRegistration = crate::gc::NativeGcRegistration::new();
+const MAP_REGISTRATION: crate::gc::NativeGcRegistration = crate::gc::NativeGcRegistration::Map;
 const MAP_GC_TYPES: &[crate::gc::NativeGcType] =
     &[
         crate::gc::NativeGcType::new(MAP_TYPE_ID, Some(trace_map), Some(drop_map))
@@ -893,8 +896,7 @@ pub extern "C" fn willow_map_snapshot(map: *mut u8, mode: i64, value_pair: i64) 
                 .collect()
         };
     entries.sort_unstable_by(|a, b| {
-        #[cfg(test)]
-        SNAPSHOT_COMPARISONS.with(|count| count.set(count.get() + 1));
+        crate::observation::record(crate::observation::Event::SnapshotComparisons, 1);
         match (&a.0, &b.0) {
             (MapKey::Str(a), MapKey::Str(b)) => a.cmp(b),
             (MapKey::Word(a), MapKey::Word(b)) if layout.key_kind == 1 => {
@@ -1140,7 +1142,7 @@ mod tests {
     #[test]
     fn confined_string_maps_scale_without_lookup_allocation_and_skip_gc_borrows() {
         use crate::scheduler::scaling_measurements::counting_allocator as counter;
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         for count in [16, 128, 1024, 8192] {
             for length in [20, 128] {
                 willow_gc_init();
@@ -1206,7 +1208,7 @@ mod tests {
 
     #[test]
     fn confined_constructor_keeps_reference_values_synchronized() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let mut map = unsafe { willow_map_new_local(3, 3, 1) };
         willow_push_root(&mut map);
@@ -1229,7 +1231,7 @@ mod tests {
 
     #[test]
     fn confined_scalar_accesses_never_acquire_mutual_exclusion() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         for count in [16, 128, 1024, 8192] {
             crate::gc::willow_gc_init();
             let mut map = unsafe { willow_map_new_local(0, 0, 0) };
@@ -1282,7 +1284,7 @@ mod tests {
 
     #[test]
     fn scalar_storage_gate_serializes_retained_aliases_and_releases_on_unwind() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         let storage = WordStorage::default();
         storage.lock().entries.insert(0, 0);
@@ -1291,7 +1293,7 @@ mod tests {
             for _ in 0..4 {
                 let storage = &storage;
                 let start = &start;
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     start.wait();
                     for _ in 0..1024 {
                         let mut data = storage.lock();
@@ -1301,7 +1303,7 @@ mod tests {
                         std::thread::yield_now();
                         data.entries.insert(0, previous + 1);
                     }
-                });
+                }));
             }
         });
         assert_eq!(storage.lock().entries[&0], 4096);
@@ -1318,7 +1320,7 @@ mod tests {
 
     #[test]
     fn scalar_map_aliases_share_one_gate_across_all_accessors() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         let mut map = willow_map_new(0, 0, 0);
         crate::gc::willow_push_root(&mut map);
@@ -1327,7 +1329,7 @@ mod tests {
         std::thread::scope(|scope| {
             for writer in 0..4 {
                 let start = &start;
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     // Raw aliases model independent wrappers and an original
                     // map alias. No external lock protects these operations.
                     let map = address as *mut u8;
@@ -1341,7 +1343,7 @@ mod tests {
                         assert_eq!(willow_map_contains(map, key, 0), 1);
                         assert!(willow_map_len(map) > i);
                     }
-                });
+                }));
             }
         });
         assert_eq!(willow_map_len(map), 16384);
@@ -1357,7 +1359,7 @@ mod tests {
     #[test]
     fn scalar_map_hash_work_and_lookup_allocations_scale_linearly() {
         use crate::scheduler::scaling_measurements::counting_allocator as counter;
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         for count in [16_i64, 128, 1024, 8192] {
             for stride in [1_i64, 2654435761, 1 << 32, -1] {
                 crate::gc::willow_gc_init();
@@ -1410,13 +1412,13 @@ mod tests {
 
     #[test]
     fn scalar_gc_hooks_do_not_borrow_mutating_storage() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         let mut map = willow_map_new(0, 0, 0);
         crate::gc::willow_push_root(&mut map);
         let address = map as usize;
         std::thread::scope(|scope| {
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 let map = address as *mut u8;
                 let mut slots = Vec::new();
                 let mut children = Vec::new();
@@ -1433,7 +1435,7 @@ mod tests {
                 }
                 assert!(slots.is_empty());
                 assert!(children.is_empty());
-            });
+            }));
             for key in 0..8192 {
                 willow_map_insert(map, key, 0, key, 0);
             }
@@ -1444,7 +1446,7 @@ mod tests {
 
     #[test]
     fn scalar_frozen_copy_supports_parallel_reads_and_independent_updates() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         let baseline = crate::gc_telemetry::external_bytes();
         let mut map = willow_map_new(0, 0, 0);
@@ -1458,14 +1460,14 @@ mod tests {
         let address = copy as usize;
         std::thread::scope(|scope| {
             for _ in 0..4 {
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     let map = address as *mut u8;
                     for key in 0..1024 {
                         let mut payload = 0;
                         assert_eq!(willow_map_get_into(map, key, 0, &mut payload), 0);
                         assert_eq!(payload, !key);
                     }
-                });
+                }));
             }
         });
         crate::gc::willow_gc_collect();
@@ -1479,7 +1481,7 @@ mod tests {
 
     #[test]
     fn concurrent_slice_retries_a_busy_map_without_waiting_or_partial_children() {
-        let _guard = crate::gc::runtime_test_guard();
+        let _guard = crate::gc::isolated_runtime();
         crate::gc::willow_gc_init();
         let mut map = willow_map_new(0, 0, 1);
         crate::gc::willow_push_root(&mut map);
@@ -1502,7 +1504,7 @@ mod tests {
         crate::gc::willow_gc_collect();
     }
     use crate::gc::{
-        runtime_test_guard, willow_gc_collect, willow_gc_init, willow_pop_roots, willow_push_root,
+        isolated_runtime, willow_gc_collect, willow_gc_init, willow_pop_roots, willow_push_root,
     };
     use crate::string::{willow_string_as_str, willow_string_from_str};
 
@@ -1515,7 +1517,7 @@ mod tests {
 
     #[test]
     fn map_unit_01_new_is_empty() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let m = willow_map_new(0, 0, 0);
         assert!(!m.is_null());
@@ -1526,7 +1528,7 @@ mod tests {
     fn inline_maps_remain_stable_and_are_reclaimed_at_increasing_counts() {
         use crate::gc::{GC_HEADER_SIZE, willow_gc_allocated_bytes};
 
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for count in [1, 16, 128] {
             willow_gc_init();
             // Reserve every root slot before registering its address.
@@ -1565,7 +1567,7 @@ mod tests {
 
     #[test]
     fn map_unit_02_int_key_insert_get() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let m = willow_map_new(0, 0, 0);
         willow_map_insert(m, 7, 0, 100, 0);
@@ -1579,7 +1581,7 @@ mod tests {
 
     #[test]
     fn map_get_into_preserves_payload_bits_without_allocating_wrappers() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         for kind in [0, 1, 2] {
             let mut map = willow_map_new(0, kind, 0);
@@ -1614,7 +1616,7 @@ mod tests {
 
     #[test]
     fn map_unit_03_insert_overwrites() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let m = willow_map_new(0, 0, 0);
         willow_map_insert(m, 1, 0, 10, 0);
@@ -1625,7 +1627,7 @@ mod tests {
 
     #[test]
     fn map_unit_04_string_keys_compare_by_content() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let m = willow_map_new(3, 0, 0);
         let alice = willow_string_from_str("Alice");
@@ -1641,7 +1643,7 @@ mod tests {
 
     #[test]
     fn map_unit_05_contains() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let m = willow_map_new(0, 0, 0);
         willow_map_insert(m, 5, 0, 50, 0);
@@ -1651,7 +1653,7 @@ mod tests {
 
     #[test]
     fn map_unit_06_reference_values_survive_collection() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let mut m = willow_map_new(0, 3, 1);
         willow_push_root(&mut m as *mut *mut u8);
@@ -1667,7 +1669,7 @@ mod tests {
 
     #[test]
     fn map_unit_07_reference_option_uses_nullable_pointer_niche() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let m = willow_map_new(0, 3, 1);
         let value = willow_string_from_str("niche-value");
@@ -1677,7 +1679,7 @@ mod tests {
     }
     #[test]
     fn map_layout_survives_freeze_and_drives_word_display() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let map = willow_map_new(1, 2, 0);
         willow_map_insert(map, 1.5f64.to_bits() as i64, 0, 1, 0);
@@ -1692,7 +1694,7 @@ mod tests {
     }
     #[test]
     fn borrowed_string_keys_survive_copy_update_and_collection() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for local in [false, true] {
             willow_gc_init();
             let mut map = if local {
@@ -1738,7 +1740,7 @@ mod tests {
 
     #[test]
     fn borrowed_word_keys_preserve_all_bits() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let map = willow_map_new(0, 0, 0);
         let words = [
@@ -1761,7 +1763,7 @@ mod tests {
 
     #[test]
     fn float_keys_normalize_zero_preserve_numbers_and_copy() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let mut map = willow_map_new(1, 0, 0);
         willow_push_root(&mut map);
@@ -1808,7 +1810,7 @@ mod tests {
     #[test]
     fn float_keys_reject_all_nan_forms_without_mutating_or_holding_lock() {
         use crate::panic_context::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(903))));
         let mut map = willow_map_new(1, 0, 0);
@@ -1895,7 +1897,7 @@ mod tests {
         use std::time::{Duration, Instant};
         const VALUES: i64 = 8;
 
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         crate::gc::willow_gc_register_mutator();
         // Environment stress must not promote the values before the copy: the
@@ -1914,7 +1916,8 @@ mod tests {
         }
         let moved_before = crate::gc::willow_gc_moved_objects();
 
-        let collector = std::thread::spawn(crate::gc::minor_collect_internal);
+        let collector =
+            std::thread::spawn(crate::runtime::serving(crate::gc::minor_collect_internal));
         // Wait for the COORDINATION flag, not the lock-free gate: the gate is
         // published first, and a safepoint reached between the two returns
         // without parking, which would leave the collector waiting forever.
@@ -1956,7 +1959,7 @@ mod tests {
     /// traced anyway; the remembered-set count is what shows the barrier ran.
     #[test]
     fn copy_of_young_values_is_updated_by_the_next_minor_collection() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         crate::gc::set_gc_stress_for_test(Some(""));
         let mut tls = crate::gc::tlab_state_for_test();
@@ -2002,7 +2005,7 @@ mod tests {
     /// source map.
     #[test]
     fn copy_keeps_string_values_across_a_full_collection_in_its_allocation() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let mut map = willow_map_new(3, 3, 1);
         willow_push_root(&mut map);
@@ -2041,7 +2044,7 @@ mod tests {
     fn read_only_lookups_never_copy_the_key() {
         use crate::scheduler::scaling_measurements::counting_allocator as counter;
         const CALLS: usize = 1_000;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let mut map = willow_map_new(3, 0, 0);
         willow_push_root(&mut map);
@@ -2141,7 +2144,7 @@ mod native_accounting_tests {
 
     #[test]
     fn string_keys_growth_updates_copy_telemetry_and_finalizers() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for count in [1, 32, 1024] {
             willow_gc_init();
             let baseline = crate::gc_telemetry::external_bytes();
@@ -2194,7 +2197,7 @@ mod native_accounting_tests {
 
     #[test]
     fn reset_releases_native_map_storage() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let baseline = crate::gc_telemetry::external_bytes();
         let map = willow_map_new(0, 0, 0);
@@ -2214,7 +2217,7 @@ mod iteration_tests {
 
     #[test]
     fn remove_reuses_slots_and_snapshots_sort_all_storage_paths() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         for confined in [false, true] {
             for string_key in [false, true] {
@@ -2275,7 +2278,7 @@ mod iteration_tests {
 
     #[test]
     fn removed_holes_copy_and_reinsert_are_independent() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let map = GcRootHandle::new(willow_map_new(3, 0, 0));
         for text in ["a", "b", "c"] {
@@ -2297,7 +2300,7 @@ mod iteration_tests {
 
     #[test]
     fn snapshot_comparison_and_compaction_counts_scale() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         for count in [64_i64, 256, 1024, 4096] {
             let map = GcRootHandle::new(willow_map_new(0, 3, 1));
@@ -2324,7 +2327,7 @@ mod iteration_tests {
 
     #[test]
     fn remove_barrier_clears_reference_slots_and_snapshot_roots_survive_gc() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         willow_gc_init();
         let map = GcRootHandle::new(willow_map_new(0, 3, 1));
         for key in 0..128 {

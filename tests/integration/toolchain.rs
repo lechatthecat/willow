@@ -449,11 +449,15 @@ fn assert_staticlib_exports_backend_symbols(runtime_lib: &Path) {
             }
         }
     }
-    // Data symbols the backend reads inline are imported outside the
-    // function table and must be exported by the same staticlib.
+    // Generated code now reaches the mark-phase and card-epoch gates through
+    // the pinned context, but the staticlib keeps exporting both data symbols
+    // for ABI compatibility: they remain the default runtime's gates.
     let missing: Vec<_> = backend_runtime_symbols()
         .into_iter()
-        .chain([willow_abi::GC_MARK_PHASE_SYMBOL.to_string()])
+        .chain([
+            willow_abi::GC_MARK_PHASE_SYMBOL.to_string(),
+            willow_abi::GC_CARD_EPOCH_SYMBOL.to_string(),
+        ])
         .filter(|name| !symbols.contains(name))
         .collect();
     assert!(

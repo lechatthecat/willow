@@ -6,57 +6,111 @@ unsafe extern "C" fn ready(_: *mut c_void) -> i32 {
 
 #[test]
 fn cooperative_preemption_reroutes_thieves_and_releases_at_source_wait() {
-    let _guard = crate::gc::runtime_test_guard();
-    reset_global_scheduler_for_test();
-    replace_global_scheduler_for_test(2);
-    let task = willow_sched_spawn_cooperative(ready, std::ptr::null_mut()) as u64;
+    let owner = crate::runtime::Runtime::new(|| RuntimeWorkerConfig::with_workers(2));
+    let task = {
+        let target = owner.scheduler().components().spawn_target();
+        let id = target.reserve_task_id();
+        target.publish(id, ready, std::ptr::null_mut(), None, true);
+        id
+    };
     let previous_worker = CURRENT_WORKER.with(|slot| slot.replace(1));
-    assert_eq!(claim_global_ready_for_worker(1, None).unwrap().0, task);
-    finish_global_poll_boundary(task, GlobalPollBoundary::Preempted);
+    assert_eq!(
+        claim_ready_for_worker_in(owner.scheduler(), 1, None)
+            .unwrap()
+            .0,
+        task
+    );
+    finish_poll_boundary_in(
+        owner.scheduler().components(),
+        task,
+        GlobalPollBoundary::Preempted,
+    );
     set_current_task(None);
-    assert_eq!(crate::worker_affinity::required_workers(), 2);
+    assert_eq!(owner.affinities.required_workers(), 2);
     for _ in 0..16 {
-        assert!(claim_global_ready_for_worker(0, None).is_none());
-        assert!(global_run_queues().contains(task));
+        assert!(claim_ready_for_worker_in(owner.scheduler(), 0, None).is_none());
+        assert!(owner.scheduler().components().run_queues.contains(task));
     }
-    assert_eq!(claim_global_ready_for_worker(1, None).unwrap().0, task);
-    finish_global_poll_boundary(task, GlobalPollBoundary::Pending);
+    assert_eq!(
+        claim_ready_for_worker_in(owner.scheduler(), 1, None)
+            .unwrap()
+            .0,
+        task
+    );
+    finish_poll_boundary_in(
+        owner.scheduler().components(),
+        task,
+        GlobalPollBoundary::Pending,
+    );
     set_current_task(None);
-    assert_eq!(crate::worker_affinity::required_workers(), 0);
-    assert!(with_global(|sched| sched.wake(task)));
+    assert_eq!(owner.affinities.required_workers(), 0);
+    assert!(SchedulerServices::with_scheduler(
+        || owner.scheduler(),
+        |sched| sched.wake(task)
+    ));
     CURRENT_WORKER.with(|slot| slot.set(0));
-    assert_eq!(claim_global_ready_for_worker(0, None).unwrap().0, task);
-    with_global(|sched| sched.complete(task));
+    assert_eq!(
+        claim_ready_for_worker_in(owner.scheduler(), 0, None)
+            .unwrap()
+            .0,
+        task
+    );
+    SchedulerServices::with_scheduler(|| owner.scheduler(), |sched| sched.complete(task));
     set_current_task(None);
     CURRENT_WORKER.with(|slot| slot.set(previous_worker));
-    reset_global_scheduler_for_test();
 }
 
 #[test]
 fn cooperative_affinity_release_covers_yield_completion_and_cancellation() {
-    let _guard = crate::gc::runtime_test_guard();
     for terminal in [false, true] {
         for cancelled in [false, true] {
-            reset_global_scheduler_for_test();
-            replace_global_scheduler_for_test(2);
-            let task = willow_sched_spawn_cooperative(ready, std::ptr::null_mut()) as u64;
+            let owner = crate::runtime::Runtime::new(|| RuntimeWorkerConfig::with_workers(2));
+            let task = {
+                let target = owner.scheduler().components().spawn_target();
+                let id = target.reserve_task_id();
+                target.publish(id, ready, std::ptr::null_mut(), None, true);
+                id
+            };
             let previous_worker = CURRENT_WORKER.with(|slot| slot.replace(1));
-            assert_eq!(claim_global_ready_for_worker(1, None).unwrap().0, task);
-            finish_global_poll_boundary(task, GlobalPollBoundary::Preempted);
+            assert_eq!(
+                claim_ready_for_worker_in(owner.scheduler(), 1, None)
+                    .unwrap()
+                    .0,
+                task
+            );
+            finish_poll_boundary_in(
+                owner.scheduler().components(),
+                task,
+                GlobalPollBoundary::Preempted,
+            );
             set_current_task(None);
             if terminal {
-                assert_eq!(claim_global_ready_for_worker(1, None).unwrap().0, task);
-                with_global(|sched| {
-                    if cancelled {
-                        sched.finalize_cancelled(task);
-                    } else {
-                        sched.complete(task);
-                    }
-                });
+                assert_eq!(
+                    claim_ready_for_worker_in(owner.scheduler(), 1, None)
+                        .unwrap()
+                        .0,
+                    task
+                );
+                SchedulerServices::with_scheduler(
+                    || owner.scheduler(),
+                    |sched| {
+                        if cancelled {
+                            sched.finalize_cancelled(task);
+                        } else {
+                            sched.complete(task);
+                        }
+                    },
+                );
                 set_current_task(None);
             } else {
-                assert_eq!(claim_global_ready_for_worker(1, None).unwrap().0, task);
-                finish_global_poll_boundary(
+                assert_eq!(
+                    claim_ready_for_worker_in(owner.scheduler(), 1, None)
+                        .unwrap()
+                        .0,
+                    task
+                );
+                finish_poll_boundary_in(
+                    owner.scheduler().components(),
                     task,
                     if cancelled {
                         GlobalPollBoundary::Pending
@@ -66,19 +120,23 @@ fn cooperative_affinity_release_covers_yield_completion_and_cancellation() {
                 );
                 set_current_task(None);
             }
-            assert_eq!(crate::worker_affinity::required_workers(), 0);
+            assert_eq!(owner.affinities.required_workers(), 0);
             CURRENT_WORKER.with(|slot| slot.set(previous_worker));
         }
     }
-    reset_global_scheduler_for_test();
 }
 
-static OWNERS: LazyLock<Mutex<std::collections::HashMap<u64, std::thread::ThreadId>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
-static ENTERED: AtomicUsize = AtomicUsize::new(0);
-static FINISH: AtomicBool = AtomicBool::new(false);
-static FAILURES: AtomicUsize = AtomicUsize::new(0);
-static CLEANED: AtomicUsize = AtomicUsize::new(0);
+static OWNERS: crate::runtime::PerRuntime<
+    Mutex<std::collections::HashMap<u64, std::thread::ThreadId>>,
+> = crate::runtime::PerRuntime::new(|| Mutex::new(std::collections::HashMap::new()));
+static ENTERED: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static FINISH: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+static FAILURES: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static CLEANED: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
 unsafe extern "C" fn affine_cancel(_: *mut c_void) {
     let owners = OWNERS.lock().unwrap();
@@ -129,7 +187,7 @@ unsafe extern "C" fn forced_preemption(_: *mut c_void) -> i32 {
 
 #[test]
 fn cooperative_preemption_keeps_os_thread_across_worker_shrink() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for cancelled in [false, true] {
         reset_global_scheduler_for_test();
         replace_global_scheduler_for_test(4);
@@ -172,7 +230,7 @@ fn cooperative_preemption_keeps_os_thread_across_worker_shrink() {
 
 #[test]
 fn cooperative_affinity_acquires_once_per_segment() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for polls in [16, 64, 256] {
         reset_global_scheduler_for_test();
         replace_global_scheduler_for_test(2);

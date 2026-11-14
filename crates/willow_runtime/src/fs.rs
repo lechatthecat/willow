@@ -437,7 +437,7 @@ pub extern "C" fn willow_fs_remove_file_async(path: *const u8) -> *mut c_void {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::{reset_internal_for_test, runtime_test_guard};
+    use crate::gc::{isolated_runtime, reset_internal_for_test};
 
     fn read_tag(ptr: *mut u8) -> i64 {
         unsafe { *(ptr as *const i64) }
@@ -466,7 +466,7 @@ mod tests {
             TAG.store(read_tag(result), Ordering::SeqCst);
             RUNTIME_POLL_READY
         }
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for cancel in [false, true] {
             reset_global_scheduler_for_test();
             let path = std::env::temp_dir()
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn poll_state_remains_owned_after_frame_cleanup() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let frame = NativeTaskFrame::<FsScalarFrame>::allocate().unwrap();
         let core = Arc::new(BlockingFsState::new());
@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn temp_path_sanitizes_escaping_prefixes() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         let tmp = std::env::temp_dir();
         for evil in ["/etc/passwd", "../../escape", "a/b", "", "日本語"] {
             let p = willow_fs_temp_path(willow_string_from_str(evil));
@@ -547,7 +547,7 @@ mod tests {
 
     #[test]
     fn fs_roundtrip_ok_and_err_tags() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         let unique = willow_fs_temp_path(willow_string_from_str("willow_fs_test"));
         let dir = std::path::PathBuf::from(unsafe { willow_string_as_str(unique) });
         std::fs::create_dir_all(&dir).unwrap();
@@ -585,7 +585,7 @@ mod tests {
             reset_global_scheduler_for_test, willow_sched_run_until, willow_sched_task_state,
         };
 
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let unique = willow_fs_temp_path(willow_string_from_str("willow_async_fs_test"));
         let path = unsafe { willow_string_as_str(unique) }.to_string();
@@ -616,7 +616,7 @@ mod tests {
     fn published_fs_state_survives_poll_cleanup_before_spawn_returns() {
         use crate::scheduler::{reset_global_scheduler_for_test, willow_sched_run_until};
 
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let mut observed = false;
         spawn_blocking_fs_after_publication(
@@ -695,7 +695,7 @@ mod tests {
             }
         }
 
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let threads = pool_threads();
         let completed_before = willow_blocking_completed_jobs();
@@ -811,7 +811,7 @@ mod tests {
             }
         }
 
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();

@@ -7,10 +7,8 @@ pub(crate) struct WakeBatchScratch {
     grouped: Vec<RuntimeTaskId>,
     pub(crate) enqueued: Vec<RuntimeTaskId>,
     pub(crate) terminal: Vec<RuntimeTaskId>,
-    #[cfg(test)]
-    shard_locks: usize,
-    #[cfg(test)]
-    queue_batches: usize,
+    shard_locks: crate::observation::Value<usize>,
+    queue_batches: crate::observation::Value<usize>,
 }
 
 impl ShardedTaskTable {
@@ -22,11 +20,8 @@ impl ShardedTaskTable {
     ) {
         scratch.enqueued.clear();
         scratch.terminal.clear();
-        #[cfg(test)]
-        {
-            scratch.shard_locks = 0;
-            scratch.queue_batches = 0;
-        }
+        scratch.shard_locks.observe_mut(|count| *count = 0);
+        scratch.queue_batches.observe_mut(|count| *count = 0);
         scratch.grouped.clear();
         if ids.is_empty() {
             return;
@@ -77,10 +72,9 @@ impl ShardedTaskTable {
                 start = end;
             }
         }
-        #[cfg(test)]
-        {
-            scratch.shard_locks = usize::from(single.is_some()) + several.len();
-        }
+        scratch
+            .shard_locks
+            .observe_mut(|count| *count = usize::from(single.is_some()) + several.len());
         let mut unblocked = 0;
         for (range, shard) in single.iter_mut().chain(several.iter_mut()) {
             for &id in &scratch.grouped[range.clone()] {
@@ -102,10 +96,9 @@ impl ShardedTaskTable {
             }
         }
         run_queues.push_woken_batch(&scratch.enqueued);
-        #[cfg(test)]
-        {
-            scratch.queue_batches = usize::from(!scratch.enqueued.is_empty());
-        }
+        scratch
+            .queue_batches
+            .observe_mut(|count| *count = usize::from(!scratch.enqueued.is_empty()));
         // wake() only exits BlockedSyscall; it never enters it. All affected
         // shards remain locked, so the aggregate decrement is equivalent to
         // per-task reconcile_blocked_transition, after the same publication edge.

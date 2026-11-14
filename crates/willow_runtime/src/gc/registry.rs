@@ -31,14 +31,18 @@ impl MinorRegistryCache {
 /// Read-only legacy lookups need no cache lock. Registration invalidates without copying;
 /// the next capture rebuilds once, avoiding quadratic startup registration.
 pub(super) fn minor_registry_snapshot() -> std::sync::Arc<MinorRegistrySnapshot> {
-    let mut cache = runtime().minor_registry_cache.lock().unwrap();
+    minor_registry_snapshot_in(runtime())
+}
+
+pub(super) fn minor_registry_snapshot_in(gc: &GcRuntime) -> std::sync::Arc<MinorRegistrySnapshot> {
+    let mut cache = gc.minor_registry_cache.lock().unwrap();
     if let Some(snapshot) = &cache.snapshot
         && snapshot.generation == cache.generation
     {
         return std::sync::Arc::clone(snapshot);
     }
-    let trace = type_registry().lock().unwrap();
-    let drops = drop_registry().lock().unwrap();
+    let trace = gc.trace_registry.lock().unwrap();
+    let drops = gc.drop_registry.lock().unwrap();
     let mut generated_drop = false;
     let drops = drops
         .iter()
@@ -61,11 +65,15 @@ pub(super) fn minor_registry_snapshot() -> std::sync::Arc<MinorRegistrySnapshot>
 }
 
 pub(super) fn clear_hook_registries() {
-    let mut cache = runtime().minor_registry_cache.lock().unwrap();
-    type_registry().lock().unwrap().clear();
-    runtime().concurrent_trace_registry.lock().unwrap().clear();
-    runtime().concurrent_slice_registry.lock().unwrap().clear();
-    drop_registry().lock().unwrap().clear();
+    clear_hook_registries_in(runtime());
+}
+
+fn clear_hook_registries_in(gc: &GcRuntime) {
+    let mut cache = gc.minor_registry_cache.lock().unwrap();
+    gc.trace_registry.lock().unwrap().clear();
+    gc.concurrent_trace_registry.lock().unwrap().clear();
+    gc.concurrent_slice_registry.lock().unwrap().clear();
+    gc.drop_registry.lock().unwrap().clear();
     cache.changed();
 }
 
@@ -161,20 +169,21 @@ pub fn willow_register_type_capability(
         NativeTraceCapability::ConcurrentSafe(trace) => (Some(trace), None),
         NativeTraceCapability::SliceConcurrentSafe(slice) => (None, Some(slice)),
     };
-    register_hooks(type_id, stopped, trace, slice);
+    register_hooks_in(runtime(), type_id, stopped, trace, slice);
 }
 
-fn register_hooks(
+fn register_hooks_in(
+    gc: &GcRuntime,
     type_id: u32,
     stopped: TraceFn,
     trace: Option<ConcurrentTraceFn>,
     slice: Option<ConcurrentTraceSliceFn>,
 ) {
     // Common lock order also makes epoch capture and diagnostics coherent.
-    let mut cache = runtime().minor_registry_cache.lock().unwrap();
-    let mut legacy = type_registry().lock().unwrap();
-    let mut traces = runtime().concurrent_trace_registry.lock().unwrap();
-    let mut slices = runtime().concurrent_slice_registry.lock().unwrap();
+    let mut cache = gc.minor_registry_cache.lock().unwrap();
+    let mut legacy = gc.trace_registry.lock().unwrap();
+    let mut traces = gc.concurrent_trace_registry.lock().unwrap();
+    let mut slices = gc.concurrent_slice_registry.lock().unwrap();
     legacy.insert(type_id, stopped);
     traces.remove(&type_id);
     slices.remove(&type_id);
@@ -190,9 +199,13 @@ fn register_hooks(
 /// Current registered native capabilities, in unspecified order. Already-running
 /// epochs retain their own snapshot. Absent types have no native trace hook.
 pub fn native_trace_modes() -> Vec<(u32, TraceMode)> {
-    let legacy = type_registry().lock().unwrap();
-    let traces = runtime().concurrent_trace_registry.lock().unwrap();
-    let slices = runtime().concurrent_slice_registry.lock().unwrap();
+    native_trace_modes_in(runtime())
+}
+
+fn native_trace_modes_in(gc: &GcRuntime) -> Vec<(u32, TraceMode)> {
+    let legacy = gc.trace_registry.lock().unwrap();
+    let traces = gc.concurrent_trace_registry.lock().unwrap();
+    let slices = gc.concurrent_slice_registry.lock().unwrap();
     legacy
         .keys()
         .map(|&id| {
@@ -207,10 +220,17 @@ pub fn native_trace_modes() -> Vec<(u32, TraceMode)> {
 // One lookup per encountered type per stopped walk, including absent hooks.
 // This avoids scanning every registered type for a small/empty stopped graph.
 pub(super) fn lookup_trace_contract(type_id: u32) -> Option<(TraceFn, TraceMode)> {
-    let legacy = type_registry().lock().unwrap();
+    lookup_trace_contract_in(runtime(), type_id)
+}
+
+pub(super) fn lookup_trace_contract_in(
+    gc: &GcRuntime,
+    type_id: u32,
+) -> Option<(TraceFn, TraceMode)> {
+    let legacy = gc.trace_registry.lock().unwrap();
     let trace = *legacy.get(&type_id)?;
-    let traces = runtime().concurrent_trace_registry.lock().unwrap();
-    let slices = runtime().concurrent_slice_registry.lock().unwrap();
+    let traces = gc.concurrent_trace_registry.lock().unwrap();
+    let slices = gc.concurrent_slice_registry.lock().unwrap();
     Some((
         trace,
         trace_mode(traces.contains_key(&type_id), slices.contains_key(&type_id)),
@@ -222,9 +242,19 @@ pub(super) fn trace_registry_snapshot() -> (
     IdMap<u32, ConcurrentTraceFn>,
     IdMap<u32, ConcurrentTraceSliceFn>,
 ) {
-    let legacy = type_registry().lock().unwrap();
-    let traces = runtime().concurrent_trace_registry.lock().unwrap();
-    let slices = runtime().concurrent_slice_registry.lock().unwrap();
+    trace_registry_snapshot_in(runtime())
+}
+
+pub(super) fn trace_registry_snapshot_in(
+    gc: &GcRuntime,
+) -> (
+    IdSet<u32>,
+    IdMap<u32, ConcurrentTraceFn>,
+    IdMap<u32, ConcurrentTraceSliceFn>,
+) {
+    let legacy = gc.trace_registry.lock().unwrap();
+    let traces = gc.concurrent_trace_registry.lock().unwrap();
+    let slices = gc.concurrent_slice_registry.lock().unwrap();
     (
         legacy.keys().copied().collect(),
         traces.clone(),
@@ -258,15 +288,19 @@ pub fn willow_register_type(type_id: u32, trace: TraceFn) {
 
 /// Unregister all trace capabilities for `type_id`.
 pub fn willow_unregister_type(type_id: u32) {
-    let mut cache = runtime().minor_registry_cache.lock().unwrap();
-    let mut legacy = type_registry().lock().unwrap();
-    let mut traces = runtime().concurrent_trace_registry.lock().unwrap();
-    let mut slices = runtime().concurrent_slice_registry.lock().unwrap();
+    unregister_type_in(runtime(), type_id);
+}
+
+fn unregister_type_in(gc: &GcRuntime, type_id: u32) {
+    let mut cache = gc.minor_registry_cache.lock().unwrap();
+    let mut legacy = gc.trace_registry.lock().unwrap();
+    let mut traces = gc.concurrent_trace_registry.lock().unwrap();
+    let mut slices = gc.concurrent_slice_registry.lock().unwrap();
     legacy.remove(&type_id);
     traces.remove(&type_id);
     slices.remove(&type_id);
     cache.changed();
-    runtime().registry_generation.fetch_add(1, Ordering::AcqRel);
+    gc.registry_generation.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Finalizer: given a payload pointer, release any non-GC resources the object
@@ -323,42 +357,82 @@ impl NativeGcType {
     }
 }
 
-/// Installs a module's native GC hooks at most once per registry generation.
+/// Selects one native hook group in the owning collector. The selector is
+/// immutable; generations and registration locks belong to `GcRuntime`.
+/// Each group has one fixed descriptor set; replacing live native layouts is
+/// unsupported, just as with direct hook registration.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub enum NativeGcRegistration {
+    Array,
+    Map,
+    Channel,
+    BlockingCell,
+    AsyncMutex,
+    AsyncRwLock,
+    Cancellation,
+    Network,
+}
+
+const NATIVE_REGISTRATION_COUNT: usize = NativeGcRegistration::Network as usize + 1;
+
+pub(super) struct NativeGcRegistrations {
+    states: [NativeGcRegistrationState; NATIVE_REGISTRATION_COUNT],
+}
+
+impl NativeGcRegistrations {
+    pub(super) const fn new() -> Self {
+        Self {
+            states: [const { NativeGcRegistrationState::new() }; NATIVE_REGISTRATION_COUNT],
+        }
+    }
+}
+
+/// Installs a module's native GC hooks at most once per owning registry generation.
 ///
 /// `willow_gc_init` and explicit unregistration invalidate the runtime
 /// registries by advancing their generation. The allocation hot path pays one
-/// acquire load; only the first allocation in a generation takes this mutex.
-pub struct NativeGcRegistration {
+/// generation load and one cached-generation load; only the first allocation
+/// in a generation takes this mutex.
+struct NativeGcRegistrationState {
     registered_generation: AtomicU64,
     lock: Mutex<()>,
 }
 
-impl NativeGcRegistration {
-    pub const fn new() -> Self {
+impl NativeGcRegistrationState {
+    const fn new() -> Self {
         Self {
             registered_generation: AtomicU64::new(0),
             lock: Mutex::new(()),
         }
     }
+}
 
+impl NativeGcRegistration {
     /// Ensure every descriptor is installed. Returns `true` only to the caller
     /// that performed registration for this generation.
     pub fn ensure(&self, types: &[NativeGcType]) -> bool {
-        let generation = registry_generation();
-        if self.registered_generation.load(Ordering::Acquire) == generation {
+        self.ensure_in(runtime(), types)
+    }
+
+    fn ensure_in(&self, gc: &GcRuntime, types: &[NativeGcType]) -> bool {
+        let state = &gc.native_registrations.states[*self as usize];
+        let generation = gc.registry_generation.load(Ordering::Acquire);
+        if state.registered_generation.load(Ordering::Acquire) == generation {
             return false;
         }
-        let _guard = self
+        let _guard = state
             .lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let generation = registry_generation();
-        if self.registered_generation.load(Ordering::Acquire) == generation {
+        let generation = gc.registry_generation.load(Ordering::Acquire);
+        if state.registered_generation.load(Ordering::Acquire) == generation {
             return false;
         }
         for native in types {
             if let Some(trace) = native.trace {
-                register_hooks(
+                register_hooks_in(
+                    gc,
                     native.type_id,
                     trace,
                     native.concurrent_trace,
@@ -366,18 +440,13 @@ impl NativeGcRegistration {
                 );
             }
             if let Some(drop_fn) = native.drop_fn {
-                willow_register_drop(native.type_id, drop_fn);
+                register_drop_in(gc, native.type_id, drop_fn);
             }
         }
-        self.registered_generation
+        state
+            .registered_generation
             .store(generation, Ordering::Release);
         true
-    }
-}
-
-impl Default for NativeGcRegistration {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -388,21 +457,37 @@ pub(super) fn drop_registry() -> &'static Mutex<HashMap<u32, DropFn>> {
 /// Register a finalizer for `type_id`, run by the sweep phase before an object
 /// of that type is deallocated.
 pub fn willow_register_drop(type_id: u32, drop_fn: DropFn) {
-    let mut cache = runtime().minor_registry_cache.lock().unwrap();
-    drop_registry().lock().unwrap().insert(type_id, drop_fn);
+    register_drop_in(runtime(), type_id, drop_fn);
+}
+
+fn register_drop_in(gc: &GcRuntime, type_id: u32, drop_fn: DropFn) {
+    let mut cache = gc.minor_registry_cache.lock().unwrap();
+    gc.drop_registry.lock().unwrap().insert(type_id, drop_fn);
     cache.changed();
 }
 
 pub(super) fn lookup_drop(type_id: u32) -> Option<DropFn> {
-    drop_registry().lock().unwrap().get(&type_id).copied()
+    lookup_drop_in(runtime(), type_id)
+}
+
+pub(super) fn lookup_drop_in(gc: &GcRuntime, type_id: u32) -> Option<DropFn> {
+    gc.drop_registry.lock().unwrap().get(&type_id).copied()
 }
 
 /// Hooks must remain leaf operations: no GC access or safepoints. A partially
 /// executed destructor cannot safely be retried or ignored; terminate on panic.
-pub(super) unsafe fn run_drop_hook(drop_fn: DropFn, payload: *mut u8) {
+pub(super) unsafe fn run_drop_hook(
+    gc: &GcRuntime,
+    drop_fn: DropFn,
+    payload: *mut u8,
+    observed_type: crate::observation::Value<u32>,
+) {
     crate::failure::ffi_boundary("GC native destructor", || {
         // SAFETY: caller owns a dead, still-allocated payload for this hook.
         unsafe { drop_fn(payload) };
+        observed_type.observe(|type_id| {
+            crate::observation::Native::dropped(|| &gc.native_observation, || Some(*type_id));
+        });
     });
 }
 

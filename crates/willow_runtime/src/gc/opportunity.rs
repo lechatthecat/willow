@@ -20,7 +20,6 @@ pub struct CpuWindowV1 {
 }
 const FRESH_NS: u64 = 100_000_000;
 const COOLDOWN_NS: u64 = 1_000_000_000;
-static NEXT_OPTIONAL: AtomicU64 = AtomicU64::new(0);
 
 fn eligible(priority: Priority, cpu: Option<CpuWindowV1>, now: u64, queued: usize) -> bool {
     if matches!(priority, Priority::Emergency | Priority::Required) {
@@ -68,7 +67,7 @@ pub fn request_tracked(priority: Priority, cpu: Option<CpuWindowV1>) -> Option<R
         let now = crate::gc_telemetry::timestamp_ns();
         if scheduler.version != 1
             || !eligible(priority, cpu, now, scheduler.runnable)
-            || !reserve(&NEXT_OPTIONAL, now)
+            || !reserve(&crate::runtime::current().optional_gc_deadline, now)
         {
             return None;
         }
@@ -149,7 +148,9 @@ mod tests {
     fn m3_opportunity_quota_has_one_winner_and_no_overflow() {
         let next = AtomicU64::new(0);
         std::thread::scope(|scope| {
-            let results: Vec<_> = (0..64).map(|_| scope.spawn(|| reserve(&next, 1))).collect();
+            let results: Vec<_> = (0..64)
+                .map(|_| scope.spawn(crate::runtime::serving(|| reserve(&next, 1))))
+                .collect();
             assert_eq!(
                 results
                     .into_iter()
@@ -164,8 +165,36 @@ mod tests {
         assert!(!reserve(&next, u64::MAX));
     }
     #[test]
+    fn private_runtime_optional_quotas_have_independent_concurrent_winners() {
+        let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+        let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+        for now in [1, COOLDOWN_NS + 1, 2 * COOLDOWN_NS + 1] {
+            std::thread::scope(|scope| {
+                let results: Vec<_> = (0..32)
+                    .map(|_| {
+                        scope.spawn(crate::runtime::serving(|| {
+                            (
+                                usize::from(reserve(&first.optional_gc_deadline, now)),
+                                usize::from(reserve(&second.optional_gc_deadline, now)),
+                            )
+                        }))
+                    })
+                    .collect();
+                let totals = results
+                    .into_iter()
+                    .map(|thread| thread.join().unwrap())
+                    .fold((0, 0), |(a, b), (x, y)| (a + x, b + y));
+                assert_eq!(totals, (1, 1));
+            });
+        }
+        drop(first);
+        assert!(reserve(&second.optional_gc_deadline, 3 * COOLDOWN_NS + 1));
+        assert!(std::sync::LazyLock::get(&second.gc).is_none());
+    }
+
+    #[test]
     fn m3_mandatory_collection_ignores_missing_utilization() {
-        let _guard = super::super::runtime_test_guard();
+        let _guard = super::super::isolated_runtime();
         super::super::reset_internal_for_test();
         super::super::willow_alloc(128);
         assert!(request(Priority::Required, None));
@@ -183,7 +212,7 @@ mod saturation_test {
     use crate::gc::*;
     #[test]
     fn m3_saturated_mutators_preserve_mandatory_progress_and_hard_budget() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         const LIMIT: usize = 8 * GC_OLD_REGION_SIZE;
         runtime().heap.lock().unwrap().memory_limit_bytes = Some(LIMIT);
@@ -193,7 +222,7 @@ mod saturation_test {
         let threads: Vec<_> = (0..4)
             .map(|_| {
                 let (stop, progress) = (stop.clone(), progress.clone());
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     let _mutator = MutatorRegistration::new();
                     while !stop.load(Ordering::Acquire) {
                         let mut checksum = 1u64;
@@ -205,7 +234,7 @@ mod saturation_test {
                         willow_gc_safepoint();
                         progress.fetch_add(1, Ordering::Relaxed);
                     }
-                })
+                }))
             })
             .collect();
         let before = runtime().heap.lock().unwrap().major_collections;

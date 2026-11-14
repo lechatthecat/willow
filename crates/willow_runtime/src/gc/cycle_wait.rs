@@ -8,19 +8,30 @@ std::thread_local! {
     static IS_COLLECTOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-pub(super) struct CollectorGuard(Option<std::sync::MutexGuard<'static, ()>>);
+pub(super) struct CollectorGuard<'a> {
+    gc: &'a GcRuntime,
+    milestones: &'a crate::gc_telemetry::milestones::Milestones,
+    serialize: Option<std::sync::MutexGuard<'a, ()>>,
+}
 
 pub(super) fn is_collector() -> bool {
     IS_COLLECTOR.get()
 }
 
-impl CollectorGuard {
+impl CollectorGuard<'static> {
     pub(super) fn try_acquire() -> Option<Self> {
+        Self::try_acquire_in(crate::runtime::current())
+    }
+}
+
+impl<'a> CollectorGuard<'a> {
+    pub(super) fn try_acquire_in(owner: &'a crate::runtime::Runtime) -> Option<Self> {
         if IS_COLLECTOR.get() {
             return None;
         }
-        let mut coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
-        let serialize = match runtime().collect_lock.try_lock() {
+        let gc = &*owner.gc;
+        let mut coord = gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
+        let serialize = match gc.collect_lock.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return None,
@@ -29,17 +40,21 @@ impl CollectorGuard {
         // before the heap exposes a mark epoch and after sweep accounting.
         coord.cycle_collector = Some(std::thread::current().id());
         IS_COLLECTOR.set(true);
-        Some(Self(Some(serialize)))
+        Some(Self {
+            gc,
+            milestones: &owner.telemetry.milestones,
+            serialize: Some(serialize),
+        })
     }
 }
 
-impl Drop for CollectorGuard {
+impl Drop for CollectorGuard<'_> {
     fn drop(&mut self) {
-        let mut coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut coord = self.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
         // Release serialization before publishing completion, including skip
         // and unwind paths. A new election cannot interleave under coord.
-        drop(self.0.take());
-        crate::gc_telemetry::milestones::quiescent();
+        drop(self.serialize.take());
+        self.milestones.quiescent();
         IS_COLLECTOR.set(false);
         coord.cycle_collector = None;
         coord.recovery_requested_for = None;
@@ -47,7 +62,7 @@ impl Drop for CollectorGuard {
             .cycle_generation
             .checked_add(1)
             .expect("collection generation exhausted");
-        runtime().budget_cv.notify_all();
+        self.gc.budget_cv.notify_all();
     }
 }
 
@@ -55,69 +70,65 @@ fn participation_required(coord: &GcCoord) -> bool {
     coord.stop_requested
 }
 
-#[cfg(test)]
-pub(super) static SLEEPS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-pub(super) static CHECKS: AtomicUsize = AtomicUsize::new(0);
-
 pub(super) fn collect_for_budget() {
+    collect_for_budget_in(crate::runtime::current())
+}
+
+pub(super) fn collect_for_budget_in(owner: &crate::runtime::Runtime) {
     if IS_COLLECTOR.get() {
         return;
     }
     let me = std::thread::current().id();
-    let mut coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    let mut coord = owner.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
     let generation = coord.cycle_generation;
     if coord.cycle_collector == Some(me) {
         return;
     }
     if coord.cycle_collector.is_none() {
         drop(coord);
-        collect_internal();
-        coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = try_collect_internal_in(owner);
+        coord = owner.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
     }
-    wait_for_cycle(coord, generation);
-}
-
-#[cfg(test)]
-pub(super) static INITIAL_ALLOCATION_WAITS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(test)]
-std::thread_local! {
-    pub(super) static BEFORE_INITIAL_HANDSHAKE: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+    wait_for_cycle_in(owner, coord, generation);
 }
 
 /// Bound a delayed automatic request without making its allocating caller the
 /// collector. A native trace may Retry until this allocation returns, so only
 /// join initial publication, never marking or whole-cycle completion.
 pub(super) fn start_for_allocation() {
+    start_for_allocation_in(crate::runtime::current())
+}
+
+pub(super) fn start_for_allocation_in(owner: &crate::runtime::Runtime) {
     if IS_COLLECTOR.get() {
         return;
     }
-    let coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    let coord = owner.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
     let generation = coord.cycle_generation;
     let request = coord.cycle_collector.is_none();
     drop(coord);
-    if request && !coordinator::request() {
+    if request && !coordinator::request_in(owner) {
         // Unregistered legacy roots or unavailable background collection must
         // retain progress, not fall back to synchronous Retry-blind marking.
         return;
     }
-    let mut coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
-    while coord.cycle_generation == generation && GC_MARK_PHASE.load(Ordering::Acquire) == 0 {
-        if foreign_root_stack_owner_active_locked(&coord) {
+    let mut coord = owner.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    while coord.cycle_generation == generation && owner.gc.mark_phase().load(Ordering::Acquire) == 0
+    {
+        if root::foreign_root_stack_owner_active_locked_in(&owner.gc, &coord) {
             return;
         }
         if coord.stop_requested {
             drop(coord);
-            willow_gc_safepoint();
-            coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+            safepoint::safepoint_in(owner);
+            coord = owner.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
             continue;
         }
-        #[cfg(test)]
-        INITIAL_ALLOCATION_WAITS.fetch_add(1, Ordering::Release);
+        RuntimeWaitObservation::initial_wait(|| &owner.gc.wait_observation);
         // Initial stop publication and collector retirement both notify under
         // coord. No polling or missed wake between this predicate and sleep.
-        coord = runtime()
+        coord = owner
+            .gc
             .budget_cv
             .wait(coord)
             .unwrap_or_else(|p| p.into_inner());
@@ -125,36 +136,45 @@ pub(super) fn start_for_allocation() {
     drop(coord);
     // If publication exposed an exhausted runway, retain the normal native
     // Retry escape. This call charges no allocation bytes a second time.
-    assist_concurrent_mark(0);
+    marking::assist_concurrent_mark_in(owner, 0);
 }
 
 /// Wait for an elected collector without consuming an automatic request.
 /// The same condition-variable protocol joins sweep completion and services
 /// each subsequent stop while this registered waiter remains enrolled.
 pub(super) fn wait_for_current_cycle() {
-    let coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    wait_for_current_cycle_in(crate::runtime::current());
+}
+
+pub(super) fn wait_for_current_cycle_in(owner: &crate::runtime::Runtime) {
+    let coord = owner.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
     let generation = coord.cycle_generation;
-    wait_for_cycle(coord, generation);
+    wait_for_cycle_in(owner, coord, generation);
 }
 
 /// Revalidate sweep admission under coord -> heap lock order. A sweep may
 /// retire and a later mark may win election after the allocator dropped heap;
 /// never join that later mark on the strength of a stale sweep predicate.
 pub(super) fn wait_for_sweep_budget() -> bool {
+    wait_for_sweep_budget_in(crate::runtime::current())
+}
+
+pub(super) fn wait_for_sweep_budget_in(owner: &crate::runtime::Runtime) -> bool {
     if IS_COLLECTOR.get() {
         return false;
     }
-    let coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    let coord = owner.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
     if coord.cycle_collector.is_none()
-        || !sweep::allocation_budget_exhausted(&runtime().heap.lock().unwrap())
+        || !sweep::allocation_budget_exhausted(&owner.gc.heap.lock().unwrap())
     {
         return false;
     }
     let generation = coord.cycle_generation;
-    let _interval = crate::gc_telemetry::observations::Span::new(
+    let _interval = crate::gc_telemetry::observations::Span::for_runtime(
+        owner,
         crate::gc_telemetry::observations::Kind::AllocationStall,
     );
-    wait_for_cycle(coord, generation);
+    wait_for_cycle_in(owner, coord, generation);
     true
 }
 
@@ -162,18 +182,23 @@ pub(super) fn wait_for_sweep_budget() -> bool {
 /// growing the nursery while their pending minor waits behind its sweep. Native collector
 /// callbacks must retain the existing non-waiting/reentrant behavior.
 pub(super) fn wait_for_minor_budget() -> bool {
+    wait_for_minor_budget_in(crate::runtime::current())
+}
+
+pub(super) fn wait_for_minor_budget_in(owner: &crate::runtime::Runtime) -> bool {
     if IS_COLLECTOR.get() {
         return false;
     }
-    let coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    let coord = owner.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
     if coord.cycle_collector.is_none() {
         return false;
     }
     let generation = coord.cycle_generation;
-    let _interval = crate::gc_telemetry::observations::Span::new(
+    let _interval = crate::gc_telemetry::observations::Span::for_runtime(
+        owner,
         crate::gc_telemetry::observations::Kind::AllocationStall,
     );
-    wait_for_cycle(coord, generation);
+    wait_for_cycle_in(owner, coord, generation);
     true
 }
 
@@ -204,8 +229,8 @@ pub(super) fn collect_explicit_after(arm: impl FnOnce()) {
 /// Requests are tied to the elected generation under the same lock used to
 /// retire completion. A late request during remark, Recovery or sweep cannot
 /// survive guard drop or target a subsequent election.
-pub(super) fn take_recovery_request() -> bool {
-    let mut coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+pub(super) fn take_recovery_request(owner: &GcRuntime) -> bool {
+    let mut coord = owner.coord.0.lock().unwrap_or_else(|p| p.into_inner());
     let requested = coord.recovery_requested_for.take();
     coord.cycle_collector == Some(std::thread::current().id())
         && requested == Some(coord.cycle_generation)
@@ -213,16 +238,24 @@ pub(super) fn take_recovery_request() -> bool {
 
 /// Shared by allocation, explicit `gc()` and unregister waits; callers own any
 /// interval attribution.
-pub(super) fn wait_for_cycle(mut coord: std::sync::MutexGuard<'_, GcCoord>, generation: u64) {
+pub(super) fn wait_for_cycle(coord: std::sync::MutexGuard<'_, GcCoord>, generation: u64) {
+    wait_for_cycle_in(crate::runtime::current(), coord, generation);
+}
+
+pub(super) fn wait_for_cycle_in<'a>(
+    owner: &'a crate::runtime::Runtime,
+    mut coord: std::sync::MutexGuard<'a, GcCoord>,
+    generation: u64,
+) {
     let mut interval = None;
     loop {
-        #[cfg(test)]
-        CHECKS.fetch_add(1, Ordering::Relaxed);
+        RuntimeWaitObservation::checked(|| &owner.gc.wait_observation);
         if coord.cycle_generation != generation || coord.cycle_collector.is_none() {
             return;
         }
         interval.get_or_insert_with(|| {
-            crate::gc_telemetry::observations::Span::new(
+            crate::gc_telemetry::observations::Span::for_runtime(
+                owner,
                 crate::gc_telemetry::observations::Kind::CycleWait,
             )
         });
@@ -230,20 +263,17 @@ pub(super) fn wait_for_cycle(mut coord: std::sync::MutexGuard<'_, GcCoord>, gene
             // Never sleep through a request that needs this mutator. The
             // safepoint owns root publication and the STW parking protocol.
             drop(coord);
-            willow_gc_safepoint();
-            coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+            safepoint::safepoint_in(owner);
+            coord = owner.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
             continue;
         }
-        #[cfg(test)]
-        {
-            if runtime().heap.lock().unwrap().sweeping.is_some() {
-                SWEEP_BUDGET_WAITING.store(true, Ordering::Release);
-            } else {
-                ELECTION_BUDGET_WAITING.store(true, Ordering::Release);
-            }
-            SLEEPS.fetch_add(1, Ordering::Release);
-        }
-        coord = runtime()
+        RuntimeWaitObservation::sleeping(|| {
+            let gc = &owner.gc;
+            let sweeping = gc.heap.lock().unwrap().sweeping.is_some();
+            (&gc.wait_observation, sweeping)
+        });
+        coord = owner
+            .gc
             .budget_cv
             .wait(coord)
             .unwrap_or_else(|p| p.into_inner());
@@ -252,6 +282,99 @@ pub(super) fn wait_for_cycle(mut coord: std::sync::MutexGuard<'_, GcCoord>, gene
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_requests_are_consumed_only_from_the_selected_owner_and_generation() {
+        use super::*;
+        let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+        let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+        let elected = CollectorGuard::try_acquire_in(&first).unwrap();
+        for owner in [&first, &second] {
+            let mut coord = owner.gc.coord.0.lock().unwrap();
+            coord.recovery_requested_for = Some(coord.cycle_generation);
+        }
+        assert!(take_recovery_request(&first.gc));
+        assert!(!take_recovery_request(&first.gc));
+        assert_eq!(
+            second.gc.coord.0.lock().unwrap().recovery_requested_for,
+            Some(0)
+        );
+        // An unelected runtime cannot consume a request as its collector.
+        assert!(!take_recovery_request(&second.gc));
+        {
+            let mut coord = first.gc.coord.0.lock().unwrap();
+            coord.recovery_requested_for = Some(coord.cycle_generation + 1);
+        }
+        assert!(!take_recovery_request(&first.gc));
+        drop(elected);
+        let _next = CollectorGuard::try_acquire_in(&second).unwrap();
+        {
+            let mut coord = second.gc.coord.0.lock().unwrap();
+            coord.recovery_requested_for = Some(coord.cycle_generation);
+        }
+        assert!(take_recovery_request(&second.gc));
+        assert!(!take_recovery_request(&first.gc));
+    }
+
+    #[test]
+    fn private_collector_elections_publish_only_their_owners_on_release_and_unwind() {
+        use super::*;
+        use crate::gc_telemetry::{GcStage, milestones::GcTicket};
+        let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+        let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = [&first, &second]
+                .into_iter()
+                .map(|owner| {
+                    let barrier = &barrier;
+                    scope.spawn(crate::runtime::serving(move || {
+                        let mut correct = true;
+                        for epoch in 1..=64 {
+                            let elected = CollectorGuard::try_acquire_in(owner).unwrap();
+                            correct &= CollectorGuard::try_acquire_in(owner).is_none();
+                            owner.telemetry.milestones.begin(epoch);
+                            barrier.wait();
+                            owner.telemetry.milestones.reached(GcStage::MarkComplete);
+                            owner.telemetry.milestones.reached(GcStage::SweepComplete);
+                            owner.telemetry.milestones.finished(epoch, false);
+                            drop(elected);
+                            barrier.wait();
+                            let coord = owner.gc.coord.0.lock().unwrap();
+                            correct &=
+                                coord.cycle_collector.is_none() && coord.cycle_generation == epoch;
+                            drop(coord);
+                            correct &= !is_collector();
+                            correct &= owner
+                                .telemetry
+                                .milestones
+                                .wait_gc_for_test(
+                                    GcTicket(epoch),
+                                    GcStage::Quiescent,
+                                    std::time::Duration::ZERO,
+                                )
+                                .is_ok();
+                        }
+                        correct
+                    }))
+                })
+                .collect();
+            for handle in handles {
+                assert!(handle.join().unwrap());
+            }
+        });
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = CollectorGuard::try_acquire_in(&first).unwrap();
+            first.telemetry.milestones.begin(65);
+            panic!("private collector unwind");
+        }));
+        assert!(unwind.is_err());
+        assert!(!is_collector());
+        assert_eq!(first.gc.coord.0.lock().unwrap().cycle_generation, 65);
+        assert_eq!(second.gc.coord.0.lock().unwrap().cycle_generation, 64);
+        assert_eq!(first.telemetry.milestones.record(65).unwrap().aborted, 1);
+        assert!(second.telemetry.milestones.record(65).is_none());
+        drop(CollectorGuard::try_acquire_in(&first).unwrap());
+    }
     use super::*;
     use std::time::{Duration, Instant};
 
@@ -273,13 +396,13 @@ mod tests {
             return;
         }
         use crate::gc_telemetry::observations::{self, Kind};
-        let _test = runtime_test_guard();
+        let _test = isolated_runtime();
         reset_internal_for_test();
         for explicit in [false, true] {
             let _collector = (!explicit).then(MutatorRegistration::new);
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             let (go_tx, go_rx) = std::sync::mpsc::channel();
-            let worker = std::thread::spawn(move || {
+            let worker = std::thread::spawn(crate::runtime::serving(move || {
                 // Explicit collection enters as an existing registered mutator;
                 // registration enters while the stopped callback owns coord.
                 let registration = explicit.then(MutatorRegistration::new);
@@ -292,7 +415,7 @@ mod tests {
                     willow_gc_safepoint();
                 }
                 drop(registration);
-            });
+            }));
             ready_rx.recv().unwrap();
             // Existing mutators must park before the callback, so use the actual
             // stopped callback with registration; for explicit entry hold the
@@ -360,7 +483,7 @@ mod tests {
 
     fn await_sleeps(count: usize) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while SLEEPS.load(Ordering::Acquire) < count {
+        while runtime().wait_observation.sleeps.load(Ordering::Acquire) < count {
             assert!(Instant::now() < deadline, "budget wait never slept");
             std::thread::yield_now();
         }
@@ -370,20 +493,26 @@ mod tests {
     }
 
     fn waiter() -> std::thread::JoinHandle<()> {
-        std::thread::spawn(|| {
+        std::thread::spawn(crate::runtime::serving(|| {
             let _mutator = MutatorRegistration::new();
             collect_for_budget();
-        })
+        }))
     }
 
     fn reset_counts() {
-        SLEEPS.store(0, Ordering::Relaxed);
-        CHECKS.store(0, Ordering::Relaxed);
+        runtime()
+            .wait_observation
+            .sleeps
+            .store(0, Ordering::Relaxed);
+        runtime()
+            .wait_observation
+            .checks
+            .store(0, Ordering::Relaxed);
     }
 
     #[test]
     fn explicit_collect_joins_active_cycles_without_busy_polling() {
-        let _test = runtime_test_guard();
+        let _test = isolated_runtime();
         reset_internal_for_test();
         for count in [1, 4, 16, 32] {
             reset_counts();
@@ -391,17 +520,17 @@ mod tests {
             let generation = runtime().coord.0.lock().unwrap().cycle_generation;
             // Reentrant callbacks on the elected collector must never wait.
             willow_gc_collect();
-            assert_eq!(CHECKS.load(Ordering::Relaxed), 0);
+            assert_eq!(runtime().wait_observation.checks.load(Ordering::Relaxed), 0);
             let waiters: Vec<_> = (0..count)
                 .map(|_| {
-                    std::thread::spawn(|| {
+                    std::thread::spawn(crate::runtime::serving(|| {
                         let _mutator = MutatorRegistration::new();
                         willow_gc_collect();
-                    })
+                    }))
                 })
                 .collect();
             let deadline = Instant::now() + Duration::from_secs(10);
-            while SLEEPS.load(Ordering::Acquire) < count {
+            while runtime().wait_observation.sleeps.load(Ordering::Acquire) < count {
                 assert!(
                     waiters.iter().all(|w| !w.is_finished()),
                     "explicit collection returned before the elected cycle completed"
@@ -424,21 +553,21 @@ mod tests {
             // The joined epoch and the subsequently required full collection
             // are distinct. Contending full requests may coalesce; no waiter
             // may return without a post-join collection completing.
-            assert!(CHECKS.load(Ordering::Relaxed) >= 3 * count);
-            assert!(SLEEPS.load(Ordering::Relaxed) >= 2 * count);
+            assert!(runtime().wait_observation.checks.load(Ordering::Relaxed) >= 3 * count);
+            assert!(runtime().wait_observation.sleeps.load(Ordering::Relaxed) >= 2 * count);
             assert!(runtime().coord.0.lock().unwrap().cycle_generation >= generation + 2);
             assert!(runtime().heap.lock().unwrap().major_collections >= 1);
             println!(
                 "explicit GC waiters={count} sleeps={} checks={}",
-                SLEEPS.load(Ordering::Relaxed),
-                CHECKS.load(Ordering::Relaxed)
+                runtime().wait_observation.sleeps.load(Ordering::Relaxed),
+                runtime().wait_observation.checks.load(Ordering::Relaxed)
             );
         }
         reset_internal_for_test();
     }
 
     fn late_request_is_retired(reason: Option<crate::gc_telemetry::stops::StopReason>) {
-        let _test = runtime_test_guard();
+        let _test = isolated_runtime();
         reset_internal_for_test();
         reset_counts();
         let elected = CollectorGuard::try_acquire().unwrap();
@@ -447,16 +576,16 @@ mod tests {
         let waiter = if let Some(reason) = reason {
             with_stw(reason, |_, _| {
                 let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-                let waiter = std::thread::spawn(move || {
+                let waiter = std::thread::spawn(crate::runtime::serving(move || {
                     ready_tx.send(()).unwrap();
                     collect_explicit();
-                });
+                }));
                 ready_rx.recv().unwrap();
                 waiter
             })
         } else {
             runtime().heap.lock().unwrap().sweeping = Some(std::thread::current().id());
-            std::thread::spawn(collect_explicit)
+            std::thread::spawn(crate::runtime::serving(collect_explicit))
         };
         await_sleeps(1);
         {
@@ -470,7 +599,7 @@ mod tests {
         waiter.join().unwrap(); // Also finishes its subsequent full collection.
         let next = CollectorGuard::try_acquire().unwrap();
         assert!(
-            !take_recovery_request(),
+            !take_recovery_request(runtime()),
             "late request leaked into next election"
         );
         assert!(
@@ -501,7 +630,7 @@ mod tests {
 
     #[test]
     fn budget_wait_spurious_wakeups_and_scaling() {
-        let _test = runtime_test_guard();
+        let _test = isolated_runtime();
         reset_internal_for_test();
         for count in [1, 4, 16, 32] {
             reset_counts();
@@ -519,13 +648,19 @@ mod tests {
             // Acknowledgement notifications must not wake sleeping waiters.
             let coord = runtime().coord.0.lock().unwrap();
             runtime().coord.1.notify_all();
-            assert_eq!(SLEEPS.load(Ordering::Acquire), count * 5);
+            assert_eq!(
+                runtime().wait_observation.sleeps.load(Ordering::Acquire),
+                count * 5
+            );
             drop(coord);
             drop(elected);
             for worker in waiters {
                 worker.join().unwrap();
             }
-            assert_eq!(CHECKS.load(Ordering::Relaxed), count * 6);
+            assert_eq!(
+                runtime().wait_observation.checks.load(Ordering::Relaxed),
+                count * 6
+            );
             assert_eq!(
                 runtime().coord.0.lock().unwrap().cycle_generation,
                 generation.wrapping_add(1)
@@ -541,7 +676,7 @@ mod tests {
 
     #[test]
     fn budget_wait_participates_in_real_root_rounds_remark_and_recovery() {
-        let _test = runtime_test_guard();
+        let _test = isolated_runtime();
         reset_internal_for_test();
         reset_counts();
         let elected = CollectorGuard::try_acquire().unwrap();
@@ -565,7 +700,9 @@ mod tests {
                 assert_eq!(coord.parked.len(), 16);
                 let mut state = runtime().heap.lock().unwrap();
                 marking::set_concurrent_cycle(&mut state, None);
-                GC_MARK_PHASE.store(0, Ordering::Release);
+                crate::runtime::current()
+                    .mark_phase()
+                    .store(0, Ordering::Release);
                 marking.queue.end_epoch();
             },
         );
@@ -581,7 +718,7 @@ mod tests {
 
     #[test]
     fn budget_wait_unwind_completes_generation_and_allows_next_election() {
-        let _test = runtime_test_guard();
+        let _test = isolated_runtime();
         reset_internal_for_test();
         reset_counts();
         let mut workers = Vec::new();
@@ -602,7 +739,7 @@ mod tests {
 
     #[test]
     fn budget_wait_self_collection_and_completion_before_wait() {
-        let _test = runtime_test_guard();
+        let _test = isolated_runtime();
         reset_internal_for_test();
         reset_counts();
         let elected = CollectorGuard::try_acquire().unwrap();
@@ -611,17 +748,17 @@ mod tests {
             // Preserve self-collection semantics while owning coord's mutex.
             collect_for_budget();
         });
-        assert_eq!(SLEEPS.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime().wait_observation.sleeps.load(Ordering::Relaxed), 0);
         drop(elected);
         // Completion before entry must not sleep on an already-published event.
         collect_for_budget();
-        assert_eq!(SLEEPS.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime().wait_observation.sleeps.load(Ordering::Relaxed), 0);
         reset_internal_for_test();
     }
 
     #[test]
     fn budget_wait_completed_generation_does_not_join_a_later_cycle() {
-        let _test = runtime_test_guard();
+        let _test = isolated_runtime();
         reset_internal_for_test();
         reset_counts();
         let old_generation = runtime().coord.0.lock().unwrap().cycle_generation;
@@ -630,13 +767,13 @@ mod tests {
         let next = CollectorGuard::try_acquire().unwrap();
         // Deterministically model completion and immediate re-election before
         // a delayed waiter reacquires coord. It owes only the previous cycle.
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let coord = runtime().coord.0.lock().unwrap();
             wait_for_cycle(coord, old_generation);
-        })
+        }))
         .join()
         .unwrap();
-        assert_eq!(SLEEPS.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime().wait_observation.sleeps.load(Ordering::Relaxed), 0);
         drop(next);
         reset_internal_for_test();
     }
@@ -685,7 +822,7 @@ mod tests {
     #[test]
     #[ignore = "opt-in waiter CPU comparison, 100ms holds per data point"]
     fn budget_wait_cpu_measurement() {
-        let _test = runtime_test_guard();
+        let _test = isolated_runtime();
         reset_internal_for_test();
         for count in [1, 4, 16, 32] {
             for legacy in [true, false] {
@@ -698,7 +835,7 @@ mod tests {
                 let workers: Vec<_> = (0..count)
                     .map(|_| {
                         let ready = ready.clone();
-                        std::thread::spawn(move || {
+                        std::thread::spawn(crate::runtime::serving(move || {
                             let _mutator = MutatorRegistration::new();
                             assert!(!can_reserve(&mut runtime().heap.lock().unwrap(), 1));
                             ready.wait();
@@ -713,7 +850,7 @@ mod tests {
                                 .zip(crate::gc_telemetry::workers::thread_cpu_ns())
                                 .map(|(before, after)| after.saturating_sub(before));
                             (checks, cpu)
-                        })
+                        }))
                     })
                     .collect();
                 ready.wait();
@@ -726,12 +863,12 @@ mod tests {
                 let checks = if legacy {
                     results.iter().map(|r| r.0).sum()
                 } else {
-                    CHECKS.load(Ordering::Relaxed)
+                    runtime().wait_observation.checks.load(Ordering::Relaxed)
                 };
                 let cpu: Option<u64> = results.iter().map(|r| r.1).sum();
                 eprintln!(
                     "budget_wait measurement legacy={legacy} waiters={count} checks={checks} sleeps={} cpu_ns={cpu:?}",
-                    SLEEPS.load(Ordering::Relaxed)
+                    runtime().wait_observation.sleeps.load(Ordering::Relaxed)
                 );
                 if !legacy {
                     assert_eq!(checks, 2 * count);

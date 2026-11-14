@@ -8,12 +8,10 @@ use super::*;
 type Candidates = [Option<(usize, Arc<concurrent_bitmap::ConcurrentMarkBits>)>; 2];
 
 #[derive(Default)]
-pub(super) struct RootTlabs(std::sync::RwLock<IdMap<usize, Candidates>>);
-
-#[cfg(test)]
-thread_local! {
-    static CANDIDATE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+pub(super) struct RootTlabs(
+    std::sync::RwLock<IdMap<usize, Candidates>>,
+    crate::observation::Value<std::sync::atomic::AtomicUsize>,
+);
 
 impl RootTlabs {
     pub(super) fn insert(&self, chunk: &BumpChunk) {
@@ -56,8 +54,9 @@ impl RootTlabs {
         let header = address.checked_sub(GC_HEADER_SIZE)?;
         let pages = self.0.read().unwrap();
         for (base, starts) in pages.get(&(header / GC_TLAB_CHUNK_SIZE))?.iter().flatten() {
-            #[cfg(test)]
-            CANDIDATE_VISITS.set(CANDIDATE_VISITS.get() + 1);
+            self.1.observe(|visits| {
+                visits.fetch_add(1, Ordering::Relaxed);
+            });
             let Some(offset) = header.checked_sub(*base) else {
                 continue;
             };
@@ -95,7 +94,7 @@ mod tests {
             for i in 1..=count {
                 index.insert_view(i * GC_TLAB_CHUNK_SIZE + 8, &bits);
             }
-            CANDIDATE_VISITS.set(0);
+            index.1.store(0, Ordering::Relaxed);
             for i in 1..=count {
                 assert_eq!(
                     index.generation(i * GC_TLAB_CHUNK_SIZE + 8 + GC_HEADER_SIZE),
@@ -106,7 +105,7 @@ mod tests {
                     None
                 );
             }
-            let visits = CANDIDATE_VISITS.get();
+            let visits = index.1.load(Ordering::Relaxed);
             assert!(visits <= 4 * count);
             for i in (1..=count).step_by(2) {
                 index.remove(i * GC_TLAB_CHUNK_SIZE + 8);
@@ -122,7 +121,7 @@ mod tests {
 
     #[test]
     fn generation_index_tracks_active_retired_survivor_and_released_chunks() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let mut tls = Box::new(GcTlabState::new());
         let young = willow_gc_alloc_slow(&mut *tls, 0, 0, 8, 0);

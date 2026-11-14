@@ -2,7 +2,7 @@
 use super::*;
 use std::sync::atomic::AtomicU64;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct WaitList {
     slots: Vec<WaitSlot>,
     free: Vec<usize>,
@@ -12,6 +12,7 @@ struct WaitList {
     by_worker: Vec<Option<usize>>,
 }
 
+#[derive(Debug)]
 struct WaitSlot {
     thread: std::thread::Thread,
     worker: usize,
@@ -70,7 +71,7 @@ impl WaitList {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct IdleWaiters {
     generation: AtomicU64,
     registered: AtomicUsize,
@@ -145,6 +146,16 @@ impl IdleWaiters {
     }
 
     fn wait_inner(&self, start: u64, timeout: Option<Duration>, backoff: impl FnOnce()) -> bool {
+        self.wait_inner_in(crate::runtime::current(), start, timeout, backoff)
+    }
+
+    fn wait_inner_in(
+        &self,
+        owner: &crate::runtime::Runtime,
+        start: u64,
+        timeout: Option<Duration>,
+        backoff: impl FnOnce(),
+    ) -> bool {
         // Bounded CPU backoff per failed probe, including publication races.
         // The backoff never waits for a condition or yields to the OS, and
         // it holds no lock. Then retry known work or register to park.
@@ -153,21 +164,19 @@ impl IdleWaiters {
         // not a yield or a contended waiter-list registration. This read is
         // only a fast path: registration still rechecks the generation below.
         if self.generation() != start {
-            #[cfg(test)]
-            super::idle_backoff_tests::record_stale_retry();
+            crate::observation::SchedulerHooks::idle(|| owner, 1);
             return true;
         }
         // SAFETY: the remaining interval only operates on native wait-list
         // metadata and parks. Drop resumes GC ownership after the list locks
         // are released, including both registration-race and timeout returns.
-        let _idle_mutator = unsafe { crate::gc::IdleMutator::enter() };
+        let _idle_mutator = unsafe { crate::gc::IdleMutator::enter_in(owner) };
         let index = {
             let mut list = self.list.lock().unwrap_or_else(|p| p.into_inner());
             self.registered.fetch_add(1, Ordering::SeqCst);
             if self.generation() != start {
                 self.registered.fetch_sub(1, Ordering::SeqCst);
-                #[cfg(test)]
-                super::idle_backoff_tests::record_stale_retry();
+                crate::observation::SchedulerHooks::idle(|| owner, 1);
                 return true;
             }
             list.insert()
@@ -198,54 +207,121 @@ impl IdleWaiters {
     }
 }
 
-static IDLE_WAITERS: LazyLock<IdleWaiters> = LazyLock::new(IdleWaiters::default);
-// Drivers cannot consume a worker's work notification or hide worker 0's
-// targeted registration. Only completion and shutdown wake this list.
-static COMPLETION_WAITERS: LazyLock<IdleWaiters> = LazyLock::new(IdleWaiters::default);
+/// Wake lists belong to a runtime; equal worker indices in another runtime
+/// must not consume or hide this runtime's targeted notification.
+#[derive(Debug, Default)]
+pub(crate) struct Parking {
+    idle: IdleWaiters,
+    completion: IdleWaiters,
+}
+
+impl Parking {
+    pub(super) fn completion_generation(&self) -> u64 {
+        self.completion.generation()
+    }
+    pub(super) fn wait_completion(&self, owner: &crate::runtime::Runtime, start: u64) {
+        self.completion
+            .wait_inner_in(owner, start, None, std::hint::spin_loop);
+    }
+    pub(super) fn generation(&self) -> u64 {
+        self.idle.generation()
+    }
+    pub(super) fn notify_idle(&self) {
+        self.idle.notify(false);
+    }
+    pub(super) fn notify_local(&self, backlog: usize) {
+        self.idle.publish(backlog > 1, false);
+    }
+    pub(super) fn notify_worker(&self, worker: usize) {
+        self.idle.notify_worker(worker);
+    }
+    pub(super) fn notify_all(&self) {
+        self.idle.notify(true);
+        self.completion.notify(true);
+    }
+}
+
+fn default_parking() -> &'static Parking {
+    &crate::runtime::current().parking
+}
 
 pub(super) fn completion_wake_generation() -> u64 {
-    COMPLETION_WAITERS.generation()
+    default_parking().completion.generation()
 }
-
 pub(super) fn wait_for_completion_event(start: u64) {
-    COMPLETION_WAITERS.wait_inner(start, None, std::hint::spin_loop);
+    default_parking()
+        .completion
+        .wait_inner(start, None, std::hint::spin_loop);
 }
-
 pub(super) fn notify_idle_waiters() {
-    IDLE_WAITERS.notify(false);
+    default_parking().notify_idle();
 }
-
 pub(super) fn notify_local_work(backlog: usize) {
-    // The publishing worker can consume one runnable task itself. Waking a
-    // thief for that sole continuation creates cross-core ping-pong (and
-    // native-stack affinity bounces) without adding useful parallelism.
-    IDLE_WAITERS.publish(backlog > 1, false);
+    default_parking().notify_local(backlog);
 }
-
 pub(super) fn notify_worker_waiter(worker: usize) {
-    IDLE_WAITERS.notify_worker(worker);
+    default_parking().notify_worker(worker);
 }
-
 pub(super) fn notify_all_idle_waiters() {
-    IDLE_WAITERS.notify(true);
-    COMPLETION_WAITERS.notify(true);
+    default_parking().notify_all();
 }
-
 pub(super) fn current_wake_generation() -> u64 {
-    IDLE_WAITERS.generation()
+    default_parking().generation()
 }
-
 pub(super) fn wait_for_wake_since(start: u64, timeout: Duration) -> bool {
-    IDLE_WAITERS.wait(start, timeout)
+    default_parking().idle.wait(start, timeout)
 }
-
-pub(super) fn wait_for_event_since(start: u64) -> bool {
-    IDLE_WAITERS.wait_inner(start, None, std::hint::spin_loop)
+pub(super) fn wait_for_owner_event(
+    owner: &crate::runtime::Runtime,
+    start: u64,
+    timeout: Option<Duration>,
+) -> bool {
+    owner.parking.idle.wait_inner_in(owner, start, timeout, || {
+        std::hint::spin_loop();
+        if timeout.is_some() {
+            std::hint::spin_loop();
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_wait_lists_do_not_consume_peer_worker_notifications() {
+        let first = crate::runtime::Runtime::new(environment_worker_config);
+        let second = crate::runtime::Runtime::new(environment_worker_config);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            for (id, owner) in [(1, &first), (2, &second)] {
+                let done_tx = done_tx.clone();
+                scope.spawn(crate::runtime::serving(move || {
+                    let _registration = crate::gc::MutatorRegistration::new_in(owner);
+                    let generation = owner.parking.generation();
+                    let woken =
+                        wait_for_owner_event(owner, generation, Some(Duration::from_secs(5)));
+                    done_tx.send((id, woken)).unwrap();
+                }));
+            }
+            registered(&first.parking.idle, 1);
+            registered(&second.parking.idle, 1);
+            let first_generation = first.parking.generation();
+            let first_completion = first.parking.completion_generation();
+            second.parking.notify_worker(0);
+            let completed = done_rx.recv_timeout(Duration::from_secs(2));
+            let first_still_waiting = first.parking.idle.registered.load(Ordering::SeqCst) == 1;
+            let first_unchanged = first.parking.generation() == first_generation
+                && first.parking.completion_generation() == first_completion;
+            first.parking.notify_all();
+            assert_eq!(completed.unwrap(), (2, true));
+            assert!(first_still_waiting && first_unchanged);
+            assert_eq!(
+                done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                (1, true)
+            );
+        });
+    }
 
     fn registered(waiters: &IdleWaiters, count: usize) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -272,8 +348,8 @@ mod tests {
 
     #[test]
     fn idle_gc_stops_do_not_wake_workers_or_completion_drivers() {
-        let _test = crate::gc::runtime_test_guard();
-        for waiters in [&*IDLE_WAITERS, &*COMPLETION_WAITERS] {
+        let _test = crate::gc::isolated_runtime();
+        for waiters in [&default_parking().idle, &default_parking().completion] {
             for workers in [1, 4, 16] {
                 for cycles in [1, 8, 64] {
                     // The queues are process-wide, so another test may publish
@@ -289,12 +365,12 @@ mod tests {
                         let parked = std::thread::scope(|scope| {
                             for _ in 0..workers {
                                 let probes = &probes;
-                                scope.spawn(move || {
+                                scope.spawn(crate::runtime::serving(move || {
                                     let _mutator = crate::gc::MutatorRegistration::new();
                                     assert!(waiters.wait_inner(generation, None, || {
                                         probes.fetch_add(1, Ordering::SeqCst);
                                     }));
-                                });
+                                }));
                             }
                             if !registered_since(waiters, workers, generation) {
                                 waiters.notify(true);
@@ -346,11 +422,11 @@ mod tests {
                 for _ in 0..workers {
                     let waiters = &waiters;
                     let probes = &probes;
-                    scope.spawn(move || {
+                    scope.spawn(crate::runtime::serving(move || {
                         assert!(waiters.wait_inner(waiters.generation(), None, || {
                             probes.fetch_add(1, Ordering::SeqCst);
                         }));
-                    });
+                    }));
                 }
                 registered(&waiters, workers);
                 // The event wait has no timeout; one registration/probe per
@@ -371,9 +447,9 @@ mod tests {
             std::thread::scope(|scope| {
                 for _ in 0..workers {
                     let waiters = &waiters;
-                    scope.spawn(move || {
+                    scope.spawn(crate::runtime::serving(move || {
                         assert!(waiters.wait(waiters.generation(), Duration::from_secs(5)));
-                    });
+                    }));
                 }
                 registered(&waiters, workers);
                 // Publication changes the generation before taking the list lock.
@@ -395,9 +471,9 @@ mod tests {
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..2)
                 .map(|_| {
-                    scope.spawn(|| {
+                    scope.spawn(crate::runtime::serving(|| {
                         assert!(waiters.wait(waiters.generation(), Duration::from_secs(5)));
-                    })
+                    }))
                 })
                 .collect();
             registered(&waiters, 2);
@@ -456,10 +532,10 @@ mod tests {
             let handles: Vec<_> = (0..workers)
                 .map(|worker| {
                     let waiters = &waiters;
-                    scope.spawn(move || {
+                    scope.spawn(crate::runtime::serving(move || {
                         CURRENT_WORKER.with(|slot| slot.set(worker));
                         waiters.wait(waiters.generation(), Duration::from_secs(30))
-                    })
+                    }))
                 })
                 .collect();
             registered(&waiters, workers);
@@ -508,9 +584,9 @@ mod tests {
     fn sole_local_continuation_does_not_unpark_a_thief() {
         let waiters = IdleWaiters::default();
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            scope.spawn(crate::runtime::serving(|| {
                 waiters.wait(waiters.generation(), Duration::from_secs(5));
-            });
+            }));
             registered(&waiters, 1);
             assert_eq!(waiters.publish(false, false), 0);
             assert!(waiters.list.lock().unwrap().head.is_some());
@@ -526,11 +602,11 @@ mod tests {
                 std::thread::scope(|scope| {
                     for _ in 0..publishers {
                         let waiters = &waiters;
-                        scope.spawn(move || {
+                        scope.spawn(crate::runtime::serving(move || {
                             for _ in 0..publications {
                                 assert_eq!(waiters.publish(false, false), 0);
                             }
-                        });
+                        }));
                     }
                 });
                 assert_eq!(waiters.generation(), 0);
@@ -580,7 +656,7 @@ mod tests {
                     for _ in 0..workers {
                         let waiters = &waiters;
                         let backoffs = &backoffs;
-                        scope.spawn(move || {
+                        scope.spawn(crate::runtime::serving(move || {
                             for _ in 0..retries {
                                 assert!(waiters.wait_with_backoff(
                                     generation,
@@ -590,7 +666,7 @@ mod tests {
                                     },
                                 ));
                             }
-                        });
+                        }));
                     }
                 });
                 assert_eq!(waiters.registered.load(Ordering::SeqCst), 0);
@@ -685,10 +761,10 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::scope(|scope| {
                 let waiters = &waiters;
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     assert!(waiters.wait(waiters.generation(), Duration::from_secs(5)));
                     tx.send(Instant::now()).unwrap();
-                });
+                }));
                 registered(waiters, 1);
                 let start = Instant::now();
                 assert!(waiters.notify(false) <= 1);

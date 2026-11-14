@@ -15,6 +15,7 @@ pub(super) struct AddressIndex {
     free: Vec<usize>,
     root: Option<usize>,
     len: usize,
+    comparisons: crate::observation::Value<std::sync::atomic::AtomicUsize>,
 }
 impl AddressIndex {
     fn allocate(&mut self, node: Node) -> usize {
@@ -45,8 +46,9 @@ impl AddressIndex {
         self.nodes[index].max = self.nodes[right].max;
     }
     fn visit(&self, index: usize) -> Node {
-        #[cfg(test)]
-        COMPARISONS.set(COMPARISONS.get() + 1);
+        self.comparisons.observe(|count| {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
         self.nodes[index]
     }
     fn search_leaf(&self, start: usize) -> Option<usize> {
@@ -213,10 +215,11 @@ impl AddressIndex {
 }
 
 #[cfg(test)]
-thread_local! { static COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-#[cfg(test)]
-pub(super) fn take_comparisons() -> usize {
-    COMPARISONS.replace(0)
+impl AddressIndex {
+    pub(super) fn take_comparisons(&self) -> usize {
+        self.comparisons
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -230,11 +233,11 @@ mod tests {
                 index.insert(1024 + i * 128, i);
             }
             assert_eq!(index.candidate(1023), None);
-            COMPARISONS.set(0);
+            index.take_comparisons();
             for i in 0..count {
                 assert_eq!(index.candidate(1024 + i * 128 + 127), Some(i));
             }
-            let visits = COMPARISONS.get();
+            let visits = index.take_comparisons();
             assert!(visits <= count * (2 * usize::BITS as usize + 1));
             println!(
                 "radix regions={count} queries={count} visits={visits} nodes={} metadata_bytes={}",

@@ -152,13 +152,13 @@ mod tests {
                 let (done_tx, done_rx) = std::sync::mpsc::channel();
                 let worker = {
                     let protocol = protocol.clone();
-                    std::thread::spawn(move || {
+                    std::thread::spawn(crate::runtime::serving(move || {
                         begin_rx.recv().unwrap();
                         let owner = protocol.enter();
                         assert!(!protocol.requested());
                         drop(owner);
                         done_tx.send(()).unwrap();
-                    })
+                    }))
                 };
                 if publication_first {
                     begin_tx.send(()).unwrap();
@@ -306,8 +306,9 @@ mod notification_tests {
         t.wait_for_change(old, Duration::from_secs(10)); // Must not lose prior publication.
         let sample = t.sample();
         let other = t.clone();
-        let waiter =
-            std::thread::spawn(move || other.wait_for_change(sample, Duration::from_secs(10)));
+        let waiter = std::thread::spawn(crate::runtime::serving(move || {
+            other.wait_for_change(sample, Duration::from_secs(10))
+        }));
         let deadline = Instant::now() + Duration::from_secs(2);
         while t.3.load(Ordering::SeqCst) == 0 {
             assert!(Instant::now() < deadline);

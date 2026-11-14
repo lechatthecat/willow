@@ -3,7 +3,9 @@ use crate::gc_telemetry::native_trace;
 
 unsafe fn stopped(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     assert_ne!(
-        GC_MARK_PHASE.load(Ordering::Acquire),
+        crate::runtime::current()
+            .mark_phase()
+            .load(Ordering::Acquire),
         1,
         "legacy callback raced marking"
     );
@@ -24,7 +26,7 @@ unsafe fn slice(
 
 #[test]
 fn native_capability_registration_replacement_and_reset() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     const ID: u32 = 0xFA90;
     assert!(native_trace_modes().is_empty());
@@ -64,7 +66,7 @@ fn native_capability_registration_replacement_and_reset() {
 
 #[test]
 fn native_capability_sliced_graph_deduplicates_and_avoids_stopped_hooks() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1, 16, 257] {
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -108,7 +110,7 @@ fn native_capability_sliced_graph_deduplicates_and_avoids_stopped_hooks() {
 
 #[test]
 fn native_capability_transitive_sliced_types_preserve_reachability() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     for id in [0xFA94, 0xFA95] {
         willow_register_type_capability(
@@ -137,7 +139,7 @@ fn native_capability_transitive_sliced_types_preserve_reachability() {
 
 #[test]
 fn native_capability_telemetry_unwind_and_reset() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let _ = std::panic::catch_unwind(|| {
         let mut counts = native_trace::Counts::default();
@@ -164,7 +166,7 @@ fn native_capability_telemetry_unwind_and_reset() {
 /// Native array scaling never invokes an unrestricted stopped callback.
 #[test]
 fn native_capability_array_remark_measurement() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for size in [4096, 32768, 262144] {
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -188,8 +190,10 @@ fn native_capability_array_remark_measurement() {
     reset_internal_for_test();
 }
 
-static SNAPSHOT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static MUTATION_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SNAPSHOT_READY: crate::runtime::PerRuntime<std::sync::atomic::AtomicBool> =
+    crate::runtime::PerRuntime::new(|| std::sync::atomic::AtomicBool::new(false));
+static MUTATION_DONE: crate::runtime::PerRuntime<std::sync::atomic::AtomicBool> =
+    crate::runtime::PerRuntime::new(|| std::sync::atomic::AtomicBool::new(false));
 
 unsafe fn wait_for_mutation(
     _: *mut u8,
@@ -207,7 +211,7 @@ unsafe fn wait_for_mutation(
 
 #[test]
 fn native_capability_sliced_slot_mutation_during_marking() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     SNAPSHOT_READY.store(false, Ordering::Relaxed);
     MUTATION_DONE.store(false, Ordering::Relaxed);
@@ -235,7 +239,7 @@ fn native_capability_sliced_slot_mutation_during_marking() {
     let worker = {
         let (source, child) = (source as usize, child as usize);
         let (ready, finish) = (ready.clone(), finish.clone());
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let _mutator = MutatorRegistration::new();
             ready.store(true, Ordering::Release);
             while !SNAPSHOT_READY.load(Ordering::Acquire) {
@@ -258,7 +262,7 @@ fn native_capability_sliced_slot_mutation_during_marking() {
                 willow_gc_safepoint();
                 std::thread::yield_now();
             }
-        })
+        }))
     };
     while !ready.load(Ordering::Acquire) {
         std::thread::yield_now();
@@ -281,19 +285,19 @@ fn native_capability_sliced_slot_mutation_during_marking() {
 
 #[test]
 fn native_capability_parallel_telemetry_aggregates_per_type() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for types in [1, 16, 257] {
         reset_internal_for_test();
         std::thread::scope(|scope| {
             for _ in 0..4 {
-                scope.spawn(|| {
+                scope.spawn(crate::runtime::serving(|| {
                     let mut counts = native_trace::Counts::default();
                     for id in 0..types {
                         for _ in 0..8 {
                             counts.deferred(id);
                         }
                     }
-                });
+                }));
             }
         });
         let rows = native_trace::snapshot();
@@ -311,7 +315,7 @@ fn native_capability_parallel_telemetry_aggregates_per_type() {
 #[test]
 fn native_capability_standard_container_inventory_survives_reset() {
     use willow_abi::runtime_type_ids::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for _ in 0..2 {
         reset_internal_for_test();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
@@ -363,12 +367,12 @@ fn native_capability_standard_container_inventory_survives_reset() {
 
 #[test]
 fn native_capability_registration_snapshot_is_coherent() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     const ID: u32 = 0xFA98;
     willow_register_type(ID, stopped);
     std::thread::scope(|scope| {
-        scope.spawn(|| {
+        scope.spawn(crate::runtime::serving(|| {
             for _ in 0..1024 {
                 willow_register_type_capability(
                     ID,
@@ -382,7 +386,7 @@ fn native_capability_registration_snapshot_is_coherent() {
                 );
                 willow_register_type(ID, stopped);
             }
-        });
+        }));
         for _ in 0..1024 {
             let (legacy, traces, slices) = trace_registry_snapshot();
             assert!(legacy.contains(&ID));

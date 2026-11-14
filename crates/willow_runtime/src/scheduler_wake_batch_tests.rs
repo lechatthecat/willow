@@ -71,7 +71,7 @@ fn fixture(size: u64, mixed: bool) -> (ShardedTaskTable, RunQueues) {
                 task.state.finish_terminal();
             }
             4 => {
-                task.state.request_cancel();
+                task.state.request_cancel(&tasks.cancel_epoch);
                 task.state.park_after_poll();
                 assert_eq!(task.state.claim_for_poll(), ClaimOutcome::Cancel);
             }
@@ -157,7 +157,7 @@ fn batch_fanout_counts_and_fifo_scale_and_scratch_is_reused() {
         let capacities = scratch.grouped.capacity();
         println!(
             "ids={size} shard_locks={} queue_batches={}",
-            scratch.shard_locks, scratch.queue_batches
+            *scratch.shard_locks, *scratch.queue_batches
         );
         wake_tasks_outcome_in(&tasks, &queues, &ids, &mut scratch);
         assert!(scratch.enqueued.is_empty());
@@ -176,18 +176,19 @@ fn batch_cancel_race_has_exactly_one_queue_token_and_balanced_blocked_count() {
         let ids = (1..=256).collect::<Vec<_>>();
         let barrier = std::sync::Barrier::new(2);
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            scope.spawn(crate::runtime::serving(|| {
                 barrier.wait();
                 for &id in &ids {
                     tasks.with_mut(id, |task| {
                         let before = task.state.lifecycle();
-                        if task.state.request_cancel() == CancelOutcome::Enqueue {
+                        if task.state.request_cancel(&tasks.cancel_epoch) == CancelOutcome::Enqueue
+                        {
                             queues.push_global(id);
                         }
                         tasks.reconcile_blocked_transition(before, task.state.lifecycle());
                     });
                 }
-            });
+            }));
             barrier.wait();
             wake_tasks_outcome_in(&tasks, &queues, &ids, &mut WakeBatchScratch::default());
         });
@@ -207,12 +208,15 @@ fn batch_cancel_race_has_exactly_one_queue_token_and_balanced_blocked_count() {
 #[test]
 fn batch_keeps_blocked_count_until_queue_publication() {
     let (tasks, queues) = fixture(1, true); // ID 1 is BlockedSyscall.
-    let guard = queues.global_publish_gate.lock().unwrap();
-    queues.pause_global_publish.store(true, Ordering::Release);
+    let guard = queues.observation.global_publish_gate.lock().unwrap();
+    queues
+        .observation
+        .pause_global_publish
+        .store(true, Ordering::Release);
     std::thread::scope(|scope| {
-        let wake = scope.spawn(|| {
+        let wake = scope.spawn(crate::runtime::serving(|| {
             wake_tasks_outcome_in(&tasks, &queues, &[1], &mut WakeBatchScratch::default())
-        });
+        }));
         // Wait for the waker to own the shard: it must retain it while the queue
         // mutex prevents publication. Timeout bounds a failed regression.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -244,13 +248,13 @@ fn overlapping_batches_publish_each_token_once() {
         for reverse in [false, true] {
             let tasks = &tasks;
             let queues = &queues;
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 let mut ids = (1..=4096).collect::<Vec<_>>();
                 if reverse {
                     ids.reverse();
                 }
                 wake_tasks_outcome_in(tasks, queues, &ids, &mut WakeBatchScratch::default());
-            });
+            }));
         }
     });
     let mut seen = std::collections::HashSet::new();
@@ -263,7 +267,7 @@ fn overlapping_batches_publish_each_token_once() {
 
 #[test]
 fn global_batch_publishes_notification_and_ffi_wakes_tasks() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     reset_global_scheduler_for_test();
     let tasks = global_task_table();
     let queues = global_run_queues();

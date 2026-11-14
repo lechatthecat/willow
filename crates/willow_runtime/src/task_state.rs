@@ -48,18 +48,35 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-/// Advances after every cancel request that set a task's request bit. A predicate
-/// `cancel_requested || Cancelling` can only
-/// become true through such a request, so a reader that already looked at a
-/// task's state after observing epoch `E` need not look again until the epoch
-/// moves. Starts at 1 so a zero cache always forces the first look.
-static CANCEL_EPOCH: AtomicU64 = AtomicU64::new(1);
+/// Cancel-request epoch of one runtime's task table.
+///
+/// Advances after every cancel request that set a task's request bit. A
+/// predicate `cancel_requested || Cancelling` can only become true through such
+/// a request, so a reader that already looked at a task's state after
+/// observing epoch `E` need not look again until the epoch moves. Each task
+/// table owns one, so requests in one runtime never force state looks (and
+/// shard locks) in another. Starts at 1 so a zero cache always forces the
+/// first look.
+#[derive(Debug)]
+pub struct CancelEpoch(AtomicU64);
 
-/// The current cancel-request epoch. Acquire pairs with the Release advance
-/// that follows the request CAS, so a state read after this load observes
-/// every request counted in the returned value.
-pub fn cancel_epoch() -> u64 {
-    CANCEL_EPOCH.load(Ordering::Acquire)
+impl CancelEpoch {
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(1))
+    }
+
+    /// Acquire pairs with the Release advance that follows the request CAS,
+    /// so a state read after this load observes every request counted in the
+    /// returned value.
+    pub fn load(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl Default for CancelEpoch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Lifecycle state of a task, as stored in the low bits of the atomic word.
@@ -449,7 +466,7 @@ impl AtomicTaskState {
     /// promptly, so the request also has to return it to `Ready` and hand the
     /// caller the queue push. The blocking-pool job may continue independently;
     /// its eventual completion wake is stale and safely ignored.
-    pub fn request_cancel(&self) -> CancelOutcome {
+    pub fn request_cancel(&self, epoch: &CancelEpoch) -> CancelOutcome {
         let mut word = self.word.load(Ordering::Acquire);
         loop {
             let lifecycle = TaskLifecycle::from_bits(word & STATE_MASK);
@@ -472,7 +489,7 @@ impl AtomicTaskState {
             };
             match self.compare_exchange(word, next, ordering) {
                 Ok(_) => {
-                    CANCEL_EPOCH.fetch_add(1, Ordering::Release);
+                    epoch.0.fetch_add(1, Ordering::Release);
                     return if deferred || already_queued {
                         CancelOutcome::Deferred
                     } else {
@@ -590,27 +607,33 @@ mod tests {
         state
     }
 
-    /// every recorded request advances the cancel epoch
-    /// before its caller returns, so a reader caching "not cancelled" against
-    /// an older epoch looks again. Other tests may advance it concurrently, so
-    /// only strict growth is asserted.
+    /// Every recorded request advances the epoch passed by its table before
+    /// the caller returns, so a reader caching "not cancelled" against an
+    /// older epoch looks again. Another table's epoch never moves.
     #[test]
-    fn recorded_cancel_requests_advance_the_cancel_epoch() {
+    fn recorded_cancel_requests_advance_only_their_table_epoch() {
+        let epoch = CancelEpoch::new();
+        let other = CancelEpoch::new();
         for (state, outcome) in [
             (running(), CancelOutcome::Deferred),
             (parked(), CancelOutcome::Enqueue),
             (blocked(), CancelOutcome::Enqueue),
         ] {
-            let before = cancel_epoch();
-            assert_eq!(state.request_cancel(), outcome);
-            let after = cancel_epoch();
-            assert!(after > before, "{outcome:?} did not advance the epoch");
+            let before = epoch.load();
+            assert_eq!(state.request_cancel(&epoch), outcome);
+            assert_eq!(
+                epoch.load(),
+                before + 1,
+                "{outcome:?} did not advance the epoch"
+            );
             // The predicate that readers cache is now true.
             assert!(state.load().cancel_requested());
-            assert_eq!(state.request_cancel(), CancelOutcome::NoChange);
+            assert_eq!(state.request_cancel(&epoch), CancelOutcome::NoChange);
+            assert_eq!(epoch.load(), before + 1);
         }
-        assert_eq!(terminal().request_cancel(), CancelOutcome::NoChange);
-        assert_ne!(cancel_epoch(), 0, "zero is reserved for 'never looked'");
+        assert_eq!(terminal().request_cancel(&epoch), CancelOutcome::NoChange);
+        assert_eq!(epoch.load(), 4);
+        assert_eq!(other.load(), 1, "zero is reserved for 'never looked'");
     }
 
     #[test]
@@ -676,11 +699,11 @@ mod tests {
             for _ in 0..8 {
                 let state = Arc::clone(&state);
                 let polls = Arc::clone(&polls);
-                handles.push(std::thread::spawn(move || {
+                handles.push(std::thread::spawn(crate::runtime::serving(move || {
                     if state.claim_for_poll() == ClaimOutcome::Poll {
                         polls.fetch_add(1, Ordering::Relaxed);
                     }
-                }));
+                })));
             }
             for handle in handles {
                 handle.join().unwrap();
@@ -704,7 +727,11 @@ mod tests {
     #[test]
     fn s09_cancel_requested_ready_task_claims_into_cancelling() {
         let state = AtomicTaskState::new();
-        assert_eq!(state.request_cancel(), CancelOutcome::Enqueue, "I4");
+        assert_eq!(
+            state.request_cancel(&CancelEpoch::new()),
+            CancelOutcome::Enqueue,
+            "I4"
+        );
         assert_eq!(state.claim_for_poll(), ClaimOutcome::Cancel, "I4");
         assert_eq!(state.lifecycle(), TaskLifecycle::Cancelling);
         assert!(state.lifecycle().owns_frame(), "I6");
@@ -784,11 +811,11 @@ mod tests {
             for _ in 0..8 {
                 let state = Arc::clone(&state);
                 let enqueues = Arc::clone(&enqueues);
-                handles.push(std::thread::spawn(move || {
+                handles.push(std::thread::spawn(crate::runtime::serving(move || {
                     if state.wake() == WakeOutcome::Enqueue {
                         enqueues.fetch_add(1, Ordering::Relaxed);
                     }
-                }));
+                })));
             }
             for handle in handles {
                 handle.join().unwrap();
@@ -804,10 +831,16 @@ mod tests {
     #[test]
     fn s18_cancellation_can_be_requested_from_any_live_state() {
         let ready = AtomicTaskState::new();
-        assert_eq!(ready.request_cancel(), CancelOutcome::Enqueue);
+        assert_eq!(
+            ready.request_cancel(&CancelEpoch::new()),
+            CancelOutcome::Enqueue
+        );
 
         let running = running();
-        assert_eq!(running.request_cancel(), CancelOutcome::Deferred);
+        assert_eq!(
+            running.request_cancel(&CancelEpoch::new()),
+            CancelOutcome::Deferred
+        );
         assert_eq!(
             running.lifecycle(),
             TaskLifecycle::Running,
@@ -815,19 +848,36 @@ mod tests {
         );
 
         let parked = parked();
-        assert_eq!(parked.request_cancel(), CancelOutcome::Enqueue);
+        assert_eq!(
+            parked.request_cancel(&CancelEpoch::new()),
+            CancelOutcome::Enqueue
+        );
 
         let blocked = blocked();
-        assert_eq!(blocked.request_cancel(), CancelOutcome::Enqueue);
+        assert_eq!(
+            blocked.request_cancel(&CancelEpoch::new()),
+            CancelOutcome::Enqueue
+        );
     }
 
     #[test]
     fn s19_s20_duplicate_and_terminal_cancel_requests_change_nothing() {
         let state = AtomicTaskState::new();
-        assert_eq!(state.request_cancel(), CancelOutcome::Enqueue);
-        assert_eq!(state.request_cancel(), CancelOutcome::NoChange, "S19");
+        assert_eq!(
+            state.request_cancel(&CancelEpoch::new()),
+            CancelOutcome::Enqueue
+        );
+        assert_eq!(
+            state.request_cancel(&CancelEpoch::new()),
+            CancelOutcome::NoChange,
+            "S19"
+        );
 
-        assert_eq!(terminal().request_cancel(), CancelOutcome::NoChange, "S20");
+        assert_eq!(
+            terminal().request_cancel(&CancelEpoch::new()),
+            CancelOutcome::NoChange,
+            "S20"
+        );
     }
 
     #[test]
@@ -839,11 +889,11 @@ mod tests {
             for _ in 0..8 {
                 let state = Arc::clone(&state);
                 let finishers = Arc::clone(&finishers);
-                handles.push(std::thread::spawn(move || {
+                handles.push(std::thread::spawn(crate::runtime::serving(move || {
                     if state.finish_terminal() {
                         finishers.fetch_add(1, Ordering::Relaxed);
                     }
-                }));
+                })));
             }
             for handle in handles {
                 handle.join().unwrap();
@@ -870,12 +920,12 @@ mod tests {
                 let state = Arc::clone(&state);
                 let popped = Arc::clone(&popped);
                 let wake_done = Arc::clone(&wake_done);
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     popped.wait();
                     let outcome = state.wake();
                     wake_done.wait();
                     outcome
-                })
+                }))
             };
 
             popped.wait();
@@ -926,7 +976,7 @@ mod tests {
     fn s25_cancelling_a_parked_task_makes_it_runnable_again() {
         let state = parked();
         assert_eq!(
-            state.request_cancel(),
+            state.request_cancel(&CancelEpoch::new()),
             CancelOutcome::Enqueue,
             "S25: nothing else would ever schedule this task again"
         );
@@ -940,7 +990,10 @@ mod tests {
     #[test]
     fn s26_cancelling_a_running_task_requeues_it_at_its_poll_boundary() {
         let state = running();
-        assert_eq!(state.request_cancel(), CancelOutcome::Deferred);
+        assert_eq!(
+            state.request_cancel(&CancelEpoch::new()),
+            CancelOutcome::Deferred
+        );
         assert_eq!(
             state.park_after_poll(),
             BoundaryOutcome::Requeue,
@@ -956,7 +1009,7 @@ mod tests {
     fn s27_cancelling_a_blocked_task_makes_it_runnable_immediately() {
         let state = blocked();
         assert_eq!(
-            state.request_cancel(),
+            state.request_cancel(&CancelEpoch::new()),
             CancelOutcome::Enqueue,
             "S27: cancellation must not wait for the syscall to complete"
         );
@@ -983,7 +1036,10 @@ mod tests {
     #[test]
     fn s29_block_on_syscall_refuses_to_block_after_a_cancel() {
         let state = running();
-        assert_eq!(state.request_cancel(), CancelOutcome::Deferred);
+        assert_eq!(
+            state.request_cancel(&CancelEpoch::new()),
+            CancelOutcome::Deferred
+        );
         assert_eq!(state.block_on_syscall(), BoundaryOutcome::Requeue, "S29");
         assert_eq!(state.lifecycle(), TaskLifecycle::Ready);
         assert_eq!(state.claim_for_poll(), ClaimOutcome::Cancel);
@@ -1011,7 +1067,7 @@ mod tests {
     #[test]
     fn s31_a_cancelling_task_resumes_cleanup_after_it_suspends() {
         let state = AtomicTaskState::new();
-        state.request_cancel();
+        state.request_cancel(&CancelEpoch::new());
         assert_eq!(state.claim_for_poll(), ClaimOutcome::Cancel);
 
         // A cleanup that itself has to wait parks like any other poll, and the
@@ -1027,7 +1083,7 @@ mod tests {
     #[test]
     fn s32_the_claim_consumes_the_cancel_request() {
         let state = AtomicTaskState::new();
-        state.request_cancel();
+        state.request_cancel(&CancelEpoch::new());
         assert_eq!(state.claim_for_poll(), ClaimOutcome::Cancel);
         assert!(
             !state.load().cancel_requested(),
@@ -1046,20 +1102,20 @@ mod tests {
             let canceller = {
                 let state = Arc::clone(&state);
                 let pushes = Arc::clone(&pushes);
-                std::thread::spawn(move || {
-                    if state.request_cancel() == CancelOutcome::Enqueue {
+                std::thread::spawn(crate::runtime::serving(move || {
+                    if state.request_cancel(&CancelEpoch::new()) == CancelOutcome::Enqueue {
                         pushes.fetch_add(1, Ordering::Relaxed);
                     }
-                })
+                }))
             };
             let parker = {
                 let state = Arc::clone(&state);
                 let pushes = Arc::clone(&pushes);
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     if state.park_after_poll() == BoundaryOutcome::Requeue {
                         pushes.fetch_add(1, Ordering::Relaxed);
                     }
-                })
+                }))
             };
             canceller.join().unwrap();
             parker.join().unwrap();
@@ -1088,20 +1144,20 @@ mod tests {
             let waker = {
                 let state = Arc::clone(&state);
                 let pushes = Arc::clone(&pushes);
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     if state.wake() == WakeOutcome::Enqueue {
                         pushes.fetch_add(1, Ordering::Relaxed);
                     }
-                })
+                }))
             };
             let blocker = {
                 let state = Arc::clone(&state);
                 let pushes = Arc::clone(&pushes);
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     if state.block_on_syscall() == BoundaryOutcome::Requeue {
                         pushes.fetch_add(1, Ordering::Relaxed);
                     }
-                })
+                }))
             };
             waker.join().unwrap();
             blocker.join().unwrap();
@@ -1133,20 +1189,20 @@ mod tests {
             let canceller = {
                 let state = Arc::clone(&state);
                 let pushes = Arc::clone(&pushes);
-                std::thread::spawn(move || {
-                    if state.request_cancel() == CancelOutcome::Enqueue {
+                std::thread::spawn(crate::runtime::serving(move || {
+                    if state.request_cancel(&CancelEpoch::new()) == CancelOutcome::Enqueue {
                         pushes.fetch_add(1, Ordering::Relaxed);
                     }
-                })
+                }))
             };
             let completer = {
                 let state = Arc::clone(&state);
                 let pushes = Arc::clone(&pushes);
-                std::thread::spawn(move || {
+                std::thread::spawn(crate::runtime::serving(move || {
                     if state.wake() == WakeOutcome::Enqueue {
                         pushes.fetch_add(1, Ordering::Relaxed);
                     }
-                })
+                }))
             };
             canceller.join().unwrap();
             completer.join().unwrap();

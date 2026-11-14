@@ -12,10 +12,11 @@
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
 pub mod collector_profile;
+pub(crate) mod cpu_observation;
 pub mod failure_record;
 pub mod footprint;
 pub mod measurement;
@@ -311,7 +312,7 @@ pub(crate) struct MarkWork {
 }
 
 pub(crate) fn profiling() -> bool {
-    crate::diagnostic_settings::GC_PROFILE.os
+    crate::runtime::current().diagnostics.gc_profile.os
 }
 
 impl MarkWork {
@@ -357,10 +358,58 @@ struct GcTelemetry {
     stats: WillowGcStatsV1,
     minor_cpu_ns: u64,
 }
-static TELEMETRY: LazyLock<Mutex<GcTelemetry>> =
-    LazyLock::new(|| Mutex::new(GcTelemetry::default()));
+/// Aggregate lifetime follows the runtime; active cycles borrow their original
+/// owner so completion and abort cannot select another aggregate.
+pub(crate) struct Telemetry {
+    trace: OnceLock<Option<Mutex<TraceSink>>>,
+    trace_errors: AtomicU64,
+    #[cfg(feature = "gc-acceptance-faults")]
+    external_observation_consumer: std::sync::atomic::AtomicBool,
+    pub(crate) observations: observations::Observations,
+    pub(crate) pause: pause::PauseTelemetry,
+    pub(crate) stops: stops::Stops,
+    pub(crate) collector_profile: collector_profile::CollectorProfile,
+    pub(crate) footprint: footprint::Counters,
+    pub(crate) sweep: sweep::SweepTelemetry,
+    pub(crate) workers: std::sync::LazyLock<std::sync::Arc<workers::WorkerTelemetry>>,
+    pub(crate) native_trace: native_trace::NativeTrace,
+    pub(crate) measurements: std::sync::LazyLock<std::sync::Arc<measurement::Measurements>>,
+    pub(crate) milestones: milestones::Milestones,
+    pub(crate) pacing: pacing::Pacing,
+    pub(crate) completed_cpu: cpu_observation::RuntimeCpuObservation,
+    state: LazyLock<Mutex<GcTelemetry>>,
+}
+impl Telemetry {
+    pub(crate) const fn new() -> Self {
+        Self {
+            trace: OnceLock::new(),
+            trace_errors: AtomicU64::new(0),
+            #[cfg(feature = "gc-acceptance-faults")]
+            external_observation_consumer: std::sync::atomic::AtomicBool::new(false),
+            state: LazyLock::new(|| Mutex::new(GcTelemetry::default())),
+            observations: observations::Observations::new(),
+            pause: pause::PauseTelemetry::new(),
+            stops: stops::Stops::new(),
+            collector_profile: collector_profile::CollectorProfile::new(),
+            footprint: footprint::Counters::new(),
+            sweep: sweep::SweepTelemetry::new(),
+            workers: std::sync::LazyLock::new(|| {
+                std::sync::Arc::new(workers::WorkerTelemetry::new())
+            }),
+            native_trace: native_trace::NativeTrace::new(),
+            measurements: std::sync::LazyLock::new(|| {
+                std::sync::Arc::new(measurement::Measurements::new())
+            }),
+            pacing: pacing::Pacing::new(),
+            milestones: milestones::Milestones::new(),
+            completed_cpu: cpu_observation::RuntimeCpuObservation::new(),
+        }
+    }
+}
+fn telemetry() -> &'static Telemetry {
+    &crate::runtime::current().telemetry
+}
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-static TRACE_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn timestamp_ns() -> u64 {
     elapsed_ns(*START)
@@ -369,7 +418,8 @@ pub(crate) fn elapsed_ns(start: Instant) -> u64 {
     start.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
-pub(crate) struct Cycle {
+pub(crate) struct Cycle<'a> {
+    owner: &'a Telemetry,
     kind: CycleKind,
     epoch: u64,
     start_ns: u64,
@@ -378,51 +428,49 @@ pub(crate) struct Cycle {
     cpu_start: Option<u64>,
     minor_cpu_before: u64,
     previous_epoch: u64,
-    _interval: observations::Span,
+    _interval: observations::Span<'a>,
 }
 
-impl Drop for Cycle {
+impl Drop for Cycle<'_> {
     fn drop(&mut self) {
-        observations::epoch(self.previous_epoch);
+        self.owner.observations.epoch(self.previous_epoch);
         if !self.completed {
             self._interval.abort();
             // An aborted collection has no completed work to publish. Keep its
             // epoch consumed while allowing the next elected collector to start.
-            let mut telemetry = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner());
+            let mut telemetry = self.owner.state.lock().unwrap_or_else(|p| p.into_inner());
             telemetry.stats.phase = self.previous_phase;
-            pacing::abort(self.start_ns, timestamp_ns(), self.previous_phase != 0);
-            milestones::abort(self.epoch);
+            self.owner
+                .pacing
+                .abort(self.start_ns, timestamp_ns(), self.previous_phase != 0);
+            self.owner.milestones.abort(self.epoch);
         }
     }
 }
 
-#[cfg(test)]
-std::thread_local! {
-    static COMPLETED_CPU_FOR_TEST: std::cell::Cell<Option<Option<u64>>> = const { std::cell::Cell::new(None) };
-}
-
-/// Replace only the measured CPU value, preserving the real collection,
-/// completion publication and policy-decision call path. Thread-local and scoped.
+/// Replace only the measured CPU input in this runtime's current-thread scope.
 #[cfg(test)]
 pub(crate) fn with_completed_cpu_for_test<T>(cpu: Option<u64>, run: impl FnOnce() -> T) -> T {
-    struct Restore(Option<Option<u64>>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            COMPLETED_CPU_FOR_TEST.set(self.0);
-        }
-    }
-    let _restore = Restore(COMPLETED_CPU_FOR_TEST.replace(Some(cpu)));
-    run()
+    crate::runtime::current()
+        .telemetry
+        .completed_cpu
+        .with_override(cpu, run)
 }
 
-impl Cycle {
+impl Cycle<'static> {
     /// Called only by the elected collector, before requesting safepoints.
     pub(crate) fn begin(kind: CycleKind) -> Self {
+        Self::begin_in(telemetry(), kind)
+    }
+}
+
+impl<'a> Cycle<'a> {
+    pub(crate) fn begin_in(owner: &'a Telemetry, kind: CycleKind) -> Self {
         let start_ns = timestamp_ns();
-        let mut telemetry = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner());
+        let mut telemetry = owner.state.lock().unwrap_or_else(|p| p.into_inner());
         let minor_cpu_before = telemetry.minor_cpu_ns;
         if kind == CycleKind::Major {
-            pacing::begin_major(start_ns);
+            owner.pacing.begin_major(start_ns);
         }
         let stats = &mut telemetry.stats;
         let previous_phase = stats.phase;
@@ -435,9 +483,10 @@ impl Cycle {
             .checked_add(1)
             .expect("GC cycle identity exhausted");
         stats.phase = kind as u32;
-        milestones::begin(stats.epoch);
-        let previous_epoch = observations::epoch(stats.epoch);
+        owner.milestones.begin(stats.epoch);
+        let previous_epoch = owner.observations.epoch(stats.epoch);
         Self {
+            owner,
             kind,
             epoch: stats.epoch,
             start_ns,
@@ -446,7 +495,7 @@ impl Cycle {
             cpu_start: workers::thread_cpu_ns(),
             minor_cpu_before,
             previous_epoch,
-            _interval: observations::Span::new(observations::Kind::Cycle),
+            _interval: observations::Span::new_in(&owner.observations, observations::Kind::Cycle),
         }
     }
     /// Called after resuming mutators; returns the trace record for publication
@@ -504,7 +553,7 @@ impl Cycle {
             .cpu_start
             .and_then(|start| workers::thread_cpu_ns()?.checked_sub(start));
         let cpu = {
-            let mut telemetry = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner());
+            let mut telemetry = self.owner.state.lock().unwrap_or_else(|p| p.into_inner());
             let cpu = cpu.map(|cpu| {
                 if self.kind == CycleKind::Minor {
                     telemetry.minor_cpu_ns = telemetry.minor_cpu_ns.saturating_add(cpu);
@@ -525,11 +574,13 @@ impl Cycle {
             telemetry.stats.phase = self.previous_phase;
             cpu
         };
-        #[cfg(test)]
-        let cpu = COMPLETED_CPU_FOR_TEST.get().unwrap_or(cpu);
-        pacing::cycle(self.start_ns, end_ns, cpu, self.previous_phase != 0);
+        use cpu_observation::{CpuObservation, RuntimeCpuObservation};
+        let cpu = RuntimeCpuObservation::completed(|| &self.owner.completed_cpu, cpu);
+        self.owner
+            .pacing
+            .cycle(self.start_ns, end_ns, cpu, self.previous_phase != 0);
         if profiling()
-            && let Some(trace) = TRACE.as_ref()
+            && let Some(trace) = self.owner.trace().as_ref()
         {
             let mut trace = trace.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(writer) = trace.writer.as_mut() {
@@ -546,14 +597,18 @@ impl Cycle {
                     cpu.map_or_else(|| "null".to_string(), |cpu| cpu.to_string())
                 );
                 if result.is_err() {
-                    trace_error();
+                    self.owner.trace_error();
                     trace.writer = None;
                 }
             }
         }
-        milestones::finished(self.epoch, self.previous_phase != 0);
+        self.owner
+            .milestones
+            .finished(self.epoch, self.previous_phase != 0);
         self.completed = true;
-        measurement::completed(work, cycle.reclaimed_bytes);
+        self.owner
+            .measurements
+            .completed(work, cycle.reclaimed_bytes);
         cycle
     }
 }
@@ -582,7 +637,11 @@ impl GcTelemetry {
 /// Cycle group only: safe while the caller already owns the heap mutex.
 /// Reuses V1's measurement units without recursively sampling the heap.
 pub(crate) fn pacing_cycle_snapshot() -> WillowGcStatsV1 {
-    TELEMETRY.lock().unwrap_or_else(|p| p.into_inner()).stats
+    pacing_cycle_snapshot_in(telemetry())
+}
+
+pub(crate) fn pacing_cycle_snapshot_in(owner: &Telemetry) -> WillowGcStatsV1 {
+    owner.state.lock().unwrap_or_else(|p| p.into_inner()).stats
 }
 
 /// Snapshot without RSS sampling, suitable for control loops and frequent polls.
@@ -590,13 +649,17 @@ pub(crate) fn pacing_cycle_snapshot() -> WillowGcStatsV1 {
 /// can complete between those groups. Within each group the fields agree.
 pub fn snapshot() -> WillowGcStatsV1 {
     let (counters, heap) = crate::gc::telemetry_heap_snapshot();
-    let mut stats = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner()).stats;
+    let mut stats = telemetry()
+        .state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .stats;
     stats.version = GC_STATS_VERSION;
     stats.struct_size = std::mem::size_of::<WillowGcStatsV1>() as u32;
     stats.timestamp_ns = timestamp_ns();
     stats.counters = counters;
     stats.heap = heap;
-    stats.trace_errors = TRACE_ERRORS.load(Ordering::Relaxed);
+    stats.trace_errors = telemetry().trace_errors.load(Ordering::Relaxed);
     stats
 }
 
@@ -713,7 +776,7 @@ struct TraceSink {
     writer: Option<Box<dyn Write + Send>>,
 }
 impl TraceSink {
-    fn from_env() -> Self {
+    fn from_env(owner: &Telemetry) -> Self {
         let Some(path) = crate::diagnostic_settings::gc_trace_path() else {
             return Self { writer: None };
         };
@@ -731,43 +794,44 @@ impl TraceSink {
                 writer: Some(Box::new(io::BufWriter::new(file))),
             },
             Err(_) => {
-                trace_error();
+                owner.trace_error();
                 Self { writer: None }
             }
         }
     }
-    fn cycle(&mut self, c: GcCycleV1) {
+    fn cycle(&mut self, c: GcCycleV1, runtime: &crate::runtime::Runtime) {
+        let owner = &runtime.telemetry;
         if let Some(writer) = self.writer.as_mut()
             && write_cycle(writer, c)
                 .and_then(|()| {
-                    if !*TRACE_MILESTONES {
+                    if !runtime.diagnostics.trace_milestones() {
                         return Ok(());
                     }
-                    if let Some(record) = milestones::record(c.epoch) {
+                    if let Some(record) = owner.milestones.record(c.epoch) {
                         write_milestones(writer, record)?;
                     } else {
                         if c.epoch != 0 {
-                            trace_error(); // Bounded history expired before trace publication.
+                            owner.trace_error(); // Bounded history expired before trace publication.
                         }
                     }
-                    write_verification(writer, c.epoch)
+                    write_verification(writer, c.epoch, runtime)
                 })
                 .and_then(|()| writer.flush())
                 .is_err()
         {
-            trace_error();
+            owner.trace_error();
             // A broken sink must not repeatedly penalize collection.
             self.writer = None;
         }
     }
-    fn stops(&mut self, events: &[stops::StopEventV2]) {
+    fn stops(&mut self, events: &[stops::StopEventV2], owner: &Telemetry) {
         if let Some(writer) = self.writer.as_mut()
             && events
                 .iter()
                 .try_for_each(|event| write_stop(writer, event))
                 .is_err()
         {
-            trace_error();
+            owner.trace_error();
             self.writer = None;
         }
     }
@@ -790,10 +854,18 @@ fn write_milestones(writer: &mut dyn Write, record: milestones::CycleMilestones)
     Ok(())
 }
 
-fn write_verification(writer: &mut dyn Write, event_epoch: u64) -> io::Result<()> {
-    let (counts, deletions, valid) = crate::gc::barrier_variant_counts();
-    let stats = measurement::snapshot();
-    let telemetry = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner());
+fn write_verification(
+    writer: &mut dyn Write,
+    event_epoch: u64,
+    runtime: &crate::runtime::Runtime,
+) -> io::Result<()> {
+    let (counts, deletions, valid) = runtime.barrier_counts.variant_counts(&runtime.diagnostics);
+    let stats = runtime.telemetry.measurements.snapshot();
+    let telemetry = runtime
+        .telemetry
+        .state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let (counter_epoch, generation) = (telemetry.stats.epoch, telemetry.stats.reset_generation);
     drop(telemetry);
     writeln!(
@@ -834,12 +906,23 @@ fn write_stop(writer: &mut dyn Write, e: &stops::StopEventV2) -> io::Result<()> 
 }
 /// Non-allocating error sample for consumers after their final trace flush.
 pub fn trace_errors() -> u64 {
-    TRACE_ERRORS.load(Ordering::Relaxed)
+    telemetry().trace_errors.load(Ordering::Relaxed)
 }
-fn trace_error() {
-    let _ = TRACE_ERRORS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-        Some(n.saturating_add(1))
-    });
+impl Telemetry {
+    fn trace_error(&self) {
+        let _ = self
+            .trace_errors
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(1))
+            });
+    }
+    fn trace(&self) -> &Option<Mutex<TraceSink>> {
+        self.trace.get_or_init(|| {
+            let sink = TraceSink::from_env(self);
+            sink.writer.as_ref()?;
+            Some(Mutex::new(sink))
+        })
+    }
 }
 fn write_cycle(writer: &mut dyn Write, c: GcCycleV1) -> io::Result<()> {
     // Emit the pair together after world resumption. Times describe the event,
@@ -864,70 +947,71 @@ fn write_cycle(writer: &mut dyn Write, c: GcCycleV1) -> io::Result<()> {
         c.reclaimed_bytes
     )
 }
-static TRACE: LazyLock<Option<Mutex<TraceSink>>> = LazyLock::new(|| {
-    let sink = TraceSink::from_env();
-    sink.writer.as_ref()?;
-    Some(Mutex::new(sink))
-});
 #[cfg(test)]
 use crate::diagnostic_settings::bounded_capacity;
-use crate::diagnostic_settings::{TRACE_MILESTONES, TRACE_OBSERVATIONS, TRACE_STOPS};
 
 /// Whether a V4 sink exists to drain per-event observation history.
 fn observation_history() -> bool {
-    *TRACE_OBSERVATIONS && TRACE.is_some()
+    crate::runtime::current().diagnostics.trace_observations() && telemetry().trace().is_some()
 }
-#[cfg(feature = "gc-acceptance-faults")]
-static ACCEPTANCE_EXTERNAL_CONSUMER: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 /// The acceptance observer takes responsibility for all V4 drains while enabled.
 /// Enable before starting its thread; disable only after joining and flushing it.
 /// Endpoints still reconcile the full sequence and reject any missing records.
 #[cfg(feature = "gc-acceptance-faults")]
 pub fn acceptance_external_observation_consumer(enabled: bool) {
-    ACCEPTANCE_EXTERNAL_CONSUMER.store(enabled, Ordering::Release);
+    telemetry()
+        .external_observation_consumer
+        .store(enabled, Ordering::Release);
 }
 /// Flush V4 observations after releasing GC locks. Collections flush per cycle;
 /// runtime exit flushes the final checkpoint, including for workloads that
 /// perform no collection. Broken sinks remain nonfatal.
 pub fn flush_observations() {
+    flush_observations_in(crate::runtime::current());
+}
+fn flush_observations_in(runtime: &crate::runtime::Runtime) {
+    let owner = &runtime.telemetry;
     #[cfg(feature = "gc-acceptance-faults")]
-    if ACCEPTANCE_EXTERNAL_CONSUMER.load(Ordering::Acquire) {
+    if owner.external_observation_consumer.load(Ordering::Acquire) {
         return;
     }
-    if !observations::enabled() || !*TRACE_OBSERVATIONS {
+    if !runtime.diagnostics.gc_observations() || !runtime.diagnostics.trace_observations() {
         return;
     }
     // Serialize drain with output so concurrent flushes cannot reorder batches.
-    if let Some(sink) = &*TRACE {
+    if let Some(sink) = owner.trace() {
         let mut sink = sink.lock().unwrap_or_else(|p| p.into_inner());
-        let (events, stats) = observations::take_events();
+        let (events, stats) = owner.observations.take_events();
         if let Some(writer) = sink.writer.as_mut()
             && observations::write(writer, &events, stats)
                 .and_then(|()| writer.flush())
                 .is_err()
         {
-            trace_error();
+            owner.trace_error();
             sink.writer = None;
         }
     }
 }
 pub(crate) fn emit_cycle(cycle: GcCycleV1) {
-    flush_observations();
+    emit_cycle_in(crate::runtime::current(), cycle);
+}
+pub(crate) fn emit_cycle_in(runtime: &crate::runtime::Runtime, cycle: GcCycleV1) {
+    let owner = &runtime.telemetry;
+    flush_observations_in(runtime);
     // Always drain: disabled tracing must neither retain an unbounded history
     // nor report artificial event loss after 64 successful stops.
-    let events = if TRACE.is_some() && *TRACE_STOPS {
-        stops::take_events()
+    let events = if owner.trace().is_some() && runtime.diagnostics.trace_stops() {
+        owner.stops.take_events()
     } else {
-        stops::discard_events();
+        owner.stops.discard_events();
         Vec::new()
     };
-    if let Some(sink) = &*TRACE {
+    if let Some(sink) = owner.trace() {
         let mut sink = sink.lock().unwrap_or_else(|p| p.into_inner());
-        if *TRACE_STOPS {
-            sink.stops(&events);
+        if runtime.diagnostics.trace_stops() {
+            sink.stops(&events, owner);
         }
-        sink.cycle(cycle);
+        sink.cycle(cycle, runtime);
     }
 }
 
@@ -1065,7 +1149,7 @@ pub fn peak_resident_bytes() -> Option<u64> {
 }
 
 pub(crate) fn reset_for_test() {
-    let mut telemetry = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner());
+    let mut telemetry = telemetry().state.lock().unwrap_or_else(|p| p.into_inner());
     let epoch = telemetry.stats.epoch;
     let generation = telemetry.stats.reset_generation.saturating_add(1);
     *telemetry = GcTelemetry::default();
@@ -1119,7 +1203,7 @@ pub fn native_memory_snapshot() -> NativeMemorySnapshot {
 
 /// Bounded panic-path sample; never block while a collector owns telemetry.
 pub(crate) fn diagnostic_cycle() -> Option<WillowGcStatsV1> {
-    Some(TELEMETRY.try_lock().ok()?.stats)
+    Some(telemetry().state.try_lock().ok()?.stats)
 }
 
 #[cfg(test)]

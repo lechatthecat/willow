@@ -25,7 +25,7 @@ pub struct GcProgressV1 {
     pub successful_collections: u64,
 }
 
-struct Progress {
+pub(super) struct Progress {
     last_success_ns: u64,
     allocated_at_success: u64,
     skip_started: Option<u64>,
@@ -43,11 +43,10 @@ impl Default for Progress {
         }
     }
 }
-static PROGRESS: LazyLock<Mutex<Progress>> = LazyLock::new(|| Mutex::new(Progress::default()));
 
-pub(super) fn record_skip(reason: GcSkipReason) {
-    let mut progress = PROGRESS.lock().unwrap();
-    runtime()
+pub(super) fn record_skip(owner: &GcRuntime, reason: GcSkipReason) {
+    let mut progress = owner.progress.lock().unwrap();
+    owner
         .skipped_foreign_owner_collections
         .fetch_add(1, Ordering::Relaxed);
     progress
@@ -57,8 +56,8 @@ pub(super) fn record_skip(reason: GcSkipReason) {
 }
 
 // Caller has synchronized allocation accounting under heap. No scans added.
-pub(super) fn record_success(allocated: u64) {
-    let mut progress = PROGRESS.lock().unwrap();
+pub(super) fn record_success(owner: &GcRuntime, allocated: u64) {
+    let mut progress = owner.progress.lock().unwrap();
     progress.last_success_ns = crate::gc_telemetry::timestamp_ns();
     progress.allocated_at_success = allocated;
     progress.skip_started = None;
@@ -68,12 +67,13 @@ pub(super) fn record_success(allocated: u64) {
 /// Coherent snapshot. Allocation accounting merges TLAB deltas once; this
 /// diagnostic is O(TLAB records + old allocation buffers), never on the allocation hot path.
 pub fn gc_progress() -> GcProgressV1 {
-    let mut heap = runtime().heap.lock().unwrap();
+    let owner = runtime();
+    let mut heap = owner.heap.lock().unwrap();
     sync_tlab_bytes(&mut heap);
-    let progress = PROGRESS.lock().unwrap();
+    let progress = owner.progress.lock().unwrap();
     let now = crate::gc_telemetry::timestamp_ns();
     GcProgressV1 {
-        skipped_collections: runtime()
+        skipped_collections: owner
             .skipped_foreign_owner_collections
             .load(Ordering::Relaxed),
         last_skip_reason: progress.last_reason as u64,
@@ -103,12 +103,8 @@ pub unsafe extern "C" fn willow_gc_progress_v1(output: *mut GcProgressV1) -> boo
     true
 }
 
-pub(super) fn reset() {
-    *PROGRESS.lock().unwrap() = Progress::default();
-}
-
-pub(super) fn initialize() {
-    LazyLock::force(&PROGRESS);
+pub(super) fn reset(owner: &GcRuntime) {
+    *owner.progress.lock().unwrap() = Progress::default();
 }
 
 #[cfg(test)]
@@ -117,10 +113,41 @@ mod tests {
 
     #[test]
     fn foreign_owner_progress_epoch_precedes_first_query() {
-        let _guard = runtime_test_guard();
-        let _ = runtime();
+        let owner = GcRuntime::default();
         let before_query = crate::gc_telemetry::timestamp_ns();
-        // Reading the lazy state here must not initialize it after this mark.
-        assert!(PROGRESS.lock().unwrap().last_success_ns <= before_query);
+        assert!(owner.progress.lock().unwrap().last_success_ns <= before_query);
+    }
+
+    #[test]
+    fn private_collectors_keep_progress_and_reset_independent() {
+        let first = GcRuntime::default();
+        let second = GcRuntime::default();
+        std::thread::scope(|scope| {
+            for (owner, count) in [(&first, 64), (&second, 192)] {
+                scope.spawn(crate::runtime::serving(move || {
+                    for allocated in 1..=count {
+                        record_skip(owner, GcSkipReason::ForeignOwner);
+                        record_success(owner, allocated);
+                    }
+                    record_skip(owner, GcSkipReason::ForeignOwnerAtHandshake);
+                }));
+            }
+        });
+        for (owner, count) in [(&first, 64), (&second, 192)] {
+            let progress = owner.progress.lock().unwrap();
+            assert_eq!(progress.successes, count);
+            assert_eq!(progress.allocated_at_success, count);
+            assert!(progress.skip_started.is_some());
+            assert_eq!(progress.last_reason, GcSkipReason::ForeignOwnerAtHandshake);
+            assert_eq!(
+                owner
+                    .skipped_foreign_owner_collections
+                    .load(Ordering::Relaxed),
+                count + 1
+            );
+        }
+        reset(&first);
+        assert_eq!(first.progress.lock().unwrap().successes, 0);
+        assert_eq!(second.progress.lock().unwrap().successes, 192);
     }
 }

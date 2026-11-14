@@ -43,7 +43,7 @@
 use crate::wait_queue::WaitQueue;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, LazyLock, Mutex};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 pub(crate) type BlockingWork = Box<dyn FnOnce() + Send + 'static>;
 
@@ -108,9 +108,17 @@ fn env_count(name: &str) -> Option<usize> {
 
 // A caller-side FFI catch cannot observe a detached thread's panic. Cover
 // initialization, dequeue/wakeup, job execution and accounting on this thread.
-fn blocking_worker_entry(pool: &'static LazyLock<BlockingPool>, initialize: fn()) {
+fn blocking_worker_entry(
+    owner: &'static crate::runtime::Runtime,
+    kind: PoolKind,
+    initialize: fn(),
+) {
     crate::failure::ffi_boundary("blocking worker", || {
+        // Completions wake tasks of the runtime that owns this pool.
+        owner.select_for_thread();
         initialize();
+        // The creating thread publishes the pool after starting its workers.
+        let pool = kind.slot(owner).wait();
         loop {
             let (work, freed_slot_for) = pool.dequeue();
             // Waking takes scheduler locks and can trigger GC: keep it inside
@@ -127,18 +135,29 @@ fn blocking_worker_entry(pool: &'static LazyLock<BlockingPool>, initialize: fn()
 }
 
 impl BlockingPool {
-    fn new() -> Self {
-        let threads = env_count("WILLOW_BLOCKING_THREADS").unwrap_or(DEFAULT_BLOCKING_THREADS);
-        let capacity = env_count("WILLOW_BLOCKING_QUEUE")
-            .unwrap_or_else(|| threads.saturating_mul(DEFAULT_BLOCKING_QUEUE_PER_THREAD));
-        Self::with_workers(threads, capacity, "willow-blocking", &BLOCKING_POOL)
+    fn new(owner: &'static crate::runtime::Runtime, kind: PoolKind) -> Self {
+        match kind {
+            PoolKind::General => {
+                let threads =
+                    env_count("WILLOW_BLOCKING_THREADS").unwrap_or(DEFAULT_BLOCKING_THREADS);
+                let capacity = env_count("WILLOW_BLOCKING_QUEUE")
+                    .unwrap_or_else(|| threads.saturating_mul(DEFAULT_BLOCKING_QUEUE_PER_THREAD));
+                Self::with_workers(threads, capacity, "willow-blocking", owner, kind)
+            }
+            // Stdout can wait indefinitely for a consumer. It must not occupy
+            // any of the general pool's workers. One writer and one queued job
+            // suffice because stdout itself is serialized; excess writers
+            // retain their jobs on their tasks.
+            PoolKind::Stdout => Self::with_workers(1, 1, "willow-stdout", owner, kind),
+        }
     }
 
     fn with_workers(
         threads: usize,
         capacity: usize,
         name: &str,
-        owner: &'static LazyLock<BlockingPool>,
+        owner: &'static crate::runtime::Runtime,
+        kind: PoolKind,
     ) -> Self {
         let pool = Self {
             state: Mutex::new(PoolState {
@@ -154,7 +173,11 @@ impl BlockingPool {
             std::thread::Builder::new()
                 .name(format!("{name}-{index}"))
                 .spawn(move || {
-                    blocking_worker_entry(owner, crate::stack_overflow::protect_current_thread)
+                    blocking_worker_entry(
+                        owner,
+                        kind,
+                        crate::stack_overflow::protect_current_thread,
+                    )
                 })
                 .unwrap_or_else(|_| {
                     crate::failure::resource_exhausted(format_args!(
@@ -266,12 +289,47 @@ impl BlockingPool {
     }
 }
 
-static BLOCKING_POOL: LazyLock<BlockingPool> = LazyLock::new(BlockingPool::new);
-// Stdout can wait indefinitely for a consumer. It must not occupy any of
-// the general pool's workers. One writer and one queued job suffice because
-// stdout itself is serialized; excess writers retain their jobs on their tasks.
-static STDOUT_POOL: LazyLock<BlockingPool> =
-    LazyLock::new(|| BlockingPool::with_workers(1, 1, "willow-stdout", &STDOUT_POOL));
+/// A runtime's lazily started blocking pools. Pool threads serve their owner,
+/// so a completion wakes that owner's task.
+pub(crate) struct BlockingPools {
+    general: OnceLock<BlockingPool>,
+    stdout: OnceLock<BlockingPool>,
+}
+
+impl BlockingPools {
+    pub(crate) const fn new() -> Self {
+        Self {
+            general: OnceLock::new(),
+            stdout: OnceLock::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PoolKind {
+    General,
+    Stdout,
+}
+
+impl PoolKind {
+    fn slot(self, owner: &'static crate::runtime::Runtime) -> &'static OnceLock<BlockingPool> {
+        match self {
+            Self::General => &owner.blocking.general,
+            Self::Stdout => &owner.blocking.stdout,
+        }
+    }
+
+    /// The current runtime's pool, started on first use.
+    fn pool(self) -> &'static BlockingPool {
+        let owner = crate::runtime::current();
+        self.slot(owner)
+            .get_or_init(|| BlockingPool::new(owner, self))
+    }
+
+    fn started(self) -> Option<&'static BlockingPool> {
+        self.slot(crate::runtime::current()).get()
+    }
+}
 
 #[derive(Default)]
 struct PoolMetrics {
@@ -296,7 +354,7 @@ struct PoolMetrics {
     all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 ))]
 pub(crate) fn run_owned<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-    run_owned_on(&BLOCKING_POOL, work)
+    run_owned_on(PoolKind::General.pool(), work)
 }
 
 #[cfg(any(
@@ -312,7 +370,7 @@ pub(crate) fn run_owned<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'st
     all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 ))]
 fn run_owned_on<T: Send + 'static>(
-    pool: &LazyLock<BlockingPool>,
+    pool: &BlockingPool,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
     use std::sync::Arc;
@@ -364,18 +422,18 @@ fn run_owned_on<T: Send + 'static>(
 pub(crate) fn run_sync_call<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
-    run_sync_call_on(&BLOCKING_POOL, work)
+    run_sync_call_on(PoolKind::General, work)
 }
 
 /// Stdout has a separate bounded worker so a full pipe cannot starve file I/O.
 pub(crate) fn run_stdout_call<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
-    run_sync_call_on(&STDOUT_POOL, work)
+    run_sync_call_on(PoolKind::Stdout, work)
 }
 
 fn run_sync_call_on<T: Send + 'static>(
-    pool: &LazyLock<BlockingPool>,
+    kind: PoolKind,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
     #[cfg(any(
@@ -391,7 +449,7 @@ fn run_sync_call_on<T: Send + 'static>(
         all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
     if crate::native_stack::is_active() {
-        return run_owned_on(pool, work);
+        return run_owned_on(kind.pool(), work);
     }
     // SAFETY: `work` is `'static + Send`, so it holds no thread-owned runtime
     // state, and its contract above excludes managed objects.
@@ -402,7 +460,7 @@ fn run_sync_call_on<T: Send + 'static>(
 /// reservation on; otherwise hand it back so the caller's Task can keep it and
 /// wait via [`try_submit_or_wait`]. Never blocks the calling thread.
 pub(crate) fn try_submit(work: BlockingWork) -> Result<(), BlockingWork> {
-    BLOCKING_POOL.try_submit(work)
+    PoolKind::General.pool().try_submit(work)
 }
 
 /// Re-submit a job that `try_submit` handed back. On `Err` the Task has been
@@ -410,14 +468,14 @@ pub(crate) fn try_submit(work: BlockingWork) -> Result<(), BlockingWork> {
 /// pool wakes it once a freed slot is reserved for it. Idempotent for spurious
 /// re-polls of a registered waiter.
 pub(crate) fn try_submit_or_wait(task_id: u64, work: BlockingWork) -> Result<(), BlockingWork> {
-    BLOCKING_POOL.try_submit_or_wait(task_id, work)
+    PoolKind::General.pool().try_submit_or_wait(task_id, work)
 }
 
 /// Drop a Task's slot-waiter registration (cancel path). No-op for a Task that
 /// never had to wait.
 pub(crate) fn forget_waiter(task_id: u64) {
-    for owner in [&BLOCKING_POOL, &STDOUT_POOL] {
-        if let Some(pool) = LazyLock::get(owner) {
+    for kind in [PoolKind::General, PoolKind::Stdout] {
+        if let Some(pool) = kind.started() {
             pool.forget_waiter(task_id);
         }
     }
@@ -428,8 +486,8 @@ pub(crate) fn forget_waiter(task_id: u64) {
 /// (which a reset scheduler even reuses) reserving slots forever.
 #[cfg(test)]
 pub(crate) fn reset_slot_waiters_for_test() {
-    for owner in [&BLOCKING_POOL, &STDOUT_POOL] {
-        if let Some(pool) = LazyLock::get(owner) {
+    for kind in [PoolKind::General, PoolKind::Stdout] {
+        if let Some(pool) = kind.started() {
             let mut state = pool.lock();
             state.waiters = WaitQueue::default();
             state.reserved.clear();
@@ -442,16 +500,18 @@ pub(crate) fn reset_slot_waiters_for_test() {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_active_jobs() -> i64 {
-    LazyLock::get(&BLOCKING_POOL).map_or(0, |pool| pool.metrics.active.load(Ordering::Acquire))
-        as i64
+    PoolKind::General
+        .started()
+        .map_or(0, |pool| pool.metrics.active.load(Ordering::Acquire)) as i64
 }
 
 /// Jobs that have finished running on pool threads (monotonic).
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_completed_jobs() -> i64 {
-    LazyLock::get(&BLOCKING_POOL).map_or(0, |pool| pool.metrics.completed.load(Ordering::Acquire))
-        as i64
+    PoolKind::General
+        .started()
+        .map_or(0, |pool| pool.metrics.completed.load(Ordering::Acquire)) as i64
 }
 
 /// Jobs admitted to the bounded queue but not yet started (depth gauge,
@@ -459,8 +519,9 @@ pub extern "C" fn willow_blocking_completed_jobs() -> i64 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_queued_jobs() -> i64 {
-    LazyLock::get(&BLOCKING_POOL).map_or(0, |pool| pool.metrics.queued.load(Ordering::Acquire))
-        as i64
+    PoolKind::General
+        .started()
+        .map_or(0, |pool| pool.metrics.queued.load(Ordering::Acquire)) as i64
 }
 
 /// Tasks parked because no queue slot was available when they submitted
@@ -468,15 +529,16 @@ pub extern "C" fn willow_blocking_queued_jobs() -> i64 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_slot_waiters() -> i64 {
-    LazyLock::get(&BLOCKING_POOL).map_or(0, |pool| pool.metrics.waiters.load(Ordering::Acquire))
-        as i64
+    PoolKind::General
+        .started()
+        .map_or(0, |pool| pool.metrics.waiters.load(Ordering::Acquire)) as i64
 }
 
 /// Bounded queue capacity (`WILLOW_BLOCKING_QUEUE`).
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_queue_capacity() -> i64 {
-    BLOCKING_POOL.capacity as i64
+    PoolKind::General.pool().capacity as i64
 }
 
 /// Helpers for tests that must fill the process-global pool (also used by the
@@ -622,7 +684,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
-    use crate::gc::runtime_test_guard;
+    use crate::gc::isolated_runtime;
     use crate::scheduler::{
         reset_global_scheduler_for_test, willow_monotonic_millis, willow_sched_run_until_deadline,
         willow_sched_spawn, willow_sched_task_state,
@@ -658,7 +720,7 @@ mod tests {
 
     #[test]
     fn blocking_pool_executes_submitted_work() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         let (sender, receiver) = mpsc::channel();
         assert!(try_submit(Box::new(move || sender.send(42).unwrap())).is_ok());
         assert_eq!(receiver.recv_timeout(Duration::from_secs(2)), Ok(42));
@@ -686,7 +748,7 @@ mod tests {
             );
             crate::task::RUNTIME_POLL_READY
         }
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for count in [1, 16, 64] {
             reset_global_scheduler_for_test();
             RAN.store(0, Ordering::SeqCst);
@@ -694,7 +756,8 @@ mod tests {
             let (release, gate) = mpsc::channel::<()>();
             let (started, running) = mpsc::channel();
             assert!(
-                STDOUT_POOL
+                PoolKind::Stdout
+                    .pool()
                     .try_submit(Box::new(move || {
                         started.send(()).unwrap();
                         // Dropping release on assertion failure also unblocks the worker.
@@ -703,14 +766,35 @@ mod tests {
                     .is_ok()
             );
             running.recv_timeout(Duration::from_secs(5)).unwrap();
-            assert!(STDOUT_POOL.try_submit(Box::new(|| {})).is_ok());
+            assert!(PoolKind::Stdout.pool().try_submit(Box::new(|| {})).is_ok());
             let ids: Vec<_> = (0..count)
                 .map(|_| willow_sched_spawn(writer, std::ptr::null_mut()))
                 .collect();
             willow_sched_run_until_deadline(willow_monotonic_millis() + 50);
-            assert_eq!(STDOUT_POOL.metrics.waiters.load(Ordering::Acquire), count);
-            assert_eq!(STDOUT_POOL.metrics.queued.load(Ordering::Acquire), 1);
-            assert_eq!(STDOUT_POOL.metrics.active.load(Ordering::Acquire), 1);
+            assert_eq!(
+                PoolKind::Stdout
+                    .pool()
+                    .metrics
+                    .waiters
+                    .load(Ordering::Acquire),
+                count
+            );
+            assert_eq!(
+                PoolKind::Stdout
+                    .pool()
+                    .metrics
+                    .queued
+                    .load(Ordering::Acquire),
+                1
+            );
+            assert_eq!(
+                PoolKind::Stdout
+                    .pool()
+                    .metrics
+                    .active
+                    .load(Ordering::Acquire),
+                1
+            );
             assert_eq!(willow_blocking_slot_waiters(), 0);
             let (done, progress) = mpsc::channel();
             assert!(
@@ -728,12 +812,29 @@ mod tests {
             }
             assert_eq!(DROPPED.load(Ordering::SeqCst), count);
             assert_eq!(RAN.load(Ordering::SeqCst), 0);
-            assert_eq!(STDOUT_POOL.metrics.waiters.load(Ordering::Acquire), 0);
+            assert_eq!(
+                PoolKind::Stdout
+                    .pool()
+                    .metrics
+                    .waiters
+                    .load(Ordering::Acquire),
+                0
+            );
             println!("stdout tasks={count} drops={count} jobs_run=0 queued=1 active=1 waiters=0");
             drop(release);
             wait_until("stdout drains", || {
-                STDOUT_POOL.metrics.queued.load(Ordering::Acquire) == 0
-                    && STDOUT_POOL.metrics.active.load(Ordering::Acquire) == 0
+                PoolKind::Stdout
+                    .pool()
+                    .metrics
+                    .queued
+                    .load(Ordering::Acquire)
+                    == 0
+                    && PoolKind::Stdout
+                        .pool()
+                        .metrics
+                        .active
+                        .load(Ordering::Acquire)
+                        == 0
             });
         }
         reset_global_scheduler_for_test();
@@ -766,7 +867,7 @@ mod tests {
     /// queued jobs in FIFO order.
     #[test]
     fn overflow_hands_jobs_back_instead_of_growing_the_queue() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         let mut stalled = stall_pool_threads();
         let capacity = willow_blocking_queue_capacity() as usize;
         assert_eq!(queued(), 0);
@@ -809,7 +910,7 @@ mod tests {
     /// nor a newcomer can take it.
     #[test]
     fn slot_waiters_are_admitted_oldest_first() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let mut stalled = stall_pool_threads();
         let capacity = willow_blocking_queue_capacity() as usize;
@@ -886,7 +987,7 @@ mod tests {
     /// the oldest one polls; slots no waiter holds are open to newcomers.
     #[test]
     fn each_freed_slot_is_reserved_for_and_wakes_the_next_waiter() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         let capacity = willow_blocking_queue_capacity() as usize;
         if capacity < 2 {
             eprintln!("skipped: needs WILLOW_BLOCKING_QUEUE >= 2 to free two slots at once");
@@ -954,7 +1055,7 @@ mod tests {
     /// that passes (with a wake) to the next waiter instead of stranding it.
     #[test]
     fn forgetting_a_reserved_waiter_passes_the_slot_on() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let mut stalled = stall_pool_threads();
         let capacity = willow_blocking_queue_capacity() as usize;

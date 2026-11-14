@@ -258,14 +258,13 @@ unsafe fn drop_async_rwlock(payload: *mut u8) {
         );
     }
     unsafe { std::ptr::drop_in_place(payload as *mut AsyncRwLock) };
-    #[cfg(test)]
-    ASYNC_RWLOCK_DROP_COUNT.fetch_add(1, Ordering::SeqCst);
 }
 
 #[cfg(test)]
-static ASYNC_RWLOCK_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-static ASYNC_RWLOCK_REGISTRATION: crate::gc::NativeGcRegistration =
-    crate::gc::NativeGcRegistration::new();
+const ASYNC_RWLOCK_DROP_COUNT: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::AsyncRwlockDropCount);
+const ASYNC_RWLOCK_REGISTRATION: crate::gc::NativeGcRegistration =
+    crate::gc::NativeGcRegistration::AsyncRwLock;
 const ASYNC_RWLOCK_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
     ASYNC_RWLOCK_TYPE_ID,
     Some(trace_async_rwlock),
@@ -446,7 +445,7 @@ pub extern "C" fn willow_async_rwlock_invalid_status(status: i32, phase: i32) ->
 mod tests {
     use super::*;
     use crate::gc::{
-        runtime_test_guard, willow_gc_add_runtime_root, willow_gc_collect, willow_gc_init,
+        isolated_runtime, willow_gc_add_runtime_root, willow_gc_collect, willow_gc_init,
         willow_gc_remove_runtime_root,
     };
     use crate::scheduler::{reset_global_scheduler_for_test, with_global_for_test};
@@ -490,7 +489,7 @@ mod tests {
 
     #[test]
     fn reclamation_waits_for_readers_writer_waiters_and_frame_refs() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let lock = AsyncRwLock::new(7, false);
         let reader = parked_task();
@@ -538,7 +537,7 @@ mod tests {
 
     #[test]
     fn queued_writer_is_not_starved_by_continuing_reader_arrivals() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         let lock = AsyncRwLock::new(0, false);
         let first_reader = parked_task();
@@ -585,7 +584,7 @@ mod tests {
 
     #[test]
     fn ten_thousand_mixed_waiters_drain_by_fair_ownership_units() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         const FIRST_READERS: usize = 4_999;
         const SECOND_READERS: usize = 5_000;
@@ -663,7 +662,7 @@ mod tests {
 
     #[test]
     fn gc_managed_handle_traces_value_and_reclaims_native_state() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         willow_gc_init();
         let protected = willow_string_from_str("rw protected");
@@ -685,7 +684,7 @@ mod tests {
 
     #[test]
     fn repeated_unreachable_handles_are_finalized() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
         willow_gc_init();
         let before = ASYNC_RWLOCK_DROP_COUNT.load(Ordering::SeqCst);

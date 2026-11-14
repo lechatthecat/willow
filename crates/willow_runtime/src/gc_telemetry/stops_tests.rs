@@ -136,7 +136,7 @@ fn saturated_counters_are_explicitly_invalid_for_acceptance() {
 #[test]
 fn v2_negotiation_preserves_v1_and_guards_unaligned_output() {
     use crate::gc_telemetry::*;
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     assert_eq!(std::mem::size_of::<WillowGcStatsV1>(), 2112);
     assert_eq!(std::mem::offset_of!(WillowGcStatsV2, baseline), 16);
@@ -168,7 +168,7 @@ fn v2_negotiation_preserves_v1_and_guards_unaligned_output() {
 #[test]
 fn actual_baseline_stops_are_visible_even_for_empty_heaps() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     willow_gc_collect();
     crate::gc::minor_collect_internal();
@@ -190,7 +190,7 @@ fn actual_baseline_stops_are_visible_even_for_empty_heaps() {
 #[test]
 fn normal_old_cycles_do_not_scan_headers_or_sweep_under_stops() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for n in [16, 64, 256, 1024] {
         reset_internal_for_test();
         for _ in 0..n {
@@ -214,7 +214,7 @@ fn normal_old_cycles_do_not_scan_headers_or_sweep_under_stops() {
 
 #[test]
 fn unfinished_measurement_records_failure_instead_of_zero_stops() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
     let result = std::panic::catch_unwind(|| {
         let _stop = StopMeasurement::begin(StopReason::Recovery);
@@ -257,4 +257,100 @@ fn configured_stop_history_is_bounded_and_invalid_is_not_silent() {
         assert_eq!(t.stats.events_dropped, 3);
         assert_ne!(t.stats.flags & STOP_EVENTS_LOST, 0);
     }
+}
+
+#[test]
+fn stop_history_owners_keep_equal_sequences_totals_and_reset_independent() {
+    let first = Stops::new();
+    let second = Stops::new();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = [(&first, StopReason::Minor), (&second, StopReason::Remark)]
+            .into_iter()
+            .map(|(owner, reason)| {
+                let barrier = &barrier;
+                scope.spawn(crate::runtime::serving(move || {
+                    for round in 1..=32 {
+                        complete(&mut owner.state.lock().unwrap(), reason, round * 100, false);
+                        barrier.wait();
+                        assert_eq!(owner.snapshot_stops().last_sequence, round);
+                        assert_eq!(
+                            owner.snapshot_stops().by_reason[reason as usize - 1].completed,
+                            round
+                        );
+                        barrier.wait();
+                    }
+                }))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+    let second_before = second.snapshot_stops();
+    first.reset_for_test();
+    assert_eq!(first.snapshot_stops().last_sequence, 32);
+    assert_eq!(
+        first.snapshot_stops().by_reason.map(|r| r.completed),
+        [0; 4]
+    );
+    assert_eq!(
+        second.snapshot_stops().by_reason.map(|r| r.completed),
+        second_before.by_reason.map(|r| r.completed)
+    );
+    assert_eq!(second.take_events().len(), 32);
+    assert_eq!(second.snapshot_stops().events_pending, 0);
+    assert!(first.take_events().is_empty());
+    complete(
+        &mut first.state.lock().unwrap(),
+        StopReason::Recovery,
+        4000,
+        true,
+    );
+    assert_eq!(first.snapshot_stops().last_sequence, 33);
+    assert_eq!(second.snapshot_stops().last_sequence, 32);
+    first.discard_events();
+    assert_eq!(first.snapshot_stops().events_pending, 0);
+}
+
+#[test]
+fn private_stop_history_configuration_survives_reset_and_peer_teardown() {
+    let first = Stops {
+        state: LazyLock::new(|| Mutex::new(StopTelemetry::with_capacity(Some(3)))),
+    };
+    let second = Stops {
+        state: LazyLock::new(|| Mutex::new(StopTelemetry::with_capacity(None))),
+    };
+    std::thread::scope(|scope| {
+        for (owner, configured) in [(&first, Some(3)), (&second, None)] {
+            scope.spawn(crate::runtime::serving(move || {
+                for _ in 0..4 {
+                    for round in 0..9 {
+                        complete(
+                            &mut owner.state.lock().unwrap(),
+                            StopReason::Minor,
+                            round * 100,
+                            false,
+                        );
+                    }
+                    assert_eq!(
+                        owner.transport_capacity(),
+                        configured.unwrap_or(EVENT_CAPACITY)
+                    );
+                    owner.reset_for_test();
+                    let stats = owner.snapshot_stops();
+                    assert_eq!(stats.events_pending, 0);
+                    assert_eq!(stats.flags & STOP_CONFIG_INVALID != 0, configured.is_none());
+                    assert_eq!(
+                        owner.transport_capacity(),
+                        configured.unwrap_or(EVENT_CAPACITY)
+                    );
+                }
+            }));
+        }
+    });
+    drop(first);
+    second.reset_for_test();
+    assert_eq!(second.transport_capacity(), EVENT_CAPACITY);
+    assert_ne!(second.snapshot_stops().flags & STOP_CONFIG_INVALID, 0);
 }

@@ -8,18 +8,19 @@ fn detached_worker_panics_terminate_without_hanging() {
     if let Ok(case) = std::env::var(KEY) {
         match case.as_str() {
             "initialize" => {
-                std::thread::spawn(|| {
-                    blocking_worker_entry(&BLOCKING_POOL, || {
+                std::thread::spawn(crate::runtime::serving(|| {
+                    blocking_worker_entry(crate::runtime::current(), PoolKind::General, || {
                         panic!("injected worker initialization panic")
                     });
-                });
+                }));
             }
             "job" => {
                 assert!(try_submit(Box::new(|| panic!("injected blocking job panic"))).is_ok());
             }
             "stdout-job" => {
                 assert!(
-                    STDOUT_POOL
+                    PoolKind::Stdout
+                        .pool()
                         .try_submit(Box::new(|| panic!("injected stdout job panic")))
                         .is_ok()
                 );

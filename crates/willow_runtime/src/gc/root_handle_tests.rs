@@ -9,7 +9,7 @@ fn young_word(tls: &mut GcTlabState, word: i64) -> *mut u8 {
 
 #[test]
 fn normal_handle_move_park_resume_cancel_and_unwind() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for exit in ["resume", "cancel", "panic"] {
         reset_gc();
         let mut tls = new_tlab_state();
@@ -56,7 +56,7 @@ fn normal_handle_move_park_resume_cancel_and_unwind() {
 
 #[test]
 fn normal_handle_aliases_null_store_release_and_arena_drop() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let before = runtime_root_count();
@@ -95,7 +95,7 @@ fn normal_handle_aliases_null_store_release_and_arena_drop() {
 
 #[test]
 fn scoped_loan_park_resume_cancel_panic_and_stack_alias() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for exit in ["resume", "cancel", "panic"] {
         for kind in ["interior", "ffi"] {
             reset_gc();
@@ -153,7 +153,7 @@ fn scoped_loan_park_resume_cancel_panic_and_stack_alias() {
 
 #[test]
 fn scoped_loan_native_old_retired_and_nested_lifetimes() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let native = [1u8; 16];
     assert!(PinLease::<InteriorPointer>::for_address(native.as_ptr()).is_none());
@@ -187,7 +187,7 @@ fn scoped_loan_native_old_retired_and_nested_lifetimes() {
 #[test]
 fn scoped_loan_bridge_deduplicates_and_preserves_foreign_string_data() {
     use crate::rust_bridge_abi::aggregate::*;
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let string = willow_gc_alloc_slow(&mut tls, 902, 0, 16, 0);
@@ -228,7 +228,7 @@ fn scoped_loan_bridge_deduplicates_and_preserves_foreign_string_data() {
 // tests inspect actual movement, rather than assuming stress triggered it.
 fn during_minor<R>(operation: impl FnOnce() -> R) -> R {
     let _registration = MutatorRegistration::new();
-    let collector = std::thread::spawn(|| willow_gc_minor_collect());
+    let collector = std::thread::spawn(crate::runtime::serving(|| willow_gc_minor_collect()));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while unsafe { *willow_gc_stop_flag() } == 0 {
         assert!(
@@ -246,7 +246,7 @@ fn during_minor<R>(operation: impl FnOnce() -> R) -> R {
 
 #[test]
 fn normal_handle_runtime_string_and_enum_paths_move_without_pin() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for operation in ["concat", "substring", "trim", "repeat", "split", "enum"] {
         reset_gc();
         set_gc_stress_for_test(Some(""));
@@ -312,7 +312,7 @@ fn normal_handle_runtime_string_and_enum_paths_move_without_pin() {
 #[test]
 fn normal_handle_panic_inputs_move_and_remain_remembered_after_transfer() {
     use crate::panic_context::*;
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     struct Restore(Option<std::sync::Arc<PanicContext>>);
     impl Drop for Restore {
@@ -361,7 +361,7 @@ fn normal_handle_panic_inputs_move_and_remain_remembered_after_transfer() {
 
 #[test]
 fn normal_handle_lock_constructors_reload_reference_arguments() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for kind in [
         "blocking_mutex",
         "blocking_rwlock",
@@ -401,7 +401,7 @@ fn normal_handle_lock_constructors_reload_reference_arguments() {
 
 #[test]
 fn scoped_loan_string_interior_copy_survives_a_pending_minor() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     set_gc_stress_for_test(Some(""));
     let mut tls = new_tlab_state();
@@ -445,7 +445,7 @@ fn verify_no_pin_rejects_an_actual_scoped_young_loan() {
         assert!(stderr.contains("scoped fixed-address loan"), "{stderr}");
         return;
     }
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let _loan = PinLease::<ForeignReference>::new(young_word(&mut tls, 1));
@@ -454,45 +454,55 @@ fn verify_no_pin_rejects_an_actual_scoped_young_loan() {
 
 #[test]
 fn normal_handle_concurrent_snapshot_churn_uses_live_atomic_slots() {
-    let _guard = gc_test_guard();
-    reset_gc();
-    let old = willow_alloc(8);
-    willow_gc_add_runtime_root(old);
+    let owner = Arc::new(crate::runtime::Runtime::new(
+        crate::scheduler::environment_worker_config,
+    ));
+    let old = allocate_old_in(&owner, 0, 0, 8, 0);
+    root::add_task_frame_root_in(&owner, old);
     let address = old as usize;
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
     let mut threads = Vec::new();
     for _ in 0..4 {
         let barrier = std::sync::Arc::clone(&barrier);
-        threads.push(std::thread::spawn(move || {
+        let owner = Arc::clone(&owner);
+        threads.push(std::thread::spawn(crate::runtime::serving(move || {
             barrier.wait();
             for _ in 0..4096 {
-                let root = GcRootHandle::new(address as *mut u8);
+                let root = GcRootHandle::new_in(Arc::clone(&owner), address as *mut u8);
                 root.release();
                 root.store(address as *mut u8);
                 std::thread::yield_now();
             }
-        }));
+        })));
     }
     barrier.wait();
     for _ in 0..4096 {
-        let values = runtime_roots_snapshot();
+        let values = runtime_roots_snapshot_in(&owner.gc);
         assert!(values.iter().all(|&value| value == old));
         assert!(!values.is_empty());
     }
     for thread in threads {
         thread.join().unwrap();
     }
-    assert_eq!(runtime_root_count(), 1);
-    willow_gc_remove_runtime_root(old);
-    willow_gc_collect();
-    assert_eq!(runtime_root_count(), 0);
-    assert_eq!(willow_gc_allocated_bytes(), 0);
-    reset_gc();
+    assert_eq!(
+        (owner.gc.runtime_roots.len() + owner.gc.runtime_root_slots.len()),
+        1
+    );
+    root::remove_runtime_root_in(&owner, old);
+    assert_eq!(
+        try_collect_internal_in(&owner),
+        CollectionAttempt::Completed
+    );
+    assert_eq!(
+        (owner.gc.runtime_roots.len() + owner.gc.runtime_root_slots.len()),
+        0
+    );
+    assert_eq!(owner.gc.heap.lock().unwrap().allocated_bytes, 0);
 }
 
 #[test]
 fn scoped_handle_emergency_tenure_budget_keeps_the_slot_valid() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let root = GcRootHandle::new(young_word(&mut tls, 53));
@@ -522,7 +532,7 @@ fn scoped_handle_emergency_tenure_budget_keeps_the_slot_valid() {
 #[test]
 fn normal_handle_overhead_and_fragmented_registration_scaling() {
     use crate::scheduler::scaling_measurements::counting_allocator as counter;
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     // Measure cold/growing registry costs too; the handle vector is prepared
     // outside the measured region. Null values isolate root-management work.
@@ -546,7 +556,7 @@ fn normal_handle_overhead_and_fragmented_registration_scaling() {
         let allocated = counter::thread_allocations() - allocations;
         let allocated_bytes = counter::thread_bytes() - bytes;
         let elapsed = started.elapsed().as_nanos();
-        assert_eq!(runtime_root_slots().len(), count);
+        assert_eq!(runtime_root_slots(runtime()).len(), count);
         assert!(allocated >= count && allocated <= count + 128 + count / 2);
         let load_allocations = counter::thread_allocations();
         let load_started = std::time::Instant::now();
@@ -566,7 +576,7 @@ fn normal_handle_overhead_and_fragmented_registration_scaling() {
                 kept.push(handle);
             }
         }
-        assert_eq!(runtime_root_slots().len(), count / 16);
+        assert_eq!(runtime_root_slots(runtime()).len(), count / 16);
         eprintln!(
             "handles={count} slot_visits={count} fragmented_visits={} handle_bytes={} cell_bytes={} allocated={allocated} allocated_bytes={allocated_bytes} create_ns={elapsed} legacy_allocated={legacy_allocated} legacy_create_ns={legacy_ns} loads={loads} load_ns={load_ns}",
             count / 16,
@@ -577,4 +587,44 @@ fn normal_handle_overhead_and_fragmented_registration_scaling() {
         assert_eq!(runtime_root_count(), 0);
     }
     reset_gc();
+}
+
+#[test]
+fn private_scoped_handles_keep_their_heap_alive_through_release_and_unwind() {
+    for unwind in [false, true] {
+        let owner = Arc::new(crate::runtime::Runtime::new(
+            crate::scheduler::environment_worker_config,
+        ));
+        let peer = Arc::new(crate::runtime::Runtime::new(
+            crate::scheduler::environment_worker_config,
+        ));
+        let weak = Arc::downgrade(&owner);
+        let old = allocate_old_in(&owner, 0, 0, 8, 0);
+        unsafe { old.cast::<u64>().write(73) };
+        let root = GcRootHandle::new_in(Arc::clone(&owner), old);
+        let alias = GcRootHandle::new_in(Arc::clone(&owner), std::ptr::null_mut());
+        alias.store(root.load());
+        assert_eq!(owner.gc.runtime_root_slots.len(), 2);
+        assert_eq!(peer.gc.runtime_root_slots.len(), 0);
+        root.release();
+        root.release();
+        drop(root);
+        assert_eq!(owner.gc.runtime_root_slots.len(), 1);
+        assert_eq!(
+            try_collect_internal_in(&owner),
+            CollectionAttempt::Completed
+        );
+        assert_eq!(unsafe { alias.load().cast::<u64>().read() }, 73);
+        drop(owner);
+        assert!(weak.upgrade().is_some());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _alias = alias;
+            if unwind {
+                panic!("private scoped root unwind");
+            }
+        }));
+        assert_eq!(outcome.is_err(), unwind);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(peer.gc.runtime_root_slots.len(), 0);
+    }
 }

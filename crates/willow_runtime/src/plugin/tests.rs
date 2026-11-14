@@ -190,10 +190,10 @@ fn running_wasm_cancellation_and_timeout() {
         let (id, c) = s.submit(1, None, b"").unwrap();
         std::thread::scope(|scope| {
             if !timeout {
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     std::thread::sleep(Duration::from_millis(2));
                     c.cancel();
-                });
+                }));
             }
             s.drive_one();
         });
@@ -399,10 +399,10 @@ fn native_cancellation_terminates_and_reaps() {
     let Some(mut s) = native() else { return };
     let (id, c) = s.submit(3, None, b"").unwrap();
     std::thread::scope(|scope| {
-        scope.spawn(move || {
+        scope.spawn(crate::runtime::serving(move || {
             std::thread::sleep(Duration::from_millis(10));
             c.cancel();
-        });
+        }));
         s.drive_one();
     });
     assert_eq!(s.take(id), Some(Err(Error::Cancelled)));
@@ -492,10 +492,10 @@ fn cancellation_response_race_has_one_winner() {
         let (id, token) = s.submit(1, None, b"value").unwrap();
         let barrier = std::sync::Barrier::new(2);
         let won = std::thread::scope(|scope| {
-            let worker = scope.spawn(|| {
+            let worker = scope.spawn(crate::runtime::serving(|| {
                 barrier.wait();
                 token.cancel()
-            });
+            }));
             barrier.wait();
             s.drive_one();
             worker.join().unwrap()

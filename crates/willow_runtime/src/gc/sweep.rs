@@ -3,6 +3,7 @@
 //! wait for completion and the next mark epoch before allocator reuse.
 use super::*;
 mod batches;
+pub(crate) use batches::ActiveSweep;
 
 /// Shared fixed runway for old-region allocations during concurrent sweep.
 /// Fast small-object buffers retain their existing allocation policy.
@@ -16,7 +17,10 @@ pub(super) fn allocation_budget_exhausted(state: &GcState) -> bool {
             >= ALLOCATION_RUNWAY
 }
 pub(super) fn assist() {
-    batches::assist();
+    assist_in(crate::runtime::current());
+}
+pub(super) fn assist_in(owner: &crate::runtime::Runtime) {
+    batches::assist_in(owner);
 }
 
 /// Region flag/state writes plus one candidate-index key. Tree-node traffic
@@ -40,21 +44,34 @@ pub(super) struct SweepPlan {
 
 /// Shared by both major sweep preparations once liveness is final.
 fn begin_sweep(state: &mut GcState) {
+    begin_sweep_in(crate::runtime::current(), state);
+}
+fn begin_sweep_in(owner: &crate::runtime::Runtime, state: &mut GcState) {
     assert!(state.sweeping.is_none());
     #[cfg(feature = "gc-acceptance-faults")]
-    crate::gc_telemetry::footprint::mark_window_complete();
+    owner.telemetry.footprint.mark_window_complete();
     state.sweeping = Some(std::thread::current().id());
     state.sweep_allocation_start = state.total_allocated_bytes;
     state.pending_sweep_chunks = 0..state.tlab_chunks.len();
-    publish_collection_busy(state);
+    publish_collection_busy_in(&owner.gc, state);
     state.major_collections = state.major_collections.saturating_add(1);
 }
 
 pub(super) fn prepare(state: &mut GcState, marking: Option<Arc<ConcurrentCycle>>) -> SweepPlan {
-    crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::MarkComplete);
-    begin_sweep(state);
+    prepare_in(crate::runtime::current(), state, marking)
+}
+pub(super) fn prepare_in(
+    owner: &crate::runtime::Runtime,
+    state: &mut GcState,
+    marking: Option<Arc<ConcurrentCycle>>,
+) -> SweepPlan {
+    owner
+        .telemetry
+        .milestones
+        .reached(crate::gc_telemetry::GcStage::MarkComplete);
+    begin_sweep_in(owner, state);
     // Active buffers copied a clear sweep_pending flag.
-    old_lab::retire_all(state);
+    old_lab::retire_all_in(&owner.gc, state);
     for (index, region) in state.old_regions.iter_mut().enumerate() {
         region.sweep_pending = true;
         region.sweep_quarantined = true;
@@ -87,13 +104,23 @@ pub(super) fn prepare_bounded(
     budget: &mut old_cycle::RemarkBudget,
     stop_work: &mut crate::gc_telemetry::stops::StopWorkV2,
 ) -> Option<SweepPlan> {
-    if !old_lab::retire_bounded(state, budget, stop_work) {
+    prepare_bounded_in(crate::runtime::current(), state, marking, budget, stop_work)
+}
+
+pub(super) fn prepare_bounded_in(
+    owner: &crate::runtime::Runtime,
+    state: &mut GcState,
+    marking: Arc<ConcurrentCycle>,
+    budget: &mut old_cycle::RemarkBudget,
+    stop_work: &mut crate::gc_telemetry::stops::StopWorkV2,
+) -> Option<SweepPlan> {
+    if !old_lab::retire_bounded_in(&owner.gc, state, budget, stop_work) {
         return None;
     }
     if !publish_regions_bounded(state, &marking, budget, crate::gc_telemetry::timestamp_ns) {
         return None;
     }
-    begin_sweep(state);
+    begin_sweep_in(owner, state);
     Some(SweepPlan {
         old: state.old_regions.len(),
         chunks: state.tlab_chunks.len(),
@@ -104,23 +131,27 @@ pub(super) fn prepare_bounded(
     })
 }
 
-#[cfg(test)]
-pub(super) static CONCURRENT_PUBLICATIONS: AtomicUsize = AtomicUsize::new(0);
-
 /// Publish the existing prefix outside global stops, releasing the heap lock
 /// between bounded chunks. Mark coloring remains active: a pre-existing LAB
 /// whose cached sweep flag is clear still allocates black. Final stopped closure
 /// retires every such LAB before disabling marking. Newly appended regions are
 /// handled by the final bounded check, never chased indefinitely in this loop.
 pub(super) fn publish_regions_concurrently(marking: &ConcurrentCycle) {
-    let end = runtime().heap.lock().unwrap().old_regions.len();
+    publish_regions_concurrently_in(crate::runtime::current(), marking);
+}
+
+pub(super) fn publish_regions_concurrently_in(
+    owner: &crate::runtime::Runtime,
+    marking: &ConcurrentCycle,
+) {
+    let end = owner.gc.heap.lock().unwrap().old_regions.len();
     loop {
-        let mut state = runtime().heap.lock().unwrap();
+        let mut state = owner.gc.heap.lock().unwrap();
         let before = marking.sweep_publication_cursor.load(Ordering::Relaxed);
         if before >= end {
             return;
         }
-        assert_ne!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+        assert_ne!(owner.gc.mark_phase().load(Ordering::Acquire), 0);
         assert!(state.sweeping.is_none());
         let mut budget = old_cycle::RemarkBudget::new(
             64,
@@ -138,7 +169,8 @@ pub(super) fn publish_regions_concurrently(marking: &ConcurrentCycle) {
         let after = marking.sweep_publication_cursor.load(Ordering::Relaxed);
         drop(state);
         let regions = (after - before) as u64;
-        crate::gc_telemetry::observations::work(
+        crate::gc_telemetry::observations::work_in(
+            owner,
             1,
             crate::gc_telemetry::observations::Work {
                 slots: regions,
@@ -147,8 +179,7 @@ pub(super) fn publish_regions_concurrently(marking: &ConcurrentCycle) {
                 ..Default::default()
             },
         );
-        #[cfg(test)]
-        CONCURRENT_PUBLICATIONS.fetch_add(after - before, Ordering::Relaxed);
+        RuntimeSweepObservation::published(|| &owner.gc.sweep_observation, after - before);
         std::thread::yield_now();
     }
 }
@@ -203,9 +234,12 @@ fn publish_region_prefix_bounded(
 /// Each visit is region-local and runs after initial stop release; no heap-wide
 /// index rebuild or sweep work is hidden in the initial pause.
 pub(super) fn release_quarantine(epoch: u64) {
-    let count = runtime().heap.lock().unwrap().old_regions.len();
+    release_quarantine_in(runtime(), epoch);
+}
+pub(super) fn release_quarantine_in(owner: &GcRuntime, epoch: u64) {
+    let count = owner.heap.lock().unwrap().old_regions.len();
     for index in 0..count {
-        let mut state = runtime().heap.lock().unwrap();
+        let mut state = owner.heap.lock().unwrap();
         let region = &mut state.old_regions[index];
         if region.sweep_state.phase == region::SweepPhase::Swept
             && region.sweep_quarantined
@@ -218,26 +252,36 @@ pub(super) fn release_quarantine(epoch: u64) {
 }
 
 pub(super) fn stopped(work: &mut crate::gc_telemetry::stops::StopWorkV2) -> usize {
-    let plan = prepare(&mut runtime().heap.lock().unwrap(), None);
-    execute(plan, work, false)
+    stopped_in(crate::runtime::current(), work)
+}
+pub(super) fn stopped_in(
+    owner: &crate::runtime::Runtime,
+    work: &mut crate::gc_telemetry::stops::StopWorkV2,
+) -> usize {
+    let plan = prepare_in(owner, &mut owner.gc.heap.lock().unwrap(), None);
+    execute(owner, plan, work, false)
 }
 
 pub(super) fn concurrent(plan: SweepPlan) -> usize {
-    assert!(
-        !runtime().stop_requested.load(Ordering::Acquire),
-        "normal sweep began before mutator resume"
-    );
-    batches::execute(plan)
+    concurrent_in(crate::runtime::current(), plan)
 }
 
-type PendingDrop = (DropFn, *mut u8);
+pub(super) fn concurrent_in(owner: &crate::runtime::Runtime, plan: SweepPlan) -> usize {
+    assert!(
+        !owner.gc.stop_requested.load(Ordering::Acquire),
+        "normal sweep began before mutator resume"
+    );
+    batches::execute_in(owner, plan)
+}
 
-fn run_drops(drops: &mut Vec<PendingDrop>, epoch: u64) {
-    for (hook, payload) in drops.drain(..) {
+type PendingDrop = (DropFn, *mut u8, crate::observation::Value<u32>);
+
+fn run_drops(owner: &crate::runtime::Runtime, drops: &mut Vec<PendingDrop>, epoch: u64) {
+    for (hook, payload, observed_type) in drops.drain(..) {
         // SAFETY: dead storage is quarantined until finish(), and each hook is
         // queued once before its object leaves the live allocation metadata.
-        unsafe { run_drop_hook(hook, payload) };
-        crate::frame_lifetime::record_sweep(
+        unsafe { run_drop_hook(&owner.gc, hook, payload, observed_type) };
+        owner.frame_lifetime.record_sweep(
             crate::frame_lifetime::FrameEventKind::DropCompleted,
             payload as usize,
             epoch,
@@ -247,6 +291,7 @@ fn run_drops(drops: &mut Vec<PendingDrop>, epoch: u64) {
 }
 
 fn execute(
+    owner: &crate::runtime::Runtime,
     mut plan: SweepPlan,
     work: &mut crate::gc_telemetry::stops::StopWorkV2,
     concurrent: bool,
@@ -261,22 +306,24 @@ fn execute(
     let mut drops = Vec::new();
     for index in 0..plan.old {
         freed += sweep_region(
-            &mut runtime().heap.lock().unwrap(),
+            owner,
+            &mut owner.gc.heap.lock().unwrap(),
             index,
             work,
             visited,
             &mut drops,
             plan.marking.as_deref(),
         );
-        run_drops(&mut drops, plan.epoch);
+        run_drops(owner, &mut drops, plan.epoch);
         if concurrent {
-            between_regions(index);
+            between_regions_in(&owner.gc, index);
         }
     }
     let mut dead_chunks = Vec::with_capacity(plan.chunks);
     for index in 0..plan.chunks {
         let (bytes, dead) = sweep_chunk(
-            &mut runtime().heap.lock().unwrap(),
+            owner,
+            &mut owner.gc.heap.lock().unwrap(),
             index,
             work,
             visited,
@@ -285,13 +332,13 @@ fn execute(
         );
         freed += bytes;
         dead_chunks.push(dead);
-        run_drops(&mut drops, plan.epoch);
+        run_drops(owner, &mut drops, plan.epoch);
         if concurrent {
-            between_regions(plan.old + index);
+            between_regions_in(&owner.gc, plan.old + index);
         }
     }
-    let mut state = runtime().heap.lock().unwrap();
-    finish(&mut state, &dead_chunks);
+    let mut state = owner.gc.heap.lock().unwrap();
+    finish(owner, &mut state, &dead_chunks);
     if let Some(marking) = &plan.marking {
         marking
             .phase
@@ -300,15 +347,18 @@ fn execute(
             .transition(old_cycle::Phase::Idle);
     }
     // Publish stats before the milestone that wakes sweep waiters.
-    crate::gc_telemetry::sweep::completed(
+    owner.telemetry.sweep.completed(
         work.swept_objects.saturating_sub(before),
         *visited,
         started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
         freed as u64,
     );
-    crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::SweepComplete);
+    owner
+        .telemetry
+        .milestones
+        .reached(crate::gc_telemetry::GcStage::SweepComplete);
     // Account reusable storage before another sweep can start.
-    crate::frame_lifetime::record_sweep(
+    owner.frame_lifetime.record_sweep(
         crate::frame_lifetime::FrameEventKind::SweepCompleted,
         0,
         plan.epoch,
@@ -317,19 +367,78 @@ fn execute(
     freed
 }
 
-fn between_regions(_index: usize) {
-    #[cfg(test)]
+pub(super) trait SweepObservation {
+    fn region_visited<'a>(_owner: impl FnOnce() -> &'a Self)
+    where
+        Self: 'a,
     {
-        let hook = *SWEEP_TEST_HOOK.lock().unwrap_or_else(|p| p.into_inner());
+    }
+    fn object_visited<'a>(_owner: impl FnOnce() -> &'a Self)
+    where
+        Self: 'a,
+    {
+    }
+
+    fn published<'a>(_owner: impl FnOnce() -> &'a Self, _count: usize)
+    where
+        Self: 'a,
+    {
+    }
+
+    fn between_regions<'a>(_owner: impl FnOnce() -> &'a Self, _index: usize)
+    where
+        Self: 'a,
+    {
+    }
+}
+impl SweepObservation for () {}
+#[cfg(not(test))]
+pub(super) type RuntimeSweepObservation = ();
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct RuntimeSweepObservation {
+    pub(super) hook: Mutex<Option<fn(usize)>>,
+    pub(super) publications: AtomicUsize,
+    pub(super) region_visits: AtomicUsize,
+    pub(super) object_visits: AtomicUsize,
+}
+#[cfg(test)]
+impl SweepObservation for RuntimeSweepObservation {
+    fn region_visited<'a>(owner: impl FnOnce() -> &'a Self) {
+        owner().region_visits.fetch_add(1, Ordering::Relaxed);
+    }
+    fn object_visited<'a>(owner: impl FnOnce() -> &'a Self) {
+        owner().object_visits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn published<'a>(owner: impl FnOnce() -> &'a Self, count: usize) {
+        owner().publications.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn between_regions<'a>(owner: impl FnOnce() -> &'a Self, index: usize) {
+        // Release the observation lock before invoking a reentrant hook.
+        let hook = *owner().hook.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(hook) = hook {
-            hook(_index);
+            hook(index);
         }
     }
-    std::thread::yield_now();
 }
 
-#[cfg(test)]
-pub(super) static SWEEP_TEST_HOOK: Mutex<Option<fn(usize)>> = Mutex::new(None);
+fn between_regions(index: usize) {
+    between_regions_observed(|| &runtime().sweep_observation, index);
+}
+
+fn between_regions_in(owner: &GcRuntime, index: usize) {
+    between_regions_observed(|| &owner.sweep_observation, index);
+}
+
+fn between_regions_observed<'a>(
+    observation: impl FnOnce() -> &'a RuntimeSweepObservation,
+    index: usize,
+) {
+    RuntimeSweepObservation::between_regions(observation, index);
+    std::thread::yield_now();
+}
 
 /// Shared by stopped and bounded concurrent sweep, before storage reuse.
 fn release_pin(
@@ -345,6 +454,7 @@ fn release_pin(
 }
 
 fn sweep_region(
+    owner: &crate::runtime::Runtime,
     state: &mut GcState,
     index: usize,
     stop_work: &mut crate::gc_telemetry::stops::StopWorkV2,
@@ -355,7 +465,7 @@ fn sweep_region(
     let mut freed_bytes = 0;
     let sweep_epoch = state.major_collections;
     // Index buffer objects carved during this sweep before visiting them.
-    old_lab::retire_region(state, index);
+    old_lab::retire_region(&owner.gc, state, index);
     {
         let GcState {
             old_regions,
@@ -369,8 +479,7 @@ fn sweep_region(
         } = &mut *state;
         let region = &mut old_regions[index];
         {
-            #[cfg(test)]
-            SWEEP_REGION_VISITS.fetch_add(1, Ordering::Relaxed);
+            RuntimeSweepObservation::region_visited(|| &owner.gc.sweep_observation);
             region.mark_bitmap.clear();
             let mut free_spans = Vec::new();
             region.largest_free_span = 0;
@@ -378,8 +487,7 @@ fn sweep_region(
             let base = region.base;
             region.allocations.retain(|&offset, span_size| {
                 stop_work.swept_objects += 1;
-                #[cfg(test)]
-                SWEEP_OBJECT_VISITS.fetch_add(1, Ordering::Relaxed);
+                RuntimeSweepObservation::object_visited(|| &owner.gc.sweep_observation);
                 // SAFETY: allocation metadata owns a valid header at offset.
                 let object = HeapObject::from_raw(unsafe { base.add(offset) }.cast())
                     .expect("region allocation has a non-null header");
@@ -404,15 +512,19 @@ fn sweep_region(
                     object.clear_mark();
                     true
                 } else {
-                    if let Some(drop_fn) = lookup_drop(object.type_id()) {
-                        crate::frame_lifetime::pending_drop(
-                            object.payload().as_ptr() as usize,
-                            sweep_epoch,
-                        );
-                        drops.push((drop_fn, object.payload().as_ptr()));
+                    if let Some(drop_fn) = registry::lookup_drop_in(&owner.gc, object.type_id()) {
+                        owner
+                            .frame_lifetime
+                            .pending_drop(object.payload().as_ptr() as usize, sweep_epoch);
+                        drops.push((
+                            drop_fn,
+                            object.payload().as_ptr(),
+                            crate::observation::Value::new(|| object.type_id()),
+                        ));
                     }
                     if object.generation() == GC_GENERATION_OLD {
-                        runtime()
+                        owner
+                            .gc
                             .runtime_roots
                             .forget_pending(object.payload().as_ptr() as usize);
                     }
@@ -425,7 +537,7 @@ fn sweep_region(
                         survivor_stats,
                         object.payload().as_ptr() as usize,
                     );
-                    note_dead_frame(object, sweep_epoch);
+                    note_dead_frame_in(&owner.frame_lifetime, object, sweep_epoch);
                     object.reclaim_in_place();
                     region.live_bytes = region.live_bytes.saturating_sub(size);
                     freed_bytes += size;
@@ -445,6 +557,7 @@ fn sweep_region(
 }
 
 fn sweep_chunk(
+    owner: &crate::runtime::Runtime,
     state: &mut GcState,
     chunk_index: usize,
     stop_work: &mut crate::gc_telemetry::stops::StopWorkV2,
@@ -518,18 +631,21 @@ fn sweep_chunk(
         } else {
             let payload = object.payload().as_ptr() as usize;
             if object.generation() == GC_GENERATION_OLD {
-                runtime().runtime_roots.forget_pending(payload);
+                owner.gc.runtime_roots.forget_pending(payload);
             }
             state.remembered_set.remove(&payload);
-            if let Some(drop_fn) = lookup_drop(object.type_id()) {
-                crate::frame_lifetime::pending_drop(
-                    object.payload().as_ptr() as usize,
-                    state.major_collections,
-                );
-                drops.push((drop_fn, object.payload().as_ptr()));
+            if let Some(drop_fn) = registry::lookup_drop_in(&owner.gc, object.type_id()) {
+                owner
+                    .frame_lifetime
+                    .pending_drop(object.payload().as_ptr() as usize, state.major_collections);
+                drops.push((
+                    drop_fn,
+                    object.payload().as_ptr(),
+                    crate::observation::Value::new(|| object.type_id()),
+                ));
             }
             release_pin(&mut state.pin_records, &mut state.survivor_stats, payload);
-            note_dead_frame(object, state.major_collections);
+            note_dead_frame_in(&owner.frame_lifetime, object, state.major_collections);
             object.reclaim_in_place();
             if object.generation() == GC_GENERATION_YOUNG {
                 state.young_allocated_bytes = state.young_allocated_bytes.saturating_sub(size);
@@ -560,10 +676,10 @@ fn sweep_chunk(
     (freed_bytes, !has_live_objects && owner_state.is_none())
 }
 
-fn finish(state: &mut GcState, dead_chunks: &[bool]) {
+fn finish(owner: &crate::runtime::Runtime, state: &mut GcState, dead_chunks: &[bool]) {
     // Release decisions read `allocations`, and remapping invalidates the
     // region indexes of active buffers.
-    old_lab::retire_all(state);
+    old_lab::retire_all_in(&owner.gc, state);
     let regions_before = state.old_regions.len();
     let mut released = 0usize;
     let mut positions = Vec::with_capacity(regions_before);
@@ -586,7 +702,7 @@ fn finish(state: &mut GcState, dead_chunks: &[bool]) {
     state.old_addresses.remap(&positions);
     state.old_reserved_bytes -= released;
     // Keep released storage for the next cycle's regions. O(released).
-    let budget = region_cache_budget(state);
+    let budget = region_cache_budget_in(&owner.gc, state);
     for (base, capacity) in released_storage {
         // SAFETY: the released region handed over its unindexed storage.
         if let Some(base) = unsafe { state.region_cache.retain(base, capacity, budget) } {
@@ -618,7 +734,7 @@ fn finish(state: &mut GcState, dead_chunks: &[bool]) {
                 state.survivor_stats.survivor_space_reserved -= chunk.capacity as u64;
             }
             assert!(chunk.owner_state.is_none());
-            runtime().root_tlabs.remove(chunk.base as usize);
+            owner.gc.root_tlabs.remove(chunk.base as usize);
             positions.push(None);
             let layout =
                 Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>()).unwrap();
@@ -645,8 +761,8 @@ fn finish(state: &mut GcState, dead_chunks: &[bool]) {
     );
     state.sweeping = None;
     state.pending_sweep_chunks = 0..0;
-    publish_collection_busy(state);
-    if *crate::diagnostic_settings::GC_VERIFY_REGIONS
+    publish_collection_busy_in(&owner.gc, state);
+    if *owner.diagnostics.verify_regions
         && let Err(message) = verify_old_region_metadata(state)
     {
         panic!("willow gc: region verification failed after major collection: {message}");
@@ -654,8 +770,19 @@ fn finish(state: &mut GcState, dead_chunks: &[bool]) {
 }
 
 fn note_dead_frame(object: HeapObject, sweep_epoch: u64) {
+    note_dead_frame_in(
+        &crate::runtime::current().frame_lifetime,
+        object,
+        sweep_epoch,
+    );
+}
+fn note_dead_frame_in(
+    owner: &crate::frame_lifetime::FrameLifetime,
+    object: HeapObject,
+    sweep_epoch: u64,
+) {
     if object.is_async_frame() {
-        crate::frame_lifetime::metadata_removed(
+        owner.metadata_removed(
             object.payload().as_ptr() as usize,
             object.size(),
             crate::async_frame::frame_is_terminal(object.payload().as_ptr().cast()),
@@ -674,9 +801,9 @@ mod publication_tests {
 
     fn append(state: &mut GcState, count: usize) {
         for _ in 0..count {
-            state
-                .old_regions
-                .push(OldRegion::new(RegionKind::Old, 16).unwrap());
+            state.old_regions.push(
+                OldRegion::new(&RuntimeStorageAllocator::default(), RegionKind::Old, 16).unwrap(),
+            );
         }
     }
 
@@ -795,5 +922,48 @@ mod publication_tests {
         ));
         assert_eq!(marking.sweep_publication_cursor.load(Ordering::Relaxed), 8);
         assert!(state.old_regions.iter().all(|r| r.sweep_pending));
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+
+    #[test]
+    fn sweep_observation_hooks_are_owned_and_called_outside_the_lock() {
+        let first = GcRuntime::default();
+        let second = GcRuntime::default();
+        *first.sweep_observation.hook.lock().unwrap() = Some(|_| panic!("selected hook"));
+        std::thread::scope(|scope| {
+            let a = scope.spawn(crate::runtime::serving(|| {
+                std::panic::catch_unwind(|| {
+                    RuntimeSweepObservation::between_regions(|| &first.sweep_observation, 0);
+                })
+                .is_err()
+            }));
+            let b = scope.spawn(crate::runtime::serving(|| {
+                RuntimeSweepObservation::published(|| &second.sweep_observation, 17);
+                RuntimeSweepObservation::between_regions(|| &second.sweep_observation, 0);
+            }));
+            assert!(a.join().unwrap());
+            b.join().unwrap();
+        });
+        RuntimeSweepObservation::published(|| &first.sweep_observation, 5);
+        assert_eq!(
+            first.sweep_observation.publications.load(Ordering::Relaxed),
+            5
+        );
+        assert_eq!(
+            second
+                .sweep_observation
+                .publications
+                .load(Ordering::Relaxed),
+            17
+        );
+        <()>::published(|| panic!("disabled observer resolved owner"), 1);
+        // A panicking callback must neither retain nor poison the observation lock.
+        *first.sweep_observation.hook.try_lock().unwrap() = None;
+        RuntimeSweepObservation::between_regions(|| &first.sweep_observation, 0);
+        <()>::between_regions(|| panic!("disabled observer resolved owner"), 0);
     }
 }

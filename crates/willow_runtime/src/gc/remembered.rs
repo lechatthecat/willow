@@ -46,18 +46,69 @@ pub(super) fn array_slot_card(owner: usize, slot: usize) -> usize {
 /// one value. Minors and resets run stopped; a swept owner is unreachable, so
 /// no mutator can store into its address until after reallocation, which
 /// follows this release increment.
+///
+/// The exported symbol is the process-default runtime's epoch. Every other
+/// runtime owns its own cell, so one runtime's minors never invalidate another
+/// runtime's barrier caches.
 #[unsafe(export_name = "willow_gc_card_epoch")]
 static CARD_EPOCH: AtomicU64 = AtomicU64::new(1);
 
-pub(super) fn card_epoch() -> u64 {
-    CARD_EPOCH.load(Ordering::Acquire)
+/// The process-default runtime's card epoch: the exported ABI data symbol.
+#[inline]
+pub(crate) const fn default_card_epoch() -> &'static AtomicU64 {
+    &CARD_EPOCH
 }
-fn advance_card_epoch() {
-    CARD_EPOCH.fetch_add(1, Ordering::AcqRel);
+
+/// One runtime's card-cache epoch, shared by its collector state and its
+/// lock-free barrier readers.
+#[derive(Clone, Debug)]
+pub(crate) enum CardEpoch {
+    DefaultAbi,
+    Owned(std::sync::Arc<AtomicU64>),
+}
+
+/// Bits below each runtime's epoch space. A thread's card cache and context
+/// proofs are keyed by `(owner, card, epoch)` and survive switching the served
+/// runtime, so epochs of different runtimes must never compare equal even when
+/// a released owner address is reused by another runtime's heap.
+const CARD_EPOCH_SPACE_BITS: u32 = 40;
+
+impl Default for CardEpoch {
+    fn default() -> Self {
+        // Space 0 is the default runtime's exported epoch.
+        static NEXT_SPACE: AtomicU64 = AtomicU64::new(1);
+        let space = NEXT_SPACE.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            space < 1 << (u64::BITS - CARD_EPOCH_SPACE_BITS),
+            "card epoch spaces exhausted"
+        );
+        Self::Owned(std::sync::Arc::new(AtomicU64::new(
+            (space << CARD_EPOCH_SPACE_BITS) | 1,
+        )))
+    }
+}
+
+impl CardEpoch {
+    #[inline]
+    pub(crate) fn cell(&self) -> &AtomicU64 {
+        match self {
+            Self::DefaultAbi => &CARD_EPOCH,
+            Self::Owned(epoch) => epoch,
+        }
+    }
+}
+
+/// The epoch of the runtime this thread serves; card caches are thread-local
+/// and filled only for that runtime.
+pub(super) fn card_epoch() -> u64 {
+    crate::runtime::current()
+        .card_epoch()
+        .load(Ordering::Acquire)
 }
 
 #[derive(Debug, Default)]
 pub(super) struct RememberedSet {
+    epoch: CardEpoch,
     owners: IdSet<usize>,
     cards: IdMap<usize, usize>,
     /// Card-remembered owners (also in `owners`) and their recorded cards.
@@ -65,11 +116,22 @@ pub(super) struct RememberedSet {
     array_cards: IdMap<usize, IdSet<usize>>,
 }
 impl RememberedSet {
+    pub(super) fn with_epoch(epoch: CardEpoch) -> Self {
+        Self {
+            epoch,
+            owners: IdSet::default(),
+            cards: IdMap::default(),
+            array_cards: IdMap::default(),
+        }
+    }
+    fn advance_card_epoch(&self) {
+        self.epoch.cell().fetch_add(1, Ordering::AcqRel);
+    }
     pub(super) fn insert(&mut self, owner: usize) -> bool {
         // Whole-owner remembering subsumes any recorded cards.
         let had_cards = self.array_cards.remove(&owner).is_some();
         if had_cards {
-            advance_card_epoch();
+            self.advance_card_epoch();
         }
         if !self.owners.insert(owner) {
             return had_cards;
@@ -96,7 +158,7 @@ impl RememberedSet {
             return false;
         }
         if self.array_cards.remove(owner).is_some() {
-            advance_card_epoch();
+            self.advance_card_epoch();
         }
         let card = owner / GC_CARD_SIZE;
         let count = self.cards.get_mut(&card).expect("remembered card count");
@@ -122,13 +184,18 @@ impl RememberedSet {
         self.owners.clear();
         self.cards.clear();
         self.array_cards.clear();
-        advance_card_epoch();
+        self.advance_card_epoch();
     }
     /// Move the contents out for a minor collection, invalidating barrier
     /// dedup caches of the recorded cards.
     pub(super) fn take(&mut self) -> Self {
-        advance_card_epoch();
-        std::mem::take(self)
+        self.advance_card_epoch();
+        Self {
+            epoch: self.epoch.clone(),
+            owners: std::mem::take(&mut self.owners),
+            cards: std::mem::take(&mut self.cards),
+            array_cards: std::mem::take(&mut self.array_cards),
+        }
     }
     /// Consume the set as whole owners and card-remembered owners.
     pub(super) fn into_parts(self) -> (Vec<usize>, Vec<(usize, Vec<usize>)>) {
@@ -201,9 +268,12 @@ mod tests {
         assert!(set.contains(&owner));
         assert_eq!(set.owner_cards(owner).map(|cards| cards.len()), Some(2));
 
-        let before = card_epoch();
+        let before = set.epoch.cell().load(Ordering::Acquire);
         let taken = set.take();
-        assert!(card_epoch() > before, "taking the set invalidates caches");
+        assert!(
+            set.epoch.cell().load(Ordering::Acquire) > before,
+            "taking the set invalidates caches"
+        );
         assert!(set.is_empty() && set.owner_cards(owner).is_none());
         let (whole, mut carded) = taken.into_parts();
         assert!(whole.is_empty());
@@ -212,10 +282,10 @@ mod tests {
 
         // Whole-owner remembering supersedes cards and drops them.
         assert!(set.insert_card(owner, 1));
-        let before = card_epoch();
+        let before = set.epoch.cell().load(Ordering::Acquire);
         assert!(set.insert(owner), "conversion must set the header flag");
         assert!(!set.insert(owner));
-        assert!(card_epoch() > before);
+        assert!(set.epoch.cell().load(Ordering::Acquire) > before);
         assert!(set.owner_cards(owner).is_none());
         assert!(!set.insert_card(owner, 2), "whole owner ignores cards");
         assert!(set.owner_cards(owner).is_none());
@@ -225,15 +295,15 @@ mod tests {
 
         // Sweeping a card owner invalidates caches for a reused address.
         assert!(set.insert_card(owner, 5));
-        let before = card_epoch();
+        let before = set.epoch.cell().load(Ordering::Acquire);
         assert!(set.remove(&owner));
-        assert!(card_epoch() > before);
+        assert!(set.epoch.cell().load(Ordering::Acquire) > before);
         assert!(set.is_empty() && set.cards.is_empty());
 
         assert!(set.insert_card(owner, 5));
-        let before = card_epoch();
+        let before = set.epoch.cell().load(Ordering::Acquire);
         set.clear();
-        assert!(card_epoch() > before);
+        assert!(set.epoch.cell().load(Ordering::Acquire) > before);
         assert!(set.owner_cards(owner).is_none());
     }
 }

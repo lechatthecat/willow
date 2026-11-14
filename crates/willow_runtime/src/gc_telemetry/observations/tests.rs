@@ -115,13 +115,13 @@ fn concurrent_recording_and_snapshots_preserve_group_invariants() {
     std::thread::scope(|scope| {
         for _ in 0..4 {
             let s = &s;
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 for _ in 0..100 {
                     let mut s = s.lock().unwrap();
                     s.begin(e(1, 0, 1));
                     s.end(e(2, 0, 2), 1);
                 }
-            });
+            }));
         }
         for _ in 0..100 {
             let s = s.lock().unwrap();
@@ -134,7 +134,7 @@ fn concurrent_recording_and_snapshots_preserve_group_invariants() {
 #[test]
 fn v4_abi_negotiation_preserves_v1_v2_v3() {
     use crate::gc_telemetry::*;
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     assert_eq!(std::mem::offset_of!(WillowGcStatsV4, struct_size), 4);
     assert_eq!(std::mem::offset_of!(WillowGcStatsV4, baseline), 16);
     assert_eq!(std::mem::size_of::<Work>(), 56);
@@ -236,9 +236,9 @@ fn enabled_runtime_lifecycle_assist_unwind_and_lock_capture() {
         std::fs::remove_dir_all(&dir).unwrap();
         return;
     };
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     let before = snapshot();
-    std::thread::spawn(|| {
+    std::thread::spawn(crate::runtime::serving(|| {
         let _registration = crate::gc::MutatorRegistration::new();
         for _ in 0..CAPACITY * 2 {
             crate::gc::willow_gc_safepoint();
@@ -249,12 +249,12 @@ fn enabled_runtime_lifecycle_assist_unwind_and_lock_capture() {
         });
         let mutex = GcMutex::new(());
         drop(mutex.lock().unwrap());
-    })
+    }))
     .join()
     .unwrap();
     // The same role scope used by worker_loop must cover registration,
     // progress and retirement, including unwind restoration.
-    std::thread::spawn(|| {
+    std::thread::spawn(crate::runtime::serving(|| {
         assert_eq!(ROLE.get(), 0);
         {
             let _role = MarkerRole::new();
@@ -263,7 +263,7 @@ fn enabled_runtime_lifecycle_assist_unwind_and_lock_capture() {
             assert_eq!(event(7, 0).role, 1);
         }
         assert_eq!(ROLE.get(), 0);
-    })
+    }))
     .join()
     .unwrap();
     let after = snapshot();
@@ -280,10 +280,10 @@ fn enabled_runtime_lifecycle_assist_unwind_and_lock_capture() {
     // Explicit collection joins through the shared cycle wait, which is not an
     // allocation stall. Checked after lifecycle counts: it starts marker threads.
     let stalls = snapshot().intervals[Kind::AllocationStall as usize].count;
-    std::thread::spawn(|| {
+    std::thread::spawn(crate::runtime::serving(|| {
         let _registration = crate::gc::MutatorRegistration::new();
         crate::gc::willow_gc_collect();
-    })
+    }))
     .join()
     .unwrap();
     assert_eq!(
@@ -305,7 +305,9 @@ fn concurrent_progress_saturates_instead_of_wrapping() {
     std::thread::scope(|scope| {
         for _ in 0..16 {
             let count = &count;
-            scope.spawn(move || accumulate_progress(count, 256));
+            scope.spawn(crate::runtime::serving(move || {
+                accumulate_progress(count, 256)
+            }));
         }
     });
     assert_eq!(count.load(Ordering::Relaxed), u64::MAX);
@@ -315,31 +317,40 @@ fn concurrent_progress_saturates_instead_of_wrapping() {
 fn nested_phase_scope_restores_after_unwind() {
     assert_eq!(STOP_PHASE.get(), None);
     {
-        let _phase = StopPhase::new(1);
+        let _phase = StopPhase::new(default_owner(), 1);
         let _ = std::panic::catch_unwind(|| {
-            let _nested = StopPhase::new(2);
-            assert_eq!(STOP_PHASE.get(), Some(2));
+            let _nested = StopPhase::new(default_owner(), 2);
+            assert_eq!(STOP_PHASE.get(), Some((default_owner() as *const _, 2)));
             panic!("nested phase");
         });
-        assert_eq!(STOP_PHASE.get(), Some(1));
+        assert_eq!(STOP_PHASE.get(), Some((default_owner() as *const _, 1)));
     }
     assert_eq!(STOP_PHASE.get(), None);
 }
 
 #[test]
 fn progress_batch_flushes_on_unregister_and_is_per_thread() {
-    let before = PROGRESS.load(Ordering::Relaxed);
-    std::thread::spawn(|| {
-        LOCAL_PROGRESS.set(7);
-        PENDING_PROGRESS.set(7);
-        flush_progress();
-        assert_eq!(PENDING_PROGRESS.get(), 0);
-        assert_eq!(event(4, 0).progress, 7);
-        flush_progress();
-    })
-    .join()
-    .unwrap();
-    assert!(PROGRESS.load(Ordering::Relaxed) >= before + 7);
+    let owner = Observations {
+        state: LazyLock::new(|| Mutex::new(State::default())),
+        progress: AtomicU64::new(0),
+        epoch: AtomicU64::new(0),
+    };
+    std::thread::scope(|scope| {
+        scope
+            .spawn(crate::runtime::serving(|| {
+                REGISTERED.set(&owner);
+                LOCAL_PROGRESS.set(7);
+                PENDING_PROGRESS.set(7);
+                flush_progress(&owner);
+                assert_eq!(PENDING_PROGRESS.get(), 0);
+                assert_eq!(owner.event(4, 0).progress, 7);
+                flush_progress(&owner);
+                REGISTERED.set(std::ptr::null());
+            }))
+            .join()
+            .unwrap();
+    });
+    assert_eq!(owner.progress.load(Ordering::Relaxed), 7);
     assert_eq!(LOCAL_PROGRESS.get(), 0);
 }
 
@@ -356,20 +367,20 @@ fn cycle_wait_events_do_not_grow_or_pollute_histogram_abi() {
 #[test]
 fn nested_cycle_restores_parent_epoch_on_completion_and_unwind() {
     use crate::gc_telemetry::{Cycle, CycleKind};
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     crate::gc::reset_internal_for_test();
-    let before = EPOCH.load(Ordering::Relaxed);
+    let before = default_owner().epoch.load(Ordering::Relaxed);
     {
         let outer = Cycle::begin(CycleKind::Major);
-        let parent = EPOCH.load(Ordering::Relaxed);
+        let parent = default_owner().epoch.load(Ordering::Relaxed);
         {
             let _nested = Cycle::begin(CycleKind::Minor);
-            assert!(EPOCH.load(Ordering::Relaxed) > parent);
+            assert!(default_owner().epoch.load(Ordering::Relaxed) > parent);
         }
-        assert_eq!(EPOCH.load(Ordering::Relaxed), parent);
+        assert_eq!(default_owner().epoch.load(Ordering::Relaxed), parent);
         outer.finish(0, 0, Default::default());
     }
-    assert_eq!(EPOCH.load(Ordering::Relaxed), before);
+    assert_eq!(default_owner().epoch.load(Ordering::Relaxed), before);
 }
 
 #[test]
@@ -435,4 +446,201 @@ fn configured_transport_bound_and_drain_preserve_sequence() {
         assert_eq!(s.events.front().unwrap().sequence, 2 * capacity as u64 + 1);
         assert_ne!(s.stats.flags & LOST, 0);
     }
+}
+
+#[test]
+fn observation_owners_keep_event_sequences_progress_and_drains_independent() {
+    fn owner() -> Observations {
+        Observations {
+            state: LazyLock::new(|| Mutex::new(State::default())),
+            progress: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+        }
+    }
+    let first = owner();
+    let second = owner();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = [(&first, 1), (&second, 3)]
+            .into_iter()
+            .map(|(owner, stride)| {
+                let barrier = &barrier;
+                scope.spawn(crate::runtime::serving(move || {
+                    for round in 1..=32 {
+                        let mut event = e(1, Kind::Roots as u64, round * 100);
+                        {
+                            let mut state = owner.state.lock().unwrap();
+                            event.identity = state.begin(event);
+                            event.event = 2;
+                            event.timestamp_ns += stride;
+                            state.end(event, round * 100);
+                        }
+                        accumulate_progress(&owner.progress, stride);
+                        barrier.wait();
+                        let stats = owner.snapshot();
+                        assert_eq!(stats.sequence, 2 * round);
+                        assert_eq!(stats.progress, round * stride);
+                        assert_eq!(stats.active_intervals, 0);
+                        barrier.wait();
+                    }
+                }))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+    let (events, first_stats) = first.take_events();
+    assert_eq!(events.len(), 64);
+    assert_eq!(first_stats.progress, 32);
+    assert!(first.take_events().0.is_empty());
+    let (events, second_stats) = second.take_events();
+    assert_eq!(events.len(), 64);
+    assert_eq!(second_stats.progress, 96);
+    assert_eq!(second_stats.dropped, 0);
+}
+
+#[test]
+fn observation_epoch_owners_tag_spans_and_restore_nested_epochs_independently() {
+    fn owner() -> Observations {
+        Observations {
+            state: LazyLock::new(|| Mutex::new(State::default())),
+            progress: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+        }
+    }
+    let first = owner();
+    let second = owner();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = [(&first, 1), (&second, 100)]
+            .into_iter()
+            .map(|(owner, epoch)| {
+                let barrier = &barrier;
+                scope.spawn(crate::runtime::serving(move || {
+                    let previous = owner.epoch(epoch);
+                    let outer = Span::start_in(owner, Kind::Cycle);
+                    barrier.wait();
+                    let parent = owner.epoch(epoch + 1);
+                    let mut inner = Span::start_in(owner, Kind::Cycle);
+                    inner.abort();
+                    owner.epoch(parent);
+                    drop(inner);
+                    barrier.wait();
+                    assert_eq!(owner.event(0, 0).epoch, epoch);
+                    owner.epoch(previous);
+                    drop(outer);
+                    let (events, stats) = owner.take_events();
+                    assert_eq!(
+                        events.iter().map(|e| e.epoch).collect::<Vec<_>>(),
+                        vec![epoch, epoch + 1, epoch + 1, epoch]
+                    );
+                    assert_eq!(stats.active_intervals, 0);
+                    assert_eq!(events[2].aborted, 1);
+                    assert_eq!(owner.epoch.load(Ordering::Relaxed), 0);
+                }))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+}
+
+#[test]
+fn private_observation_span_does_not_flush_another_owners_progress() {
+    fn owner() -> Observations {
+        Observations {
+            state: LazyLock::new(|| Mutex::new(State::default())),
+            progress: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+        }
+    }
+    let first = owner();
+    let second = owner();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(crate::runtime::serving(|| {
+                REGISTERED.set(&first);
+                LOCAL_PROGRESS.set(19);
+                PENDING_PROGRESS.set(19);
+                drop(Span::start_in(&second, Kind::Cycle));
+                assert_eq!(PENDING_PROGRESS.get(), 19);
+                assert_eq!(second.snapshot().progress, 0);
+                assert!(
+                    second
+                        .take_events()
+                        .0
+                        .iter()
+                        .all(|event| event.progress == 0)
+                );
+                drop(Span::start_in(&first, Kind::Cycle));
+                assert_eq!(PENDING_PROGRESS.get(), 0);
+                assert_eq!(first.snapshot().progress, 19);
+                assert!(
+                    first
+                        .take_events()
+                        .0
+                        .iter()
+                        .all(|event| event.progress == 19)
+                );
+                REGISTERED.set(std::ptr::null());
+            }))
+            .join()
+            .unwrap();
+    });
+    assert_eq!(second.snapshot().progress, 0);
+}
+
+#[test]
+fn stopped_graph_work_uses_only_the_matching_runtime_phase() {
+    let mut first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let mut second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    first.diagnostics.gc_measure = std::sync::LazyLock::new(|| true);
+    second.diagnostics.gc_measure = std::sync::LazyLock::new(|| true);
+    let mark = super::super::MarkWork {
+        objects: 7,
+        ..Default::default()
+    };
+    {
+        let _outer = StopPhase::new(&first.telemetry.observations, 1);
+        graph_work_in(&first, mark);
+        graph_work_in(&second, mark);
+        assert_eq!(first.telemetry.observations.snapshot().work[1].objects, 7);
+        assert_eq!(second.telemetry.observations.snapshot().work[1].objects, 0);
+        {
+            let _inner = StopPhase::new(&second.telemetry.observations, 2);
+            graph_work_in(&second, mark);
+        }
+        graph_work_in(&first, mark);
+    }
+    assert_eq!(first.telemetry.observations.snapshot().work[1].objects, 14);
+    assert_eq!(second.telemetry.observations.snapshot().work[2].objects, 7);
+    assert!(STOP_PHASE.get().is_none());
+}
+
+#[test]
+fn progress_rejects_foreign_owner_without_consuming_pending_batch() {
+    std::thread::spawn(crate::runtime::serving(|| {
+        let first = Observations::new();
+        let second = Observations::new();
+        progress_in(&first);
+        assert_eq!(LOCAL_PROGRESS.get(), 0);
+        REGISTERED.set(&first);
+        for _ in 0..255 {
+            progress_in(&first);
+            progress_in(&second);
+        }
+        assert_eq!(PENDING_PROGRESS.get(), 255);
+        assert_eq!(LOCAL_PROGRESS.get(), 255);
+        assert_eq!(second.progress.load(Ordering::Relaxed), 0);
+        progress_in(&first);
+        assert_eq!(PENDING_PROGRESS.get(), 0);
+        assert_eq!(first.progress.load(Ordering::Relaxed), 256);
+        REGISTERED.set(std::ptr::null());
+        progress_in(&first);
+        assert_eq!(LOCAL_PROGRESS.get(), 256);
+    }))
+    .join()
+    .unwrap();
 }

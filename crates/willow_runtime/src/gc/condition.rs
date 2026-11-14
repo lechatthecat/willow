@@ -9,8 +9,7 @@ use std::time::Duration;
 pub(crate) struct GcCondvar {
     inner: Condvar,
     waiters: AtomicUsize,
-    #[cfg(test)]
-    notifications: AtomicUsize,
+    notifications: crate::observation::Value<AtomicUsize>,
 }
 
 struct Waiter<'a>(&'a AtomicUsize);
@@ -53,8 +52,9 @@ impl GcCondvar {
     /// registration and this check, so the count needs no independent fence.
     pub(crate) fn notify_all(&self) {
         if self.waiters.load(Ordering::Relaxed) != 0 {
-            #[cfg(test)]
-            self.notifications.fetch_add(1, Ordering::Relaxed);
+            self.notifications.observe(|count| {
+                count.fetch_add(1, Ordering::Relaxed);
+            });
             self.inner.notify_all();
         }
     }
@@ -85,12 +85,12 @@ mod tests {
             let lock = Mutex::new(false);
             std::thread::scope(|scope| {
                 for _ in 0..count {
-                    scope.spawn(|| {
+                    scope.spawn(crate::runtime::serving(|| {
                         let mut done = lock.lock().unwrap();
                         while !*done {
                             done = cv.wait(done).unwrap();
                         }
-                    });
+                    }));
                 }
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 loop {
@@ -124,11 +124,11 @@ mod tests {
         let lock = Mutex::new(());
         let guard = lock.lock().unwrap();
         std::thread::scope(|scope| {
-            let worker = scope.spawn(|| {
+            let worker = scope.spawn(crate::runtime::serving(|| {
                 let _guard = lock.lock().unwrap();
                 cv.notify_all();
                 panic!("poisoned predicate");
-            });
+            }));
             let mut waiting = guard;
             while let Ok(next) = cv.wait(waiting) {
                 waiting = next;

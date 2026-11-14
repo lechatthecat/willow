@@ -74,7 +74,7 @@ fn histogram_and_cycle_work_saturate_without_wrapping() {
 
 #[test]
 fn fixed_v1_header_and_symbol_write_one_struct() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     assert_eq!(std::mem::offset_of!(WillowGcStatsV1, version), 0);
     assert_eq!(std::mem::offset_of!(WillowGcStatsV1, struct_size), 4);
@@ -107,7 +107,7 @@ fn fixed_v1_header_and_symbol_write_one_struct() {
 
 #[test]
 fn negotiated_snapshot_validates_before_writing_and_accepts_byte_buffers() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let size = std::mem::size_of::<WillowGcStatsV1>();
     assert_eq!(willow_gc_stats_size(1), size as i64);
@@ -144,7 +144,7 @@ fn negotiated_snapshot_validates_before_writing_and_accepts_byte_buffers() {
 
 #[test]
 fn major_cycle_reports_live_graph_null_slots_and_duplicate_roots() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let mut parent = willow_alloc_typed(16, 3);
     willow_push_root(&mut parent);
@@ -192,7 +192,7 @@ fn major_cycle_reports_live_graph_null_slots_and_duplicate_roots() {
 
 #[test]
 fn registered_trace_callbacks_contribute_reference_scan_bytes() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     unsafe fn trace(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
         slots.push(payload.cast());
@@ -229,7 +229,7 @@ fn registered_trace_callbacks_contribute_reference_scan_bytes() {
 
 #[test]
 fn minor_cycles_do_not_overwrite_the_last_major_live_measurement() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let mut live = willow_alloc(8);
     willow_push_root(&mut live);
@@ -252,7 +252,7 @@ fn minor_cycles_do_not_overwrite_the_last_major_live_measurement() {
 
 #[test]
 fn reset_clears_cumulative_counts_without_reusing_cycle_identity() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     willow_gc_collect();
     let epoch = snapshot().epoch;
@@ -321,7 +321,7 @@ fn trace_pair_and_histogram_describe_the_same_cycle() {
 
 #[test]
 fn broken_trace_writer_is_disabled_and_gc_still_completes() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     struct Broken;
     impl Write for Broken {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> {
@@ -331,15 +331,22 @@ fn broken_trace_writer_is_disabled_and_gc_still_completes() {
             Ok(())
         }
     }
-    let before = TRACE_ERRORS.load(Ordering::Relaxed);
+    let trace_owner = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let before = trace_owner.telemetry.trace_errors.load(Ordering::Relaxed);
     let mut sink = TraceSink {
         writer: Some(Box::new(Broken)),
     };
-    sink.cycle(GcCycleV1::default());
+    sink.cycle(GcCycleV1::default(), &trace_owner);
     assert!(sink.writer.is_none());
-    assert_eq!(TRACE_ERRORS.load(Ordering::Relaxed), before + 1);
-    sink.cycle(GcCycleV1::default());
-    assert_eq!(TRACE_ERRORS.load(Ordering::Relaxed), before + 1);
+    assert_eq!(
+        trace_owner.telemetry.trace_errors.load(Ordering::Relaxed),
+        before + 1
+    );
+    sink.cycle(GcCycleV1::default(), &trace_owner);
+    assert_eq!(
+        trace_owner.telemetry.trace_errors.load(Ordering::Relaxed),
+        before + 1
+    );
     reset_internal_for_test();
     willow_alloc(8);
     willow_gc_collect();
@@ -348,7 +355,7 @@ fn broken_trace_writer_is_disabled_and_gc_still_completes() {
 
 #[test]
 fn concurrent_allocation_registration_collection_and_100k_snapshots() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     willow_gc_register_mutator();
     let start = Arc::new(std::sync::Barrier::new(41));
@@ -357,7 +364,7 @@ fn concurrent_allocation_registration_collection_and_100k_snapshots() {
     let readers: Vec<_> = (0..8)
         .map(|_| {
             let start = start.clone();
-            std::thread::spawn(move || {
+            std::thread::spawn(crate::runtime::serving(move || {
                 start.wait();
                 let mut previous = snapshot();
                 for _ in 0..12_500 {
@@ -378,7 +385,7 @@ fn concurrent_allocation_registration_collection_and_100k_snapshots() {
                     assert!(s.timestamp_ns >= previous.timestamp_ns);
                     previous = s;
                 }
-            })
+            }))
         })
         .collect();
     let workers: Vec<_> = (0..32)
@@ -386,7 +393,7 @@ fn concurrent_allocation_registration_collection_and_100k_snapshots() {
             let start = start.clone();
             let done = done.clone();
             let ready = ready.clone();
-            std::thread::spawn(move || {
+            std::thread::spawn(crate::runtime::serving(move || {
                 // Wait before registering: a barrier wait is not a GC safepoint.
                 start.wait();
                 let mutator = crate::gc::MutatorRegistration::new();
@@ -400,7 +407,7 @@ fn concurrent_allocation_registration_collection_and_100k_snapshots() {
                     std::thread::yield_now();
                 }
                 drop(mutator);
-            })
+            }))
         })
         .collect();
     start.wait();
@@ -439,7 +446,7 @@ fn resident_sampling_is_best_effort_and_does_not_claim_heap_rss() {
     if let Some(bytes) = resident_bytes() {
         assert!(bytes > 0);
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let s = snapshot();
     assert_eq!(s.resident_valid, 0); // frequent Rust API never performs OS I/O
     assert_eq!(s.process_resident_bytes, 0);
@@ -534,7 +541,7 @@ fn v2_trace_records_required_initial_and_remark_stops() {
 
 #[test]
 fn v2_stop_trace_failure_disables_writer_without_changing_counts() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     struct Broken;
     impl Write for Broken {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> {
@@ -544,17 +551,24 @@ fn v2_stop_trace_failure_disables_writer_without_changing_counts() {
             Ok(())
         }
     }
-    let before = TRACE_ERRORS.load(Ordering::Relaxed);
+    let trace_owner = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let before = trace_owner.telemetry.trace_errors.load(Ordering::Relaxed);
     let counts = stops::snapshot_stops();
     let mut sink = TraceSink {
         writer: Some(Box::new(Broken)),
     };
-    sink.stops(&[stops::StopEventV2::default()]);
+    sink.stops(&[stops::StopEventV2::default()], &trace_owner.telemetry);
     assert!(sink.writer.is_none());
-    assert_eq!(TRACE_ERRORS.load(Ordering::Relaxed), before + 1);
+    assert_eq!(
+        trace_owner.telemetry.trace_errors.load(Ordering::Relaxed),
+        before + 1
+    );
     assert_eq!(stops::snapshot_stops().last_sequence, counts.last_sequence);
-    sink.cycle(GcCycleV1::default());
-    assert_eq!(TRACE_ERRORS.load(Ordering::Relaxed), before + 1);
+    sink.cycle(GcCycleV1::default(), &trace_owner);
+    assert_eq!(
+        trace_owner.telemetry.trace_errors.load(Ordering::Relaxed),
+        before + 1
+    );
 }
 
 #[test]
@@ -657,7 +671,7 @@ fn trace_file_write_failure_preserves_collection() {
 
 #[test]
 fn aborted_cycles_restore_idle_without_publishing_partial_work() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     willow_gc_collect();
     let completed = snapshot();
@@ -697,7 +711,7 @@ fn aborted_cycles_restore_idle_without_publishing_partial_work() {
 
 #[test]
 fn nested_minor_preserves_major_phase_and_monotonic_epoch() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let major = Cycle::begin(CycleKind::Major);
     let minor = Cycle::begin(CycleKind::Minor);
@@ -735,5 +749,185 @@ fn platform_provider_fakes_preserve_scope_and_clear_stale_validity() {
         assert_eq!(sample.process_resident_bytes, resident.unwrap_or(0));
         assert_eq!(sample.heap.committed_bytes, 123);
         assert_eq!(sample.heap.occupied_bytes, 17);
+    }
+}
+
+#[test]
+fn cycle_aggregate_completion_and_abort_follow_the_borrowed_owner() {
+    let _guard = crate::gc::isolated_runtime();
+    crate::gc::reset_internal_for_test();
+    let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let before = pacing_cycle_snapshot();
+    let a = Cycle::begin_in(&first.telemetry, CycleKind::Major);
+    first.telemetry.completed_cpu.with_override(Some(7), || {
+        a.finish(
+            64,
+            32,
+            MarkWork {
+                cpu_ns: 11,
+                ..MarkWork::default()
+            },
+        );
+    });
+    assert_eq!(first.telemetry.pacing.snapshot().gc_cpu_ns, 7);
+    let b = Cycle::begin_in(&second.telemetry, CycleKind::Minor);
+    second.telemetry.completed_cpu.with_override(None, || {
+        b.finish(
+            16,
+            8,
+            MarkWork {
+                cpu_ns: 5,
+                ..MarkWork::default()
+            },
+        );
+    });
+    assert_eq!(
+        first.telemetry.observations.epoch.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        second.telemetry.observations.epoch.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(first.telemetry.measurements.snapshot().mark_cpu_ns, 11);
+    assert_eq!(second.telemetry.measurements.snapshot().mark_cpu_ns, 5);
+    assert_eq!(measurement::snapshot().mark_cpu_ns, 0);
+    assert_eq!(first.telemetry.pacing.snapshot().gc_cpu_ns, 7);
+    assert_eq!(second.telemetry.pacing.snapshot().cpu_missing_cycles, 1);
+    assert_eq!(first.telemetry.pacing.snapshot().cpu_missing_cycles, 0);
+    assert_eq!(pacing::snapshot().gc_cpu_ns, 0);
+    assert_eq!(pacing::snapshot().cpu_missing_cycles, 0);
+    {
+        let first_stats = first.telemetry.state.lock().unwrap().stats;
+        let second_stats = second.telemetry.state.lock().unwrap().stats;
+        assert_eq!(first_stats.major_cycles, 1);
+        assert_eq!(first_stats.minor_cycles, 0);
+        assert_eq!(second_stats.major_cycles, 0);
+        assert_eq!(second_stats.minor_cycles, 1);
+    }
+    let aborted = Cycle::begin_in(&first.telemetry, CycleKind::Major);
+    drop(aborted);
+    let first_stats = first.telemetry.state.lock().unwrap().stats;
+    assert_eq!(first_stats.major_cycles, 1);
+    assert_eq!(first_stats.epoch, 2);
+    assert_eq!(first_stats.phase, 0);
+    assert_eq!(second.telemetry.state.lock().unwrap().stats.epoch, 1);
+    assert_eq!(pacing_cycle_snapshot().major_cycles, before.major_cycles);
+    assert_eq!(pacing_cycle_snapshot().minor_cycles, before.minor_cycles);
+    assert_eq!(pacing_cycle_snapshot().epoch, before.epoch);
+    assert!(std::sync::LazyLock::get(&first.gc).is_none());
+    assert!(std::sync::LazyLock::get(&second.gc).is_none());
+    crate::gc::reset_internal_for_test();
+}
+
+#[test]
+fn private_trace_owners_isolate_failures_and_release_writers() {
+    struct Broken(std::sync::Arc<AtomicU64>);
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected private trace failure"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Drop for Broken {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let drops = std::sync::Arc::new(AtomicU64::new(0));
+    for owner in [&first, &second] {
+        assert!(
+            owner
+                .telemetry
+                .trace
+                .set(Some(Mutex::new(TraceSink {
+                    writer: Some(Box::new(Broken(drops.clone()))),
+                })))
+                .is_ok()
+        );
+    }
+    std::thread::scope(|scope| {
+        for owner in [&first, &second] {
+            scope.spawn(crate::runtime::serving(move || {
+                let mut sink = owner.telemetry.trace().as_ref().unwrap().lock().unwrap();
+                sink.cycle(GcCycleV1::default(), owner);
+                assert_eq!(owner.telemetry.trace_errors.load(Ordering::Relaxed), 1);
+                sink.cycle(GcCycleV1::default(), owner);
+                assert_eq!(owner.telemetry.trace_errors.load(Ordering::Relaxed), 1);
+                assert!(sink.writer.is_none());
+            }));
+        }
+    });
+    assert_eq!(drops.load(Ordering::Relaxed), 2);
+    drop(first);
+    second
+        .telemetry
+        .trace_errors
+        .store(u64::MAX, Ordering::Relaxed);
+    second.telemetry.trace_error();
+    assert_eq!(
+        second.telemetry.trace_errors.load(Ordering::Relaxed),
+        u64::MAX
+    );
+}
+
+#[test]
+fn private_cycle_publication_uses_its_runtime_configuration_and_counters() {
+    #[derive(Clone)]
+    struct Output(std::sync::Arc<Mutex<Vec<u8>>>);
+    impl Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let mut second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    first.diagnostics.gc_trace_version = LazyLock::new(|| 3);
+    second.diagnostics.gc_trace_version = LazyLock::new(|| 1);
+    first.diagnostics.gc_measure = LazyLock::new(|| false);
+    second.diagnostics.gc_measure = LazyLock::new(|| false);
+    let outputs: Vec<_> = [&first, &second]
+        .into_iter()
+        .enumerate()
+        .map(|(index, owner)| {
+            owner.telemetry.state.lock().unwrap().stats.epoch = 41 + index as u64;
+            let output = Output(std::sync::Arc::new(Mutex::new(Vec::new())));
+            assert!(
+                owner
+                    .telemetry
+                    .trace
+                    .set(Some(Mutex::new(TraceSink {
+                        writer: Some(Box::new(output.clone())),
+                    })))
+                    .is_ok()
+            );
+            output
+        })
+        .collect();
+    std::thread::scope(|scope| {
+        for owner in [&first, &second] {
+            scope.spawn(crate::runtime::serving(move || {
+                emit_cycle_in(owner, GcCycleV1::default())
+            }));
+        }
+    });
+    let first_text = String::from_utf8(outputs[0].0.lock().unwrap().clone()).unwrap();
+    let second_text = String::from_utf8(outputs[1].0.lock().unwrap().clone()).unwrap();
+    assert!(first_text.contains("\"counter_epoch\":41"));
+    assert!(!first_text.contains("\"counter_epoch\":42"));
+    assert!(!second_text.contains("gc_verification"));
+    assert!(second_text.contains("gc_end"));
+    for owner in [&first, &second] {
+        assert_eq!(owner.telemetry.trace_errors.load(Ordering::Relaxed), 0);
+        assert!(LazyLock::get(&owner.gc).is_none());
     }
 }

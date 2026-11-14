@@ -3,14 +3,16 @@ use super::*;
 use crate::gc::*;
 
 fn end(cycle: &ConcurrentCycle) {
-    GC_MARK_PHASE.store(0, Ordering::Release);
+    crate::runtime::current()
+        .mark_phase()
+        .store(0, Ordering::Release);
     marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
     cycle.queue.end_epoch();
 }
 
 #[test]
 fn overlap_graph_copy_promotion_and_snapshot_only_reachability() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for shape in ["chain", "cycle", "fanout", "shared"] {
         for count in [1usize, 16, 64, 256] {
             reset_internal_for_test();
@@ -101,7 +103,7 @@ fn overlap_graph_copy_promotion_and_snapshot_only_reachability() {
 
 #[test]
 fn overlap_containers_and_async_frame_preserve_rewritten_edges() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for kind in ["array", "map", "channel", "frame"] {
         reset_internal_for_test();
         let mut owner = match kind {
@@ -166,28 +168,38 @@ fn overlap_containers_and_async_frame_preserve_rewritten_edges() {
 
 #[test]
 fn overlap_minor_requests_coalesce_under_major_owner_and_registration_changes() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for participants in [1, 4, 16] {
         reset_internal_for_test();
-        PENDING.store(false, std::sync::atomic::Ordering::Release);
+        runtime()
+            .minor_pending
+            .store(false, std::sync::atomic::Ordering::Release);
         let elected = cycle_wait::CollectorGuard::try_acquire().unwrap();
         let (_, cycle) = root_handshake::begin().unwrap();
         let threads: Vec<_> = (0..participants)
             .map(|_| {
-                std::thread::spawn(|| {
+                std::thread::spawn(crate::runtime::serving(|| {
                     let _mutator = MutatorRegistration::new();
                     minor_collect_internal();
-                })
+                }))
             })
             .collect();
         for thread in threads {
             thread.join().unwrap();
         }
         assert_eq!(runtime().heap.lock().unwrap().minor_collections, 0);
-        assert!(PENDING.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            runtime()
+                .minor_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
         service_pending();
         assert_eq!(runtime().heap.lock().unwrap().minor_collections, 1);
-        assert!(!PENDING.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            !runtime()
+                .minor_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
         assert_eq!(cycle.queue.current_epoch(), cycle.mark_epoch);
         assert!(!cycle.termination.request(cycle.termination.sample(), false));
         end(&cycle);
@@ -198,11 +210,13 @@ fn overlap_minor_requests_coalesce_under_major_owner_and_registration_changes() 
 
 #[test]
 fn overlap_satb_deletions_parked_mutators_and_old_descendants_survive_sweep() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for participants in [1usize, 4, 16] {
         for closing in [false, true] {
             reset_internal_for_test();
-            PENDING.store(false, std::sync::atomic::Ordering::Release);
+            runtime()
+                .minor_pending
+                .store(false, std::sync::atomic::Ordering::Release);
             let mut tls = tlab_state_for_test();
             let mut owners = Vec::new();
             let mut leaves = Vec::new();
@@ -242,7 +256,7 @@ fn overlap_satb_deletions_parked_mutators_and_old_descendants_survive_sweep() {
                     let address = owner as usize;
                     let ready = ready.clone();
                     let done = done.clone();
-                    std::thread::spawn(move || {
+                    std::thread::spawn(crate::runtime::serving(move || {
                         let _mutator = MutatorRegistration::new();
                         let owner = address as *mut u8;
                         let young = unsafe { *owner.cast::<*mut u8>() };
@@ -261,7 +275,7 @@ fn overlap_satb_deletions_parked_mutators_and_old_descendants_survive_sweep() {
                             willow_gc_safepoint();
                             std::thread::yield_now();
                         }
-                    })
+                    }))
                 })
                 .collect();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -307,7 +321,7 @@ fn overlap_native_async_frame_and_marker_pool_pause_resume() {
             willow_abi::NativeFrameLayout::new(&[willow_abi::SlotKind::GcRef]);
         const NAME: &'static str = "minor overlap";
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let frame = NativeTaskFrame::<Frame>::allocate().unwrap();
     let mut tls = tlab_state_for_test();
@@ -320,13 +334,15 @@ fn overlap_native_async_frame_and_marker_pool_pause_resume() {
     let (_, cycle) = root_handshake::begin().unwrap();
     let pool = mark_workers::Pool::new(2).unwrap();
     for _ in 0..2 {
-        PENDING.store(true, std::sync::atomic::Ordering::Release);
-        pool.run(&cycle, 1024);
+        runtime()
+            .minor_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+        pool.run(crate::runtime::current(), &cycle, 1024);
         assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
         assert_eq!(cycle.queue.snapshot().active_consumers, 0);
         service_pending();
         assert_eq!(cycle.queue.current_epoch(), cycle.mark_epoch);
-        pool.run(&cycle, 1024);
+        pool.run(crate::runtime::current(), &cycle, 1024);
         assert!(cycle.queue.snapshot().is_drained());
         assert!(cycle.is_marked(frame.load_gc(0) as usize));
         assert_eq!(unsafe { *frame.load_gc(0).cast::<i64>() }, 456);
@@ -343,14 +359,14 @@ fn overlap_native_async_frame_and_marker_pool_pause_resume() {
 
 #[test]
 fn overlap_phase_requests_and_remark_election_keep_epoch_ownership_distinct() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for phase in ["initial", "concurrent", "remark_request", "remark", "sweep"] {
         reset_internal_for_test();
         let elected = cycle_wait::CollectorGuard::try_acquire().unwrap();
         // Initial/remark/sweep stops cannot recursively collect; the same owner
         // services a coalesced request only at its following non-sweep boundary.
         if phase == "initial" {
-            PENDING.store(true, Ordering::Release);
+            runtime().minor_pending.store(true, Ordering::Release);
         }
         let (_, cycle) = root_handshake::begin().unwrap();
         if phase == "remark_request" {
@@ -363,13 +379,13 @@ fn overlap_phase_requests_and_remark_election_keep_epoch_ownership_distinct() {
         if phase == "sweep" {
             let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
             assert!(runtime().heap.lock().unwrap().sweeping.is_some());
-            PENDING.store(true, Ordering::Release);
+            runtime().minor_pending.store(true, Ordering::Release);
             assert_eq!(runtime().heap.lock().unwrap().minor_collections, 0);
             sweep::concurrent(plan);
             service_pending();
             assert!(cycle.queue.current_epoch().is_idle());
         } else {
-            PENDING.store(true, Ordering::Release);
+            runtime().minor_pending.store(true, Ordering::Release);
             service_pending();
             assert_eq!(cycle.queue.current_epoch(), cycle.mark_epoch);
             assert!(!cycle.termination.requested());
@@ -377,7 +393,7 @@ fn overlap_phase_requests_and_remark_election_keep_epoch_ownership_distinct() {
             end(&cycle);
         }
         assert_eq!(runtime().heap.lock().unwrap().minor_collections, 1);
-        assert!(!PENDING.load(Ordering::Acquire));
+        assert!(!runtime().minor_pending.load(Ordering::Acquire));
         drop(elected);
     }
     reset_internal_for_test();
@@ -385,7 +401,7 @@ fn overlap_phase_requests_and_remark_election_keep_epoch_ownership_distinct() {
 
 #[test]
 fn overlap_post_snapshot_tlab_black_allocation_survives_minor_and_old_sweep() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     let elected = cycle_wait::CollectorGuard::try_acquire().unwrap();
     let (_, cycle) = root_handshake::begin().unwrap();
@@ -418,7 +434,7 @@ fn overlap_post_snapshot_tlab_black_allocation_survives_minor_and_old_sweep() {
 
 #[test]
 fn concurrent_minor_snapshot_and_relocation_scale_linearly() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1_000usize, 10_000, 100_000] {
         reset_internal();
         {
@@ -456,13 +472,25 @@ fn concurrent_minor_snapshot_and_relocation_scale_linearly() {
         runtime().runtime_root_slots.remove(slot);
         cycle.drain(usize::MAX);
         for pass in 0..2 {
-            PAGE_QUERIES.set(0);
+            runtime()
+                .heap
+                .lock()
+                .unwrap()
+                .minor_observation
+                .page_queries
+                .set(0);
             let before = runtime().heap.lock().unwrap().moved_objects;
             let before_injected = cycle.queue.snapshot().injected;
             let before_bytes = cycle.work.lock().unwrap().marked_bytes;
             collect_owned();
             assert_eq!(
-                SNAPSHOT_DEDUP_KEYS.get(),
+                runtime()
+                    .heap
+                    .lock()
+                    .unwrap()
+                    .minor_observation
+                    .snapshot_dedup_keys
+                    .get(),
                 0,
                 "bitmap roots need no hash entries"
             );
@@ -475,7 +503,13 @@ fn concurrent_minor_snapshot_and_relocation_scale_linearly() {
                 cycle.work.lock().unwrap().marked_bytes - before_bytes,
                 (count * bytes) as u64
             );
-            let queries = PAGE_QUERIES.get();
+            let queries = runtime()
+                .heap
+                .lock()
+                .unwrap()
+                .minor_observation
+                .page_queries
+                .get();
             assert!(queries <= 16 * count, "queries={queries}, nodes={count}");
             cycle.drain(usize::MAX);
             let state = runtime().heap.lock().unwrap();
@@ -494,7 +528,7 @@ fn concurrent_minor_snapshot_and_relocation_scale_linearly() {
 
 #[test]
 fn post_snapshot_extent_publications_do_not_build_per_object_pending_sets() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [100usize, 1_000, 10_000] {
         reset_internal_for_test();
         {
@@ -539,7 +573,7 @@ fn post_snapshot_extent_publications_do_not_build_per_object_pending_sets() {
 
 #[test]
 fn overlap_minor_inline_credit_publishes_old_descendants() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1usize, 100, 10_000] {
         reset_internal_for_test();
         {
@@ -605,7 +639,7 @@ fn overlap_native_recovery_retry_history_follows_minor_relocation() {
             TraceSliceProgress::Retry
         }
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal_for_test();
     RELEASE.store(false, Ordering::Release);
     const TYPE: u32 = 0xFA97;

@@ -130,66 +130,139 @@ impl State {
         s.window_cpu_missing = self.missing + u64::from(self.cpu > u128::from(u64::MAX));
     }
 }
-static STATS: Mutex<Option<State>> = Mutex::new(None);
+pub(crate) struct Pacing {
+    state: Mutex<Option<State>>,
+}
+impl Pacing {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+        }
+    }
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map_or(
+                Snapshot {
+                    version: 1,
+                    ..Snapshot::default()
+                },
+                State::view,
+            )
+    }
+    pub(crate) fn publish(&self, decision: Decision) {
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let stats = &mut guard.get_or_insert_with(State::default).snapshot;
+        stats.version = 1;
+        stats.publications = stats.publications.saturating_add(1);
+        stats.decision = decision;
+    }
+    pub(crate) fn duty(&self, cpu: Option<u64>, wait: u64) {
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let stats = &mut guard.get_or_insert_with(State::default).snapshot;
+        stats.version = 1;
+        stats.background_cpu_ns = stats.background_cpu_ns.saturating_add(cpu.unwrap_or(0));
+        stats.duty_wait_ns = stats.duty_wait_ns.saturating_add(wait);
+        stats.missing_cpu_samples = stats
+            .missing_cpu_samples
+            .saturating_add(u64::from(cpu.is_none()));
+    }
+    pub(crate) fn begin_major(&self, start: u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(State::default)
+            .begin_major(start);
+    }
+    pub(crate) fn abort(&self, start: u64, end: u64, nested: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(State::default)
+            .abort(start, end, nested);
+    }
+    pub(crate) fn cycle(&self, start: u64, end: u64, cpu: Option<u64>, nested: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(State::default)
+            .cycle(start, end, cpu, nested);
+    }
+    pub(crate) fn reset(&self) {
+        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
 
+fn default_pacing() -> &'static Pacing {
+    &super::telemetry().pacing
+}
 pub fn snapshot() -> Snapshot {
-    STATS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .as_ref()
-        .map_or(
-            Snapshot {
-                version: 1,
-                ..Snapshot::default()
-            },
-            State::view,
-        )
+    default_pacing().snapshot()
 }
 pub(crate) fn publish(decision: Decision) {
-    let mut guard = STATS.lock().unwrap_or_else(|p| p.into_inner());
-    let stats = &mut guard.get_or_insert_with(State::default).snapshot;
-    stats.version = 1;
-    stats.publications = stats.publications.saturating_add(1);
-    stats.decision = decision;
+    default_pacing().publish(decision);
 }
 pub(crate) fn duty(cpu: Option<u64>, wait: u64) {
-    let mut guard = STATS.lock().unwrap_or_else(|p| p.into_inner());
-    let stats = &mut guard.get_or_insert_with(State::default).snapshot;
-    stats.version = 1;
-    stats.background_cpu_ns = stats.background_cpu_ns.saturating_add(cpu.unwrap_or(0));
-    stats.duty_wait_ns = stats.duty_wait_ns.saturating_add(wait);
-    stats.missing_cpu_samples = stats
-        .missing_cpu_samples
-        .saturating_add(u64::from(cpu.is_none()));
-}
-pub(crate) fn begin_major(start: u64) {
-    STATS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get_or_insert_with(State::default)
-        .begin_major(start);
-}
-pub(crate) fn abort(start: u64, end: u64, nested: bool) {
-    STATS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get_or_insert_with(State::default)
-        .abort(start, end, nested);
-}
-pub(crate) fn cycle(start: u64, end: u64, cpu: Option<u64>, nested: bool) {
-    STATS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get_or_insert_with(State::default)
-        .cycle(start, end, cpu, nested);
+    default_pacing().duty(cpu, wait);
 }
 pub(crate) fn reset() {
-    *STATS.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    default_pacing().reset();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_pacing_owners_accept_overlapping_nested_cycles() {
+        let first = Pacing::new();
+        let second = Pacing::new();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = [(&first, 1), (&second, 3)]
+                .into_iter()
+                .map(|(owner, stride)| {
+                    let barrier = &barrier;
+                    scope.spawn(crate::runtime::serving(move || {
+                        let mut correct = true;
+                        for round in 0..64 {
+                            let start = round * 100 + 1;
+                            owner.begin_major(start);
+                            barrier.wait();
+                            owner.cycle(start + 1, start + 2, Some(stride), true);
+                            owner.cycle(start, start + 3, Some(2 * stride), false);
+                            owner.publish(Decision {
+                                goal_bytes: stride,
+                                ..Decision::default()
+                            });
+                            barrier.wait();
+                            let snapshot = owner.snapshot();
+                            correct &= snapshot.gc_cpu_ns == (round + 1) * 3 * stride;
+                            correct &= snapshot.cpu_missing_cycles == 0;
+                            correct &= snapshot.publications == round + 1;
+                            correct &= snapshot.decision.goal_bytes == stride;
+                        }
+                        correct
+                    }))
+                })
+                .collect();
+            for handle in handles {
+                assert!(handle.join().unwrap());
+            }
+        });
+        assert_eq!(first.snapshot().window_cpu_ns, 24);
+        assert_eq!(second.snapshot().window_cpu_ns, 72);
+        first.begin_major(7000);
+        first.abort(7000, 7001, false);
+        assert_eq!(first.snapshot().cpu_missing_cycles, 1);
+        assert_eq!(second.snapshot().cpu_missing_cycles, 0);
+        first.reset();
+        assert_eq!(first.snapshot().gc_cpu_ns, 0);
+        assert_eq!(second.snapshot().gc_cpu_ns, 576);
+    }
+
     #[test]
     fn cpu_window_forgets_missing_and_step_history_in_eight_cycles() {
         let mut s = State::default();

@@ -22,11 +22,7 @@ pub(super) struct WaiterQueue {
     tail: Option<u64>,
     next_ticket: u64,
     native_table_bytes: usize,
-}
-
-#[cfg(test)]
-thread_local! {
-    pub(super) static LINK_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) link_visits: crate::observation::Value<std::cell::Cell<usize>>,
 }
 
 impl WaiterQueue {
@@ -95,8 +91,7 @@ impl WaiterQueue {
     }
 
     pub(super) fn remove_ticket(&mut self, task: u64, ticket: u64) -> bool {
-        #[cfg(test)]
-        LINK_VISITS.with(|count| count.set(count.get() + 1));
+        self.link_visits.observe(|count| count.set(count.get() + 1));
         if let Some(single) = self.single {
             if single == (task, ticket) {
                 self.single = None;
@@ -114,15 +109,13 @@ impl WaiterQueue {
 
     fn unlink(&mut self, entry: Entry) {
         if let Some(previous) = entry.previous {
-            #[cfg(test)]
-            LINK_VISITS.with(|count| count.set(count.get() + 1));
+            self.link_visits.observe(|count| count.set(count.get() + 1));
             self.entries.get_mut(&previous).unwrap().next = entry.next;
         } else {
             self.head = entry.next;
         }
         if let Some(next) = entry.next {
-            #[cfg(test)]
-            LINK_VISITS.with(|count| count.set(count.get() + 1));
+            self.link_visits.observe(|count| count.set(count.get() + 1));
             self.entries.get_mut(&next).unwrap().previous = entry.previous;
         } else {
             self.tail = entry.previous;
@@ -131,13 +124,11 @@ impl WaiterQueue {
 
     pub(super) fn pop_front_ticket(&mut self) -> Option<(u64, u64)> {
         if let Some(single) = self.single.take() {
-            #[cfg(test)]
-            LINK_VISITS.with(|count| count.set(count.get() + 1));
+            self.link_visits.observe(|count| count.set(count.get() + 1));
             return Some(single);
         }
         let task = self.head?;
-        #[cfg(test)]
-        LINK_VISITS.with(|count| count.set(count.get() + 1));
+        self.link_visits.observe(|count| count.set(count.get() + 1));
         let entry = self.entries.remove(&task).expect("indexed FIFO head");
         self.unlink(entry);
         Some((task, entry.ticket))
@@ -199,7 +190,7 @@ mod tests {
     fn single_waiter_churn_never_allocates_a_table() {
         for count in [1, 32, 1024, 32768] {
             let mut queue = WaiterQueue::default();
-            LINK_VISITS.set(0);
+            queue.link_visits.set(0);
             for task in 0..count {
                 let (ticket, fresh) = queue.register_ticket_fresh(task);
                 assert!(fresh);
@@ -218,10 +209,10 @@ mod tests {
                 assert_eq!(queue.native_bytes(), 0);
                 assert_eq!(queue.entries.capacity(), 0);
             }
-            assert_eq!(LINK_VISITS.get(), 2 * count as usize);
+            assert_eq!(queue.link_visits.get(), 2 * count as usize);
             println!(
                 "single_waiters={count} link_visits={} table_capacity=0",
-                LINK_VISITS.get()
+                queue.link_visits.get()
             );
         }
     }

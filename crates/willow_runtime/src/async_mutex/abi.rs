@@ -82,14 +82,13 @@ unsafe fn drop_async_mutex(payload: *mut u8) {
         );
     }
     unsafe { std::ptr::drop_in_place(payload as *mut AsyncMutex) };
-    #[cfg(test)]
-    ASYNC_MUTEX_DROP_COUNT.fetch_add(1, Ordering::SeqCst);
 }
 
 #[cfg(test)]
-static ASYNC_MUTEX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-static ASYNC_MUTEX_REGISTRATION: crate::gc::NativeGcRegistration =
-    crate::gc::NativeGcRegistration::new();
+const ASYNC_MUTEX_DROP_COUNT: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::AsyncMutexDropCount);
+const ASYNC_MUTEX_REGISTRATION: crate::gc::NativeGcRegistration =
+    crate::gc::NativeGcRegistration::AsyncMutex;
 const ASYNC_MUTEX_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
     ASYNC_MUTEX_TYPE_ID,
     Some(trace_async_mutex),

@@ -7,7 +7,7 @@ fn allocation_failures_terminate_before_returning_to_callers() {
         willow_gc_init();
         let mut tls = tlab_state_for_test();
         if case.starts_with("storage") || case.starts_with("retry") {
-            STORAGE_FAILURES.set(2);
+            runtime().storage_allocator.set_failures(2);
         }
         if case.starts_with("retry") {
             willow_gc_set_memory_limit(u64::MAX);

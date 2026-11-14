@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn nursery_runtime_survival_updates_live_telemetry() {
         use crate::gc::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         let initial = initial_budget();
         for n in [32, 128, 512] {
             reset_internal();
@@ -236,7 +236,7 @@ mod tests {
             }
             return;
         }
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         let mut tls = tlab_state_for_test();
         assert_eq!(telemetry_heap_snapshot().1.minor_trigger_bytes, 4194304);
@@ -344,7 +344,7 @@ fn startup_runway_is_worker_bounded_and_respects_limits() {
 #[test]
 fn scheduler_runway_only_initializes_a_cold_heap_once() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     {
         let mut state = runtime().heap.lock().unwrap();
@@ -377,7 +377,9 @@ fn scheduler_runway_only_initializes_a_cold_heap_once() {
         assert_eq!(state.threshold_bytes, 1024 * 1024);
         marking::set_concurrent_cycle(&mut state, None);
     }
-    GC_MARK_PHASE.store(0, Ordering::Release);
+    crate::runtime::current()
+        .mark_phase()
+        .store(0, Ordering::Release);
     cycle.queue.end_epoch();
     reset_internal();
     {
@@ -395,7 +397,7 @@ fn scheduler_runway_only_initializes_a_cold_heap_once() {
 #[test]
 fn scheduler_capacity_preserves_compact_nursery_and_overrides() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for workers in [0, 1, 2, 8, 64, usize::MAX] {
         for fixed in [None, Some(8192), Some(4 * 1024 * 1024)] {
             for limit in [None, Some(4096)] {

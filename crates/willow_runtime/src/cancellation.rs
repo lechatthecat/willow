@@ -550,8 +550,8 @@ unsafe fn drop_task_scope(payload: *mut u8) {
     unsafe { std::ptr::drop_in_place(payload.cast::<TaskScopeHandle>()) };
 }
 
-static CANCELLATION_REGISTRATION: crate::gc::NativeGcRegistration =
-    crate::gc::NativeGcRegistration::new();
+const CANCELLATION_REGISTRATION: crate::gc::NativeGcRegistration =
+    crate::gc::NativeGcRegistration::Cancellation;
 const CANCELLATION_GC_TYPES: &[crate::gc::NativeGcType] = &[
     crate::gc::NativeGcType::new(
         CANCELLATION_TOKEN_TYPE_ID,
@@ -753,8 +753,7 @@ impl ScopeFinishState {
         Self {
             traversal: Mutex::new(ScopeFinishTraversal {
                 stack: vec![ScopeFinishCursor::new(Arc::clone(&core))],
-                #[cfg(test)]
-                counts: [1, 0, 0],
+                counts: crate::observation::Value::new(|| [1, 0, 0]),
             }),
             core,
         }
@@ -764,8 +763,7 @@ impl ScopeFinishState {
 struct ScopeFinishTraversal {
     stack: Vec<ScopeFinishCursor>,
     // Scope visits, frame status checks, await attempts. No production overhead.
-    #[cfg(test)]
-    counts: [usize; 3],
+    counts: crate::observation::Value<[usize; 3]>,
 }
 
 impl ScopeFinishTraversal {
@@ -779,10 +777,7 @@ impl ScopeFinishTraversal {
             // Another finish handle may already have released these roots.
             if !state.finished {
                 if let Some(task) = state.tasks.get(cursor.next_task) {
-                    #[cfg(test)]
-                    {
-                        self.counts[1] += 1;
-                    }
+                    self.counts.observe_mut(|counts| counts[1] += 1);
                     let status =
                         crate::async_frame::frame_terminal_status(task.frame.load().cast());
                     if status == crate::async_frame::WILLOW_FRAME_STATUS_PENDING {
@@ -791,10 +786,7 @@ impl ScopeFinishTraversal {
                         // Await can collect; do not hold a scope mutex or carry a
                         // loaded frame pointer through this boundary. The ID-only
                         // await uses the same race-safe waiter registration path.
-                        #[cfg(test)]
-                        {
-                            self.counts[2] += 1;
-                        }
+                        self.counts.observe_mut(|counts| counts[2] += 1);
                         if await_task(id) == 0 {
                             return false;
                         }
@@ -814,10 +806,7 @@ impl ScopeFinishTraversal {
                     cursor.visited_children += 1;
                     drop(state);
                     self.stack.push(ScopeFinishCursor::new(child));
-                    #[cfg(test)]
-                    {
-                        self.counts[0] += 1;
-                    }
+                    self.counts.observe_mut(|counts| counts[0] += 1);
                     continue;
                 }
             }
@@ -911,7 +900,7 @@ pub extern "C" fn willow_task_scope_finish(scope_handle: *mut u8) -> *mut c_void
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::{reset_internal_for_test, runtime_test_guard};
+    use crate::gc::{isolated_runtime, reset_internal_for_test};
     use crate::scheduler::{
         reset_global_scheduler_for_test, willow_sched_run, willow_sched_run_until,
     };
@@ -935,7 +924,7 @@ mod tests {
 
     #[test]
     fn scope_membership_scales_and_duplicates_preserve_first_frame_and_order() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         for n in [64u64, 256, 1024, 4096] {
             let core = ScopeCore::default();
@@ -998,7 +987,7 @@ mod tests {
     #[test]
     fn scope_finish_staggered_completion_scales_with_multiple_handles() {
         use crate::scheduler::{with_current_task_for_test, with_global_for_test};
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         for shape in ["flat", "deep", "fanout"] {
             for n in [64, 256, 1024] {
@@ -1079,7 +1068,7 @@ mod tests {
 
     #[test]
     fn scope_finish_reloads_roots_and_tolerates_another_handle_releasing_them() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let root = Arc::new(ScopeCore::default());
         let pending = crate::async_frame::willow_async_frame_alloc(1, 0);
@@ -1123,7 +1112,7 @@ mod tests {
 
     #[test]
     fn scope_finish_out_of_order_completion_and_spurious_polls_only_revisit_frontier() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let root = Arc::new(ScopeCore::default());
         let mut frames = Vec::new();
@@ -1158,7 +1147,7 @@ mod tests {
 
     #[test]
     fn scope_finish_handles_completion_during_waiter_registration() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let root = Arc::new(ScopeCore::default());
         let frame = crate::async_frame::willow_async_frame_alloc(1, 0);
@@ -1183,7 +1172,7 @@ mod tests {
 
     #[test]
     fn poll_state_remains_owned_after_frame_cleanup() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let frame = NativeTaskFrame::<ScopeFinishFrame>::allocate().unwrap();
         let core = Arc::new(ScopeCore::default());
@@ -1209,7 +1198,7 @@ mod tests {
 
     #[test]
     fn cancelled_token_immediately_cancels_late_attachment() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         reset_global_scheduler_for_test();
         let token = willow_cancellation_token_new();
@@ -1230,7 +1219,7 @@ mod tests {
 
     #[test]
     fn attach_cancel_race_cannot_miss_a_participant() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         reset_global_scheduler_for_test();
         let core = Arc::new(CancellationCore::default());
@@ -1249,10 +1238,10 @@ mod tests {
         for id in ids {
             let core = Arc::clone(&core);
             let barrier = Arc::clone(&barrier);
-            workers.push(std::thread::spawn(move || {
+            workers.push(std::thread::spawn(crate::runtime::serving(move || {
                 barrier.wait();
                 core.attach(id);
-            }));
+            })));
         }
         barrier.wait();
         core.cancel();
@@ -1274,7 +1263,7 @@ mod tests {
     fn scope_slices_are_bounded_finite_and_do_not_wait_on_busy_state() {
         use crate::gc::TraceSliceProgress;
         use crate::scheduler::scaling_measurements::counting_allocator as counter;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         for roots in [0usize, 513, 4097, 65_537] {
             let core = Arc::new(ScopeCore::default());
@@ -1335,7 +1324,7 @@ mod tests {
 
     #[test]
     fn scope_trace_slots_survive_task_vector_growth() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let core = ScopeCore::default();
         let first_frame = 0x1000usize as *mut u8;
@@ -1358,7 +1347,7 @@ mod tests {
 
     #[test]
     fn scope_finish_releases_task_metadata_without_invalidating_trace_slots() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
 
         let core = ScopeCore::default();
@@ -1405,7 +1394,7 @@ mod tests {
 
     #[test]
     fn cancelled_result_uses_the_fieldless_enum_immediate_payload() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal_for_test();
         let mut result = alloc_cancelled_result();
         assert!(!result.is_null());

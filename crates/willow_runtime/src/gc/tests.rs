@@ -1,9 +1,5 @@
 use super::*;
 
-fn gc_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    runtime_test_guard()
-}
-
 #[test]
 fn empty_root_arena_first_snapshot_is_allocation_free() {
     use crate::scheduler::scaling_measurements::counting_allocator as counter;
@@ -11,7 +7,7 @@ fn empty_root_arena_first_snapshot_is_allocation_free() {
     let arena = GcRootArena::default();
     // Move the initialized arena to a collector thread before its first
     // snapshot; do not warm up the snapshot path inside the measurement.
-    std::thread::spawn(move || {
+    std::thread::spawn(crate::runtime::serving(move || {
         let mut children = Vec::new();
         let allocations = counter::thread_allocations();
         let progress = arena.snapshot_slice(0, 512, usize::MAX, &mut children);
@@ -19,7 +15,7 @@ fn empty_root_arena_first_snapshot_is_allocation_free() {
         assert_eq!(progress, Some((0, 0)));
         assert!(children.is_empty());
         assert_eq!(allocated, 0);
-    })
+    }))
     .join()
     .unwrap();
 }
@@ -31,7 +27,7 @@ fn empty_root_arena_first_snapshot_is_allocation_free() {
 #[test]
 fn gc_stress_mode_checks_are_allocation_free_after_first_use() {
     use crate::scheduler::scaling_measurements::counting_allocator as counter;
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     set_gc_stress_for_test(None);
     let _ = gc_stress_enabled("alloc");
     let allocations = counter::thread_allocations();
@@ -52,7 +48,7 @@ fn gc_stress_mode_checks_are_allocation_free_after_first_use() {
 
 #[test]
 fn gc_stress_modes_parse_lists_and_override_replaces_the_environment() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     assert!(parse_gc_stress_modes("").is_empty());
     assert_eq!(
         parse_gc_stress_modes(" alloc , minor,,await"),
@@ -96,11 +92,11 @@ fn runtime_state_starts_owned_and_empty() {
 
 #[test]
 fn legacy_root_owner_released_after_late_registration() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for count in [1, 16, 256] {
         reset_gc();
         let before = willow_gc_skipped_collections();
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let mut slot = willow_alloc_object(2, 32);
             for _ in 0..count {
                 willow_push_root(&mut slot);
@@ -110,7 +106,7 @@ fn legacy_root_owner_released_after_late_registration() {
                 willow_pop_root();
             }
             willow_gc_unregister_mutator();
-        })
+        }))
         .join()
         .unwrap();
         // The owner has exited; collection runs on a different thread.
@@ -123,12 +119,12 @@ fn legacy_root_owner_released_after_late_registration() {
 
 #[test]
 fn legacy_root_owner_retained_after_nonempty_unregister() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let before = willow_gc_skipped_collections();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let owner = std::thread::spawn(move || {
+    let owner = std::thread::spawn(crate::runtime::serving(move || {
         let mut slot = willow_alloc_object(2, 32);
         willow_push_root(&mut slot);
         willow_gc_register_mutator();
@@ -136,7 +132,7 @@ fn legacy_root_owner_retained_after_nonempty_unregister() {
         ready_tx.send(()).unwrap();
         release_rx.recv().unwrap();
         willow_pop_root();
-    });
+    }));
     ready_rx.recv().unwrap();
     willow_gc_collect();
     crate::gc::minor_collect_internal();
@@ -153,7 +149,7 @@ fn legacy_root_owner_retained_after_nonempty_unregister() {
 
 #[test]
 fn gc_counts_collections_skipped_for_foreign_root_owner() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let before = willow_gc_skipped_collections();
     // This thread claims root-stack ownership by pushing a root.
@@ -161,7 +157,9 @@ fn gc_counts_collections_skipped_for_foreign_root_owner() {
     willow_push_root(&mut slot as *mut *mut u8);
     // A foreign thread cannot scan our root stack, so its collection must be
     // skipped — and counted.
-    std::thread::spawn(|| willow_gc_collect()).join().unwrap();
+    std::thread::spawn(crate::runtime::serving(|| willow_gc_collect()))
+        .join()
+        .unwrap();
     willow_pop_root();
     let after = willow_gc_skipped_collections();
     assert!(
@@ -174,16 +172,16 @@ fn gc_counts_collections_skipped_for_foreign_root_owner() {
 
 #[test]
 fn coord_register_makes_multi_mutator_active_from_other_thread() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     assert!(!multi_mutator_active(), "no mutators registered yet");
     // A second registered thread makes this thread see a foreign mutator.
-    let handle = std::thread::spawn(|| {
+    let handle = std::thread::spawn(crate::runtime::serving(|| {
         willow_gc_register_mutator();
         // Keep the registration alive until the main thread observes it.
         std::thread::sleep(std::time::Duration::from_millis(20));
         willow_gc_unregister_mutator();
-    });
+    }));
     // Spin briefly until the worker has registered.
     let mut saw = false;
     for _ in 0..200 {
@@ -203,7 +201,7 @@ fn coord_register_makes_multi_mutator_active_from_other_thread() {
 
 #[test]
 fn coord_safepoint_is_noop_when_no_stop_requested() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     // No collection in progress: a safepoint poll must return immediately.
     willow_gc_safepoint();
@@ -215,7 +213,7 @@ fn coord_safepoint_is_noop_when_no_stop_requested() {
 #[test]
 fn published_root_slots_are_writable_and_preserve_nulls() {
     use std::sync::{Arc, atomic::AtomicBool};
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_gc_register_mutator();
     let mut replacement = willow_alloc_object(0, 8);
@@ -225,7 +223,7 @@ fn published_root_slots_are_writable_and_preserve_nulls() {
     let done = Arc::new(AtomicBool::new(false));
     let worker_ready = ready.clone();
     let worker_done = done.clone();
-    let worker = std::thread::spawn(move || {
+    let worker = std::thread::spawn(crate::runtime::serving(move || {
         let mutator = crate::gc::MutatorRegistration::new();
         let mut first = willow_alloc_object(0, 8);
         let mut alias = first;
@@ -243,7 +241,7 @@ fn published_root_slots_are_writable_and_preserve_nulls() {
         assert!(empty.is_null());
         willow_pop_roots(3);
         drop(mutator);
-    });
+    }));
     while !ready.load(Ordering::Acquire) {
         std::thread::yield_now();
     }
@@ -271,7 +269,7 @@ fn published_root_slots_are_writable_and_preserve_nulls() {
 
 #[test]
 fn published_root_slot_count_is_linear_in_registered_slots() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     for count in [1, 16, 256, 4096] {
         let mut slots = vec![willow_alloc_object(0, 8); count];
@@ -301,7 +299,7 @@ fn published_root_slot_count_is_linear_in_registered_slots() {
 fn multi_mutator_stw_keeps_other_thread_roots_alive_through_generated_gate() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_gc_register_mutator(); // main is a mutator too
 
@@ -313,7 +311,7 @@ fn multi_mutator_stw_keeps_other_thread_roots_alive_through_generated_gate() {
     let ready = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     let (r2, d2) = (ready.clone(), done.clone());
-    let worker = std::thread::spawn(move || {
+    let worker = std::thread::spawn(crate::runtime::serving(move || {
         let mutator = crate::gc::MutatorRegistration::new();
         // Worker holds root B and keeps polling safepoints (so it parks
         // during the collector's stop-the-world).
@@ -337,7 +335,7 @@ fn multi_mutator_stw_keeps_other_thread_roots_alive_through_generated_gate() {
         }
         willow_pop_root();
         drop(mutator);
-    });
+    }));
 
     while !ready.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -360,7 +358,7 @@ fn multi_mutator_stw_keeps_other_thread_roots_alive_through_generated_gate() {
 
 #[test]
 fn multi_mutator_concurrent_collection_does_not_deadlock() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     // Two registered mutators each allocate garbage and trigger collections
     // concurrently. The collector-election (try_lock + safepoint) must keep
@@ -368,7 +366,7 @@ fn multi_mutator_concurrent_collection_does_not_deadlock() {
     // safepoint instead of blocking on the collect lock.
     let handles: Vec<_> = (0..2)
         .map(|_| {
-            std::thread::spawn(|| {
+            std::thread::spawn(crate::runtime::serving(|| {
                 let mutator = crate::gc::MutatorRegistration::new();
                 for _ in 0..30 {
                     let _garbage = willow_alloc_object(0, 8); // unrooted
@@ -376,7 +374,7 @@ fn multi_mutator_concurrent_collection_does_not_deadlock() {
                     willow_gc_collect();
                 }
                 drop(mutator);
-            })
+            }))
         })
         .collect();
     for h in handles {
@@ -395,14 +393,14 @@ fn multi_mutator_concurrent_collection_does_not_deadlock() {
 fn multi_mutator_stw_frees_unrooted_object() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_gc_register_mutator();
 
     let ready = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     let (r2, d2) = (ready.clone(), done.clone());
-    let worker = std::thread::spawn(move || {
+    let worker = std::thread::spawn(crate::runtime::serving(move || {
         let mutator = crate::gc::MutatorRegistration::new();
         // Worker registers but holds NO root; it just parks at safepoints.
         r2.store(true, Ordering::SeqCst);
@@ -411,7 +409,7 @@ fn multi_mutator_stw_frees_unrooted_object() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         drop(mutator);
-    });
+    }));
     while !ready.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -498,7 +496,7 @@ fn run_registration_race(workers: usize, rounds: usize, minor: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
     let stop = Arc::new(AtomicBool::new(false));
     let collector_stop = stop.clone();
-    let collector = std::thread::spawn(move || {
+    let collector = std::thread::spawn(crate::runtime::serving(move || {
         while !collector_stop.load(Ordering::Acquire) {
             // This thread never registers, so it is the one that used to
             // take the "I am alone" fast path.
@@ -509,12 +507,12 @@ fn run_registration_race(workers: usize, rounds: usize, minor: bool) {
             }
             std::thread::yield_now();
         }
-    });
+    }));
     let handles: Vec<_> = (0..workers)
         .map(|worker| {
-            std::thread::spawn(move || {
+            std::thread::spawn(crate::runtime::serving(move || {
                 racing_root_worker(rounds, 1_000 + worker as i64 * 1_000, minor)
-            })
+            }))
         })
         .collect();
     for handle in handles {
@@ -526,7 +524,7 @@ fn run_registration_race(workers: usize, rounds: usize, minor: bool) {
 
 #[test]
 fn coord_registration_racing_a_major_collection_keeps_the_newcomers_roots() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     run_registration_race(1, 200, false);
     reset_gc();
@@ -534,7 +532,7 @@ fn coord_registration_racing_a_major_collection_keeps_the_newcomers_roots() {
 
 #[test]
 fn coord_registration_racing_a_minor_collection_keeps_the_newcomers_roots() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     run_registration_race(1, 200, true);
     reset_gc();
@@ -542,7 +540,7 @@ fn coord_registration_racing_a_minor_collection_keeps_the_newcomers_roots() {
 
 #[test]
 fn coord_several_mutators_registering_at_once_keep_their_roots() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     run_registration_race(4, 100, false);
     reset_gc();
@@ -552,18 +550,18 @@ fn coord_several_mutators_registering_at_once_keep_their_roots() {
 fn coord_a_registered_mutators_runtime_root_survives_a_racing_collection() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     // The same race reaches runtime roots — the scheduler's hold on a task
     // frame — because the sweep, not the scan, is what frees the object.
     let stop = Arc::new(AtomicBool::new(false));
     let collector_stop = stop.clone();
-    let collector = std::thread::spawn(move || {
+    let collector = std::thread::spawn(crate::runtime::serving(move || {
         while !collector_stop.load(Ordering::Acquire) {
             willow_gc_collect();
             std::thread::yield_now();
         }
-    });
+    }));
     for round in 0..200 {
         willow_gc_register_mutator();
         let object = willow_alloc_object(0, 8);
@@ -592,19 +590,19 @@ fn coord_a_registered_mutators_runtime_root_survives_a_racing_collection() {
 fn coord_a_collection_racing_registration_still_frees_garbage() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     // Stopping the world for every cycle must not make the collector
     // conservative: unrooted objects allocated by a registering worker are
     // still reclaimed.
     let stop = Arc::new(AtomicBool::new(false));
     let collector_stop = stop.clone();
-    let collector = std::thread::spawn(move || {
+    let collector = std::thread::spawn(crate::runtime::serving(move || {
         while !collector_stop.load(Ordering::Acquire) {
             willow_gc_collect();
             std::thread::yield_now();
         }
-    });
+    }));
     for _ in 0..200 {
         willow_gc_register_mutator();
         let _garbage = willow_alloc_object(0, 8);
@@ -625,7 +623,7 @@ fn coord_a_collection_racing_registration_still_frees_garbage() {
 #[cfg(debug_assertions)]
 #[test]
 fn coord_a_panicking_collection_resumes_the_world() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     // Now that every cycle stops the world, a cycle that panics has to put
     // the world back: an unwind that leaves `stop_requested` set parks every
@@ -654,7 +652,7 @@ fn coord_a_panicking_collection_resumes_the_world() {
 
 #[test]
 fn coord_a_lone_thread_still_collects_without_registering() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     // The fast path is gone, so check the ordinary single-threaded program
     // still collects: an unregistered thread with no other mutators must
@@ -706,7 +704,7 @@ fn new_tlab_state() -> GcTlabState {
 
 #[test]
 fn telemetry_merges_fast_tlab_deltas_once_and_on_unregister() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_gc_register_mutator();
     let mut tls = new_tlab_state();
@@ -755,7 +753,7 @@ fn fast_alloc_for_test(tls: &GcTlabState, bytes: usize) -> usize {
 /// refills, retirement and unregister, without double counting.
 #[test]
 fn derived_fast_tlab_counts_survive_refills_retirement_and_unregister() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_gc_register_mutator();
     let mut tls = new_tlab_state();
@@ -798,7 +796,7 @@ fn derived_fast_tlab_counts_survive_refills_retirement_and_unregister() {
 /// extra bit inside an object (overlap) must both be rejected.
 #[test]
 fn retirement_rejects_unpublished_and_overlapping_start_bits() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for extra_bit in [false, true] {
         reset_gc();
         let mut tls = new_tlab_state();
@@ -829,7 +827,7 @@ fn retirement_rejects_unpublished_and_overlapping_start_bits() {
 
 #[test]
 fn telemetry_promotion_is_not_a_second_logical_allocation() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let young = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
@@ -871,7 +869,7 @@ fn telemetry_promotion_is_not_a_second_logical_allocation() {
 
 #[test]
 fn compact_header_descriptors_follow_sweep_copy_and_reset() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let key = willow_abi::GcLayoutDescriptor {
         type_id: 0,
@@ -1064,7 +1062,7 @@ fn native_gc_schema_rejects_unknown_ids_and_incorrect_hooks() {
 
 #[test]
 fn test_gc_tlab_large_object_uses_old_region_slow_path() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let payload_size = GC_TLAB_MAX_OBJECT_SIZE as i64;
@@ -1084,7 +1082,7 @@ fn test_gc_tlab_large_object_uses_old_region_slow_path() {
 
 #[test]
 fn test_gc_tlab_refill_slow_path_coordinates_threshold_collection() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let first = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
@@ -1109,7 +1107,7 @@ fn test_gc_tlab_refill_slow_path_coordinates_threshold_collection() {
 
 #[test]
 fn test_gc_minor_collection_moves_heap_reachable_young_and_updates_slot() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let young = willow_gc_alloc_slow(&mut tls, 11, 0, 8, 0);
@@ -1146,7 +1144,7 @@ fn test_gc_minor_collection_moves_heap_reachable_young_and_updates_slot() {
 
 #[test]
 fn test_gc_minor_collection_defers_direct_young_root_outside_relocation_scope() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let original = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
@@ -1184,7 +1182,7 @@ fn test_gc_minor_collection_defers_direct_young_root_outside_relocation_scope() 
 
 #[test]
 fn test_gc_minor_collection_pins_runtime_held_root_under_hard_memory_limit() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let mut young = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
@@ -1213,7 +1211,7 @@ fn test_gc_minor_collection_pins_runtime_held_root_under_hard_memory_limit() {
 
 #[test]
 fn test_gc_minor_collection_relocates_generated_code_root_slots() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let original = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
@@ -1242,7 +1240,7 @@ fn test_gc_minor_collection_relocates_generated_code_root_slots() {
 
 #[test]
 fn test_gc_minor_collection_rewrites_parked_relocatable_stack_roots() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let original = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
@@ -1274,7 +1272,7 @@ fn test_gc_minor_collection_rewrites_parked_relocatable_stack_roots() {
 
 #[test]
 fn test_gc_minor_collection_defers_roots_parked_from_runtime_code() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let original = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
@@ -1304,7 +1302,7 @@ fn test_gc_minor_collection_defers_roots_parked_from_runtime_code() {
 
 #[test]
 fn test_gc_minor_deferral_backs_off_and_is_bounded_by_an_indefinite_park() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let original = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
@@ -1376,7 +1374,7 @@ fn test_gc_minor_deferral_backs_off_and_is_bounded_by_an_indefinite_park() {
 
 #[test]
 fn test_gc_runtime_root_slot_relocates_young_referent() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let original = willow_gc_alloc_slow(&mut tls, 22, 0, 8, 0);
@@ -1410,7 +1408,7 @@ fn test_gc_runtime_root_slot_relocates_young_referent() {
 fn test_gc_address_runtime_root_rejects_young_object() {
     use super::failure_policy_tests::{GC_FATAL_CASE, assert_fatal_child};
     if std::env::var_os(GC_FATAL_CASE).is_some() {
-        let _guard = gc_test_guard();
+        let _guard = isolated_runtime();
         reset_gc();
         let mut tls = new_tlab_state();
         let young = willow_gc_alloc_slow(&mut tls, 22, 0, 8, 0);
@@ -1426,7 +1424,7 @@ fn test_gc_address_runtime_root_rejects_young_object() {
 
 #[test]
 fn test_gc_minor_collection_reclaims_unreachable_nursery() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let young = willow_gc_alloc_slow(&mut tls, 31, 0, 8, 0);
@@ -1442,7 +1440,7 @@ fn test_gc_minor_collection_reclaims_unreachable_nursery() {
 
 #[test]
 fn test_gc_minor_collection_updates_array_reference_slots() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     // This fixture specifically verifies nursery evacuation and its barrier.
     let _stress = GcStressTestScope::normal();
     reset_gc();
@@ -1472,7 +1470,7 @@ fn test_gc_minor_collection_updates_array_reference_slots() {
 
 #[test]
 fn test_gc_minor_collection_updates_map_reference_slots() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut map = crate::map::willow_map_new(0, 3, 1);
     willow_push_root(&mut map as *mut *mut u8);
@@ -1495,7 +1493,7 @@ fn test_gc_minor_collection_updates_map_reference_slots() {
 
 #[test]
 fn test_gc_minor_collection_updates_channel_queue_reference_slots() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut channel = crate::channel::willow_channel_new(1) as *mut u8;
     willow_push_root(&mut channel as *mut *mut u8);
@@ -1521,7 +1519,7 @@ fn test_gc_minor_collection_updates_channel_queue_reference_slots() {
 
 #[test]
 fn test_gc_alloc_returns_non_null() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(1, 16);
     assert!(!ptr.is_null());
@@ -1530,7 +1528,7 @@ fn test_gc_alloc_returns_non_null() {
 
 #[test]
 fn test_gc_alloc_zero_size_object() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(0, 0);
     assert!(!ptr.is_null(), "zero-payload allocation should succeed");
@@ -1539,7 +1537,7 @@ fn test_gc_alloc_zero_size_object() {
 
 #[test]
 fn test_gc_allocated_bytes_increases() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let before = willow_gc_allocated_bytes();
     willow_alloc_object(1, 64);
@@ -1551,7 +1549,7 @@ fn test_gc_allocated_bytes_increases() {
 /// allocated_bytes はヘッダ込みのサイズを追跡していること
 #[test]
 fn test_gc_allocated_bytes_includes_header_overhead() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let payload: i64 = 40;
     willow_alloc_object(1, payload);
@@ -1567,7 +1565,7 @@ fn test_gc_allocated_bytes_includes_header_overhead() {
 /// total_allocs カウンタが増える
 #[test]
 fn test_gc_total_allocs_counter() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let before = total_allocs();
     willow_alloc_object(1, 8);
@@ -1579,7 +1577,7 @@ fn test_gc_total_allocs_counter() {
 
 #[test]
 fn test_gc_alloc_wrapper_uses_opaque_type_and_zero_mask() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc(16);
     let header = payload_to_header(ptr);
@@ -1609,7 +1607,7 @@ fn test_gc_alloc_wrapper_uses_opaque_type_and_zero_mask() {
 
 #[test]
 fn test_gc_alloc_typed_records_ref_mask() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_typed(16, 0b10);
     let header = payload_to_header(ptr);
@@ -1625,7 +1623,7 @@ fn test_gc_alloc_typed_records_ref_mask() {
 
 #[test]
 fn test_gc_bitmap_and_inline_slots_follow_mixed_storage_layout() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     // Inline bit 1 and extended bit 65 have a scalar word immediately
     // before them. Both paths must locate the same storage-word stride.
@@ -1677,7 +1675,7 @@ fn test_gc_bitmap_and_inline_slots_follow_mixed_storage_layout() {
 
 #[test]
 fn bitmap_fingerprints_are_independent_of_descriptor_addresses() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     for words in [0usize, 1, 2, 8, 32, 128] {
         let mut descriptor = vec![0u64; words + 1];
@@ -1729,7 +1727,7 @@ fn bitmap_fingerprints_are_independent_of_descriptor_addresses() {
 
 #[test]
 fn test_gc_layout_allocation_records_central_metadata() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     assert_eq!(
         gc_layout_id(GcObjectKind::Enum, 16, 0, 0b10),
@@ -1769,7 +1767,7 @@ fn test_gc_layout_allocation_records_central_metadata() {
 
 #[test]
 fn test_gc_write_barrier_ignores_old_to_old_store() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let child = willow_alloc(8);
     let parent = willow_gc_alloc_layout(7, 0, 8, 0b1);
@@ -1790,7 +1788,7 @@ fn test_gc_write_barrier_ignores_old_to_old_store() {
 
 #[test]
 fn test_gc_barrier_verifier_rejects_unremembered_old_to_young_edge() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let young = willow_gc_alloc_slow(&mut tls, 51, 0, 8, 0);
@@ -1815,7 +1813,7 @@ fn test_gc_barrier_verifier_rejects_unremembered_old_to_young_edge() {
 // discovery and allocation costs. All fixture pointers remain GC-owned.
 #[test]
 fn test_gc_sweep_scaling_and_fragmentation() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for large in [false, true] {
         for n in [32, 64, 128, 256] {
             reset_gc();
@@ -1830,16 +1828,31 @@ fn test_gc_sweep_scaling_and_fragmentation() {
                     (*payload_to_header(payload)).marked = index % 2 == 1;
                 }
             }
-            SWEEP_REGION_VISITS.store(0, Ordering::Relaxed);
-            SWEEP_OBJECT_VISITS.store(0, Ordering::Relaxed);
+            runtime()
+                .sweep_observation
+                .region_visits
+                .store(0, Ordering::Relaxed);
+            runtime()
+                .sweep_observation
+                .object_visits
+                .store(0, Ordering::Relaxed);
             let start = std::time::Instant::now();
             assert_eq!(sweep(), n * (GC_HEADER_SIZE + payload_size));
             let elapsed = start.elapsed();
             assert_eq!(
-                SWEEP_REGION_VISITS.load(Ordering::Relaxed),
+                runtime()
+                    .sweep_observation
+                    .region_visits
+                    .load(Ordering::Relaxed),
                 if large { 2 * n } else { 1 }
             );
-            assert_eq!(SWEEP_OBJECT_VISITS.load(Ordering::Relaxed), 2 * n);
+            assert_eq!(
+                runtime()
+                    .sweep_observation
+                    .object_visits
+                    .load(Ordering::Relaxed),
+                2 * n
+            );
             let state = runtime().heap.lock().unwrap();
             verify_old_region_metadata(&state).unwrap();
             assert_eq!(state.allocated_bytes, n * (GC_HEADER_SIZE + payload_size));
@@ -1862,8 +1875,14 @@ fn test_gc_sweep_scaling_and_fragmentation() {
                 } else {
                     "release"
                 },
-                SWEEP_REGION_VISITS.load(Ordering::Relaxed),
-                SWEEP_OBJECT_VISITS.load(Ordering::Relaxed),
+                runtime()
+                    .sweep_observation
+                    .region_visits
+                    .load(Ordering::Relaxed),
+                runtime()
+                    .sweep_observation
+                    .object_visits
+                    .load(Ordering::Relaxed),
                 elapsed.as_nanos()
             );
             // Cleared marks make the next sweep reclaim every survivor.
@@ -1881,7 +1900,7 @@ fn test_gc_sweep_adjacent_gaps_tail_finalizers_and_cards() {
     unsafe fn count_drop(_: *mut u8) {
         DROPS.fetch_add(1, Ordering::Relaxed);
     }
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     set_threshold(usize::MAX);
     DROPS.store(0, Ordering::Relaxed);
@@ -1938,7 +1957,7 @@ fn test_gc_sweep_adjacent_gaps_tail_finalizers_and_cards() {
 
 #[test]
 fn test_gc_old_region_metadata_tracks_regular_allocation() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let object = willow_alloc_object(61, 24);
     assert!(!object.is_null());
@@ -1969,7 +1988,7 @@ fn test_gc_old_region_metadata_tracks_regular_allocation() {
 
 #[test]
 fn test_gc_old_region_sweep_creates_and_reuses_middle_hole() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let a = willow_alloc_object(62, 8);
     let dead = willow_alloc_object(63, 8);
@@ -2010,7 +2029,7 @@ fn test_gc_old_region_sweep_creates_and_reuses_middle_hole() {
 
 #[test]
 fn test_gc_empty_old_region_is_released_after_major_sweep() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let released = willow_gc_old_regions_released();
     let _garbage = willow_alloc_object(66, 8);
@@ -2028,7 +2047,7 @@ fn test_gc_empty_old_region_is_released_after_major_sweep() {
 
 #[test]
 fn test_gc_large_object_uses_dedicated_region_and_stays_non_moving() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let payload_size = GC_LARGE_OBJECT_THRESHOLD;
     let mut large = willow_alloc_object(67, payload_size as i64);
@@ -2057,7 +2076,7 @@ fn test_gc_large_object_uses_dedicated_region_and_stays_non_moving() {
 
 #[test]
 fn test_gc_regular_old_allocation_rolls_over_to_multiple_regions() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let count = GC_OLD_REGION_SIZE / (GC_HEADER_SIZE + 8) + 10;
     let mut roots = Vec::with_capacity(count);
@@ -2090,7 +2109,7 @@ fn test_gc_regular_old_allocation_rolls_over_to_multiple_regions() {
 
 #[test]
 fn test_gc_minor_promotion_target_is_old_region_backed() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let young = willow_gc_alloc_slow(&mut tls, 68, 0, 8, 0);
@@ -2126,7 +2145,7 @@ fn test_gc_minor_promotion_target_is_old_region_backed() {
 
 #[test]
 fn test_gc_alloc_typed_mask_traces_child_pointer_slot() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let child = willow_alloc(8);
     let parent = willow_alloc_typed(8, 0b1);
@@ -2151,7 +2170,7 @@ fn test_gc_alloc_typed_mask_traces_child_pointer_slot() {
 
 #[test]
 fn test_gc_collect_frees_unreachable_objects() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_alloc_object(1, 128);
     let before = willow_gc_allocated_bytes();
@@ -2168,7 +2187,7 @@ fn test_gc_collect_frees_unreachable_objects() {
 /// collect 後に total_frees が増えること
 #[test]
 fn test_gc_total_frees_counter_after_collect() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_alloc_object(1, 16);
     willow_alloc_object(1, 16);
@@ -2185,7 +2204,7 @@ fn test_gc_total_frees_counter_after_collect() {
 /// collect を複数回呼んでも壊れない (2回目以降は何も回収しない)
 #[test]
 fn test_gc_collect_idempotent_on_empty_heap() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_gc_collect();
     willow_gc_collect();
@@ -2197,7 +2216,7 @@ fn test_gc_collect_idempotent_on_empty_heap() {
 /// (リセットされないと次サイクルで全部生存扱いになる)
 #[test]
 fn test_gc_survivor_mark_bit_cleared_after_collection() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(1, 16);
     let mut slot: *mut u8 = ptr;
@@ -2224,7 +2243,7 @@ fn test_gc_survivor_mark_bit_cleared_after_collection() {
 
 #[test]
 fn test_gc_collect_preserves_rooted_objects() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(2, 32);
     let mut slot: *mut u8 = ptr;
@@ -2246,7 +2265,7 @@ fn test_gc_collect_preserves_rooted_objects() {
 
 #[test]
 fn test_gc_runtime_root_preserves_object_without_stack_root() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(2, 32);
 
@@ -2307,7 +2326,7 @@ fn runtime_root_set_distinct_snapshots_and_balanced_owners() {
 
 #[test]
 fn test_gc_runtime_root_ignores_null_and_ref_counts_retentions() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(2, 32);
 
@@ -2340,20 +2359,20 @@ fn test_gc_runtime_root_ignores_null_and_ref_counts_retentions() {
 
 #[test]
 fn test_gc_foreign_thread_collect_skips_live_root_stack_owner() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(2, 32);
     let ptr_addr = ptr as usize;
     let (rooted_tx, rooted_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
 
-    let owner_thread = std::thread::spawn(move || {
+    let owner_thread = std::thread::spawn(crate::runtime::serving(move || {
         let mut slot = ptr_addr as *mut u8;
         willow_push_root(&mut slot as *mut *mut u8);
         rooted_tx.send(()).unwrap();
         release_rx.recv().unwrap();
         willow_pop_root();
-    });
+    }));
 
     rooted_rx.recv().unwrap();
     willow_gc_collect();
@@ -2373,7 +2392,7 @@ fn test_gc_foreign_thread_collect_skips_live_root_stack_owner() {
 #[cfg(debug_assertions)]
 #[test]
 fn test_gc_debug_validation_rejects_invalid_runtime_root_pointer() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = tlab_state_for_test();
     assert!(!willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0).is_null());
@@ -2393,7 +2412,7 @@ fn test_gc_debug_validation_rejects_invalid_runtime_root_pointer() {
 
 #[test]
 fn test_gc_root_push_pop_symmetry() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut slot1: *mut u8 = std::ptr::null_mut();
     let mut slot2: *mut u8 = std::ptr::null_mut();
@@ -2409,7 +2428,7 @@ fn test_gc_root_push_pop_symmetry() {
 
 #[test]
 fn test_gc_root_depth_mirror_tracks_mutations_and_stack_transfers() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let check = |expected: usize| {
         ROOT_STACK.with(|stack| assert_eq!(stack.borrow().len(), expected));
@@ -2423,10 +2442,10 @@ fn test_gc_root_depth_mirror_tracks_mutations_and_stack_transfers() {
         check(index + 1);
     }
     // A new worker's view must not inherit this worker's three roots.
-    std::thread::spawn(|| {
+    std::thread::spawn(crate::runtime::serving(|| {
         assert_eq!(willow_root_depth(), 0);
         assert_eq!(gc_thread_root_depth(), 0);
-    })
+    }))
     .join()
     .unwrap();
     check(3);
@@ -2486,7 +2505,7 @@ fn test_gc_root_depth_mirror_overflow_is_fatal() {
 /// pop_roots(0) はスタックを変えない
 #[test]
 fn test_gc_pop_roots_zero_is_noop() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut slot: *mut u8 = std::ptr::null_mut();
     willow_push_root(&mut slot as *mut *mut u8);
@@ -2499,7 +2518,7 @@ fn test_gc_pop_roots_zero_is_noop() {
 /// pop_roots(n > stack size) はアンダーフローしない
 #[test]
 fn test_gc_pop_roots_excess_clamps_to_zero() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut slot: *mut u8 = std::ptr::null_mut();
     willow_push_root(&mut slot as *mut *mut u8);
@@ -2512,7 +2531,7 @@ fn test_gc_pop_roots_excess_clamps_to_zero() {
 /// スロットの値が null のルートがあっても GC はクラッシュしない
 #[test]
 fn test_gc_null_root_value_does_not_crash() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     // slot は非null だが、slot の指す先 (ポインタ値) が null
     let mut slot: *mut u8 = std::ptr::null_mut();
@@ -2529,7 +2548,7 @@ fn test_gc_null_root_value_does_not_crash() {
 
 #[test]
 fn test_gc_multiple_allocs_and_collect() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     for _ in 0..9 {
         willow_alloc_object(1, 16);
@@ -2555,7 +2574,7 @@ fn test_gc_multiple_allocs_and_collect() {
 /// 100個確保して1つだけルートを張る → collect後にちょうど1個残る
 #[test]
 fn test_gc_large_population_single_survivor() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     for _ in 0..99 {
         willow_alloc_object(1, 8);
@@ -2582,7 +2601,7 @@ fn test_gc_large_population_single_survivor() {
 /// collect後にまた確保できること (ヒープが壊れていないこと)
 #[test]
 fn test_gc_reallocation_after_collection() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     // 1回目の確保・回収サイクル
     willow_alloc_object(1, 32);
@@ -2602,7 +2621,7 @@ fn test_gc_reallocation_after_collection() {
 /// しきい値を超えた確保が自動でGCをトリガーすること
 #[test]
 fn test_gc_auto_trigger_by_threshold() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
 
     // まず1つ確保してしきい値をそのオブジェクトのサイズより小さく設定
@@ -2641,7 +2660,7 @@ fn test_gc_auto_trigger_by_threshold() {
 /// 複数ルートのうち1つだけ外すと、外したものだけ回収される
 #[test]
 fn test_gc_partial_roots_partial_collection() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
 
     let ptr_a = willow_alloc_object(1, 16);
@@ -2675,7 +2694,7 @@ fn test_gc_partial_roots_partial_collection() {
 // =========================================================================
 #[test]
 fn test_gc_large_payload_alloc_succeeds() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(1, 1024 * 1024);
     assert!(!ptr.is_null(), "1 MiB payload allocation must succeed");
@@ -2685,7 +2704,7 @@ fn test_gc_large_payload_alloc_succeeds() {
 // Consecutive allocations must enter the authoritative region index.
 #[test]
 fn test_gc_consecutive_allocs_update_region_index() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let first = willow_alloc_object(1, 8);
     let second = willow_alloc_object(2, 8);
@@ -2701,7 +2720,7 @@ fn test_gc_consecutive_allocs_update_region_index() {
 // 観点3: 確保したペイロード領域に読み書きできる
 #[test]
 fn test_gc_payload_is_readable_writable() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(1, 8) as *mut i64;
     unsafe {
@@ -2714,7 +2733,7 @@ fn test_gc_payload_is_readable_writable() {
 // 観点4: 複数の type_id を持つオブジェクトが混在して確保できる
 #[test]
 fn test_gc_multiple_type_ids_work() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let p1 = willow_alloc_object(1, 8);
     let p2 = willow_alloc_object(2, 8);
@@ -2744,7 +2763,7 @@ fn test_gc_multiple_type_ids_work() {
 // 観点5: 確保直後の GcHeader.marked が false
 #[test]
 fn test_gc_header_marked_false_after_alloc() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(1, 8);
     assert!(!unsafe { (*payload_to_header(ptr)).marked });
@@ -2754,7 +2773,7 @@ fn test_gc_header_marked_false_after_alloc() {
 // 観点6: 確保直後の GcHeader.type_id が指定値と一致
 #[test]
 fn test_gc_header_type_id_matches() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(42, 8);
     assert_eq!(
@@ -2770,7 +2789,7 @@ fn test_gc_header_type_id_matches() {
 // 観点7: GcHeader.size がヘッダ+ペイロードと一致
 #[test]
 fn test_gc_header_size_field_matches_total() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let payload: i64 = 24;
     let ptr = willow_alloc_object(1, payload);
@@ -2785,7 +2804,7 @@ fn test_gc_header_size_field_matches_total() {
 // Region membership is authoritative; no linkage word exists.
 #[test]
 fn test_gc_region_allocations_do_not_publish_heap_links() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let first = willow_alloc_object(1, 8);
     let second = willow_alloc_object(2, 8);
@@ -2799,7 +2818,7 @@ fn test_gc_region_allocations_do_not_publish_heap_links() {
 // =========================================================================
 #[test]
 fn test_gc_push_root_n_times_increases_stack_by_n() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut slots = [std::ptr::null_mut::<u8>(); 5];
     for s in slots.iter_mut() {
@@ -2813,7 +2832,7 @@ fn test_gc_push_root_n_times_increases_stack_by_n() {
 // 観点10: pop_roots(n) でちょうど n 個減る
 #[test]
 fn test_gc_pop_roots_n_decreases_by_exactly_n() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut slot = std::ptr::null_mut::<u8>();
     for _ in 0..6 {
@@ -2828,7 +2847,7 @@ fn test_gc_pop_roots_n_decreases_by_exactly_n() {
 // 観点11: push→pop→push のスロット再利用
 #[test]
 fn test_gc_push_pop_push_slot_reuse() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr1 = willow_alloc_object(1, 8);
     let mut slot: *mut u8 = ptr1;
@@ -2853,7 +2872,7 @@ fn test_gc_push_pop_push_slot_reuse() {
 // 観点12: 同じスロットを2回 push するとスタックに2エントリ入る
 #[test]
 fn test_gc_same_slot_pushed_twice_creates_two_entries() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut slot = std::ptr::null_mut::<u8>();
     willow_push_root(&mut slot as *mut *mut u8);
@@ -2866,7 +2885,7 @@ fn test_gc_same_slot_pushed_twice_creates_two_entries() {
 // 観点13: 空スタックで pop_root を呼んでもクラッシュしない
 #[test]
 fn test_gc_pop_root_on_empty_stack_no_crash() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_pop_root();
     ROOT_STACK.with(|rs| assert_eq!(rs.borrow().len(), 0));
@@ -2876,7 +2895,7 @@ fn test_gc_pop_root_on_empty_stack_no_crash() {
 // 観点14: 空スタックで pop_roots(n) を呼んでもクラッシュしない
 #[test]
 fn test_gc_pop_roots_on_empty_stack_no_crash() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_pop_roots(5);
     ROOT_STACK.with(|rs| assert_eq!(rs.borrow().len(), 0));
@@ -2886,7 +2905,7 @@ fn test_gc_pop_roots_on_empty_stack_no_crash() {
 // 観点15: 4000個近くまで push_root できる
 #[test]
 fn test_gc_push_root_near_max_capacity() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     const N: usize = 4000;
     let mut slots = vec![std::ptr::null_mut::<u8>(); N];
@@ -2906,7 +2925,7 @@ fn test_gc_push_root_near_max_capacity() {
 // 観点16: 同じオブジェクトを2つのルートが指しても二重マークでクラッシュしない
 #[test]
 fn test_gc_two_roots_same_object_no_double_mark_crash() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(1, 8);
     let mut s1: *mut u8 = ptr;
@@ -2932,7 +2951,7 @@ fn test_gc_two_roots_same_object_no_double_mark_crash() {
 // 観点21: ヒープ先頭 (heap_head) が unreachable でも正しく回収
 #[test]
 fn test_gc_sweep_head_object_unreachable() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr_a = willow_alloc_object(1, 8); // first alloc → becomes tail
     let _ptr_b = willow_alloc_object(2, 8); // second alloc → becomes head (unreachable)
@@ -2956,7 +2975,7 @@ fn test_gc_sweep_head_object_unreachable() {
 // 観点22: ヒープ末尾が unreachable でも正しく回収
 #[test]
 fn test_gc_sweep_tail_object_unreachable() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let _ptr_a = willow_alloc_object(1, 8); // first → tail (unreachable)
     let ptr_b = willow_alloc_object(2, 8); // second → head (rooted)
@@ -2980,7 +2999,7 @@ fn test_gc_sweep_tail_object_unreachable() {
 // 観点23: ヒープ中間のオブジェクトだけ unreachable でも正しく回収
 #[test]
 fn test_gc_sweep_middle_object_unreachable() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr_a = willow_alloc_object(1, 8); // tail
     let _ptr_b = willow_alloc_object(2, 8); // middle (unreachable)
@@ -3004,7 +3023,7 @@ fn test_gc_sweep_middle_object_unreachable() {
 // 観点24: sweep後にヒープリストが null で終端される
 #[test]
 fn test_gc_heap_null_terminated_after_sweep() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(1, 8);
     let mut slot: *mut u8 = ptr;
@@ -3018,7 +3037,7 @@ fn test_gc_heap_null_terminated_after_sweep() {
 // 観点25: 全員生き残ったときリンクリストが壊れていない
 #[test]
 fn test_gc_survivors_remain_indexed_after_sweep() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let pa = willow_alloc_object(1, 8);
     let pb = willow_alloc_object(2, 8);
@@ -3048,7 +3067,7 @@ fn test_gc_survivors_remain_indexed_after_sweep() {
 // 観点26: 確保するたびに正確に (header+payload) ずつ増える
 #[test]
 fn test_gc_allocated_bytes_grows_precisely_per_alloc() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let step = obj_size(16);
     willow_alloc_object(1, 16);
@@ -3063,7 +3082,7 @@ fn test_gc_allocated_bytes_grows_precisely_per_alloc() {
 // 観点28: partial collect で回収分だけ減り、生存分は保持される
 #[test]
 fn test_gc_partial_collect_bytes_accurate() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let pa = willow_alloc_object(1, 8); // freed
     let pb = willow_alloc_object(2, 8); // survives
@@ -3083,7 +3102,7 @@ fn test_gc_partial_collect_bytes_accurate() {
 // 観点29: 5つルートを張った5個全員の合計バイトが正確
 #[test]
 fn test_gc_five_roots_five_survivors_bytes() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut ptrs: Vec<*mut u8> = (0..5).map(|i| willow_alloc_object(i, 8)).collect();
     for p in ptrs.iter_mut() {
@@ -3104,7 +3123,7 @@ fn test_gc_five_roots_five_survivors_bytes() {
 // 観点30: threshold 未満では auto-collect が走らない
 #[test]
 fn test_gc_no_auto_trigger_below_threshold() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     set_threshold(usize::MAX);
     let before = total_frees();
@@ -3118,7 +3137,7 @@ fn test_gc_no_auto_trigger_below_threshold() {
 // 観点31: auto-collect 後に threshold が2倍になる
 #[test]
 fn test_gc_threshold_doubles_after_auto_trigger() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_alloc_object(1, 8); // allocated_bytes = header+8
     set_threshold(1); // 現在の allocated_bytes より小さく設定
@@ -3134,7 +3153,7 @@ fn test_gc_threshold_doubles_after_auto_trigger() {
 // 観点32: auto-collect 後に新規確保が正常にできる
 #[test]
 fn test_gc_realloc_after_auto_trigger_works() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_alloc_object(1, 16);
     set_threshold(1);
@@ -3149,7 +3168,7 @@ fn test_gc_realloc_after_auto_trigger_works() {
 // auto-collect が走り、確保ごとにヒープロックを取らない。
 #[test]
 fn test_gc_threshold_one_triggers_collect_once_per_policy_budget() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     set_threshold(1);
     let before = total_frees();
@@ -3175,7 +3194,7 @@ fn test_gc_threshold_one_triggers_collect_once_per_policy_budget() {
 // 観点34: 100回 auto-collect サイクルを繰り返してもメモリリークなし
 #[test]
 fn test_gc_100_auto_trigger_cycles_no_leak() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     set_threshold(1);
     for _ in 0..100 {
@@ -3193,7 +3212,7 @@ fn test_gc_100_auto_trigger_cycles_no_leak() {
 // 観点35: alloc→root→collect(生存)→unroot→collect(回収) の完全1サイクル
 #[test]
 fn test_gc_full_lifecycle() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(1, 16);
     let mut slot: *mut u8 = ptr;
@@ -3216,7 +3235,7 @@ fn test_gc_full_lifecycle() {
 // 観点36: rooted のまま collect を 10回繰り返しても毎回生き残る
 #[test]
 fn test_gc_repeated_collect_rooted_object_survives() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(1, 8);
     let mut slot: *mut u8 = ptr;
@@ -3237,7 +3256,7 @@ fn test_gc_repeated_collect_rooted_object_survives() {
 // 観点37: alloc→collect を 100サイクル繰り返してもリークなし
 #[test]
 fn test_gc_100_alloc_collect_cycles_no_leak() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     for _ in 0..100 {
         willow_alloc_object(1, 16);
@@ -3250,7 +3269,7 @@ fn test_gc_100_alloc_collect_cycles_no_leak() {
 // 観点38: collect 後も生き残ったオブジェクトのペイロード値が変化していない
 #[test]
 fn test_gc_payload_unchanged_after_collection() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(1, 8) as *mut i64;
     unsafe {
@@ -3271,7 +3290,7 @@ fn test_gc_payload_unchanged_after_collection() {
 // 観点39: unroot 直後の collect でオブジェクトが即座に回収される
 #[test]
 fn test_gc_collect_immediately_after_unroot() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(1, 8);
     let mut slot: *mut u8 = ptr;
@@ -3295,7 +3314,7 @@ fn test_gc_collect_immediately_after_unroot() {
 // 観点40: reset 後に total_allocs が 0 から始まる
 #[test]
 fn test_gc_total_allocs_starts_at_zero_after_reset() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     assert_eq!(total_allocs(), 0);
     reset_gc();
@@ -3304,7 +3323,7 @@ fn test_gc_total_allocs_starts_at_zero_after_reset() {
 // 観点42: partial collect で total_frees が回収個数分だけ増える
 #[test]
 fn test_gc_partial_collect_total_frees_count() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     for _ in 0..5 {
         willow_alloc_object(1, 8);
@@ -3330,7 +3349,7 @@ fn test_gc_partial_collect_total_frees_count() {
 // 観点43: ペイロード 1 バイトの確保が成功する
 #[test]
 fn test_gc_alloc_payload_size_one() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(1, 1);
     assert!(!ptr.is_null());
@@ -3340,7 +3359,7 @@ fn test_gc_alloc_payload_size_one() {
 // 観点44: 奇数ペイロードサイズでも正しく動く
 #[test]
 fn test_gc_alloc_odd_payload_sizes() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     for &size in &[1i64, 3, 5, 7, 9, 11] {
         let ptr = willow_alloc_object(1, size);
@@ -3352,7 +3371,7 @@ fn test_gc_alloc_odd_payload_sizes() {
 // 観点45: 10,000個確保して全部回収される
 #[test]
 fn test_gc_ten_thousand_allocs_all_freed() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     set_threshold(usize::MAX); // 自動トリガー無効
     for _ in 0..10_000 {
@@ -3367,7 +3386,7 @@ fn test_gc_ten_thousand_allocs_all_freed() {
 // 観点46: 確保→回収サイクルを 20回繰り返した後にヒープが空
 #[test]
 fn test_gc_empty_heap_after_many_cycles() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     for _ in 0..20 {
         for _ in 0..10 {
@@ -3390,7 +3409,7 @@ fn test_gc_empty_heap_after_many_cycles() {
 // 観点47: alloc から返ったポインタを payload_to_header に渡すと元のヘッダが返る
 #[test]
 fn test_gc_payload_to_header_roundtrip() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let ptr = willow_alloc_object(7, 16);
     let hdr = payload_to_header(ptr);
@@ -3409,7 +3428,7 @@ fn test_gc_payload_to_header_roundtrip() {
 // 観点48: 2個確保したとき、それぞれ payload_to_header が別のヘッダを返す
 #[test]
 fn test_gc_payload_to_header_two_objects_distinct() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let p1 = willow_alloc_object(1, 8);
     let p2 = willow_alloc_object(2, 8);
@@ -3432,7 +3451,7 @@ fn test_gc_payload_to_header_two_objects_distinct() {
 // =========================================================================
 #[test]
 fn test_gc_log_env_var_does_not_panic() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_alloc_object(1, 8);
     // WILLOW_GC_LOG が設定されていても collect はクラッシュしない
@@ -3446,16 +3465,16 @@ fn test_gc_log_env_var_does_not_panic() {
 // =========================================================================
 #[test]
 fn test_gc_concurrent_alloc_no_panic() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
 
     let handles: Vec<_> = (0..4)
         .map(|_| {
-            std::thread::spawn(|| {
+            std::thread::spawn(crate::runtime::serving(|| {
                 for _ in 0..100 {
                     let _ptr = willow_alloc_object(1, 16);
                 }
-            })
+            }))
         })
         .collect();
 
@@ -3604,7 +3623,7 @@ unsafe fn trace_msg(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
 // -------------------------------------------------------------------------
 #[test]
 fn test_gc_typeinfo_root_child_survives() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_register_type_capability(
         TYPE_NODE,
@@ -3639,7 +3658,7 @@ fn test_gc_typeinfo_root_child_survives() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_gc_typeinfo_root_child_grandchild_survives() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_register_type_capability(
         TYPE_NODE,
@@ -3678,7 +3697,7 @@ fn test_gc_typeinfo_root_child_grandchild_survives() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_gc_typeinfo_rootless_cycle_collected() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_register_type_capability(
         TYPE_NODE,
@@ -3707,7 +3726,7 @@ fn test_gc_typeinfo_rootless_cycle_collected() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_gc_typeinfo_rooted_cycle_survives() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_register_type_capability(
         TYPE_NODE,
@@ -3743,7 +3762,7 @@ fn test_gc_typeinfo_rooted_cycle_survives() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_gc_typeinfo_class_field_traced() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_register_type_capability(
         TYPE_CLASS,
@@ -3780,7 +3799,7 @@ fn test_gc_typeinfo_class_field_traced() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_gc_typeinfo_two_children_traced() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_register_type_capability(
         TYPE_NODE2,
@@ -3818,7 +3837,7 @@ fn test_gc_typeinfo_two_children_traced() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_gc_typeinfo_array_elements_traced() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_register_type_capability(
         TYPE_ARRAY,
@@ -3868,7 +3887,7 @@ fn test_gc_typeinfo_array_elements_traced() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_gc_typeinfo_enum_text_variant_traced() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_register_type_capability(
         TYPE_MSG,
@@ -3905,7 +3924,7 @@ fn test_gc_typeinfo_enum_text_variant_traced() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_gc_typeinfo_enum_number_variant_not_traced() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_register_type_capability(
         TYPE_MSG,
@@ -3942,7 +3961,7 @@ fn test_gc_typeinfo_enum_number_variant_not_traced() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_gc_typeinfo_unrooted_parent_child_both_collected() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_register_type_capability(
         TYPE_NODE,
@@ -3968,7 +3987,7 @@ fn test_gc_typeinfo_unrooted_parent_child_both_collected() {
 #[test]
 fn enum_variant_mixed_pair_words_preserve_offsets_and_gc_edges() {
     use willow_abi::SlotKind::{GcRef, InterfacePair, ScalarPair, Word};
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     for count in [1, 4, 8] {
         let mut slots = Vec::new();
@@ -4045,7 +4064,7 @@ fn enum_variant_mixed_pair_words_preserve_offsets_and_gc_edges() {
 // coordination lock and must track register, unregister and heap resets.
 #[test]
 fn registration_cache_tracks_register_unregister_and_reset() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     assert!(!current_thread_is_registered());
     willow_gc_register_mutator();
@@ -4074,7 +4093,7 @@ fn registration_cache_tracks_register_unregister_and_reset() {
 
 #[test]
 fn registration_cache_is_per_thread() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let (registered, release) = (
         std::sync::Arc::new(std::sync::Barrier::new(2)),
@@ -4082,14 +4101,14 @@ fn registration_cache_is_per_thread() {
     );
     let worker = {
         let (registered, release) = (registered.clone(), release.clone());
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             willow_gc_register_mutator();
             let seen = current_thread_is_registered();
             registered.wait();
             release.wait();
             willow_gc_unregister_mutator();
             seen
-        })
+        }))
     };
     registered.wait();
     // Another thread's registration does not register this one.
@@ -4104,7 +4123,7 @@ fn registration_cache_is_per_thread() {
 fn registered_root_pushes_match_the_coordination_registry() {
     // Registered threads keep bypassing the legacy single-owner guard: many
     // pushes and pops leave no root-stack owner behind.
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_gc_register_mutator();
     let mut roots = vec![std::ptr::null_mut::<u8>(); 64];
@@ -4122,7 +4141,7 @@ fn registered_root_pushes_match_the_coordination_registry() {
 // locks the heap) once per TLAB-chunk budget per thread, not per allocation.
 #[test]
 fn runtime_policy_budget_checks_first_then_once_per_chunk() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     assert!(runtime_policy_check_due(16), "first allocation checks");
     let step = 64;
@@ -4147,7 +4166,7 @@ fn runtime_policy_budget_checks_first_then_once_per_chunk() {
 // and after every policy-input change.
 #[test]
 fn runtime_policy_headroom_is_bounded_and_invalidated() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_alloc(64);
     {
@@ -4155,11 +4174,20 @@ fn runtime_policy_headroom_is_bounded_and_invalidated() {
         state.threshold_bytes = usize::MAX / 2;
         state.pacer_trigger = u64::MAX / 2;
     }
-    assert!(!allocation_should_collect());
-    assert_eq!(POLICY_HEADROOM.load(Ordering::Acquire), POLICY_HEADROOM_CAP);
-    assert!(consume_policy_headroom(POLICY_HEADROOM_CAP - 1));
-    assert!(!consume_policy_headroom(2), "headroom never goes negative");
-    assert!(consume_policy_headroom(1));
+    assert!(!allocation_should_collect_with_sync_in(
+        crate::runtime::current(),
+        true
+    ));
+    assert_eq!(
+        runtime().headroom.policy.load(Ordering::Acquire),
+        POLICY_HEADROOM_CAP
+    );
+    assert!(consume_policy_headroom(runtime(), POLICY_HEADROOM_CAP - 1));
+    assert!(
+        !consume_policy_headroom(runtime(), 2),
+        "headroom never goes negative"
+    );
+    assert!(consume_policy_headroom(runtime(), 1));
     {
         let mut state = runtime().heap.lock().unwrap();
         let occupied = memory_inputs(&state).occupied;
@@ -4179,17 +4207,20 @@ fn runtime_policy_headroom_is_bounded_and_invalidated() {
         assert_eq!(policy_headroom(&state), 0, "under a hard cap");
         state.memory_limit_bytes = None;
     }
-    assert!(!allocation_should_collect());
-    assert!(POLICY_HEADROOM.load(Ordering::Acquire) > 0);
+    assert!(!allocation_should_collect_with_sync_in(
+        crate::runtime::current(),
+        true
+    ));
+    assert!(runtime().headroom.policy.load(Ordering::Acquire) > 0);
     invalidate_runtime_policy_budgets();
-    assert_eq!(POLICY_HEADROOM.load(Ordering::Acquire), 0);
+    assert_eq!(runtime().headroom.policy.load(Ordering::Acquire), 0);
     reset_gc();
-    assert_eq!(POLICY_HEADROOM.load(Ordering::Acquire), 0);
+    assert_eq!(runtime().headroom.policy.load(Ordering::Acquire), 0);
 }
 
 #[test]
 fn runtime_policy_budget_rearms_on_reservation_growth_only_under_hard_cap() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     assert!(runtime_policy_check_due(1));
     {
@@ -4214,13 +4245,13 @@ fn runtime_policy_budget_rearms_on_reservation_growth_only_under_hard_cap() {
 
 #[test]
 fn runtime_policy_budget_is_per_thread() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     assert!(runtime_policy_check_due(1));
     assert!(!runtime_policy_check_due(1));
     // A fresh thread has no budget yet and checks at its first allocation.
     assert!(
-        std::thread::spawn(|| runtime_policy_check_due(1))
+        std::thread::spawn(crate::runtime::serving(|| runtime_policy_check_due(1)))
             .join()
             .unwrap()
     );
@@ -4236,7 +4267,7 @@ mod foreign_owner_tests;
 
 #[test]
 fn cumulative_allocation_bytes_survive_collection_and_repeated_reads() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for count in [1, 8, 64, 512] {
         reset_gc();
         assert_eq!(willow_gc_total_allocated_bytes(), 0);
@@ -4261,7 +4292,7 @@ fn cumulative_allocation_bytes_survive_collection_and_repeated_reads() {
 
 #[test]
 fn cumulative_allocation_bytes_merge_fast_path_once_and_scale_by_tlabs() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for count in [1, 8, 64] {
         reset_gc();
         willow_gc_register_mutator();
@@ -4270,13 +4301,13 @@ fn cumulative_allocation_bytes_merge_fast_path_once_and_scale_by_tlabs() {
             willow_gc_alloc_slow(tls, 1, 0, 8, 0);
             fast_alloc_for_test(tls, GC_HEADER_SIZE + 8);
         }
-        TLAB_ACCOUNTING_RECORD_VISITS.store(0, Ordering::Relaxed);
+        runtime().heap.lock().unwrap().tlab_accounting_observation = 0;
         let expected = (count * 2 * (GC_HEADER_SIZE + 8)) as i64;
         for _ in 0..3 {
             assert_eq!(willow_gc_total_allocated_bytes(), expected);
         }
         assert_eq!(
-            TLAB_ACCOUNTING_RECORD_VISITS.load(Ordering::Relaxed),
+            runtime().heap.lock().unwrap().tlab_accounting_observation,
             3 * count
         );
         assert_eq!(willow_gc_allocated_bytes(), expected);
@@ -4295,7 +4326,7 @@ fn cumulative_allocation_bytes_merge_fast_path_once_and_scale_by_tlabs() {
 
 #[test]
 fn cumulative_allocation_bytes_clamp_without_wrapping() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     for total in [i64::MAX as u64 - 1, i64::MAX as u64, u64::MAX] {
         runtime().heap.lock().unwrap().total_allocated_bytes = total;
@@ -4312,7 +4343,7 @@ fn cumulative_allocation_bytes_clamp_without_wrapping() {
 /// the budget and promoted bytes do.
 #[test]
 fn major_policy_domain_counts_young_bytes_only_past_the_nursery_budget() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut state = runtime().heap.lock().unwrap();
     let old = 4096;
@@ -4343,7 +4374,11 @@ fn major_policy_domain_counts_young_bytes_only_past_the_nursery_budget() {
     let base = policy_allocated_total(&state);
     assert_eq!(
         base,
-        2_300 + EXTERNAL_ALLOCATED_BYTES.load(Ordering::Relaxed)
+        2_300
+            + runtime()
+                .native_accounting
+                .allocated_bytes
+                .load(Ordering::Relaxed)
     );
     state.total_allocated_bytes += 5_000;
     state.young_allocation_clock += 5_000;
@@ -4360,7 +4395,7 @@ fn major_policy_domain_counts_young_bytes_only_past_the_nursery_budget() {
 /// young bytes stay with minor collections.
 #[test]
 fn soft_memory_limit_counts_young_bytes_at_every_nursery_size() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut state = runtime().heap.lock().unwrap();
     let limit: usize = 8 << 20;
@@ -4409,33 +4444,47 @@ fn soft_memory_limit_counts_young_bytes_at_every_nursery_size() {
 /// the reservation refuses keeps it for a retry, and installation takes it.
 #[test]
 fn tlab_chunk_storage_is_kept_when_refused_and_taken_when_installed() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     let mut tls = new_tlab_state();
     let owner = &mut tls as *mut GcTlabState as usize;
-    let mut storage = tlab::ChunkStorage::allocate();
+    let mut storage = tlab::ChunkStorage::allocate(&RuntimeStorageAllocator::default());
     assert!(storage.is_some());
     let mut state = runtime().heap.lock().unwrap();
     tlab::register_tlab_state(&mut state, owner);
     let chunks = state.tlab_chunks.len();
     state.memory_limit_bytes = Some(1);
-    assert!(tlab::install_tlab_chunk(&mut state, owner, &mut storage).is_none());
+    assert!(
+        tlab::install_tlab_chunk(crate::runtime::current(), &mut state, owner, &mut storage)
+            .is_none()
+    );
     assert!(storage.is_some(), "a refused refill keeps its storage");
     assert_eq!(state.tlab_chunks.len(), chunks);
     state.memory_limit_bytes = None;
-    let base = tlab::install_tlab_chunk(&mut state, owner, &mut storage);
+    let base = tlab::install_tlab_chunk(crate::runtime::current(), &mut state, owner, &mut storage);
     assert!(base.is_some());
     assert!(storage.is_none(), "installation takes the storage");
     assert_eq!(state.tlab_chunks.len(), chunks + 1);
     assert_eq!(state.tlab_chunks.last().unwrap().base, base.unwrap());
     // Nothing left to install: no chunk without storage.
-    assert!(tlab::install_tlab_chunk(&mut state, owner, &mut storage).is_none());
+    assert!(
+        tlab::install_tlab_chunk(crate::runtime::current(), &mut state, owner, &mut storage)
+            .is_none()
+    );
     assert_eq!(state.tlab_chunks.len(), chunks + 1);
-    retire_tlab_locked(&mut state, owner);
+    let footprint = crate::gc_telemetry::footprint::Counters::new();
+    let other = crate::gc_telemetry::footprint::Counters::new();
+    tlab::retire_tlab_locked_in(&footprint, &mut state, owner);
+    assert_eq!(footprint.snapshot(), (0, GC_TLAB_CHUNK_SIZE as u64));
+    assert_eq!(other.snapshot(), (0, 0));
+    tlab::retire_tlab_locked_in(&footprint, &mut state, owner);
+    assert_eq!(footprint.snapshot(), (0, GC_TLAB_CHUNK_SIZE as u64));
     drop(state);
     reset_gc();
     // An uninstalled value releases its storage on drop.
-    drop(tlab::ChunkStorage::allocate());
+    drop(tlab::ChunkStorage::allocate(
+        &RuntimeStorageAllocator::default(),
+    ));
 }
 
 // Keep several inactive/partially filled owners while one owner repeatedly
@@ -4443,7 +4492,7 @@ fn tlab_chunk_storage_is_kept_when_refused_and_taken_when_installed() {
 // across the hot owner's retired chunks.
 #[test]
 fn refill_accounting_constant_visits_and_bounded_lag() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     let bytes = GC_HEADER_SIZE + 8;
     for count in [1, 4, 16, 64] {
         reset_gc();
@@ -4460,7 +4509,7 @@ fn refill_accounting_constant_visits_and_bounded_lag() {
             fast_alloc_for_test(tls, bytes);
         }
         let mut expected = (2 * count * bytes) as u64;
-        TLAB_ACCOUNTING_RECORD_VISITS.store(0, Ordering::Relaxed);
+        runtime().heap.lock().unwrap().tlab_accounting_observation = 0;
         for round in 1..=8 {
             // Both fragmented tails and full chunks exercise retirement.
             let tls = &mut states[0];
@@ -4474,7 +4523,10 @@ fn refill_accounting_constant_visits_and_bounded_lag() {
             }
             assert!(!willow_gc_alloc_slow(tls, 1, 0, 8, 0).is_null());
             expected += bytes as u64;
-            assert_eq!(TLAB_ACCOUNTING_RECORD_VISITS.load(Ordering::Relaxed), round);
+            assert_eq!(
+                runtime().heap.lock().unwrap().tlab_accounting_observation,
+                round
+            );
             let state = runtime().heap.lock().unwrap();
             let lag = expected - state.total_allocated_bytes;
             assert_eq!(lag, ((count - 1) * bytes) as u64);
@@ -4496,7 +4548,7 @@ fn refill_accounting_constant_visits_and_bounded_lag() {
 
 #[test]
 fn refill_accounting_triggers_without_registry_rescan() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     reset_gc();
     willow_gc_register_mutator();
     let mut tls = new_tlab_state();
@@ -4510,20 +4562,22 @@ fn refill_accounting_triggers_without_registry_rescan() {
         sync_tlab_record_bytes(&mut state, &tls as *const _ as usize);
         assert!(minor_allocation_due(&state));
     }
-    TLAB_ACCOUNTING_RECORD_VISITS.store(0, Ordering::Relaxed);
-    assert!(allocation_should_minor_collect());
+    runtime().heap.lock().unwrap().tlab_accounting_observation = 0;
+    assert!(allocation_should_minor_collect_in(crate::runtime::current()));
     // Queued-minor retries consume the same monotonic published clock.
     {
         let mut state = runtime().heap.lock().unwrap();
         state.minor_deferral_start_bytes = Some(state.young_allocation_clock);
         state.minor_retry_bytes = state.young_allocation_clock + 1;
     }
-    assert!(!allocation_should_minor_collect());
+    assert!(!allocation_should_minor_collect_in(
+        crate::runtime::current()
+    ));
     {
         let mut state = runtime().heap.lock().unwrap();
         state.minor_retry_bytes = state.young_allocation_clock;
     }
-    assert!(allocation_should_minor_collect());
+    assert!(allocation_should_minor_collect_in(crate::runtime::current()));
     for paced in [false, true] {
         let mut state = runtime().heap.lock().unwrap();
         state.nursery_threshold_bytes = 0;
@@ -4531,16 +4585,22 @@ fn refill_accounting_triggers_without_registry_rescan() {
         state.pacer_trigger = 1;
         state.pacer.set_enabled_for_test(paced);
         drop(state);
-        assert!(allocation_should_collect_with_sync(false));
+        assert!(allocation_should_collect_with_sync_in(
+            crate::runtime::current(),
+            false
+        ));
     }
-    assert_eq!(TLAB_ACCOUNTING_RECORD_VISITS.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        runtime().heap.lock().unwrap().tlab_accounting_observation,
+        0
+    );
     willow_gc_unregister_mutator();
     reset_gc();
 }
 
 #[test]
 fn inline_slot_enumeration_preserves_payload_bounds_and_existing_slots() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for words in [0usize, 1, 2, 63, 64, 65, 128] {
         for mask in [0u64, 1, 1 << 63, u64::MAX, 0xaaaaaaaaaaaaaaaa] {
             reset_gc();
@@ -4566,7 +4626,7 @@ fn inline_slot_enumeration_preserves_payload_bounds_and_existing_slots() {
 
 #[test]
 fn barrier_verifier_preserves_both_membership_flag_implications() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for remembered in [false, true] {
         for flagged in [false, true] {
             for carded in [false, true] {
@@ -4602,7 +4662,7 @@ fn verifier_trace_cache_tracks_type_changes_and_registry_lifetime() {
     unsafe fn second(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
         slots.push(unsafe { payload.add(GC_STORAGE_WORD_BYTES).cast() });
     }
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for target in 0..3 {
         reset_gc();
         let mut tls = new_tlab_state();
@@ -4645,7 +4705,7 @@ fn barrier_verifier_visits_dense_sparse_and_fragmented_objects_once() {
         CALLS.fetch_add(1, Ordering::Relaxed);
         slots.push(payload.cast());
     }
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for count in [16usize, 1024, 4096] {
         for payload_bytes in [8, 4096] {
             reset_gc();
@@ -4694,7 +4754,7 @@ fn barrier_verifier_visits_dense_sparse_and_fragmented_objects_once() {
 
 #[test]
 fn barrier_verifier_checks_active_and_retired_zero_payload_boundaries() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for bytes in [0, 8, 128] {
         for retired in [false, true] {
             reset_gc();
@@ -4721,7 +4781,7 @@ fn barrier_verifier_checks_active_and_retired_zero_payload_boundaries() {
 
 #[test]
 fn verifier_layout_cache_distinguishes_masks_with_the_same_type() {
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for target in 0..3 {
         reset_gc();
         let mut tls = new_tlab_state();
@@ -4756,7 +4816,7 @@ fn barrier_verifier_checks_all_streams_after_single_slot_fast_path() {
         slots.push(unsafe { payload.add(2 * GC_STORAGE_WORD_BYTES).cast() });
     }
     static BITMAP: [u64; 3] = [2, 0b10, 0b10];
-    let _guard = gc_test_guard();
+    let _guard = isolated_runtime();
     for mode in 0..4 {
         reset_gc();
         let mut tls = new_tlab_state();
@@ -4807,4 +4867,182 @@ fn barrier_verifier_checks_all_streams_after_single_slot_fast_path() {
         );
     }
     reset_gc();
+}
+
+#[test]
+fn private_allocation_headrooms_consume_and_invalidate_independently() {
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = [16usize, 64]
+            .into_iter()
+            .map(|stride| {
+                let barrier = &barrier;
+                scope.spawn(crate::runtime::serving(move || {
+                    let owner = GcRuntime::default();
+                    let room = &owner.headroom;
+                    room.policy.store(stride as u64, Ordering::Release);
+                    barrier.wait();
+                    assert!(!consume_policy_headroom(&owner, stride as u64 + 1));
+                    assert_eq!(room.policy.load(Ordering::Acquire), stride as u64);
+                    assert!(consume_policy_headroom(&owner, stride as u64 - 1));
+                    barrier.wait();
+                    assert_eq!(room.policy.load(Ordering::Acquire), 1);
+                    assert!(consume_policy_headroom(&owner, 1));
+                    assert!(!consume_policy_headroom(&owner, 1));
+                    assert!(consume_policy_headroom(&owner, 0));
+                    barrier.wait();
+                    assert_eq!(room.policy.load(Ordering::Acquire), 0);
+                    room.external.store(stride * 8, Ordering::Release);
+                    room.policy.store((stride * 4) as u64, Ordering::Release);
+                    for round in 1..=8 {
+                        room.consume(stride);
+                        barrier.wait();
+                        assert_eq!(room.external.load(Ordering::Acquire), stride * (8 - round));
+                        assert_eq!(
+                            room.policy.load(Ordering::Acquire),
+                            (stride * 4).saturating_sub(stride * round) as u64
+                        );
+                        barrier.wait();
+                    }
+                    room.external.store(stride, Ordering::Release);
+                    room.policy.store(stride as u64, Ordering::Release);
+                    barrier.wait();
+                    if stride == 16 {
+                        room.invalidate();
+                    }
+                    barrier.wait();
+                    let expected = if stride == 16 { 0 } else { stride };
+                    assert_eq!(room.external.load(Ordering::Acquire), expected);
+                    assert_eq!(room.policy.load(Ordering::Acquire), expected as u64);
+                }))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+}
+
+#[test]
+fn policy_budgets_distinguish_owners_and_invalidate_only_the_selected_epoch() {
+    let first = GcRuntime::default();
+    let second = GcRuntime::default();
+    assert!(runtime_policy_check_due_in(&first, 1));
+    assert!(!runtime_policy_check_due_in(&first, 1));
+    assert!(runtime_policy_check_due_in(&second, 1));
+    assert!(!runtime_policy_check_due_in(&second, 1));
+    invalidate_runtime_policy_budgets_in(&first);
+    assert!(!runtime_policy_check_due_in(&second, 1));
+    assert!(runtime_policy_check_due_in(&first, 1));
+    assert!(!runtime_policy_check_due_in(&first, 1));
+    invalidate_runtime_policy_budgets_in(&first);
+    assert!(runtime_policy_check_due_in(&first, 1));
+    assert!(!runtime_policy_check_due_in(
+        &first,
+        GC_TLAB_CHUNK_SIZE as u64 - 1
+    ));
+    assert!(runtime_policy_check_due_in(&first, 1));
+    let old_identity = first.policy_identity;
+    drop(first);
+    let replacement = GcRuntime::default();
+    assert_ne!(replacement.policy_identity, old_identity);
+    assert!(runtime_policy_check_due_in(&replacement, 1));
+}
+
+#[test]
+fn cached_mark_cycles_distinguish_equal_generations_and_owner_removal() {
+    let first = GcRuntime::default();
+    let second = GcRuntime::default();
+    let make_cycle = || {
+        Arc::new(ConcurrentCycle::new(
+            std::iter::empty(),
+            Default::default(),
+            Default::default(),
+            0,
+        ))
+    };
+    let first_cycle = make_cycle();
+    let second_cycle = make_cycle();
+    marking::set_concurrent_cycle_in(
+        &first,
+        &mut first.heap.lock().unwrap(),
+        Some(first_cycle.clone()),
+    );
+    marking::set_concurrent_cycle_in(
+        &second,
+        &mut second.heap.lock().unwrap(),
+        Some(second_cycle.clone()),
+    );
+    for _ in 0..16 {
+        let (a, cycle) = marking::cached_cycle_in(&first).unwrap();
+        assert!(Arc::ptr_eq(&cycle, &first_cycle));
+        let (b, cycle) = marking::cached_cycle_in(&second).unwrap();
+        assert_eq!(a, b);
+        assert!(Arc::ptr_eq(&cycle, &second_cycle));
+    }
+    marking::set_concurrent_cycle_in(&first, &mut first.heap.lock().unwrap(), None);
+    assert!(marking::cached_cycle_in(&first).is_none());
+    assert!(Arc::ptr_eq(
+        &marking::cached_cycle_in(&second).unwrap().1,
+        &second_cycle
+    ));
+    marking::set_concurrent_cycle_in(&second, &mut second.heap.lock().unwrap(), None);
+    assert!(marking::cached_cycle_in(&second).is_none());
+}
+
+#[test]
+fn private_mark_phases_are_independent_and_default_preserves_abi_address() {
+    let first = GcRuntime::default();
+    let second = GcRuntime::default();
+    assert!(std::ptr::eq(
+        crate::runtime::process_default().mark_phase(),
+        &GC_MARK_PHASE
+    ));
+    assert!(!std::ptr::eq(first.mark_phase(), &GC_MARK_PHASE));
+    for phase in [1, 2, 0] {
+        first.mark_phase().store(phase, Ordering::Release);
+        assert_eq!(first.mark_phase().load(Ordering::Acquire), phase);
+        assert_eq!(second.mark_phase().load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn checked_payload_validation_uses_only_the_selected_private_heap() {
+    let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let allocate = |owner: &crate::runtime::Runtime| {
+        allocate_old_region_object_locked(&mut owner.gc.heap.lock().unwrap(), 0, 0, 8, 0, true)
+            .unwrap()
+            .payload()
+            .as_ptr() as usize
+    };
+    let first_payload = allocate(&first);
+    let second_payload = allocate(&second);
+    std::thread::scope(|scope| {
+        for (owner, payload) in [(&first, first_payload), (&second, second_payload)] {
+            scope.spawn(crate::runtime::serving(move || {
+                assert_eq!(
+                    checked_payload_to_header(owner, payload as *mut u8, "private heap validation"),
+                    payload_to_header(payload as *mut u8),
+                );
+            }));
+        }
+    });
+    for (owner, foreign) in [(&first, second_payload), (&second, first_payload)] {
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                checked_payload_to_header(owner, foreign as *mut u8, "foreign heap validation");
+            }))
+            .is_err()
+        );
+        assert!(
+            owner.gc.heap.lock().is_ok(),
+            "validation must release heap before panic"
+        );
+    }
+}
+
+fn runtime_policy_check_due(bytes: u64) -> bool {
+    runtime_policy_check_due_in(runtime(), bytes)
 }

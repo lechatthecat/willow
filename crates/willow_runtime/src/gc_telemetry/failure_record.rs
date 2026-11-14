@@ -64,9 +64,29 @@ fn record(
     actual: Option<u64>,
     limit: Option<u64>,
 ) -> fmt::Result {
-    let epoch = super::milestones::try_snapshot().map(|r| r.epoch);
+    record_in(
+        crate::runtime::current(),
+        out,
+        kind,
+        reason,
+        memory,
+        actual,
+        limit,
+    )
+}
+
+fn record_in(
+    owner: &crate::runtime::Runtime,
+    out: &mut Buffer,
+    kind: &str,
+    reason: &str,
+    memory: Option<GcMemoryV3>,
+    actual: Option<u64>,
+    limit: Option<u64>,
+) -> fmt::Result {
+    let epoch = owner.telemetry.milestones.try_snapshot().map(|r| r.epoch);
     let r = REPRO.get();
-    let frames = crate::frame_lifetime::snapshot();
+    let frames = owner.frame_lifetime.snapshot();
     out.write_str("{\"version\":3,\"event\":\"gc_failure\",\"kind\":")?;
     string(out, kind)?;
     out.write_str(",\"reason\":")?;
@@ -153,7 +173,38 @@ pub(crate) fn emit(kind: &str, reason: &str) {
         None,
     );
 }
+pub(crate) fn emit_in(owner: &crate::runtime::Runtime, kind: &str, reason: &str) {
+    let memory =
+        std::sync::LazyLock::get(&owner.gc).and_then(crate::gc::diagnostic_memory_snapshot_in);
+    emit_with_in(
+        owner,
+        kind,
+        reason,
+        memory,
+        memory.map(|m| m.managed_bytes.saturating_add(m.external_bytes)),
+        None,
+    );
+}
+
 pub(crate) fn emit_with(
+    kind: &str,
+    reason: &str,
+    memory: Option<GcMemoryV3>,
+    actual: Option<u64>,
+    limit: Option<u64>,
+) {
+    emit_with_in(
+        crate::runtime::current(),
+        kind,
+        reason,
+        memory,
+        actual,
+        limit,
+    );
+}
+
+fn emit_with_in(
+    owner: &crate::runtime::Runtime,
     kind: &str,
     reason: &str,
     memory: Option<GcMemoryV3>,
@@ -167,7 +218,7 @@ pub(crate) fn emit_with(
         bytes: [0; FAILURE_RECORD_LIMIT],
         len: 0,
     };
-    if record(&mut out, kind, reason, memory, actual, limit).is_ok() {
+    if record_in(owner, &mut out, kind, reason, memory, actual, limit).is_ok() {
         let _ = io::stderr().lock().write_all(&out.bytes[..out.len]);
     } else {
         let _ = io::stderr().lock().write_all(
@@ -286,7 +337,7 @@ mod tests {
     fn m0_failure_real_invariant_panic_threshold_and_locked_heap() {
         const KEY: &str = "WILLOW_M0_FAILURE_CASE";
         if let Ok(case) = std::env::var(KEY) {
-            let _guard = crate::gc::runtime_test_guard();
+            let _guard = crate::gc::isolated_runtime();
             crate::gc::reset_internal_for_test();
             reproduction(7_276_289, 42);
             crate::gc::willow_alloc(16);

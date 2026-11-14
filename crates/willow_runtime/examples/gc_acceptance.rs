@@ -85,8 +85,7 @@ fn sample(index: usize, elapsed: u128, operations: usize, checksum: u64, workloa
     t::flush_observations();
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn willow_user_main() {
+fn input_arguments() -> (Vec<String>, usize, usize) {
     let args: Vec<_> = std::env::args().collect();
     assert_eq!(
         args.len(),
@@ -127,6 +126,13 @@ pub extern "C" fn willow_user_main() {
         .parse()
         .unwrap();
     assert!(workers > 0 && work > 0);
+    (args, workers, work)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_user_main() {
+    let (args, workers, work) = input_arguments();
+    let shape = args[1].as_str();
     let bytes: usize = args[2].parse().unwrap();
     let roots_count: usize = args[3].parse().unwrap();
     let warmup: usize = args[4].parse().unwrap();

@@ -137,8 +137,7 @@ unsafe fn poll(frame: *mut c_void, receive: bool) -> i32 {
                 let Some((task, generation)) = state.waiters.pop_front_ticket() else {
                     break;
                 };
-                #[cfg(test)]
-                CHANNEL_WAITER_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::observation::record(crate::observation::Event::ChannelWaiterVisits, 1);
                 crate::scheduler::clear_channel_ownership(
                     task,
                     core_token(channel, ChannelRole::RecvWait, generation),

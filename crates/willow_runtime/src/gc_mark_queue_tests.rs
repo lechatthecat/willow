@@ -831,7 +831,7 @@ fn mark_queue_30_multi_worker_delivery_is_lossless() {
                 let delivered = Arc::clone(&delivered);
                 let seen_count = Arc::clone(&seen_count);
                 let stop = Arc::clone(&stop);
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     let mut worker = queue.register_worker().expect("one slot per worker");
                     let mut local = Vec::new();
                     while !stop.load(Ordering::SeqCst) {
@@ -844,7 +844,7 @@ fn mark_queue_30_multi_worker_delivery_is_lossless() {
                         }
                     }
                     delivered.lock().unwrap().extend(local);
-                });
+                }));
             }
 
             wait_for(
@@ -891,7 +891,7 @@ fn mark_queue_31_producers_and_consumers_race_without_loss() {
     std::thread::scope(|scope| {
         for producer in 0..producers {
             let queue = Arc::clone(&queue);
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 for index in 0..per_producer {
                     let addr = producer * per_producer + index + 1;
                     queue
@@ -901,7 +901,7 @@ fn mark_queue_31_producers_and_consumers_race_without_loss() {
                         std::thread::yield_now();
                     }
                 }
-            });
+            }));
         }
 
         for _ in 0..4 {
@@ -909,7 +909,7 @@ fn mark_queue_31_producers_and_consumers_race_without_loss() {
             let delivered = Arc::clone(&delivered);
             let seen_count = Arc::clone(&seen_count);
             let stop = Arc::clone(&stop);
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 let mut worker = queue.register_worker().expect("one slot per worker");
                 let mut local = Vec::new();
                 while !stop.load(Ordering::SeqCst) {
@@ -922,7 +922,7 @@ fn mark_queue_31_producers_and_consumers_race_without_loss() {
                     }
                 }
                 delivered.lock().unwrap().extend(local);
-            });
+            }));
         }
 
         wait_for(
@@ -965,18 +965,18 @@ fn mark_queue_32_publication_before_zero_holds_under_stress() {
         std::thread::scope(|scope| {
             {
                 let queue = Arc::clone(&queue);
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     for index in 0..total {
                         queue
                             .inject(MarkWork::new(epoch, object(index + 1)))
                             .expect("accepted");
                     }
-                });
+                }));
             }
             {
                 let queue = Arc::clone(&queue);
                 let seen_count = Arc::clone(&seen_count);
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     let mut worker = queue.register_worker().expect("slot 0");
                     while seen_count.load(Ordering::SeqCst) < total {
                         if worker.next_work().is_some() {
@@ -985,13 +985,13 @@ fn mark_queue_32_publication_before_zero_holds_under_stress() {
                             std::thread::yield_now();
                         }
                     }
-                });
+                }));
             }
             {
                 let queue = Arc::clone(&queue);
                 let seen_count = Arc::clone(&seen_count);
                 let observations = Arc::clone(&observations);
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     let counters = &queue.counters;
                     while seen_count.load(Ordering::SeqCst) < total {
                         let injected = counters.injected.load(Ordering::SeqCst);
@@ -1008,7 +1008,7 @@ fn mark_queue_32_publication_before_zero_holds_under_stress() {
                             observations.fetch_add(1, Ordering::SeqCst);
                         }
                     }
-                });
+                }));
             }
         });
 
@@ -1036,7 +1036,7 @@ fn mark_queue_33_nightly_high_volume_stress() {
     std::thread::scope(|scope| {
         for producer in 0..4 {
             let queue = Arc::clone(&queue);
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 for index in 0..per_producer {
                     let addr = producer * per_producer + index + 1;
                     // Back off rather than let the injector grow without bound:
@@ -1048,13 +1048,13 @@ fn mark_queue_33_nightly_high_volume_stress() {
                         .inject(MarkWork::new(epoch, object(addr)))
                         .expect("accepted");
                 }
-            });
+            }));
         }
         for _ in 0..workers {
             let queue = Arc::clone(&queue);
             let seen_count = Arc::clone(&seen_count);
             let stop = Arc::clone(&stop);
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 let mut worker = queue.register_worker().expect("one slot per worker");
                 // Deliveries are counted in batches: at this volume one atomic
                 // per item would measure the counter, not the queue. The
@@ -1080,7 +1080,7 @@ fn mark_queue_33_nightly_high_volume_stress() {
                     }
                     std::thread::yield_now();
                 }
-            });
+            }));
         }
 
         wait_for(
@@ -1116,7 +1116,7 @@ fn mark_queue_34_flush_races_local_refill_without_deadlock() {
 
     {
         let done = Arc::clone(&done);
-        std::thread::spawn(move || {
+        std::thread::spawn(crate::runtime::serving(move || {
             let deadline = Instant::now() + Duration::from_secs(120);
             while !done.load(Ordering::SeqCst) {
                 if Instant::now() > deadline {
@@ -1128,13 +1128,13 @@ fn mark_queue_34_flush_races_local_refill_without_deadlock() {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-        });
+        }));
     }
 
     std::thread::scope(|scope| {
         for _ in 0..4 {
             let queue = Arc::clone(&queue);
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 let mut worker = queue.register_worker().expect("one slot per worker");
                 for round in 0..rounds {
                     for index in 0..8 {
@@ -1145,15 +1145,15 @@ fn mark_queue_34_flush_races_local_refill_without_deadlock() {
                     worker.publish_local(usize::MAX);
                     while worker.next_work().is_some() {}
                 }
-            });
+            }));
         }
         let queue = Arc::clone(&queue);
-        scope.spawn(move || {
+        scope.spawn(crate::runtime::serving(move || {
             for _ in 0..rounds {
                 queue.flush_all_locals();
                 std::thread::yield_now();
             }
-        });
+        }));
     });
 
     done.store(true, Ordering::SeqCst);
@@ -1258,22 +1258,22 @@ fn mark_queue_37_inject_racing_a_new_epoch_never_leaks_stale_work() {
             {
                 let queue = Arc::clone(&queue);
                 let barrier = Arc::clone(&barrier);
-                scope.spawn(move || {
+                scope.spawn(crate::runtime::serving(move || {
                     barrier.wait();
                     for index in 0..INJECTS_PER_ROUND {
                         // Tagged for the cycle that is about to end. Accepted or
                         // refused is up to the race; leaking is not.
                         let _ = queue.inject(MarkWork::new(old, object(0x500 + index)));
                     }
-                });
+                }));
             }
             let queue = Arc::clone(&queue);
             let barrier = Arc::clone(&barrier);
             scope
-                .spawn(move || {
+                .spawn(crate::runtime::serving(move || {
                     barrier.wait();
                     queue.begin_epoch()
-                })
+                }))
                 .join()
                 .expect("the collector thread does not panic")
         });
@@ -1333,7 +1333,7 @@ fn mark_queue_38_is_drained_is_never_true_with_work_left() {
         for producer in 0..PRODUCERS {
             let queue = Arc::clone(&queue);
             let injected_ok = Arc::clone(&injected_ok);
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 for index in 0..PER_PRODUCER {
                     let shard = (producer * PER_PRODUCER + index) as u32;
                     queue
@@ -1348,14 +1348,14 @@ fn mark_queue_38_is_drained_is_never_true_with_work_left() {
                     injected_ok.fetch_add(1, Ordering::SeqCst);
                     std::thread::yield_now();
                 }
-            });
+            }));
         }
 
         for _ in 0..WORKERS {
             let queue = Arc::clone(&queue);
             let consumed = Arc::clone(&consumed);
             let stop = Arc::clone(&stop);
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 let mut worker = queue.register_worker().expect("one slot per worker");
                 while !stop.load(Ordering::SeqCst) {
                     let Some(work) = worker.next_work() else {
@@ -1371,7 +1371,7 @@ fn mark_queue_38_is_drained_is_never_true_with_work_left() {
                         }
                     }
                 }
-            });
+            }));
         }
 
         let queue = Arc::clone(&queue);
@@ -1379,7 +1379,7 @@ fn mark_queue_38_is_drained_is_never_true_with_work_left() {
         let consumed = Arc::clone(&consumed);
         let producing = Arc::clone(&producing);
         let stop = Arc::clone(&stop);
-        scope.spawn(move || {
+        scope.spawn(crate::runtime::serving(move || {
             let deadline = Instant::now() + Duration::from_secs(60);
             let total = PRODUCERS * PER_PRODUCER;
             loop {
@@ -1405,7 +1405,7 @@ fn mark_queue_38_is_drained_is_never_true_with_work_left() {
             }
             producing.store(false, Ordering::SeqCst);
             stop.store(true, Ordering::SeqCst);
-        });
+        }));
     });
 
     assert!(
@@ -1615,7 +1615,7 @@ fn mark_queue_slot_pool_concurrent_claims_have_exclusive_owners() {
     std::thread::scope(|scope| {
         for thread in 0..THREADS {
             let (queue, barrier, owners) = (&queue, &barrier, &owners);
-            scope.spawn(move || {
+            scope.spawn(crate::runtime::serving(move || {
                 for round in 0..ROUNDS {
                     let mut worker = if (thread + round) % 2 == 0 {
                         queue.register_worker().expect("one slot per thread")
@@ -1632,7 +1632,7 @@ fn mark_queue_slot_pool_concurrent_claims_have_exclusive_owners() {
                     drop(worker);
                     barrier.wait();
                 }
-            });
+            }));
         }
     });
     assert_eq!(QueueGuard::new(&queue.free_slots).len(), THREADS);

@@ -18,7 +18,7 @@ fn quiet_heap() {
 fn minor() -> crate::gc_telemetry::MarkWork {
     with_stw(
         crate::gc_telemetry::stops::StopReason::Minor,
-        super::collect_stopped,
+        |coord, work| super::collect_stopped(crate::runtime::current(), coord, false, work),
     )
     .expect("minor collection ran")
     .2
@@ -73,7 +73,7 @@ fn hits() -> u64 {
 
 #[test]
 fn card_threshold_selects_only_large_reference_buffers() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     quiet_heap();
     for (len, expected) in [
         (0, false),
@@ -97,7 +97,7 @@ fn card_threshold_selects_only_large_reference_buffers() {
 
 #[test]
 fn minor_card_slots_stay_flat_as_old_array_grows() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let mut table = Vec::new();
     for len in [1024usize, 16_384, 262_144] {
         quiet_heap();
@@ -167,7 +167,7 @@ fn minor_card_slots_stay_flat_as_old_array_grows() {
 
 #[test]
 fn small_reference_buffers_keep_whole_owner_remembering() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(ARRAY_CARD_SLOTS as i64, 1);
     willow_push_root(&mut array);
@@ -199,7 +199,7 @@ fn small_reference_buffers_keep_whole_owner_remembering() {
 
 #[test]
 fn repeated_stores_into_one_card_record_it_once() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
     willow_push_root(&mut array);
@@ -225,7 +225,7 @@ fn repeated_stores_into_one_card_record_it_once() {
 
 #[test]
 fn barrier_dedup_cache_does_not_survive_a_minor_that_dropped_the_card() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
     willow_push_root(&mut array);
@@ -252,7 +252,7 @@ fn barrier_dedup_cache_does_not_survive_a_minor_that_dropped_the_card() {
 
 #[test]
 fn growth_into_large_old_buffer_records_every_young_card() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     quiet_heap();
     let mut array = crate::array::willow_array_new(0, 1);
     willow_push_root(&mut array);
@@ -284,7 +284,7 @@ fn growth_into_large_old_buffer_records_every_young_card() {
 
 #[test]
 fn slotless_barrier_remembers_whole_buffer_until_minor_converts_it() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
     willow_push_root(&mut array);
@@ -316,7 +316,7 @@ fn slotless_barrier_remembers_whole_buffer_until_minor_converts_it() {
 
 #[test]
 fn array_barrier_with_foreign_slot_falls_back_to_whole_owner() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
     willow_push_root(&mut array);
@@ -343,7 +343,7 @@ fn array_barrier_with_foreign_slot_falls_back_to_whole_owner() {
 
 #[test]
 fn generated_array_barrier_records_slot_card() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
     willow_push_root(&mut array);
@@ -374,7 +374,7 @@ fn generated_array_barrier_records_slot_card() {
 
 #[test]
 fn verifier_rejects_young_child_in_unrecorded_card() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
     willow_push_root(&mut array);
@@ -395,8 +395,7 @@ fn verifier_rejects_young_child_in_unrecorded_card() {
 
 #[test]
 fn compiled_array_stores_without_value_header_hit_card_cache() {
-    use super::super::barrier::CARD_CACHE_HITS;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
     willow_push_root(&mut array);
@@ -410,10 +409,10 @@ fn compiled_array_stores_without_value_header_hit_card_cache() {
         willow_gc_array_write_barrier(buffer as *mut u8, slot, std::ptr::null_mut(), child, flags);
         unsafe { store_gc_reference(slot.cast(), child) };
     };
-    let hits_before = CARD_CACHE_HITS.get();
+    let hits_before = runtime().path_observation.card_cache_hits();
     store(&mut tls, 2 * ARRAY_CARD_SLOTS, 0);
     assert_eq!(
-        CARD_CACHE_HITS.get(),
+        runtime().path_observation.card_cache_hits(),
         hits_before,
         "first store takes the lock"
     );
@@ -423,7 +422,7 @@ fn compiled_array_stores_without_value_header_hit_card_cache() {
         store(&mut tls, 2 * ARRAY_CARD_SLOTS + offset, offset as u64);
     }
     assert_eq!(
-        CARD_CACHE_HITS.get() - hits_before,
+        runtime().path_observation.card_cache_hits() - hits_before,
         repeats as u64,
         "repeat stores into the recorded card skip the heap lock"
     );
@@ -432,9 +431,9 @@ fn compiled_array_stores_without_value_header_hit_card_cache() {
     verify().unwrap();
     // A minor advances the epoch: the next store relocks and re-records.
     minor();
-    let after_minor = CARD_CACHE_HITS.get();
+    let after_minor = runtime().path_observation.card_cache_hits();
     store(&mut tls, 2 * ARRAY_CARD_SLOTS, 99);
-    assert_eq!(CARD_CACHE_HITS.get(), after_minor);
+    assert_eq!(runtime().path_observation.card_cache_hits(), after_minor);
     assert_eq!(recorded_cards(buffer).unwrap(), vec![2]);
     verify().unwrap();
     minor();
@@ -451,8 +450,7 @@ fn compiled_array_stores_without_value_header_hit_card_cache() {
 
 #[test]
 fn runtime_array_card_filter_counts_cards_instead_of_stores() {
-    use super::super::barrier::CARD_CACHE_HITS;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [64usize, 128, 512, 1024] {
         quiet_heap();
         let mut array = new_old_array(4096, 1);
@@ -460,7 +458,7 @@ fn runtime_array_card_filter_counts_cards_instead_of_stores() {
         let mut tls = tlab_state_for_test();
         let child = young(&mut tls, 42);
         let before = runtime().write_barrier_calls.load(Ordering::Relaxed);
-        let cached = CARD_CACHE_HITS.get();
+        let cached = runtime().path_observation.card_cache_hits();
         for index in 0..count {
             willow_array_set(array, index as i64, child as i64);
         }
@@ -469,7 +467,10 @@ fn runtime_array_card_filter_counts_cards_instead_of_stores() {
             runtime().write_barrier_calls.load(Ordering::Relaxed) - before,
             cards
         );
-        assert_eq!(CARD_CACHE_HITS.get() - cached, count as u64 - cards);
+        assert_eq!(
+            runtime().path_observation.card_cache_hits() - cached,
+            count as u64 - cards
+        );
         verify().unwrap();
         assert_eq!(minor().remembered_card_slots, count as u64);
         for index in 0..count {
@@ -482,7 +483,7 @@ fn runtime_array_card_filter_counts_cards_instead_of_stores() {
 
 #[test]
 fn runtime_cached_card_still_publishes_during_active_marking() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
     willow_push_root(&mut array);
@@ -507,7 +508,7 @@ fn runtime_cached_card_still_publishes_during_active_marking() {
 
 #[test]
 fn reference_array_growth_barriers_scale_with_cards() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [512usize, 1024, 2048, 4096] {
         quiet_heap();
         let mut array = new_old_array(count as i64, 1);

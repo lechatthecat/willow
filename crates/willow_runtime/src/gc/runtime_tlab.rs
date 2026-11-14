@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn array_literal_inline_trace_is_ready_after_every_gc_init() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         for _ in 0..2 {
             willow_gc_init();
             let _owner = RuntimeTlabOwner::enter();
@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn unregistered_threads_never_use_the_runtime_tlab() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         assert!(!runtime_tlab_enabled());
         assert_eq!(try_alloc_young_string_payload(9), None);
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn owner_allocates_young_strings_and_retires_on_drop() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         let fast_before = willow_gc_tlab_fast_allocations();
         {
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn concatenation_reloads_parts_moved_by_its_own_collection() {
         use willow_abi::string_concat::{PART_I64, PART_STRING};
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         let _owner = RuntimeTlabOwner::enter();
         // One object per TLAB: every runtime string allocation collects.
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn unregistered_threads_allocate_array_literals_old() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         let fast_before = willow_gc_tlab_fast_allocations();
         let arr = crate::array::willow_array_new_literal(3, 0);
@@ -602,7 +602,7 @@ mod tests {
 
     #[test]
     fn owner_bump_allocates_array_literal_handle_and_buffer_together() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         let _owner = RuntimeTlabOwner::enter();
         prime_runtime_tlab();
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn array_literal_miss_path_rewrites_rooted_caller_values() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         let _owner = RuntimeTlabOwner::enter();
         // One object per TLAB: every literal reaches the collecting miss path.
@@ -670,7 +670,7 @@ mod tests {
 
     #[test]
     fn push_growth_gives_old_handles_young_buffers_kept_by_the_barrier() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         let _owner = RuntimeTlabOwner::enter();
         let mut arr = new_old_array(0, 1);
@@ -701,7 +701,7 @@ mod tests {
 
     #[test]
     fn push_growth_under_relocation_keeps_every_element() {
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         let _owner = RuntimeTlabOwner::enter();
         let _stress = StressModes::set("relocate");
@@ -730,10 +730,7 @@ mod tests {
 
     /// `(old allocations, runtime-root slot registrations)` made by this thread.
     fn path_counts() -> (usize, usize) {
-        (
-            super::OLD_ALLOCATIONS_FOR_TEST.get(),
-            super::RUNTIME_ROOT_SLOT_ADDS_FOR_TEST.get(),
-        )
+        runtime().path_observation.current()
     }
 
     fn young(ptr: *mut u8) -> bool {
@@ -751,7 +748,7 @@ mod tests {
     #[test]
     fn runtime_method_results_bump_allocate_young_without_root_traffic() {
         use crate::string::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         let _owner = RuntimeTlabOwner::enter();
         let (source, space, comma, bad) = (ws("  lend 123456 45 6 "), ws(" "), ws(","), ws("12x"));
@@ -817,7 +814,7 @@ mod tests {
     #[test]
     fn runtime_method_results_survive_relocating_misses() {
         use crate::string::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         let _owner = RuntimeTlabOwner::enter();
         // One object per TLAB: every allocation below misses and collects.
@@ -879,7 +876,7 @@ mod tests {
     #[test]
     fn unregistered_threads_build_runtime_method_results_old() {
         use crate::string::*;
-        let _guard = runtime_test_guard();
+        let _guard = isolated_runtime();
         reset_internal();
         assert!(!runtime_tlab_enabled());
         let source = ws(" a b ");

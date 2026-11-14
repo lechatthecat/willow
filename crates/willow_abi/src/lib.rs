@@ -895,8 +895,15 @@ pub mod generated_context {
     pub const ROOT_TOP_OFFSET: i32 = 80;
     /// Admitted capacity; zero forces cold ownership/capacity admission.
     pub const ROOT_LIMIT_OFFSET: i32 = 88;
+    /// Pointer to the serving runtime's atomic SATB mark-phase byte. The
+    /// process-default runtime points it at `GC_MARK_PHASE_SYMBOL`.
+    pub const MARK_PHASE_OFFSET: i32 = 96;
+    /// Pointer to the serving runtime's atomic remembered-card epoch, which
+    /// validates the card proof at `CARD_EPOCH_OFFSET`. The process-default
+    /// runtime points it at `GC_CARD_EPOCH_SYMBOL`.
+    pub const CARD_EPOCH_CELL_OFFSET: i32 = 104;
     /// Size of the generated-code-visible prefix; runtime storage follows it.
-    pub const SIZE: usize = 96;
+    pub const SIZE: usize = 112;
     pub const HELPER_DESCRIPTOR_SIZE: usize = 16;
     pub const HELPER_LENGTH_OFFSET: usize = 8;
 }

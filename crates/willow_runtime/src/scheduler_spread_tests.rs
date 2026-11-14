@@ -87,15 +87,30 @@ fn deferred_global_pop_serves_local_work_first_once() {
 #[test]
 fn rerouted_task_reaches_its_owner_without_waking_idle_thieves() {
     let queues = RunQueues::new(4);
-    let before = queues.idle_notifications.load(Ordering::Relaxed);
+    let before = queues
+        .observation
+        .idle_notifications
+        .load(Ordering::Relaxed);
     let generation = current_wake_generation();
     for id in 1..=64 {
         queues.push_rerouted(2, id);
     }
-    assert_eq!(queues.idle_notifications.load(Ordering::Relaxed), before);
+    assert_eq!(
+        queues
+            .observation
+            .idle_notifications
+            .load(Ordering::Relaxed),
+        before
+    );
     // Each reroute targets its owner and advances the wake generation, so an
     // owner that probed before the publication does not park on it.
-    assert_eq!(queues.owner_notifications.load(Ordering::Relaxed), 64);
+    assert_eq!(
+        queues
+            .observation
+            .owner_notifications
+            .load(Ordering::Relaxed),
+        64
+    );
     assert!(current_wake_generation() >= generation + 64);
     for id in 1..=64 {
         assert_eq!(queues.pop_for_worker(2), Some(id));
@@ -103,7 +118,10 @@ fn rerouted_task_reaches_its_owner_without_waking_idle_thieves() {
     // An ordinary local push still wakes an idle worker.
     queues.push_local(2, 65);
     assert_eq!(
-        queues.idle_notifications.load(Ordering::Relaxed),
+        queues
+            .observation
+            .idle_notifications
+            .load(Ordering::Relaxed),
         before + 1
     );
     // Without a local queue the reroute falls back to the shared queue.

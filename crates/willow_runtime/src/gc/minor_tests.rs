@@ -14,7 +14,7 @@ fn minor_registry_active_collection_retains_trace_during_registration() {
     unsafe fn new_trace(_: *mut u8, _: &mut Vec<*mut *mut u8>) {
         NEW_TRACES.fetch_add(1, Ordering::Relaxed);
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     OLD_TRACES.store(0, Ordering::Relaxed);
     NEW_TRACES.store(0, Ordering::Relaxed);
@@ -29,10 +29,12 @@ fn minor_registry_active_collection_retains_trace_during_registration() {
     let mut state = runtime().heap.lock().unwrap();
     retire_all_tlabs_unindexed(&mut state);
     let mut stop = Default::default();
-    let collector = MinorCollector::new(&mut state, registry, &mut stop);
-    std::thread::spawn(|| crate::gc::willow_register_type(123_456, new_trace))
-        .join()
-        .unwrap();
+    let collector = MinorCollector::new(crate::runtime::current(), &mut state, registry, &mut stop);
+    std::thread::spawn(crate::runtime::serving(|| {
+        crate::gc::willow_register_type(123_456, new_trace)
+    }))
+    .join()
+    .unwrap();
     let (_, work) = collector.run(
         MinorRoots {
             slots: vec![&raw mut root],
@@ -58,7 +60,7 @@ fn minor_registry_active_collection_retains_drop_during_registration() {
     unsafe fn new_drop(_: *mut u8) {
         NEW_DROPS.fetch_add(1, Ordering::Relaxed);
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     OLD_DROPS.store(0, Ordering::Relaxed);
     NEW_DROPS.store(0, Ordering::Relaxed);
@@ -69,12 +71,14 @@ fn minor_registry_active_collection_retains_drop_during_registration() {
     let mut state = runtime().heap.lock().unwrap();
     retire_all_tlabs_unindexed(&mut state);
     let mut stop = Default::default();
-    let collector = MinorCollector::new(&mut state, registry, &mut stop);
+    let collector = MinorCollector::new(crate::runtime::current(), &mut state, registry, &mut stop);
     // Deterministically pause the collection after capture while a mutator
     // replaces the callback. Its finalization must still use the old snapshot.
-    std::thread::spawn(|| crate::gc::willow_register_drop(123_456, new_drop))
-        .join()
-        .unwrap();
+    std::thread::spawn(crate::runtime::serving(|| {
+        crate::gc::willow_register_drop(123_456, new_drop)
+    }))
+    .join()
+    .unwrap();
     collector.run(MinorRoots::default(), Default::default());
     assert_eq!(OLD_DROPS.load(Ordering::Relaxed), 1);
     assert_eq!(NEW_DROPS.load(Ordering::Relaxed), 0);
@@ -89,8 +93,6 @@ fn minor_registry_active_collection_retains_drop_during_registration() {
 #[test]
 fn scoped_lease_policy_visits_scale_with_roots_plus_loans() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
-    reset_internal();
     for leases in [1, 16, 256, 4096] {
         for fanout in [1, 8] {
             let mut roots = MinorRoots::default();
@@ -105,9 +107,9 @@ fn scoped_lease_policy_visits_scale_with_roots_plus_loans() {
                 ));
                 roots.values.push((value, PinSource::ScopedLoan));
             }
-            let mut state = runtime().heap.lock().unwrap();
-            assert!(!super::should_defer_minor(&mut state, &roots));
-            let visits = super::LEASE_POLICY_VISITS.get();
+            let mut state = GcState::default();
+            assert!(!super::should_defer_minor(&mut state, &roots, false));
+            let visits = state.minor_observation.policy_visits.get();
             assert_eq!(visits, 2 * roots.values.len());
             eprintln!(
                 "leases={leases} aliases={} policy_visits={visits}",
@@ -115,17 +117,16 @@ fn scoped_lease_policy_visits_scale_with_roots_plus_loans() {
             );
         }
     }
-    reset_internal();
 }
 use crate::gc::{
-    GC_HEADER_SIZE, minor_registry_snapshot, reset_internal, retire_all_tlabs_unindexed, runtime,
-    runtime_test_guard, tlab_state_for_test, type_registry, verify_old_region_metadata,
-    willow_gc_alloc_slow,
+    GC_HEADER_SIZE, isolated_runtime, minor_registry_snapshot, reset_internal,
+    retire_all_tlabs_unindexed, runtime, tlab_state_for_test, type_registry,
+    verify_old_region_metadata, willow_gc_alloc_slow,
 };
 
 #[test]
 fn minor_tracing_work_scales_with_graph_and_roots() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for shape in ["chain", "fanout", "shared", "duplicate_roots"] {
         for n in [32usize, 128, 512, 1024] {
             reset_internal();
@@ -161,13 +162,15 @@ fn minor_tracing_work_scales_with_graph_and_roots() {
             let mut state = runtime().heap.lock().unwrap();
             retire_all_tlabs_unindexed(&mut state);
             let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
-            let (_, work) = MinorCollector::new(&mut state, registry, &mut stop).run(
-                MinorRoots {
-                    slots: Vec::new(),
-                    values: vec![(nodes[0], PinSource::RuntimeCodeStack); root_count],
-                },
-                Default::default(),
-            );
+            let (_, work) =
+                MinorCollector::new(crate::runtime::current(), &mut state, registry, &mut stop)
+                    .run(
+                        MinorRoots {
+                            slots: Vec::new(),
+                            values: vec![(nodes[0], PinSource::RuntimeCodeStack); root_count],
+                        },
+                        Default::default(),
+                    );
             // Existing production telemetry counts objects and reference slots,
             // not elapsed time. Duplicate edges/roots must not rescan objects.
             assert_eq!(work.marked_bytes, (n * (GC_HEADER_SIZE + 16)) as u64);
@@ -180,7 +183,7 @@ fn minor_tracing_work_scales_with_graph_and_roots() {
             // Release indexes only swept chunks: the value-root chunk is
             // retained in place; evacuated sources are released whole.
             // Dead chunks and new survivor destinations need no header walk.
-            let swept = if super::moved_sources_poisoned() {
+            let swept = if super::moved_sources_poisoned(&crate::runtime::current().diagnostics) {
                 n
             } else {
                 1
@@ -237,7 +240,13 @@ fn collect(roots: Vec<*mut u8>) -> crate::gc_telemetry::MarkWork {
     retire_all_tlabs_unindexed(&mut state);
     let remembered = state.remembered_set.take();
     state.dirty_cards.clear();
-    let (_, work) = MinorCollector::new(&mut state, registry, &mut Default::default()).run(
+    let (_, work) = MinorCollector::new(
+        crate::runtime::current(),
+        &mut state,
+        registry,
+        &mut Default::default(),
+    )
+    .run(
         MinorRoots {
             slots: Vec::new(),
             values: roots
@@ -255,7 +264,7 @@ fn collect(roots: Vec<*mut u8>) -> crate::gc_telemetry::MarkWork {
 #[test]
 fn survivor_remembered_edge_tenures_without_root_or_mutator_store() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let mut tls = tlab_state_for_test();
     let child = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
@@ -303,7 +312,7 @@ fn survivor_dies_young_and_drop_hook_runs_exactly_once() {
     unsafe fn drop_child(_: *mut u8) {
         DROPS.fetch_add(1, Ordering::Relaxed);
     }
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     DROPS.store(0, Ordering::Relaxed);
     willow_register_drop(98761, drop_child);
@@ -330,7 +339,7 @@ fn survivor_dies_young_and_drop_hook_runs_exactly_once() {
 #[test]
 fn survivor_direct_root_and_budget_fallback_promote_in_place() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for limit in [false, true] {
         reset_internal();
         let mut tls = tlab_state_for_test();
@@ -384,7 +393,7 @@ fn survivor_direct_root_and_budget_fallback_promote_in_place() {
 #[test]
 fn major_collection_traces_and_reclaims_survivor_storage() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let mut tls = tlab_state_for_test();
     let child = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
@@ -410,7 +419,7 @@ fn major_collection_traces_and_reclaims_survivor_storage() {
 #[test]
 fn minor_metadata_skips_pinned_chunks_across_repeated_collections() {
     use crate::gc::{RegionKind, willow_alloc_typed};
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for n in [32usize, 128, 512] {
         for young in [0usize, 4] {
             reset_internal();
@@ -439,7 +448,13 @@ fn minor_metadata_skips_pinned_chunks_across_repeated_collections() {
                 state.dirty_cards.clear();
                 let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
                 let roots = if young == 0 { vec![] } else { vec![owner] };
-                let (_, work) = MinorCollector::new(&mut state, Default::default(), &mut stop).run(
+                let (_, work) = MinorCollector::new(
+                    crate::runtime::current(),
+                    &mut state,
+                    Default::default(),
+                    &mut stop,
+                )
+                .run(
                     MinorRoots {
                         slots: Vec::new(),
                         values: roots
@@ -452,7 +467,8 @@ fn minor_metadata_skips_pinned_chunks_across_repeated_collections() {
                 // New child chunks require an index only for poisoning;
                 // existing survivor sources already have their full index.
                 // Release discards fully evacuated sources without a walk.
-                let swept = if super::moved_sources_poisoned() {
+                let swept = if super::moved_sources_poisoned(&crate::runtime::current().diagnostics)
+                {
                     young
                 } else {
                     0
@@ -496,7 +512,7 @@ fn minor_metadata_skips_pinned_chunks_across_repeated_collections() {
 #[test]
 fn tenured_parent_remembers_younger_cycle_and_shared_child() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let mut tls = tlab_state_for_test();
     let parent = willow_gc_alloc_slow(&mut tls, 1, 0, 16, 0b11);
@@ -540,7 +556,7 @@ fn tenured_parent_remembers_younger_cycle_and_shared_child() {
 #[test]
 fn tenure_budget_failure_retains_survivor_chunk_as_pinned() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let mut tls = tlab_state_for_test();
     let child = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
@@ -573,7 +589,7 @@ fn tenure_budget_failure_retains_survivor_chunk_as_pinned() {
 /// only exact payload starts of young objects in pre-cycle chunks qualify.
 #[test]
 fn young_source_accepts_only_exact_pre_cycle_young_payloads() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let mut tls = tlab_state_for_test();
     let young = willow_gc_alloc_slow(&mut tls, 1, 0, 16, 0);
@@ -581,7 +597,12 @@ fn young_source_accepts_only_exact_pre_cycle_young_payloads() {
     let mut state = runtime().heap.lock().unwrap();
     retire_all_tlabs_unindexed(&mut state);
     let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
-    let mut collector = MinorCollector::new(&mut state, Default::default(), &mut stop);
+    let mut collector = MinorCollector::new(
+        crate::runtime::current(),
+        &mut state,
+        Default::default(),
+        &mut stop,
+    );
     let address = young as usize;
     assert!(collector.young_source(address).is_some());
     assert!(collector.young_source(address + 8).is_none(), "interior");
@@ -608,7 +629,7 @@ fn young_source_accepts_only_exact_pre_cycle_young_payloads() {
 #[test]
 fn remembered_header_flag_mirrors_remembered_set_membership() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let remembered = |payload: *mut u8| unsafe { (*payload_to_header(payload)).remembered };
     let mut tls = tlab_state_for_test();
@@ -658,7 +679,7 @@ fn runtime_object_owner_filter_calls_barrier_only_for_new_young_edges() {
     // runtime container stores skip the locked barrier
     // exactly when the generated inline filter would.
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let calls = || {
         runtime()
@@ -695,9 +716,13 @@ fn runtime_object_owner_filter_calls_barrier_only_for_new_young_edges() {
     store(owner, young);
     assert_eq!(calls(), before + 1, "a remembered owner skips");
     // Active marking always reaches the barrier, even for old values.
-    crate::gc::barrier::GC_MARK_PHASE.store(1, std::sync::atomic::Ordering::Release);
+    crate::runtime::current()
+        .mark_phase()
+        .store(1, std::sync::atomic::Ordering::Release);
     store(owner, old_value);
-    crate::gc::barrier::GC_MARK_PHASE.store(0, std::sync::atomic::Ordering::Release);
+    crate::runtime::current()
+        .mark_phase()
+        .store(0, std::sync::atomic::Ordering::Release);
     assert_eq!(calls(), before + 2);
     reset_internal();
 }
@@ -705,7 +730,7 @@ fn runtime_object_owner_filter_calls_barrier_only_for_new_young_edges() {
 #[test]
 fn in_place_promotion_clears_stale_remembered_byte() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let mut tls = tlab_state_for_test();
     let pinned = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
@@ -777,7 +802,7 @@ fn collect_with_stop(slots: Vec<*mut *mut u8>) -> crate::gc_telemetry::stops::St
     let mut state = runtime().heap.lock().unwrap();
     retire_all_tlabs_unindexed(&mut state);
     let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
-    MinorCollector::new(&mut state, registry, &mut stop).run(
+    MinorCollector::new(crate::runtime::current(), &mut state, registry, &mut stop).run(
         MinorRoots {
             slots,
             values: Vec::new(),
@@ -793,7 +818,7 @@ fn collect_with_stop(slots: Vec<*mut *mut u8>) -> crate::gc_telemetry::stops::St
 #[test]
 fn sparse_source_validation_does_not_index_dead_neighbors() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _stress = GcStressTestScope::normal();
     for count in [1, 16, 256, GC_TLAB_CHUNK_SIZE / (GC_HEADER_SIZE + 8)] {
         for position in [0, count / 2, count - 1] {
@@ -803,7 +828,12 @@ fn sparse_source_validation_does_not_index_dead_neighbors() {
             let mut state = runtime().heap.lock().unwrap();
             retire_all_tlabs_unindexed(&mut state);
             let mut stop = Default::default();
-            let mut collector = MinorCollector::new(&mut state, Default::default(), &mut stop);
+            let mut collector = MinorCollector::new(
+                crate::runtime::current(),
+                &mut state,
+                Default::default(),
+                &mut stop,
+            );
             let source = payloads[position];
             for _ in 0..16 {
                 assert!(collector.young_source(source as usize).is_some());
@@ -832,7 +862,7 @@ fn sparse_source_validation_does_not_index_dead_neighbors() {
 #[test]
 fn sparse_unindexed_source_keeps_relocation_poisoning() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _normal = GcStressTestScope::normal();
     for count in [16, 256] {
         reset_internal();
@@ -840,7 +870,9 @@ fn sparse_unindexed_source_keeps_relocation_poisoning() {
         let payloads = fill_chunks(&mut tls, 1, count, |_| 0, 0);
         let mut root = payloads[count / 2];
         let _stress = GcStressTestScope::with_modes("relocate");
-        assert!(super::moved_sources_poisoned());
+        assert!(super::moved_sources_poisoned(
+            &crate::runtime::current().diagnostics
+        ));
         let stop = collect_with_stop(vec![&raw mut root]);
         assert_ne!(root, payloads[count / 2]);
         // A full index and poison sweep remain required even in release.
@@ -865,7 +897,7 @@ fn sparse_unindexed_source_keeps_relocation_poisoning() {
 #[test]
 fn fully_dead_nursery_chunks_are_released_without_header_walks() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let size = GC_HEADER_SIZE + 8;
     let chunks = 4;
     for per_chunk in [1, 16, 256, GC_TLAB_CHUNK_SIZE / size] {
@@ -886,7 +918,8 @@ fn fully_dead_nursery_chunks_are_released_without_header_walks() {
                 // Debug indexes and poisons the rooted source; release
                 // trusts published starts and discards the source whole.
                 // The copy's destination chunk is not swept.
-                let walks = if super::moved_sources_poisoned() {
+                let walks = if super::moved_sources_poisoned(&crate::runtime::current().diagnostics)
+                {
                     2
                 } else {
                     0
@@ -936,7 +969,7 @@ fn evacuated_sparse_survivor_chunks_release_whole_or_drop_dead_objects_once() {
         DROPS.fetch_add(1, Ordering::Relaxed);
     }
     let native = willow_abi::runtime_type_ids::NETWORK_HANDLE_TYPE_ID;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let size = GC_HEADER_SIZE + 8;
     let chunks = 4;
     let stride = 8;
@@ -963,7 +996,8 @@ fn evacuated_sparse_survivor_chunks_release_whole_or_drop_dead_objects_once() {
         let slots = roots.iter_mut().map(|root| root as *mut *mut u8).collect();
         let stop = collect_with_stop(slots);
         let objects = chunks * per_chunk;
-        let walked_chunks = if super::moved_sources_poisoned() {
+        let walked_chunks = if super::moved_sources_poisoned(&crate::runtime::current().diagnostics)
+        {
             chunks
         } else {
             chunks / 2
@@ -1015,7 +1049,7 @@ fn dead_droppable_copy_inside_evacuated_survivor_chunk_still_drops() {
         DROPS.fetch_add(1, Ordering::Relaxed);
     }
     let native = willow_abi::runtime_type_ids::NETWORK_HANDLE_TYPE_ID;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     DROPS.store(0, Ordering::Relaxed);
     willow_register_drop(native, count_drop);
@@ -1062,7 +1096,7 @@ fn droppable_nursery_chunks_are_walked_and_drop_exactly_once() {
     }
     const GENERATED: u32 = 98_771;
     let native = willow_abi::runtime_type_ids::NETWORK_HANDLE_TYPE_ID;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let chunks = 4;
     let per_chunk = 32;
     for generated in [false, true] {
@@ -1115,7 +1149,7 @@ fn droppable_nursery_chunks_are_walked_and_drop_exactly_once() {
 fn minor_rejects_unpublished_and_overlapping_start_bits_in_unindexed_chunk() {
     use crate::gc::*;
     use std::sync::atomic::Ordering;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for extra_bit in [false, true] {
         reset_internal();
         let mut tls = tlab_state_for_test();
@@ -1134,7 +1168,13 @@ fn minor_rejects_unpublished_and_overlapping_start_bits_in_unindexed_chunk() {
             retire_all_tlabs_unindexed(&mut state);
             assert!(state.tlab_chunks[0].needs_index());
             let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
-            MinorCollector::new(&mut state, Default::default(), &mut stop).run(
+            MinorCollector::new(
+                crate::runtime::current(),
+                &mut state,
+                Default::default(),
+                &mut stop,
+            )
+            .run(
                 MinorRoots {
                     slots: vec![slot as *mut *mut u8],
                     values: Vec::new(),
@@ -1157,7 +1197,7 @@ fn minor_rejects_unpublished_and_overlapping_start_bits_in_unindexed_chunk() {
 #[test]
 fn persistent_old_roots_only_scan_changed_young_edges() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1_000, 10_000, 100_000] {
         reset_internal();
         {
@@ -1185,7 +1225,7 @@ fn persistent_old_roots_only_scan_changed_young_edges() {
         let run = || {
             let result = with_stw(
                 crate::gc_telemetry::stops::StopReason::Minor,
-                super::collect_stopped,
+                |coord, work| super::collect_stopped(crate::runtime::current(), coord, false, work),
             );
             result.unwrap().2
         };
@@ -1252,7 +1292,7 @@ fn persistent_old_roots_only_scan_changed_young_edges() {
 fn minor_reference_slot_scratch_reuses_capacity_across_shapes() {
     use crate::gc::*;
     use crate::scheduler::scaling_measurements::counting_allocator as counter;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let _stress = GcStressTestScope::normal();
     unsafe fn native_trace(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
@@ -1308,7 +1348,7 @@ fn minor_reference_slot_scratch_reuses_capacity_across_shapes() {
 #[test]
 fn minor_collector_keeps_reference_scratch_between_objects() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let _stress = GcStressTestScope::normal();
     unsafe fn native_slots(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
@@ -1323,7 +1363,8 @@ fn minor_collector_keeps_reference_scratch_between_objects() {
     let mut state = runtime().heap.lock().unwrap();
     retire_all_tlabs_unindexed(&mut state);
     let mut stop = Default::default();
-    let mut collector = MinorCollector::new(&mut state, registry, &mut stop);
+    let mut collector =
+        MinorCollector::new(crate::runtime::current(), &mut state, registry, &mut stop);
     collector.scan_object(HeapObject::from_payload(
         GcPayload::from_raw(first).unwrap(),
     ));
@@ -1343,7 +1384,7 @@ fn minor_collector_keeps_reference_scratch_between_objects() {
 #[test]
 fn promotion_cursor_rekeys_regions_instead_of_each_object() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1usize, 1_000, 100_000] {
         reset_internal();
         let _stress = GcStressTestScope::normal();
@@ -1352,7 +1393,8 @@ fn promotion_cursor_rekeys_regions_instead_of_each_object() {
         let mut state = runtime().heap.lock().unwrap();
         retire_all_tlabs_unindexed(&mut state);
         let mut stop = Default::default();
-        let mut collector = MinorCollector::new(&mut state, registry, &mut stop);
+        let mut collector =
+            MinorCollector::new(crate::runtime::current(), &mut state, registry, &mut stop);
         let mut switches = 0;
         let mut previous = None;
         for _ in 0..count {
@@ -1390,7 +1432,7 @@ fn persistent_survival_skips_intermediate_copy_and_churn_restores_it() {
         GC_GENERATION_OLD, GC_GENERATION_YOUNG, minor_collect_internal, payload_to_header,
         reset_internal_for_test,
     };
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [16usize, 1_000, 10_000] {
         reset_internal_for_test();
         {
@@ -1455,21 +1497,22 @@ fn persistent_survival_skips_intermediate_copy_and_churn_restores_it() {
 
 #[test]
 fn old_reference_slots_do_not_probe_the_young_page_index() {
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for count in [1, 1000, 100000] {
         reset_internal();
         let old = crate::gc::allocate_old(0, 0, 8, 0);
         let registry = minor_registry_snapshot();
         let mut state = runtime().heap.lock().unwrap();
         let mut stop = Default::default();
-        let mut collector = MinorCollector::new(&mut state, registry, &mut stop);
-        super::PAGE_QUERIES.set(0);
+        let mut collector =
+            MinorCollector::new(crate::runtime::current(), &mut state, registry, &mut stop);
+        collector.state.minor_observation.page_queries.set(0);
         for _ in 0..count {
             let mut slot = old;
             collector.scan_slot(&raw mut slot);
             assert_eq!(slot, old);
         }
-        assert_eq!(super::PAGE_QUERIES.get(), 0);
+        assert_eq!(collector.state.minor_observation.page_queries.get(), 0);
         assert!(collector.worklist.is_empty());
         drop(collector);
         drop(state);
@@ -1480,7 +1523,7 @@ fn old_reference_slots_do_not_probe_the_young_page_index() {
 #[test]
 fn fully_forwarded_chunks_release_without_a_second_header_walk() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _stress = GcStressTestScope::normal();
     for chunks in [1usize, 16, 256] {
         reset_internal();
@@ -1528,7 +1571,7 @@ fn fully_forwarded_chunks_release_without_a_second_header_walk() {
 #[test]
 fn minor_survivor_cost_and_page_index_scale() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _stress = GcStressTestScope::normal();
     for chunks in [1usize, 4, 16, 64] {
         reset_internal();
@@ -1541,7 +1584,8 @@ fn minor_survivor_cost_and_page_index_scale() {
         let mut state = runtime().heap.lock().unwrap();
         retire_all_tlabs_unindexed(&mut state);
         let mut stop = Default::default();
-        let mut collector = MinorCollector::new(&mut state, registry, &mut stop);
+        let mut collector =
+            MinorCollector::new(crate::runtime::current(), &mut state, registry, &mut stop);
         // A fixed-size, potentially unaligned chunk intersects at most two pages.
         assert!(collector.chunk_pages.capacity() >= 2 * chunks);
         let capacity = collector.chunk_pages.capacity();
@@ -1581,7 +1625,7 @@ fn minor_survivor_cost_and_page_index_scale() {
 #[test]
 fn m4_survivor_admission_accounts_before_stop_and_transfers_without_storage_allocation() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _stress = GcStressTestScope::normal();
     for count in [1, 16, 128] {
         reset_internal();
@@ -1593,11 +1637,11 @@ fn m4_survivor_admission_accounts_before_stop_and_transfers_without_storage_allo
         let mut state = runtime().heap.lock().unwrap();
         retire_all_tlabs_unindexed(&mut state);
         let before = state.tlab_reserved_bytes;
-        ZEROED_STORAGE_BYTES.set(0);
-        STORAGE_ATTEMPTS.set(0);
+        runtime().storage_allocator.set_zeroed_bytes(0);
+        runtime().storage_allocator.set_attempts(0);
         super::prepare_survivor_reserve(&mut state);
-        assert_eq!(ZEROED_STORAGE_BYTES.get(), 0);
-        assert_eq!(STORAGE_ATTEMPTS.get(), count);
+        assert_eq!(runtime().storage_allocator.zeroed_bytes(), 0);
+        assert_eq!(runtime().storage_allocator.attempts(), count);
         assert_eq!(state.survivor_reserve.len(), count);
         assert_eq!(
             state.survivor_reserve_stats.admitted_bytes,
@@ -1620,16 +1664,22 @@ fn m4_survivor_admission_accounts_before_stop_and_transfers_without_storage_allo
             // field and sweeping must never interpret an unpublished header.
             unsafe { chunk.base.write_bytes(0xa5, chunk.capacity) };
         }
-        STORAGE_ATTEMPTS.set(0);
+        runtime().storage_allocator.set_attempts(0);
         let mut stop = Default::default();
-        MinorCollector::new(&mut state, minor_registry_snapshot(), &mut stop).run(
+        MinorCollector::new(
+            crate::runtime::current(),
+            &mut state,
+            minor_registry_snapshot(),
+            &mut stop,
+        )
+        .run(
             MinorRoots {
                 slots: payloads.iter_mut().map(|p| p as *mut *mut u8).collect(),
                 values: Vec::new(),
             },
             Default::default(),
         );
-        assert_eq!(STORAGE_ATTEMPTS.get(), 0);
+        assert_eq!(runtime().storage_allocator.attempts(), 0);
         assert_eq!(state.survivor_stats.survivor_copies, (count * 8) as u64);
         for (index, payload) in payloads.iter().enumerate() {
             assert_eq!(unsafe { payload.cast::<usize>().read() }, index ^ 0x1234);
@@ -1659,7 +1709,7 @@ fn m4_survivor_admission_accounts_before_stop_and_transfers_without_storage_allo
 #[test]
 fn survivor_storage_failure_preserves_reservation_accounting() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _stress = GcStressTestScope::normal();
     reset_internal();
     let mut tls = tlab_state_for_test();
@@ -1667,11 +1717,11 @@ fn survivor_storage_failure_preserves_reservation_accounting() {
     let mut state = runtime().heap.lock().unwrap();
     retire_all_tlabs_unindexed(&mut state);
     let before = state.tlab_reserved_bytes;
-    STORAGE_FAILURES.set(1);
-    STORAGE_ATTEMPTS.set(0);
+    runtime().storage_allocator.set_failures(1);
+    runtime().storage_allocator.set_attempts(0);
     super::prepare_survivor_reserve(&mut state);
-    assert_eq!(STORAGE_ATTEMPTS.get(), 1);
-    assert_eq!(STORAGE_FAILURES.get(), 0);
+    assert_eq!(runtime().storage_allocator.attempts(), 1);
+    assert_eq!(runtime().storage_allocator.failures(), 0);
     assert!(state.survivor_reserve.is_empty());
     assert_eq!(state.survivor_reserve_stats.admitted_bytes, 0);
     assert_eq!(state.tlab_reserved_bytes, before);
@@ -1684,7 +1734,7 @@ fn survivor_storage_failure_preserves_reservation_accounting() {
 #[test]
 fn m4_empty_admission_fallback_preserves_graph_and_releases_reserve() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for hard_cap in [false, true] {
         reset_internal();
         let mut tls = tlab_state_for_test();
@@ -1703,7 +1753,13 @@ fn m4_empty_admission_fallback_preserves_graph_and_releases_reserve() {
         // Empty admission also models refills racing a finite pre-stop reserve.
         state.survivor_reserve_active = true;
         let mut stop = Default::default();
-        MinorCollector::new(&mut state, minor_registry_snapshot(), &mut stop).run(
+        MinorCollector::new(
+            crate::runtime::current(),
+            &mut state,
+            minor_registry_snapshot(),
+            &mut stop,
+        )
+        .run(
             MinorRoots {
                 slots: vec![&raw mut root],
                 values: Vec::new(),
@@ -1727,7 +1783,7 @@ fn m4_empty_admission_fallback_preserves_graph_and_releases_reserve() {
 #[test]
 fn m4_refills_after_admission_admit_their_own_destinations() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let mut tls = tlab_state_for_test();
     let mut head = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 1);
@@ -1756,7 +1812,13 @@ fn m4_refills_after_admission_admit_their_own_destinations() {
     );
     retire_all_tlabs_unindexed(&mut state);
     let mut stop = Default::default();
-    MinorCollector::new(&mut state, minor_registry_snapshot(), &mut stop).run(
+    MinorCollector::new(
+        crate::runtime::current(),
+        &mut state,
+        minor_registry_snapshot(),
+        &mut stop,
+    )
+    .run(
         MinorRoots {
             slots: vec![&raw mut head],
             values: Vec::new(),
@@ -1786,13 +1848,13 @@ fn m4_refills_after_admission_admit_their_own_destinations() {
 #[test]
 fn m4_admission_guard_releases_unused_capacity_on_unwind() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let mut tls = tlab_state_for_test();
     willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
     let before = runtime().heap.lock().unwrap().tlab_reserved_bytes;
     let result = std::panic::catch_unwind(|| {
-        let _admission = super::SurvivorAdmission::new();
+        let _admission = super::SurvivorAdmission::new(crate::runtime::current());
         assert!(runtime().heap.lock().unwrap().tlab_reserved_bytes > before);
         panic!("admission unwind fixture");
     });
@@ -1807,7 +1869,7 @@ fn m4_admission_guard_releases_unused_capacity_on_unwind() {
 #[test]
 fn m4_actual_stop_components_sum_to_complete_request_and_release() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     reset_internal();
     let mut tls = tlab_state_for_test();
     let mut root = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
@@ -1830,7 +1892,7 @@ fn m4_actual_stop_components_sum_to_complete_request_and_release() {
 #[test]
 fn address_root_initial_children_survive_transfer_to_old_parent() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for major_first in [false, true] {
         reset_internal();
         let parent = willow_alloc_typed(8, 1);
@@ -1861,7 +1923,7 @@ fn address_root_initial_children_survive_transfer_to_old_parent() {
         }
         with_stw(
             crate::gc_telemetry::stops::StopReason::Minor,
-            super::collect_stopped,
+            |coord, work| super::collect_stopped(crate::runtime::current(), coord, false, work),
         )
         .unwrap();
         let retained = unsafe { *owner.cast::<*mut u8>() };
@@ -1881,7 +1943,7 @@ fn address_root_initial_children_survive_transfer_to_old_parent() {
 #[test]
 fn pending_address_owner_reclamation_clears_obligations_in_both_major_sweeps() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     for stopped in [false, true] {
         reset_internal();
         let mut tls = tlab_state_for_test();
@@ -1923,7 +1985,7 @@ fn pending_address_owner_reclamation_clears_obligations_in_both_major_sweeps() {
         willow_gc_remove_runtime_root(replacement);
         with_stw(
             crate::gc_telemetry::stops::StopReason::Minor,
-            super::collect_stopped,
+            |coord, work| super::collect_stopped(crate::runtime::current(), coord, false, work),
         )
         .unwrap();
         assert_eq!(runtime().runtime_roots.pending_count(), 0);
@@ -1934,7 +1996,7 @@ fn pending_address_owner_reclamation_clears_obligations_in_both_major_sweeps() {
 #[test]
 fn unused_survivor_reserve_reuses_storage_and_metadata_with_bounded_retention() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _stress = GcStressTestScope::normal();
     for count in [1, 4, 16, 64] {
         reset_internal();
@@ -1942,9 +2004,9 @@ fn unused_survivor_reserve_reuses_storage_and_metadata_with_bounded_retention() 
         fill_chunks(&mut tls, count, 8, |_| 0, 0);
         let mut state = runtime().heap.lock().unwrap();
         retire_all_tlabs_unindexed(&mut state);
-        STORAGE_ATTEMPTS.set(0);
+        runtime().storage_allocator.set_attempts(0);
         super::prepare_survivor_reserve(&mut state);
-        assert_eq!(STORAGE_ATTEMPTS.get(), count);
+        assert_eq!(runtime().storage_allocator.attempts(), count);
         let mut original: Vec<_> = state
             .survivor_reserve
             .iter()
@@ -1956,7 +2018,7 @@ fn unused_survivor_reserve_reuses_storage_and_metadata_with_bounded_retention() 
             state.region_cache.retained_bytes(),
             count * GC_TLAB_CHUNK_SIZE
         );
-        STORAGE_ATTEMPTS.set(0);
+        runtime().storage_allocator.set_attempts(0);
         for _ in 0..8 {
             super::prepare_survivor_reserve(&mut state);
             let mut reused: Vec<_> = state
@@ -1969,7 +2031,7 @@ fn unused_survivor_reserve_reuses_storage_and_metadata_with_bounded_retention() 
             assert_eq!(state.region_cache.retained_bytes(), 0);
             super::release_survivor_reserve(&mut state);
         }
-        assert_eq!(STORAGE_ATTEMPTS.get(), 0);
+        assert_eq!(runtime().storage_allocator.attempts(), 0);
         eprintln!("sources={count} cycles=8 warm_storage_allocations=0 metadata_reallocations=0");
         state.region_cache.shrink_to(GC_TLAB_CHUNK_SIZE);
         assert_eq!(state.region_cache.retained_bytes(), GC_TLAB_CHUNK_SIZE);
@@ -1987,7 +2049,7 @@ fn unused_survivor_reserve_reuses_storage_and_metadata_with_bounded_retention() 
 #[test]
 fn empty_chunk_cache_preserves_epoch_readers_and_zeroes_reused_payloads() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _stress = GcStressTestScope::normal();
     reset_internal();
     let mut state = runtime().heap.lock().unwrap();
@@ -2028,7 +2090,7 @@ fn empty_chunk_cache_preserves_epoch_readers_and_zeroes_reused_payloads() {
 #[test]
 fn nursery_allocator_evidence_survives_refill_retirement_and_expires_after_minor() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _stress = GcStressTestScope::normal();
     reset_internal();
     let mut owners: Vec<_> = (0..8).map(|_| Box::new(tlab_state_for_test())).collect();
@@ -2053,7 +2115,7 @@ fn nursery_allocator_evidence_survives_refill_retirement_and_expires_after_minor
 #[test]
 fn cached_empty_chunks_yield_to_hard_and_soft_memory_limits() {
     use crate::gc::*;
-    let _guard = runtime_test_guard();
+    let _guard = isolated_runtime();
     let _stress = GcStressTestScope::normal();
     reset_internal();
     let mut state = runtime().heap.lock().unwrap();
@@ -2077,4 +2139,116 @@ fn cached_empty_chunks_yield_to_hard_and_soft_memory_limits() {
     assert_eq!(state.region_cache.retained_bytes(), 0);
     drop(state);
     reset_internal();
+}
+
+#[test]
+fn private_minor_collectors_release_only_their_own_reserve_on_unwind() {
+    std::thread::scope(|scope| {
+        for externally_admitted in [false, true] {
+            scope.spawn(crate::runtime::serving(move || {
+                let owner =
+                    crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+                let mut state = owner.gc.heap.lock().unwrap();
+                if externally_admitted {
+                    super::prepare_survivor_reserve(&mut state);
+                }
+                for unwind in [false, true] {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut stop = Default::default();
+                        let collector = MinorCollector::new(
+                            &owner,
+                            &mut state,
+                            std::sync::Arc::new(crate::gc::MinorRegistrySnapshot::default()),
+                            &mut stop,
+                        );
+                        assert!(collector.state.survivor_reserve_active);
+                        assert_eq!(collector.release_reserve_on_drop, !externally_admitted);
+                        if unwind {
+                            panic!("exercise private collector reserve cleanup");
+                        }
+                        drop(collector);
+                    }));
+                    assert_eq!(result.is_err(), unwind);
+                    assert_eq!(state.survivor_reserve_active, externally_admitted);
+                    assert!(state.survivor_reserve.is_empty());
+                }
+                if externally_admitted {
+                    super::release_survivor_reserve(&mut state);
+                }
+                assert!(!state.survivor_reserve_active);
+            }));
+        }
+    });
+}
+
+#[test]
+fn minor_observations_follow_private_heap_owners() {
+    std::thread::scope(|scope| {
+        for count in [8, 64] {
+            scope.spawn(crate::runtime::serving(move || {
+                let first = crate::gc::GcState::default();
+                let second = crate::gc::GcState::default();
+                for _ in 0..count {
+                    super::MinorObservation::page_query(&first.minor_observation);
+                }
+                super::MinorObservation::snapshot_keys(&first.minor_observation, count);
+                assert_eq!(first.minor_observation.page_queries.get(), count);
+                assert_eq!(first.minor_observation.snapshot_dedup_keys.get(), count);
+                assert_eq!(second.minor_observation.page_queries.get(), 0);
+                assert_eq!(second.minor_observation.snapshot_dedup_keys.get(), 0);
+            }));
+        }
+    });
+}
+
+#[test]
+fn private_survivor_admission_cleanup_keeps_other_owner_active() {
+    let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let rendezvous = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        scope.spawn(crate::runtime::serving(|| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _admission = super::SurvivorAdmission::new(&first);
+                rendezvous.wait();
+                panic!("private admission unwind");
+            }));
+            assert!(result.is_err());
+            assert!(!first.gc.heap.lock().unwrap().survivor_reserve_active);
+            assert!(second.gc.heap.lock().unwrap().survivor_reserve_active);
+            rendezvous.wait();
+        }));
+        scope.spawn(crate::runtime::serving(|| {
+            let admission = super::SurvivorAdmission::new(&second);
+            rendezvous.wait();
+            rendezvous.wait();
+            assert!(second.gc.heap.lock().unwrap().survivor_reserve_active);
+            drop(admission);
+            assert!(!second.gc.heap.lock().unwrap().survivor_reserve_active);
+        }));
+    });
+}
+
+#[test]
+fn private_survivor_admission_charges_selected_native_budget() {
+    use crate::gc::GC_TLAB_CHUNK_SIZE;
+    use std::sync::atomic::Ordering;
+    let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+    first.gc.native_accounting.bytes.store(1, Ordering::Relaxed);
+    for owner in [&first, &second] {
+        let mut state = owner.gc.heap.lock().unwrap();
+        state.memory_limit_bytes = Some(GC_TLAB_CHUNK_SIZE);
+        assert_eq!(
+            super::admit_survivor_chunk_in(owner, &mut state),
+            std::ptr::eq(owner, &second)
+        );
+        assert_eq!(
+            state.survivor_reserve.len(),
+            usize::from(std::ptr::eq(owner, &second))
+        );
+        super::release_survivor_reserve(&mut state);
+    }
+    assert_eq!(first.gc.native_accounting.bytes.load(Ordering::Relaxed), 1);
+    assert_eq!(second.gc.native_accounting.bytes.load(Ordering::Relaxed), 0);
 }

@@ -2,18 +2,25 @@
 use super::*;
 use std::sync::atomic::AtomicU64;
 
-static ACTIVE: AtomicBool = AtomicBool::new(false);
-static FORCE_WINDOW: AtomicBool = AtomicBool::new(false);
-static PRODUCER_DONE: AtomicBool = AtomicBool::new(false);
-static FAILED_PROBES: AtomicUsize = AtomicUsize::new(0);
-static PUBLISHED_ROUND: AtomicUsize = AtomicUsize::new(0);
-static STALE_RETRIES: AtomicUsize = AtomicUsize::new(0);
-static PROBE: Mutex<Option<Arc<Probe>>> = Mutex::new(None);
+static ACTIVE: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+static FORCE_WINDOW: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+static PRODUCER_DONE: crate::runtime::PerRuntime<AtomicBool> =
+    crate::runtime::PerRuntime::new(|| AtomicBool::new(false));
+static FAILED_PROBES: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static PUBLISHED_ROUND: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static STALE_RETRIES: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+static PROBE: crate::runtime::PerRuntime<Mutex<Option<Arc<Probe>>>> =
+    crate::runtime::PerRuntime::new(|| Mutex::new(None));
 thread_local! {
     static LAST_STALE: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
-pub(super) fn record_failed_probe() {
+pub(super) fn record_failed_probe(owner: &crate::runtime::Runtime) {
     if !ACTIVE.load(Ordering::Relaxed) {
         return;
     }
@@ -28,13 +35,13 @@ pub(super) fn record_failed_probe() {
             && !PRODUCER_DONE.load(Ordering::Acquire)
             && Instant::now() < deadline
         {
-            crate::gc::relocatable_safepoint();
+            crate::gc::relocatable_safepoint_in(owner);
             std::hint::spin_loop();
         }
     }
 }
 
-pub(super) fn record_stale_retry() {
+pub(super) fn record_stale_retry(_: &crate::runtime::Runtime) {
     if ACTIVE.load(Ordering::Relaxed) {
         STALE_RETRIES.fetch_add(1, Ordering::Relaxed);
         LAST_STALE.set(Some(Instant::now()));
@@ -200,6 +207,9 @@ fn run_probe(workers: usize, count: usize, burst: usize, forced: bool) {
     STALE_RETRIES.store(0, Ordering::Relaxed);
     PRODUCER_DONE.store(false, Ordering::Relaxed);
     FORCE_WINDOW.store(forced, Ordering::Relaxed);
+    crate::runtime::current()
+        .scheduler_hooks
+        .set_idle([Some(record_failed_probe), Some(record_stale_retry)]);
     ACTIVE.store(true, Ordering::Release);
     willow_sched_spawn_cooperative(producer, std::ptr::null_mut());
     let state = Arc::new(ParallelRunState::default());
@@ -207,10 +217,15 @@ fn run_probe(workers: usize, count: usize, burst: usize, forced: bool) {
     std::thread::scope(|scope| {
         for worker in 0..workers {
             let state = Arc::clone(&state);
-            scope.spawn(move || run_parallel_worker(worker, None, state, Some(deadline)));
+            scope.spawn(crate::runtime::serving(move || {
+                run_parallel_worker(worker, None, state, Some(deadline))
+            }));
         }
     });
     ACTIVE.store(false, Ordering::Release);
+    crate::runtime::current()
+        .scheduler_hooks
+        .set_idle([None; 2]);
     *PROBE.lock().unwrap() = None;
     assert!(!probe.timed_out.load(Ordering::Acquire));
     let mut all = Vec::with_capacity(count);
@@ -247,7 +262,7 @@ fn run_probe(workers: usize, count: usize, burst: usize, forced: bool) {
 
 #[test]
 fn publication_during_failed_probes_reaches_real_task_polls() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for workers in [2, 8] {
         run_probe(workers, 128, 8, true);
     }
@@ -256,7 +271,7 @@ fn publication_during_failed_probes_reaches_real_task_polls() {
 #[test]
 #[ignore = "release full-scheduler latency measurement; run arms interleaved on an idle host"]
 fn full_scheduler_publication_latency() {
-    let _guard = crate::gc::runtime_test_guard();
+    let _guard = crate::gc::isolated_runtime();
     for workers in [2, 8, 16] {
         for forced in [false, true] {
             run_probe(workers, 4096, 8, forced);

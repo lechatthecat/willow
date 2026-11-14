@@ -77,7 +77,9 @@ pub(super) fn record_mark_cpu(cpu: Option<u64>) {
     }
 }
 
+// CPU samples and the restored TLS slot belong to the creating thread.
 pub(super) struct CpuScope {
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
     start: Option<u64>,
     previous: Option<Option<u64>>,
 }
@@ -87,6 +89,7 @@ impl CpuScope {
         Self {
             start: crate::gc_telemetry::workers::thread_cpu_ns(),
             previous: MARK_CPU.replace(Some(Some(0))),
+            _thread: std::marker::PhantomData,
         }
     }
 
@@ -109,6 +112,7 @@ impl Drop for CpuScope {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Debt {
+    credited: crate::observation::Value<u64>,
     epoch: u64,
     units: i64,
 }
@@ -116,7 +120,11 @@ struct Debt {
 impl Debt {
     fn charge(&mut self, epoch: u64, bytes: u64, rate: u64) -> bool {
         if self.epoch != epoch {
-            *self = Self { epoch, units: 0 };
+            *self = Self {
+                epoch,
+                units: 0,
+                ..*self
+            };
         }
         let charge = (u128::from(bytes) * u128::from(rate)).min(i64::MAX as u128) as i64;
         self.units = self.units.saturating_add(charge);
@@ -124,6 +132,8 @@ impl Debt {
     }
 
     fn credit(&mut self, epoch: u64, work: u64) {
+        self.credited
+            .observe_mut(|credited| *credited = credited.saturating_add(work));
         if self.epoch == epoch {
             let credit = (u128::from(work) * u128::from(SCALE)).min(i64::MAX as u128) as i64;
             self.units = self.units.saturating_sub(credit);
@@ -132,7 +142,7 @@ impl Debt {
 }
 
 thread_local! {
-    static DEBT: Cell<Debt> = const { Cell::new(Debt { epoch: 0, units: 0 }) };
+    static DEBT: Cell<Debt> = const { Cell::new(Debt { credited: crate::observation::Value::constant(0), epoch: 0, units: 0 }) };
 }
 
 pub(super) fn rate(work: u64, runway: u64) -> u64 {
@@ -152,8 +162,15 @@ pub(super) fn charge(epoch: u64, bytes: u64, rate: u64) -> bool {
 }
 
 #[cfg(test)]
-thread_local! {
-    pub(super) static CREDITED: Cell<u64> = const { Cell::new(0) };
+pub(super) fn reset_credited() {
+    let mut debt = DEBT.get();
+    debt.credited = crate::observation::Value::constant(0);
+    DEBT.set(debt);
+}
+
+#[cfg(test)]
+pub(super) fn credited() -> u64 {
+    *DEBT.get().credited
 }
 
 #[cfg(test)]
@@ -162,8 +179,6 @@ pub(super) fn debt_units() -> i64 {
 }
 
 pub(super) fn credit(epoch: u64, work: u64) {
-    #[cfg(test)]
-    CREDITED.set(CREDITED.get().saturating_add(work));
     DEBT.with(|local| {
         let mut debt = local.get();
         debt.credit(epoch, work);
@@ -270,11 +285,11 @@ mod tests {
             std::thread::scope(|scope| {
                 for _ in 0..threads {
                     let pacing = &pacing;
-                    scope.spawn(move || {
+                    scope.spawn(crate::runtime::serving(move || {
                         for _ in 0..100 {
                             pacing.charge(64, 0, true);
                         }
-                    });
+                    }));
                 }
             });
             assert_eq!(
@@ -320,7 +335,7 @@ mod tests {
         for threads in [1, 5, 16] {
             std::thread::scope(|scope| {
                 for thread in 0..threads {
-                    scope.spawn(move || {
+                    scope.spawn(crate::runtime::serving(move || {
                         reset();
                         assert!(charge(7, 64, SCALE));
                         if thread % 2 == 0 {
@@ -331,7 +346,7 @@ mod tests {
                         }
                         reset();
                         assert!(!charge(7, 0, SCALE));
-                    });
+                    }));
                 }
             });
         }

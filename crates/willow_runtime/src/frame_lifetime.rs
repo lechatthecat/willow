@@ -36,12 +36,26 @@ pub struct FrameEvent {
 }
 
 const EVENT_LIMIT: usize = 512;
-static CAPTURE: AtomicBool = AtomicBool::new(false);
-static EVENTS: Mutex<VecDeque<FrameEvent>> = Mutex::new(VecDeque::new());
+pub(crate) struct FrameLifetime {
+    counts: counts::Counters,
+    capture: AtomicBool,
+    events: Mutex<VecDeque<FrameEvent>>,
+}
+impl FrameLifetime {
+    pub(crate) const fn new() -> Self {
+        Self {
+            counts: counts::Counters::new(),
+            capture: AtomicBool::new(false),
+            events: Mutex::new(VecDeque::new()),
+        }
+    }
+}
+fn runtime() -> &'static FrameLifetime {
+    &crate::runtime::current().frame_lifetime
+}
 
 macro_rules! counters {
     (striped: [$($hot:ident),+ $(,)?], global: [$($field:ident),+ $(,)?] $(,)?) => {
-        $(static $field: AtomicU64 = AtomicU64::new(0);)+
         /// Per-Task events run on every worker, so each thread adds to its own
         /// stripe and snapshots pay for the sum.
         #[repr(align(128))]
@@ -50,13 +64,24 @@ macro_rules! counters {
             exited: AtomicU64,
             $($hot: AtomicU64,)+
         }
-        static COUNTER_SHARDS: [CounterShard; COUNTER_SHARD_COUNT] = [const {
-            CounterShard {
-                entered: AtomicU64::new(0),
-                exited: AtomicU64::new(0),
-                $($hot: AtomicU64::new(0),)+
+        pub(super) struct Counters {
+            $($field: AtomicU64,)+
+            shards: [CounterShard; COUNTER_SHARD_COUNT],
+        }
+        impl Counters {
+            pub(super) const fn new() -> Self {
+                Self {
+                    $($field: AtomicU64::new(0),)+
+                    shards: [const {
+                        CounterShard {
+                            entered: AtomicU64::new(0),
+                            exited: AtomicU64::new(0),
+                            $($hot: AtomicU64::new(0),)+
+                        }
+                    }; COUNTER_SHARD_COUNT],
+                }
             }
-        }; COUNTER_SHARD_COUNT];
+        }
         #[derive(Debug, Clone, Copy, Default)]
         #[repr(C)]
         pub struct FrameLifetimeSnapshot {
@@ -70,22 +95,24 @@ macro_rules! counters {
         }
         /// Atomic counters can span adjacent events during concurrent activity.
         /// Exact accounting assertions must take snapshots at a rendezvous.
-        pub fn snapshot() -> FrameLifetimeSnapshot {
-            let mut s = FrameLifetimeSnapshot {
-                $($hot: COUNTER_SHARDS
-                    .iter()
-                    .map(|shard| shard.$hot.load(Ordering::Acquire))
-                    .sum(),)+
-                $($field: $field.load(Ordering::Acquire),)+
-                ..Default::default()
-            };
-            let (entered, exited) = poll_totals();
-            s.task_frames_running = entered.saturating_sub(exited);
-            s.poll_exits = exited;
-            s.task_frames_rooted = s.scheduler_roots_added.saturating_sub(s.scheduler_roots_released);
-            s.task_frames_retired = s.terminal_events.saturating_sub(s.scheduler_roots_released);
-            s.task_frames_terminal = s.terminal_events.saturating_sub(s.terminal_frames_reclaimed);
-            s
+        impl Counters {
+            pub(super) fn snapshot(&self) -> FrameLifetimeSnapshot {
+                let mut s = FrameLifetimeSnapshot {
+                    $($hot: self.shards
+                        .iter()
+                        .map(|shard| shard.$hot.load(Ordering::Acquire))
+                        .sum(),)+
+                    $($field: self.$field.load(Ordering::Acquire),)+
+                    ..Default::default()
+                };
+                let (entered, exited) = self.poll_totals();
+                s.task_frames_running = entered.saturating_sub(exited);
+                s.poll_exits = exited;
+                s.task_frames_rooted = s.scheduler_roots_added.saturating_sub(s.scheduler_roots_released);
+                s.task_frames_retired = s.terminal_events.saturating_sub(s.scheduler_roots_released);
+                s.task_frames_terminal = s.terminal_events.saturating_sub(s.terminal_frames_reclaimed);
+                s
+            }
         }
         #[cfg(test)]
         #[test]
@@ -106,15 +133,15 @@ macro_rules! counters {
             assert!(text.contains("reclaimed_frame_bytes: 18446744073709551615"));
         }
         #[cfg(test)]
-        pub(crate) fn reset() {
-            $($field.store(0, Ordering::Release);)+
-            for shard in &COUNTER_SHARDS {
-                shard.entered.store(0, Ordering::Release);
-                shard.exited.store(0, Ordering::Release);
-                $(shard.$hot.store(0, Ordering::Release);)+
+        impl Counters {
+            pub(super) fn reset(&self) {
+                $(self.$field.store(0, Ordering::Release);)+
+                for shard in &self.shards {
+                    shard.entered.store(0, Ordering::Release);
+                    shard.exited.store(0, Ordering::Release);
+                    $(shard.$hot.store(0, Ordering::Release);)+
+                }
             }
-            EVENTS.lock().unwrap_or_else(|p| p.into_inner()).clear();
-            CAPTURE.store(false, Ordering::Release);
         }
     };
 }
@@ -137,11 +164,6 @@ fn counter_shard_index() -> usize {
     })
 }
 
-// Lowercase names deliberately match the public snapshot fields.
-#[allow(
-    non_upper_case_globals,
-    reason = "Identifiers retain exported ABI or snapshot field spelling"
-)]
 mod counts {
     use super::*;
     counters! {
@@ -161,171 +183,261 @@ mod counts {
     }
     /// Sum exits before entries: an exit is counted only after its entry, so a
     /// concurrent snapshot never observes more exits than entries.
-    fn poll_totals() -> (u64, u64) {
-        let exited = COUNTER_SHARDS
-            .iter()
-            .map(|shard| shard.exited.load(Ordering::Acquire))
-            .sum::<u64>();
-        let entered = COUNTER_SHARDS
-            .iter()
-            .map(|shard| shard.entered.load(Ordering::Acquire))
-            .sum::<u64>();
-        (entered, exited)
-    }
-    pub(super) fn record(kind: FrameEventKind, bytes: u64) {
-        let shard = || &COUNTER_SHARDS[counter_shard_index()];
-        let increment = |counter: &AtomicU64| {
-            counter.fetch_add(1, Ordering::AcqRel);
-        };
-        match kind {
-            FrameEventKind::Created => {
-                let shard = shard();
-                increment(&shard.frames_created);
-                shard
-                    .allocated_frame_bytes
-                    .fetch_add(bytes, Ordering::AcqRel);
-            }
-            FrameEventKind::SchedulerRootAdded => increment(&shard().scheduler_roots_added),
-            FrameEventKind::PollEntered => {
-                shard().entered.fetch_add(1, Ordering::Release);
-            }
-            FrameEventKind::PollExited => {
-                shard().exited.fetch_add(1, Ordering::Release);
-            }
-            FrameEventKind::Terminal => increment(&shard().terminal_events),
-            FrameEventKind::Quiescent => increment(&shard().quiescent_events),
-            FrameEventKind::SchedulerRootReleased => increment(&shard().scheduler_roots_released),
-            FrameEventKind::ScopeOwnerReleased => increment(&shard().scope_owner_releases),
-            FrameEventKind::LogicallyDead => {}
-            FrameEventKind::DropPending => increment(&pending_drops),
-            FrameEventKind::MetadataRemoved => {
-                increment(&metadata_removed_frames);
-                metadata_removed_bytes.fetch_add(bytes, Ordering::AcqRel);
-                increment(&quarantined_frames);
-                quarantined_bytes.fetch_add(bytes, Ordering::AcqRel);
-            }
-            FrameEventKind::DropCompleted => {
-                pending_drops.fetch_sub(1, Ordering::AcqRel);
-            }
-            FrameEventKind::SweepCompleted => {
-                let frames = quarantined_frames.swap(0, Ordering::AcqRel);
-                let bytes = quarantined_bytes.swap(0, Ordering::AcqRel);
-                task_frames_reclaimed.fetch_add(frames, Ordering::AcqRel);
-                reclaimed_frame_bytes.fetch_add(bytes, Ordering::AcqRel);
-                terminal_frames_reclaimed.fetch_add(
-                    quarantined_terminal_frames.swap(0, Ordering::AcqRel),
-                    Ordering::AcqRel,
-                );
-                increment(&sweep_completions);
+    impl Counters {
+        fn poll_totals(&self) -> (u64, u64) {
+            let exited = self
+                .shards
+                .iter()
+                .map(|shard| shard.exited.load(Ordering::Acquire))
+                .sum::<u64>();
+            let entered = self
+                .shards
+                .iter()
+                .map(|shard| shard.entered.load(Ordering::Acquire))
+                .sum::<u64>();
+            (entered, exited)
+        }
+        pub(super) fn record(&self, kind: FrameEventKind, bytes: u64) {
+            let shard = || &self.shards[counter_shard_index()];
+            let increment = |counter: &AtomicU64| {
+                counter.fetch_add(1, Ordering::AcqRel);
+            };
+            match kind {
+                FrameEventKind::Created => {
+                    let shard = shard();
+                    increment(&shard.frames_created);
+                    shard
+                        .allocated_frame_bytes
+                        .fetch_add(bytes, Ordering::AcqRel);
+                }
+                FrameEventKind::SchedulerRootAdded => increment(&shard().scheduler_roots_added),
+                FrameEventKind::PollEntered => {
+                    shard().entered.fetch_add(1, Ordering::Release);
+                }
+                FrameEventKind::PollExited => {
+                    shard().exited.fetch_add(1, Ordering::Release);
+                }
+                FrameEventKind::Terminal => increment(&shard().terminal_events),
+                FrameEventKind::Quiescent => increment(&shard().quiescent_events),
+                FrameEventKind::SchedulerRootReleased => {
+                    increment(&shard().scheduler_roots_released)
+                }
+                FrameEventKind::ScopeOwnerReleased => increment(&shard().scope_owner_releases),
+                FrameEventKind::LogicallyDead => {}
+                FrameEventKind::DropPending => increment(&self.pending_drops),
+                FrameEventKind::MetadataRemoved => {
+                    increment(&self.metadata_removed_frames);
+                    self.metadata_removed_bytes
+                        .fetch_add(bytes, Ordering::AcqRel);
+                    increment(&self.quarantined_frames);
+                    self.quarantined_bytes.fetch_add(bytes, Ordering::AcqRel);
+                }
+                FrameEventKind::DropCompleted => {
+                    self.pending_drops.fetch_sub(1, Ordering::AcqRel);
+                }
+                FrameEventKind::SweepCompleted => {
+                    let frames = self.quarantined_frames.swap(0, Ordering::AcqRel);
+                    let bytes = self.quarantined_bytes.swap(0, Ordering::AcqRel);
+                    self.task_frames_reclaimed
+                        .fetch_add(frames, Ordering::AcqRel);
+                    self.reclaimed_frame_bytes
+                        .fetch_add(bytes, Ordering::AcqRel);
+                    self.terminal_frames_reclaimed.fetch_add(
+                        self.quarantined_terminal_frames.swap(0, Ordering::AcqRel),
+                        Ordering::AcqRel,
+                    );
+                    increment(&self.sweep_completions);
+                }
             }
         }
+        pub(super) fn terminal_reclaimed(&self) {
+            self.quarantined_terminal_frames
+                .fetch_add(1, Ordering::AcqRel);
+        }
     }
-    pub(super) fn terminal_reclaimed() {
-        quarantined_terminal_frames.fetch_add(1, Ordering::AcqRel);
+}
+pub use counts::FrameLifetimeSnapshot;
+pub fn snapshot() -> FrameLifetimeSnapshot {
+    runtime().snapshot()
+}
+
+impl FrameLifetime {
+    pub(crate) fn snapshot(&self) -> FrameLifetimeSnapshot {
+        self.counts.snapshot()
     }
 }
 #[cfg(test)]
-pub(crate) use counts::reset;
-pub use counts::{FrameLifetimeSnapshot, snapshot};
+pub(crate) fn reset() {
+    runtime().counts.reset();
+    runtime()
+        .events
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+    runtime().capture.store(false, Ordering::Release);
+}
 
 /// Enable bounded event capture. Counters remain available when disabled.
 pub fn capture_events(enabled: bool) {
-    if enabled {
-        // Reserve before publishing capture: native destructor diagnostics
-        // must never allocate while the drop hook owns quarantined storage.
-        let mut events = EVENTS.lock().unwrap_or_else(|p| p.into_inner());
-        let additional = EVENT_LIMIT.saturating_sub(events.capacity());
-        events.reserve_exact(additional);
-        CAPTURE.store(true, Ordering::Release);
-    } else {
-        CAPTURE.store(false, Ordering::Release);
-        EVENTS.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    runtime().capture_events(enabled);
+}
+impl FrameLifetime {
+    fn capture_events(&self, enabled: bool) {
+        if enabled {
+            // Reserve before publishing capture: native destructor diagnostics
+            // must never allocate while the drop hook owns quarantined storage.
+            let mut events = self.events.lock().unwrap_or_else(|p| p.into_inner());
+            let additional = EVENT_LIMIT.saturating_sub(events.capacity());
+            events.reserve_exact(additional);
+            self.capture.store(true, Ordering::Release);
+        } else {
+            self.capture.store(false, Ordering::Release);
+            self.events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+        }
+    }
+    fn events(&self) -> Vec<FrameEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .copied()
+            .collect()
     }
 }
 pub fn events() -> Vec<FrameEvent> {
-    EVENTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .copied()
-        .collect()
+    runtime().events()
 }
 pub(crate) fn record(kind: FrameEventKind, frame: usize, epoch: u64, bytes: u64) {
-    record_with_sweep(kind, frame, epoch, 0, bytes);
+    runtime().record_with_sweep(kind, frame, epoch, 0, bytes);
 }
 pub(crate) fn record_sweep(kind: FrameEventKind, frame: usize, sweep_epoch: u64, bytes: u64) {
-    record_with_sweep(
-        kind,
-        frame,
-        crate::frame_reclaim::current_epoch(),
-        sweep_epoch,
-        bytes,
-    );
+    runtime().record_sweep(kind, frame, sweep_epoch, bytes);
 }
-fn record_with_sweep(kind: FrameEventKind, frame: usize, epoch: u64, sweep_epoch: u64, bytes: u64) {
-    counts::record(kind, bytes);
-    if CAPTURE.load(Ordering::Acquire) {
-        push_event(FrameEvent {
+impl FrameLifetime {
+    pub(crate) fn record_sweep(
+        &self,
+        kind: FrameEventKind,
+        frame: usize,
+        sweep_epoch: u64,
+        bytes: u64,
+    ) {
+        self.record_with_sweep(
             kind,
-            epoch,
-            sweep_epoch,
             frame,
+            crate::frame_reclaim::current_epoch(),
+            sweep_epoch,
             bytes,
-        });
+        );
     }
-}
-fn push_event(event: FrameEvent) {
-    let mut events = EVENTS.lock().unwrap_or_else(|p| p.into_inner());
-    if events.len() == EVENT_LIMIT {
-        events.pop_front();
+
+    pub(crate) fn record_with_sweep(
+        &self,
+        kind: FrameEventKind,
+        frame: usize,
+        epoch: u64,
+        sweep_epoch: u64,
+        bytes: u64,
+    ) {
+        self.counts.record(kind, bytes);
+        if self.capture.load(Ordering::Acquire) {
+            self.push_event(FrameEvent {
+                kind,
+                epoch,
+                sweep_epoch,
+                frame,
+                bytes,
+            });
+        }
     }
-    events.push_back(event);
+    fn push_event(&self, event: FrameEvent) {
+        let mut events = self.events.lock().unwrap_or_else(|p| p.into_inner());
+        if events.len() == EVENT_LIMIT {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
 }
 pub(crate) fn metadata_removed(frame: usize, bytes: usize, terminal: bool, sweep_epoch: u64) {
-    #[cfg(feature = "borrow-migration-probe")]
-    crate::borrow_migration_probe::removed(frame);
-    if terminal {
-        counts::terminal_reclaimed();
-    }
-    record_sweep(
-        FrameEventKind::LogicallyDead,
-        frame,
-        sweep_epoch,
-        bytes as u64,
-    );
-    record_sweep(
-        FrameEventKind::MetadataRemoved,
-        frame,
-        sweep_epoch,
-        bytes as u64,
-    );
+    runtime().metadata_removed(frame, bytes, terminal, sweep_epoch);
 }
 pub(crate) fn pending_drop(frame: usize, sweep_epoch: u64) {
-    record_sweep(FrameEventKind::DropPending, frame, sweep_epoch, 0);
+    runtime().pending_drop(frame, sweep_epoch);
+}
+impl FrameLifetime {
+    pub(crate) fn metadata_removed(
+        &self,
+        frame: usize,
+        bytes: usize,
+        terminal: bool,
+        sweep_epoch: u64,
+    ) {
+        #[cfg(feature = "borrow-migration-probe")]
+        crate::borrow_migration_probe::removed(frame);
+        if terminal {
+            self.counts.terminal_reclaimed();
+        }
+        self.record_sweep(
+            FrameEventKind::LogicallyDead,
+            frame,
+            sweep_epoch,
+            bytes as u64,
+        );
+        self.record_sweep(
+            FrameEventKind::MetadataRemoved,
+            frame,
+            sweep_epoch,
+            bytes as u64,
+        );
+    }
+    pub(crate) fn pending_drop(&self, frame: usize, sweep_epoch: u64) {
+        self.record_sweep(FrameEventKind::DropPending, frame, sweep_epoch, 0);
+    }
 }
 
-pub(crate) struct PollLifetime(usize);
-impl PollLifetime {
+pub(crate) struct PollLifetime<'a> {
+    frame: usize,
+    owner: &'a FrameLifetime,
+}
+impl PollLifetime<'static> {
     pub(crate) fn enter(frame: usize) -> Self {
-        if frame != 0 {
-            record_poll(FrameEventKind::PollEntered, frame);
-        }
-        Self(frame)
+        Self::enter_in(runtime(), frame)
     }
 }
-impl Drop for PollLifetime {
+impl<'a> PollLifetime<'a> {
+    pub(crate) fn enter_in(owner: &'a FrameLifetime, frame: usize) -> Self {
+        if frame != 0 {
+            owner.record_poll(FrameEventKind::PollEntered, frame);
+        }
+        Self { frame, owner }
+    }
+}
+impl Drop for PollLifetime<'_> {
+    #[inline]
     fn drop(&mut self) {
-        if self.0 != 0 {
-            record_poll(FrameEventKind::PollExited, self.0);
+        if self.frame != 0 {
+            self.owner
+                .record_poll(FrameEventKind::PollExited, self.frame);
         }
     }
 }
 
-/// Poll events read the retire epoch only when events are being captured.
-fn record_poll(kind: FrameEventKind, frame: usize) {
-    counts::record(kind, 0);
-    if CAPTURE.load(Ordering::Acquire) {
-        push_event(FrameEvent {
+impl FrameLifetime {
+    /// Poll events read the retire epoch only when events are being captured.
+    #[inline]
+    fn record_poll(&self, kind: FrameEventKind, frame: usize) {
+        self.counts.record(kind, 0);
+        if self.capture.load(Ordering::Acquire) {
+            self.capture_poll(kind, frame);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn capture_poll(&self, kind: FrameEventKind, frame: usize) {
+        self.push_event(FrameEvent {
             kind,
             epoch: crate::frame_reclaim::current_epoch(),
             sweep_epoch: 0,
@@ -347,4 +459,122 @@ pub extern "C" fn willow_gc_task_frame_diagnostics() {
 
 fn diagnostic_text(counters: FrameLifetimeSnapshot) -> String {
     format!("task_frame_lifetime_v1 {counters:?}\n")
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn frame_lifetime_owners_isolate_concurrent_counts_and_bounded_events() {
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            for bytes in [16, 48] {
+                let barrier = &barrier;
+                scope.spawn(crate::runtime::serving(move || {
+                    let owner = FrameLifetime::new();
+                    owner.capture_events(true);
+                    barrier.wait();
+                    for frame in 1..=EVENT_LIMIT + 17 {
+                        owner.record_with_sweep(FrameEventKind::Created, frame, 7, 0, bytes);
+                        owner.record_with_sweep(FrameEventKind::PollEntered, frame, 7, 0, 0);
+                        owner.record_with_sweep(FrameEventKind::PollExited, frame, 7, 0, 0);
+                    }
+                    barrier.wait();
+                    let snapshot = owner.counts.snapshot();
+                    assert_eq!(snapshot.frames_created, (EVENT_LIMIT + 17) as u64);
+                    assert_eq!(
+                        snapshot.allocated_frame_bytes,
+                        snapshot.frames_created * bytes
+                    );
+                    assert_eq!(snapshot.task_frames_running, 0);
+                    assert_eq!(snapshot.poll_exits, snapshot.frames_created);
+                    let events = owner.events();
+                    assert_eq!(events.len(), EVENT_LIMIT);
+                    assert_eq!(events.last().unwrap().frame, EVENT_LIMIT + 17);
+                    assert!(
+                        events
+                            .iter()
+                            .filter(|event| event.kind == FrameEventKind::Created)
+                            .all(|event| event.bytes == bytes)
+                    );
+                    owner.capture_events(false);
+                    assert!(owner.events().is_empty());
+                    assert_eq!(
+                        owner.counts.snapshot().frames_created,
+                        snapshot.frames_created
+                    );
+                }));
+            }
+        });
+    }
+
+    #[test]
+    fn frame_lifetime_poll_guards_retain_owner_across_nesting_and_unwind() {
+        let first = FrameLifetime::new();
+        let second = FrameLifetime::new();
+        first.capture_events(true);
+        second.capture_events(true);
+        let outer = PollLifetime::enter_in(&first, 11);
+        {
+            let _other = PollLifetime::enter_in(&second, 22);
+            let _nested = PollLifetime::enter_in(&first, 33);
+            assert_eq!(first.counts.snapshot().task_frames_running, 2);
+            assert_eq!(second.counts.snapshot().task_frames_running, 1);
+        }
+        let unwind = std::panic::catch_unwind(|| {
+            let _poll = PollLifetime::enter_in(&second, 44);
+            panic!("poll unwind");
+        });
+        assert!(unwind.is_err());
+        drop(PollLifetime::enter_in(&first, 0));
+        assert_eq!(first.counts.snapshot().task_frames_running, 1);
+        drop(outer);
+        assert_eq!(first.counts.snapshot().task_frames_running, 0);
+        assert_eq!(second.counts.snapshot().task_frames_running, 0);
+        assert_eq!(first.counts.snapshot().poll_exits, 2);
+        assert_eq!(second.counts.snapshot().poll_exits, 2);
+        assert!(
+            first
+                .events()
+                .iter()
+                .all(|event| [11, 33].contains(&event.frame))
+        );
+        assert!(
+            second
+                .events()
+                .iter()
+                .all(|event| [22, 44].contains(&event.frame))
+        );
+    }
+
+    #[test]
+    fn frame_lifetime_owner_sweep_drains_only_its_quarantine() {
+        let owners = [FrameLifetime::new(), FrameLifetime::new()];
+        for (index, owner) in owners.iter().enumerate() {
+            owner.record_with_sweep(FrameEventKind::MetadataRemoved, index, 2, 3, 32);
+            owner.counts.terminal_reclaimed();
+            owner.record_with_sweep(FrameEventKind::DropPending, index, 2, 3, 0);
+        }
+        owners[0].record_with_sweep(FrameEventKind::DropCompleted, 0, 2, 3, 0);
+        owners[0].record_with_sweep(FrameEventKind::SweepCompleted, 0, 2, 3, 0);
+        let first = owners[0].counts.snapshot();
+        let second = owners[1].counts.snapshot();
+        assert_eq!((first.quarantined_frames, first.pending_drops), (0, 0));
+        assert_eq!(
+            (first.task_frames_reclaimed, first.terminal_frames_reclaimed),
+            (1, 1)
+        );
+        assert_eq!(first.reclaimed_frame_bytes, 32);
+        assert_eq!((second.quarantined_frames, second.pending_drops), (1, 1));
+        assert_eq!(
+            (
+                second.task_frames_reclaimed,
+                second.terminal_frames_reclaimed
+            ),
+            (0, 0)
+        );
+        assert_eq!(second.sweep_completions, 0);
+    }
 }

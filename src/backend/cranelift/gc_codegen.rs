@@ -728,6 +728,58 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         );
     }
 
+    /// The serving runtime's gate cell published at `offset` in the pinned
+    /// context, loaded once at the function entry (see [`BarrierGates`]).
+    fn barrier_gate(&mut self, offset: i32) -> Value {
+        use cranelift_codegen::cursor::{Cursor, FuncCursor};
+        let gates = &mut self.gates;
+        let cached = if offset == willow_abi::generated_context::MARK_PHASE_OFFSET {
+            &mut gates.mark_phase
+        } else {
+            debug_assert_eq!(
+                offset,
+                willow_abi::generated_context::CARD_EPOCH_CELL_OFFSET
+            );
+            &mut gates.card_epoch
+        };
+        if let Some(cell) = *cached {
+            return cell;
+        }
+        let ptr_ty = reference_type(self.module.target_config());
+        let entry = self
+            .builder
+            .func
+            .layout
+            .entry_block()
+            .expect("barrier emitted outside a function body");
+        // Entry-block values dominate every barrier. Insert after values
+        // already hoisted here so the context read precedes its loads.
+        let mut cursor = FuncCursor::new(self.builder.func);
+        cursor = match gates.context {
+            Some(context) => {
+                let def = cursor.func.dfg.value_def(context).unwrap_inst();
+                cursor.at_inst(def)
+            }
+            None => cursor.at_first_insertion_point(entry),
+        };
+        let context = match gates.context {
+            Some(context) => {
+                cursor.next_inst();
+                context
+            }
+            None => {
+                let context = cursor.ins().get_pinned_reg(ptr_ty);
+                gates.context = Some(context);
+                context
+            }
+        };
+        let cell = cursor
+            .ins()
+            .load(ptr_ty, MemFlagsData::trusted(), context, offset);
+        *cached = Some(cell);
+        cell
+    }
+
     /// Store a reference `word` into `slot` inside the GC object whose payload
     /// starts at `owner`. The fused
     /// `willow_gc_write_barrier` call is skipped when it is a no-op: no SATB
@@ -755,38 +807,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.set_cold_block(barrier);
         let done = self.builder.create_block();
 
-        let phase_data = self
-            .module
-            .declare_data(
-                willow_abi::GC_MARK_PHASE_SYMBOL,
-                cranelift_module::Linkage::Import,
-                false,
-                false,
-            )
-            .expect("GC mark phase symbol");
-        let phase_global = self
-            .module
-            .declare_data_in_func(phase_data, self.builder.func);
-        let phase_addr = self.builder.ins().symbol_value(ptr_ty, phase_global);
+        let phase_addr = self.barrier_gate(willow_abi::generated_context::MARK_PHASE_OFFSET);
         let phase = self
             .builder
             .ins()
             .atomic_load(types::I8, MemFlagsData::trusted(), phase_addr);
         let marking = self.builder.ins().icmp_imm_s(IntCC::NotEqual, phase, 0);
         if destination == GcStoreDestination::ArrayElement {
-            let epoch_data = self
-                .module
-                .declare_data(
-                    willow_abi::GC_CARD_EPOCH_SYMBOL,
-                    cranelift_module::Linkage::Import,
-                    false,
-                    false,
-                )
-                .expect("GC card epoch symbol");
-            let epoch_global = self
-                .module
-                .declare_data_in_func(epoch_data, self.builder.func);
-            let epoch_addr = self.builder.ins().symbol_value(ptr_ty, epoch_global);
+            let epoch_addr =
+                self.barrier_gate(willow_abi::generated_context::CARD_EPOCH_CELL_OFFSET);
             let epoch =
                 self.builder
                     .ins()
