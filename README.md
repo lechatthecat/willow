@@ -19,7 +19,17 @@ Its premise is simple: **when a person or an AI agent changes a program, the com
 
 This README describes the current `main` branch. Some features are newer than the latest prebuilt release; see [Try Willow](#try-willow).
 
-**Contents:** [A taste of Willow](#a-taste-of-willow) · [Try Willow](#try-willow) · [Rust interop](#rust-interop) · [Concurrency guarantees](#concurrency-the-compiler-follows-the-wait) · [Proven contracts](#contracts-from-run-time-checks-to-proofs) · [Locks](#locks-designed-together-with-the-compiler-and-scheduler) · [Semantic tooling](#semantic-tooling-for-people-and-ai-agents) · [Related approaches](#how-this-relates-to-other-approaches) · [Measurements](#measurements) · [Current boundaries](#current-boundaries)
+**Contents:**
+· [A taste of Willow](#a-taste-of-willow)
+· [Try Willow](#try-willow)
+· [Rust interop](#rust-interop)
+· [Concurrency guarantees](#concurrency-the-compiler-follows-the-wait)
+· [Proven contracts](#contracts-from-run-time-checks-to-proofs)
+· [Locks](#locks-designed-together-with-the-compiler-and-scheduler)
+· [Semantic tooling](#semantic-tooling-for-people-and-ai-agents)
+· [Related approaches](#how-this-relates-to-other-approaches)
+· [Measurements](#measurements)
+· [Current boundaries](#current-boundaries)
 
 ## A taste of Willow
 
