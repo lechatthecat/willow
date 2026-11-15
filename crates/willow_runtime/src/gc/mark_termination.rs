@@ -62,6 +62,12 @@ impl Termination {
             .expect("mark publication generation exhausted")
     }
 
+    /// Ownership transitions so far (each enter and each drop advances once).
+    #[cfg(test)]
+    pub(super) fn generation_for_test(&self) -> u64 {
+        self.sample() / GENERATION
+    }
+
     /// Sample before inspecting sources; CAS only the very same generation.
     pub(super) fn sample(&self) -> u64 {
         self.0.load(Ordering::SeqCst)

@@ -344,9 +344,10 @@ fn marking_barriers_publish_without_heap_lock_until_sealed() {
         );
     }
     worker.join().unwrap();
-    // The new edge is enqueued eagerly; deletions wait in the shard buffer.
-    assert!(cycle.is_marked(value as usize));
-    assert!(cycle.is_marked(young as usize));
+    // New edges and deletions both wait in the mutator's shard buffer: no
+    // shared mark-queue publication per store.
+    assert!(!cycle.is_marked(value as usize));
+    assert!(!cycle.is_marked(young as usize));
     assert!(!cycle.is_marked(old as usize));
     assert!(!cycle.is_marked(deleted as usize));
     with_stw(
@@ -359,6 +360,8 @@ fn marking_barriers_publish_without_heap_lock_until_sealed() {
         cycle.is_marked(old as usize),
         "sealing lost a shard deletion"
     );
+    assert!(cycle.is_marked(value as usize), "sealing lost a new edge");
+    assert!(cycle.is_marked(young as usize), "sealing lost a young edge");
     assert!(cycle.is_marked(deleted as usize));
     assert!(cycle.satb_shards.is_empty());
     // Sealed: the deletion goes to the heap-locked buffers instead.
@@ -4725,6 +4728,76 @@ fn concurrent_nonleaf_fanout_batches_claims_without_losing_shared_edges() {
             .store(0, Ordering::Release);
         willow_pop_root();
         willow_pop_root();
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn marking_phase_store_publication_batches_per_mutator() {
+    // Every store during concurrent marking publishes a deletion and a new
+    // edge. Both go through the mutator's private buffer, so the shared mark
+    // queue sees O(N / chunk) injections for N stores, never one per store.
+    let _guard = isolated_runtime();
+    for count in [1_024usize, 8_192, 65_536] {
+        reset_internal_for_test();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.pacer_trigger = u64::MAX;
+            state.pacer.disable_for_test();
+            state.nursery_threshold_bytes = usize::MAX;
+        }
+        let mut parent = willow_gc_alloc_layout(7, 0, 8, 0b1);
+        willow_push_root(&mut parent);
+        let children: Vec<_> = (0..count).map(|_| willow_alloc(8)).collect();
+        let (_, cycle) = root_handshake::begin().unwrap();
+        assert!(children.iter().all(|c| !cycle.is_marked(*c as usize)));
+        let before = cycle.queue.snapshot().injected;
+        let owned_before = cycle.termination.generation_for_test();
+        let slot = parent.cast::<*mut u8>();
+        for &child in &children {
+            let old = unsafe { *slot };
+            willow_gc_write_barrier(parent, old, child, 1);
+            unsafe { *slot = child };
+        }
+        let buffered = cycle.queue.snapshot().injected - before;
+        // Termination ownership is taken per full-buffer publication, not per
+        // store: enter + drop each advance the shared word once.
+        let transitions = cycle.termination.generation_for_test() - owned_before;
+        let full_buffers = (2 * count / satb::configured_capacity()) as u64;
+        assert!(
+            transitions <= 2 * full_buffers,
+            "stores={count} termination transitions={transitions}"
+        );
+        barrier::flush_satb_current(false);
+        let injected = cycle.queue.snapshot().injected - before;
+        // 2N entries (deletion + new edge), published per full buffer; each
+        // published buffer is split into queue items of at most 32 values.
+        let capacity = satb::configured_capacity();
+        let entries = 2 * count;
+        let bound = ((entries / capacity) * capacity.div_ceil(32)
+            + (entries % capacity).div_ceil(32)) as u64
+            + 2;
+        assert!(
+            injected <= bound,
+            "stores={count} injected={injected} bound={bound}"
+        );
+        assert!(buffered <= injected);
+        cycle.drain(usize::MAX);
+        for child in &children {
+            assert!(cycle.is_marked(*child as usize), "new edge lost");
+        }
+        assert!(cycle.queue.snapshot().is_drained());
+        assert_eq!(cycle.queue.snapshot().counter_underflows, 0);
+        assert_eq!(cycle.queue.end_epoch(), 0);
+        marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+        crate::runtime::current()
+            .mark_phase()
+            .store(0, Ordering::Release);
+        willow_pop_root();
+        eprintln!(
+            "marking_store_batch stores={count} queue_injections={injected} termination_transitions={transitions}"
+        );
     }
     reset_internal_for_test();
 }

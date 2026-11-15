@@ -210,10 +210,11 @@ pub(super) fn record_satb_locked(state: &mut GcState, old: *mut u8) {
 }
 
 /// Publish a concurrent-mark deletion (`old`) and new edge (`value`) into the
-/// cached cycle's shard buffers without the heap lock.
+/// calling mutator's shard buffer without the heap lock. Both are batched;
+/// the shared mark queue sees one publication per full buffer.
 /// Returns false when the caller must use the heap-locked path instead: no
 /// concurrent phase, a stale cache, or shards sealed by closure/remark. The
-/// validity checks run under the shard lock, and so does every queue
+/// validity checks run under the buffer lock, and so does every queue
 /// publication, so a seal's flush observes all of them.
 fn publish_marking_unlocked_in(
     owner: &crate::runtime::Runtime,
@@ -228,7 +229,10 @@ fn publish_marking_unlocked_in(
     let Some((generation, cycle)) = marking::cached_cycle_in(&owner.gc) else {
         return false;
     };
-    let _publication = cycle.termination.enter();
+    // No termination ownership per store: a buffered entry is not mark work
+    // yet. Election requires the stopped seal's drain, which either takes
+    // this entry or makes the sealed check below reject it; a full-buffer
+    // publication owns termination inside `enqueue_satb_batch`.
     cycle
         .satb_shards
         .with_current_in(
@@ -238,10 +242,13 @@ fn publish_marking_unlocked_in(
                     && !cycle.closing.load(Ordering::Acquire)
             },
             |buffer| {
+                // The new edge shares the deletion's private buffer: both are
+                // claimed in batches, and every seal/flush that drains
+                // deletions before closure or minor relocation drains them
+                // too. A store touches the shared mark queue once per full
+                // buffer instead of once per value.
                 buffer.record(old as usize, |values| cycle.enqueue_satb_batch(values));
-                if !value.is_null() {
-                    cycle.enqueue(value);
-                }
+                buffer.record(value as usize, |values| cycle.enqueue_satb_batch(values));
                 if std::ptr::eq(owner, crate::runtime::current())
                     && safepoint::current_thread_is_registered_in(&owner.gc)
                 {

@@ -22,7 +22,7 @@ fn assert_stopped_owners(coord: &super::GcCoord) {
     );
 }
 
-fn configured_capacity() -> usize {
+pub(super) fn configured_capacity() -> usize {
     capacity_from_setting(
         std::env::var("WILLOW_GC_SATB_BUFFER_ENTRIES")
             .ok()
