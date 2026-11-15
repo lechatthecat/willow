@@ -263,6 +263,12 @@ fn register_mutator_in(owner: &crate::runtime::Runtime) {
         "a thread must retire its previous mutator before changing runtime"
     );
     crate::gc_telemetry::observations::register_for_runtime(owner);
+    // The log's fixed storage counts toward the memory budget while it exists.
+    // Charge before taking coord: the charge may take the heap lock.
+    let charged = !mutator_log::is_bound_in(&owner.gc);
+    if charged {
+        super::account_fixed_external_in(&owner.gc, mutator_log::MutatorLog::BYTES);
+    }
     let (lock, _) = &owner.gc.coord;
     {
         let mut coord = lock.lock().unwrap();
@@ -270,6 +276,18 @@ fn register_mutator_in(owner: &crate::runtime::Runtime) {
         let record = coord.mutators.entry(id).or_default();
         let buffer = record.satb_buffer.get_or_insert_with(Default::default);
         SATB_BUFFER.with(|local| *local.borrow_mut() = Some(Arc::clone(buffer)));
+        let log = match coord.mutator_logs.entry(id) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                if charged {
+                    super::release_external_in(&owner.gc, mutator_log::MutatorLog::BYTES);
+                }
+                Arc::clone(entry.get())
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                Arc::clone(entry.insert(Arc::new(mutator_log::MutatorLog::new())))
+            }
+        };
+        mutator_log::bind(log);
         REGISTERED_EPOCH_CELL.set(&owner.gc.mutator_epoch);
         SERVED_EPOCH_CELL.set(if std::ptr::eq(owner, crate::runtime::current()) {
             &owner.gc.mutator_epoch
@@ -302,6 +320,8 @@ fn unregister_mutator_in(owner: &crate::runtime::Runtime) {
     );
     assist::reset();
     barrier::flush_satb_current_in(owner, true);
+    // Before leaving the registry: afterwards no stop would drain this log.
+    mutator_log::flush_current_in(owner);
     crate::generated_context::revoke_barrier_buffers();
     let id = std::thread::current().id();
     let (lock, cv) = &owner.gc.coord;
@@ -326,6 +346,10 @@ fn unregister_mutator_in(owner: &crate::runtime::Runtime) {
     crate::gc_telemetry::observations::unregister_for_runtime(owner);
     coord.mutators.remove(&id);
     coord.stw_pending.remove(&id);
+    if coord.mutator_logs.remove(&id).is_some() {
+        super::release_external_in(&owner.gc, mutator_log::MutatorLog::BYTES);
+    }
+    mutator_log::unbind();
     REGISTERED_EPOCH.set(0);
     REGISTERED_EPOCH_CELL.set(std::ptr::null());
     SERVED_EPOCH_CELL.set(std::ptr::null());
@@ -653,8 +677,10 @@ pub(crate) struct IdleMutator<'a> {
 impl IdleMutator<'static> {
     /// # Safety
     /// Until this guard is dropped, the caller must not access managed objects,
-    /// root slots, TLAB state, or SATB buffers, or call back into managed code.
-    /// It may only wait on native synchronization or OS calls. Relocation safety
+    /// root slots, TLAB state, SATB buffers or its mutator log (so no GC
+    /// diagnostic reader such as `willow_gc_remembered_set_size`, which
+    /// flushes that log while a stop may be draining it), or call back into
+    /// managed code. It may only wait on native synchronization or OS calls. Relocation safety
     /// is inherited from the caller; raw runtime references remain pinned.
     pub(crate) unsafe fn enter() -> Self {
         unsafe { Self::enter_in(crate::runtime::current()) }
@@ -835,6 +861,8 @@ pub(super) fn with_stw_in<R>(
         for published in coord.mutators.values_mut() {
             published.materialize();
         }
+        // Every logged edge and root registration precedes this stop.
+        mutator_log::drain_stopped(owner, &coord);
         collect(&coord, measurement.work())
     }));
     let collector_end = crate::gc_telemetry::timestamp_ns();

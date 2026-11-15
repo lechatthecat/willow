@@ -96,7 +96,7 @@ pub(super) fn remember_card(state: &mut GcState, owner_payload: usize, card: usi
 /// Remember an old owner with a young child stored at `slot` (null when the
 /// caller has no slot address): per card for a large reference-array buffer
 /// whose slot is known, otherwise as a whole owner.
-fn remember_store(state: &mut GcState, owner_payload: usize, slot: *mut u8) -> bool {
+pub(super) fn remember_store(state: &mut GcState, owner_payload: usize, slot: *mut u8) -> bool {
     if !slot.is_null()
         && let Some(card) = slot_card(owner_payload, slot as usize)
     {
@@ -107,7 +107,7 @@ fn remember_store(state: &mut GcState, owner_payload: usize, slot: *mut u8) -> b
 
 /// Card of `slot` when `owner_payload` is a card-remembered array buffer and
 /// `slot` is one of its element slots.
-fn slot_card(owner_payload: usize, slot: usize) -> Option<usize> {
+pub(super) fn slot_card(owner_payload: usize, slot: usize) -> Option<usize> {
     let owner = HeapObject::from_payload(GcPayload::from_raw(owner_payload as *mut u8)?);
     let capacity = super::remembered::card_array_capacity(owner)?;
     let first =
@@ -136,7 +136,7 @@ fn card_cache_hit(owner: usize, card: usize) -> Option<u64> {
         .then_some(epoch)
 }
 /// Call under the heap lock after the card was recorded.
-fn card_cache_fill(owner: usize, card: usize) {
+pub(super) fn card_cache_fill(owner: usize, card: usize) {
     let epoch = super::remembered::card_epoch();
     CARD_CACHE.with(|cache| cache[card_cache_index(owner, card)].set((owner, card, epoch)));
     crate::generated_context::set_remembered_card(owner, card, epoch);
@@ -476,6 +476,8 @@ pub(crate) fn write_barrier_in(
     // flagged as a GC payload start has a readable header; an old one cannot
     // create such an edge either (the inline filter trusts the same byte).
     let young_edge_possible = !value.is_null()
+        && !owner.is_null()
+        && destination_kind != GcStoreDestination::GlobalStatic as i64
         && gc.tlab_ever_allocated.load(Ordering::Acquire)
         && !(value_has_header
             && GcPayload::from_raw(value).is_some_and(|value| {
@@ -517,11 +519,30 @@ pub(crate) fn write_barrier_in(
         );
         return;
     }
+    // A registered mutator logs the generational record privately; the next
+    // stop applies it before any collector reads the remembered set. Only an
+    // unpublished marking store (which must enqueue under the heap lock) or an
+    // unregistered thread takes the shared lock below.
+    if young_edge_possible
+        && (published || !marking_active)
+        && super::mutator_log::record_edge_in(
+            runtime_owner,
+            owner,
+            slot,
+            value,
+            destination_kind,
+            owner_has_header && destination_kind != GcStoreDestination::IndirectReference as i64,
+            serves_thread(),
+        )
+    {
+        return;
+    }
     let _interval = crate::gc_telemetry::observations::Span::new_in(
         &runtime_owner.telemetry.observations,
         crate::gc_telemetry::observations::Kind::BarrierSlow,
     );
     let mut state = gc.heap.lock().unwrap();
+    super::mutator_log::count_shared_lock();
     if marking_active && !published {
         if serves_thread() {
             record_satb_locked(&mut state, old_value);
@@ -783,6 +804,17 @@ mod count_owner_tests {
                             | willow_abi::GC_STORE_VALUE_HAS_HEADER
                             | willow_abi::GC_STORE_OWNER_HAS_HEADER,
                     );
+                    // The registered mutator logs the edge privately.
+                    assert!(
+                        runtime_owner
+                            .gc
+                            .heap
+                            .lock()
+                            .unwrap()
+                            .remembered_set
+                            .is_empty()
+                    );
+                    super::super::mutator_log::flush_current_in(runtime_owner);
                     let state = runtime_owner.gc.heap.lock().unwrap();
                     assert_eq!(state.remembered_set.len(), 1);
                     assert!(state.remembered_set.contains(&(old as usize)));

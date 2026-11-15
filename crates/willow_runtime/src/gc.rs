@@ -46,6 +46,7 @@ use tlab::*;
 mod root;
 pub use root::*;
 mod barrier;
+mod mutator_log;
 pub use barrier::*;
 mod progress;
 pub use progress::{GcProgressV1, GcSkipReason, gc_progress, willow_gc_progress_v1};
@@ -766,6 +767,25 @@ fn charge_external_in(owner: &GcRuntime, bytes: usize) -> bool {
     pressure
 }
 
+/// Account fixed collector-owned storage (such as a mutator log) without an
+/// admission check: like retained regions it counts toward the budget but is
+/// never refused, so registering a mutator cannot fail on a tight cap.
+fn account_fixed_external_in(owner: &GcRuntime, bytes: usize) {
+    if charge_external_lock_free_in(owner, bytes) {
+        return;
+    }
+    owner
+        .native_accounting
+        .bytes
+        .fetch_add(bytes, Ordering::Relaxed);
+    let _ = owner
+        .headroom
+        .external
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |room| {
+            Some(room.saturating_sub(bytes))
+        });
+}
+
 pub(crate) fn release_external(bytes: usize) {
     release_external_in(runtime(), bytes);
 }
@@ -1158,6 +1178,9 @@ struct GcCoord {
     /// Registered mutators → writable root-slot addresses, valid only while
     /// the owner is parked. Empty until the first stop-the-world publication.
     mutators: HashMap<ThreadId, PublishedRoots>,
+    /// Lock-free edge and root-slot logs of registered mutators, drained at
+    /// the start of every stop (see `mutator_log`).
+    mutator_logs: HashMap<ThreadId, Arc<mutator_log::MutatorLog>>,
     /// A collector has requested all mutators to reach a safepoint and park.
     stop_requested: bool,
     /// Mutators with published roots at a safepoint or scheduler idle wait.
@@ -1198,6 +1221,8 @@ pub(crate) struct GcRuntime {
     /// headers; declared after `heap` so it outlives every header reference.
     layouts: layouts::Layouts,
     write_barrier_calls: AtomicU64,
+    /// Entries applied from mutator logs at stops (telemetry).
+    mutator_log_drained_entries: AtomicU64,
     /// Conservative nursery-presence gate: set before the first TLAB can
     /// publish an object, and cleared only by the quiescent runtime reset.
     /// Keeping it set after collection avoids racing a concurrent refill.
@@ -1285,6 +1310,7 @@ impl GcRuntime {
             heap: crate::gc_telemetry::observations::GcMutex::new(heap),
             layouts: layouts::Layouts::default(),
             write_barrier_calls: AtomicU64::new(0),
+            mutator_log_drained_entries: AtomicU64::new(0),
             tlab_ever_allocated: std::sync::atomic::AtomicBool::new(false),
             collect_lock: Mutex::new(()),
             root_stack_owner: Mutex::new(None),
@@ -3180,6 +3206,10 @@ fn reset_internal() {
     {
         let (lock, cv) = &runtime().coord;
         let mut coord = reset_lock(lock);
+        release_external_in(
+            runtime(),
+            coord.mutator_logs.len() * mutator_log::MutatorLog::BYTES,
+        );
         *coord = GcCoord::default();
         safepoint::invalidate_mutator_registrations();
         invalidate_runtime_policy_budgets();

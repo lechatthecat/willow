@@ -4,7 +4,7 @@ use super::{GcLatencyV1, timestamp_ns};
 use std::cell::Cell;
 use std::sync::Mutex;
 
-pub const COMPONENTS: usize = 6;
+pub const COMPONENTS: usize = 7;
 #[repr(usize)]
 #[derive(Clone, Copy, Debug)]
 pub enum Component {
@@ -14,6 +14,8 @@ pub enum Component {
     Evacuation,
     Metadata,
     Wakeup,
+    /// Applying mutator-private edge and root-slot logs at stop entry.
+    RememberedLog,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -290,7 +292,7 @@ mod tests {
         a.switch(Component::Metadata, 170);
         a.switch(Component::Wakeup, 190);
         a.switch(Component::Metadata, 200);
-        assert_eq!(a.sample.ns, [10, 30, 5, 25, 20, 10]);
+        assert_eq!(a.sample.ns, [10, 30, 5, 25, 20, 10, 0]);
         assert_eq!(a.sample.ns.iter().sum::<u64>(), 100);
     }
 
@@ -310,7 +312,7 @@ mod tests {
                 }
             );
             assert_eq!(s.last.aborted, reason == 4);
-            assert_eq!(s.last.ns, [20, 0, 0, 0, 0, 0]);
+            assert_eq!(s.last.ns, [20, 0, 0, 0, 0, 0, 0]);
         }
         for cause in owner.snapshot().by_reason {
             assert!(cause.iter().all(|h| h.count == 1));

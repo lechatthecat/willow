@@ -326,7 +326,12 @@ pub(crate) fn add_runtime_root_slot_in(owner: &crate::runtime::Runtime, slot: *m
         cycle.enqueue(unsafe { *slot });
     }
     RuntimePathObservation::root_slot_registration(|| &owner.gc.path_observation);
-    owner.gc.runtime_root_slots.add(slot.cast());
+    // A registered mutator logs the registration without a shared lock; the
+    // next stop applies it before any root snapshot or slot rewrite.
+    if !mutator_log::record_root_in(owner, slot as usize, 1) {
+        mutator_log::count_shared_lock();
+        owner.gc.runtime_root_slots.adjust(slot.cast(), 1);
+    }
 }
 
 /// Stop retaining the referent of a slot registered with
@@ -347,7 +352,12 @@ pub(crate) fn remove_runtime_root_slot_in(owner: &crate::runtime::Runtime, slot:
         .then(|| owner.gc.coord.0.lock().unwrap());
     // SAFETY: the slot stays valid until this removal returns.
     barrier::satb_delete_in(owner, unsafe { *slot });
-    owner.gc.runtime_root_slots.remove(slot.cast());
+    // The registration may sit in another worker's log after its task moved;
+    // signed deltas let the two halves meet in the shared set in any order.
+    if !mutator_log::record_root_in(owner, slot as usize, -1) {
+        mutator_log::count_shared_lock();
+        owner.gc.runtime_root_slots.adjust(slot.cast(), -1);
+    }
 }
 
 fn legacy_owner_is_current(gc: &GcRuntime) -> bool {
@@ -477,7 +487,17 @@ pub(super) fn foreign_root_stack_owner_active_locked_in(
 /// root it took, instead of only checking that the program printed the right
 /// text.
 pub fn runtime_root_count() -> usize {
-    runtime().runtime_roots.len() + runtime().runtime_root_slots.len()
+    runtime_root_count_in(runtime())
+}
+
+/// Address roots plus live slot registrations, including registrations still
+/// held in mutator logs. Exact when no mutator is concurrently adding or
+/// removing slots; otherwise in-flight log deltas make the slot part an
+/// approximation (see `net_root_slots`), clamped at zero because a read can
+/// see a migrated remove without its add.
+pub(crate) fn runtime_root_count_in(owner: &GcRuntime) -> usize {
+    let slots = mutator_log::net_root_slots(owner);
+    owner.runtime_roots.len() + slots.max(0).unsigned_abs()
 }
 
 /// Values of every runtime-held root: address-registered runtime roots,

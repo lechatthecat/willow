@@ -19,6 +19,9 @@ pub(crate) fn telemetry_heap_snapshot() -> (
     crate::gc_telemetry::GcHeapV1,
 ) {
     use crate::gc_telemetry::{GcCountersV1, GcHeapV1};
+    // This thread's logged edges are visible now; other mutators' logs apply
+    // at the next stop.
+    mutator_log::flush_current_in(crate::runtime::current());
     let mut state = runtime().heap.lock().unwrap_or_else(|p| p.into_inner());
     sync_tlab_accounting(&mut state);
     let old_reserved = state.old_reserved_bytes as u64;
@@ -335,18 +338,21 @@ fn saturating_i64(value: u64) -> i64 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_remembered_set_size() -> i64 {
+    mutator_log::flush_current_in(crate::runtime::current());
     runtime().heap.lock().unwrap().remembered_set.len() as i64
 }
 
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_dirty_card_count() -> i64 {
+    mutator_log::flush_current_in(crate::runtime::current());
     runtime().heap.lock().unwrap().dirty_cards.len() as i64
 }
 
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_write_barrier_hits() -> i64 {
+    mutator_log::flush_current_in(crate::runtime::current());
     runtime().heap.lock().unwrap().write_barrier_hits as i64
 }
 

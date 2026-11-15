@@ -6,7 +6,9 @@ const SHARD_COUNT: usize = 32;
 struct Roots {
     // The map is only an index; snapshots never enumerate retained buckets.
     indices: IdMap<usize, usize>,
-    entries: Vec<(usize, usize)>, // (address, owner count)
+    // (address, owner count). Only `adjust` may leave a count negative: a
+    // logged removal can be applied before the matching logged addition.
+    entries: Vec<(usize, isize)>,
     pending_indices: IdMap<usize, usize>,
     pending: Vec<usize>,
 }
@@ -22,11 +24,26 @@ impl Roots {
     }
 
     fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.iter().filter(|&&(_, count)| count > 0).count()
     }
 
     fn addresses(&self) -> impl Iterator<Item = usize> + '_ {
-        self.entries.iter().map(|&(address, _)| address)
+        self.entries
+            .iter()
+            .filter(|&&(_, count)| count > 0)
+            .map(|&(address, _)| address)
+    }
+
+    fn net(&self) -> isize {
+        self.entries.iter().map(|&(_, count)| count).sum()
+    }
+
+    fn remove_entry(&mut self, address: usize, index: usize) {
+        self.indices.remove(&address);
+        self.entries.swap_remove(index);
+        if let Some(&(moved, _)) = self.entries.get(index) {
+            *self.indices.get_mut(&moved).unwrap() = index;
+        }
     }
 }
 
@@ -58,9 +75,13 @@ impl RuntimeRootSet {
             return;
         }
         let root = object as usize;
+        super::mutator_log::count_shared_lock();
         let mut roots = self.shards[Self::shard_index(root)].lock().unwrap();
         if let Some(&index) = roots.indices.get(&root) {
             roots.entries[index].1 += 1;
+            if roots.entries[index].1 == 0 {
+                roots.remove_entry(root, index);
+            }
         } else {
             let index = roots.entries.len();
             roots.entries.push((root, 1));
@@ -78,18 +99,48 @@ impl RuntimeRootSet {
             return;
         }
         let root = object as usize;
+        super::mutator_log::count_shared_lock();
         let mut roots = self.shards[Self::shard_index(root)].lock().unwrap();
-        if let Some(&index) = roots.indices.get(&root) {
+        if let Some(&index) = roots.indices.get(&root)
+            && roots.entries[index].1 > 0
+        {
             if roots.entries[index].1 > 1 {
                 roots.entries[index].1 -= 1;
             } else {
-                roots.indices.remove(&root);
-                roots.entries.swap_remove(index);
-                if let Some(&(moved, _)) = roots.entries.get(index) {
-                    *roots.indices.get_mut(&moved).unwrap() = index;
-                }
+                roots.remove_entry(root, index);
             }
         }
+    }
+
+    /// Apply a signed registration delta. Unlike `remove`, a removal of an
+    /// absent address is kept as a negative count: registrations logged on
+    /// different threads may be applied in either order, and only their sum
+    /// is meaningful. Entries with a nonpositive count are never enumerated.
+    pub(super) fn adjust(&self, object: *mut u8, delta: isize) {
+        self.adjust_then(object, delta, || {});
+    }
+
+    /// [`Self::adjust`], then `applied` inside the same shard critical
+    /// section, so a reader holding every shard lock ([`Self::net_with`])
+    /// sees the adjustment and `applied`'s effect together or not at all.
+    pub(super) fn adjust_then(&self, object: *mut u8, delta: isize, applied: impl FnOnce()) {
+        if object.is_null() || delta == 0 {
+            applied();
+            return;
+        }
+        let root = object as usize;
+        let mut roots = self.shards[Self::shard_index(root)].lock().unwrap();
+        if let Some(&index) = roots.indices.get(&root) {
+            roots.entries[index].1 += delta;
+            if roots.entries[index].1 == 0 {
+                roots.remove_entry(root, index);
+            }
+        } else {
+            let index = roots.entries.len();
+            roots.entries.push((root, delta));
+            roots.indices.insert(root, index);
+        }
+        applied();
     }
 
     /// Reclamation, unlike root removal, ends an owner's scan obligation.
@@ -112,6 +163,12 @@ impl RuntimeRootSet {
                 visit(root);
             }
         }
+    }
+
+    /// Hold every shard, for tests proving a path takes none of them.
+    #[cfg(test)]
+    pub(super) fn hold_all_for_test(&self) -> impl Sized + '_ {
+        self.lock_all()
     }
 
     fn lock_all(&self) -> [MutexGuard<'_, Roots>; SHARD_COUNT] {
@@ -154,6 +211,19 @@ impl RuntimeRootSet {
 
     pub(super) fn len(&self) -> usize {
         self.lock_all().iter().map(|shard| shard.len()).sum()
+    }
+
+    /// Sum of all signed registration counts.
+    #[cfg(test)]
+    pub(super) fn net(&self) -> isize {
+        self.net_with(|| 0)
+    }
+
+    /// Net registrations in the shards plus `pending`, read while every
+    /// shard lock is held so no [`Self::adjust_then`] is half-observed.
+    pub(super) fn net_with(&self, pending: impl FnOnce() -> isize) -> isize {
+        let shards = self.lock_all();
+        shards.iter().map(|shard| shard.net()).sum::<isize>() + pending()
     }
 
     #[cfg(test)]
@@ -283,8 +353,8 @@ mod tests {
                     guards
                         .iter()
                         .flat_map(|shard| shard.entries.iter().map(|&(_, count)| count))
-                        .sum::<usize>(),
-                    distinct * 4
+                        .sum::<isize>(),
+                    (distinct * 4) as isize
                 );
                 drop(guards);
                 let mut actual: Vec<_> = roots.snapshot().into_iter().map(|p| p as usize).collect();
@@ -404,7 +474,7 @@ mod tests {
                     .lock_all()
                     .iter()
                     .flat_map(|shard| shard.entries.iter().map(|&(_, count)| count))
-                    .all(|count| count == WORKERS)
+                    .all(|count| count == WORKERS as isize)
             );
             barrier.wait();
             for _ in 0..32 {

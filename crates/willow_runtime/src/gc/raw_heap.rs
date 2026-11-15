@@ -324,6 +324,17 @@ impl Object {
         }
     }
 
+    /// Set the remembered byte if it was clear. Exactly one of any number of
+    /// racing callers wins, which deduplicates lock-free edge logging.
+    pub(super) fn try_claim_remembered(self) -> bool {
+        // SAFETY: as in `remembered`.
+        unsafe {
+            AtomicU8::from_ptr(&raw mut (*self.as_ptr()).remembered)
+                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        }
+    }
+
     pub(super) fn set_generation(self, generation: u8) {
         // SAFETY: collection has exclusive access while mutators are stopped.
         unsafe {
