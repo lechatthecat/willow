@@ -293,6 +293,7 @@ fn overlap_satb_deletions_parked_mutators_and_old_descendants_survive_sweep() {
             for thread in threads {
                 thread.join().unwrap();
             }
+            crate::gc::preemption_tolerant_remark_budget_for_test();
             let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
             sweep::concurrent(plan);
             for (index, leaf) in leaves.into_iter().enumerate() {
@@ -350,6 +351,7 @@ fn overlap_native_async_frame_and_marker_pool_pause_resume() {
     assert_ne!(frame.load_gc(0), young);
     frame.store_gc(0, std::ptr::null_mut());
     collect_owned();
+    crate::gc::preemption_tolerant_remark_budget_for_test();
     let closed = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
     sweep::concurrent(closed.1);
     drop(pool);
@@ -377,6 +379,7 @@ fn overlap_phase_requests_and_remark_election_keep_epoch_ownership_distinct() {
             cycle.closing.store(true, Ordering::Release);
         }
         if phase == "sweep" {
+            crate::gc::preemption_tolerant_remark_budget_for_test();
             let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
             assert!(runtime().heap.lock().unwrap().sweeping.is_some());
             runtime().minor_pending.store(true, Ordering::Release);
@@ -422,6 +425,7 @@ fn overlap_post_snapshot_tlab_black_allocation_survives_minor_and_old_sweep() {
     };
     assert_ne!(survivor, young);
     assert!(cycle.is_marked(survivor as usize));
+    crate::gc::preemption_tolerant_remark_budget_for_test();
     let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
     sweep::concurrent(plan);
     assert_eq!(unsafe { *survivor.cast::<i64>() }, 12345);
@@ -558,6 +562,7 @@ fn post_snapshot_extent_publications_do_not_build_per_object_pending_sets() {
         );
         cycle.drain(usize::MAX);
         assert_eq!(cycle.objects.marked_count(), count);
+        crate::gc::preemption_tolerant_remark_budget_for_test();
         let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
         sweep::concurrent(plan);
         {
@@ -609,6 +614,7 @@ fn overlap_minor_inline_credit_publishes_old_descendants() {
         cycle.drain(usize::MAX);
         assert!(cycle.is_marked(old_leaf as usize));
         assert!(cycle.queue.snapshot().is_drained());
+        crate::gc::preemption_tolerant_remark_budget_for_test();
         let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
         sweep::concurrent(plan);
         {

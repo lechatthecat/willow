@@ -3370,12 +3370,12 @@ fn t9ha4_23_run_until_returns_when_the_sleeping_target_completes() {
 #[test]
 fn t9ha4_24_cancelling_a_sleeper_clears_its_deadline_and_the_drive_terminates() {
     let _guard = isolated_runtime();
+    let single = single_worker_for_test();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
-    let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    let id = willow_sched_spawn(poll_long_sleep_then_ready, frame);
-    // A short bounded drive gives it its first poll — which parks it on a
-    // 2s deadline — and returns without waiting that sleep out.
+    let id = spawn_parked_long_sleeper(&single);
+    // A short bounded drive finds nothing ready and returns at its deadline
+    // without waiting the 2s sleep out.
     assert_eq!(
         willow_sched_run_until_deadline(willow_monotonic_millis() + 30),
         0
@@ -3410,10 +3410,10 @@ fn t9ha4_25_drive_deadline_still_wins_over_a_far_off_sleeper() {
     // The idle wait is computed from the timer queue; clamping it to the
     // caller's deadline must survive the move to the separate lock.
     let _guard = isolated_runtime();
+    let single = single_worker_for_test();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
-    let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    let id = willow_sched_spawn(poll_long_sleep_then_ready, frame);
+    let id = spawn_parked_long_sleeper(&single);
 
     let start = Instant::now();
     assert_eq!(
@@ -3581,6 +3581,31 @@ unsafe extern "C" fn poll_long_sleep_then_ready(frame: *mut c_void) -> i32 {
     }
 }
 
+/// Spawn a `poll_long_sleep_then_ready` task and give it its first poll, so it
+/// is parked on its 2s timer when this returns.
+///
+/// A deadline-bounded drive cannot do this reliably: it checks its deadline
+/// before claiming work, and the drive runs on the runtime's worker threads.
+/// When those threads are not scheduled within the deadline (a loaded CI
+/// host, or a fresh test runtime still starting its pool) the drive
+/// correctly returns without polling and the task stays `Ready`. Instead,
+/// drive until a marker spawned after the sleeper completes: one worker pops
+/// the FIFO global queue, so the sleeper is always polled first, and the
+/// target-bounded drive returns once the marker is done without waiting on
+/// the sleeper's timer. The single-worker lease must be installed before the
+/// scheduler reset so the run queues are sized for that worker.
+fn spawn_parked_long_sleeper(_single: &SingleWorkerForTest) -> u64 {
+    assert_eq!(runtime_worker_config().active_workers(), 1);
+    let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+    let sleeper = willow_sched_spawn(poll_long_sleep_then_ready, frame);
+    let marker = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    assert_eq!(willow_sched_run_until(marker), 1);
+    assert_eq!(willow_sched_task_state(marker), -1);
+    assert_eq!(willow_sched_task_state(sleeper), 2, "the sleeper is parked");
+    assert_eq!(global_timers().len(), 1, "on its 2s timer");
+    sleeper
+}
+
 #[test]
 fn deadline_01_empty_scheduler_returns_immediately() {
     // The deadline is a CEILING, not a sleep: with nothing to run the drive
@@ -3622,10 +3647,10 @@ fn deadline_03_run_returns_at_deadline_not_after_long_task() {
     // The bug this guards: an unbounded `willow_sched_run` inside sync
     // select drains a 2s task before ever re-checking a 30ms timeout.
     let _guard = isolated_runtime();
+    let single = single_worker_for_test();
     reset_internal_for_test();
     reset_global_scheduler_for_test();
-    let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    let long = willow_sched_spawn(poll_long_sleep_then_ready, frame);
+    let long = spawn_parked_long_sleeper(&single);
     let start = Instant::now();
     willow_sched_run_until_deadline(willow_monotonic_millis() + 30);
     let elapsed = start.elapsed();

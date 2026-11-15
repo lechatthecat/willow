@@ -355,8 +355,9 @@ async fn main() {
 
 #[test]
 fn array_reference_store_sites_match_scalar_store_runtime_calls() {
-    // Count relocation targets for 1/8/32 store sites of `Array<i64>` and
-    // `Array<Node>`. The reference store must add exactly the per-site calls
+    // Count relocation targets and inline context reads (the per-site
+    // mark-phase byte load through the pinned context's gate cell) for 1/8/32
+    // store sites of `Array<i64>` and `Array<Node>`. The reference store must add exactly the per-site calls
     // of the i64 store (its cold `willow_array_set` slow path) plus one cold
     // barrier call and one mark-phase load: no extra root pair and no hot
     // panic-depth bracket. The loaded array temporaries of successive sites
@@ -369,7 +370,7 @@ fn array_reference_store_sites_match_scalar_store_runtime_calls() {
         "inline_panic_depth",
         "willow_array_set",
         "willow_gc_array_write_barrier",
-        "willow_gc_mark_phase",
+        "inline_mark_phase",
     ];
     let counts = |element: &str, array: &str, value: &str, sites: usize| {
         let source = format!(

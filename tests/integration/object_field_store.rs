@@ -212,7 +212,9 @@ async fn main() {
 
 #[test]
 fn object_field_store_sites_add_one_cold_barrier_and_phase_load_each() {
-    // Count relocation targets for 1/8/32 store sites. A reference field
+    // Count relocation targets and inline context reads (the per-site
+    // mark-phase byte load through the pinned context's gate cell) for
+    // 1/8/32 store sites. A reference field
     // store adds exactly one cold barrier call and one mark-phase load per
     // site relative to an i64 field store, and no root or panic bracket. A
     // static (global) store keeps one unconditional barrier call and never
@@ -222,7 +224,7 @@ fn object_field_store_sites_add_one_cold_barrier_and_phase_load_each() {
         "root_pop",
         "inline_panic_depth",
         "willow_gc_write_barrier",
-        "willow_gc_mark_phase",
+        "inline_mark_phase",
     ];
     let counts = |body: &str, sites: usize| {
         let source = format!(

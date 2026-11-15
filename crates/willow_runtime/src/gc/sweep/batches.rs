@@ -1155,6 +1155,7 @@ mod tests {
 
     fn closed_cursor() -> Cursor {
         let (_, cycle) = root_handshake::begin().unwrap();
+        crate::gc::preemption_tolerant_remark_budget_for_test();
         let (_, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
         Cursor::new(plan)
     }

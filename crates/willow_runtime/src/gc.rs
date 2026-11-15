@@ -3257,6 +3257,22 @@ pub fn reset_internal_for_test() {
         .store(0, Ordering::Relaxed);
 }
 
+/// Give this runtime's remark stops a 100ms wall-clock work budget until the
+/// next [`reset_internal_for_test`], instead of the 1ms default.
+///
+/// A remark stop that exceeds its work budget correctly abandons the
+/// concurrent closure for the stopped fallback, so `mark_closure::finish`
+/// returns `None`. A test that requires the concurrent closure to succeed
+/// must not depend on the collector thread staying scheduled for a whole
+/// millisecond: a preempted CI runner exceeds that without any GC fault.
+#[cfg(test)]
+pub(crate) fn preemption_tolerant_remark_budget_for_test() {
+    runtime()
+        .remark_observation
+        .work_ns
+        .store(100_000_000, Ordering::Relaxed);
+}
+
 /// A fresh, empty generated-TLS block for tests in sibling modules that need a
 /// YOUNG object: `willow_gc_alloc_slow` is the only runtime entry that allocates
 /// into the nursery, every `willow_alloc_*` helper goes straight to the old

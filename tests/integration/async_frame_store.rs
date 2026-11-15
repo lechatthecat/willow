@@ -65,7 +65,9 @@ fn async_frame_store_example_passes_barrier_verification() {
 
 #[test]
 fn async_frame_store_sites_add_one_cold_barrier_and_phase_load_each() {
-    // Count relocation targets for 1/8/32 frame store sites. Each site stores
+    // Count relocation targets and inline context reads (the per-site
+    // mark-phase byte load through the pinned context's gate cell) for 1/8/32
+    // frame store sites. Each site stores
     // a local that lives across an await, so the store goes to the frame.
     // Reference stores add a constant number of filtered barrier sites per
     // source site relative to an i64 store, and no root or panic bracket.
@@ -74,7 +76,7 @@ fn async_frame_store_sites_add_one_cold_barrier_and_phase_load_each() {
         "root_pop",
         "inline_panic_depth",
         "willow_gc_write_barrier",
-        "willow_gc_mark_phase",
+        "inline_mark_phase",
     ];
     let counts = |init: &str, body: &str, result: &str, sites: usize| {
         let source = format!(

@@ -57,27 +57,51 @@ pub(super) fn sink_cold_regions(func: &mut Function) {
         func.layout.set_cold(block);
     }
     if *crate::diagnostic_settings::PANIC_DEPTH_LOAD_LOG {
+        use cranelift_codegen::ir::{InstructionData, Opcode, Value, ValueDef};
+        // Offset of a load from the pinned generated context, if `inst` is one.
+        let context_load = |inst| match func.dfg.insts[inst] {
+            InstructionData::Load {
+                opcode: Opcode::Load,
+                arg,
+                offset,
+                ..
+            } => match func.dfg.value_def(arg) {
+                ValueDef::Result(def, _)
+                    if func.dfg.insts[def].opcode() == Opcode::GetPinnedReg =>
+                {
+                    Some(i32::from(offset))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let defined_by_context_load = |value: Value| match func.dfg.value_def(value) {
+            ValueDef::Result(def, _) => context_load(def),
+            _ => None,
+        };
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
-                if let cranelift_codegen::ir::InstructionData::Load { offset, .. } =
-                    func.dfg.insts[inst]
-                {
-                    let address = func.dfg.inst_args(inst)[0];
-                    if let cranelift_codegen::ir::ValueDef::Result(def, _) =
-                        func.dfg.value_def(address)
-                        && func.dfg.insts[def].opcode()
-                            == cranelift_codegen::ir::Opcode::GetPinnedReg
-                    {
-                        match i32::from(offset) {
-                            willow_abi::generated_context::PANIC_DEPTH_OFFSET => {
-                                eprintln!("[panic-depth-load]")
-                            }
-                            willow_abi::generated_context::GC_STOP_OFFSET => {
-                                eprintln!("[sync-gate-load]")
-                            }
-                            _ => {}
-                        }
+                match context_load(inst) {
+                    Some(willow_abi::generated_context::PANIC_DEPTH_OFFSET) => {
+                        eprintln!("[panic-depth-load]")
                     }
+                    Some(willow_abi::generated_context::GC_STOP_OFFSET) => {
+                        eprintln!("[sync-gate-load]")
+                    }
+                    _ => {}
+                }
+                // The mark-phase cell pointer is read from the context once per
+                // function; each store site then atomically loads the phase
+                // byte through it. Report those per-site phase loads.
+                if let InstructionData::LoadNoOffset {
+                    opcode: Opcode::AtomicLoad,
+                    arg,
+                    ..
+                } = func.dfg.insts[inst]
+                    && defined_by_context_load(arg)
+                        == Some(willow_abi::generated_context::MARK_PHASE_OFFSET)
+                {
+                    eprintln!("[mark-phase-load]")
                 }
             }
         }

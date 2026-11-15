@@ -635,6 +635,7 @@ fn collect_codegen_events(
                 .filter_map(|line| match line {
                     "[panic-depth-load]" => Some("inline_panic_depth"),
                     "[sync-gate-load]" => Some("inline_sync_gate"),
+                    "[mark-phase-load]" => Some("inline_mark_phase"),
                     "[indirect-leaf-expand]" => Some("indirect_leaf_expand"),
                     _ => None,
                 })

@@ -1078,6 +1078,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/panic_effect_self_dispatch.wi",
             "recovered:child hook\nafter\n",
         ),
+        ("example/panic_allocation_contracts.wi", "42\n"),
         (
             "example/shared_ast_walk.wi",
             concat!(
@@ -1816,6 +1817,17 @@ fn test_recent_cli_and_language_examples() {
         assert!(ok, "{path} failed to compile or run");
         assert_eq!(out, *expected, "{path} output mismatch");
     }
+}
+
+#[test]
+fn test_panic_allocation_contracts_example() {
+    let (path, expected) = runnable_example_cases()
+        .iter()
+        .find(|(path, _)| *path == "example/panic_allocation_contracts.wi")
+        .expect("panic allocation contracts example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected);
 }
 
 #[test]

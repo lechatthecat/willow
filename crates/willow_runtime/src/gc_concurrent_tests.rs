@@ -2242,6 +2242,7 @@ fn array_shrink_between_slices_preserves_unscanned_deleted_references() {
         assert_eq!(crate::array::willow_array_pop(array), deleted as i64);
     }
     drop(consumer);
+    crate::gc::preemption_tolerant_remark_budget_for_test();
     let (_, plan) =
         mark_closure::finish(&cycle, Instant::now()).expect("native slices close concurrently");
     assert!(cycle.is_marked(deleted as usize));
@@ -2532,6 +2533,7 @@ fn satb_phase_flip_stops_owners_before_activation_and_remark() {
         while !deleted.load(Ordering::Acquire) {
             std::thread::yield_now();
         }
+        crate::gc::preemption_tolerant_remark_budget_for_test();
         let (_, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
         assert_eq!(
             crate::runtime::current()
@@ -2909,6 +2911,7 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
             std::thread::yield_now();
         }
         assert!(cycle.queue.snapshot().is_drained());
+        crate::gc::preemption_tolerant_remark_budget_for_test();
         let finished = mark_closure::finish(&cycle, Instant::now());
         assist.join().unwrap();
         assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
@@ -3263,6 +3266,7 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
     while !ready.load(Ordering::Acquire) {
         std::thread::yield_now();
     }
+    crate::gc::preemption_tolerant_remark_budget_for_test();
     let (work, plan) = mark_closure::finish(&cycle, Instant::now()).expect("normal closure");
     producer.join().unwrap();
     assert_eq!(work.marked_bytes, 3 * (GC_HEADER_SIZE + 8) as u64);
@@ -5745,6 +5749,7 @@ fn reference_array_growth_during_marking_preserves_copied_edges() {
         }
         let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
         crate::array::willow_array_push(array, old as i64);
+        crate::gc::preemption_tolerant_remark_budget_for_test();
         let (_, plan) = mark_closure::finish(&cycle, Instant::now())
             .expect("native array tracing closes concurrently");
         assert!(cycle.is_marked(old as usize));

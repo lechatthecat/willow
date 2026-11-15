@@ -1993,6 +1993,7 @@ fn region_cache_05_concurrent_sweep_retains_released_storage() {
     reset_internal_for_test();
     let before = allocate_dead_regions();
     let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
+    crate::gc::preemption_tolerant_remark_budget_for_test();
     let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now())
         .expect("an unrooted heap closes concurrently");
     sweep::concurrent(plan);

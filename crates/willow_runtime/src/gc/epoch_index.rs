@@ -741,6 +741,9 @@ mod tests {
         let _test = isolated_runtime();
         for _ in 0..32 {
             reset_internal_for_test();
+            // Thirty-two remark stops per run: a preempted 1ms stop would
+            // take the stopped fallback this test does not exercise.
+            crate::gc::preemption_tolerant_remark_budget_for_test();
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
             let collector = cycle_wait::CollectorGuard::try_acquire().unwrap();
             let mut root = willow_alloc_typed(8, 1);
@@ -844,6 +847,7 @@ mod tests {
         );
         cycle.publish_late(late);
         assert!(cycle.unindexed.lock().unwrap().is_empty());
+        crate::gc::preemption_tolerant_remark_budget_for_test();
         let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
         assert!(cycle.is_marked(late_root as usize));
         sweep::concurrent(plan);
@@ -906,6 +910,7 @@ mod tests {
         };
         assert!(!cycle.objects.contains_extent(chunk_base));
         assert!(cycle.objects.retains_allocated(young as usize));
+        crate::gc::preemption_tolerant_remark_budget_for_test();
         let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
         sweep::concurrent(plan);
         let object = HeapObject::from_payload(GcPayload::from_raw(young).unwrap());
@@ -958,6 +963,7 @@ mod tests {
         assert!(cycle.unindexed.lock().unwrap().contains(&(child as usize)));
         cycle.publish_late(late);
         assert!(cycle.unindexed.lock().unwrap().is_empty());
+        crate::gc::preemption_tolerant_remark_budget_for_test();
         let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
         assert!(cycle.is_marked(child as usize));
         sweep::concurrent(plan);

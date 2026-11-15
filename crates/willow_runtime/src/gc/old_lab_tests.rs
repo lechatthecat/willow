@@ -111,6 +111,7 @@ fn buffer_allocations_survive_mark_closure_and_a_pending_sweep() {
             let mut consumer = cycle.queue.register_assist();
             while cycle.drain_worker(64, &mut Vec::new(), &mut consumer).0 > 0 {}
             drop(consumer);
+            crate::gc::preemption_tolerant_remark_budget_for_test();
             let (_, plan) =
                 mark_closure::finish(&cycle, Instant::now()).expect("closes concurrently");
             assert_eq!(local_pending_for_test(), 0, "closure retires every buffer");
