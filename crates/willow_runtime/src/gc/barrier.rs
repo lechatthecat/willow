@@ -196,7 +196,10 @@ pub(super) fn record_satb_locked(state: &mut GcState, old: *mut u8) {
     } = state;
     if let Some(cycle) = concurrent_cycle {
         let _publication = cycle.termination.enter();
-        if cycle.closing.load(Ordering::Acquire) {
+        // Revoked private publication (closure before its first stopped seal,
+        // or recovery) publishes directly; a reopened closing epoch buffers
+        // here like concurrent marking and its recheck stop flushes these.
+        if cycle.buffers_revoked.load(Ordering::Acquire) {
             cycle.enqueue(old);
             return;
         }
@@ -213,9 +216,12 @@ pub(super) fn record_satb_locked(state: &mut GcState, old: *mut u8) {
 /// calling mutator's shard buffer without the heap lock. Both are batched;
 /// the shared mark queue sees one publication per full buffer.
 /// Returns false when the caller must use the heap-locked path instead: no
-/// concurrent phase, a stale cache, or shards sealed by closure/remark. The
-/// validity checks run under the buffer lock, and so does every queue
-/// publication, so a seal's flush observes all of them.
+/// concurrent phase, a stale cache, private publication revoked, or shards
+/// sealed by closure/remark. Closing stores after the first stopped seal
+/// reopened the shards publish here too; every recheck stop reseals and
+/// drains these buffers before electing termination. The validity checks run
+/// under the buffer lock, and so does every queue publication, so a seal's
+/// flush observes all of them.
 fn publish_marking_unlocked_in(
     owner: &crate::runtime::Runtime,
     old: *mut u8,
@@ -239,7 +245,7 @@ fn publish_marking_unlocked_in(
             &owner.gc,
             || {
                 owner.gc.assist_cycle_generation.load(Ordering::Acquire) == generation
-                    && !cycle.closing.load(Ordering::Acquire)
+                    && !cycle.buffers_revoked.load(Ordering::Acquire)
             },
             |buffer| {
                 // The new edge shares the deletion's private buffer: both are
@@ -253,7 +259,7 @@ fn publish_marking_unlocked_in(
                     && safepoint::current_thread_is_registered_in(&owner.gc)
                 {
                     crate::generated_context::set_barrier_buffer(
-                        buffer.admit_inline(&cycle.closing),
+                        buffer.admit_inline(&cycle.buffers_revoked),
                     );
                 }
             },
@@ -320,8 +326,11 @@ pub(super) fn flush_satb_current_in(owner: &crate::runtime::Runtime, retire: boo
     if phase == 1
         && let Some((generation, cycle)) = marking::cached_cycle_in(&owner.gc)
     {
-        let _publication = cycle.termination.enter();
         // Flush only this mutator's buffer; closure seals all registrations.
+        // Entries stay in the locked buffer until `enqueue_satb_batch`
+        // returns, and it owns termination for claimable values itself. An
+        // empty or fully marked buffer therefore takes no ownership and does
+        // not advance the termination generation at every safepoint.
         cycle.satb_shards.with_current_in(
             &owner.gc,
             || owner.gc.assist_cycle_generation.load(Ordering::Acquire) == generation,

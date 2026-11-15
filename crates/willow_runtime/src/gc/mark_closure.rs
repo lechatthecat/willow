@@ -145,12 +145,23 @@ impl Drop for WaveRecorder<'_> {
 // scan worker slots or mutator buffers. Ownership covers pre-enqueue claims,
 // root enumeration and metadata merges after the last queue item completes.
 fn request_remark(cycle: &ConcurrentCycle) -> bool {
+    request_remark_with(cycle, cycle.satb_shards.is_drained())
+}
+
+/// Optimistic election while mutators run. The first stopped seal reopened
+/// private publication, so shards are not drained here; the recheck stop
+/// reseals them and elects again with [`request_remark`] before completion.
+fn request_remark_candidate(cycle: &ConcurrentCycle) -> bool {
+    request_remark_with(cycle, true)
+}
+
+fn request_remark_with(cycle: &ConcurrentCycle, sources_sealed: bool) -> bool {
     let generation = cycle.termination.sample();
     let publication = cycle.queue.publication_generation();
     cycle.termination.request(
         generation,
         cycle.closing.load(Ordering::Acquire)
-            && cycle.satb_shards.is_drained()
+            && sources_sealed
             && cycle.queue.current_epoch() == cycle.mark_epoch
             && cycle.queue.snapshot().is_drained()
             && cycle.active_drains.load(Ordering::Acquire) == 0
@@ -207,54 +218,7 @@ fn finish_with_policy_in(
 ) -> Option<(crate::gc_telemetry::MarkWork, sweep::SweepPlan)> {
     #[cfg(not(any(test, feature = "gc-notification-prototype")))]
     let _ = notification;
-    // Owners continue publishing their own buffers at safepoints/unregister.
-    // Closing redirects later heap-locked deletion publications to the queue;
-    // foreign buffers are inspected only at the stopped COORD boundary below.
-    cycle.closing.store(true, Ordering::Release);
-    // Preserve the first-slice stopped boundary, with no buffered graph work.
-    cycle
-        .phase
-        .lock()
-        .unwrap()
-        .transition(old_cycle::Phase::RemarkRequested);
-    let transferred = safepoint::with_stw_in(
-        owner,
-        crate::gc_telemetry::stops::StopReason::Remark,
-        |coord, _| {
-            let mut budget =
-                old_cycle::RemarkBudget::configured(crate::gc_telemetry::timestamp_ns());
-            cycle
-                .phase
-                .lock()
-                .unwrap()
-                .transition(old_cycle::Phase::RemarkSTW);
-            owner.gc.mark_phase().store(2, Ordering::Release);
-            let mut state = owner.gc.heap.lock().unwrap();
-            let transferred =
-                cycle
-                    .satb_shards
-                    .seal_stopped_bounded(coord, &mut budget, |values| {
-                        cycle.enqueue_satb_batch(values)
-                    })
-                    && state.satb.flush_all_bounded(coord, &mut budget, |values| {
-                        cycle.enqueue_satb_batch(values)
-                    });
-            drop(state);
-            cycle.queue.flush_all_locals();
-
-            owner.gc.mark_phase().store(1, Ordering::Release);
-            if !budget.reserve(0, 0, crate::gc_telemetry::timestamp_ns()) {
-                cycle.termination.restart();
-            }
-            cycle
-                .phase
-                .lock()
-                .unwrap()
-                .transition(old_cycle::Phase::ConcurrentMark);
-            transferred
-        },
-    );
-    if !transferred {
+    if !seal_closing_sources_in(owner, cycle) {
         return require_stopped_completion(cycle);
     }
     let mut remark_rounds = 1;
@@ -360,7 +324,7 @@ fn finish_with_policy_in(
             return require_stopped_completion(cycle);
         }
         cycle.termination.restart();
-        if !request_remark(cycle) {
+        if !request_remark_candidate(cycle) {
             recorder.counts.candidate_rejected += 1;
             if stalled_waves == MAX_STALLED_DRAIN_WAVES {
                 recorder.counts.stall_escalations += 1;
@@ -384,7 +348,7 @@ fn finish_with_policy_in(
         let finished = safepoint::with_stw_in(
             owner,
             crate::gc_telemetry::stops::StopReason::Remark,
-            |_, stop_work| {
+            |coord, stop_work| {
                 cycle
                     .phase
                     .lock()
@@ -394,17 +358,38 @@ fn finish_with_policy_in(
                     old_cycle::RemarkBudget::configured(crate::gc_telemetry::timestamp_ns());
                 let mut state = owner.gc.heap.lock().unwrap();
                 owner.gc.mark_phase().store(2, Ordering::Release);
-                assert!(cycle.satb_shards.is_drained());
-                assert!(state.satb.is_empty());
+                // Reseal the private buffers reopened by the previous seal and
+                // drain them (and heap-locked fallback entries) before the
+                // election: buffered values that are not yet claimed become
+                // queue work and reject the candidate. A budget-rejected
+                // transfer keeps the shards sealed and the untouched entries
+                // for the stopped completion's authoritative seal.
+                let sealed = cycle
+                    .satb_shards
+                    .seal_stopped_bounded(coord, &mut budget, |values| {
+                        cycle.enqueue_satb_batch(values)
+                    })
+                    && state.satb.flush_all_bounded(coord, &mut budget, |values| {
+                        cycle.enqueue_satb_batch(values)
+                    });
+                // Owners are parked (enrolled) or find the shards sealed under
+                // their buffer lock and wait for this heap lock (unenrolled), so
+                // no publication can follow the drain until the phase changes.
+                let reopen = |cycle: &ConcurrentCycle| {
+                    if sealed {
+                        reopen_buffers_stopped(coord, cycle);
+                    }
+                };
                 // Rendezvous publications can invalidate the optimistic
                 // candidate. Elect again under the stopped producer boundary.
                 cycle.termination.restart();
-                if request_remark(cycle) && cycle.termination.requested() {
+                if sealed && request_remark(cycle) && cycle.termination.requested() {
                     // Read exception state after the reader acquire. A finishing drain
                     // can merge a deferred hook just before dropping its reader count.
                     if cycle.worker_failed.load(Ordering::Acquire)
                         || !cycle.deferred.lock().unwrap().is_empty()
                     {
+                        reopen(cycle);
                         owner.gc.mark_phase().store(1, Ordering::Release);
                         cycle
                             .phase
@@ -413,10 +398,11 @@ fn finish_with_policy_in(
                             .transition(old_cycle::Phase::ConcurrentMark);
                         return None;
                     }
-                    // Engine merges precede active_drains reaching zero. All mutator
-                    // publications require this heap lock, so empty cannot be invalidated
-                    // between the check and the phase transition. A late empty assist
-                    // may enroll but cannot acquire an object after end_epoch().
+                    // Engine merges precede active_drains reaching zero. Every mutator
+                    // publication after the seal requires this heap lock, so empty
+                    // cannot be invalidated between the check and the phase transition.
+                    // A late empty assist may enroll but cannot acquire an object after
+                    // end_epoch().
                     #[cfg(debug_assertions)]
                     {
                         let mut error = None;
@@ -427,6 +413,7 @@ fn finish_with_policy_in(
                                 crate::gc_telemetry::timestamp_ns(),
                             ) {
                                 cycle.termination.restart();
+                                reopen(cycle);
                                 owner.gc.mark_phase().store(1, Ordering::Release);
                                 cycle
                                     .phase
@@ -466,6 +453,7 @@ fn finish_with_policy_in(
                         stop_work,
                     ) else {
                         cycle.termination.restart();
+                        reopen(cycle);
                         owner.gc.mark_phase().store(1, Ordering::Release);
                         cycle
                             .phase
@@ -493,6 +481,7 @@ fn finish_with_policy_in(
                     return Some((work, plan));
                 }
                 cycle.termination.restart();
+                reopen(cycle);
                 owner.gc.mark_phase().store(1, Ordering::Release);
                 cycle
                     .phase
@@ -516,6 +505,81 @@ fn finish_with_policy_in(
     }
     recorder.counts.cap_exhausted += 1;
     require_stopped_completion(cycle)
+}
+
+/// Enter closure and run its first stop: seal and transfer every SATB source
+/// into the queue, then reopen private buffers for the rest of the closing
+/// epoch. Returns false when the remark budget rejected the transfer; the
+/// shards then stay sealed and publication revoked for stopped completion.
+pub(super) fn seal_closing_sources_in(
+    owner: &crate::runtime::Runtime,
+    cycle: &Arc<ConcurrentCycle>,
+) -> bool {
+    // Owners continue publishing their own buffers at safepoints/unregister.
+    // Until the stopped seal below, closing redirects deletion publications
+    // to the queue under the heap lock; foreign buffers are inspected only at
+    // that COORD boundary, which then reopens the drained private buffers.
+    cycle.close();
+    // Preserve the first-slice stopped boundary, with no buffered graph work.
+    cycle
+        .phase
+        .lock()
+        .unwrap()
+        .transition(old_cycle::Phase::RemarkRequested);
+    safepoint::with_stw_in(
+        owner,
+        crate::gc_telemetry::stops::StopReason::Remark,
+        |coord, _| {
+            let mut budget =
+                old_cycle::RemarkBudget::configured(crate::gc_telemetry::timestamp_ns());
+            cycle
+                .phase
+                .lock()
+                .unwrap()
+                .transition(old_cycle::Phase::RemarkSTW);
+            owner.gc.mark_phase().store(2, Ordering::Release);
+            let mut state = owner.gc.heap.lock().unwrap();
+            let transferred =
+                cycle
+                    .satb_shards
+                    .seal_stopped_bounded(coord, &mut budget, |values| {
+                        cycle.enqueue_satb_batch(values)
+                    })
+                    && state.satb.flush_all_bounded(coord, &mut budget, |values| {
+                        cycle.enqueue_satb_batch(values)
+                    });
+            drop(state);
+            cycle.queue.flush_all_locals();
+            if transferred {
+                // Every owner is stopped and every buffer drained: closing
+                // stores now batch in private buffers (O(S / capacity) shared
+                // publications for S stores) instead of serializing on the
+                // heap lock. Each recheck stop reseals before its election.
+                reopen_buffers_stopped(coord, cycle);
+            }
+
+            owner.gc.mark_phase().store(1, Ordering::Release);
+            if !budget.reserve(0, 0, crate::gc_telemetry::timestamp_ns()) {
+                cycle.termination.restart();
+            }
+            cycle
+                .phase
+                .lock()
+                .unwrap()
+                .transition(old_cycle::Phase::ConcurrentMark);
+            transferred
+        },
+    )
+}
+
+/// Resume private SATB publication for the rest of a closing epoch. Requires
+/// the stopped boundary that drained every shard buffer; the cycle must still
+/// be closing, and a revoked stopped completion never reopens.
+fn reopen_buffers_stopped(coord: &GcCoord, cycle: &ConcurrentCycle) {
+    debug_assert!(cycle.closing.load(Ordering::Acquire));
+    debug_assert!(!cycle.recovering.load(Ordering::Acquire));
+    cycle.satb_shards.reopen_stopped(coord);
+    cycle.buffers_revoked.store(false, Ordering::Release);
 }
 
 /// Completed work items and mark bytes from every drain, and native Retry
@@ -591,7 +655,7 @@ fn finish_recovery_with_wait_in(
         return finish_feature_off(owner, marking, started);
     }
     marking.recovering.store(true, Ordering::Release);
-    marking.closing.store(true, Ordering::Release);
+    marking.close();
     loop {
         // An unwound consumer may have lost its in-hand item. Continuing would
         // collect reachable children; unrestricted legacy retracing is forbidden.
@@ -730,7 +794,7 @@ pub(super) fn cancel(marking: &Arc<ConcurrentCycle>) {
 }
 
 pub(super) fn cancel_in(owner: &crate::runtime::Runtime, marking: &Arc<ConcurrentCycle>) {
-    marking.closing.store(true, Ordering::Release);
+    marking.close();
     let mut region_cursor = 0;
     loop {
         let done = safepoint::with_stw_in(
@@ -959,7 +1023,7 @@ mod termination_tests {
     }
 
     fn seal(cycle: &ConcurrentCycle) {
-        cycle.closing.store(true, Ordering::Release);
+        cycle.close();
         let coord = GcCoord {
             stop_requested: true,
             ..Default::default()

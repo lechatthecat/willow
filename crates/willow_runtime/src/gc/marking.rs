@@ -53,6 +53,12 @@ pub(super) struct ConcurrentCycle {
     pub(super) native_retries: AtomicU64,
     recovery_native_retries: Mutex<IdMap<usize, (usize, usize)>>,
     pub(super) closing: std::sync::atomic::AtomicBool,
+    /// Private (shard/inline) SATB publication is revoked: barriers enqueue
+    /// directly under the heap lock. Set with `closing` by [`Self::close`];
+    /// the first stopped closure seal clears it again after reopening the
+    /// drained shards, so post-seal closing stores buffer per mutator and
+    /// every recheck stop reseals before electing termination.
+    pub(super) buffers_revoked: std::sync::atomic::AtomicBool,
     pub(super) tracing_enabled: std::sync::atomic::AtomicBool,
     pub(super) active_drains: AtomicUsize,
     active_assists: AtomicUsize,
@@ -312,6 +318,7 @@ impl ConcurrentCycle {
             native_retries: AtomicU64::new(0),
             recovery_native_retries: Mutex::new(IdMap::default()),
             closing: std::sync::atomic::AtomicBool::new(false),
+            buffers_revoked: std::sync::atomic::AtomicBool::new(false),
             tracing_enabled: std::sync::atomic::AtomicBool::new(true),
             active_drains: AtomicUsize::new(0),
             active_assists: AtomicUsize::new(0),
@@ -332,6 +339,13 @@ impl ConcurrentCycle {
 
     pub(super) fn is_marked(&self, address: usize) -> bool {
         self.objects.is_marked(address)
+    }
+
+    /// Enter closure: assists stop and private SATB publication is revoked
+    /// until a stopped seal reopens it (see `buffers_revoked`).
+    pub(super) fn close(&self) {
+        self.buffers_revoked.store(true, Ordering::Release);
+        self.closing.store(true, Ordering::Release);
     }
 
     pub(super) fn claim_or_defer(&self, address: usize) -> bool {
@@ -402,6 +416,31 @@ impl ConcurrentCycle {
     }
 
     pub(super) fn enqueue_satb_batch(&self, values: &[usize]) {
+        // Drop values that cannot become work (already marked, or implicitly
+        // black and unindexed after late publication) under one index read,
+        // before taking termination ownership. Neither outcome claims or
+        // injects, and marks only grow within the epoch, so a batch of such
+        // values neither owns nor advances the termination generation:
+        // concurrent mutator flushes of closing-phase stores cannot keep
+        // defeating a closure election. Counters match one `claim_or_defer`
+        // per non-null value.
+        let late_published = self.late_published.load(Ordering::Acquire);
+        let mut pending = Vec::new();
+        let (marked, unindexed) =
+            self.objects
+                .retain_claimable(values, late_published, &mut pending);
+        if marked + unindexed != 0 {
+            self.pointer_checks
+                .fetch_add(marked + unindexed, Ordering::Relaxed);
+            self.duplicate_discoveries
+                .fetch_add(marked, Ordering::Relaxed);
+            self.unindexed_discoveries
+                .fetch_add(unindexed, Ordering::Relaxed);
+        }
+        if pending.is_empty() {
+            return;
+        }
+        let values = pending.as_slice();
         let _publication = self.termination.enter();
         use crate::gc_mark_queue::{MarkWork, MarkWorkItem, ObjectRef};
         // Bound one owned queue item even with the maximum configured SATB

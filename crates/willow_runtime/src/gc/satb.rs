@@ -585,9 +585,10 @@ impl SatbShards {
         true
     }
 
-    /// Minor relocation has translated the injector and every buffer is empty.
-    /// Resume private publication in the same epoch, while all owners remain
-    /// stopped. Closure must keep its authoritative seal instead.
+    /// Every buffer is empty (minor relocation translated the injector, or a
+    /// closure seal drained them). Resume private publication in the same
+    /// epoch while all owners remain stopped. A revoked closure (before its
+    /// first seal, or recovery) must keep its authoritative seal instead.
     pub(super) fn reopen_stopped(&self, coord: &super::GcCoord) {
         assert!(coord.stop_requested);
         let current = std::thread::current().id();
@@ -668,10 +669,12 @@ pub(super) struct ShardBuffer<'a> {
 }
 
 impl ShardBuffer<'_> {
-    pub(super) fn admit_inline(&mut self, closing: &AtomicBool) -> usize {
+    /// `revoked` is the epoch's private-publication revocation flag, which
+    /// generated appends acquire-load before writing.
+    pub(super) fn admit_inline(&mut self, revoked: &AtomicBool) -> usize {
         self.entries
             .closing
-            .set(closing as *const AtomicBool as usize);
+            .set(revoked as *const AtomicBool as usize);
         assert_eq!(self.entries.published, 0);
         self.entries
             .inline_limit

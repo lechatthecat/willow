@@ -247,7 +247,9 @@ fn overlap_satb_deletions_parked_mutators_and_old_descendants_survive_sweep() {
             }
             let elected = cycle_wait::CollectorGuard::try_acquire().unwrap();
             let (_, cycle) = root_handshake::begin().unwrap();
-            cycle.closing.store(closing, Ordering::Release);
+            if closing {
+                cycle.close();
+            }
             let ready = Arc::new(AtomicUsize::new(0));
             let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let threads: Vec<_> = owners
@@ -376,7 +378,7 @@ fn overlap_phase_requests_and_remark_election_keep_epoch_ownership_distinct() {
             assert!(cycle.termination.requested());
         }
         if phase == "remark" {
-            cycle.closing.store(true, Ordering::Release);
+            cycle.close();
         }
         if phase == "sweep" {
             crate::gc::preemption_tolerant_remark_budget_for_test();

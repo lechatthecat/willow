@@ -912,7 +912,7 @@ pub mod generated_context {
 /// barrier, which registers storage with the current marking epoch. Generated
 /// code may append the overwritten and inserted reference (including nulls)
 /// only in concurrent phase, with no possible new generational edge, room
-/// for both words, and an acquire-loaded false epoch closing flag. Write entries
+/// for both words, and an acquire-loaded false epoch revocation flag. Write entries
 /// before LENGTH; no safepoint may intervene.
 /// The buffer is revoked on context refresh, safepoint, unregister and stopped
 /// seal. Full/unadmitted buffers and generational edges use the original barrier.
@@ -921,7 +921,9 @@ pub mod barrier_buffer {
     pub const BASE_OFFSET: i32 = 0;
     pub const LENGTH_OFFSET: i32 = 8;
     pub const LIMIT_OFFSET: i32 = 16;
-    /// Pointer to the current epoch's atomic closing flag.
+    /// Pointer to the current epoch's atomic private-publication revocation
+    /// flag (set when closure begins, cleared once its first stopped seal
+    /// reopens the drained buffers).
     pub const CLOSING_OFFSET: i32 = 24;
     pub const PAIR_ENTRIES: i64 = 2;
     pub const CONCURRENT_PHASE: i64 = 1;

@@ -3193,7 +3193,7 @@ fn concurrent_closure_and_sweep_preserve_a_new_active_tlab_after_stopped_ownersh
 }
 
 #[test]
-fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work() {
+fn closing_phase_deletions_publish_directly_until_seal_then_buffer_for_recheck() {
     let _guard = isolated_runtime();
     reset_internal_for_test();
     let parent = willow_alloc_typed(8, 1) as usize;
@@ -3258,7 +3258,17 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
                 store_gc_reference(parent as *mut *mut u8, std::ptr::null_mut());
             }
             assert!(runtime().heap.lock().unwrap().satb.is_empty());
-            assert!(cycle.is_marked(child));
+            // No safepoint since the barrier, so the closure seal state is
+            // stable: before the first stopped seal the deletion publishes
+            // directly; after it reopened the buffers, the deletion waits in
+            // this mutator's buffer and unregistration (or the recheck stop's
+            // reseal) publishes it before any election can complete.
+            if cycle.buffers_revoked.load(Ordering::Acquire) {
+                assert!(cycle.is_marked(child));
+            } else {
+                assert!(!cycle.is_marked(child));
+                assert!(!cycle.satb_shards.is_empty());
+            }
             drop(batch);
             drop(mutator);
         }))
@@ -3267,7 +3277,20 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
         std::thread::yield_now();
     }
     crate::gc::preemption_tolerant_remark_budget_for_test();
-    let (work, plan) = mark_closure::finish(&cycle, Instant::now()).expect("normal closure");
+    // A deletion buffered after the first seal reopened the shards may reach
+    // the recheck stop unpublished (the producer parks there before
+    // unregistering). The reseal then transfers the unmarked child, rejects
+    // the election and requires stopped completion; either way it survives.
+    let (work, plan) = match mark_closure::finish(&cycle, Instant::now()) {
+        Some(finished) => finished,
+        None => {
+            assert!(cycle.stopped_completion_required.load(Ordering::Acquire));
+            assert!(!cycle.worker_failed.load(Ordering::Acquire));
+            let (work, plan, freed) = mark_closure::finish_stopped(&cycle, Instant::now());
+            assert_eq!(freed, 0);
+            (work, plan.expect("stopped completion plans sweep"))
+        }
+    };
     producer.join().unwrap();
     assert_eq!(work.marked_bytes, 3 * (GC_HEADER_SIZE + 8) as u64);
     sweep::concurrent(plan);
@@ -5100,6 +5123,219 @@ fn marking_phase_store_publication_batches_per_mutator() {
         eprintln!(
             "marking_store_batch stores={count} queue_injections={injected} termination_transitions={transitions}"
         );
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn closing_phase_store_publication_batches_per_mutator() {
+    // After closure's first stopped seal reopens the private buffers, closing
+    // stores publish like concurrent-marking stores: no heap lock per store
+    // and O(N / capacity) shared queue and termination operations for N
+    // stores. Before, every closing store took the heap lock and enqueued
+    // both values directly (N heap-lock acquisitions).
+    let _guard = isolated_runtime();
+    for count in [1_024usize, 8_192, 65_536] {
+        reset_internal_for_test();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.pacer_trigger = u64::MAX;
+            state.pacer.disable_for_test();
+            state.nursery_threshold_bytes = usize::MAX;
+        }
+        let mut parent = willow_gc_alloc_layout(7, 0, 8, 0b1);
+        willow_push_root(&mut parent);
+        let children: Vec<_> = (0..count).map(|_| willow_alloc(8)).collect();
+        let (_, cycle) = root_handshake::begin().unwrap();
+        crate::gc::preemption_tolerant_remark_budget_for_test();
+        assert!(mark_closure::seal_closing_sources_in(
+            crate::runtime::current(),
+            &cycle
+        ));
+        assert!(cycle.closing.load(Ordering::Acquire));
+        assert!(!cycle.buffers_revoked.load(Ordering::Acquire));
+        assert!(!cycle.satb_shards.is_drained(), "first seal must reopen");
+        assert!(children.iter().all(|c| !cycle.is_marked(*c as usize)));
+        let locks_before = mutator_log::shared_locks_for_test();
+        let injected_before = cycle.queue.snapshot().injected;
+        let owned_before = cycle.termination.generation_for_test();
+        let slot = parent.cast::<*mut u8>();
+        for &child in &children {
+            let old = unsafe { *slot };
+            willow_gc_write_barrier(parent, old, child, 1);
+            unsafe { *slot = child };
+        }
+        let heap_locks = mutator_log::shared_locks_for_test() - locks_before;
+        assert_eq!(heap_locks, 0, "closing stores={count} took the heap lock");
+        let transitions = cycle.termination.generation_for_test() - owned_before;
+        let capacity = satb::configured_capacity();
+        let full_buffers = (2 * count / capacity) as u64;
+        assert!(
+            transitions <= 2 * full_buffers,
+            "closing stores={count} termination transitions={transitions}"
+        );
+        let buffered = cycle.queue.snapshot().injected - injected_before;
+        let entries = 2 * count;
+        let bound = ((entries / capacity) * capacity.div_ceil(32)) as u64;
+        assert!(
+            buffered <= bound,
+            "closing stores={count} injected={buffered} bound={bound}"
+        );
+        // The tail is still private: a recheck-style stopped seal must drain
+        // it before any election, then reopen for the rest of closure.
+        assert!(!cycle.is_marked(*children.last().unwrap() as usize));
+        with_stw(
+            crate::gc_telemetry::stops::StopReason::Remark,
+            |coord, _| {
+                flush_satb_all_locked(coord, &mut runtime().heap.lock().unwrap());
+                assert!(cycle.satb_shards.is_drained());
+                // A rejected recheck reopens for the rest of closure.
+                cycle.satb_shards.reopen_stopped(coord);
+            },
+        );
+        let injected = cycle.queue.snapshot().injected - injected_before;
+        let bound = ((entries / capacity) * capacity.div_ceil(32)
+            + (entries % capacity).div_ceil(32)) as u64
+            + 2;
+        assert!(
+            injected <= bound,
+            "closing stores={count} injected={injected} bound={bound}"
+        );
+        cycle.drain(usize::MAX);
+        for child in &children {
+            assert!(cycle.is_marked(*child as usize), "closing new edge lost");
+        }
+        assert!(cycle.queue.snapshot().is_drained());
+        assert_eq!(cycle.queue.snapshot().counter_underflows, 0);
+        // Closing stores of already-marked values (the common closing-phase
+        // shape) publish full buffers and safepoint flushes without taking
+        // termination ownership: they neither inject nor advance the
+        // generation, so they cannot repeatedly defeat a closure election.
+        assert!(!cycle.satb_shards.is_drained(), "reseal must reopen");
+        let marked_locks = mutator_log::shared_locks_for_test();
+        let marked_injected = cycle.queue.snapshot().injected;
+        let marked_generation = cycle.termination.generation_for_test();
+        for &child in children.iter().rev() {
+            let old = unsafe { *slot };
+            willow_gc_write_barrier(parent, old, child, 1);
+            unsafe { *slot = child };
+        }
+        barrier::flush_satb_current(false);
+        assert_eq!(mutator_log::shared_locks_for_test(), marked_locks);
+        let marked_transitions = cycle.termination.generation_for_test() - marked_generation;
+        assert_eq!(
+            marked_transitions, 0,
+            "marked closing stores={count} advanced termination"
+        );
+        assert_eq!(cycle.queue.snapshot().injected, marked_injected);
+        assert!(cycle.satb_shards.is_empty());
+        assert_eq!(cycle.queue.end_epoch(), 0);
+        marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+        crate::runtime::current()
+            .mark_phase()
+            .store(0, Ordering::Release);
+        willow_pop_root();
+        eprintln!(
+            "closing_store_batch stores={count} heap_locks={heap_locks} queue_injections={injected} termination_transitions={transitions} marked_transitions={marked_transitions}"
+        );
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn closing_recheck_stop_reseals_reopened_buffers_before_election() {
+    // Closing stores between the optimistic election and the recheck stop
+    // stay in the mutator's private buffer. The recheck stop must reseal and
+    // drain them before electing: already-marked values complete normally,
+    // while a hidden unmarked value rejects the candidate and survives.
+    let _guard = isolated_runtime();
+    for hidden_store in [false, true] {
+        reset_internal_for_test();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.pacer_trigger = u64::MAX;
+            state.pacer.disable_for_test();
+            state.nursery_threshold_bytes = usize::MAX;
+        }
+        let mut parent = willow_gc_alloc_layout(7, 0, 8, 0b1);
+        willow_push_root(&mut parent);
+        let mut first = willow_alloc(8);
+        let mut second = willow_alloc(8);
+        willow_push_root(&mut first);
+        willow_push_root(&mut second);
+        let hidden = willow_alloc(8);
+        unsafe { *hidden.cast::<usize>() = 0x5a7b };
+        unsafe { store_gc_reference(parent.cast(), first) };
+        let (_, cycle) = root_handshake::begin().unwrap();
+        crate::gc::preemption_tolerant_remark_budget_for_test();
+        let mut rechecks = 0;
+        let finished = mark_closure::finish_with_hooks(
+            &cycle,
+            Instant::now(),
+            |_| std::thread::yield_now(),
+            || {
+                rechecks += 1;
+                assert!(!cycle.buffers_revoked.load(Ordering::Acquire));
+                assert!(cycle.is_marked(first as usize) && cycle.is_marked(second as usize));
+                assert!(!cycle.is_marked(hidden as usize));
+                let locks = mutator_log::shared_locks_for_test();
+                let slot = parent.cast::<*mut u8>();
+                for i in 0..1_000 {
+                    let value = if i % 2 == 0 { second } else { first };
+                    let old = unsafe { *slot };
+                    willow_gc_write_barrier(parent, old, value, 1);
+                    unsafe { *slot = value };
+                }
+                if hidden_store {
+                    let old = unsafe { *slot };
+                    willow_gc_write_barrier(parent, old, hidden, 1);
+                    unsafe { *slot = hidden };
+                }
+                assert_eq!(mutator_log::shared_locks_for_test(), locks);
+                assert!(!cycle.satb_shards.is_drained());
+                assert!(
+                    !cycle.satb_shards.is_empty(),
+                    "closing tail was not buffered"
+                );
+                assert!(!cycle.is_marked(hidden as usize));
+            },
+        );
+        assert_eq!(rechecks, 1);
+        assert!(cycle.satb_shards.is_drained() || hidden_store);
+        if hidden_store {
+            // The resealed buffer claimed the hidden value under the stop and
+            // invalidated the election; stopped completion must retain it.
+            assert!(finished.is_none());
+            assert!(cycle.stopped_completion_required.load(Ordering::Acquire));
+            assert!(cycle.is_marked(hidden as usize));
+            let (_, plan, freed) = mark_closure::finish_stopped(&cycle, Instant::now());
+            assert_eq!(freed, 0);
+            sweep::concurrent(plan.unwrap());
+        } else {
+            let (_, plan) = finished.expect("marked closing stores keep the election");
+            assert!(cycle.satb_shards.is_empty());
+            sweep::concurrent(plan);
+        }
+        assert_eq!(
+            crate::runtime::current()
+                .mark_phase()
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(
+            HeapObject::from_payload(GcPayload::from_raw(hidden).unwrap()).allocated()
+                || !hidden_store
+        );
+        if hidden_store {
+            assert_eq!(unsafe { *hidden.cast::<usize>() }, 0x5a7b);
+        }
+        assert_eq!(cycle.queue.snapshot().counter_underflows, 0);
+        willow_pop_roots(3);
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        eprintln!("closing_recheck_reseal hidden_store={hidden_store} rechecks={rechecks}");
     }
     reset_internal_for_test();
 }

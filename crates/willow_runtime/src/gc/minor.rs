@@ -1624,8 +1624,12 @@ fn collect_stopped(
     drop(root_scan);
     let result = minor_collect_with_roots(owner, roots, force_pin, stop_work);
     if let Some(cycle) = owner.gc.heap.lock().unwrap().concurrent_cycle.as_ref()
-        && !cycle.closing.load(std::sync::atomic::Ordering::Acquire)
+        && !cycle
+            .buffers_revoked
+            .load(std::sync::atomic::Ordering::Acquire)
     {
+        // Concurrent marking and a closure reopened by its first seal resume
+        // private publication; revoked closure keeps the authoritative seal.
         cycle.satb_shards.reopen_stopped(coord);
     }
     result

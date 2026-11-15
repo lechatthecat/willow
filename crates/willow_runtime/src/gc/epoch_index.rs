@@ -530,6 +530,32 @@ impl EpochIndex {
     pub(super) fn is_marked(&self, address: usize) -> bool {
         self.0.read().unwrap().is_marked(address)
     }
+    /// Partition non-null `values` under one read lock: push those a claim
+    /// could still turn into work onto `pending`, and count those already
+    /// marked and those unindexed outside every captured extent once late
+    /// extents are published (implicitly black). Returns `(marked, unindexed)`.
+    pub(super) fn retain_claimable(
+        &self,
+        values: &[usize],
+        late_published: bool,
+        pending: &mut Vec<usize>,
+    ) -> (u64, u64) {
+        let index = self.0.read().unwrap();
+        let (mut marked, mut unindexed) = (0, 0);
+        for &address in values.iter().filter(|&&address| address != 0) {
+            if index.is_marked(address) {
+                marked += 1;
+            } else if late_published
+                && !index.contains(address)
+                && !index.needs_start_publication(address)
+            {
+                unindexed += 1;
+            } else {
+                pending.push(address);
+            }
+        }
+        (marked, unindexed)
+    }
     pub(super) fn retains_allocated(&self, address: usize) -> bool {
         self.0.read().unwrap().retains_allocated(address)
     }
