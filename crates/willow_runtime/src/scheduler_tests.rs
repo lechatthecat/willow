@@ -6557,3 +6557,63 @@ fn concurrent_runtime_instances_schedule_independent_task_sets() {
         assert!(side.5.iter().all(|state| *state == 1));
     }
 }
+
+/// Teardown order of a private runtime is fixed by `Drop for Runtime`, not by
+/// field declaration order: every live persistent worker exits (releasing its
+/// runner) before collector storage is reclaimed. Removing that `Drop` and
+/// declaring `gc` before `worker_pool` makes the reclaim event come first.
+#[test]
+fn private_runtime_drop_joins_live_workers_before_reclaiming_collector_storage() {
+    type Events = Arc<TestMutex<Vec<&'static str>>>;
+    const FINALIZED: u32 = 0x5eed;
+    struct WorkerExit(Events);
+    impl Drop for WorkerExit {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push("worker");
+        }
+    }
+    unsafe fn reclaimed(payload: *mut u8) {
+        let events = unsafe { Box::from_raw(payload.cast::<*mut Events>().read()) };
+        events.lock().unwrap().push("gc");
+    }
+    fn workers() -> RuntimeWorkerConfig {
+        RuntimeWorkerConfig::with_workers(4)
+    }
+    for count in [1, 4, 16] {
+        let events: Events = Arc::new(TestMutex::new(Vec::new()));
+        // Declared before `owner` so it outlives the runtime that registers it.
+        let mut tlab = crate::gc::tlab_state_for_test();
+        let owner = crate::runtime::Runtime::shared(workers);
+        let payload = crate::gc::allocate_finalized_for_test(
+            &owner,
+            &mut tlab,
+            FINALIZED,
+            reclaimed,
+            std::mem::size_of::<*mut Events>(),
+        );
+        unsafe {
+            payload
+                .cast::<*mut Events>()
+                .write(Box::into_raw(Box::new(Arc::clone(&events))))
+        };
+        {
+            let mut pool = owner.worker_pool.lock().unwrap();
+            for _ in 0..count {
+                let exit = WorkerExit(Arc::clone(&events));
+                pool.start_worker(None, move |_, _, _, _| {
+                    let _ = &exit;
+                    unreachable!("no drive is sent to this pool");
+                });
+            }
+            assert_eq!(pool.handles.len(), count);
+            assert!(pool.handles.iter().all(|handle| !handle.is_finished()));
+        }
+        let weak = Arc::downgrade(&owner);
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+        let events = events.lock().unwrap();
+        let mut expected = vec!["worker"; count];
+        expected.push("gc");
+        assert_eq!(*events, expected, "count={count}");
+    }
+}

@@ -10,9 +10,9 @@ use crate::scheduler::RuntimeWorkerConfig;
 pub(crate) struct Runtime {
     pub(crate) scheduler_hooks: crate::observation::SchedulerHooks,
     pub(crate) service_owner: OnceLock<std::sync::Weak<Runtime>>,
-    // Fields drop in declaration order. Join workers and release their service
-    // owners before reclaiming collector storage. Runners must not own this
-    // Runtime (or its pool), which would create an ownership cycle/self-join.
+    /// Joined first by `Drop for Runtime`, whatever its declaration position.
+    /// Runners must not own this Runtime (or its pool): that would create an
+    /// ownership cycle and a worker joining itself.
     pub(crate) worker_pool: Mutex<crate::scheduler::PersistentWorkers>,
     pub(crate) affinities: LazyLock<
         std::sync::Arc<
@@ -105,6 +105,29 @@ impl Runtime {
                 crate::worker_affinity::Registry::for_runtime(self),
             )
         })
+    }
+}
+
+/// Teardown order is fixed here rather than by field declaration order.
+///
+/// 1. Disconnect and join every persistent worker. A worker's exit releases
+///    its runner (and any service owner it captured) and runs its thread-local
+///    destructors, which may still reach collector storage of this runtime.
+/// 2. Only then do the remaining fields drop (in declaration order, which no
+///    longer matters): collector storage, frame-reclaim/lifetime domains and
+///    the other services. Collector-owned threads (cycle coordinator, marker
+///    pool) are stopped by `GcRuntime`'s own `Drop` and hold leases, not
+///    borrows, of this runtime.
+///
+/// The process-default instance is a `static` and never dropped; this runs for
+/// shared/private owners and costs nothing outside teardown.
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        let pool = self
+            .worker_pool
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(std::mem::take(pool));
     }
 }
 

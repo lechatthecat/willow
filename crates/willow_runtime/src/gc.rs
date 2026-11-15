@@ -3267,6 +3267,40 @@ pub(crate) fn tlab_state_for_test() -> GcTlabState {
     GcTlabState::new()
 }
 
+/// Allocate one young object of `type_id` in `owner`'s heap with `drop_fn` as
+/// its finalizer, for sibling-module tests that observe when a private
+/// runtime's collector storage is reclaimed. `GcRuntime`'s `Drop` finalizes
+/// the object, so the hook runs exactly when collector storage is released.
+///
+/// The allocation registers `tlab`'s address in `owner`'s heap state, so the
+/// caller must keep `tlab` alive and unmoved until `owner` is dropped (later
+/// refills, collections and resets read it through that registration).
+#[cfg(test)]
+pub(crate) fn allocate_finalized_for_test(
+    owner: &crate::runtime::Runtime,
+    tlab: &mut GcTlabState,
+    type_id: u32,
+    drop_fn: DropFn,
+    payload_size: usize,
+) -> *mut u8 {
+    owner
+        .gc
+        .drop_registry
+        .lock()
+        .unwrap()
+        .insert(type_id, drop_fn);
+    let payload = tlab_alloc_slow_in(
+        owner,
+        std::ptr::from_mut(tlab) as usize,
+        0,
+        i64::from(type_id),
+        payload_size as i64,
+        0,
+    );
+    assert!(!payload.is_null());
+    payload
+}
+
 #[cfg(test)]
 fn publish_tlab_start_for_test(tls: &GcTlabState, header: *mut u8) {
     let base = tls.limit.load(Ordering::Acquire) - GC_TLAB_CHUNK_SIZE;
