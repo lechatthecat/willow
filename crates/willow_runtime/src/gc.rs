@@ -2825,6 +2825,22 @@ fn try_collect_internal_in(owner: &crate::runtime::Runtime) -> CollectionAttempt
             mark_closure::finish_stopped_in(owner, &marking, started)
         };
         let (mut work, plan, stopped_freed) = result;
+        if gc_log {
+            let waves = *marking.closure_waves.lock().unwrap();
+            eprintln!(
+                "[gc] closure waves={} drains={} queue_pending={} active_drains={} candidate_rejected={} recheck_rejected={} stalled={} stall_escalations={} cap_exhausted={} concurrent_closed={}",
+                waves.waves,
+                waves.drains,
+                waves.queue_pending,
+                waves.active_drains,
+                waves.candidate_rejected,
+                waves.recheck_rejected,
+                waves.stalled,
+                waves.stall_escalations,
+                waves.cap_exhausted,
+                concurrent_closed
+            );
+        }
         let freed = plan.map_or(stopped_freed, |plan| sweep::concurrent_in(owner, plan));
         {
             let swept = marking.work.lock().unwrap();

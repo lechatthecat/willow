@@ -70,6 +70,8 @@ pub(super) struct ConcurrentCycle {
     pub(super) work: Mutex<crate::gc_telemetry::MarkWork>,
     /// Deletion buffers filled without the heap mutex while marking.
     pub(super) satb_shards: satb::SatbShards,
+    /// Concurrent closure wave outcomes, published once per closure attempt.
+    pub(super) closure_waves: Mutex<super::mark_closure::ClosureWaves>,
 }
 
 // These diagnostics are separate from the stable C snapshot layouts. Publish
@@ -183,6 +185,12 @@ impl Drop for MarkBatch<'_> {
             } else {
                 total.cpu_incomplete = true;
             }
+        } else if self.work.objects != 0 {
+            // Byte-free items (zero-slot native or Retry slices) stay out of
+            // the rate sample but still count as completed, so closure sees
+            // an advancing native cursor as progress.
+            let mut total = self.cycle.work.lock().unwrap();
+            total.objects = total.objects.saturating_add(self.work.objects);
         }
         if !self.deferred.is_empty() {
             self.cycle
@@ -318,6 +326,7 @@ impl ConcurrentCycle {
             queue,
             work: Mutex::new(crate::gc_telemetry::MarkWork::roots(roots)),
             satb_shards: satb::SatbShards::default(),
+            closure_waves: Mutex::new(Default::default()),
         }
     }
 
@@ -752,6 +761,17 @@ impl ConcurrentCycle {
         self.drain_recovering_in(owner, || self.drain_until_in(owner, limit, deadline))
     }
 
+    /// As `drain_checked_until_in`, also returning the work items completed.
+    /// Zero-slot native continuations complete items without adding bytes.
+    pub(super) fn drain_checked_items_until_in(
+        &self,
+        owner: &crate::runtime::Runtime,
+        limit: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> (usize, u64) {
+        self.drain_recovering_in(owner, || self.drain_items_until_in(owner, limit, deadline))
+    }
+
     /// Unwinding retires the queue consumer and publishes MarkBatch before
     /// requesting authoritative stopped tracing. Never continue partial scans.
     pub(super) fn drain_recovering<T: Default>(&self, drain: impl FnOnce() -> T) -> T {
@@ -794,6 +814,15 @@ impl ConcurrentCycle {
         limit: usize,
         deadline: Option<std::time::Instant>,
     ) -> u64 {
+        self.drain_items_until_in(owner, limit, deadline).1
+    }
+
+    fn drain_items_until_in(
+        &self,
+        owner: &crate::runtime::Runtime,
+        limit: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> (usize, u64) {
         // Concurrent hooks may neither allocate GC memory nor reach a safepoint,
         // so marking cannot reenter this thread's scratch-buffer borrow. Keep
         // capacity across bounded assists; successful drains leave the buffer empty.
@@ -805,7 +834,6 @@ impl ConcurrentCycle {
         CHILDREN.with_borrow_mut(|children| {
             let mut worker = self.queue.register_assist();
             self.drain_worker_until_stride(owner, limit, children, &mut worker, deadline, 1)
-                .1
         })
     }
 

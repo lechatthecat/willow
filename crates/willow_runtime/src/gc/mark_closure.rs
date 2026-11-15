@@ -16,9 +16,45 @@ pub(super) fn finish_in(
 ) -> Option<(crate::gc_telemetry::MarkWork, sweep::SweepPlan)> {
     #[cfg(feature = "gc-notification-prototype")]
     if *owner.diagnostics.gc_notify {
-        return finish_with_policy_in(owner, cycle, started, std::thread::sleep, || {}, true);
+        return finish_with_policy_in(
+            owner,
+            cycle,
+            started,
+            DRAIN_WAVE_BUDGET,
+            std::thread::sleep,
+            || {},
+            true,
+        );
     }
-    finish_with_policy_in(owner, cycle, started, std::thread::sleep, || {}, false)
+    finish_with_policy_in(
+        owner,
+        cycle,
+        started,
+        DRAIN_WAVE_BUDGET,
+        std::thread::sleep,
+        || {},
+        false,
+    )
+}
+
+/// Tests choose the per-wave drain time, so wave counts do not depend on how
+/// fast the test host traces (a debug build is several times slower).
+#[cfg(test)]
+pub(super) fn finish_with_wave_budget(
+    cycle: &Arc<ConcurrentCycle>,
+    started: std::time::Instant,
+    wave_budget: std::time::Duration,
+    wait: impl FnMut(std::time::Duration),
+) -> Option<(crate::gc_telemetry::MarkWork, sweep::SweepPlan)> {
+    finish_with_policy_in(
+        crate::runtime::current(),
+        cycle,
+        started,
+        wave_budget,
+        wait,
+        || {},
+        false,
+    )
 }
 
 // Separate waiting from policy so contention duration can be tested with
@@ -36,6 +72,73 @@ pub(super) fn finish_with_wait(
 // preserves its cursors and resumes mutators between stops; it has no full walk.
 pub(super) const MAX_REMARK_ROUNDS: usize = 3;
 pub(super) const MAX_DRAIN_WAVES: usize = 128;
+/// Consecutive waves in which no drain completed a work item, no native slice
+/// retried and no other drain held work, before closure escalates to the
+/// stopped path. Nothing can change such a wave's outcome except an owner that
+/// only a stop makes visible, so waiting longer cannot help. Native Retry
+/// contention is progress that a lock holder can release; it keeps the paced
+/// `MAX_DRAIN_WAVES` allowance before Recovery's own per-cursor allowance.
+pub(super) const MAX_STALLED_DRAIN_WAVES: usize = 8;
+/// Collector drain time per wave. A wave keeps claiming 256-item drains while
+/// they make progress, so queued closure work is not paced at 256 items per
+/// wait; the CPU spent is then repaid before the next unfinished wave.
+const DRAIN_WAVE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1);
+const DRAIN_WAVE_ITEMS: usize = 256;
+
+/// Per-cycle closure wave outcomes. The collector counts locally and publishes
+/// once when closure returns, so waves pay no shared-counter traffic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ClosureWaves {
+    /// Drain waves run (each ends with one closure predicate check).
+    pub(super) waves: u64,
+    /// Bounded collector drains, including continuations within a wave.
+    pub(super) drains: u64,
+    /// Waves whose check found queued work outstanding.
+    pub(super) queue_pending: u64,
+    /// Waves whose queue was drained while another drain still held work.
+    pub(super) active_drains: u64,
+    /// Waves whose optimistic remark election failed (ownership or
+    /// generation churn, or a source refilled after the check).
+    pub(super) candidate_rejected: u64,
+    /// Remark recheck stops that rejected the candidate under the stop.
+    pub(super) recheck_rejected: u64,
+    /// Waves with no completed work, Retry or other drain (see
+    /// `MAX_STALLED_DRAIN_WAVES`); a closure that finds everything already
+    /// drained counts its single wave here too.
+    pub(super) stalled: u64,
+    /// 1 when closure escalated after `MAX_STALLED_DRAIN_WAVES`.
+    pub(super) stall_escalations: u64,
+    /// 1 when closure used every `MAX_DRAIN_WAVES` wave.
+    pub(super) cap_exhausted: u64,
+}
+
+impl ClosureWaves {
+    fn add(&mut self, other: Self) {
+        self.waves += other.waves;
+        self.drains += other.drains;
+        self.queue_pending += other.queue_pending;
+        self.active_drains += other.active_drains;
+        self.candidate_rejected += other.candidate_rejected;
+        self.recheck_rejected += other.recheck_rejected;
+        self.stalled += other.stalled;
+        self.stall_escalations += other.stall_escalations;
+        self.cap_exhausted += other.cap_exhausted;
+    }
+}
+
+// Publishes on every return, including the stopped-fallback and unwind paths.
+struct WaveRecorder<'a> {
+    cycle: &'a ConcurrentCycle,
+    counts: ClosureWaves,
+}
+
+impl Drop for WaveRecorder<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut total) = self.cycle.closure_waves.lock() {
+            total.add(self.counts);
+        }
+    }
+}
 
 // Queue outstanding counts private segments and work in hand. Flushing once
 // at the seal makes hidden jobs stealable; the election does not repeatedly
@@ -85,6 +188,7 @@ pub(super) fn finish_with_policy(
         crate::runtime::current(),
         cycle,
         started,
+        DRAIN_WAVE_BUDGET,
         wait,
         before_recheck,
         notification,
@@ -96,6 +200,7 @@ fn finish_with_policy_in(
     owner: &crate::runtime::Runtime,
     cycle: &Arc<ConcurrentCycle>,
     started: std::time::Instant,
+    wave_budget: std::time::Duration,
     mut wait: impl FnMut(std::time::Duration),
     mut before_recheck: impl FnMut(),
     notification: bool,
@@ -153,6 +258,12 @@ fn finish_with_policy_in(
         return require_stopped_completion(cycle);
     }
     let mut remark_rounds = 1;
+    let mut recorder = WaveRecorder {
+        cycle,
+        counts: ClosureWaves::default(),
+    };
+    let mut progress = mark_progress(cycle);
+    let mut stalled_waves = 0;
     for wave in 0..MAX_DRAIN_WAVES {
         minor::service_pending_in(owner);
         if cycle_wait::take_recovery_request(&owner.gc) {
@@ -164,11 +275,27 @@ fn finish_with_policy_in(
         }
         let wave_start = std::time::Instant::now();
         let cpu_start = crate::gc_telemetry::workers::thread_cpu_ns();
-        cycle.drain_checked_until_in(
-            owner,
-            256,
-            Some(wave_start + std::time::Duration::from_millis(1)),
-        );
+        let deadline = wave_start + wave_budget;
+        recorder.counts.waves += 1;
+        // Keep claiming while drains complete items and wave time remains.
+        // Items, not bytes: a zero-slot native continuation is progress too.
+        // A drain without items (nothing claimable, an admitted assist owns
+        // progress), any native Retry contention or a minor request ends the
+        // wave at once, so contended slices keep one paced drain per wave.
+        loop {
+            recorder.counts.drains += 1;
+            let retries = cycle.native_retries.load(Ordering::Acquire);
+            let (items, _) =
+                cycle.drain_checked_items_until_in(owner, DRAIN_WAVE_ITEMS, Some(deadline));
+            if items == 0
+                || cycle.native_retries.load(Ordering::Acquire) != retries
+                || cycle.queue.snapshot().is_drained()
+                || minor::requested(&owner.gc)
+                || std::time::Instant::now() >= deadline
+            {
+                break;
+            }
+        }
         // Repay this collector's measured CPU before another unfinished wave.
         // Missing/regressing CPU samples use elapsed wall time conservatively.
         // The 1ms floor also bounds empty-reader polling and fast Retry work.
@@ -182,15 +309,37 @@ fn finish_with_policy_in(
         // Owners bracket queue publication and the final reader/accounting merge.
         #[cfg(any(test, feature = "gc-notification-prototype"))]
         let generation = cycle.termination.sample();
-        if !cycle.queue.snapshot().is_drained() || cycle.active_drains.load(Ordering::Acquire) != 0
-        {
+        let queue_pending = !cycle.queue.snapshot().is_drained();
+        let others_draining = cycle.active_drains.load(Ordering::Acquire) != 0;
+        // No work item or mark byte completed and no native slice retried
+        // anywhere since the previous wave, and no other drain can be about to publish.
+        let now = mark_progress(cycle);
+        let stalled = now == progress && !others_draining;
+        progress = now;
+        if stalled {
+            recorder.counts.stalled += 1;
+            stalled_waves += 1;
+        } else {
+            stalled_waves = 0;
+        }
+        if queue_pending || others_draining {
+            if queue_pending {
+                recorder.counts.queue_pending += 1;
+            } else {
+                recorder.counts.active_drains += 1;
+            }
             RuntimeWaitObservation::reader_wait(|| {
                 (
                     &owner.gc.wait_observation,
                     cycle.active_drains.load(Ordering::Acquire) != 0,
                 )
             });
+            if stalled_waves == MAX_STALLED_DRAIN_WAVES {
+                recorder.counts.stall_escalations += 1;
+                return require_stopped_completion(cycle);
+            }
             if wave + 1 == MAX_DRAIN_WAVES {
+                recorder.counts.cap_exhausted += 1;
                 return require_stopped_completion(cycle);
             }
             #[cfg(any(test, feature = "gc-notification-prototype"))]
@@ -212,6 +361,15 @@ fn finish_with_policy_in(
         }
         cycle.termination.restart();
         if !request_remark(cycle) {
+            recorder.counts.candidate_rejected += 1;
+            if stalled_waves == MAX_STALLED_DRAIN_WAVES {
+                recorder.counts.stall_escalations += 1;
+                return require_stopped_completion(cycle);
+            }
+            if wave + 1 == MAX_DRAIN_WAVES {
+                recorder.counts.cap_exhausted += 1;
+                return require_stopped_completion(cycle);
+            }
             wait(delay);
             continue;
         }
@@ -350,12 +508,28 @@ fn finish_with_policy_in(
         {
             return finished;
         }
+        recorder.counts.recheck_rejected += 1;
         if remark_rounds >= MAX_REMARK_ROUNDS - 1 {
             return require_stopped_completion(cycle);
         }
         wait(delay);
     }
+    recorder.counts.cap_exhausted += 1;
     require_stopped_completion(cycle)
+}
+
+/// Completed work items and mark bytes from every drain, and native Retry
+/// results so far. Every traced object, native or bitmap slice (including a
+/// zero-slot continuation) counts one completed item.
+fn mark_progress(cycle: &ConcurrentCycle) -> (u64, u64, u64) {
+    let work = cycle.work.lock().unwrap();
+    (
+        work.objects,
+        work.marked_bytes
+            .saturating_add(work.scanned_bytes)
+            .saturating_add(work.descriptor_bytes),
+        cycle.native_retries.load(Ordering::Acquire),
+    )
 }
 
 /// Recovery keeps the original SATB epoch alive. Only ownership transfer and

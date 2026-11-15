@@ -4069,7 +4069,7 @@ fn satb_closure_wave_cap_resumes_retrying_work_with_bounded_recovery() {
         }
     }
     let _guard = isolated_runtime();
-    for count in [1, 16, 257] {
+    for count in [1usize, 16, 257] {
         reset_internal_for_test();
         BUDGET_RETRY_CALLS.store(0, Ordering::Relaxed);
         BUDGET_RETRY_LIMIT.store(usize::MAX, Ordering::Relaxed);
@@ -4111,9 +4111,23 @@ fn satb_closure_wave_cap_resumes_retrying_work_with_bounded_recovery() {
             .is_none()
         );
         assert_eq!(waits, mark_closure::MAX_DRAIN_WAVES - 1);
+        // Retry contention is releasable progress: it keeps the paced wave
+        // allowance instead of the no-progress escalation.
+        let waves = *cycle.closure_waves.lock().unwrap();
+        let cap = mark_closure::MAX_DRAIN_WAVES as u64;
+        // Drains that claim first-time objects complete work and may continue
+        // their wave (unless the 1ms wave expires); Retry-only drains end it.
+        assert_eq!((waves.waves, waves.queue_pending), (cap, cap));
+        assert!(
+            (cap..=cap + count.div_ceil(256) as u64).contains(&waves.drains),
+            "count={count} {waves:?}"
+        );
+        assert_eq!((waves.stalled, waves.stall_escalations), (0, 0));
+        assert_eq!(waves.cap_exhausted, 1);
         let calls = BUDGET_RETRY_CALLS.load(Ordering::Relaxed);
         assert!(
-            (mark_closure::MAX_DRAIN_WAVES..=mark_closure::MAX_DRAIN_WAVES * 256).contains(&calls)
+            (mark_closure::MAX_DRAIN_WAVES..=waves.drains as usize * 256).contains(&calls),
+            "count={count} calls={calls} {waves:?}"
         );
         assert!(cycle.stopped_completion_required.load(Ordering::Acquire));
         assert!(!cycle.queue.snapshot().is_drained());
@@ -4165,6 +4179,290 @@ fn satb_closure_wave_cap_resumes_retrying_work_with_bounded_recovery() {
         );
     }
     BUDGET_RETRY_LIMIT.store(0, Ordering::Relaxed);
+    reset_internal_for_test();
+}
+
+fn closure_cycle_with_queued_objects(count: usize) -> Arc<ConcurrentCycle> {
+    let objects: Vec<_> = (0..count).map(|_| willow_alloc(8)).collect();
+    let mut state = runtime().heap.lock().unwrap();
+    let cycle = Arc::new(ConcurrentCycle::with_index(
+        epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state)),
+        IdSet::default(),
+        IdMap::default(),
+        0,
+    ));
+    for object in objects {
+        cycle.enqueue(object);
+    }
+    marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+    crate::runtime::current()
+        .mark_phase()
+        .store(1, Ordering::Release);
+    cycle
+}
+
+#[test]
+fn closure_wave_keeps_draining_productive_batches_until_its_budget() {
+    let _guard = isolated_runtime();
+    for count in [1usize, 255, 256, 257, 4096, 20_000] {
+        reset_internal_for_test();
+        // A loaded host must not exhaust the remark stop budget either.
+        runtime()
+            .remark_observation
+            .work_ns
+            .store(100_000_000, Ordering::Relaxed);
+        let cycle = closure_cycle_with_queued_objects(count);
+        let mut waits = 0;
+        // An unlimited wave budget fixes the wave count independent of how
+        // fast the host traces; closure paces only between unfinished waves.
+        let (work, plan) = mark_closure::finish_with_wave_budget(
+            &cycle,
+            Instant::now(),
+            Duration::from_secs(3600),
+            |_| waits += 1,
+        )
+        .expect("queued work completes concurrently");
+        let waves = *cycle.closure_waves.lock().unwrap();
+        // The old 256-item wave needed ceil(count / 256) waves and waits.
+        assert_eq!(waits, 0, "count={count} {waves:?}");
+        assert_eq!(
+            waves,
+            mark_closure::ClosureWaves {
+                waves: 1,
+                drains: count.div_ceil(256) as u64,
+                ..Default::default()
+            },
+            "count={count}"
+        );
+        assert_eq!(work.marked_bytes, (count * (GC_HEADER_SIZE + 8)) as u64);
+        assert!(cycle.queue.snapshot().is_drained());
+        sweep::concurrent(plan);
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            (count * (GC_HEADER_SIZE + 8)) as i64
+        );
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        println!(
+            "closure_wave objects={count} waves={} drains={} waits={waits}",
+            waves.waves, waves.drains
+        );
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn closure_wave_budget_bounds_one_wave_and_repays_before_the_next() {
+    let _guard = isolated_runtime();
+    reset_internal_for_test();
+    runtime()
+        .remark_observation
+        .work_ns
+        .store(100_000_000, Ordering::Relaxed);
+    let count = 64;
+    let cycle = closure_cycle_with_queued_objects(count);
+    let mut delays = Vec::new();
+    // An expired wave still admits one drain, which always takes one item,
+    // then ends the wave: the budget, not the item batch, bounds a wave.
+    let (work, plan) =
+        mark_closure::finish_with_wave_budget(&cycle, Instant::now(), Duration::ZERO, |delay| {
+            delays.push(delay);
+        })
+        .expect("bounded waves still complete");
+    let waves = *cycle.closure_waves.lock().unwrap();
+    let expected = count as u64;
+    assert_eq!(waves.waves, expected, "{waves:?}");
+    assert_eq!(waves.drains, expected);
+    assert_eq!(waves.queue_pending, expected - 1);
+    assert_eq!(waves.stalled, 0);
+    assert_eq!(delays.len() as u64, expected - 1);
+    assert!(
+        delays
+            .iter()
+            .all(|&delay| delay >= Duration::from_millis(1))
+    );
+    assert_eq!(work.marked_bytes, (count * (GC_HEADER_SIZE + 8)) as u64);
+    sweep::concurrent(plan);
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+    reset_internal_for_test();
+}
+
+static EMPTY_SLICE_STEPS: crate::runtime::PerRuntime<AtomicUsize> =
+    crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
+
+/// Advances its cursor one slot per call without reporting any child, so each
+/// continuation completes a work item but adds no mark bytes.
+unsafe fn empty_range_slice(
+    _: *mut u8,
+    offset: usize,
+    _: usize,
+    _: &mut Vec<*mut u8>,
+) -> TraceSliceProgress {
+    if offset + 1 < EMPTY_SLICE_STEPS.load(Ordering::Relaxed) {
+        TraceSliceProgress::Continue(offset + 1)
+    } else {
+        TraceSliceProgress::Done
+    }
+}
+
+#[test]
+fn closure_counts_zero_slot_native_continuations_as_progress() {
+    let _guard = isolated_runtime();
+    // (slice calls, wave budget). Zero budget: one item per wave, so more
+    // byte-free waves than the stall bound. Unlimited budget: zero-byte drains
+    // must not end the wave after one 256-item batch.
+    let unlimited = Duration::from_secs(3600);
+    for (steps, budget) in [
+        (4 * mark_closure::MAX_STALLED_DRAIN_WAVES, Duration::ZERO),
+        (255, unlimited),
+        (257, unlimited),
+        (2000, unlimited),
+    ] {
+        reset_internal_for_test();
+        runtime()
+            .remark_observation
+            .work_ns
+            .store(100_000_000, Ordering::Relaxed);
+        EMPTY_SLICE_STEPS.store(steps, Ordering::Relaxed);
+        let object = willow_alloc_object(0xFA7A, 8);
+        let cycle = {
+            let mut state = runtime().heap.lock().unwrap();
+            let mut cycle = ConcurrentCycle::with_index(
+                epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state)),
+                IdSet::default(),
+                IdMap::default(),
+                0,
+            );
+            cycle.slices.insert(0xFA7A, empty_range_slice);
+            cycle.enqueue(object);
+            let cycle = Arc::new(cycle);
+            marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+            crate::runtime::current()
+                .mark_phase()
+                .store(1, Ordering::Release);
+            cycle
+        };
+        let mut waits = 0u64;
+        let (work, plan) =
+            mark_closure::finish_with_wave_budget(&cycle, Instant::now(), budget, |_| waits += 1)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "steps={steps} budget={budget:?} {:?} deferred={}",
+                        *cycle.closure_waves.lock().unwrap(),
+                        cycle.deferred.lock().unwrap().len()
+                    )
+                });
+        let waves = *cycle.closure_waves.lock().unwrap();
+        // The object trace runs slice 0; each later slice is one queue item.
+        let items = steps as u64;
+        let (expected_waves, expected_drains) = if budget.is_zero() {
+            (items, items)
+        } else {
+            (1, items.div_ceil(256))
+        };
+        assert_eq!(
+            waves,
+            mark_closure::ClosureWaves {
+                waves: expected_waves,
+                drains: expected_drains,
+                queue_pending: expected_waves - 1,
+                ..Default::default()
+            },
+            "steps={steps} budget={budget:?}"
+        );
+        assert_eq!(waits, expected_waves - 1);
+        assert_eq!(work.objects, items);
+        assert_eq!(work.marked_bytes, (GC_HEADER_SIZE + 8) as u64);
+        assert_eq!(work.scanned_bytes, 0);
+        assert!(cycle.queue.snapshot().is_drained());
+        sweep::concurrent(plan);
+        assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn closure_escalates_after_bounded_waves_without_progress() {
+    let _guard = isolated_runtime();
+    // Released before the cap: the election succeeds on the next wave. Never
+    // released: closure stops waiting after the stall bound, not all waves.
+    for release_after in [
+        Some(1usize),
+        Some(mark_closure::MAX_STALLED_DRAIN_WAVES - 1),
+        None,
+    ] {
+        reset_internal_for_test();
+        runtime()
+            .remark_observation
+            .work_ns
+            .store(100_000_000, Ordering::Relaxed);
+        let cycle = closure_cycle_with_queued_objects(0);
+        // A publication owner that never publishes: every source is drained
+        // and no drain is active, yet each remark election is rejected.
+        let mut owner = Some(cycle.termination.enter());
+        let mut waits = 0;
+        let finished = mark_closure::finish_with_wave_budget(
+            &cycle,
+            Instant::now(),
+            Duration::from_secs(3600),
+            |delay| {
+                assert!(delay >= Duration::from_millis(1));
+                waits += 1;
+                if Some(waits) == release_after {
+                    owner.take();
+                }
+            },
+        );
+        let waves = *cycle.closure_waves.lock().unwrap();
+        drop(owner);
+        match release_after {
+            Some(release) => {
+                let (_, plan) = finished.expect("released owner lets closure finish");
+                assert_eq!(waits, release);
+                assert_eq!(
+                    waves,
+                    mark_closure::ClosureWaves {
+                        waves: release as u64 + 1,
+                        drains: release as u64 + 1,
+                        candidate_rejected: release as u64,
+                        stalled: release as u64 + 1,
+                        ..Default::default()
+                    }
+                );
+                assert!(!cycle.stopped_completion_required.load(Ordering::Acquire));
+                sweep::concurrent(plan);
+            }
+            None => {
+                assert!(finished.is_none());
+                let stall = mark_closure::MAX_STALLED_DRAIN_WAVES as u64;
+                assert_eq!(waits as u64, stall - 1);
+                assert_eq!(
+                    waves,
+                    mark_closure::ClosureWaves {
+                        waves: stall,
+                        drains: stall,
+                        candidate_rejected: stall,
+                        stalled: stall,
+                        stall_escalations: 1,
+                        ..Default::default()
+                    }
+                );
+                assert!(cycle.stopped_completion_required.load(Ordering::Acquire));
+                let (_, plan, _) = mark_closure::finish_stopped(&cycle, Instant::now());
+                sweep::concurrent(plan.expect("stopped completion publishes a sweep plan"));
+            }
+        }
+        assert_eq!(
+            crate::runtime::current()
+                .mark_phase()
+                .load(Ordering::Acquire),
+            0
+        );
+        println!("closure_stall release_after={release_after:?} waves={waves:?}");
+    }
     reset_internal_for_test();
 }
 
