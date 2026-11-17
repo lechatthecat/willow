@@ -182,6 +182,44 @@ fn repeated_stores_into_one_owner_log_once() {
     reset_internal_for_test();
 }
 
+/// Sends into an old channel are remembered through the channel's header:
+/// one owner entry per minor, whatever the number of sends, and no send
+/// takes the heap lock. The queued values survive the minor intact.
+#[test]
+fn channel_sends_into_an_old_channel_log_one_owner_edge() {
+    let _guard = isolated_runtime();
+    quiet_heap();
+    let _registration = MutatorRegistration::new();
+    let mut tls = tlab_state_for_test();
+    let mut channel = crate::channel::willow_channel_new(1).cast::<u8>();
+    willow_push_root(&mut channel);
+    let header = HeapObject::from_payload(GcPayload::from_raw(channel).unwrap());
+    assert_eq!(header.generation(), GC_GENERATION_OLD, "channels start old");
+    let sends = 4 * EDGE_LOG_CAPACITY as u64;
+    let locks = shared_locks();
+    for value in 0..sends {
+        assert_eq!(
+            crate::channel::willow_channel_try_send_ptr(
+                channel.cast(),
+                young_object(&mut tls, value).cast()
+            ),
+            1
+        );
+    }
+    assert_eq!(shared_locks(), locks, "a send took the heap lock");
+    assert_eq!(pending_edges(), 1, "one owner entry covers every send");
+    stop();
+    assert!(remembered(channel));
+    verify().unwrap();
+    minor();
+    for value in 0..sends {
+        let received = crate::channel::willow_channel_recv_ptr(channel.cast()).cast::<u64>();
+        assert_eq!(unsafe { *received }, value);
+    }
+    willow_pop_root();
+    reset_internal_for_test();
+}
+
 #[test]
 fn write_lock_count_is_zero_for_any_number_of_stop_separated_batches() {
     let _guard = isolated_runtime();

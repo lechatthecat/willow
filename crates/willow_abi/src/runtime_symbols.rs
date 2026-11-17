@@ -70,6 +70,7 @@ const BLOCK_PANIC_ALLOC: RuntimeEffects = RuntimeEffects::MAY_BLOCK
     .union(RuntimeEffects::MAY_PANIC)
     .union(RuntimeEffects::MAY_ALLOCATE);
 const SUSPEND: RuntimeEffects = RuntimeEffects::MAY_SUSPEND;
+const SUSPEND_ALLOC: RuntimeEffects = SUSPEND.union(ALLOC);
 const PREEMPT: RuntimeEffects = RuntimeEffects::MAY_PREEMPT;
 const TASK_STACK: RuntimeEffects = RuntimeEffects::MAY_PREEMPT
     .union(RuntimeEffects::MAY_PANIC)
@@ -192,6 +193,9 @@ runtime_abi_schema! {
     NONE; willow_gc_write_barrier => ([Ptr, Ptr, Ptr, I64] -> None);
     // Arguments: buffer payload, element slot address, previous, value, destination.
     NONE; willow_gc_array_write_barrier => ([Ptr, Ptr, Ptr, Ptr, I64] -> None);
+    // Argument: a non-null unshared GC payload about to be stored into a
+    // shared object; publishes it without storing.
+    NONE; willow_gc_publish_stored_value => ([Ptr] -> None);
     PREEMPT; willow_gc_collect => ([] -> None);
     PREEMPT; willow_gc_minor_collect => ([] -> None);
     NONE; willow_gc_stats_snapshot_v1 => ([Ptr] -> Some(I32));
@@ -380,6 +384,7 @@ runtime_abi_schema! {
     PANIC_ALLOC; willow_channel_recv_opt_into => ([Ptr, Ptr] -> Some(I64));
     NONE; willow_channel_close => ([Ptr] -> None);
     SUSPEND; willow_channel_recv_ready => ([Ptr] -> Some(I32));
+    SUSPEND_ALLOC; willow_channel_recv_take => ([Ptr, Ptr] -> Some(I32));
     ALLOC; willow_channel_unregister_waiter => ([Ptr] -> None);
     ALLOC; willow_channel_select_cleanup => ([Ptr, Ptr, I64] -> None);
     PANIC_ALLOC; willow_channel_new_bounded => ([I64, I64] -> Some(Ptr));

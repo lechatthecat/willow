@@ -598,6 +598,8 @@ mod alloc_effects_tests {
         rt::willow_channel_recv_f64,
         rt::willow_channel_recv_ptr,
         rt::willow_channel_recv_opt_into,
+        // Waking a sender or receiver can collect under scheduler GC stress.
+        rt::willow_channel_recv_take,
         rt::willow_channel_new_bounded,
         rt::willow_nil_deref,
         rt::willow_int_div_panic,
@@ -817,6 +819,7 @@ mod alloc_effects_tests {
             rt::willow_map_len,
             rt::willow_gc_write_barrier,
             rt::willow_gc_array_write_barrier,
+            rt::willow_gc_publish_stored_value,
             rt::willow_push_root,
             rt::willow_pop_roots,
             rt::willow_root_depth,

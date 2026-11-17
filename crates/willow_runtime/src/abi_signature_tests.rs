@@ -85,6 +85,7 @@ fn gc_objects_metadata_and_root_slots_are_pointers() {
     let _: extern "C" fn(*mut u8, *mut u8, *mut u8, i64) = gc::willow_gc_write_barrier;
     let _: extern "C" fn(*mut u8, *mut u8, *mut u8, *mut u8, i64) =
         gc::willow_gc_array_write_barrier;
+    let _: extern "C" fn(*mut u8) = gc::willow_gc_publish_stored_value;
     let _: extern "C" fn() -> i64 = gc::willow_gc_allocated_bytes;
     let _: extern "C" fn(u64) -> u64 = gc::willow_gc_set_memory_limit;
     assert_schema("willow_gc_set_memory_limit", &[I64], Some(I64));
@@ -314,6 +315,8 @@ fn typed_scalar_rows_never_carry_a_word() {
     assert_schema("willow_channel_recv_ptr", &[Ptr], Some(Ptr));
     // (channel, out_payload) -> tag: 0 `Some`, 1 closed and drained.
     assert_schema("willow_channel_recv_opt_into", &[Ptr, Ptr], Some(I64));
+    // (channel, out_payload) -> 1 taken, 2 closed and drained, 0 parked.
+    assert_schema("willow_channel_recv_take", &[Ptr, Ptr], Some(I32));
     assert_schema("willow_channel_send_bool", &[Ptr, I8], None);
     assert_schema("willow_channel_send_f64", &[Ptr, F64], None);
     assert_schema("willow_atomic_i64_new", &[I64], Some(Ptr));
@@ -339,6 +342,7 @@ fn flags_ids_and_sizes_are_i64_next_to_native_pointers() {
         &[Ptr, Ptr, Ptr, Ptr, I64],
         None,
     );
+    assert_schema("willow_gc_publish_stored_value", &[Ptr], None);
     assert_schema("willow_gc_stats_snapshot", &[I64, Ptr, I64], Some(I64));
     assert_schema("willow_string_alloc", &[Ptr, I64], Some(Ptr));
     assert_schema("willow_sched_spawn", &[Ptr, Ptr], Some(I64));
@@ -397,6 +401,7 @@ fn channel_pointer_and_scalar_payloads_have_distinct_signatures() {
     let _: extern "C" fn(*mut c_void, *mut c_void) = channel::willow_channel_send_ptr;
     let _: extern "C" fn(*mut c_void) -> *mut c_void = channel::willow_channel_recv_ptr;
     let _: extern "C" fn(*mut c_void, *mut i64) -> i64 = channel::willow_channel_recv_opt_into;
+    let _: extern "C" fn(*mut c_void, *mut i64) -> i32 = channel::willow_channel_recv_take;
     let _: extern "C" fn(*mut c_void, i64) = channel::willow_channel_send_i64;
     let _: extern "C" fn(*mut c_void) -> i64 = channel::willow_channel_recv_i64;
     let _: extern "C" fn(*mut c_void, u8) = channel::willow_channel_send_bool;

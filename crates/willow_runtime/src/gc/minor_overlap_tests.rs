@@ -153,6 +153,11 @@ fn overlap_containers_and_async_frame_preserve_rewritten_edges() {
             _ => unsafe { *owner.cast::<*mut u8>() },
         };
         assert_ne!(value, young);
+        if kind == "channel" {
+            // A send publishes its young value; the minor then promotes the
+            // copy, which keeps the shared mark.
+            assert!(HeapObject::from_payload(GcPayload::from_raw(value).unwrap()).shared());
+        }
         assert_eq!(unsafe { *value.cast::<i64>() }, 987);
         assert!(cycle.is_marked(value as usize));
         assert_eq!(

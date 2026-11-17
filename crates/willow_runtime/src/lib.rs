@@ -181,6 +181,7 @@ pub extern "C" fn runtime_start(argc: i32, argv: *mut *mut c_char) {
     unsafe { generated_context::invoke(__willow_static_init as *const (), std::ptr::null_mut()) };
     unsafe { generated_context::invoke(willow_user_main as *const (), std::ptr::null_mut()) };
     drop(runtime_tlab);
+    gc::report_publication_stats_if_requested();
     gc::shutdown_mark_workers();
     gc_telemetry::flush_observations();
     panic_context::replace_current_context(previous_panic_context);

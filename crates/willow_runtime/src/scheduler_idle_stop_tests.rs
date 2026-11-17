@@ -96,10 +96,10 @@ fn is_idle(state: &ParallelRunState) -> bool {
 // only the state word. Completion publishes status in the third header word.
 type CounterFrame = [i64; crate::async_frame::ASYNC_FRAME_HEADER_WORDS as usize];
 
+/// Spawned frames are GC async frames (spawn and completion publish their
+/// reference slots), never Rust boxes. These carry no reference slots.
 fn counter_frame() -> *mut c_void {
-    Box::into_raw(Box::<CounterFrame>::new(
-        [0; crate::async_frame::ASYNC_FRAME_HEADER_WORDS as usize],
-    )) as *mut c_void
+    crate::async_frame::willow_async_frame_alloc(0, 0)
 }
 
 /// One node of an await chain: the id it awaits (0 for the tail), a turn
@@ -115,22 +115,23 @@ struct ChainFrame {
 }
 
 fn chain_frame(child: u64) -> *mut c_void {
-    Box::into_raw(Box::new(ChainFrame {
-        header: [0; crate::async_frame::ASYNC_FRAME_HEADER_WORDS as usize],
-        child,
-        turns: 0,
-        polls: 0,
-    })) as *mut c_void
+    // Three scalar data slots after the zeroed header: child, turns, polls.
+    let frame = crate::async_frame::willow_async_frame_alloc(3, 0);
+    assert!(!frame.is_null());
+    // SAFETY: the frame holds the header plus three word slots, matching
+    // `ChainFrame`'s `repr(C)` layout.
+    unsafe { (*(frame as *mut ChainFrame)).child = child };
+    frame
 }
 
-/// Reclaim a chain frame and read back what its poll function recorded.
+/// Read back what a chain frame's poll function recorded.
 ///
 /// # Safety
 ///
 /// `frame` must come from [`chain_frame`] and its task must be terminal, so no
 /// poll can still be holding a reference to it.
 unsafe fn take_chain_frame(frame: *mut c_void) -> ChainFrame {
-    *unsafe { Box::from_raw(frame as *mut ChainFrame) }
+    unsafe { std::ptr::read(frame as *const ChainFrame) }
 }
 
 /// How many chain nodes have registered themselves as waiters on the tail.
@@ -481,7 +482,6 @@ fn idle_14_run_until_returns_only_once_its_target_is_terminal() {
         -1,
         "the drive may not return while its target is still runnable"
     );
-    drop(unsafe { Box::from_raw(frame as *mut CounterFrame) });
 }
 
 #[test]
@@ -520,7 +520,6 @@ fn idle_17_run_until_reports_every_completion_it_drove() {
         completed <= others.len() as i64 + 1,
         "a re-drive must not double-count completions, got {completed}"
     );
-    drop(unsafe { Box::from_raw(frame as *mut CounterFrame) });
 }
 
 #[test]
@@ -537,9 +536,6 @@ fn idle_18_a_drive_strands_no_runnable_task_behind_its_own_stop() {
         "the stop decision left runnable work in a queue"
     );
     assert!(!scheduler_has_wake_source());
-    for frame in frames {
-        drop(unsafe { Box::from_raw(frame as *mut CounterFrame) });
-    }
 }
 
 #[test]
@@ -554,9 +550,6 @@ fn idle_19_more_tasks_than_workers_all_complete_in_one_drive() {
     assert_eq!(willow_sched_run(), count as i64);
     for id in ids {
         assert_eq!(willow_sched_task_state(id), -1);
-    }
-    for frame in frames {
-        drop(unsafe { Box::from_raw(frame as *mut CounterFrame) });
     }
 }
 

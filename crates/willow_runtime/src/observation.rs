@@ -84,6 +84,7 @@ pub(crate) enum Event {
     OutputCopies,
     ChannelOwnershipHashes,
     ChannelOwnershipScans,
+    ChannelInboxBatches,
     BuiltEvents,
 }
 
@@ -117,7 +118,7 @@ mod native_tests {
     use super::Event;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{LazyLock, Mutex};
-    const EVENTS: usize = 26;
+    const EVENTS: usize = 27;
     const AGGREGATE_EVENTS: usize = 12;
 
     pub(crate) struct Native {

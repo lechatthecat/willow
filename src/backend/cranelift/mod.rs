@@ -2014,13 +2014,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.stack_store(val, *slot);
             }
             VarStorage::ReferencePtr { var, ty } => {
-                let ptr = self.reference_cell_address(*var);
-                self.store_indirect_reference(ptr, val, ty);
+                let cell = self.builder.use_var(*var);
+                self.store_indirect_reference(cell, val, ty);
             }
             VarStorage::FrameReference { offset, ty } => {
                 let cell = self.frame_reference_cell(*offset);
-                let address = self.reference_cell_value_address(cell);
-                self.store_indirect_reference(address, val, ty);
+                self.store_indirect_reference(cell, val, ty);
             }
             VarStorage::Frame { offset, ty } => {
                 let base = self
@@ -2064,13 +2063,34 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().iadd(base, offset)
     }
 
+    /// Store through the reference cell `cell` (`{base, offset}`). A managed
+    /// value passes the cell's base (a payload start, or null for a native
+    /// stack slot) with the slot, so the barrier can publish a value stored
+    /// into a shared object and remember the slot's card.
     fn store_indirect_reference(
         &mut self,
-        ptr: cranelift_codegen::ir::Value,
+        cell: cranelift_codegen::ir::Value,
         val: cranelift_codegen::ir::Value,
         ty: &Type,
     ) {
-        self.emit_gc_heap_store(ptr, 0, val, ty, GcStoreDestination::IndirectReference);
+        if !is_gc_managed(ty, self.enum_infos) {
+            let address = self.reference_cell_value_address(cell);
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), val, address, 0);
+            return;
+        }
+        let ptr_ty = reference_type(self.module.target_config());
+        let base = self
+            .builder
+            .ins()
+            .load(ptr_ty, MemFlagsData::new(), cell, 0);
+        let offset = self
+            .builder
+            .ins()
+            .load(ptr_ty, MemFlagsData::new(), cell, 8);
+        let slot = self.builder.ins().iadd(base, offset);
+        self.emit_indirect_reference_store(base, slot, val);
     }
 
     /// If `target_ty` is an interface and `value`'s static type is a class that

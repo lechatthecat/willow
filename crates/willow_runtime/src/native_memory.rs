@@ -411,10 +411,11 @@ mod tests {
                     crate::gc_telemetry::external_bytes() - baseline,
                     count as u64 * per_channel
                 );
-                // Construction and one send each: no scan over prior channels.
+                // Construction (state and inbox owners) and one send each:
+                // no scan over prior channels.
                 assert_eq!(
                     crate::gc::native_reconciliation_observation().load(Ordering::Relaxed),
-                    2 * count
+                    3 * count
                 );
                 println!(
                     "native channels={count} reconciliations={} requested_bytes={} reset={reset}",

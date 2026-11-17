@@ -699,6 +699,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/ordered_locks.wi", "105\n15\n"),
         ("example/parent_child_locks.wi", "3\n6\n100\n101\n7\n3\n"),
         (
+            "example/task_publication.wi",
+            "499500\n2190\n50\n26\n1006\n2000\n",
+        ),
+        (
             "example/object_field_store.wi",
             "11\nfield-store\n36\n5\n9\n3\n200\nnone\n200\nsubclass\n42\n1999000\n",
         ),

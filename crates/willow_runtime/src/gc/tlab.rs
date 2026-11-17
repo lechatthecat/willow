@@ -576,6 +576,7 @@ pub(super) fn install_tlab_chunk(
         concurrent_marks,
         header_offsets,
     });
+    super::publish::install_chunk_owner(owner, state, state.tlab_chunks.len() - 1);
     let chunk = state.tlab_chunks.last().unwrap();
     owner.gc.root_tlabs.insert(chunk);
     // SAFETY: the generated TLS is owned by this allocation's mutator.

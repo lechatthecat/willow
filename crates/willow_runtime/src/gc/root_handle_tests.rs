@@ -105,11 +105,17 @@ fn scoped_loan_park_resume_cancel_panic_and_stack_alias() {
             let mut stack_alias = original;
             willow_push_root(&mut stack_alias);
             let token = unsafe { park_current_roots(0) };
+            // Both loans pin their young owner in place; a foreign (native
+            // boundary) loan also publishes it first.
+            let foreign = kind == "ffi";
             let run = |loan_address: *mut u8| {
                 minor_collect_internal();
                 assert_eq!(loan_address, original);
                 assert_eq!(stack_alias, original);
                 assert_eq!(unsafe { original.cast::<i64>().read() }, 37);
+                let object = HeapObject::from_payload(GcPayload::from_raw(original).unwrap());
+                assert_eq!(object.shared(), foreign);
+                assert_eq!(object.generation(), GC_GENERATION_OLD);
                 assert_eq!(willow_gc_pinned_promotions(), 1);
                 let pins = crate::gc_telemetry::pin_snapshot();
                 assert_eq!(pins.len(), 1);
@@ -162,10 +168,16 @@ fn scoped_loan_native_old_retired_and_nested_lifetimes() {
     let original = young_word(&mut tls, 23);
     retire_tlabs_for_thread(std::thread::current().id());
     let first = PinLease::<InteriorPointer>::for_address(unsafe { original.add(1) }).unwrap();
+    minor_collect_internal();
+    assert_eq!(first.load(), original);
+    assert_eq!(willow_gc_pinned_promotions(), 1);
+    // A foreign loan of the now pinned-old owner publishes it without a
+    // second promotion; both loans keep the address.
     let second = PinLease::<ForeignReference>::new(original);
     minor_collect_internal();
     assert_eq!(first.load(), original);
     assert_eq!(second.load(), original);
+    assert!(HeapObject::from_payload(GcPayload::from_raw(original).unwrap()).shared());
     assert_eq!(willow_gc_pinned_promotions(), 1);
     drop(first);
     assert_eq!(runtime().pin_lease_slots.len(), 1);

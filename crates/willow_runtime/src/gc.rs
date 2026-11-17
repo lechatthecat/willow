@@ -47,7 +47,12 @@ mod root;
 pub use root::*;
 mod barrier;
 mod mutator_log;
+mod publish;
 pub use barrier::*;
+pub(crate) use publish::{
+    PublicationPoint, finish_task_result_in, publish_frame_slots_in, publish_in,
+    report_publication_stats_if_requested, switch_task_owner, task_owner,
+};
 mod progress;
 pub use progress::{GcProgressV1, GcSkipReason, gc_progress, willow_gc_progress_v1};
 mod heap_snapshot;
@@ -297,6 +302,9 @@ pub struct GcHeader {
     /// call; only the runtime writes it, under the heap lock
     /// or with mutators stopped.
     pub remembered: u8,
+    /// Nonzero once published to shared state; never cleared. See
+    /// `willow_abi::gc_header::SHARED_OFFSET` and `gc::publish`.
+    pub shared: u8,
     /// Live: immutable descriptor address. During minor STW only, a moved
     /// source holds its destination payload address tagged with low bit 1;
     /// metadata then comes from that live destination. Reclaimed: original
@@ -392,7 +400,7 @@ struct GcState {
     old_lab_indices: IdMap<usize, usize>,
     old_lab_pending: pending_registry::Pending<usize>,
     /// Generated TLS states observed on allocation slow paths.
-    tlab_states: HashMap<usize, TlabStateRecord>,
+    tlab_states: IdMap<usize, TlabStateRecord>,
     tlab_accounting_observation: tlab::RuntimeAccountingObservation,
     minor_observation: minor::RuntimeMinorObservation,
     tlab_owners: HashMap<ThreadId, HashSet<usize>>,
@@ -451,11 +459,18 @@ struct GcState {
     /// Sparse card table keyed by absolute old-heap card. Region bounds make
     /// each dirty card attributable to one old/pinned region without changing
     /// the Stage-4 barrier ABI.
-    dirty_cards: HashSet<usize>,
+    dirty_cards: IdSet<usize>,
     write_barrier_hits: u64,
     minor_collections: u64,
     promoted_objects: u64,
     promoted_bytes: u64,
+    /// Bytes of young objects published since the last minor collection
+    /// (`gc::publish`). They stay young; the next minor retains the live ones
+    /// in place and accounts the rest as promoted-then-died.
+    published_young_bytes: u64,
+    /// Task owners of TLAB chunks, keyed by chunk base, kept only while the
+    /// publication verifier runs (`gc::publish`, `region::OwnerSegments`).
+    chunk_owners: IdMap<usize, OwnerSegments>,
     moved_objects: u64,
     survivor_stats: crate::gc_telemetry::GcSurvivorStats,
     old_region_allocations: u64,
@@ -1091,7 +1106,7 @@ impl Default for GcState {
             old_labs: Vec::new(),
             old_lab_indices: IdMap::default(),
             old_lab_pending: Default::default(),
-            tlab_states: HashMap::new(),
+            tlab_states: IdMap::default(),
             tlab_accounting_observation: tlab::RuntimeAccountingObservation::default(),
             minor_observation: minor::RuntimeMinorObservation::default(),
             tlab_owners: HashMap::new(),
@@ -1128,11 +1143,13 @@ impl Default for GcState {
             tlab_fast_allocated_bytes: 0,
             tlab_reserved_bytes: 0,
             remembered_set: remembered::RememberedSet::default(),
-            dirty_cards: HashSet::new(),
+            dirty_cards: IdSet::default(),
             write_barrier_hits: 0,
             minor_collections: 0,
             promoted_objects: 0,
             promoted_bytes: 0,
+            published_young_bytes: 0,
+            chunk_owners: IdMap::default(),
             moved_objects: 0,
             survivor_stats: Default::default(),
             old_region_allocations: 0,
@@ -1220,7 +1237,7 @@ pub(crate) struct GcRuntime {
     /// Interned runtime-allocation descriptors referenced by this heap's
     /// headers; declared after `heap` so it outlives every header reference.
     layouts: layouts::Layouts,
-    write_barrier_calls: AtomicU64,
+    write_barrier_calls: barrier::BarrierCallCounter,
     /// Entries applied from mutator logs at stops (telemetry).
     mutator_log_drained_entries: AtomicU64,
     /// Conservative nursery-presence gate: set before the first TLAB can
@@ -1256,6 +1273,15 @@ pub(crate) struct GcRuntime {
     concurrent_slice_registry: Mutex<IdMap<u32, ConcurrentTraceSliceFn>>,
     drop_registry: Mutex<HashMap<u32, DropFn>>,
     minor_registry_cache: Mutex<MinorRegistryCache>,
+    /// Advances with every change of the minor registry snapshot, so a
+    /// publication can reuse a thread-cached snapshot without the cache lock.
+    minor_registry_generation: std::sync::atomic::AtomicU64,
+    /// Smallest (high half) and largest (low half) type id that ever had a
+    /// trace hook; only widens. A publication looks hooks up only for type
+    /// ids inside it, so publishing generated objects reads no registry.
+    trace_type_range: std::sync::atomic::AtomicU64,
+    /// Publication counters and parked publications (`publish`).
+    publication: publish::Publication,
     /// Advances only when registered hooks are invalidated. Runtime container
     /// types use this to cache per-generation registration without taking the
     /// registry mutex on every allocation.
@@ -1309,7 +1335,7 @@ impl GcRuntime {
             storage_allocator,
             heap: crate::gc_telemetry::observations::GcMutex::new(heap),
             layouts: layouts::Layouts::default(),
-            write_barrier_calls: AtomicU64::new(0),
+            write_barrier_calls: barrier::BarrierCallCounter::new(),
             mutator_log_drained_entries: AtomicU64::new(0),
             tlab_ever_allocated: std::sync::atomic::AtomicBool::new(false),
             collect_lock: Mutex::new(()),
@@ -1334,6 +1360,9 @@ impl GcRuntime {
             concurrent_slice_registry: Mutex::new(IdMap::default()),
             drop_registry: Mutex::new(HashMap::new()),
             minor_registry_cache: Mutex::new(MinorRegistryCache::default()),
+            minor_registry_generation: std::sync::atomic::AtomicU64::new(0),
+            trace_type_range: std::sync::atomic::AtomicU64::new(registry::EMPTY_TRACE_TYPE_RANGE),
+            publication: publish::Publication::default(),
             registry_generation: std::sync::atomic::AtomicU64::new(1),
             native_registrations: NativeGcRegistrations::new(),
             path_observation: RuntimePathObservation::default(),
@@ -1501,6 +1530,7 @@ fn initialize_generated_object_at_for_test(
             generation: GC_GENERATION_YOUNG,
             age: 0,
             remembered: 0,
+            shared: 0,
             descriptor_owned: false,
             descriptor: descriptor as *const _ as usize,
         });
@@ -3127,6 +3157,17 @@ fn reset_internal() {
     state.old_reserved_bytes = 0;
     state.region_cache.shrink_to(0);
     minor::release_survivor_reserve(&mut state);
+    state.chunk_owners.clear();
+    // Every young object goes below: no published young bytes remain, and
+    // no handed-over task owner may leak into a later heap's verifier (a
+    // reused runtime's task ids repeat).
+    state.published_young_bytes = 0;
+    runtime()
+        .publication
+        .handed_over_owners
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
     for chunk in state.tlab_chunks.drain(..) {
         let mut offset = 0;
         while offset < chunk.used {
@@ -3201,6 +3242,7 @@ fn reset_internal() {
     state.write_barrier_hits = 0;
     state.minor_collections = 0;
     state.promoted_objects = 0;
+    state.published_young_bytes = 0;
     state.promoted_bytes = 0;
     state.moved_objects = 0;
     state.survivor_stats = Default::default();

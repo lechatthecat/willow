@@ -91,6 +91,11 @@ pub const WILLOW_FRAME_STATUS_PANICKED: i64 = willow_abi::FrameTerminalStatus::P
 pub const WILLOW_FRAME_STATUS_TERMINAL_MASK: i64 = willow_abi::frame_status::TERMINAL_MASK;
 /// Cancellation was requested but the task has not reached the boundary yet.
 pub const WILLOW_FRAME_STATUS_CANCEL_REQUESTED: i64 = willow_abi::frame_status::CANCEL_REQUESTED;
+/// A publication reached the task's handle (runtime-only bit).
+pub const WILLOW_FRAME_STATUS_RESULT_ESCAPED: i64 = willow_abi::frame_status::RESULT_ESCAPED;
+/// The result was handed over to the handle's holder unpublished.
+pub const WILLOW_FRAME_STATUS_RESULT_HANDED_OVER: i64 =
+    willow_abi::frame_status::RESULT_HANDED_OVER;
 
 /// Pointer to the atomic status word, or null for a null frame.
 ///
@@ -157,6 +162,37 @@ pub fn frame_request_cancel(frame: *mut c_void) {
     if let Some(word) = unsafe { status_word(frame).as_ref() } {
         word.fetch_or(WILLOW_FRAME_STATUS_CANCEL_REQUESTED, Ordering::Release);
     }
+}
+
+/// A publication reached the task handle `frame`: its result may now be read
+/// by other tasks. True when the task already finished and handed its result
+/// over unpublished: the caller must publish that result now. Exactly one
+/// caller sees true. O(1); one load once the handle has escaped.
+pub fn frame_mark_result_escaped(frame: *mut c_void) -> bool {
+    let Some(word) = (unsafe { status_word(frame).as_ref() }) else {
+        return false;
+    };
+    if word.load(Ordering::Acquire) & WILLOW_FRAME_STATUS_RESULT_ESCAPED != 0 {
+        return false;
+    }
+    let previous = word.fetch_or(WILLOW_FRAME_STATUS_RESULT_ESCAPED, Ordering::AcqRel);
+    previous & (WILLOW_FRAME_STATUS_RESULT_ESCAPED | WILLOW_FRAME_STATUS_RESULT_HANDED_OVER)
+        == WILLOW_FRAME_STATUS_RESULT_HANDED_OVER
+}
+
+/// The task of `frame` finished; called after its result slot is written and
+/// before its terminal code is published. True when its handle has not
+/// escaped: the result is handed over, unpublished, to the handle's sole
+/// holder (a later escape publishes it, see [`frame_mark_result_escaped`]).
+/// False: the caller publishes the result. The single read-modify-write on
+/// the status word orders this against a racing escape.
+pub fn frame_hand_over_result(frame: *mut c_void) -> bool {
+    let Some(word) = (unsafe { status_word(frame).as_ref() }) else {
+        return false;
+    };
+    word.fetch_or(WILLOW_FRAME_STATUS_RESULT_HANDED_OVER, Ordering::AcqRel)
+        & WILLOW_FRAME_STATUS_RESULT_ESCAPED
+        == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +296,56 @@ mod tests {
     // -------------------------------------------------------------------------
     // F1: willow_async_frame_alloc returns non-null
     // -------------------------------------------------------------------------
+    #[test]
+    fn result_handover_and_escape_race_publish_exactly_once() {
+        // Per round, one thread finishes the task while another publishes its
+        // handle: the result is published exactly when it was handed over
+        // before the escape, never twice and never not at all.
+        let _guard = isolated_runtime();
+        reset();
+        let mut frame = willow_async_frame_alloc(1, 0) as *mut u8;
+        willow_push_root(&mut frame as *mut *mut u8);
+        let word = frame as usize;
+        for _ in 0..20_000 {
+            unsafe { status_word(word as *mut c_void).as_ref() }
+                .unwrap()
+                .store(0, Ordering::Relaxed);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let other = std::sync::Arc::clone(&barrier);
+            let escaper = std::thread::spawn(move || {
+                other.wait();
+                frame_mark_result_escaped(word as *mut c_void)
+            });
+            barrier.wait();
+            let handed_over = frame_hand_over_result(word as *mut c_void);
+            let escape_publishes = escaper.join().unwrap();
+            // Handed over: the escape publishes. Not handed over: the
+            // finishing task published, the escape must not.
+            assert_eq!(handed_over, escape_publishes);
+            assert!(!frame_mark_result_escaped(word as *mut c_void), "once");
+        }
+        willow_pop_root();
+        reset();
+    }
+
+    #[test]
+    fn result_status_bits_leave_terminal_and_cancel_bits_alone() {
+        let _guard = isolated_runtime();
+        reset();
+        let mut frame = willow_async_frame_alloc(1, 0);
+        willow_push_root(&mut frame as *mut *mut c_void as *mut *mut u8);
+        assert!(frame_hand_over_result(frame));
+        assert!(frame_mark_result_escaped(frame));
+        assert!(!frame_is_terminal(frame));
+        assert_eq!(willow_frame_is_cancelled(frame), 0);
+        frame_publish_terminal(frame, WILLOW_FRAME_STATUS_COMPLETED);
+        assert_eq!(frame_terminal_status(frame), WILLOW_FRAME_STATUS_COMPLETED);
+        assert!(!frame_hand_over_result(std::ptr::null_mut()));
+        assert!(!frame_mark_result_escaped(std::ptr::null_mut()));
+        willow_pop_root();
+        reset();
+    }
+
     #[test]
     fn frame_f1_alloc_returns_non_null() {
         let _guard = isolated_runtime();

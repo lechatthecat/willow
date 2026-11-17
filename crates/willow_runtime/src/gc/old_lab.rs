@@ -450,6 +450,24 @@ pub(crate) fn retire_served_in(previous: &crate::runtime::Runtime) {
     }
 }
 
+/// Visit each still-unindexed object without indexing it (diagnostics at a
+/// stop). O(pending objects).
+pub(super) fn for_each_unindexed(
+    state: &GcState,
+    mut visit: impl FnMut(HeapObject) -> Result<(), String>,
+) -> Result<(), String> {
+    for record in &state.old_labs {
+        let inner = record.lab.inner.lock().unwrap_or_else(|p| p.into_inner());
+        for &(offset, _) in &inner.pending[inner.pending_index..] {
+            visit(
+                HeapObject::from_raw((inner.base + offset) as *mut GcHeader)
+                    .expect("pending buffer object has an initialized header"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Runtime destruction needs payload finalization, not a new region index.
 /// Visit each still-unindexed object once and invalidate every cached buffer
 /// before the runtime releases its regions.

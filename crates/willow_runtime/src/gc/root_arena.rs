@@ -69,7 +69,11 @@ impl GcRootHandle {
 
     /// A private root keeps its owning heap alive until the slot is removed.
     /// The registry retains only the slot address, so this does not form a cycle.
+    ///
+    /// Such a root is held outside any task's stack (by a thread that need
+    /// not run this runtime's tasks), so its value is published first.
     pub(crate) fn new_in(owner: Arc<crate::runtime::Runtime>, value: *mut u8) -> Self {
+        super::publish::publish_in(&owner, value, super::PublicationPoint::RuntimeRoot, false);
         let cell = Arc::new(GcRootCell(std::sync::atomic::AtomicPtr::new(value)));
         root::add_runtime_root_slot_in(&owner, cell.0.as_ptr());
         Self {
@@ -95,6 +99,9 @@ impl GcRootHandle {
 
     pub(crate) fn store(&self, value: *mut u8) {
         let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+        if let Some(owner) = self.owner.as_deref() {
+            super::publish::publish_in(owner, value, super::PublicationPoint::RuntimeRoot, false);
+        }
         self.cell.cell().replace(value, |old| {
             barrier::write_barrier_in(
                 self.owner(),
@@ -163,12 +170,32 @@ impl PinLease<InteriorPointer> {
                 })
                 .map(|object| object.payload().as_ptr())
         };
-        owner.map(Self::new)
+        owner.map(Self::lease)
+    }
+}
+
+impl PinLease<ForeignReference> {
+    /// Lend `value` to native code (a Rust bridge call). Native code may read
+    /// it (and what it references) from any thread until Drop, so it is
+    /// published first, and the loan roots it where it lies.
+    pub(crate) fn new(value: *mut u8) -> Self {
+        let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+        super::publish::publish_in(
+            crate::runtime::current(),
+            value,
+            super::PublicationPoint::NativeBoundary,
+            false,
+        );
+        Self::lease(value)
     }
 }
 
 impl<T> PinLease<T> {
-    pub(crate) fn new(value: *mut u8) -> Self {
+    /// Root `value` at its current address until Drop. An interior loan
+    /// (`for_address`) is the runtime's own synchronous copy out of borrowed
+    /// storage on this task's thread: no other task can reach the object
+    /// through it, so it pins rather than publishes.
+    fn lease(value: *mut u8) -> Self {
         let _no_preempt = crate::preempt::NoPreemptGuard::enter();
         let root = GcRootHandle::new(value);
         runtime().pin_lease_slots.add(root.slot().cast());

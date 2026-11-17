@@ -11,6 +11,23 @@ pub(super) struct MinorRegistrySnapshot {
     /// Only opaque native payloads are excluded from inline-TLAB allocation.
     pub generated_drop: bool,
     generation: u64,
+    /// Smallest traced type id and the span up to the largest: a type id
+    /// outside the range has no hook without a map probe (generated
+    /// objects, the common case, carry no hook).
+    trace_min: u32,
+    trace_span: u32,
+}
+
+impl MinorRegistrySnapshot {
+    /// The trace hook registered for `type_id`. O(1); a probe only for a type
+    /// id inside the registered range.
+    #[inline]
+    pub(super) fn trace_hook(&self, type_id: u32) -> Option<TraceFn> {
+        if type_id.wrapping_sub(self.trace_min) > self.trace_span || self.trace.is_empty() {
+            return None;
+        }
+        self.trace.get(&type_id).copied()
+    }
 }
 
 #[derive(Default)]
@@ -54,11 +71,15 @@ pub(super) fn minor_registry_snapshot_in(gc: &GcRuntime) -> std::sync::Arc<Minor
             (id, hook)
         })
         .collect();
+    let trace_min = trace.keys().copied().min().unwrap_or(0);
+    let trace_max = trace.keys().copied().max().unwrap_or(0);
     let snapshot = std::sync::Arc::new(MinorRegistrySnapshot {
         trace: trace.iter().map(|(&id, &hook)| (id, hook)).collect(),
         drops,
         generated_drop,
         generation: cache.generation,
+        trace_min,
+        trace_span: trace_max - trace_min,
     });
     cache.snapshot = Some(std::sync::Arc::clone(&snapshot));
     snapshot
@@ -68,6 +89,26 @@ pub(super) fn clear_hook_registries() {
     clear_hook_registries_in(runtime());
 }
 
+/// No type id has a trace hook: minimum `u32::MAX` above maximum zero.
+pub(super) const EMPTY_TRACE_TYPE_RANGE: u64 = (u32::MAX as u64) << 32;
+
+/// Called with the registry locks held, so widenings never race. An object
+/// of a hooked type is allocated after its type's registration, so any
+/// publication of it observes the widened range.
+fn widen_trace_type_range(gc: &GcRuntime, type_id: u32) {
+    let (min, max) = trace_type_range_in(gc);
+    let range = (u64::from(min.min(type_id)) << 32) | u64::from(max.max(type_id));
+    gc.trace_type_range.store(range, Ordering::Release);
+}
+
+/// Inclusive range of type ids that may have a trace hook (empty when the
+/// minimum exceeds the maximum). It only widens: unregistering keeps it.
+#[inline(always)]
+pub(super) fn trace_type_range_in(gc: &GcRuntime) -> (u32, u32) {
+    let range = gc.trace_type_range.load(Ordering::Acquire);
+    ((range >> 32) as u32, range as u32)
+}
+
 fn clear_hook_registries_in(gc: &GcRuntime) {
     let mut cache = gc.minor_registry_cache.lock().unwrap();
     gc.trace_registry.lock().unwrap().clear();
@@ -75,6 +116,7 @@ fn clear_hook_registries_in(gc: &GcRuntime) {
     gc.concurrent_slice_registry.lock().unwrap().clear();
     gc.drop_registry.lock().unwrap().clear();
     cache.changed();
+    gc.minor_registry_generation.fetch_add(1, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -185,6 +227,7 @@ fn register_hooks_in(
     let mut traces = gc.concurrent_trace_registry.lock().unwrap();
     let mut slices = gc.concurrent_slice_registry.lock().unwrap();
     legacy.insert(type_id, stopped);
+    widen_trace_type_range(gc, type_id);
     traces.remove(&type_id);
     slices.remove(&type_id);
     if let Some(trace) = trace {
@@ -194,6 +237,7 @@ fn register_hooks_in(
         slices.insert(type_id, slice);
     }
     cache.changed();
+    gc.minor_registry_generation.fetch_add(1, Ordering::Release);
 }
 
 /// Current registered native capabilities, in unspecified order. Already-running
@@ -300,6 +344,7 @@ fn unregister_type_in(gc: &GcRuntime, type_id: u32) {
     traces.remove(&type_id);
     slices.remove(&type_id);
     cache.changed();
+    gc.minor_registry_generation.fetch_add(1, Ordering::Release);
     gc.registry_generation.fetch_add(1, Ordering::AcqRel);
 }
 
@@ -464,6 +509,7 @@ fn register_drop_in(gc: &GcRuntime, type_id: u32, drop_fn: DropFn) {
     let mut cache = gc.minor_registry_cache.lock().unwrap();
     gc.drop_registry.lock().unwrap().insert(type_id, drop_fn);
     cache.changed();
+    gc.minor_registry_generation.fetch_add(1, Ordering::Release);
 }
 
 pub(super) fn lookup_drop(type_id: u32) -> Option<DropFn> {

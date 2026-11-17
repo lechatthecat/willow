@@ -282,6 +282,69 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    /// A `recv` suspension: one fused runtime take, parking only when the
+    /// channel is empty and open.
+    fn emit_lir_channel_recv(
+        &mut self,
+        function: &LirFunction,
+        operation: &SuspendOp,
+        suspends: &mut CoopSuspendPoints,
+        frame: cranelift_codegen::ir::Value,
+    ) {
+        let &SuspendOp::ChannelRecv {
+            channel,
+            result,
+            ref elem_ty,
+            closed_aware,
+        } = operation
+        else {
+            unreachable!("only a channel receive suspension is emitted here");
+        };
+        let check = self.builder.create_block();
+        self.builder.ins().jump(check, &[]);
+        let state = (suspends.len() + 1) as i64;
+        self.record_coop_suspend(suspends, check);
+        self.builder.switch_to_block(check);
+        let channel_value = self.load_lir_local(function, channel);
+        // One runtime call takes the value under one channel lock;
+        // only a closed, drained channel falls back to the ordinary
+        // receive, which raises or answers `None`.
+        let (status, slot) = self.emit_channel_recv_take(channel_value);
+        let taken = self.builder.create_block();
+        let not_taken = self.builder.create_block();
+        let closed = self.builder.create_block();
+        let park = self.builder.create_block();
+        let done = self.builder.create_block();
+        let is_taken = self.builder.ins().icmp_imm_s(IntCC::Equal, status, 1);
+        self.builder
+            .ins()
+            .brif(is_taken, taken, &[], not_taken, &[]);
+        self.builder.switch_to_block(not_taken);
+        self.builder.ins().brif(status, closed, &[], park, &[]);
+        self.builder.switch_to_block(park);
+        let state = self.builder.ins().iconst(types::I64, state);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), state, frame, 0);
+        self.emit_coop_unwind_poll_roots();
+        let pending = self.builder.ins().iconst(types::I32, 0);
+        self.builder.ins().return_(&[pending]);
+        self.builder.switch_to_block(taken);
+        let value = self.emit_channel_taken_value(slot, elem_ty, closed_aware);
+        if let Some(result) = result {
+            self.store_lir_local(function, result, value);
+        }
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(closed);
+        let channel_value = self.load_lir_local(function, channel);
+        let value = self.emit_channel_recv(channel_value, elem_ty, closed_aware);
+        if let Some(result) = result {
+            self.store_lir_local(function, result, value);
+        }
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(done);
+    }
+
     fn emit_lir_suspend(
         &mut self,
         function: &LirFunction,
@@ -336,38 +399,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_coop_awaited_result(task_frame, None, *cancel_aware);
                 }
             }
-            SuspendOp::ChannelRecv {
-                channel,
-                result,
-                elem_ty,
-                closed_aware,
-            } => {
-                let check = self.builder.create_block();
-                self.builder.ins().jump(check, &[]);
-                let state = (suspends.len() + 1) as i64;
-                self.record_coop_suspend(suspends, check);
-                self.builder.switch_to_block(check);
-                let channel_value = self.load_lir_local(function, *channel);
-                let ready =
-                    self.emit_value_runtime_call(rt::willow_channel_recv_ready, &[channel_value]);
-                let receive = self.builder.create_block();
-                let park = self.builder.create_block();
-                let ready = self.builder.ins().icmp_imm_s(IntCC::NotEqual, ready, 0);
-                self.builder.ins().brif(ready, receive, &[], park, &[]);
-                self.builder.switch_to_block(park);
-                let state = self.builder.ins().iconst(types::I64, state);
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), state, frame, 0);
-                self.emit_coop_unwind_poll_roots();
-                let pending = self.builder.ins().iconst(types::I32, 0);
-                self.builder.ins().return_(&[pending]);
-                self.builder.switch_to_block(receive);
-                let channel_value = self.load_lir_local(function, *channel);
-                let value = self.emit_channel_recv(channel_value, elem_ty, *closed_aware);
-                if let Some(result) = result {
-                    self.store_lir_local(function, *result, value);
-                }
+            SuspendOp::ChannelRecv { .. } => {
+                self.emit_lir_channel_recv(function, operation, suspends, frame);
             }
             SuspendOp::ChannelSend {
                 channel,

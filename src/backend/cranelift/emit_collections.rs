@@ -71,6 +71,49 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    /// Fused receive of a `recv` suspension: `willow_channel_recv_take`
+    /// answers 1 (taken), 2 (closed and drained) or 0 (parked), and on 1 the
+    /// taken storage word is in the returned slot.
+    pub(super) fn emit_channel_recv_take(
+        &mut self,
+        channel: cranelift_codegen::ir::Value,
+    ) -> (
+        cranelift_codegen::ir::Value,
+        cranelift_codegen::ir::StackSlot,
+    ) {
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            0,
+        ));
+        let ptr_ty = reference_type(self.module.target_config());
+        let address = self.builder.ins().stack_addr(ptr_ty, slot, 0);
+        let status =
+            self.emit_value_runtime_call(rt::willow_channel_recv_take, &[channel, address]);
+        (status, slot)
+    }
+
+    /// The value of a receive from the storage word the fused take wrote:
+    /// the element, or `Some(element)` for a close-aware receive.
+    pub(super) fn emit_channel_taken_value(
+        &mut self,
+        slot: cranelift_codegen::ir::StackSlot,
+        elem_ty: &Type,
+        closed_aware: bool,
+    ) -> cranelift_codegen::ir::Value {
+        let payload = self.stack_load(types::I64, slot);
+        if !closed_aware {
+            return self.emit_from_storage_word(payload, elem_ty);
+        }
+        let option = Builtin::Option.apply(vec![elem_ty.clone()]);
+        if super::option_repr::is_scalar_pair(&option) {
+            let some = self.builder.ins().iconst(types::I64, 0);
+            return self.emit_pair(some, payload);
+        }
+        let payload = self.emit_from_storage_word(payload, elem_ty);
+        self.emit_alloc_option_some(elem_ty, payload)
+    }
+
     /// Build an `Option<value_ty>` from a runtime tag (0 `Some`, nonzero
     /// `None`) and the `Some` payload's storage word.
     fn emit_option_from_tag_payload(

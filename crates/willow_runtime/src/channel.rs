@@ -58,6 +58,31 @@ struct WillowChannelState {
     next_generation: u64,
     native_tables: [usize; 2],
     deferred_wakes: [bool; 2],
+    /// Mirror of `Inbox::open`, written only with both locks held.
+    inbox_open: bool,
+}
+
+/// Sends that arrive while no receiver waits on an open unbounded channel.
+/// They append here under this lock alone, so producers stop contending with
+/// the receiver for the state lock; a receiver that finds no unreserved value
+/// in `values` moves the whole inbox there with one acquisition. The logical
+/// queue is `values` followed by `values` of the inbox.
+///
+/// Invariants: the inbox is open only for an unbounded, unclosed channel with
+/// no receive waiters, and it is empty while closed. The state lock is always
+/// taken before this one, and `open` changes only with both held, so every
+/// state-lock holder that sees `inbox_open == false` sees an empty inbox and
+/// every waiter, claim and close decision keeps its single-queue meaning.
+#[derive(Default)]
+struct Inbox {
+    values: VecDeque<WillowChannelValue>,
+    open: bool,
+}
+
+impl crate::native_memory::Footprint for Inbox {
+    fn native_bytes(&mut self) -> usize {
+        self.values.capacity() * size_of::<WillowChannelValue>()
+    }
 }
 
 impl crate::native_memory::Footprint for WillowChannelState {
@@ -86,6 +111,10 @@ pub struct WillowAbiChannel {
 
 pub struct ChannelCore {
     state: Mutex<WillowChannelState>,
+    inbox: Mutex<Inbox>,
+    /// Lock-free hint of `Inbox::open` so a send to a closed inbox (bounded
+    /// channel, parked receiver) skips its lock; the lock decides.
+    inbox_hint: std::sync::atomic::AtomicBool,
     /// True when the element type is a GC reference (String / class / array /
     /// ...): queued values are then GC roots scanned by the collector
     /// (channel payload GC tracing).
@@ -104,6 +133,8 @@ impl WillowAbiChannel {
         Self {
             inner: Box::new(ChannelCore {
                 state: Mutex::with_base(WillowChannelState::default(), size_of::<ChannelCore>()),
+                inbox: Mutex::new(Inbox::default()),
+                inbox_hint: std::sync::atomic::AtomicBool::new(false),
                 is_ref,
             }),
         }
@@ -139,6 +170,20 @@ unsafe fn trace_channel(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     for value in &mut state.values {
         slots.push(std::ptr::addr_of_mut!(value.ptr_value).cast::<*mut u8>());
     }
+    // Inbox values are traced where they lie. Moving them into `values` here
+    // could grow its buffer, and the guard's native-memory recharge would
+    // take the heap lock the stopped-world collector already holds. With
+    // every mutator stopped no push can move the inbox buffer before the
+    // collector rewrites these slots.
+    if state.inbox_open {
+        let mut inbox = channel
+            .inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for value in &mut inbox.values {
+            slots.push(std::ptr::addr_of_mut!(value.ptr_value).cast::<*mut u8>());
+        }
+    }
 }
 
 unsafe fn snapshot_channel(payload: *mut u8, children: &mut Vec<*mut u8>) {
@@ -156,6 +201,19 @@ unsafe fn snapshot_channel(payload: *mut u8, children: &mut Vec<*mut u8>) {
                 .iter()
                 .map(|value| unsafe { value.ptr_value as *mut u8 }),
         );
+        // Copied, never absorbed: GC paths must not change native accounting.
+        if state.inbox_open {
+            let inbox = channel
+                .inbox
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            children.extend(
+                inbox
+                    .values
+                    .iter()
+                    .map(|value| unsafe { value.ptr_value as *mut u8 }),
+            );
+        }
     }
 }
 
@@ -175,16 +233,45 @@ unsafe fn snapshot_channel_slice(
         Err(std::sync::TryLockError::WouldBlock) => return TraceSliceProgress::Retry,
         Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
     };
+    // The scan covers the logical queue `values ++ inbox`. Absorbing the inbox
+    // and closing it keep that order, receives pop at the front (adjusting the
+    // window), and every send appends at the end, past the window, under the
+    // send barrier. Inbox values are read in place, never absorbed: a GC path
+    // must not change native accounting (its recharge can take the heap lock).
+    let values_len = state.values.len();
+    let needs_inbox = state.inbox_open
+        && (cursor == 0
+            || state.gc_scan_position + state.gc_scan_remaining.min(limit) > values_len);
+    let inbox = if needs_inbox {
+        match channel.inbox.try_lock() {
+            Ok(inbox) => Some(inbox),
+            Err(std::sync::TryLockError::WouldBlock) => return TraceSliceProgress::Retry,
+            Err(std::sync::TryLockError::Poisoned(poison)) => Some(poison.into_inner()),
+        }
+    } else {
+        None
+    };
     if cursor == 0 {
+        // Sends queued before marking began carry no barrier shading: the
+        // snapshot must hold them, so the whole logical queue is scanned.
         state.gc_scan_position = 0;
-        state.gc_scan_remaining = state.values.len();
+        state.gc_scan_remaining = values_len + inbox.as_ref().map_or(0, |inbox| inbox.values.len());
     }
     let count = state.gc_scan_remaining.min(limit);
     let end = state.gc_scan_position + count;
     for index in state.gc_scan_position..end {
         // Indexed VecDeque access is O(1), including a wrapped backing buffer.
-        children.push(unsafe { state.values[index].ptr_value }.cast());
+        let value = if index < values_len {
+            &state.values[index]
+        } else {
+            &inbox
+                .as_ref()
+                .expect("a scan window past the queue lies in the open inbox")
+                .values[index - values_len]
+        };
+        children.push(unsafe { value.ptr_value }.cast());
     }
+    drop(inbox);
     state.gc_scan_position = end;
     state.gc_scan_remaining -= count;
     if state.gc_scan_remaining == 0 {
@@ -229,6 +316,67 @@ const CHANNEL_REGISTRATION_COUNT: crate::observation::Counter =
 fn ensure_channel_registered() {
     if CHANNEL_REGISTRATION.ensure(CHANNEL_GC_TYPES) {
         crate::observation::record(crate::observation::Event::ChannelRegistrationCount, 1);
+    }
+}
+
+/// Move every inbox value to the back of `values`: one inbox acquisition per
+/// batch, O(1) when `values` is empty (the buffers swap). A no-op while the
+/// inbox is closed, since a closed inbox is empty.
+fn absorb_inbox(channel: &ChannelCore, state: &mut WillowChannelState) {
+    if state.inbox_open {
+        let mut inbox = channel
+            .inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        append_inbox(state, &mut inbox);
+    }
+}
+
+fn append_inbox(state: &mut WillowChannelState, inbox: &mut Inbox) {
+    if inbox.values.is_empty() {
+        return;
+    }
+    crate::observation::record(crate::observation::Event::ChannelInboxBatches, 1);
+    if state.values.is_empty() {
+        // Nothing to scan or pop remains in an empty deque, so its scan
+        // offsets are already zero.
+        std::mem::swap(&mut state.values, &mut inbox.values);
+    } else {
+        state.values.append(&mut inbox.values);
+    }
+}
+
+/// Close the inbox before a receiver registers as a waiter, keeping every
+/// value it held at the back of `values`.
+fn close_inbox(channel: &ChannelCore, state: &mut WillowChannelState) {
+    if state.inbox_open {
+        let mut inbox = channel.inbox.lock().expect("channel inbox poisoned");
+        append_inbox(state, &mut inbox);
+        inbox.open = false;
+        channel
+            .inbox_hint
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        state.inbox_open = false;
+    }
+}
+
+/// Reopen the inbox once a receive leaves no receive waiter on an open
+/// unbounded channel.
+fn open_inbox_if_idle(channel: &ChannelCore, state: &mut WillowChannelState) {
+    if !state.inbox_open && !state.closed && state.capacity.is_none() && state.waiters.is_empty() {
+        channel.inbox.lock().expect("channel inbox poisoned").open = true;
+        channel
+            .inbox_hint
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state.inbox_open = true;
+    }
+}
+
+/// Receive-side view of the queue: when `values` holds no unreserved value,
+/// pull in the inbox batch first.
+fn refill_from_inbox(channel: &ChannelCore, state: &mut WillowChannelState) {
+    if state.inbox_open && state.values.len() <= state.recv_claims.len() {
+        absorb_inbox(channel, state);
     }
 }
 
@@ -288,10 +436,38 @@ fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
     let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return 1;
     };
+    if channel.is_ref {
+        // Any receiver task may take the value: publish it before it is
+        // queued. O(1) when the blocking send already published it.
+        crate::gc::publish_in(
+            crate::runtime::current(),
+            unsafe { value.ptr_value } as *mut u8,
+            crate::gc::PublicationPoint::ChannelSend,
+            false,
+        );
+    }
+    if channel
+        .inbox_hint
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let mut inbox = channel.inbox.lock().expect("channel inbox poisoned");
+        if inbox.open {
+            // Open implies unbounded, unclosed and no receive waiter: there is
+            // no capacity, handoff or wake decision to make.
+            if channel.is_ref {
+                channel_send_barrier(raw, value);
+            }
+            inbox.values.push_back(value);
+            return 1;
+        }
+    }
     let current = crate::scheduler::willow_sched_current_task();
     crate::task::prepare_channel_wait_links();
     let (wake_receivers, wake_senders) = {
         let mut state = channel.state.lock().expect("channel mutex poisoned");
+        // A sender that found the inbox closed may run after it reopened:
+        // queue behind the values it holds.
+        absorb_inbox(channel, &mut state);
         if state.closed {
             clear_wait(raw, &mut state.send_waiters, current, ChannelRole::SendWait);
             clear_reservation(
@@ -314,14 +490,7 @@ fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
             ChannelRole::SendHandoff,
         );
         if channel.is_ref {
-            // The write barrier is non-safepointing; collection/wakes happen
-            // only after this channel lock has been released.
-            crate::gc::willow_gc_write_barrier(
-                raw as *mut u8,
-                std::ptr::null_mut(),
-                unsafe { value.ptr_value } as *mut u8,
-                crate::gc::GcStoreDestination::ContainerInternal as i64,
-            );
+            channel_send_barrier(raw, value);
         }
         state.values.push_back(value);
         let receive =
@@ -337,6 +506,20 @@ fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
         wake_send_waiters(channel);
     }
     1
+}
+
+/// The write barrier is non-safepointing; collection/wakes happen only after
+/// the channel locks have been released. The channel is a GC payload start and
+/// the value a published payload: with the header facts an old channel is
+/// remembered once per minor (its header claim filters later sends) instead of
+/// logging one unresolved edge per send and flushing them under the heap lock.
+fn channel_send_barrier(raw: *mut c_void, value: WillowChannelValue) {
+    crate::gc::write_barrier_object_owner(
+        raw as *mut u8,
+        std::ptr::null_mut(),
+        unsafe { value.ptr_value } as *mut u8,
+        crate::gc::GcStoreDestination::ContainerInternal as i64,
+    );
 }
 
 /// Remove a completed/cancelled task from every channel waiter queue. This is
@@ -413,10 +596,27 @@ unsafe fn channel_from_raw<'a>(raw: *mut c_void) -> Option<&'a WillowAbiChannel>
 }
 
 fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
+    // A blocking send drives the scheduler (a GC point), so a large graph
+    // may park mid-publication here.
+    let is_ref = unsafe { channel_from_raw(raw) }.is_some_and(|channel| channel.is_ref);
+    if is_ref {
+        crate::gc::publish_in(
+            crate::runtime::current(),
+            unsafe { value.ptr_value } as *mut u8,
+            crate::gc::PublicationPoint::ChannelSend,
+            true,
+        );
+    }
     // Fast path + unbounded path: try once and assign receiver claims.
     if channel_try_send_value(raw, value) != 0 {
         return;
     }
+    // A minor collection inside the drives below may move the channel
+    // wrapper and a reference value (shared or not): root both and reload
+    // them after every drive. Only this blocking slow path pays for it.
+    let raw_root = crate::gc::GcRootHandle::new(raw.cast());
+    let value_root =
+        is_ref.then(|| crate::gc::GcRootHandle::new(unsafe { value.ptr_value }.cast()));
     // Bounded channel is FULL in a synchronous context: help drive the
     // scheduler so consumers can free space (mirror of sync recv). If no
     // task can progress and the buffer is still full/open, abort with a
@@ -428,6 +628,12 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
         let completed = crate::scheduler::willow_sched_run_until_deadline(
             crate::scheduler::willow_monotonic_millis().saturating_add(1),
         );
+        let raw: *mut c_void = raw_root.load().cast();
+        let value = value_root
+            .as_ref()
+            .map_or(value, |root| WillowChannelValue {
+                ptr_value: root.load().cast(),
+            });
         if channel_try_send_value(raw, value) != 0 {
             // The failed attempts registered this task as a send waiter (a
             // no-op outside a task). Drop that registration: nobody will
@@ -653,6 +859,10 @@ const CHANNEL_RESERVE_LOCKS: crate::observation::Counter =
     crate::observation::Counter(crate::observation::Event::ChannelReserveLocks);
 
 #[cfg(test)]
+const CHANNEL_INBOX_BATCHES: crate::observation::Counter =
+    crate::observation::Counter(crate::observation::Event::ChannelInboxBatches);
+
+#[cfg(test)]
 const CHANNEL_WAITER_VISITS: crate::observation::Counter =
     crate::observation::Counter(crate::observation::Event::ChannelWaiterVisits);
 
@@ -722,6 +932,41 @@ fn take_value(
     }
 }
 
+/// After `take_value`: release the queue lock, then hand the freed capacity to
+/// a blocked sender and pass a remaining value on to another receiver. Runs
+/// with preemption disabled by the caller.
+fn finish_take(
+    raw: *mut c_void,
+    channel: &ChannelCore,
+    mut state: crate::native_memory::MutexGuard<'_, WillowChannelState>,
+    mut value: WillowChannelValue,
+) -> WillowChannelValue {
+    let wake_senders =
+        (!state.send_waiters.is_empty()).then(|| reserve_first_waiter(channel, &mut state, false));
+    let wake_receivers = !state.waiters.is_empty();
+    drop(state);
+    if wake_senders.is_none() && !wake_receivers {
+        return value;
+    }
+    // Waking can explicitly collect under scheduler GC stress.
+    // The popped reference no longer has the queue as its root.
+    let root = channel
+        .is_ref
+        .then(|| crate::gc::GcRootHandle::new(unsafe { value.ptr_value.cast() }));
+    let raw = if let Some(first) = wake_senders {
+        publish_first_waiter_bounded(raw, channel, false, first)
+    } else {
+        raw
+    };
+    if wake_receivers {
+        wake_waiters_bounded(raw, channel, true);
+    }
+    if let Some(root) = root {
+        value.ptr_value = root.load().cast();
+    }
+    value
+}
+
 fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
     match channel_recv_or_closed(raw) {
         Some(value) => value,
@@ -745,28 +990,10 @@ fn channel_recv_or_closed(raw: *mut c_void) -> Option<WillowChannelValue> {
         {
             let _no_preempt = crate::preempt::NoPreemptGuard::enter();
             let mut state = channel.state.lock().expect("channel mutex poisoned");
-            if let Some(mut value) = take_value(raw, &mut state, current) {
-                let wake_senders = (!state.send_waiters.is_empty())
-                    .then(|| reserve_first_waiter(channel, &mut state, false));
-                let wake_receivers = !state.waiters.is_empty();
-                drop(state);
-                // Waking can explicitly collect under scheduler GC stress.
-                // The popped reference no longer has the queue as its root.
-                let root = channel
-                    .is_ref
-                    .then(|| crate::gc::GcRootHandle::new(unsafe { value.ptr_value.cast() }));
-                let raw = if let Some(first) = wake_senders {
-                    publish_first_waiter_bounded(raw, channel, false, first)
-                } else {
-                    raw
-                };
-                if wake_receivers {
-                    wake_waiters_bounded(raw, channel, true);
-                }
-                if let Some(root) = root {
-                    value.ptr_value = root.load().cast();
-                }
-                return Some(value);
+            refill_from_inbox(channel, &mut state);
+            if let Some(value) = take_value(raw, &mut state, current) {
+                open_inbox_if_idle(channel, &mut state);
+                return Some(finish_take(raw, channel, state, value));
             }
             if state.closed && state.values.is_empty() {
                 return None;
@@ -853,6 +1080,9 @@ impl<T: GcTrace> GcTrace for RuntimeChannel<T> {
     }
 }
 
+#[cfg(test)]
+#[path = "channel_inbox_tests.rs"]
+mod inbox_tests;
 #[cfg(test)]
 mod tests;
 

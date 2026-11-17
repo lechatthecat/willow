@@ -1473,6 +1473,39 @@ pub(super) fn compile_and_run_with_runtime_env(
     env: &[(&str, &str)],
     timeout: std::time::Duration,
 ) -> (String, bool) {
+    let run = compile_and_run_with_runtime_env_split(source, env, timeout);
+    if run.ok {
+        (run.stdout, true)
+    } else if run.timed_out {
+        (
+            format!(
+                "TIMEOUT after {timeout:?}; stdout so far: {}; stderr: {}",
+                run.stdout, run.stderr
+            ),
+            false,
+        )
+    } else {
+        (format!("{}{}", run.stdout, run.stderr), false)
+    }
+}
+
+/// Output of [`compile_and_run_with_runtime_env_split`].
+pub(super) struct RuntimeEnvRun {
+    pub(super) stdout: String,
+    pub(super) stderr: String,
+    /// Compiled, finished in time and exited successfully.
+    pub(super) ok: bool,
+    pub(super) timed_out: bool,
+}
+
+/// Like [`compile_and_run_with_runtime_env`], but returns stdout and stderr
+/// separately, so a test can read runtime diagnostics of a passing run. A
+/// compile failure returns empty output.
+pub(super) fn compile_and_run_with_runtime_env_split(
+    source: &str,
+    env: &[(&str, &str)],
+    timeout: std::time::Duration,
+) -> RuntimeEnvRun {
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_rtenv_test_{}.wi", id));
     let bin_path = temp_path(format!("willow_rtenv_test_{}", id));
@@ -1491,7 +1524,12 @@ pub(super) fn compile_and_run_with_runtime_env(
         );
         let _ = fs::remove_file(&src_path);
         remove_output_artifacts(&bin_path);
-        return (String::new(), false);
+        return RuntimeEnvRun {
+            stdout: String::new(),
+            stderr: String::new(),
+            ok: false,
+            timed_out: false,
+        };
     }
 
     let mut cmd = Command::new(&bin_path);
@@ -1503,18 +1541,14 @@ pub(super) fn compile_and_run_with_runtime_env(
     let child = cmd.spawn().expect("failed to run binary");
     let (output, timed_out) = wait_with_timeout(child, timeout);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let _ = fs::remove_file(&src_path);
     remove_output_artifacts(&bin_path);
-    if timed_out {
-        (
-            format!("TIMEOUT after {timeout:?}; stdout so far: {stdout}; stderr: {stderr}"),
-            false,
-        )
-    } else if output.status.success() {
-        (stdout, true)
-    } else {
-        (format!("{stdout}{stderr}"), false)
+    RuntimeEnvRun {
+        stdout,
+        stderr,
+        ok: !timed_out && output.status.success(),
+        timed_out,
     }
 }
 

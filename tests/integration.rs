@@ -279,6 +279,8 @@ mod never_values;
 mod object_field_store;
 #[path = "integration/relocatable_roots.rs"]
 mod relocatable_roots;
+#[path = "integration/task_publication.rs"]
+mod task_publication;
 
 #[path = "integration/literal_slots.rs"]
 mod literal_slots;

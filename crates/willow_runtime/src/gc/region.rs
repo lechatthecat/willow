@@ -136,6 +136,50 @@ pub(super) struct BumpChunk {
     pub(super) header_offsets: Vec<u16>,
 }
 
+/// Task ownership of a TLAB chunk's allocated prefix: `(start offset, owner)`
+/// sorted by offset. Owner is a task id plus one; zero names no task. Each
+/// entry owns bytes up to the next entry's offset. Only the publication
+/// verifier reads it, so it lives beside the chunk table, keyed by chunk base
+/// (`GcState::chunk_owners`), and the hot `BumpChunk` carries nothing for it.
+/// See `gc::publish`.
+#[derive(Debug, Default)]
+pub(super) struct OwnerSegments(pub(super) Vec<(u32, u64)>);
+
+impl OwnerSegments {
+    /// Task owner of the object starting at `offset`, or zero.
+    pub(super) fn owner_at(&self, offset: usize) -> u64 {
+        match self.0.as_slice() {
+            [] => 0,
+            [(_, owner)] => *owner,
+            segments => {
+                let index = segments.partition_point(|&(start, _)| start as usize <= offset);
+                index.checked_sub(1).map_or(0, |index| segments[index].1)
+            }
+        }
+    }
+
+    /// Record that bytes from `offset` on belong to `owner`. Equal offsets
+    /// overwrite (the previous owner allocated nothing); equal owners merge.
+    pub(super) fn mark_owner_from(&mut self, offset: usize, capacity: usize, owner: u64) {
+        if offset >= capacity {
+            return;
+        }
+        let offset = offset as u32;
+        match self.0.last_mut() {
+            Some(last) if last.0 == offset => {
+                last.1 = owner;
+                let len = self.0.len();
+                if len >= 2 && self.0[len - 2].1 == owner {
+                    self.0.pop();
+                }
+            }
+            Some(last) if last.1 == owner => {}
+            Some(last) if last.0 > offset => {}
+            _ => self.0.push((offset, owner)),
+        }
+    }
+}
+
 impl BumpChunk {
     /// A retired, nonempty chunk whose header index is not built yet.
     pub(super) fn needs_index(&self) -> bool {

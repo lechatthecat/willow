@@ -377,3 +377,136 @@ pub(super) fn verify_old_region_metadata(state: &GcState) -> Result<(), String> 
     }
     Ok(())
 }
+
+/// Publication invariant check at a stop (`WILLOW_GC_VERIFY_PUBLICATION`,
+/// always on under GC stress):
+///
+/// * every heap object a shared object references is shared (or an async
+///   frame), except the unscanned objects of a publication parked at this
+///   stop (`parked`);
+/// * an unshared young object references unshared young objects of its own
+///   task only (published young objects belong to no task, nor do those a
+///   finished task handed over with its result: `handed_over`).
+///
+/// Diagnostic only: O(heap objects + reference slots), with an index lookup
+/// per child.
+pub(super) fn verify_publication(
+    state: &GcState,
+    trace_registry: &HashMap<u32, TraceFn, impl std::hash::BuildHasher>,
+    parked: impl Fn(usize) -> bool,
+    handed_over: &crate::id_hash::IdSet<u64>,
+) -> Result<(), String> {
+    // Owner of an unshared young object, by its TLAB chunk segment; None
+    // when shared, old or not a TLAB object.
+    let young_owner = |object: HeapObject| -> Option<u64> {
+        if object.shared() || object.generation() == GC_GENERATION_OLD {
+            return None;
+        }
+        let address = object.payload().as_ptr() as usize;
+        let chunk = find_tlab_chunk(state, address)?;
+        let owner = state
+            .chunk_owners
+            .get(&(chunk.base as usize))
+            .map_or(0, |segments| {
+                segments.owner_at(object.as_ptr() as usize - chunk.base as usize)
+            });
+        Some(if handed_over.contains(&owner) {
+            0
+        } else {
+            owner
+        })
+    };
+    // Payloads of old-buffer objects not yet indexed into their region.
+    let mut unindexed = HashMap::new();
+    super::old_lab::for_each_unindexed(state, |object| {
+        unindexed.insert(object.payload().as_ptr() as usize, object);
+        Ok(())
+    })?;
+    let lookup = |address: usize| -> Option<HeapObject> {
+        find_old_region_object(state, address, false)
+            .or_else(|| {
+                find_tlab_chunk(state, address)
+                    .and_then(|chunk| object_in_retired_chunk(chunk, address, false))
+            })
+            .or_else(|| unindexed.get(&address).copied())
+    };
+    let mut slots = Vec::new();
+    let mut verify = |object: HeapObject| -> Result<(), String> {
+        if !object.allocated() || super::publish::is_frame(object) {
+            return Ok(());
+        }
+        let address = object.payload().as_ptr() as usize;
+        let shared = object.shared();
+        let owner = if shared { None } else { young_owner(object) };
+        if !shared && owner.is_none() {
+            // Private old objects may reference their task's young objects.
+            return Ok(());
+        }
+        if shared && parked(address) {
+            return Ok(());
+        }
+        slots.clear();
+        append_object_reference_slots(object, trace_registry, &mut slots);
+        for &slot in &slots {
+            if slot.is_null() {
+                continue;
+            }
+            // SAFETY: trace metadata names readable slots; the world is stopped.
+            let child = unsafe { *slot } as usize;
+            if child == 0 {
+                continue;
+            }
+            let Some(child) = lookup(child) else {
+                continue;
+            };
+            if super::publish::is_frame(child) {
+                continue;
+            }
+            if shared {
+                if !child.shared() {
+                    return Err(format!(
+                        "shared object 0x{address:x} references unshared 0x{:x}",
+                        child.payload().as_ptr() as usize
+                    ));
+                }
+            } else if let (Some(owner), Some(child_owner)) = (owner, young_owner(child))
+                && owner != 0
+                && child_owner != 0
+                && owner != child_owner
+            {
+                return Err(format!(
+                    "young object 0x{address:x} of task owner {owner} references young 0x{:x} of task owner {child_owner}",
+                    child.payload().as_ptr() as usize
+                ));
+            }
+        }
+        Ok(())
+    };
+    for region in &state.old_regions {
+        for &offset in region.allocations.keys() {
+            // SAFETY: the allocation map owns this stopped header.
+            let raw = unsafe { region.base.add(offset) };
+            verify(HeapObject::from_raw(raw.cast()).expect("region header is non-null"))?;
+        }
+    }
+    // Objects of old allocation buffers not yet indexed into their region.
+    for object in unindexed.values() {
+        verify(*object)?;
+    }
+    for chunk in &state.tlab_chunks {
+        let used = chunk_used_bytes(state, chunk);
+        let mut offset = 0usize;
+        while offset < used {
+            // SAFETY: stopped, retired chunks hold consecutive headers.
+            let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())
+                .expect("TLAB header address is non-null");
+            let size = object.size();
+            if size == 0 {
+                break;
+            }
+            verify(object)?;
+            offset += size;
+        }
+    }
+    Ok(())
+}

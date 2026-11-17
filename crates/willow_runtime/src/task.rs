@@ -996,6 +996,13 @@ mod footprint {
     fn f25_prepared_spare_installs_a_channel_wait_without_allocating() {
         use crate::scheduler::scaling_measurements::counting_allocator as counter;
 
+        // Warm the per-thread lazies first (see the allocation budget test):
+        // whichever test touches them first otherwise pays their one-time cost.
+        let mut warm = RuntimeTask::new(0);
+        assert!(warm.install_channel_ownership(channel_token(1)));
+        assert!(warm.install_channel_ownership(channel_token(2)));
+        drop(warm);
+        SPARE_WAIT_LINKS.with(|spare| *spare.borrow_mut() = [None, None]);
         super::prepare_channel_wait_links();
         let allocs_before = counter::thread_allocations();
         super::prepare_channel_wait_links();
@@ -1206,6 +1213,14 @@ mod footprint {
     fn channel_ownership_small_wait_allocation_budget() {
         use crate::scheduler::scaling_measurements::counting_allocator as counter;
 
+        // Warm the per-thread lazies once: the spare-links thread-local's
+        // destructor registration and the observation counters first touched
+        // by the second token's scan. Neither is a per-wait cost.
+        let mut warm = RuntimeTask::new(0);
+        assert!(warm.install_channel_ownership(channel_token(1)));
+        assert!(warm.install_channel_ownership(channel_token(2)));
+        drop(warm);
+        SPARE_WAIT_LINKS.with(|spare| *spare.borrow_mut() = [None, None]);
         for channels in [1, 2] {
             for tasks in [1, 64, 1024] {
                 let mut owners: Vec<_> = (0..tasks).map(RuntimeTask::new).collect();

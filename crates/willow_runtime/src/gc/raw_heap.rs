@@ -76,6 +76,7 @@ impl Object {
             header.generation = generation;
             header.age = 0;
             header.remembered = 0;
+            header.shared = 0;
             header.descriptor = super::layouts::acquire(willow_abi::GcLayoutDescriptor {
                 type_id: u64::from(type_id),
                 layout_id,
@@ -100,15 +101,20 @@ impl Object {
             let source = &mut *source.as_ptr();
             // The destination may be uninitialized storage; do not form a
             // reference to a header containing uninitialized bool fields.
-            target.as_ptr().write(GcHeader {
-                marked: false,
-                allocated: true,
-                generation,
-                age: 0,
-                remembered: 0,
-                descriptor: source.descriptor,
-                descriptor_owned: source.descriptor_owned,
-            });
+            // The flag bytes are composed in a register and written with one
+            // word store: narrow stores followed by the collector's later
+            // header reads would defeat store forwarding on every copy.
+            let mut flags = [0u8; MOVED_FLAG_BYTES];
+            flags[std::mem::offset_of!(GcHeader, allocated)] = 1;
+            flags[std::mem::offset_of!(GcHeader, generation)] = generation;
+            flags[std::mem::offset_of!(GcHeader, descriptor_owned)] =
+                u8::from(source.descriptor_owned);
+            // A moved object keeps its publication state: every holder of
+            // a shared object is stopped and its slots are rewritten.
+            flags[std::mem::offset_of!(GcHeader, shared)] = source.shared;
+            let header = target.as_ptr();
+            header.cast::<u64>().write(u64::from_ne_bytes(flags));
+            (&raw mut (*header).descriptor).write(source.descriptor);
             source.descriptor_owned = false;
         }
         Some(Self(target))
@@ -184,14 +190,28 @@ impl Object {
     }
 
     pub(super) fn is_async_frame(self) -> bool {
-        let d = self.descriptor();
-        d.layout_id
-            == willow_abi::gc_layout_id(
-                willow_abi::GcObjectKind::AsyncFrame,
-                (d.size as usize - std::mem::size_of::<GcHeader>()) as i64,
-                d.type_id as i64,
-                d.gc_ref_mask,
+        is_async_frame_layout(&self.descriptor())
+    }
+
+    /// The descriptor of a live object that is not a forwarded minor source,
+    /// in place, and whether it is static generated data (never released, so
+    /// its address identifies one layout for the process lifetime).
+    #[inline(always)]
+    pub(super) fn live_layout(self) -> (&'static willow_abi::GcLayoutDescriptor, bool) {
+        // SAFETY: a live header owns a registry reference to its descriptor
+        // or points to static generated data; it is not forwarded.
+        unsafe {
+            let header = &*self.as_ptr();
+            (
+                &*(header.descriptor as *const willow_abi::GcLayoutDescriptor),
+                !header.descriptor_owned,
             )
+        }
+    }
+
+    /// This object's layout descriptor, read once.
+    pub(super) fn layout(self) -> willow_abi::GcLayoutDescriptor {
+        self.descriptor()
     }
 
     /// No state changes on contention. A successful permit pins an interned
@@ -234,6 +254,7 @@ impl Object {
             }
             header.marked = false;
             header.remembered = 0;
+            header.shared = 0;
         }
     }
 
@@ -335,6 +356,40 @@ impl Object {
         }
     }
 
+    /// Whether this object has been published to shared state.
+    pub(crate) fn shared(self) -> bool {
+        // SAFETY: `Object` refers to a live heap allocation; other threads
+        // read the byte concurrently, so access it atomically.
+        unsafe { AtomicU8::from_ptr(&raw mut (*self.as_ptr()).shared).load(Ordering::Relaxed) != 0 }
+    }
+
+    /// Mark this object shared. Called only by the publication routine of
+    /// the task that owns the object (an unshared object is unreachable from
+    /// other tasks), so a plain atomic store suffices; the byte is never
+    /// cleared while the object is allocated. `promoted` records that the
+    /// object was young when published (`SHARED_PROMOTED`): minor copies
+    /// keep it, and its death is accounted as promoted-then-died.
+    pub(crate) fn set_shared(self, promoted: bool) {
+        let value = if promoted {
+            SHARED_PROMOTED
+        } else {
+            SHARED_PUBLISHED
+        };
+        // SAFETY: as in `shared`.
+        unsafe {
+            AtomicU8::from_ptr(&raw mut (*self.as_ptr()).shared).store(value, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether this object was young when it was published.
+    pub(crate) fn promoted_by_publication(self) -> bool {
+        // SAFETY: as in `shared`.
+        unsafe {
+            AtomicU8::from_ptr(&raw mut (*self.as_ptr()).shared).load(Ordering::Relaxed)
+                == SHARED_PROMOTED
+        }
+    }
+
     pub(super) fn set_generation(self, generation: u8) {
         // SAFETY: collection has exclusive access while mutators are stopped.
         unsafe {
@@ -347,6 +402,19 @@ impl Object {
         }
     }
 }
+
+/// The header flag bytes precede the word-aligned descriptor, so a moved
+/// header's flags are one aligned word (`Object::initialize_moved_at`).
+const MOVED_FLAG_BYTES: usize = std::mem::offset_of!(GcHeader, descriptor);
+const _: () = assert!(
+    MOVED_FLAG_BYTES == std::mem::size_of::<u64>()
+        && std::mem::align_of::<GcHeader>() >= std::mem::align_of::<u64>()
+);
+
+/// Values of the SHARED header byte (`willow_abi::gc_header::SHARED_OFFSET`):
+/// zero while private; any nonzero value means shared.
+const SHARED_PUBLISHED: u8 = 1;
+const SHARED_PROMOTED: u8 = 2;
 
 #[derive(Clone, Copy)]
 pub(super) struct RootSlot(NonNull<*mut u8>);
@@ -366,6 +434,17 @@ impl RootSlot {
 
 /// Optional registry guard: generated immutable descriptors need no release.
 pub(super) struct ReclaimPermit(Option<super::layouts::ReleaseGuard>);
+
+/// Whether `d` describes an async frame (its fingerprint says so).
+pub(super) fn is_async_frame_layout(d: &willow_abi::GcLayoutDescriptor) -> bool {
+    d.layout_id
+        == willow_abi::gc_layout_id(
+            willow_abi::GcObjectKind::AsyncFrame,
+            (d.size as usize - std::mem::size_of::<GcHeader>()) as i64,
+            d.type_id as i64,
+            d.gc_ref_mask,
+        )
+}
 
 #[cfg(test)]
 mod move_tests {
@@ -457,6 +536,7 @@ mod move_tests {
             age: 1,
             descriptor_owned: false,
             remembered: 1,
+            shared: 0,
             descriptor: (&descriptor as *const _) as usize,
         };
         let source = Object::from_raw(&mut header).unwrap();
@@ -476,5 +556,53 @@ mod move_tests {
         assert_eq!(moved.trace_metadata().layout_id, 7);
         moved.reclaim_in_place();
         assert_eq!(moved.size(), GC_HEADER_SIZE);
+    }
+
+    /// The one-word flag store keeps the publication state and generation,
+    /// and clears every other flag byte even over stale target bytes.
+    #[test]
+    fn moving_header_keeps_publication_state_over_stale_target_bytes() {
+        let descriptor = willow_abi::GcLayoutDescriptor {
+            type_id: 42,
+            layout_id: 7,
+            gc_ref_mask: 0,
+            size: GC_HEADER_SIZE as u64,
+        };
+        for (shared, promoted) in [(0, None), (1, Some(false)), (2, Some(true))] {
+            for generation in [GC_GENERATION_YOUNG, GC_GENERATION_OLD] {
+                let mut header = GcHeader {
+                    marked: true,
+                    allocated: true,
+                    generation: GC_GENERATION_YOUNG,
+                    age: 3,
+                    descriptor_owned: false,
+                    remembered: 1,
+                    shared: 0,
+                    descriptor: (&descriptor as *const _) as usize,
+                };
+                let source = Object::from_raw(&mut header).unwrap();
+                if let Some(promoted) = promoted {
+                    source.set_shared(promoted);
+                }
+                assert_eq!(header.shared, shared);
+                let source = Object::from_raw(&mut header).unwrap();
+                // Stale bytes of a previous object in the destination.
+                let mut target = [0xffu8; std::mem::size_of::<GcHeader>()];
+                let moved =
+                    Object::initialize_moved_at(target.as_mut_ptr().cast(), source, generation)
+                        .unwrap();
+                let raw = unsafe { &*moved.as_ptr() };
+                assert!(!raw.marked);
+                assert!(raw.allocated);
+                assert_eq!(raw.generation, generation);
+                assert_eq!(raw.age, 0);
+                assert!(!raw.descriptor_owned);
+                assert_eq!(raw.remembered, 0);
+                assert_eq!(raw.shared, shared);
+                assert_eq!(moved.shared(), shared != 0);
+                assert_eq!(moved.promoted_by_publication(), promoted == Some(true));
+                assert_eq!(raw.descriptor, (&descriptor as *const _) as usize);
+            }
+        }
     }
 }

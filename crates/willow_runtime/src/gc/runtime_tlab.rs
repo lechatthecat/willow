@@ -260,6 +260,7 @@ pub(crate) fn try_alloc_young<const N: usize>(layouts: [YoungLayout; N]) -> Opti
                     age: 0,
                     descriptor_owned: false,
                     remembered: 0,
+                    shared: 0,
                     descriptor: layout.descriptor as *const willow_abi::GcLayoutDescriptor as usize,
                 });
             }

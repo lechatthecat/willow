@@ -170,7 +170,8 @@ pub extern "C" fn willow_rust_bridge_enum(
                 object,
                 std::ptr::null_mut(),
                 referent,
-                willow_abi::GcStoreDestination::EnumPayload as i64,
+                willow_abi::GcStoreDestination::EnumPayload as i64
+                    | willow_abi::GC_STORE_OWNER_HAS_HEADER,
             );
             gc::store_gc_reference(payload.cast(), referent);
         } else {
@@ -426,7 +427,8 @@ pub extern "C" fn willow_rust_bridge_record_set(
             object as *mut u8,
             std::ptr::null_mut(),
             value.low as *mut u8,
-            willow_abi::GcStoreDestination::ObjectField as i64,
+            willow_abi::GcStoreDestination::ObjectField as i64
+                | willow_abi::GC_STORE_OWNER_HAS_HEADER,
         );
         unsafe {
             gc::store_gc_reference(field.cast(), value.low as *mut u8);

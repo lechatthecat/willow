@@ -2844,6 +2844,16 @@ fn current_task_id() -> Option<RuntimeTaskId> {
     CURRENT_TASK.with(Cell::get)
 }
 
+/// Record the task running on this thread. Its young allocations from here
+/// on belong to it: a task resumed on another worker continues on that
+/// worker's region (its earlier young objects stay its own), and a finished,
+/// cancelled or panicked task hands the cursor back to owner zero.
+#[inline]
+fn install_current_task(id: Option<RuntimeTaskId>) {
+    CURRENT_TASK.with(|current| current.set(id));
+    crate::gc::switch_task_owner(id.map_or(0, crate::gc::task_owner));
+}
+
 /// Claim-time cancellation snapshot of the running task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CancelSnapshot {
@@ -2871,13 +2881,51 @@ pub(crate) fn current_cancel_snapshot() -> Option<CancelSnapshot> {
     })
 }
 
+/// `willow_sched_is_cancelled(task) != 0` for the running `task`, without a
+/// task-table lookup while the cancel epoch has not moved since its claim
+/// snapshot. A moved epoch refreshes the snapshot with one lookup; the epoch is
+/// loaded first, so the refreshed answer covers every request it counts.
+pub(crate) fn current_task_cancel_pending(task: u64) -> bool {
+    let cached = CURRENT_EXECUTION.with(|slot| {
+        let current = slot.borrow();
+        // Ids alone can alias between runtimes: trust only this runtime's table.
+        if current.owner != Some(task) || current.cancel_epoch_source != current_cancel_epoch() {
+            return Err(None);
+        }
+        // SAFETY: the epoch source is the claiming table's, valid while the
+        // owning task's poll runs on this thread.
+        let epoch = unsafe { (*current.cancel_epoch_source).load() };
+        if epoch == current.cancel_epoch {
+            Ok(current.cancelled)
+        } else {
+            Err(Some(epoch))
+        }
+    });
+    match cached {
+        Ok(cancelled) => cancelled,
+        Err(epoch) => {
+            let cancelled = willow_sched_is_cancelled(task) != 0;
+            if let Some(epoch) = epoch {
+                CURRENT_EXECUTION.with(|slot| {
+                    let mut current = slot.borrow_mut();
+                    if current.owner == Some(task) {
+                        current.cancel_epoch = epoch;
+                        current.cancelled = cancelled;
+                    }
+                });
+            }
+            cancelled
+        }
+    }
+}
+
 /// Every poll boundary drops the published fault location: release synchronous
 /// code publishes none, so a site left by the previous task (or by an async
 /// poll that returned to synchronous code) must not label its faults.
 ///
 fn set_current_task(id: Option<RuntimeTaskId>) {
     crate::panic_context::willow_fault_site_clear();
-    CURRENT_TASK.with(|current| current.set(id));
+    install_current_task(id);
     let context = id.and_then(|task_id| {
         let tasks = global_task_table();
         tasks.with_mut(task_id, |task| {
@@ -2902,7 +2950,7 @@ fn set_current_task(id: Option<RuntimeTaskId>) {
 /// claim paths use this to avoid a second task-table lock solely for TLS setup.
 fn set_current_task_context(id: RuntimeTaskId, context: Arc<crate::panic_context::PanicContext>) {
     crate::panic_context::willow_fault_site_clear();
-    CURRENT_TASK.with(|current| current.set(Some(id)));
+    install_current_task(Some(id));
     crate::panic_context::replace_current_context(Some(context));
 }
 
@@ -2957,8 +3005,19 @@ fn spawn_global_task_initialized_inner(
     // runtime root back.
     let target = global_components().spawn_target();
     let id = target.reserve_task_id();
-    let mut root = PendingSpawnRoot::new(crate::runtime::current(), frame as *mut u8);
+    let runtime = crate::runtime::current();
+    let mut root = PendingSpawnRoot::new(runtime, frame as *mut u8);
     initialize(id);
+    // Captures and arguments become reachable by the new task, which may
+    // run on any worker. Spawn is a GC point (see the stress collection
+    // below) and the frame is rooted, so the publication may park.
+    crate::gc::publish_frame_slots_in(
+        runtime,
+        frame as *mut u8,
+        None,
+        crate::gc::PublicationPoint::Spawn,
+        true,
+    );
     target.publish(id, poll, frame, cancel, cooperative_poll);
     root.publish();
     crate::observability::record(
@@ -3895,7 +3954,7 @@ impl SchedulerDriveGuard {
 
 impl Drop for SchedulerDriveGuard {
     fn drop(&mut self) {
-        CURRENT_TASK.with(|current| current.set(self.saved_running));
+        install_current_task(self.saved_running);
         CURRENT_EXECUTION.with(|slot| slot.replace(std::mem::take(&mut self.saved_execution)));
         crate::panic_context::replace_current_context(self.saved_panic_context.take());
         if let Some(id) = self.saved_running {
@@ -5631,6 +5690,11 @@ fn scheduler_run_loop_in(
                 );
             }
             PollOutcome::Ready => {
+                // Awaiters read the result once the terminal status is
+                // published: hand it over to the handle's holder, or publish
+                // it first when the handle escaped. A GC point: the poll
+                // returned and the frame stays rooted.
+                crate::gc::finish_task_result_in(owner, id, frame as *mut u8);
                 // An executable task owns its frame here, so the placeholder
                 // preparation of `RuntimeScheduler::complete` does not apply.
                 let _no_preempt = crate::preempt::NoPreemptGuard::enter();

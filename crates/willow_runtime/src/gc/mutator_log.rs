@@ -46,6 +46,95 @@ pub(super) const ROOT_LOG_CAPACITY: usize = 128;
 /// Recent root entries searched for an opposite delta to cancel. Handles are
 /// usually dropped soon after creation, in either LIFO or FIFO order.
 const ROOT_CANCEL_WINDOW: usize = 8;
+/// Task switches that moved this thread's allocation cursor, held before
+/// flushing. A switch that allocated nothing overwrites the last entry.
+pub(super) const OWNER_LOG_CAPACITY: usize = 64;
+
+/// Publication counters of one mutator (`gc::publish`), merged into the
+/// runtime's shared counters when the log is applied, so a publication or a
+/// republication touches no contended cache line.
+#[derive(Clone, Copy, Default)]
+pub(super) struct PublicationCounts {
+    pub(super) calls: u64,
+    pub(super) republished: u64,
+    pub(super) handed_over: u64,
+    pub(super) marked: u64,
+    pub(super) slots: u64,
+    pub(super) promoted_objects: u64,
+    pub(super) promoted_bytes: u64,
+    pub(super) per_point: [u64; 8],
+}
+
+impl PublicationCounts {
+    fn is_empty(&self) -> bool {
+        self.calls == 0 && self.republished == 0 && self.handed_over == 0 && self.marked == 0
+    }
+}
+
+/// Publication counters and allocation-owner changes of one mutator
+/// (`gc::publish`). Applied with the edge log: at every stop, when full, and
+/// when the thread installs a new TLAB chunk (owner entries name only the
+/// current chunk).
+#[derive(Default)]
+pub(super) struct PublicationLog {
+    pub(super) counts: PublicationCounts,
+    /// Base of the chunk the owner entries refer to.
+    chunk_base: usize,
+    /// `(cursor, owner)`: bytes allocated from `cursor` on belong to `owner`.
+    owners: Vec<(usize, u64)>,
+}
+
+impl PublicationLog {
+    fn is_empty(&self) -> bool {
+        self.counts.is_empty() && self.owners.is_empty()
+    }
+
+    pub(super) fn note_owner(&mut self, cursor: usize, owner: u64) -> bool {
+        match self.owners.last_mut() {
+            Some(last) if last.0 == cursor => {
+                last.1 = owner;
+                false
+            }
+            _ => {
+                self.owners.push((cursor, owner));
+                self.owners.len() == OWNER_LOG_CAPACITY
+            }
+        }
+    }
+
+    /// Apply under the heap lock or in a stop. O(owner entries).
+    pub(super) fn apply(&mut self, state: &mut GcState, publication: &super::publish::Publication) {
+        let counts = std::mem::take(&mut self.counts);
+        if !counts.is_empty() {
+            // Published young objects stay young; each minor accounts the
+            // ones that died young (`minor`).
+            state.published_young_bytes = state
+                .published_young_bytes
+                .saturating_add(counts.promoted_bytes);
+            publication.merge(&counts);
+        }
+        if !self.owners.is_empty() {
+            if let Some(index) = state.tlab_addresses.exact(self.chunk_base) {
+                let capacity = state.tlab_chunks[index].capacity;
+                let base = self.chunk_base;
+                let segments = state.chunk_owners.entry(base).or_default();
+                for &(cursor, owner) in &self.owners {
+                    if let Some(offset) = cursor.checked_sub(base) {
+                        segments.mark_owner_from(offset, capacity, owner);
+                    }
+                }
+            }
+            self.owners.clear();
+        }
+    }
+
+    /// The thread's TLAB moves to the chunk at `base`; entries for the
+    /// previous chunk were applied by the caller.
+    pub(super) fn start_chunk(&mut self, base: usize) {
+        debug_assert!(self.owners.is_empty());
+        self.chunk_base = base;
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Edge {
@@ -72,6 +161,7 @@ pub(super) enum Edge {
 pub(super) struct MutatorLog {
     edges: UnsafeCell<Vec<Edge>>,
     roots: UnsafeCell<Vec<(usize, isize)>>,
+    publication: UnsafeCell<PublicationLog>,
     /// Net registrations held in `roots`. Stored only by whoever owns the log
     /// at that moment; read by the registration count diagnostic.
     root_net: AtomicIsize,
@@ -85,12 +175,17 @@ unsafe impl Sync for MutatorLog {}
 impl MutatorLog {
     /// Fixed storage of one log, charged to the memory budget while bound.
     pub(super) const BYTES: usize = EDGE_LOG_CAPACITY * std::mem::size_of::<Edge>()
-        + ROOT_LOG_CAPACITY * std::mem::size_of::<(usize, isize)>();
+        + ROOT_LOG_CAPACITY * std::mem::size_of::<(usize, isize)>()
+        + OWNER_LOG_CAPACITY * std::mem::size_of::<(usize, u64)>();
 
     pub(super) fn new() -> Self {
         Self {
             edges: UnsafeCell::new(Vec::with_capacity(EDGE_LOG_CAPACITY)),
             roots: UnsafeCell::new(Vec::with_capacity(ROOT_LOG_CAPACITY)),
+            publication: UnsafeCell::new(PublicationLog {
+                owners: Vec::with_capacity(OWNER_LOG_CAPACITY),
+                ..PublicationLog::default()
+            }),
             root_net: AtomicIsize::new(0),
         }
     }
@@ -115,6 +210,16 @@ impl MutatorLog {
         unsafe { &mut *self.roots.get() }
     }
 
+    /// # Safety
+    /// As for [`Self::edges`].
+    #[allow(
+        clippy::mut_from_ref,
+        reason = "only the bound owner thread, or a stopper while it is parked, reaches the log"
+    )]
+    pub(super) unsafe fn publication(&self) -> &mut PublicationLog {
+        unsafe { &mut *self.publication.get() }
+    }
+
     pub(super) fn pending_root_net(&self) -> isize {
         self.root_net.load(Ordering::Relaxed)
     }
@@ -122,7 +227,9 @@ impl MutatorLog {
     /// # Safety
     /// As for [`Self::edges`].
     unsafe fn is_empty(&self) -> bool {
-        unsafe { self.edges().is_empty() && self.roots().is_empty() }
+        unsafe {
+            self.edges().is_empty() && self.roots().is_empty() && self.publication().is_empty()
+        }
     }
 }
 
@@ -149,7 +256,7 @@ pub(super) fn unbind() {
 /// This thread's log when it is a registered mutator of `gc`. Not inlined so a
 /// caller that later migrates never reuses another thread's TLS address.
 #[inline(never)]
-fn bound_in(gc: &GcRuntime) -> Option<&MutatorLog> {
+pub(super) fn bound_in(gc: &GcRuntime) -> Option<&MutatorLog> {
     if !safepoint::current_thread_is_registered_in(gc) {
         return None;
     }
@@ -403,6 +510,22 @@ pub(super) fn flush_current_in(owner: &crate::runtime::Runtime) {
     if !roots.is_empty() {
         flush_roots(&owner.gc, log, roots);
     }
+    let publication = unsafe { log.publication() };
+    if !publication.is_empty() {
+        flush_publication(owner, publication);
+    }
+}
+
+/// Slow path of a full publication log: apply it under the heap lock.
+#[cold]
+pub(super) fn flush_publication(owner: &crate::runtime::Runtime, publication: &mut PublicationLog) {
+    let mut state = owner
+        .gc
+        .heap
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    count_shared_lock();
+    publication.apply(&mut state, &owner.gc.publication);
 }
 
 /// Apply every registered mutator's log. Called at the start of each stop,
@@ -433,6 +556,9 @@ pub(super) fn drain_stopped(owner: &crate::runtime::Runtime, coord: &GcCoord) {
             entries += edges.len() as u64;
             // Another thread's card cache is not ours to fill.
             apply_edges(&mut state, edges, |_, _| {});
+            let publication = unsafe { log.publication() };
+            entries += publication.owners.len() as u64;
+            publication.apply(&mut state, &owner.gc.publication);
         }
     }
     for log in logs() {

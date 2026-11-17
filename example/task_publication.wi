@@ -1,0 +1,127 @@
+// task_publication.wi — task-owned young objects and publication.
+//
+// Every young object belongs to the task that allocated it. While only that
+// task can reach it, it stays in the task's young region and a minor
+// collection may move it. The moment another task can reach a value, the
+// runtime *publishes* it: the value and everything it reaches gets a
+// never-cleared SHARED header mark in place (no copy). A published object
+// then lives and dies like any other: a message nobody keeps is reclaimed by
+// the next minor collection. Publication points exercised below:
+//
+//   - a channel send                       (`results.send(...)`)
+//   - spawn arguments                      (`build(...)` started as a task)
+//   - lock-protected state                 (`lock shared as mut s { ... }`)
+//   - a store into an already shared object (`list.next = new Item(..)`)
+//
+// A task result is handed over instead: a task handle cannot cross to
+// another task, so only the task holding it reads the result, and that task
+// becomes the owner of the result's young objects without publishing them
+// (`await build(1000)` below). The runtime publishes a result only if a
+// handle reaches other tasks through a runtime path.
+//
+// A private long-lived container (`private`) is never published: its young
+// children are recorded in the task's remembered log and nothing is published.
+//
+// Run with `WILLOW_GC_VERIFY_PUBLICATION=1` to check at every minor stop that
+// no shared object references an unshared one and no task's young object is
+// referenced by another task's; `WILLOW_GC_PUBLICATION_STATS=1` prints the
+// publication counters at exit.
+import std::collections::Array;
+
+class Item {
+    pub value: i64;
+    pub next: Option<Item>;
+}
+
+fn chain(count: i64) -> Item {
+    let mut head = new Item(0, Option::None);
+    let mut i = 1;
+    while i < count {
+        head = new Item(i, Option::Some(head));
+        i = i + 1;
+    }
+    return head;
+}
+
+fn total(item: Item) -> i64 {
+    let mut sum = item.value;
+    let mut cursor = item.next;
+    while true {
+        match cursor {
+            Some(next) => {
+                sum = sum + next.value;
+                cursor = next.next;
+            }
+            None => { return sum; }
+        }
+    }
+    return sum;
+}
+
+// The result list is built in this task's young region and handed over to
+// the holder of the task handle when the task returns.
+async fn build(count: i64) -> Item {
+    return chain(count);
+}
+
+// Sends a fresh pair per round: each send publishes the items it carries.
+async fn producer(results: Channel<Item>, rounds: i64) -> i64 {
+    let mut i = 0;
+    while i < rounds {
+        results.send(new Item(i, Option::Some(new Item(100, Option::None))));
+        i = i + 1;
+    }
+    return rounds;
+}
+
+async fn main() {
+    // Task result handed over: main owns the 1000 items without
+    // publishing them.
+    let built = await build(1000);
+    println(total(built));                      // 499500
+
+    // Channel: the consumer reads lists the producer published.
+    let results = Channel<Item>::new();
+    let sent = producer(results, 20);
+    let mut received = 0;
+    let mut last = new Item(0, Option::None);
+    let mut i = 0;
+    while i < 20 {
+        last = results.recv();
+        received = received + total(last);
+        i = i + 1;
+    }
+    await sent;
+    println(received);                          // 190 + 20 * 100 = 2190
+
+    // Lock-protected state: values stored under the lock are published.
+    let shared: Mutex<Array<String>> = Mutex::new([]);
+    i = 0;
+    while i < 50 {
+        lock shared as mut s { s.push("v" + i.toString()); }
+        i = i + 1;
+    }
+    gc_minor_collect();
+    lock shared as s { println(s.len()); }      // 50
+
+    // A store into an already shared object publishes the stored value.
+    // (`last` is the producer's final, published message.)
+    last.next = Option::Some(new Item(7, Option::None));
+    gc_minor_collect();
+    println(total(last));                       // 19 + 7 = 26
+
+    // Stores into the handed-over list stay private: nothing is published.
+    built.next = Option::Some(new Item(7, Option::None));
+    gc_minor_collect();
+    println(total(built));                      // 999 + 7 = 1006
+
+    // A private container: its young children are never published.
+    let private: Array<Item> = [];
+    i = 0;
+    while i < 2000 {
+        private.push(new Item(i, Option::None));
+        i = i + 1;
+    }
+    gc_minor_collect();
+    println(private.len());                     // 2000
+}

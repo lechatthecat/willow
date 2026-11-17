@@ -735,6 +735,9 @@ fn finish(owner: &crate::runtime::Runtime, state: &mut GcState, dead_chunks: &[b
             }
             assert!(chunk.owner_state.is_none());
             owner.gc.root_tlabs.remove(chunk.base as usize);
+            if !state.chunk_owners.is_empty() {
+                state.chunk_owners.remove(&(chunk.base as usize));
+            }
             positions.push(None);
             let layout =
                 Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>()).unwrap();

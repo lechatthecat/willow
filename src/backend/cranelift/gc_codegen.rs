@@ -10,7 +10,7 @@
 //! Later stages can replace chunk/refill/card policy here without
 //! redistributing collector policy through expression-specific emitters.
 
-use cranelift_codegen::ir::{FuncRef, MemFlagsData, Value};
+use cranelift_codegen::ir::{BlockArg, FuncRef, MemFlagsData, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 use willow_abi::runtime_symbols::names as rt;
@@ -19,10 +19,18 @@ pub(super) use willow_abi::{GcObjectKind, GcStoreDestination};
 use super::*;
 
 const GC_HEADER_MARKED_OFFSET: i32 = willow_abi::gc_header::MARKED_OFFSET as i32;
-const GC_HEADER_ALLOCATED_OFFSET: i32 = willow_abi::gc_header::ALLOCATED_OFFSET as i32;
-const GC_HEADER_GENERATION_OFFSET: i32 = willow_abi::gc_header::GENERATION_OFFSET as i32;
-const GC_HEADER_AGE_OFFSET: i32 = willow_abi::gc_header::AGE_OFFSET as i32;
-const GC_HEADER_OWNED_OFFSET: i32 = willow_abi::gc_header::OWNED_OFFSET as i32;
+/// The store filter reads the generation, remembered and shared bytes from
+/// the first (little-endian, on every supported target) header word.
+const _: () = assert!(
+    willow_abi::gc_header::GENERATION_OFFSET < 8
+        && willow_abi::gc_header::REMEMBERED_OFFSET < 8
+        && willow_abi::gc_header::SHARED_OFFSET < 8
+);
+/// The first header word of a fresh young object, little-endian (every
+/// supported target): only the allocated byte is nonzero.
+const YOUNG_HEADER_FLAG_WORD: u64 = 1 << (8 * willow_abi::gc_header::ALLOCATED_OFFSET);
+const _: () =
+    assert!(willow_abi::gc_header::DESCRIPTOR_OFFSET == 8 && GC_HEADER_MARKED_OFFSET == 0);
 const GC_HEADER_DESCRIPTOR_OFFSET: i32 = willow_abi::gc_header::DESCRIPTOR_OFFSET as i32;
 const GC_TLAB_STATE_SIZE: u64 = willow_abi::tlab::STATE_SIZE as u64;
 const GC_TLAB_MAX_OBJECT_SIZE: i64 = willow_abi::tlab::MAX_OBJECT_SIZE as i64;
@@ -392,35 +400,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_young_header(&mut self, cursor: Value, layout: &GcLayoutMetadata, total_size: i64) {
         let ptr_ty = reference_type(self.module.target_config());
         // Fresh TLAB chunks are zero-filled and never reuse swept holes. Write
-        // every nonzero/semantic header field before the payload is exposed.
-        let zero8 = self.builder.ins().iconst(types::I8, 0);
-        let one8 = self.builder.ins().iconst(types::I8, 1);
+        // every nonzero/semantic header field before the payload is exposed:
+        // the whole flag word in one store (allocated; young, age zero, not
+        // owned, remembered or shared), so a later header-word load of the
+        // inline store filter forwards from this store instead of stalling on
+        // several byte stores.
+        let flags = self
+            .builder
+            .ins()
+            .iconst(types::I64, YOUNG_HEADER_FLAG_WORD as i64);
         self.builder.ins().store(
             MemFlagsData::trusted(),
-            zero8,
+            flags,
             cursor,
             GC_HEADER_MARKED_OFFSET,
-        );
-        self.builder.ins().store(
-            MemFlagsData::trusted(),
-            one8,
-            cursor,
-            GC_HEADER_ALLOCATED_OFFSET,
-        );
-        self.builder.ins().store(
-            MemFlagsData::trusted(),
-            zero8,
-            cursor,
-            GC_HEADER_GENERATION_OFFSET,
-        );
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), zero8, cursor, GC_HEADER_AGE_OFFSET);
-        self.builder.ins().store(
-            MemFlagsData::trusted(),
-            zero8,
-            cursor,
-            GC_HEADER_OWNED_OFFSET,
         );
         let descriptor = layout_descriptor(
             self.module,
@@ -728,6 +721,37 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         );
     }
 
+    /// Barriered store of the managed `value` into `slot`, the referenced
+    /// storage of a reference cell whose base is `base` (a payload start, or
+    /// null for a native stack slot). Only word zero of an inline pair is
+    /// traced; its vtable word follows untraced.
+    pub(super) fn emit_indirect_reference_store(&mut self, base: Value, slot: Value, value: Value) {
+        let flags = MemFlagsData::new();
+        let (word, vtable) = if self.builder.func.dfg.value_type(value) == types::I128 {
+            let (object, vtable) = self.builder.ins().isplit(value);
+            (object, Some(vtable))
+        } else {
+            (value, None)
+        };
+        let barrier_id = self.func_id(rt::willow_gc_array_write_barrier);
+        let barrier = self
+            .module
+            .declare_func_in_func(barrier_id, self.builder.func);
+        let destination = self
+            .builder
+            .ins()
+            .iconst(types::I64, GcStoreDestination::IndirectReference as i64);
+        let word_ty = self.builder.func.dfg.value_type(word);
+        let previous = self.builder.ins().atomic_load(word_ty, flags, slot);
+        self.builder
+            .ins()
+            .call(barrier, &[base, slot, previous, word, destination]);
+        self.builder.ins().atomic_store(flags, word, slot);
+        if let Some(vtable) = vtable {
+            self.builder.ins().store(flags, vtable, slot, 8);
+        }
+    }
+
     /// The serving runtime's gate cell published at `offset` in the pinned
     /// context, loaded once at the function entry (see [`BarrierGates`]).
     fn barrier_gate(&mut self, offset: i32) -> Value {
@@ -780,8 +804,115 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         cell
     }
 
+    /// The publication half of [`Self::emit_filtered_reference_store`]: one
+    /// branch on the generational predicate `| shared owner`, then a store-free
+    /// publication of a private value. Returns the marking predicate, the
+    /// barrier predicate and the phase in force for the generational filter.
+    fn emit_publication_filter(&mut self, filter: PublicationFilter) -> (Value, Value, Value) {
+        use willow_abi::gc_header;
+        let PublicationFilter {
+            word,
+            owner_shared,
+            nonnull,
+            new_edge,
+            phase,
+            phase_addr,
+            plain,
+            refinement,
+        } = filter;
+        let header = -(gc_header::size(reference_type(self.module.target_config()).bytes()) as i32);
+        // The generational predicate and the publication predicate (a
+        // non-null reference stored into a shared owner) share one
+        // branch, so a store that needs neither costs what it did
+        // before ownership: `| shared` on the same header word.
+        let (marking, needs) = barrier_need(self.builder, phase, new_edge, refinement);
+        let owner_shared = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::NotEqual, owner_shared, 0);
+        let publish_candidate = self.builder.ins().band(owner_shared, nonnull);
+        let publish_candidate = match refinement {
+            BarrierRefinement::BufferIsRef(is_ref) => {
+                self.builder.ins().band(is_ref, publish_candidate)
+            }
+            _ => publish_candidate,
+        };
+        let slow = self.builder.ins().bor(needs, publish_candidate);
+        let slow_block = self.builder.create_block();
+        self.builder.ins().brif(slow, slow_block, &[], plain, &[]);
+        self.builder.switch_to_block(slow_block);
+        self.builder.seal_block(slow_block);
+
+        // Publication first, apart from the generational barrier: a
+        // private value stored into a shared owner is published by a
+        // store-free, fence-free runtime call, after which the value is
+        // shared and the generational filter decides between the plain
+        // store and the barrier call. The call never parks, so no
+        // safepoint separates it from the store; the phase is read again
+        // after it. Mirrors the runtime `publication_point` for owner
+        // payloads.
+        let check_published = self.builder.create_block();
+        let publish_value = self.builder.create_block();
+        self.builder.set_cold_block(publish_value);
+        // The generational filter takes the phase and its predicates as
+        // block parameters: the paths that publish nothing reuse the
+        // ones computed above, only a publication re-reads the phase.
+        let generational = self.builder.create_block();
+        let phase_param = self.builder.append_block_param(generational, types::I8);
+        let marking_param = self.builder.append_block_param(generational, types::I8);
+        let needs_param = self.builder.append_block_param(generational, types::I8);
+        let unchanged = [
+            BlockArg::Value(phase),
+            BlockArg::Value(marking),
+            BlockArg::Value(needs),
+        ];
+        self.builder.ins().brif(
+            publish_candidate,
+            check_published,
+            &[],
+            generational,
+            &unchanged,
+        );
+        self.builder.switch_to_block(check_published);
+        self.builder.seal_block(check_published);
+        let value_shared = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::trusted(),
+            word,
+            header + gc_header::SHARED_OFFSET as i32,
+        );
+        self.builder
+            .ins()
+            .brif(value_shared, generational, &unchanged, publish_value, &[]);
+        self.builder.switch_to_block(publish_value);
+        self.builder.seal_block(publish_value);
+        let publish_id = self.func_id(rt::willow_gc_publish_stored_value);
+        let publish_ref = self
+            .module
+            .declare_func_in_func(publish_id, self.builder.func);
+        self.builder.ins().call(publish_ref, &[word]);
+        let reloaded =
+            self.builder
+                .ins()
+                .atomic_load(types::I8, MemFlagsData::trusted(), phase_addr);
+        let (marking, needs) = barrier_need(self.builder, reloaded, new_edge, refinement);
+        self.builder.ins().jump(
+            generational,
+            &[
+                BlockArg::Value(reloaded),
+                BlockArg::Value(marking),
+                BlockArg::Value(needs),
+            ],
+        );
+        self.builder.switch_to_block(generational);
+        self.builder.seal_block(generational);
+        (marking_param, needs_param, phase_param)
+    }
+
     /// Store a reference `word` into `slot` inside the GC object whose payload
-    /// starts at `owner`. The fused
+    /// starts at `owner`. A private value stored into a shared owner is first
+    /// published by `willow_gc_publish_stored_value` (no store, no fence).
+    /// The fused
     /// `willow_gc_write_barrier` call is skipped when it is a no-op: no SATB
     /// epoch is active and the word is null, the owner is not old, or the
     /// owner is already remembered (a header flag the runtime keeps equal to
@@ -806,13 +937,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let barrier = self.builder.create_block();
         self.builder.set_cold_block(barrier);
         let done = self.builder.create_block();
+        let header = -(gc_header::size(ptr_ty.bytes()) as i32);
 
         let phase_addr = self.barrier_gate(willow_abi::generated_context::MARK_PHASE_OFFSET);
         let phase = self
             .builder
             .ins()
             .atomic_load(types::I8, MemFlagsData::trusted(), phase_addr);
-        let marking = self.builder.ins().icmp_imm_s(IntCC::NotEqual, phase, 0);
+
+        // A cached remembered card of an array buffer proves the buffer is
+        // private and the card recorded (the runtime never caches a shared
+        // buffer, and publishing a cached one advances the epoch), so with
+        // no marking epoch the store is plain.
         if destination == GcStoreDestination::ArrayElement {
             let epoch_addr =
                 self.barrier_gate(willow_abi::generated_context::CARD_EPOCH_CELL_OFFSET);
@@ -828,34 +964,48 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.switch_to_block(filter);
             self.builder.seal_block(filter);
         }
-        let header = -(gc_header::size(ptr_ty.bytes()) as i32);
-        let generation = self.builder.ins().load(
-            types::I8,
-            flags,
-            owner,
-            header + gc_header::GENERATION_OFFSET as i32,
-        );
-        let remembered = self.builder.ins().load(
-            types::I8,
-            flags,
-            owner,
-            header + gc_header::REMEMBERED_OFFSET as i32,
-        );
+
+        // One owner header-word load and one phase load serve every check
+        // below: the owner's generation, remembered and shared bytes change
+        // only at a stop (or, for a shared owner, its remembered byte may be
+        // set concurrently, which only makes a stale zero call the barrier
+        // conservatively), and nothing here reaches a safepoint.
+        let header_word = self.builder.ins().load(types::I64, flags, owner, header);
+        let header_byte = |builder: &mut FunctionBuilder<'_>, offset: u32| {
+            let shifted = builder
+                .ins()
+                .ushr_imm_u(header_word, u64::from(8 * offset) as i64);
+            builder.ins().ireduce(types::I8, shifted)
+        };
+        let nonnull = self.builder.ins().icmp_imm_s(IntCC::NotEqual, word, 0);
+        let generation = header_byte(self.builder, gc_header::GENERATION_OFFSET);
+        let remembered = header_byte(self.builder, gc_header::REMEMBERED_OFFSET);
         let old = self.builder.ins().icmp_imm_s(
             IntCC::Equal,
             generation,
             i64::from(gc_header::GENERATION_OLD),
         );
         let unremembered = self.builder.ins().icmp_imm_s(IntCC::Equal, remembered, 0);
-        let nonnull = self.builder.ins().icmp_imm_s(IntCC::NotEqual, word, 0);
-        let new_edge = self.builder.ins().band(old, unremembered);
-        let new_edge = self.builder.ins().band(new_edge, nonnull);
-        let needs_barrier = self.builder.ins().bor(marking, new_edge);
-        let needs_barrier = match refinement {
-            BarrierRefinement::BufferIsRef(is_ref) => {
-                self.builder.ins().band(is_ref, needs_barrier)
-            }
-            _ => needs_barrier,
+        let young_edge = self.builder.ins().band(old, unremembered);
+        let new_edge = self.builder.ins().band(young_edge, nonnull);
+        let (marking, needs_barrier, phase) = if destination == GcStoreDestination::AsyncFrameSlot {
+            // An async frame is its task's stack: never shared, so a store
+            // into it is never a publication point (a frame hands values to
+            // other tasks only at spawn and task return, which publish them).
+            let (marking, needs) = barrier_need(self.builder, phase, new_edge, refinement);
+            (marking, needs, phase)
+        } else {
+            let owner_shared = header_byte(self.builder, gc_header::SHARED_OFFSET);
+            self.emit_publication_filter(PublicationFilter {
+                word,
+                owner_shared,
+                nonnull,
+                new_edge,
+                phase,
+                phase_addr,
+                plain,
+                refinement,
+            })
         };
         if refinement == BarrierRefinement::OldValueSkips {
             // Reached only when marking or when `word` is non-null.
@@ -877,6 +1027,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 word,
                 header + gc_header::GENERATION_OFFSET as i32,
             );
+            // Publication is settled above, so the call is needed only for
+            // an old-to-young edge: a young value (published or not) into an
+            // old unremembered owner, i.e. a new edge whose value is young.
+            // Mirrors the runtime `object_store_needs_barrier`.
             let value_old = self.builder.ins().icmp_imm_s(
                 IntCC::Equal,
                 value_generation,
@@ -896,6 +1050,35 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(barrier);
         self.builder.seal_block(barrier);
+        if destination == GcStoreDestination::ArrayElement {
+            // Past the publication filter the value is shared whenever the
+            // buffer is, so a shared buffer's cached card (tagged epoch,
+            // `CARD_EPOCH_SHARED_TAG`) proves the barrier a no-op with no
+            // marking epoch. Only this cold block pays the compare: stores
+            // into a shared buffer otherwise call the barrier every time.
+            let epoch_addr =
+                self.barrier_gate(willow_abi::generated_context::CARD_EPOCH_CELL_OFFSET);
+            let epoch =
+                self.builder
+                    .ins()
+                    .atomic_load(types::I64, MemFlagsData::trusted(), epoch_addr);
+            let tagged = self.builder.ins().bor_imm_u(
+                epoch,
+                willow_abi::generated_context::CARD_EPOCH_SHARED_TAG as i64,
+            );
+            let hit = emit_remembered_card_hit(self.builder, ptr_ty, owner, slot, tagged);
+            let inactive = self.builder.ins().icmp_imm_s(IntCC::Equal, phase, 0);
+            let skip = self.builder.ins().band(hit, inactive);
+            let shared_plain = self.builder.create_block();
+            let call = self.builder.create_block();
+            self.builder.ins().brif(skip, shared_plain, &[], call, &[]);
+            self.builder.switch_to_block(shared_plain);
+            self.builder.seal_block(shared_plain);
+            self.builder.ins().store(flags, word, slot, 0);
+            self.builder.ins().jump(done, &[]);
+            self.builder.switch_to_block(call);
+            self.builder.seal_block(call);
+        }
         let word_ty = self.builder.func.dfg.value_type(word);
         let previous = self.builder.ins().atomic_load(word_ty, flags, slot);
         let publish = self.builder.create_block();
@@ -1099,6 +1282,36 @@ fn owner_is_object_payload(destination: GcStoreDestination) -> bool {
             | GcStoreDestination::InterfaceObject
             | GcStoreDestination::AsyncFrameSlot
     )
+}
+
+/// Inputs of the publication half of a filtered reference store.
+struct PublicationFilter {
+    word: Value,
+    /// The owner's SHARED header byte.
+    owner_shared: Value,
+    nonnull: Value,
+    new_edge: Value,
+    phase: Value,
+    phase_addr: Value,
+    plain: cranelift_codegen::ir::Block,
+    refinement: BarrierRefinement,
+}
+
+/// The marking predicate and whether the generational barrier call is
+/// needed for this `phase`.
+fn barrier_need(
+    builder: &mut FunctionBuilder<'_>,
+    phase: Value,
+    new_edge: Value,
+    refinement: BarrierRefinement,
+) -> (Value, Value) {
+    let marking = builder.ins().icmp_imm_s(IntCC::NotEqual, phase, 0);
+    let needs = builder.ins().bor(marking, new_edge);
+    let needs = match refinement {
+        BarrierRefinement::BufferIsRef(is_ref) => builder.ins().band(is_ref, needs),
+        _ => needs,
+    };
+    (marking, needs)
 }
 
 #[cfg(test)]
@@ -1547,10 +1760,15 @@ mod tests {
     #[test]
     fn generated_header_and_tlab_layout_contract_is_stable() {
         assert_eq!(willow_abi::gc_header::size(8), 16);
-        assert_eq!(GC_HEADER_ALLOCATED_OFFSET, 1);
-        assert_eq!(GC_HEADER_GENERATION_OFFSET, 2);
-        assert_eq!(GC_HEADER_AGE_OFFSET, 3);
-        assert_eq!(GC_HEADER_OWNED_OFFSET, 4);
+        // One store writes the whole fresh flag word: allocated, young, age
+        // zero, not owned, remembered or shared.
+        let mut fresh = [0u8; 8];
+        fresh[willow_abi::gc_header::ALLOCATED_OFFSET as usize] = 1;
+        fresh[willow_abi::gc_header::GENERATION_OFFSET as usize] =
+            willow_abi::gc_header::GENERATION_YOUNG;
+        assert_eq!(YOUNG_HEADER_FLAG_WORD.to_le_bytes(), fresh);
+        assert_eq!(willow_abi::gc_header::AGE_OFFSET, 3);
+        assert_eq!(willow_abi::gc_header::OWNED_OFFSET, 4);
         assert_eq!(GC_HEADER_DESCRIPTOR_OFFSET, 8);
         assert_eq!(GC_TLAB_STATE_SIZE, 24);
         assert_eq!(GC_TLAB_MAX_OBJECT_SIZE, 4096);

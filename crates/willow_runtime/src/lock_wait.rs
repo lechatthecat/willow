@@ -32,6 +32,7 @@
 //!    outlived its state (ABA / lifetime-invariant violation) and aborts rather
 //!    than corrupting an unrelated lock.
 
+use crate::id_hash::IdMap;
 use crate::native_memory::Mutex as StdMutex;
 use crate::native_memory::MutexGuard;
 use crate::scheduler::{
@@ -41,7 +42,6 @@ use crate::scheduler::{
 use crate::task::RuntimeTaskId;
 use crate::task_state::WakeOutcome;
 use crate::wait_queue::WaitQueue;
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -189,15 +189,15 @@ struct LockStateInner {
     /// The token each queued task registered with. Split from `waiters` so the
     /// queue keeps its O(1) removal; a task waits on at most one lock at a time,
     /// so one entry per task is exact.
-    tokens: HashMap<RuntimeTaskId, RegistrationToken>,
+    tokens: IdMap<RuntimeTaskId, RegistrationToken>,
     /// Access mode paired with every queued token.
-    waiter_modes: HashMap<RuntimeTaskId, LockAccess>,
+    waiter_modes: IdMap<RuntimeTaskId, LockAccess>,
     /// Reserved or active exclusive ownership.
     owner: Option<(RuntimeTaskId, RegistrationToken)>,
     /// Exact active shared owners.  A reader is inserted before its handoff
     /// link is published as `HandoffOwned`, and removed only by release or
     /// cancellation of that exact token.
-    readers: HashMap<RuntimeTaskId, RegistrationToken>,
+    readers: IdMap<RuntimeTaskId, RegistrationToken>,
 }
 
 impl crate::native_memory::Footprint for LockStateInner {
@@ -234,10 +234,10 @@ impl Default for LockStateInner {
             next_token: 1,
             native_tables: [0; 3],
             waiters: WaitQueue::default(),
-            tokens: HashMap::new(),
-            waiter_modes: HashMap::new(),
+            tokens: IdMap::default(),
+            waiter_modes: IdMap::default(),
             owner: None,
-            readers: HashMap::new(),
+            readers: IdMap::default(),
         }
     }
 }

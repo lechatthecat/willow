@@ -43,6 +43,13 @@ pub(crate) struct RuntimeDiagnostics {
     /// `WILLOW_GC_VERIFY_BARRIER`; a test fixture runtime enables it directly,
     /// so production barriers carry no test-build branch.
     pub(crate) barrier_counting: LazyLock<bool>,
+    /// Scan the heap at every minor stop for task-ownership violations
+    /// (`WILLOW_GC_VERIFY_PUBLICATION`; stress modes enable it too, see
+    /// `publication_verifier_enabled`).
+    pub(crate) verify_publication: LazyLock<bool>,
+    /// `WILLOW_GC_PUBLICATION_STATS=1`: print one publication/GC summary line
+    /// to stderr when the main task finishes.
+    pub(crate) publication_stats: LazyLock<bool>,
 }
 impl RuntimeDiagnostics {
     pub(crate) fn trace_stops(&self) -> bool {
@@ -117,6 +124,15 @@ impl RuntimeDiagnostics {
             }),
             barrier_counting: LazyLock::new(|| {
                 std::env::var_os("WILLOW_GC_VERIFY_BARRIER").is_some()
+            }),
+            verify_publication: LazyLock::new(|| {
+                std::env::var_os("WILLOW_GC_VERIFY_PUBLICATION").is_some()
+                    || parse_gc_stress_modes(&std::env::var("WILLOW_GC_STRESS").unwrap_or_default())
+                        .iter()
+                        .any(|mode| PUBLICATION_VERIFIER_STRESS_MODES.contains(&mode.as_str()))
+            }),
+            publication_stats: LazyLock::new(|| {
+                std::env::var("WILLOW_GC_PUBLICATION_STATS").as_deref() == Ok("1")
             }),
         }
     }
@@ -207,7 +223,36 @@ impl StressOverride for RuntimeStressOverride {
     }
 }
 
+/// Stress modes that also turn on the publication verifier.
+const PUBLICATION_VERIFIER_STRESS_MODES: [&str; 6] =
+    ["all", "alloc", "await", "minor", "relocate", "scheduler"];
+
 impl RuntimeDiagnostics {
+    /// The publication verifier runs on request and under every stress mode.
+    /// Decided once from the environment; test builds also honour a stress
+    /// override set on the runtime.
+    pub(crate) fn publication_verifier_enabled(&self) -> bool {
+        *self.verify_publication || self.publication_verifier_overridden()
+    }
+
+    #[cfg(not(test))]
+    fn publication_verifier_overridden(&self) -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    fn publication_verifier_overridden(&self) -> bool {
+        self.stress_override
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|modes| {
+                modes.iter().any(|mode| {
+                    mode == "all" || PUBLICATION_VERIFIER_STRESS_MODES.contains(&mode.as_str())
+                })
+            })
+    }
+
     pub(crate) fn stress_enabled(&self, kind: &str) -> bool {
         self.stress_override.enabled(kind, || {
             self.gc_stress_modes

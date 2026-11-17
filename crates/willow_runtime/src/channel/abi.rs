@@ -112,7 +112,7 @@ pub extern "C" fn willow_channel_send_ready(raw: *mut c_void) -> i32 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
-    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    let no_preempt = crate::preempt::NoPreemptGuard::enter();
     let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return 1;
     };
@@ -121,6 +121,11 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
     let current = crate::scheduler::willow_sched_current_task();
     if state.recv_claims.contains_key(&current) {
         return 1;
+    }
+    refill_from_inbox(channel, &mut state);
+    if state.values.len() <= state.recv_claims.len() && !(state.closed && state.values.is_empty()) {
+        // About to park: values sent since the refill join the queue first.
+        close_inbox(channel, &mut state);
     }
     if state.values.len() > state.recv_claims.len() {
         if current == 0 {
@@ -155,9 +160,72 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
     if state.closed && state.values.is_empty() {
         return 1;
     }
+    park_receiver(raw, state, no_preempt, current)
+}
+
+/// Fused receive of a `recv` suspension, with one channel lock: returns 1
+/// after writing the taken value's storage word to `out_payload`, 2 when the
+/// channel is closed and drained (or null; the caller's ordinary receive then
+/// raises or answers `None`), 0 after registering the running task as a
+/// waiter, like `willow_channel_recv_ready`.
+///
+/// Same outcomes as `willow_channel_recv_ready` followed by the receive, minus
+/// the receive claim it installs only to clear at once: nothing can run in
+/// between, because the generated code has no safepoint there. A task with a
+/// pending cancellation still takes no unreserved value. `select` keeps
+/// `willow_channel_recv_ready`, since its probes must not consume.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_channel_recv_take(raw: *mut c_void, out_payload: *mut i64) -> i32 {
+    let no_preempt = crate::preempt::NoPreemptGuard::enter();
+    let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
+        return 2;
+    };
+    crate::task::prepare_channel_wait_links();
+    let mut state = channel.state.lock().expect("channel mutex poisoned");
+    let current = crate::scheduler::willow_sched_current_task();
+    if !state.recv_claims.contains_key(&current) {
+        refill_from_inbox(channel, &mut state);
+        if state.values.len() <= state.recv_claims.len()
+            && !(state.closed && state.values.is_empty())
+        {
+            // About to park: values sent since the refill join the queue first.
+            close_inbox(channel, &mut state);
+        }
+    }
+    if current != 0
+        && !state.recv_claims.contains_key(&current)
+        && state.values.len() > state.recv_claims.len()
+        && crate::scheduler::current_task_cancel_pending(current)
+    {
+        // `willow_channel_recv_ready` refuses its claim here: the value stays
+        // queued and the cancelled task parks to be unwound.
+        clear_wait(raw, &mut state.waiters, current, ChannelRole::RecvWait);
+        return 0;
+    }
+    if let Some(value) = take_value(raw, &mut state, current) {
+        open_inbox_if_idle(channel, &mut state);
+        let value = finish_take(raw, channel, state, value);
+        unsafe { out_payload.write(value.i64_value) };
+        return 1;
+    }
+    if state.closed && state.values.is_empty() {
+        return 2;
+    }
+    park_receiver(raw, state, no_preempt, current)
+}
+
+/// Register the running task as a receive waiter of an empty open channel and
+/// answer 0: the caller's poll returns Pending until a send or close wakes it.
+fn park_receiver(
+    raw: *mut c_void,
+    mut state: crate::native_memory::MutexGuard<'_, WillowChannelState>,
+    no_preempt: crate::preempt::NoPreemptGuard,
+    current: u64,
+) -> i32 {
     let registered = register_wait(raw, &mut state.waiters, current, ChannelRole::RecvWait);
     drop(state);
-    drop(_no_preempt);
+    drop(no_preempt);
     if registered {
         crate::observability::record(
             crate::observability::RuntimeEventKind::ChannelWait,
@@ -321,6 +389,7 @@ pub extern "C" fn willow_channel_close(raw: *mut c_void) {
     let mut wake = HashSet::new();
     {
         let mut state = channel.state.lock().expect("channel mutex poisoned");
+        close_inbox(channel, &mut state);
         state.closed = true;
         drain_waiters(
             channel,

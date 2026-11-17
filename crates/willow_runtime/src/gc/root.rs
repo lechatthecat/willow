@@ -222,7 +222,7 @@ pub(crate) fn add_task_frame_root_in(owner: &crate::runtime::Runtime, frame: *mu
 }
 
 /// Type id of frames from `willow_async_frame_alloc`; no trace hook can claim it.
-const ASYNC_FRAME_TYPE_ID: u32 = 0;
+pub(super) const ASYNC_FRAME_TYPE_ID: u32 = 0;
 
 /// Inline-traced frames are decided from their reference mask. Bitmap and
 /// runtime-traced layouts keep the conservative scan obligation.

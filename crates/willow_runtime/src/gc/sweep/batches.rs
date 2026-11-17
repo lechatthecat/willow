@@ -55,6 +55,9 @@ struct Report {
     assist_objects: u64,
     assist_bytes: u64,
     reclaimed_bytes: u64,
+    /// Freed bytes of young-published objects, added to the publication
+    /// counters once when the sweep completes.
+    promoted_died_bytes: u64,
     metadata_items: u64,
     swept_objects: u64,
     #[cfg(test)]
@@ -201,6 +204,10 @@ pub(super) fn execute_in(owner: &crate::runtime::Runtime, mut plan: SweepPlan) -
             .unwrap()
             .transition(old_cycle::Phase::Idle);
     }
+    owner
+        .gc
+        .publication
+        .note_promoted_died(cursor.report.promoted_died_bytes as usize);
     owner.telemetry.sweep.completed(
         cursor.report.swept_objects,
         cursor.report.swept_bytes,
@@ -674,6 +681,9 @@ impl Cursor {
             region.mark_bitmap.unmark(offset);
             region.live_bytes = region.live_bytes.saturating_sub(size);
             let observed_type = crate::observation::Value::new(|| object.type_id());
+            if object.promoted_by_publication() {
+                self.report.promoted_died_bytes += size as u64;
+            }
             reclaim(&owner.gc, state, object, size, reclaim_permit.unwrap());
             self.report.reclaimed_bytes += size as u64;
             hook.map_or(Action::Progress, |hook| {
@@ -916,6 +926,16 @@ impl Cursor {
             note_dead_frame_in(&owner.frame_lifetime, object, self.plan.epoch);
             chunk.mark_bitmap.unmark(offset);
             let observed_type = crate::observation::Value::new(|| object.type_id());
+            // A young-published object (`gc::publish`). One still young was
+            // counted in `published_young_bytes`, which the next minor would
+            // otherwise account as died: take it out so it counts once.
+            if object.promoted_by_publication() {
+                if object.generation() != GC_GENERATION_OLD {
+                    state.published_young_bytes =
+                        state.published_young_bytes.saturating_sub(size as u64);
+                }
+                self.report.promoted_died_bytes += size as u64;
+            }
             reclaim(&owner.gc, state, object, size, reclaim_permit.unwrap());
             self.report.reclaimed_bytes += size as u64;
             hook.map_or(Action::Progress, |hook| {
@@ -978,6 +998,9 @@ impl Cursor {
                 }
                 owner.root_tlabs.remove(chunk.base as usize);
                 state.tlab_addresses.remove(chunk.base as usize);
+                if !state.chunk_owners.is_empty() {
+                    state.chunk_owners.remove(&(chunk.base as usize));
+                }
                 if index < state.tlab_chunks.len() {
                     state
                         .tlab_addresses
@@ -1142,6 +1165,7 @@ mod tests {
                     generation: GC_GENERATION_YOUNG,
                     age: 0,
                     remembered: 0,
+                    shared: 0,
                     descriptor_owned: false,
                     descriptor: &DESCRIPTOR as *const _ as usize,
                 });

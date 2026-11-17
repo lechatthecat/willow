@@ -928,6 +928,7 @@ fn compact_static_header_reclamation_keeps_hole_size() {
         age: 0,
         descriptor_owned: false,
         remembered: 0,
+        shared: 0,
         descriptor: &DESCRIPTOR as *const _ as usize,
     };
     let object = HeapObject::from_raw(&mut header).unwrap();
@@ -1492,7 +1493,7 @@ fn test_gc_minor_collection_updates_map_reference_slots() {
 }
 
 #[test]
-fn test_gc_minor_collection_updates_channel_queue_reference_slots() {
+fn test_gc_channel_send_publishes_its_value_and_a_minor_moves_it() {
     let _guard = isolated_runtime();
     reset_gc();
     let mut channel = crate::channel::willow_channel_new(1) as *mut u8;
@@ -1501,13 +1502,59 @@ fn test_gc_minor_collection_updates_channel_queue_reference_slots() {
     let young = willow_gc_alloc_slow(&mut tls, 43, 0, 8, 0);
     unsafe { *(young as *mut i64) = 903 };
     crate::channel::willow_channel_send_ptr(channel.cast(), young.cast());
-    assert!(willow_gc_remembered_set_size() > 0);
+    // The receiver may be another task: the send marks the value shared but
+    // leaves it young; the old channel is remembered, so the next minor
+    // evacuates the value and rewrites the queued slot.
+    let object = HeapObject::from_payload(GcPayload::from_raw(young).unwrap());
+    assert!(object.shared());
+    assert_eq!(object.generation(), GC_GENERATION_YOUNG);
 
     crate::gc::minor_collect_internal();
 
-    let moved = crate::channel::willow_channel_recv_ptr(channel.cast()).cast::<u8>();
-    assert_ne!(moved, young);
-    assert_eq!(unsafe { *(moved as *mut i64) }, 903);
+    let received = crate::channel::willow_channel_recv_ptr(channel.cast()).cast::<u8>();
+    assert_ne!(received, young);
+    assert_eq!(unsafe { *(received as *mut i64) }, 903);
+    willow_pop_root();
+    willow_gc_collect();
+    reset_gc();
+}
+
+#[test]
+fn test_gc_minor_moves_values_waiting_in_a_channel_inbox() {
+    let _guard = isolated_runtime();
+    reset_gc();
+    let mut channel = crate::channel::willow_channel_new(1) as *mut u8;
+    willow_push_root(&mut channel as *mut *mut u8);
+    let mut tls = new_tlab_state();
+    // One send and one take open the producer inbox of the idle channel.
+    let opener = willow_gc_alloc_slow(&mut tls, 43, 0, 8, 0);
+    crate::channel::willow_channel_send_ptr(channel.cast(), opener.cast());
+    let mut payload = 0;
+    assert_eq!(
+        crate::channel::willow_channel_recv_take(channel.cast(), &mut payload),
+        1
+    );
+    let young: Vec<*mut u8> = (0..3)
+        .map(|index| {
+            let value = willow_gc_alloc_slow(&mut tls, 43, 0, 8, 0);
+            unsafe { *(value as *mut i64) = 910 + index };
+            crate::channel::willow_channel_send_ptr(channel.cast(), value.cast());
+            value
+        })
+        .collect();
+
+    crate::gc::minor_collect_internal();
+
+    for (index, &before) in young.iter().enumerate() {
+        let mut received = 0;
+        assert_eq!(
+            crate::channel::willow_channel_recv_take(channel.cast(), &mut received),
+            1
+        );
+        let received = received as *mut u8;
+        assert_ne!(received, before, "the minor evacuated the inbox value");
+        assert_eq!(unsafe { *(received as *mut i64) }, 910 + index as i64);
+    }
     willow_pop_root();
     willow_gc_collect();
     reset_gc();

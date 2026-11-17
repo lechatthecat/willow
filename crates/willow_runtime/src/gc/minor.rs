@@ -103,6 +103,23 @@ struct MinorCollector<'a> {
     forwarded_per_chunk: Vec<usize>,
     /// Source chunks holding a young object promoted in place this cycle.
     pinned_per_chunk: Vec<bool>,
+    /// Bytes of published young objects that survived this cycle (moved,
+    /// tenured or retained in place).
+    survived_shared_bytes: u64,
+    /// Bytes of those survivors that are still young afterwards: they stay
+    /// counted as published-young until they are tenured or die.
+    young_shared_bytes: u64,
+    /// Published young bytes exist (logs are drained before the collector
+    /// starts), so moved objects may be shared and are accounted.
+    count_shared: bool,
+    /// `count_shared` or `track_owners`: the one per-copy test of the
+    /// publication bookkeeping, off in private-only programs.
+    account_moves: bool,
+    /// Task ownership is recorded only for the publication verifier, its
+    /// sole reader (`gc::publish`): survivors then keep their owner, except
+    /// the owners in this set, which handed their objects over with a task
+    /// result: their survivors belong to no task.
+    track_owners: Option<crate::id_hash::IdSet<u64>>,
     published: Vec<usize>,
     // Old edges from inline generated layouts scanned by this minor. Publish
     // after all relocated targets have their epoch marks, so new-to-new edges
@@ -150,6 +167,17 @@ impl<'a> MinorCollector<'a> {
             prepare_survivor_reserve_in(owner, state);
         }
         let source_chunks = state.tlab_chunks.len();
+        let count_shared = state.published_young_bytes != 0;
+        let track_owners = super::publish::tracks_owners(owner).then(|| {
+            std::mem::take(
+                &mut *owner
+                    .gc
+                    .publication
+                    .handed_over_owners
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        });
         let mut collector = Self {
             owner,
             release_reserve_on_drop,
@@ -172,6 +200,11 @@ impl<'a> MinorCollector<'a> {
             forwarded_objects: 0,
             forwarded_per_chunk: vec![0; source_chunks],
             pinned_per_chunk: vec![false; source_chunks],
+            survived_shared_bytes: 0,
+            young_shared_bytes: 0,
+            count_shared,
+            account_moves: count_shared || track_owners.is_some(),
+            track_owners,
             published: Vec::new(),
             major_old_edges: AddressSet::default(),
             already_queued: AddressSet::default(),
@@ -301,6 +334,9 @@ impl<'a> MinorCollector<'a> {
             }
             self.state.survivor_stats.pinned_promotions += 1;
             let size = object.size();
+            if object.shared() {
+                self.survived_shared_bytes += size as u64;
+            }
             let stats = &mut self.state.survivor_stats;
             stats.pinned_bytes = stats.pinned_bytes.saturating_add(size as u64);
             stats.active_pin_bytes += size as u64;
@@ -334,6 +370,101 @@ impl<'a> MinorCollector<'a> {
         panic!("willow gc: invalid root 0x{address:x} during minor collection");
     }
 
+    /// An object of a publication parked at this stop stays where it lies
+    /// (the publisher holds its address): retain it as old, like a pinned
+    /// root, and scan its slots. `source` was validated by `young_source`,
+    /// which cached its chunk.
+    fn retain_in_place(&mut self, source: HeapObject) {
+        let address = source.payload().as_ptr() as usize;
+        if !self.scanned.insert(address) {
+            return;
+        }
+        source.set_generation(GC_GENERATION_OLD);
+        let chunk = self.last_chunk.get().expect("validated young source chunk");
+        self.pinned_per_chunk[chunk] = true;
+        if self.state.concurrent_cycle.is_some() {
+            self.published.push(address);
+        }
+        let size = source.size();
+        if source.shared() {
+            self.survived_shared_bytes += size as u64;
+        }
+        self.state.young_allocated_bytes = self.state.young_allocated_bytes.saturating_sub(size);
+        self.state.promoted_objects = self.state.promoted_objects.saturating_add(1);
+        self.state.promoted_bytes = self.state.promoted_bytes.saturating_add(size as u64);
+        self.worklist.push((source, true));
+    }
+
+    /// An object of a publication parked at this stop: the publisher holds
+    /// its address, so it stays in place, and its unshared children move
+    /// with updated slots.
+    fn retain_parked(&mut self, address: usize) {
+        match self.young_source(address) {
+            Some(source) if source.forwarded_to().is_none() => self.retain_in_place(source),
+            Some(_) => {}
+            None => self.pin_root(address as *mut u8, PinSource::OldOrForeign),
+        }
+    }
+
+    /// Publication bookkeeping of one copy: survived (and, when still
+    /// young, still published-young) bytes of a published object, and the
+    /// task owner of a young survivor.
+    #[cold]
+    #[inline(never)]
+    fn account_move(
+        &mut self,
+        source: HeapObject,
+        source_chunk: usize,
+        target: HeapObject,
+        size: usize,
+    ) {
+        let young = target.generation() != GC_GENERATION_OLD;
+        if self.count_shared && target.shared() {
+            self.survived_shared_bytes += size as u64;
+            if young {
+                self.young_shared_bytes += size as u64;
+            }
+        }
+        if young {
+            self.keep_survivor_owner(source, source_chunk, target);
+        }
+    }
+
+    /// Survivors stay owned by their allocating task (`gc::publish`). Only
+    /// the publication verifier records owners, so this runs only with it on.
+    /// One segment is the common case: O(1); otherwise a binary search over
+    /// the source chunk's few task switches.
+    #[cold]
+    #[inline(never)]
+    fn keep_survivor_owner(&mut self, source: HeapObject, source_chunk: usize, target: HeapObject) {
+        let Some(handed_over) = self.track_owners.as_ref() else {
+            return;
+        };
+        let source_base = self.state.tlab_chunks[source_chunk].base as usize;
+        let owner = self
+            .state
+            .chunk_owners
+            .get(&source_base)
+            .map_or(0, |segments| {
+                segments.owner_at(source.as_ptr() as usize - source_base)
+            });
+        let owner = if handed_over.contains(&owner) {
+            0
+        } else {
+            owner
+        };
+        let index = self
+            .survivor_destination
+            .expect("a young survivor lies in the survivor destination");
+        let chunk = &self.state.tlab_chunks[index];
+        let (base, capacity) = (chunk.base as usize, chunk.capacity);
+        self.state
+            .chunk_owners
+            .entry(base)
+            .or_default()
+            .mark_owner_from(target.as_ptr() as usize - base, capacity, owner);
+    }
+
     /// A per-cycle bump cursor: destinations are never evacuation sources in
     /// this cycle, and no search over old survivor chunks is needed per copy.
     fn allocate_survivor(
@@ -357,6 +488,11 @@ impl<'a> MinorCollector<'a> {
             self.state.survivor_reserve_stats.consumed_bytes += chunk.capacity as u64;
             let index = self.state.tlab_chunks.len();
             self.state.tlab_addresses.insert(chunk.base as usize, index);
+            if !self.state.chunk_owners.is_empty() {
+                // A survivor destination starts with no task owners: drop
+                // those of an earlier life of the same chunk base.
+                self.state.chunk_owners.remove(&(chunk.base as usize));
+            }
             self.owner.gc.root_tlabs.insert(&chunk);
             self.state.tlab_chunks.push(chunk);
             self.index_chunk(index);
@@ -557,6 +693,13 @@ impl<'a> MinorCollector<'a> {
                 16 => std::ptr::copy_nonoverlapping(from, to, 16),
                 size => std::ptr::copy_nonoverlapping(from, to, size),
             }
+        }
+        // A published object moves like any young object: every holder is
+        // stopped and visible to this collection, and the move copied its
+        // shared byte (`gc::publish`). Without published young bytes no young
+        // object is shared and the copy loop skips the accounting.
+        if self.account_moves {
+            self.account_move(source, source_chunk, target, size);
         }
         if target.generation() == GC_GENERATION_OLD {
             self.state.promoted_objects = self.state.promoted_objects.saturating_add(1);
@@ -900,6 +1043,9 @@ impl<'a> MinorCollector<'a> {
                 self.pin_root(root, source);
             }
         }
+        for address in self.owner.gc.publication.parked_objects() {
+            self.retain_parked(address);
+        }
         let remembered_scan = crate::gc_telemetry::pause::Span::new(
             &self.owner.telemetry.pause,
             crate::gc_telemetry::pause::Component::Remembered,
@@ -1157,6 +1303,20 @@ impl<'a> MinorCollector<'a> {
                 chunk_index += 1;
             }
         }
+        // Every young published object (published since the previous minor
+        // or still young after it) either survived above or died young
+        // (`gc::publish`). Young survivors stay counted for the next minor.
+        let published = std::mem::replace(
+            &mut self.state.published_young_bytes,
+            self.young_shared_bytes,
+        );
+        let died = published.saturating_sub(self.survived_shared_bytes);
+        if died != 0 {
+            self.owner
+                .gc
+                .publication
+                .note_promoted_died(usize::try_from(died).unwrap_or(usize::MAX));
+        }
         // Every forwarded source is a distinct reclaimed young object; the
         // rest were unreachable and count as frees.
         self.state.total_frees = self
@@ -1307,6 +1467,9 @@ impl<'a> MinorCollector<'a> {
     fn release_chunk(&mut self, chunk_index: usize, chunk_identities: &mut Vec<usize>) {
         let chunk = self.state.tlab_chunks.swap_remove(chunk_index);
         self.owner.gc.root_tlabs.remove(chunk.base as usize);
+        if !self.state.chunk_owners.is_empty() {
+            self.state.chunk_owners.remove(&(chunk.base as usize));
+        }
         chunk_identities.swap_remove(chunk_index);
         self.state.released_bytes = self
             .state
@@ -1449,6 +1612,22 @@ fn minor_collect_with_roots(
     {
         crate::gc_telemetry::failure_record::emit_in(owner, "invariant", &message);
         panic!("willow gc: write barrier verification failed: {message}");
+    }
+    if owner.diagnostics.publication_verifier_enabled()
+        && let Err(message) = super::validation::verify_publication(
+            &state,
+            &registry.trace,
+            |address| owner.gc.publication.parked_contains(address),
+            &owner
+                .gc
+                .publication
+                .handed_over_owners
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    {
+        crate::gc_telemetry::failure_record::emit_in(owner, "invariant", &message);
+        panic!("willow gc: publication verification failed: {message}");
     }
     let remembered_reset = crate::gc_telemetry::pause::Span::new(
         &owner.telemetry.pause,

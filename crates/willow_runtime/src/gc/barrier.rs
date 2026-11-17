@@ -129,17 +129,45 @@ fn card_cache_index(owner: usize, card: usize) -> usize {
     let key = (owner >> 3) ^ card.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     (key ^ (key >> 29)) % CARD_CACHE_ENTRIES
 }
-fn card_cache_hit(owner: usize, card: usize) -> Option<u64> {
+pub(super) fn card_cache_hit(owner: usize, card: usize) -> Option<u64> {
     let epoch = super::remembered::card_epoch();
     CARD_CACHE
         .with(|cache| cache[card_cache_index(owner, card)].get() == (owner, card, epoch))
         .then_some(epoch)
 }
-/// Call under the heap lock after the card was recorded.
-pub(super) fn card_cache_fill(owner: usize, card: usize) {
+
+/// A hit proving only that the card is recorded for this epoch: private
+/// entries and shared ones (`CARD_EPOCH_SHARED_TAG`). For callers whose
+/// value is already published. Returns the cached epoch word.
+fn recorded_card_cache_hit(owner: usize, card: usize) -> Option<u64> {
     let epoch = super::remembered::card_epoch();
+    let (cached_owner, cached_card, cached_epoch) =
+        CARD_CACHE.with(|cache| cache[card_cache_index(owner, card)].get());
+    (cached_owner == owner
+        && cached_card == card
+        && cached_epoch & !willow_abi::generated_context::CARD_EPOCH_SHARED_TAG == epoch)
+        .then_some(cached_epoch)
+}
+/// Call under the heap lock after the card was recorded.
+///
+/// Both entries prove the card is recorded. An untagged entry also proves
+/// the buffer private: the generated array store skips everything,
+/// publication included, on such a hit, and publishing a cached private
+/// buffer advances the card epoch, which invalidates every entry. A shared
+/// buffer (which stays shared) is cached under `CARD_EPOCH_SHARED_TAG`:
+/// only stores past their publication filter accept that entry.
+pub(super) fn card_cache_fill(owner: usize, card: usize) {
+    let mut epoch = super::remembered::card_epoch();
+    if owner_shared(owner) {
+        epoch |= willow_abi::generated_context::CARD_EPOCH_SHARED_TAG;
+    }
     CARD_CACHE.with(|cache| cache[card_cache_index(owner, card)].set((owner, card, epoch)));
     crate::generated_context::set_remembered_card(owner, card, epoch);
+}
+
+fn owner_shared(owner: usize) -> bool {
+    GcPayload::from_raw(owner as *mut u8)
+        .is_some_and(|payload| HeapObject::from_payload(payload).shared())
 }
 
 pub(super) fn barrier_owner_payload(
@@ -392,11 +420,72 @@ pub(super) fn flush_satb_all_locked(coord: &GcCoord, state: &mut GcState) {
 }
 
 fn count_barrier_call(gc: &GcRuntime) {
-    let _ = gc
-        .write_barrier_calls
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |calls| {
-            Some(calls.saturating_add(1))
-        });
+    gc.write_barrier_calls.increment();
+}
+
+/// Shards of the processed-barrier telemetry counter. Every runtime barrier
+/// call counts, from every worker at once: one shared atomic made each call a
+/// contended read-modify-write on one cache line. Each thread adds to its own
+/// line; telemetry reads pay for the sum. Only telemetry and tests read it.
+const BARRIER_CALL_SHARDS: usize = 16;
+
+#[repr(align(128))]
+struct BarrierCallShard(AtomicU64);
+
+/// Processed runtime write-barrier calls of one runtime (telemetry). Relaxed,
+/// like the single counter it replaces: a read concurrent with calls may miss
+/// in-flight increments. The total saturates at `u64::MAX`.
+pub(crate) struct BarrierCallCounter([BarrierCallShard; BARRIER_CALL_SHARDS]);
+
+// Shard choice is a per-thread spreading index, not runtime state.
+static NEXT_BARRIER_CALL_SHARD: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static BARRIER_CALL_SHARD: usize =
+        NEXT_BARRIER_CALL_SHARD.fetch_add(1, Ordering::Relaxed) % BARRIER_CALL_SHARDS;
+}
+
+impl BarrierCallCounter {
+    pub(crate) const fn new() -> Self {
+        Self([const { BarrierCallShard(AtomicU64::new(0)) }; BARRIER_CALL_SHARDS])
+    }
+
+    fn increment(&self) {
+        let shard = BARRIER_CALL_SHARD.with(|index| *index);
+        // Uncontended per thread; wraps only after 2^64 calls on one shard.
+        self.0[shard].0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total processed calls. Same signature as `AtomicU64::load`.
+    pub(crate) fn load(&self, order: Ordering) -> u64 {
+        self.0
+            .iter()
+            .fold(0u64, |sum, shard| sum.saturating_add(shard.0.load(order)))
+    }
+
+    /// Replace the total (reset, or a test fixture value).
+    pub(crate) fn store(&self, value: u64, order: Ordering) {
+        for shard in &self.0[1..] {
+            shard.0.store(0, order);
+        }
+        self.0[0].0.store(value, order);
+    }
+}
+
+/// Publish `value` before generated code stores it into a shared object.
+/// The caller proved `value` a non-null GC payload whose shared byte read
+/// zero. No store and no fence: the caller then runs its generational filter
+/// on the now shared value. Never parks (generated store sites are not GC
+/// points), so nothing moves between this call and the store.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_gc_publish_stored_value(value: *mut u8) {
+    super::publish::publish_in(
+        crate::runtime::current(),
+        value,
+        super::publish::PublicationPoint::SharedStore,
+        false,
+    );
 }
 
 /// Fused pre-store barrier: retain the overwritten reference for SATB, publish
@@ -488,6 +577,16 @@ pub(crate) fn write_barrier_in(
     }
     let gc = &*runtime_owner.gc;
     count_barrier_call(gc);
+    // A store into a shared object (or a global, a lock cell) makes the value
+    // reachable by other tasks: publish it first. A published young value
+    // stays young until the next minor, so the generational record below
+    // still applies. Barrier call sites are not GC points (generated code may
+    // hold unrooted temporaries), so the publication never parks here.
+    if !value.is_null()
+        && let Some(point) = publication_point(owner, slot, destination_kind, owner_has_header)
+    {
+        super::publish::publish_in(runtime_owner, value, point, false);
+    }
     // With no nursery ever published there are no old-to-young edges. A value
     // flagged as a GC payload start has a readable header; an old one cannot
     // create such an edge either (the inline filter trusts the same byte).
@@ -495,9 +594,9 @@ pub(crate) fn write_barrier_in(
         && !owner.is_null()
         && destination_kind != GcStoreDestination::GlobalStatic as i64
         && gc.tlab_ever_allocated.load(Ordering::Acquire)
-        && !(value_has_header
-            && GcPayload::from_raw(value).is_some_and(|value| {
-                HeapObject::from_payload(value).generation() == GC_GENERATION_OLD
+        && (!value_has_header
+            || GcPayload::from_raw(value).is_none_or(|value| {
+                HeapObject::from_payload(value).generation() != GC_GENERATION_OLD
             }))
         && (!owner_has_header
             || GcPayload::from_raw(owner).is_some_and(|owner| {
@@ -516,7 +615,8 @@ pub(crate) fn write_barrier_in(
     // A store into an already recorded card of an old card-remembered buffer
     // needs no lock: the cache entry proves the card is recorded for this
     // epoch, so the next minor scans it whatever the value is. Compiled
-    // array stores carry no value-header proof, so none is required.
+    // array stores carry no value-header proof, so none is required. The
+    // value was published above, so a shared buffer's entry serves too.
     let cached_card = (young_edge_possible
         && owner_has_header
         && !slot.is_null()
@@ -525,7 +625,7 @@ pub(crate) fn write_barrier_in(
     .then(|| slot_card(owner as usize, slot as usize))
     .flatten();
     if let Some(card) = cached_card
-        && let Some(epoch) = card_cache_hit(owner as usize, card)
+        && let Some(epoch) = recorded_card_cache_hit(owner as usize, card)
     {
         // Preserve the exact epoch observed by the TLS lookup, not a later
         // reload that might follow an invalidation on another thread.
@@ -592,6 +692,39 @@ pub(crate) fn write_barrier_in(
     }
 }
 
+/// Publication point of a store into `owner`, when the destination is
+/// reachable by other tasks: a global, a lock-protected cell, or a field,
+/// element or entry of a shared object. `owner` is read only when it is a
+/// proven payload start (header flag, or an `IndirectReference` whose caller
+/// passes the referenced storage's base with the slot).
+#[inline]
+fn publication_point(
+    owner: *mut u8,
+    slot: *mut u8,
+    destination_kind: i64,
+    owner_has_header: bool,
+) -> Option<super::publish::PublicationPoint> {
+    use super::publish::PublicationPoint;
+    const GLOBAL: i64 = GcStoreDestination::GlobalStatic as i64;
+    const ASYNC_MUTEX: i64 = GcStoreDestination::AsyncMutexCell as i64;
+    const ASYNC_RWLOCK: i64 = GcStoreDestination::AsyncRwLockCell as i64;
+    const BLOCKING: i64 = GcStoreDestination::BlockingCell as i64;
+    const BLOCKING_RW: i64 = GcStoreDestination::BlockingRwCell as i64;
+    const INDIRECT: i64 = GcStoreDestination::IndirectReference as i64;
+    match destination_kind {
+        GLOBAL => (!owner.is_null()).then_some(PublicationPoint::Global),
+        ASYNC_MUTEX | ASYNC_RWLOCK | BLOCKING | BLOCKING_RW => Some(PublicationPoint::LockedState),
+        _ => {
+            let payload_start =
+                owner_has_header || (destination_kind == INDIRECT && !slot.is_null());
+            (payload_start
+                && GcPayload::from_raw(owner)
+                    .is_some_and(|owner| HeapObject::from_payload(owner).shared()))
+            .then_some(PublicationPoint::SharedStore)
+        }
+    }
+}
+
 /// Runtime counterpart of the generated inline barrier filter
 /// (`emit_filtered_reference_store`, `OldValueSkips`) for stores whose owner
 /// is the payload start of a GC object. While marking is inactive, only a
@@ -632,7 +765,9 @@ pub(crate) fn write_barrier_array_slot(
     // The runtime caller supplies an actual array element slot, so its card
     // can be calculated without reclassifying either object. Observe the mark
     // phase first: active SATB epochs must still publish deletion/insertion.
-    // There is no safepoint between this check and the caller's atomic store.
+    // A hit also proves the buffer private (shared buffers are never cached),
+    // so no publication is skipped. There is no safepoint between this check
+    // and the caller's atomic store.
     if crate::runtime::current()
         .mark_phase()
         .load(Ordering::Acquire)
@@ -671,19 +806,29 @@ fn object_store_needs_barrier(owner: *mut u8, value: *mut u8) -> bool {
     {
         return true;
     }
-    // A null or old child cannot create an old-to-young edge. Test the child
-    // before reading the owner, so this common case pays no owner-header loads.
+    // A null child needs nothing. An old child that is shared, or stored into
+    // a private owner, neither needs publishing nor creates an old-to-young
+    // edge. Test the child before reading the owner, so the common old-child
+    // case pays one owner-header load at most.
     let Some(value) = GcPayload::from_raw(value) else {
         return false;
     };
-    if HeapObject::from_payload(value).generation() == GC_GENERATION_OLD {
+    let value = HeapObject::from_payload(value);
+    let value_old = value.generation() == GC_GENERATION_OLD;
+    if value_old && value.shared() {
         return false;
     }
     let Some(owner) = GcPayload::from_raw(owner) else {
         return false;
     };
     let owner = HeapObject::from_payload(owner);
-    owner.generation() == GC_GENERATION_OLD && !owner.remembered()
+    // A private child stored into a shared owner must be published.
+    if owner.shared() && !value.shared() {
+        return true;
+    }
+    // A young child (published or not) stored into an old owner is an
+    // old-to-young edge.
+    !value_old && owner.generation() == GC_GENERATION_OLD && !owner.remembered()
 }
 
 // Frozen owner-first generational baseline for the feature-disabled benchmark.
@@ -787,6 +932,85 @@ mod filter_tests {
                 .mark_phase()
                 .store(0, Ordering::Release)
         });
+        reset_internal_for_test();
+    }
+
+    /// The generated object store (`gc_codegen`, `OldValueSkips`) outside
+    /// marking, for a non-null value: whether it calls the store-free
+    /// publication entry first, and whether it then calls the barrier.
+    fn generated_calls(
+        owner_old: bool,
+        remembered: bool,
+        owner_shared: bool,
+        value_old: bool,
+        value_shared: bool,
+    ) -> (bool, bool) {
+        let publishes = owner_shared && !value_shared;
+        let young_edge = owner_old && !remembered;
+        (publishes, young_edge && !value_old)
+    }
+
+    #[test]
+    fn generated_and_runtime_filters_agree_on_every_shared_and_generation_state() {
+        let _guard = isolated_runtime();
+        reset_internal_for_test();
+        let owner = willow_alloc(8);
+        let value = willow_alloc(8);
+        let owner_object = HeapObject::from_payload(GcPayload::from_raw(owner).unwrap());
+        let value_object = HeapObject::from_payload(GcPayload::from_raw(value).unwrap());
+        let mut cases = 0;
+        with_stw(crate::gc_telemetry::stops::StopReason::Remark, |_, _| {
+            crate::runtime::current()
+                .mark_phase()
+                .store(0, Ordering::Release);
+            for bits in 0..32u32 {
+                let bit = |index: u32| bits & (1 << index) != 0;
+                let (owner_old, remembered, owner_shared, value_old, value_shared) =
+                    (bit(0), bit(1), bit(2), bit(3), bit(4));
+                let generation = |old: bool| {
+                    if old {
+                        GC_GENERATION_OLD
+                    } else {
+                        GC_GENERATION_YOUNG
+                    }
+                };
+                owner_object.set_generation(generation(owner_old));
+                owner_object.set_remembered(remembered);
+                value_object.set_generation(generation(value_old));
+                // SAFETY: test-owned headers; the byte is never cleared by
+                // the runtime, so restore it through the raw header.
+                unsafe {
+                    (*owner_object.as_ptr()).shared = u8::from(owner_shared);
+                    (*value_object.as_ptr()).shared = u8::from(value_shared);
+                }
+                let case = format!(
+                    "owner old {owner_old} remembered {remembered} shared {owner_shared}, \
+                     value old {value_old} shared {value_shared}"
+                );
+                let (publishes, calls) =
+                    generated_calls(owner_old, remembered, owner_shared, value_old, value_shared);
+                // The runtime filter does both jobs in its one barrier call.
+                assert_eq!(
+                    object_store_needs_barrier(owner, value),
+                    publishes || calls,
+                    "{case}"
+                );
+                if publishes {
+                    willow_gc_publish_stored_value(value);
+                    assert!(value_object.shared(), "{case}");
+                    // Publication settled, only the generational edge is left.
+                    assert_eq!(object_store_needs_barrier(owner, value), calls, "{case}");
+                }
+                cases += 1;
+            }
+        });
+        assert_eq!(cases, 32);
+        // SAFETY: as above.
+        unsafe {
+            (*owner_object.as_ptr()).shared = 0;
+            (*value_object.as_ptr()).shared = 0;
+        }
+        owner_object.set_remembered(false);
         reset_internal_for_test();
     }
 }
@@ -1029,5 +1253,57 @@ mod count_owner_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod barrier_call_counter_tests {
+    use super::*;
+
+    #[test]
+    fn striped_counter_sums_every_thread_and_store_replaces_the_total() {
+        let counter = BarrierCallCounter::new();
+        const THREADS: u64 = 24;
+        const CALLS: u64 = 1000;
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..CALLS {
+                        counter.increment();
+                    }
+                });
+            }
+        });
+        assert_eq!(counter.load(Ordering::Relaxed), THREADS * CALLS);
+        counter.store(7, Ordering::Relaxed);
+        assert_eq!(counter.load(Ordering::Relaxed), 7);
+        counter.increment();
+        assert_eq!(counter.load(Ordering::Relaxed), 8);
+        counter.store(u64::MAX, Ordering::Relaxed);
+        counter.increment();
+        counter.increment();
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX, "saturates");
+    }
+
+    #[test]
+    fn a_shared_card_entry_proves_only_the_recorded_card() {
+        let _runtime = crate::runtime::isolated_runtime();
+        let owner = allocate_old_in(crate::runtime::current(), 0, 0, 8, 0) as usize;
+        card_cache_fill(owner, 9);
+        assert!(card_cache_hit(owner, 9).is_some(), "private: full proof");
+        assert!(recorded_card_cache_hit(owner, 9).is_some());
+        HeapObject::from_payload(GcPayload::from_raw(owner as *mut u8).unwrap()).set_shared(false);
+        // As publication of a cached buffer does.
+        crate::runtime::current()
+            .card_epoch()
+            .fetch_add(1, Ordering::AcqRel);
+        card_cache_fill(owner, 9);
+        let tagged = recorded_card_cache_hit(owner, 9).expect("shared entry records the card");
+        assert_ne!(
+            tagged & willow_abi::generated_context::CARD_EPOCH_SHARED_TAG,
+            0
+        );
+        assert!(card_cache_hit(owner, 9).is_none(), "never proves privacy");
+        assert!(recorded_card_cache_hit(owner, 10).is_none());
     }
 }

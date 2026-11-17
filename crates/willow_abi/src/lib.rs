@@ -225,6 +225,12 @@ pub enum FrameTerminalStatus {
 pub mod frame_status {
     pub const TERMINAL_MASK: i64 = 0b111;
     pub const CANCEL_REQUESTED: i64 = 1 << 8;
+    /// Runtime-only: a publication reached this task's handle, so its result
+    /// may be read by other tasks.
+    pub const RESULT_ESCAPED: i64 = 1 << 9;
+    /// Runtime-only: the task finished before its handle escaped and handed
+    /// its result over to the handle's holder unpublished.
+    pub const RESULT_HANDED_OVER: i64 = 1 << 10;
 }
 
 /// Status returned by scheduler-aware lock acquisition and polling.
@@ -376,6 +382,15 @@ pub mod gc_header {
     pub const OWNED_OFFSET: u32 = 4;
     /// Nonzero while the object is in the runtime remembered set.
     pub const REMEMBERED_OFFSET: u32 = 5;
+    /// Nonzero once the object is reachable from shared state (another task,
+    /// a channel, a lock, a global, a runtime root or a native boundary).
+    /// Set by the runtime publication routine with an atomic byte store and
+    /// never cleared (a minor collection copies it with the object).
+    /// Generated stores read it
+    /// to publish a private value stored into a shared owner through
+    /// `willow_gc_publish_stored_value`. Generated code tests only nonzero; the
+    /// runtime distinguishes values that were young when published.
+    pub const SHARED_OFFSET: u32 = 6;
     pub const DESCRIPTOR_OFFSET: u32 = 8;
 
     /// Values of the byte at [`GENERATION_OFFSET`].
@@ -889,6 +904,13 @@ pub mod generated_context {
     pub const CARD_OWNER_OFFSET: i32 = 48;
     pub const CARD_INDEX_OFFSET: i32 = 56;
     pub const CARD_EPOCH_OFFSET: i32 = 64;
+    /// Set in the cached epoch when the cached buffer is shared: the entry
+    /// then proves only that the card is recorded, not that the buffer is
+    /// private. The private fast-path compare misses it, so a store still
+    /// passes its publication filter; only after that filter may a store
+    /// into the shared buffer compare `epoch | CARD_EPOCH_SHARED_TAG` and
+    /// skip the barrier call. Card epochs stay far below this bit.
+    pub const CARD_EPOCH_SHARED_TAG: u64 = 1 << 63;
     /// Pointer to the context-owned root-slot pointer array.
     pub const ROOT_BASE_OFFSET: i32 = 72;
     /// Initialized slot count, updated only by the running context owner.
