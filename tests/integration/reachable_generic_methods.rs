@@ -153,7 +153,7 @@ fn reachable_generic_method_execution_perspectives() {
 
 #[test]
 fn reachable_generic_methods_example() {
-    let source = include_str!("../../example/reachable_generic_methods.wi");
+    let source = include_str!("../../tests/regressions/reachable_generic_methods.wi");
     for run in [compile_and_run, compile_and_run_release] {
         let (out, ok) = run(source);
         assert!(ok, "{out}");

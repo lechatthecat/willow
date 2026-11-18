@@ -1,10 +1,9 @@
 //! Capability probes for Cranelift's `stack_switch` instruction.
 //!
-//! These back the decision record at
-//! `docs/decisions/0001-task-stack-switch-capability.md` (stack-switch capability, A2),
-//! which is the input to A3's task-owned synchronous stack. The record makes
-//! claims about what the pinned Cranelift can and cannot do; without probes,
-//! those claims silently rot the next time the dependency is bumped.
+//! These back the stack-switch capability decision that the task-owned
+//! synchronous stack builds on. That decision makes claims about what the
+//! pinned Cranelift can and cannot do; without probes, those claims silently
+//! rot the next time the dependency is bumped.
 //!
 //! Each probe below states the claim it pins. If one starts failing after a
 //! Cranelift upgrade, that is the signal to revisit the record — quite possibly
@@ -174,8 +173,8 @@ fn cranelift_source_root() -> Option<PathBuf> {
     Some(cranelift_codegen_src().unwrap_or_else(|| {
         panic!(
             "could not locate the pinned cranelift-codegen source under the Cargo registry, so \
-             the source-shape probes backing \
-             docs/decisions/0001-task-stack-switch-capability.md cannot run. Run `cargo fetch`, \
+             the source-shape probes backing the stack-switch capability decision \
+             cannot run. Run `cargo fetch`, \
              or set {SKIP_SOURCE_PROBES}=1 to skip them deliberately."
         )
     }))
@@ -245,8 +244,8 @@ fn basic_model_lowers_on_x64_and_is_refused_on_every_other_architecture() {
         }
         (Lowering::Compiled(bytes), false) => panic!(
             "a non-x64 host lowered `stack_switch` into {bytes} bytes — a backend gained \
-             stack-switch support, so revisit \
-             docs/decisions/0001-task-stack-switch-capability.md, which says x64 is the only one"
+             stack-switch support, so revisit the stack-switch capability decision, \
+             which says x64 is the only one"
         ),
         (Lowering::Refused(_), false) => {}
     }
@@ -272,8 +271,7 @@ fn stack_switch_does_not_lower_under_update_windows_tib() {
     if let Lowering::Compiled(bytes) = lower_on_host("update_windows_tib") {
         panic!(
             "`update_windows_tib` now lowers into {bytes} bytes — Cranelift gained Windows \
-             stack-switch support, so revisit \
-             docs/decisions/0001-task-stack-switch-capability.md"
+             stack-switch support, so revisit the stack-switch capability decision"
         );
     }
 }
@@ -336,7 +334,7 @@ fn only_the_x64_backend_mentions_stack_switch() {
         assert_eq!(
             mentions, 0,
             "backend `{backend}` now mentions stack_switch — a new architecture may be \
-             supported, so revisit docs/decisions/0001-task-stack-switch-capability.md"
+             supported, so revisit the stack-switch capability decision"
         );
     }
 

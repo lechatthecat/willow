@@ -192,11 +192,11 @@ async fn main() {
 fn lirreq_49_array_example_is_fully_lir() {
     // The example claims in its header that every function it declares is
     // compiled from the lowered IR; this is what keeps that claim honest.
-    let source = include_str!("../../../example/lir_gc_arrays.wi");
+    let source = include_str!("../../../tests/regressions/lir_gc_arrays.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
     assert!(
         ok,
-        "example/lir_gc_arrays.wi must compile with every function on the LIR path: {stderr}"
+        "tests/regressions/lir_gc_arrays.wi must compile with every function on the LIR path: {stderr}"
     );
 }
 
@@ -205,11 +205,11 @@ fn lirreq_50_object_example_is_fully_lir() {
     // Same contract for the class-object example, and here it
     // covers the method side as well: since the lowered-IR cutover a class method has
     // the same hard LIR requirement its free functions do.
-    let source = include_str!("../../../example/lir_gc_objects.wi");
+    let source = include_str!("../../../tests/regressions/lir_gc_objects.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
     assert!(
         ok,
-        "example/lir_gc_objects.wi must compile with every function on the LIR path: {stderr}"
+        "tests/regressions/lir_gc_objects.wi must compile with every function on the LIR path: {stderr}"
     );
 }
 
@@ -217,10 +217,10 @@ fn lirreq_50_object_example_is_fully_lir() {
 fn lirreq_51_collections_example_is_fully_lir() {
     // Same contract for the collections example: its header
     // claims every function is compiled from the lowered IR.
-    let source = include_str!("../../../example/lir_gc_collections.wi");
+    let source = include_str!("../../../tests/regressions/lir_gc_collections.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
     assert!(
         ok,
-        "example/lir_gc_collections.wi must compile with every function on the LIR path: {stderr}"
+        "tests/regressions/lir_gc_collections.wi must compile with every function on the LIR path: {stderr}"
     );
 }

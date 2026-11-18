@@ -3,7 +3,7 @@ use std::time::Duration;
 
 #[test]
 fn async_frame_safepoints_preserve_values_and_control_flow() {
-    let source = include_str!("../../example/async_frame_safepoints.wi");
+    let source = include_str!("../../tests/regressions/async_frame_safepoints.wi");
     for (out, ok) in [
         compile_and_run(source),
         compile_and_run_release(source),

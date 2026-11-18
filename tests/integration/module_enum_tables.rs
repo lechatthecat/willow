@@ -1007,19 +1007,19 @@ fn main() {
 const EXAMPLE: &[(&str, &str)] = &[
     (
         "signal.wi",
-        include_str!("../../example/module_enum_tables/signal.wi"),
+        include_str!("../../tests/regressions/module_enum_tables/signal.wi"),
     ),
     (
         "depth.wi",
-        include_str!("../../example/module_enum_tables/depth.wi"),
+        include_str!("../../tests/regressions/module_enum_tables/depth.wi"),
     ),
     (
         "relay.wi",
-        include_str!("../../example/module_enum_tables/relay.wi"),
+        include_str!("../../tests/regressions/module_enum_tables/relay.wi"),
     ),
     (
         "main.wi",
-        include_str!("../../example/module_enum_tables/main.wi"),
+        include_str!("../../tests/regressions/module_enum_tables/main.wi"),
     ),
 ];
 
@@ -1049,15 +1049,15 @@ fn p26_the_module_enum_tables_example_survives_gc_stress() {
 const IDENTITY_EXAMPLE: &[(&str, &str)] = &[
     (
         "signal.wi",
-        include_str!("../../example/module_enum_identity/signal.wi"),
+        include_str!("../../tests/regressions/module_enum_identity/signal.wi"),
     ),
     (
         "other.wi",
-        include_str!("../../example/module_enum_identity/other.wi"),
+        include_str!("../../tests/regressions/module_enum_identity/other.wi"),
     ),
     (
         "main.wi",
-        include_str!("../../example/module_enum_identity/main.wi"),
+        include_str!("../../tests/regressions/module_enum_identity/main.wi"),
     ),
 ];
 
@@ -1067,10 +1067,10 @@ const IDENTITY_OUTPUT: &str = "signal:high\nsignal:low\nother:off\nother:on\noth
 //     dropped for being ambiguous any more.
 #[test]
 fn p33_the_module_enum_identity_example_is_fully_lowered() {
-    let (out, ok) = compile_file_and_run("example/module_enum_identity/main.wi");
+    let (out, ok) = compile_file_and_run("tests/regressions/module_enum_identity/main.wi");
     assert!(
         ok,
-        "example/module_enum_identity/main.wi failed to compile or run"
+        "tests/regressions/module_enum_identity/main.wi failed to compile or run"
     );
     assert_eq!(out, IDENTITY_OUTPUT);
     let (out, ok) = compile_temp_project_with_env_and_run(IDENTITY_EXAMPLE, "main.wi", &PLAIN[..]);

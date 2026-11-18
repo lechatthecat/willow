@@ -1,8 +1,7 @@
 // Every path out of a value-returning body has to leave through a `return`. Willow has no
-// implicit tail expression, so a body that just
-// ends is not "returning its last value" — it used to hand the caller the zero
-// of the return type instead, silently. E0205 now rejects that, and this file
-// is the other side of the rule: every shape below is a body the check accepts,
+// implicit tail expression, so a body that just ends is not "returning its last
+// value": E0205 rejects it. This file is the other side of the rule: every
+// shape below is a body the check accepts,
 // because control provably never reaches the closing brace.
 //
 // The interesting ones are the endings that are not a literal `return`

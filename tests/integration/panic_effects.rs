@@ -746,7 +746,7 @@ fn pe_24_virtual_self_call_agrees_in_release() {
 // and a recovery that should fire silently does not. These perspectives pin
 // the slots from outside the compiler.
 
-const SHARED_AST_WALK: &str = include_str!("../../example/shared_ast_walk.wi");
+const SHARED_AST_WALK: &str = include_str!("../../tests/regressions/shared_ast_walk.wi");
 
 const SHARED_AST_WALK_OUTPUT: &str = "ternary <- ternary\n\
 binary <- binary\n\
@@ -1264,7 +1264,7 @@ fn inline_panic_snapshots_have_zero_runtime_relocations() {
     use super::support::compile_and_collect_relocation_targets_mode;
     for release in [false, true] {
         let targets = compile_and_collect_relocation_targets_mode(
-            include_str!("../../example/inline_panic_depth.wi"),
+            include_str!("../../tests/regressions/inline_panic_depth.wi"),
             &[],
             release,
         );
@@ -1360,7 +1360,7 @@ fn main() {
 
 #[test]
 fn array_literal_allocation_example_preserves_roots_and_active_panic() {
-    let source = include_str!("../../example/array_literal_allocation.wi");
+    let source = include_str!("../../tests/regressions/array_literal_allocation.wi");
     let expected = "0\ntrue\nabcd\n8\n2016\n36\nouter\n42\n";
     for run in [super::support::compile_and_run, compile_and_run_release] {
         let (out, ok) = run(source);

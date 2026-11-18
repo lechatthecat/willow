@@ -62,7 +62,7 @@ fn assert_relocating_modes(name: &str, source: &str, expected: &str) -> TestProj
 
 #[test]
 fn relocatable_roots_example_in_every_mode() {
-    let source = include_str!("../../example/relocatable_roots.wi");
+    let source = include_str!("../../tests/regressions/relocatable_roots.wi");
     assert_relocating_modes(
         "relocatable_example",
         source,
@@ -647,7 +647,7 @@ async fn main() {
 
 /// Interior `&`/`&mut` arguments pass a caller-owned `{base, offset}` cell
 /// whose base slot is a relocatable root; the callee re-derives the address
-/// at every access (docs/decisions/0011-reference-cell-abi.md). Every callee
+/// at every access. Every callee
 /// here collects and allocates before and after using its reference.
 const INTERIOR_REFERENCES: &str = r#"
 import std::collections::Array;
@@ -1000,7 +1000,7 @@ fn main() {
 fn young_array_literals_and_push_buffers_move_in_every_mode() {
     // literals and grown push buffers are young TLAB objects;
     // relocate stress moves them at every allocation without pinning.
-    let source = include_str!("../../example/array_literal_churn.wi");
+    let source = include_str!("../../tests/regressions/array_literal_churn.wi");
     let expected = "50005000\n43\n6\nalphabetagamma\n10\n5050\n2555840\n87\n1999000\n";
     let project = assert_relocating_modes("young_array_literals", source, expected);
     assert_runs(&project, &[ALLOC_NO_PIN], expected);
@@ -1055,7 +1055,7 @@ fn inline_shadow_roots_have_no_push_pop_depth_calls_and_one_cold_path() {
 fn inline_shadow_roots_example_in_relocation_modes() {
     assert_relocating_modes(
         "inline_shadow_roots",
-        include_str!("../../example/inline_shadow_roots.wi"),
+        include_str!("../../tests/regressions/inline_shadow_roots.wi"),
         "true\ntrue\ntrue\n",
     );
 }

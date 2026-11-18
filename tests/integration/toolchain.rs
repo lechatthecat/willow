@@ -1528,7 +1528,8 @@ fn abi_handshake_covers_empty_async_and_static_entry_paths() {
 
 #[test]
 fn test_runtime_direct_call_operations() {
-    let source = include_str!("../../example/runtime_direct_calls.wi").replace("10000", "100");
+    let source =
+        include_str!("../../tests/regressions/runtime_direct_calls.wi").replace("10000", "100");
     for run in [
         compile_and_run,
         compile_and_run_release,

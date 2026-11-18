@@ -136,15 +136,15 @@ fn module_downcast_payload_release_and_gc_stress() {
     let files = [
         (
             "shapes.wi",
-            include_str!("../../example/module_downcast_payload/shapes.wi"),
+            include_str!("../../tests/regressions/module_downcast_payload/shapes.wi"),
         ),
         (
             "consumer.wi",
-            include_str!("../../example/module_downcast_payload/consumer.wi"),
+            include_str!("../../tests/regressions/module_downcast_payload/consumer.wi"),
         ),
         (
             "main.wi",
-            include_str!("../../example/module_downcast_payload/main.wi"),
+            include_str!("../../tests/regressions/module_downcast_payload/main.wi"),
         ),
     ];
     let project = TestProject::new("module_downcast_release", &files);

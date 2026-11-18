@@ -285,11 +285,13 @@ fn example_program() {
         &[
             (
                 "main.wi",
-                include_str!("../../example/interface_default_self_signature.wi"),
+                include_str!("../../tests/regressions/interface_default_self_signature.wi"),
             ),
             (
                 "interface_default_self_signature_support/shapes.wi",
-                include_str!("../../example/interface_default_self_signature_support/shapes.wi"),
+                include_str!(
+                    "../../tests/regressions/interface_default_self_signature_support/shapes.wi"
+                ),
             ),
         ],
         "beta\nbeta\n14\n12\nbeta\n",

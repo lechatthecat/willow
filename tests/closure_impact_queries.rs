@@ -542,31 +542,34 @@ fn use{i}(k: i64) -> bool {{ let h = new Heap<C{i}>(|a: C{i}, b: C{i}| t{i}(a) &
     assert!(visits[2] - visits[1] <= 64, "{visits:?}");
 }
 
-/// P27: the runnable example (`example/closure_impact`) keeps fuzz-only
+/// P27: the runnable example (`tests/regressions/closure_impact`) keeps fuzz-only
 /// closures and the `Queue<Item>` caller out of `policy::before`'s impact.
 #[test]
 fn closure_impact_runnable_example() {
     let project = Project::new(&[
         (
             "data.wi",
-            include_str!("../example/closure_impact/src/data.wi"),
+            include_str!("../tests/regressions/closure_impact/src/data.wi"),
         ),
         (
             "policy.wi",
-            include_str!("../example/closure_impact/src/policy.wi"),
+            include_str!("../tests/regressions/closure_impact/src/policy.wi"),
         ),
-        ("pq.wi", include_str!("../example/closure_impact/src/pq.wi")),
+        (
+            "pq.wi",
+            include_str!("../tests/regressions/closure_impact/src/pq.wi"),
+        ),
         (
             "sim.wi",
-            include_str!("../example/closure_impact/src/sim.wi"),
+            include_str!("../tests/regressions/closure_impact/src/sim.wi"),
         ),
         (
             "fuzz.wi",
-            include_str!("../example/closure_impact/src/fuzz.wi"),
+            include_str!("../tests/regressions/closure_impact/src/fuzz.wi"),
         ),
         (
             "main.wi",
-            include_str!("../example/closure_impact/src/main.wi"),
+            include_str!("../tests/regressions/closure_impact/src/main.wi"),
         ),
     ]);
     let snapshot = project.snapshot();

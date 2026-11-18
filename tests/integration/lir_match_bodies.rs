@@ -818,7 +818,7 @@ fn main() {{
 fn lir_bodies_24_the_example_is_fully_lir() {
     let source = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/example/lir_match_bodies.wi"
+        "/tests/regressions/lir_match_bodies.wi"
     ))
     .expect("the example is checked in");
     let (ok, stderr) = compile_with_compiler_env(&source, &[("WILLOW_LIR_LOG", "1")]);

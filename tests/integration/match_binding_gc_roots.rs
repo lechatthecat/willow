@@ -651,8 +651,8 @@ fn main() {
 // 24. The runnable example, plain and under both stress modes.
 #[test]
 fn binding_roots_24_the_example_runs_the_same() {
-    let source = std::fs::read_to_string("example/match_binding_gc_roots.wi")
-        .expect("example/match_binding_gc_roots.wi");
+    let source = std::fs::read_to_string("tests/regressions/match_binding_gc_roots.wi")
+        .expect("tests/regressions/match_binding_gc_roots.wi");
     for env in [&PLAIN[..], &MINOR_STRESS[..], &ALLOC_STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(&source, env);
         assert!(ok, "example failed under {env:?}: {out}");
@@ -667,8 +667,8 @@ fn binding_roots_24_the_example_runs_the_same() {
 //     this file is really testing the LIR emitter.
 #[test]
 fn binding_roots_25_the_example_is_fully_lir() {
-    let source = std::fs::read_to_string("example/match_binding_gc_roots.wi")
-        .expect("example/match_binding_gc_roots.wi");
+    let source = std::fs::read_to_string("tests/regressions/match_binding_gc_roots.wi")
+        .expect("tests/regressions/match_binding_gc_roots.wi");
     assert_walker_compiled(
         &source,
         &[

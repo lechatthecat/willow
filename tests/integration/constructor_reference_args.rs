@@ -715,8 +715,8 @@ fn ctor_refs_31_a_reference_on_a_by_value_base_parameter_is_rejected() {
 // 32. The shipped example prints the same thing plainly and under GC stress.
 #[test]
 fn ctor_refs_32_the_example_runs_plainly_and_under_stress() {
-    let source = std::fs::read_to_string("example/constructor_reference_args.wi")
-        .expect("example/constructor_reference_args.wi");
+    let source = std::fs::read_to_string("tests/regressions/constructor_reference_args.wi")
+        .expect("tests/regressions/constructor_reference_args.wi");
     for env in [&PLAIN[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(&source, env);
         assert!(ok, "example failed under {env:?}: {out}");
@@ -727,8 +727,8 @@ fn ctor_refs_32_the_example_runs_plainly_and_under_stress() {
 // 33. And the log names every function in it, so none was quietly left out.
 #[test]
 fn ctor_refs_33_the_example_is_fully_lir() {
-    let source = std::fs::read_to_string("example/constructor_reference_args.wi")
-        .expect("example/constructor_reference_args.wi");
+    let source = std::fs::read_to_string("tests/regressions/constructor_reference_args.wi")
+        .expect("tests/regressions/constructor_reference_args.wi");
     assert_walker_compiled(
         &source,
         &[

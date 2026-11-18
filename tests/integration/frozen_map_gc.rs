@@ -399,7 +399,7 @@ const EXAMPLE_OUTPUT: &str = "449\ntwo!\n?\n1536\n2\n";
 /// 14: the example program, as the example catalog runs it.
 #[test]
 fn fmgc_14_the_example_program() {
-    let source = include_str!("../../example/frozen_map_gc.wi");
+    let source = include_str!("../../tests/regressions/frozen_map_gc.wi");
     let (output, ok) = compile_and_run(source);
     assert!(ok, "example failed:\n{output}");
     assert_eq!(output, EXAMPLE_OUTPUT);
@@ -409,7 +409,7 @@ fn fmgc_14_the_example_program() {
 /// pool workers stopping the world under each other.
 #[test]
 fn fmgc_15_the_example_under_minor_stress_with_workers() {
-    let source = include_str!("../../example/frozen_map_gc.wi");
+    let source = include_str!("../../tests/regressions/frozen_map_gc.wi");
     let (output, ok) = compile_and_run_with_env(source, &POOL_MINOR);
     assert!(ok, "example failed under minor stress:\n{output}");
     assert_eq!(output, EXAMPLE_OUTPUT);
@@ -418,7 +418,7 @@ fn fmgc_15_the_example_under_minor_stress_with_workers() {
 /// 16: the example with a full collection at every allocation and four workers.
 #[test]
 fn fmgc_16_the_example_under_alloc_stress_with_workers() {
-    let source = include_str!("../../example/frozen_map_gc.wi");
+    let source = include_str!("../../tests/regressions/frozen_map_gc.wi");
     let (output, ok) = compile_and_run_with_env(source, &POOL_ALLOC);
     assert!(ok, "example failed under alloc stress:\n{output}");
     assert_eq!(output, EXAMPLE_OUTPUT);

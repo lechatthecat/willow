@@ -106,11 +106,13 @@ fn example_program() {
         &[
             (
                 "main.wi",
-                include_str!("../../example/generic_interface_default_self.wi"),
+                include_str!("../../tests/regressions/generic_interface_default_self.wi"),
             ),
             (
                 "generic_interface_default_self_support/meters.wi",
-                include_str!("../../example/generic_interface_default_self_support/meters.wi"),
+                include_str!(
+                    "../../tests/regressions/generic_interface_default_self_support/meters.wi"
+                ),
             ),
         ],
         "300\n3\n[tank]\nfull\n[sign]\n",

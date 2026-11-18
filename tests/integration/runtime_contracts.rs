@@ -302,7 +302,10 @@ fn contracts_imports_and_cache_revisions() {
 #[test]
 fn contracts_example_runs() {
     for release in [false, true] {
-        let (out, err, ok) = run(include_str!("../../example/runtime_contracts.wi"), release);
+        let (out, err, ok) = run(
+            include_str!("../../tests/regressions/runtime_contracts.wi"),
+            release,
+        );
         assert!(ok, "{out}\n{err}");
         assert_eq!(out, "90\ncontract violation: requires\nrecovered\n");
     }

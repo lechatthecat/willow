@@ -3,7 +3,7 @@ use std::time::Duration;
 
 #[test]
 fn array_fast_paths_scalar_words_growth_and_reference_parameter() {
-    let source = include_str!("../../example/array_fast_paths.wi");
+    let source = include_str!("../../tests/regressions/array_fast_paths.wi");
     for (out, ok) in [
         compile_and_run(source),
         compile_and_run_release(source),
@@ -127,7 +127,7 @@ fn array_fast_paths_do_not_add_temporary_root_pairs_per_access() {
 
 #[test]
 fn array_push_fast_paths_growth_pop_and_frame_gc() {
-    let source = include_str!("../../example/array_push_growth.wi");
+    let source = include_str!("../../tests/regressions/array_push_growth.wi");
     for (out, ok) in [
         compile_and_run(source),
         compile_and_run_release(source),
@@ -146,7 +146,7 @@ fn array_push_fast_paths_growth_pop_and_frame_gc() {
 /// moving-GC configurations, exercise bodies whose runtime markers are elided.
 #[test]
 fn array_runtime_marker_scalar_capacity_perspectives() {
-    let source = include_str!("../../example/array_runtime_marker.wi");
+    let source = include_str!("../../tests/regressions/array_runtime_marker.wi");
     for (out, ok) in [
         compile_and_run(source),
         compile_and_run_release(source),

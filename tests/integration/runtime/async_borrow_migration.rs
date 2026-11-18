@@ -38,7 +38,7 @@ fn task_owned_shadow_roots_forced_native_preemption() {
         "task_owned_shadow_roots",
         &[(
             "main.wi",
-            include_str!("../../../example/task_owned_shadow_roots.wi"),
+            include_str!("../../../tests/regressions/task_owned_shadow_roots.wi"),
         )],
     );
     for release in [false, true] {
@@ -203,7 +203,7 @@ fn async_borrow_migration_forced_generated_polls() {
         "borrow_migration_example",
         &[(
             "main.wi",
-            include_str!("../../../example/async_borrow_migration.wi"),
+            include_str!("../../../tests/regressions/async_borrow_migration.wi"),
         )],
     );
     // Exercise the environment override as well as --runtime-lib.
@@ -286,7 +286,9 @@ fn async_borrow_migration_forced_generated_polls() {
         println!("chain depth={count} checked_polls={polls}");
     }
 
-    let (out, ok) = compile_and_run(include_str!("../../../example/async_borrow_migration.wi"));
+    let (out, ok) = compile_and_run(include_str!(
+        "../../../tests/regressions/async_borrow_migration.wi"
+    ));
     assert!(ok, "{out}");
     assert_eq!(out, "42\n");
 }

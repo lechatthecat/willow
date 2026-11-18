@@ -258,23 +258,23 @@ fn runnable_module_inference_example() {
         &[
             (
                 "project.toml",
-                include_str!("../../example/module_inference/project.toml"),
+                include_str!("../../tests/regressions/module_inference/project.toml"),
             ),
             (
                 "src/main.wi",
-                include_str!("../../example/module_inference/src/main.wi"),
+                include_str!("../../tests/regressions/module_inference/src/main.wi"),
             ),
             (
                 "src/calc.wi",
-                include_str!("../../example/module_inference/src/calc.wi"),
+                include_str!("../../tests/regressions/module_inference/src/calc.wi"),
             ),
             (
                 "src/expr.wi",
-                include_str!("../../example/module_inference/src/expr.wi"),
+                include_str!("../../tests/regressions/module_inference/src/expr.wi"),
             ),
             (
                 "src/source.wi",
-                include_str!("../../example/module_inference/src/source.wi"),
+                include_str!("../../tests/regressions/module_inference/src/source.wi"),
             ),
         ],
     );
@@ -484,19 +484,19 @@ fn runnable_item_import_prefix_example() {
         &[
             (
                 "project.toml",
-                include_str!("../../example/item_import_prefix/project.toml"),
+                include_str!("../../tests/regressions/item_import_prefix/project.toml"),
             ),
             (
                 "src/main.wi",
-                include_str!("../../example/item_import_prefix/src/main.wi"),
+                include_str!("../../tests/regressions/item_import_prefix/src/main.wi"),
             ),
             (
                 "src/ops.wi",
-                include_str!("../../example/item_import_prefix/src/ops.wi"),
+                include_str!("../../tests/regressions/item_import_prefix/src/ops.wi"),
             ),
             (
                 "src/report/text.wi",
-                include_str!("../../example/item_import_prefix/src/report/text.wi"),
+                include_str!("../../tests/regressions/item_import_prefix/src/report/text.wi"),
             ),
         ],
     );

@@ -5,12 +5,15 @@ use super::*;
 #[allow(clippy::too_many_lines, reason = "split pending")]
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
-        ("example/abi_handshake.wi", "42\n"),
+        ("tests/regressions/abi_handshake.wi", "42\n"),
         (
-            "example/builtin_method_contracts.wi",
+            "tests/regressions/builtin_method_contracts.wi",
             "true\ntrue\n4\n9\n5\n3\n6\ntrue\ntrue\n16\nbad!\n3\n5\ntrue\n1\n5\n2\n2\n10\ntrue\n15\n6\n11\ntrue\n7\ntrue\n7\ntrue\n",
         ),
-        ("example/enum_array_payload.wi", "0\n1\n0\n0\n0\n0\n0\n"),
+        (
+            "tests/regressions/enum_array_payload.wi",
+            "0\n1\n0\n0\n0\n0\n0\n",
+        ),
         ("example/io_contracts.wi", "value=42\n"),
         (
             "example/json.wi",
@@ -19,9 +22,9 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/owned_class_task_loans.wi", "11\n13\n23\n14\n"),
         ("example/owned_task_loans.wi", "11\n13\n23\n1\n"),
         ("example/ownership_transfer.wi", "42\n7\n"),
-        ("example/parallel_allocation_scaling.wi", "true\n"),
+        ("tests/regressions/parallel_allocation_scaling.wi", "true\n"),
         (
-            "example/permanent_wait_escapes.wi",
+            "tests/regressions/permanent_wait_escapes.wi",
             "42\ntrue\ntimeout\ndefault\ntask timeout\n",
         ),
         (
@@ -37,141 +40,183 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/array_join.wi",
             "日本 / Willow / 😀\n119999\ntrue\n",
         ),
-        ("example/async_growing_string.wi", "120000\n"),
+        ("tests/regressions/async_growing_string.wi", "120000\n"),
         (
             "example/builtin_method_surface.wi",
             "a\n5\n1.5\ntrue\n3\n1\n1\n",
         ),
         ("example/class_private_scope.wi", "true\n"),
-        ("example/closure_chain_stack.wi", "1000\n"),
-        ("example/constructor_closure_types.wi", "true\n"),
+        ("tests/regressions/closure_chain_stack.wi", "1000\n"),
+        ("tests/regressions/constructor_closure_types.wi", "true\n"),
         (
             "example/constructor_type_annotations.wi",
             "7\ntrue\nfail missing\n",
         ),
         ("example/function_closure_wrappers.wi", "true\ntrue\n"),
-        ("example/gc_inline_satb.wi", "8128\n"),
-        ("example/gc_mark_worker_count.wi", "120000\n"),
-        ("example/generic_parameter_methods.wi", "6\nhello\n9\n"),
+        ("tests/regressions/gc_inline_satb.wi", "8128\n"),
+        ("tests/regressions/gc_mark_worker_count.wi", "120000\n"),
         (
-            "example/generic_signature_queries.wi",
+            "tests/regressions/generic_parameter_methods.wi",
+            "6\nhello\n9\n",
+        ),
+        (
+            "tests/regressions/generic_signature_queries.wi",
             "7\n8\n9\n10\n11\n4\n",
         ),
         ("example/interface_sync_contracts.wi", "3\n7\n"),
         ("example/literal_payload_guards.wi", "2\n0\n3\n1\n"),
         ("example/persistent_query_cache.wi", "42"),
-        ("example/recursive_type_modules/main.wi", "0\n0\n"),
+        ("tests/regressions/recursive_type_modules/main.wi", "0\n0\n"),
         ("example/return_annotation.wi", "1\n"),
         ("example/runtime_source_names.wi", "7\n9\n"),
         ("example/static_frozen_array.wi", "static frozen array ok\n"),
         ("example/string_find.wi", "本\ntrue\ntrue\n0\n"),
         ("example/string_metadata.wi", "0\n9\n2\n3\n4\n0\n18\n"),
         ("example/string_pattern_if_else.wi", "1\n2\n0\n"),
-        ("example/sync_poll_gates.wi", "1\n2\n4\n8\n"),
+        ("tests/regressions/sync_poll_gates.wi", "1\n2\n4\n8\n"),
         (
-            "example/task_dispatch_effect_evidence.wi",
+            "tests/regressions/task_dispatch_effect_evidence.wi",
             "20\n10\n40\n30\n50\n",
         ),
-        ("example/task_effect_evidence.wi", "8\n"),
+        ("tests/regressions/task_effect_evidence.wi", "8\n"),
         ("example/fixed_arrays.wi", "42\nsecond\n0\n"),
         (
-            "example/source_arrays.wi",
+            "tests/regressions/source_arrays.wi",
             "source methods\nmethods\n2\n[\"source\"]\n42\n",
         ),
         (
-            "example/array_literal_allocation.wi",
+            "tests/regressions/array_literal_allocation.wi",
             "0\ntrue\nabcd\n8\n2016\n36\nouter\n42\n",
         ),
-        ("example/async_allocation_churn.wi", "12795904\ntrue\n"),
-        ("example/async_dead_locals.wi", "42\n42\n2\n3\n"),
-        ("example/closed_world_dispatch.wi", "12\n2\nitem!\n7\n"),
-        ("example/diagnostic_recovery_if.wi", "7\na.b\nnone\n"),
         (
-            "example/generic_variant_context.wi",
+            "tests/regressions/async_allocation_churn.wi",
+            "12795904\ntrue\n",
+        ),
+        ("tests/regressions/async_dead_locals.wi", "42\n42\n2\n3\n"),
+        (
+            "tests/regressions/closed_world_dispatch.wi",
+            "12\n2\nitem!\n7\n",
+        ),
+        (
+            "tests/regressions/diagnostic_recovery_if.wi",
+            "7\na.b\nnone\n",
+        ),
+        (
+            "tests/regressions/generic_variant_context.wi",
             "7\n9\nhello\ntrue\n11\n13\n15\n16\n18\n19\ntrue\n",
         ),
-        ("example/imported_error_identity/main.wi", "3\nneg\n"),
         (
-            "example/lambda_result_context.wi",
+            "tests/regressions/imported_error_identity/main.wi",
+            "3\nneg\n",
+        ),
+        (
+            "tests/regressions/lambda_result_context.wi",
             "42\ntrue\ntrue\ntrue\n7\n",
         ),
         ("example/lambda_result_expression.wi", "2\nfailed\n"),
-        ("example/map_string_local.wi", "9\n7\n3\nfalse\n2\n"),
-        ("example/memberwise_owner/main.wi", "1\n2\nkept\n"),
+        (
+            "tests/regressions/map_string_local.wi",
+            "9\n7\n3\nfalse\n2\n",
+        ),
+        ("tests/regressions/memberwise_owner/main.wi", "1\n2\nkept\n"),
         (
             "example/rwlock_class_update.wi",
             "snapshot 1\nreplacement 2\nmutex 2\n",
         ),
-        ("example/string_literal_fast_path.wi", "é水🦀\n"),
+        ("tests/regressions/string_literal_fast_path.wi", "é水🦀\n"),
         (
             "example/uppercase_static_properties.wi",
             "tables\n10\n6\n10\n16\nonce\nsixteen\n",
         ),
-        ("example/array_owned_pair_growth.wi", "7\n7\n99\n7\n"),
-        ("example/async_frame_safepoints.wi", "20\n20\n390\n6\n"),
-        ("example/atomic_inline.wi", "20000\n20000\n42\n"),
         (
-            "example/guarded_fn_values.wi",
+            "tests/regressions/array_owned_pair_growth.wi",
+            "7\n7\n99\n7\n",
+        ),
+        (
+            "tests/regressions/async_frame_safepoints.wi",
+            "20\n20\n390\n6\n",
+        ),
+        ("tests/regressions/atomic_inline.wi", "20000\n20000\n42\n"),
+        (
+            "tests/regressions/guarded_fn_values.wi",
             "4\n1\n6\n2\nrecovered\n-1\n1\n-3\nfalse\n",
         ),
         (
-            "example/imported_constructor_effects.wi",
+            "tests/regressions/imported_constructor_effects.wi",
             "1\n1\n1\n1\n2\n1\n1\n1\n5\n",
         ),
         (
-            "example/indirect_call_preemption.wi",
+            "tests/regressions/indirect_call_preemption.wi",
             "fn resumed\nclosure resumed\n",
         ),
         (
-            "example/gc_barrier_variants.wi",
+            "tests/regressions/gc_barrier_variants.wi",
             "7\n1\n14\n2\n21\n3\n28\n4\n35\n5\n42\n6\n49\n7\n56\n8\n",
         ),
-        ("example/inline_panic_depth.wi", "inner\nouter\n"),
-        ("example/inline_shadow_roots.wi", "true\ntrue\ntrue\n"),
-        ("example/interface_effect_evidence/main.wi", "7\n"),
-        ("example/gc_old_cycle.wi", "499500\n499500\n499500\n"),
-        ("example/generic_nominal_bindings.wi", "17\n79\n80\n"),
-        ("example/generic_receiver_type_queries.wi", "1\n3\n9\n5\n"),
-        ("example/standalone_generic_aliases/main.wi", "17\n"),
+        ("tests/regressions/inline_panic_depth.wi", "inner\nouter\n"),
         (
-            "example/assignable_representations.wi",
+            "tests/regressions/inline_shadow_roots.wi",
+            "true\ntrue\ntrue\n",
+        ),
+        ("tests/regressions/interface_effect_evidence/main.wi", "7\n"),
+        (
+            "tests/regressions/gc_old_cycle.wi",
+            "499500\n499500\n499500\n",
+        ),
+        (
+            "tests/regressions/generic_nominal_bindings.wi",
+            "17\n79\n80\n",
+        ),
+        (
+            "tests/regressions/generic_receiver_type_queries.wi",
+            "1\n3\n9\n5\n",
+        ),
+        (
+            "tests/regressions/standalone_generic_aliases/main.wi",
+            "17\n",
+        ),
+        (
+            "tests/regressions/assignable_representations.wi",
             "value:8\nvalue:7\n9\ntrue\n",
         ),
-        ("example/canonical_identity.wi", "42\n"),
-        ("example/imported_interface_default.wi", "42\n"),
-        ("example/imported_generic_preemption.wi", "4\nkept\n"),
+        ("tests/regressions/canonical_identity.wi", "42\n"),
+        ("tests/regressions/imported_interface_default.wi", "42\n"),
         (
-            "example/interface_default_provider_signatures.wi",
+            "tests/regressions/imported_generic_preemption.wi",
+            "4\nkept\n",
+        ),
+        (
+            "tests/regressions/interface_default_provider_signatures.wi",
             "42\n7\n",
         ),
         (
-            "example/interface_default_receiver_names.wi",
+            "tests/regressions/interface_default_receiver_names.wi",
             "provider point\n1019\nprovider point\n1007\n",
         ),
         (
-            "example/interface_default_receiver_signatures.wi",
+            "tests/regressions/interface_default_receiver_signatures.wi",
             "109\n101\n",
         ),
         (
-            "example/interface_qualified_self_reference.wi",
+            "tests/regressions/interface_qualified_self_reference.wi",
             "36\n16\n25\n",
         ),
         (
-            "example/interface_default_self_signature.wi",
+            "tests/regressions/interface_default_self_signature.wi",
             "beta\nbeta\n14\n12\nbeta\n",
         ),
-        ("example/generic_class_self.wi", "5\nsecond\n"),
+        ("tests/regressions/generic_class_self.wi", "5\nsecond\n"),
         (
-            "example/generic_interface_default_self.wi",
+            "tests/regressions/generic_interface_default_self.wi",
             "300\n3\n[tank]\nfull\n[sign]\n",
         ),
         (
-            "example/imported_generic_interface_default.wi",
+            "tests/regressions/imported_generic_interface_default.wi",
             "20\n27\n7\nwillow\n",
         ),
-        ("example/lock_imported_effects/main.wi", "7\n"),
+        ("tests/regressions/lock_imported_effects/main.wi", "7\n"),
         (
-            "example/module_generic_members/main.wi",
+            "tests/regressions/module_generic_members/main.wi",
             "5\n5\n7\n7\nkept\n",
         ),
         ("example/semantic_generic_queries.wi", "7\ngeneric\n11\n"),
@@ -180,19 +225,22 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/semantic_generic_closure_calls.wi",
             "4\nab\n12\nq!!\n",
         ),
-        ("example/task_frame_lifetime.wi", "8484\ntrue\n"),
-        ("example/codegen_unit_context/main.wi", "42\n"),
-        ("example/interface_pairs.wi", "7\n11\n7\n11\n"),
-        ("example/leaf_closure_calls.wi", "3025\n25\ntotal=3025\n"),
-        ("example/leaf_method_calls.wi", "385\n1210\n7\n"),
+        ("tests/regressions/task_frame_lifetime.wi", "8484\ntrue\n"),
+        ("tests/regressions/codegen_unit_context/main.wi", "42\n"),
+        ("tests/regressions/interface_pairs.wi", "7\n11\n7\n11\n"),
+        (
+            "tests/regressions/leaf_closure_calls.wi",
+            "3025\n25\ntotal=3025\n",
+        ),
+        ("tests/regressions/leaf_method_calls.wi", "385\n1210\n7\n"),
         ("example/map_confined.wi", "false\n128\n99\n2.5\ntrue\n"),
         ("example/map_scalar_aliases.wi", "8192\ntrue\n12288\ntrue\n"),
         (
-            "example/map_scalar_storage.wi",
+            "tests/regressions/map_scalar_storage.wi",
             "-9\n42\n0\n-1\n2\n{0: 0, 7: 42}\ntrue\nfalse\n1\n-2.5\n",
         ),
         (
-            "example/native_memory_accounting.wi",
+            "tests/regressions/native_memory_accounting.wi",
             "1024\n1024\n523776\n",
         ),
         (
@@ -200,18 +248,18 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "true\nfalse\ntrue\ntrue\ntrue\ntrue\ntrue\nfalse\n",
         ),
         (
-            "example/relocatable_roots.wi",
+            "tests/regressions/relocatable_roots.wi",
             "42\n7\n1225\n7\n25\n820\n36\n9\n6\n200\n45\n0\n0\ntrue\n",
         ),
         (
-            "example/runtime_failure_policy.wi",
+            "tests/regressions/runtime_failure_policy.wi",
             "explicit recovered\nbounds recovered\nasync recovered\ndone\n",
         ),
         (
-            "example/scalar_adt_pairs.wi",
+            "tests/regressions/scalar_adt_pairs.wi",
             "42\ntrue\n43\ntrue\n44\n45\n",
         ),
-        ("example/session_symbols.wi", "42\n"),
+        ("tests/regressions/session_symbols.wi", "42\n"),
         ("example/static_atomic.wi", "2\n"),
         ("example/string_bytes.wi", "123\n42\ntrue\n"),
         ("example/static_dependency_graph.wi", "42\n"),
@@ -220,23 +268,35 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "18\n日本\n語\n10\ntrue\ntrue\n4\nWillowWillow\n0\n0\n日本語,Willow,,\n",
         ),
         ("example/interface_marker_contract.wi", "3\n2\n"),
-        ("example/module_inference/src/main.wi", "42\n42\n42\n"),
-        ("example/item_import_prefix/src/main.wi", "42\nx != y\n==\n"),
+        (
+            "tests/regressions/module_inference/src/main.wi",
+            "42\n42\n42\n",
+        ),
+        (
+            "tests/regressions/item_import_prefix/src/main.wi",
+            "42\nx != y\n==\n",
+        ),
         ("example/diagnostic_recovery.wi", "3\n"),
         ("example/parse_cascade_recovery.wi", "7\n"),
         ("example/call_result_binding.wi", "5\n5.5\n"),
-        ("example/reference_roles.wi", "1\n9\n6\n"),
+        ("tests/regressions/reference_roles.wi", "1\n9\n6\n"),
         ("example/overview.wi", "counter\n2\n"),
-        ("example/assignment_target_types.wi", "10\n10\n12\n9\n"),
-        ("example/effect_explanations.wi", "4\n2\n"),
+        (
+            "tests/regressions/assignment_target_types.wi",
+            "10\n10\n12\n9\n",
+        ),
+        ("tests/regressions/effect_explanations.wi", "4\n2\n"),
         ("example/void_tasks_frozen_iteration.wi", "2\n60\n"),
         (
-            "example/async_frame_reclaim.wi",
+            "tests/regressions/async_frame_reclaim.wi",
             "199990000\ntrue\n108890\ntrue\ntrue\ntrue\n2001000\ntrue\n",
         ),
-        ("example/async_frame_store.wi", "201200\n106\n1835976\n"),
         (
-            "example/shared_cancellation_cleanup.wi",
+            "tests/regressions/async_frame_store.wi",
+            "201200\n106\n1835976\n",
+        ),
+        (
+            "tests/regressions/shared_cancellation_cleanup.wi",
             "shared cleanup\nouter cleanup\nasync cleanup\ndone\n",
         ),
         ("example/async_capture_diagnostics.wi", "3\n42\n"),
@@ -246,14 +306,14 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "compound assignment\nand a multi-line string\n1\n",
         ),
         (
-            "example/buildgraph_regressions.wi",
+            "tests/regressions/buildgraph_regressions.wi",
             "1\n0\n0\n0\n0\n0\n2\nsafe\nsafe\n3\n",
         ),
-        ("example/language_gaps/main.wi", "idle\n6\n9\n"),
+        ("tests/regressions/language_gaps/main.wi", "idle\n6\n9\n"),
         ("example/semantic_cli/src/main.wi", "3\n"),
         ("example/semantic_cli_diagnostics.wi", "1\n0\n0\n"),
         (
-            "example/contextual_interface_arrays.wi",
+            "tests/regressions/contextual_interface_arrays.wi",
             "30\n30\n30\n30\n30\n30\n",
         ),
         (
@@ -264,9 +324,9 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/match_loop_exit_arms.wi",
             "6\n3\n66\nfound 7 after 2\n",
         ),
-        ("example/reserved_keyword_names.wi", "true\ntrue\n"),
+        ("tests/regressions/open_prefixed_names.wi", "true\ntrue\n"),
         ("example/semantic_contract_queries.wi", "3\n"),
-        ("example/semantic_scope/main.wi", "19\n"),
+        ("tests/regressions/semantic_scope/main.wi", "19\n"),
         ("example/semantic_local_lock_queries.wi", "1\n2\n"),
         ("example/lock_effect_targets.wi", "2\n15\n"),
         (
@@ -274,7 +334,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "A\nB\nC\nF\nfizzbuzz\n1\n2\nfizz\n4\nbuzz\nfizz\n7\n8\nfizz\nbuzz\ndone\n",
         ),
         (
-            "example/incremental_dispatch_gc.wi",
+            "tests/regressions/incremental_dispatch_gc.wi",
             "child\nchild\nretained\n",
         ),
         (
@@ -285,26 +345,29 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/arithmetic.wi",
             "27\n15\n126\n3\n3\n54\n3\ntrue\n1024\n1\n",
         ),
-        ("example/array_fast_paths.wi", "42\ntrue\ntrue\n42\n7\n"),
+        (
+            "tests/regressions/array_fast_paths.wi",
+            "42\ntrue\ntrue\n42\n7\n",
+        ),
         ("example/array_growth.wi", "5\n55\n25\n16\n3\n"),
         (
-            "example/array_literal_churn.wi",
+            "tests/regressions/array_literal_churn.wi",
             "50005000\n43\n6\nalphabetagamma\n10\n5050\n2555840\n87\n1999000\n",
         ),
         (
-            "example/array_loop_safepoints.wi",
+            "tests/regressions/array_loop_safepoints.wi",
             "499500\nsummed\n499500\n3\n5\n16\n6\n31415\n8\n12\ntrue\n3\ntrue\n12\n180\n460\n6765\n",
         ),
         (
-            "example/array_store_runs.wi",
+            "tests/regressions/array_store_runs.wi",
             "499500\ntrue\ntrue\n21\n69\n9\n41\n78\n41\n81\n21\n14\n31\n18\nfilled\n18\n23\n21\n60\n210\n200\n6\ntrue\n7\n101\n303\n",
         ),
         (
-            "example/array_push_growth.wi",
+            "tests/regressions/array_push_growth.wi",
             "true\ntrue\ntrue\ntrue\ntrue\ntrue\n",
         ),
         (
-            "example/array_reference_store.wi",
+            "tests/regressions/array_reference_store.wi",
             "33\n200\n2101\nleft-right\n36\n9\n5\n8\n42\n12\n79990\ncaught\n",
         ),
         ("example/arrays.wi", "4\n10\n40\n100\n99\n2\nbob\ntrue\n"),
@@ -314,66 +377,72 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/async_concurrent.wi", "465\n"),
         ("example/async_preemption.wi", "42\n"),
         ("example/task_sync_preemption.wi", "42\n"),
-        ("example/preemption_acceptance.wi", "true\ntrue\n"),
+        ("tests/regressions/preemption_acceptance.wi", "true\ntrue\n"),
         (
             "example/task_sync_cancel.wi",
             "sync inner\nsync outer\nlock defer\nasync outer\n42\n",
         ),
-        ("example/task_owned_shadow_roots.wi", "76\n"),
+        ("tests/regressions/task_owned_shadow_roots.wi", "76\n"),
         ("example/async_scoped_borrow.wi", "40\n80\n3\n42\n"),
         ("example/async_borrow_unwind.wi", "41\n41\n42\n42\n"),
-        ("example/async_borrow_migration.wi", "42\n"),
+        ("tests/regressions/async_borrow_migration.wi", "42\n"),
         (
-            "example/pow_bit_preserving_dispatch.wi",
+            "tests/regressions/pow_bit_preserving_dispatch.wi",
             "1.1642177654608983\n",
         ),
-        ("example/async_mut_sync_preemption.wi", "1000000\n1000000\n"),
+        (
+            "tests/regressions/async_mut_sync_preemption.wi",
+            "1000000\n1000000\n",
+        ),
         ("example/async_fn_pointer.wi", "42\n14\n"),
-        ("example/release_fault_sites.wi", "500500\n999000\n14950\n"),
+        (
+            "tests/regressions/release_fault_sites.wi",
+            "500500\n999000\n14950\n",
+        ),
         ("example/lock_function_values.wi", "41\n42\n100\n"),
         (
             "example/imported_function_values/main.wi",
             "42\n8\n42\ntrue\n",
         ),
         (
-            "example/async_frame_narrowing.wi",
+            "tests/regressions/async_frame_narrowing.wi",
             "2\n1\n102\n13\n12\n3\n30\ntask\n4\n7\nhello\n6\n",
         ),
         ("example/atomics.wi", "9\n9\n100\ntrue\n"),
         (
-            "example/lir_atomics.wi",
+            "tests/regressions/lir_atomics.wi",
             "10\n15\n12\n19\ntrue\n48\n23\n18\n18\n100\nfalse\n50\ntrue\ntrue\nfalse\n",
         ),
         ("example/async_cooperative.wi", "1\n2\n3\n"),
-        ("example/async_string_param.wi", "hello, willow\n"),
+        ("tests/regressions/async_string_param.wi", "hello, willow\n"),
         ("example/booleans.wi", "true\nfalse\ntrue\ntrue\n"),
         ("example/classes_objects.wi", "Alice\n33\n"),
         ("example/class_hierarchy.wi", "3\n"),
         (
-            "example/class_inheritance_cycle_rejected.wi",
+            "example/class_inheritance_chain.wi",
             "Leaf: 1 2 3\nsum: 6\n",
         ),
         ("example/class.wi", "42\n"),
         (
-            "example/class_method_dispatch.wi",
+            "tests/regressions/class_method_dispatch.wi",
             "100\n220\n300\n22000\nledger\n",
         ),
         (
-            "example/class_layout_declaration_order.wi",
+            "tests/regressions/class_layout_declaration_order.wi",
             "6\n1\n2\n3\n1001\n2,4,8\n",
         ),
         (
-            "example/class_vtable_dispatch.wi",
+            "tests/regressions/class_vtable_dispatch.wi",
             "shape=4\nshape=16\nshape=16\ncircle=48\n5\ninvoice\n",
         ),
         ("example/command_line_args.wi", "0\n0\ntrue\ntrue\n"),
         (
-            "example/codegen_invariants.wi",
+            "tests/regressions/codegen_invariants.wi",
             "2\ntrue\n2\n-1\nhello Alice\n11\n12\nBob\n12\nBob scored 12\n14\n8\n21\n-1\n12\n7\n",
         ),
         ("example/constructor_flow.wi", "zero\n0\none\n1\nmany\n2\n"),
         (
-            "example/constructor_flow_effects.wi",
+            "tests/regressions/constructor_flow_effects.wi",
             "guarded cleanup\n3\n0\ninner recovered\n7\n",
         ),
         ("example/constructor_lambdas.wi", "8\n402\n"),
@@ -388,15 +457,14 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/constructor_visibility.wi", "pub\n42\n7\n"),
         ("example/constructors.wi", "John\n20\n7\n"),
         ("example/control_flow.wi", "120\n"),
-        ("example/debug_source_map.wi", "12\n"),
+        ("tests/regressions/debug_source_map.wi", "12\n"),
         (
             "example/defer_panic_termination.wi",
             "body\ncleanup starts\nrecovered: cleanup failed\nafter scope\n",
         ),
         ("example/early_return.wi", "7\n0\n12\n"),
-        ("example/example.wi", "50\ntrue\n"),
+        ("example/let_bindings.wi", "50\ntrue\n"),
         ("example/fib.wi", "6765\n"),
-        ("example/fib_bench.wi", "6765\n"),
         (
             "example/i64_parse.wi",
             "42\n-9223372036854775808\nparse failed\n",
@@ -421,7 +489,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "a\n1\nb\n2\n1\nc\n3\n3\n3\n-1\n",
         ),
         ("example/frozen_map.wi", "3\n2\ntrue\n150\n"),
-        ("example/frozen_map_gc.wi", "449\ntwo!\n?\n1536\n2\n"),
+        (
+            "tests/regressions/frozen_map_gc.wi",
+            "449\ntwo!\n?\n1536\n2\n",
+        ),
         (
             "example/parallel_map.wi",
             "[25, 1, 16, 4, 9]\n[10, 2, 8, 4, 6]\n",
@@ -431,38 +502,44 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "cancelled\n5997\n2997\n[15, 3, 12, 6, 9]\n320\n",
         ),
         (
-            "example/lir_parallel_map.wi",
+            "tests/regressions/lir_parallel_map.wi",
             "[25, 1, 16, 4, 9]\n[15, 11, 14, 12, 13]\n[10, 2, 8, 4, 6]\n\
              [35, 11, 26, 14, 19]\n46\n[25, 1, 16, 4, 9] [15, 11, 14, 12, 13]\n\
              []\ncancelled\n",
         ),
         ("example/gc_linked_list.wi", "6\n"),
-        ("example/gc_mutator_registration.wi", "ledger\n288\n"),
+        (
+            "tests/regressions/gc_mutator_registration.wi",
+            "ledger\n288\n",
+        ),
         (
             "example/enum_match.wi",
             "north\nwest\n78.53975\n12\n0\nzero\nnonzero\nyes\nno\n",
         ),
-        ("example/generic_enum_empty/main.wi", "1\n2\n"),
+        ("tests/regressions/generic_enum_empty/main.wi", "1\n2\n"),
         ("example/unqualified_enum_pair.wi", "42\n"),
         ("example/unqualified_enum_variant.wi", "42\n1007\n-1\n"),
         (
-            "example/interface_box_dynamic_dispatch.wi",
+            "tests/regressions/interface_box_dynamic_dispatch.wi",
             "20\n60\n200\n90\n140\n18\n9\n",
         ),
         ("example/leibniz_pi.wi", "3.141592663589326\n"),
         ("example/locks.wi", "5\ndev\nprod\nfalse\ntrue\n"),
-        ("example/blocking_cell_gc.wi", "1999000\n6\ntrue\n"),
+        (
+            "tests/regressions/blocking_cell_gc.wi",
+            "1999000\n6\ntrue\n",
+        ),
         (
             "example/lock_match_arm.wi",
             "10\n6\n6\ncredited\ndebited\n10\n100\n20\n3\n123\n\
              draft\nfinal\n120\n",
         ),
         (
-            "example/lir_local_binding_order.wi",
+            "tests/regressions/lir_local_binding_order.wi",
             "41\n10\n307\n10\nheld\nboxed\n42\nmany\n16\n5\n-1\n",
         ),
         (
-            "example/lir_locks.wi",
+            "tests/regressions/lir_locks.wi",
             "true\nfalse\n809\n4\n48\n3\n9\n42\n1. inside the section\n\
              2. still holding the lock\n3. lock released, write published\n\
              4. outside the section\nok\nrecovered: inside the section\n3\n\
@@ -480,25 +557,30 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/match_color.wi", "green\n"),
         (
-            "example/method_receiver_roots.wi",
+            "tests/regressions/method_receiver_roots.wi",
             "original!\nreplacement!\n",
         ),
         ("example/functions.wi", "25\ntrue\n"),
-        ("example/hello.wi", "50"),
         ("example/hello_world.wi", "Hello, world!\n"),
         (
-            "example/gc_scalable_bitmap.wi",
+            "tests/regressions/gc_scalable_bitmap.wi",
             "x\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
         ),
-        ("example/compiler_scalability/main.wi", "3\n42\n"),
-        ("example/iterative_scoped_traversal.wi", "value=13\ndone\n"),
-        ("example/frontend_continuations.wi", "42\n"),
-        ("example/current_unit_memory/main.wi", "42\n"),
+        ("tests/regressions/compiler_scalability/main.wi", "3\n42\n"),
         (
-            "example/iterative_operator_validation.wi",
+            "tests/regressions/iterative_scoped_traversal.wi",
+            "value=13\ndone\n",
+        ),
+        ("tests/regressions/frontend_continuations.wi", "42\n"),
+        ("tests/regressions/current_unit_memory/main.wi", "42\n"),
+        (
+            "tests/regressions/iterative_operator_validation.wi",
             "16\n20\ntrue\n19\n",
         ),
-        ("example/imported_class_lambdas/main.wi", "42\n7\n"),
+        (
+            "tests/regressions/imported_class_lambdas/main.wi",
+            "42\n7\n",
+        ),
         ("example/import_demo/main.wi", "30\n42\n42\n99\n3\n42\n"),
         ("example/item_import_demo/main.wi", "7\n25\n"),
         ("example/interfaces.wi", "woof\n4\ntweet\n2\nwoof\ntweet\n"),
@@ -514,11 +596,11 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "Rex / Sam\n<Rex>\n<Rex>\n",
         ),
         (
-            "example/interface_super_coercion.wi",
+            "tests/regressions/interface_super_coercion.wi",
             "11\n21\n41\n21\n22\n21\n22\n21\n22\n22\n21\n22\n21\n22\n31\n11\n12\n21\n22\n",
         ),
         (
-            "example/interface_diamond_widening.wi",
+            "tests/regressions/interface_diamond_widening.wi",
             "700\n7\n70\ncard\n7\n7\ncard\n",
         ),
         (
@@ -534,7 +616,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "answer = 42\nok = true\npi = 3.5\np = (3, 4)\n",
         ),
         (
-            "example/string_concat_fusion.wi",
+            "tests/regressions/string_concat_fusion.wi",
             "willow v8 build -29!\n  evaluating a\n  evaluating b\n  evaluating c\nab1c\n\
              [é水🌲]\nmin=-9223372036854775808 max=9223372036854775807\nL8|L8|2\n\
              0=0;1=1;2=4;3=9;4=16;\nwillow:8:-29\n",
@@ -546,52 +628,55 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
              odd sample\nrising batch\n?\nno reading\n6\n7\n5\n6\n9\n",
         ),
         ("example/lambda_context.wi", "20\n12\n12\nyes\n"),
-        ("example/async_reference_escape_rejected.wi", "42\n"),
+        ("example/async_reference_lifetime.wi", "42\n"),
         (
-            "example/async_scalar_reference.wi",
+            "tests/regressions/async_scalar_reference.wi",
             "42\n2.5\ntrue\n43\n4.25\nfalse\n",
         ),
         (
-            "example/async_string_reference.wi",
+            "tests/regressions/async_string_reference.wi",
             "moved string\nmoved string\nreplacement\nold alias\n",
         ),
-        ("example/stable_borrowed_scalars.wi", "42\n4.25\ntrue\n"),
-        ("example/generic_import_usage.wi", "7\n7\n7\n"),
-        ("example/mutable_captures.wi", "2\n"),
-        ("example/lazy_task_stack.wi", "cleanup\n210\n"),
         (
-            "example/reference_width.wi",
+            "tests/regressions/stable_borrowed_scalars.wi",
+            "42\n4.25\ntrue\n",
+        ),
+        ("tests/regressions/generic_import_usage.wi", "7\n7\n7\n"),
+        ("example/mutable_captures.wi", "2\n"),
+        ("tests/regressions/lazy_task_stack.wi", "cleanup\n210\n"),
+        (
+            "tests/regressions/reference_width.wi",
             "reference\n4294967297\n4294967298\nreference!\n",
         ),
         (
-            "example/match_binding_gc_roots.wi",
+            "tests/regressions/match_binding_gc_roots.wi",
             "99\n10\n55\n9\n[note] kept!\n300\n7\n",
         ),
         (
-            "example/constructor_reference_args.wi",
+            "tests/regressions/constructor_reference_args.wi",
             "42\n22\n6\n20\nhi!/hi!\n31\n6\n",
         ),
         ("example/map_inference.wi", "42\n2\n"),
         (
-            "example/map_key_value_kinds.wi",
+            "tests/regressions/map_key_value_kinds.wi",
             "16\n1\n37\ntwo\n42\ntrue\nfalse\n",
         ),
         ("example/maps.wi", "2\n31\n25\n-1\ntrue\nfalse\ntwo\n"),
         ("example/module_alias_demo/main.wi", "5\n16\n"),
         (
-            "example/imported_generic_callable/main.wi",
+            "tests/regressions/imported_generic_callable/main.wi",
             "true\ntrue\ntrue\ntrue\n",
         ),
         (
-            "example/module_interface_defaults/main.wi",
+            "tests/regressions/module_interface_defaults/main.wi",
             "<hello ada>\n<hello robot>\n41\n[local]\n",
         ),
         (
-            "example/module_alias_spellings/main.wi",
+            "tests/regressions/module_alias_spellings/main.wi",
             "high\nlow\n42\n10\ntrue\n7\ntrue\n",
         ),
         (
-            "example/module_base_short_name/main.wi",
+            "tests/regressions/module_base_short_name/main.wi",
             "3\n12\n7\n5\n20\n50\n3\n12\n42\n1\n0\n",
         ),
         (
@@ -605,7 +690,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/module_class_demo/main.wi", "42\n12\n"),
         (
-            "example/module_class_values/main.wi",
+            "tests/regressions/module_class_values/main.wi",
             "7\n12\n10\n12\n(2, 2) -> (10, 10)\norigin\n7\n12\n",
         ),
         (
@@ -613,52 +698,52 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "1005\n6\n1005\n",
         ),
         (
-            "example/module_inherited_interfaces/main.wi",
+            "tests/regressions/module_inherited_interfaces/main.wi",
             "30\n100\n40\nparcel\nentry\n7\n21\n120\n",
         ),
         (
-            "example/module_item_imports/main.wi",
+            "tests/regressions/module_item_imports/main.wi",
             "25\n275\n0\n1100\n1100\n",
         ),
         (
-            "example/module_cross_module_types/main.wi",
+            "tests/regressions/module_cross_module_types/main.wi",
             "4\n12\n24\n9\nexpress\n",
         ),
         (
-            "example/module_alias_identity/main.wi",
+            "tests/regressions/module_alias_identity/main.wi",
             "120\n60\n110\n60\n5\npremium\n",
         ),
         (
-            "example/module_static_properties/main.wi",
+            "tests/regressions/module_static_properties/main.wi",
             "1\n2\n8\nvault\n2\nledger\n4\ntrue\n",
         ),
         ("example/module_demo/main.wi", "12\n14\n"),
         (
-            "example/module_dispatch_demo/main.wi",
+            "tests/regressions/module_dispatch_demo/main.wi",
             "300\n5400\n400\n50\n",
         ),
         (
-            "example/module_typecheck_demo/main.wi",
+            "tests/regressions/module_typecheck_demo/main.wi",
             "3\n30\n6\n60\n60\n13\n",
         ),
         ("example/module_enum_demo/main.wi", "1\n2\n42\n"),
         // Option<i64> Some/None across a module, Wrap<i64> Val/Empty into
         // Result<i64, String>, a plain enum, a generic interface at i64.
         (
-            "example/type_argument_arity/main.wi",
+            "tests/regressions/type_argument_arity/main.wi",
             "5\n0\n7\nempty\nnone\n2\n42\nmaybe\n1\n12\n",
         ),
         (
-            "example/module_lir_bodies/main.wi",
+            "tests/regressions/module_lir_bodies/main.wi",
             "12\n10\n7\nwin:rect\n1\n9\n30\n90\n12\n12\n12\n20\n13\n",
         ),
         (
-            "example/module_class_visibility/main.wi",
+            "tests/regressions/module_class_visibility/main.wi",
             "7\n23\ncell:2,5\n7\n",
         ),
         ("example/module_import_scope/main.wi", "7\nsale:3\n9\n100\n"),
         (
-            "example/enum_identity_aliases/main.wi",
+            "tests/regressions/enum_identity_aliases/main.wi",
             "3\n10\n2\n3\n2\n3\n3\nmid\nhigh\n7\n0\ntrue\nfalse\n4\ntrue\ntrue\n200\n",
         ),
         (
@@ -666,15 +751,15 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "1\n42\n200\n8\nink\n2\n20\n",
         ),
         (
-            "example/imported_enum_payload/main.wi",
+            "tests/regressions/imported_enum_payload/main.wi",
             "3\n14\n25\n2\n3\nhi!\n25\nhi\nhi!\n42\n25\n",
         ),
         (
-            "example/module_enum_tables/main.wi",
+            "tests/regressions/module_enum_tables/main.wi",
             "high[]\nlow[]\nloud{}\n-{}\nfar()\n.low.low.low.low\n11\n10\nloud/ok\ntrue\nlow\nloud\n",
         ),
         (
-            "example/module_enum_identity/main.wi",
+            "tests/regressions/module_enum_identity/main.wi",
             "signal:high\nsignal:low\nother:off\nother:on\nother:extra\nsignal:high\nother:extra\ncarried\n",
         ),
         ("example/direct_import_demo/main.wi", "7\n1\n99\n"),
@@ -683,27 +768,27 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "25\n12\n3\n",
         ),
         (
-            "example/generic_iface_class_args/main.wi",
+            "tests/regressions/generic_iface_class_args/main.wi",
             "true\n1\ntrue\n",
         ),
         ("example/interface_advanced_demo/main.wi", "11\n10\n42\n"),
         ("example/mutability.wi", "6\n15\ntrue\n"),
         ("example/nested_loops.wi", "30\n"),
         (
-            "example/nil_guard_demo.wi",
+            "example/option_guard_demo.wi",
             "42\n-7\n0\ntrue\nfalse\nfalse\n126\n99\n",
         ),
-        ("example/nil_nullable.wi", "0\n10\n20\ntrue\n10\n"),
-        ("example/nil_safe_chain.wi", "60\n3\n30\n-1\n120\n"),
+        ("example/option_node_fields.wi", "0\n10\n20\ntrue\n10\n"),
+        ("example/option_linked_chain.wi", "60\n3\n30\n-1\n120\n"),
         ("example/object_argument.wi", "42\n42\n99\n41\n"),
         ("example/ordered_locks.wi", "105\n15\n"),
         ("example/parent_child_locks.wi", "3\n6\n100\n101\n7\n3\n"),
         (
-            "example/task_publication.wi",
+            "tests/regressions/task_publication.wi",
             "499500\n2190\n50\n26\n1006\n2000\n",
         ),
         (
-            "example/object_field_store.wi",
+            "tests/regressions/object_field_store.wi",
             "11\nfield-store\n36\n5\n9\n3\n200\nnone\n200\nsubclass\n42\n1999000\n",
         ),
         (
@@ -723,19 +808,21 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "dog:rex\nnone\nrobot:7\ndog:spot\n",
         ),
         (
-            "example/option_repr_niche.wi",
+            "tests/regressions/option_repr_niche.wi",
             "text\nmissing\n4\ntrue\ntrue\ntrue\nmap\ntrue\nasync\n",
         ),
         (
             "example/option_absence.wi",
             "true\ntrue\nvalue: willow\nmissing\ntrue\ntrue\n",
         ),
-        ("example/option_nil_migration.wi", "true\ntrue\ntrue\n"),
         ("example/prot_demo.wi", "10\n9\n20\n18\n17\n15\n14\n"),
         ("example/result_propagation.wi", "84\n-1\n52\n-1\n-1\n"),
-        ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
         (
-            "example/closure_enum_identity/main.wi",
+            "example/print_and_println.wi",
+            "1230\n42\ntrue\nfalsetrue\n",
+        ),
+        (
+            "tests/regressions/closure_enum_identity/main.wi",
             "true\ntrue\nfalse\n",
         ),
         (
@@ -747,7 +834,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/recursion.wi", "3628800\n1024\n6\n"),
         ("example/range_value.wi", "2\n6\n4\n14\n0\n1\n2\n"),
         (
-            "example/reference_args_control_flow.wi",
+            "tests/regressions/reference_args_control_flow.wi",
             "10\n15\n12\n14\n3\n9\n",
         ),
         (
@@ -755,7 +842,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "11\n22\ntrue\nhi!\nhi?\nold box\nold box!\nnew box\n3\n",
         ),
         (
-            "example/rust_runtime_smoke.wi",
+            "tests/regressions/rust_runtime_smoke.wi",
             "rust runtime\n42\n10\n21\n0\n",
         ),
         ("example/channel_producer.wi", "10\n20\n30\n"),
@@ -764,7 +851,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "60\nlast\nclosed\nselect saw close\n",
         ),
         (
-            "example/channel_element_inference.wi",
+            "tests/regressions/channel_element_inference.wi",
             "value 0;value 1;value 2;value 3;\n6 note 0;note 1;note 2;note 3;\n30\n\
              value 0;value 1;value 2;value 3;\n\
              bounded 0;bounded 1;bounded 2;bounded 3;\nab\n",
@@ -821,7 +908,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),
         ("example/string_greeting.wi", "hello, willow\ntrue\n"),
         (
-            "example/symbol_namespace_demo/main.wi",
+            "tests/regressions/symbol_namespace_demo/main.wi",
             "42\n100\n10\n40\n5\n15\nhi Alice\n6\n42\n121\n1\n2\n",
         ),
         ("example/task_sharing.wi", "6\n1\n2\n"),
@@ -833,7 +920,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "shipment 4kg costs 8\nshipment 4 kg (parcel) costs 13\nexpress shipment 4 kg (parcel) costs 39\n",
         ),
         (
-            "example/gc_safety_temporaries.wi",
+            "tests/regressions/gc_safety_temporaries.wi",
             "Hx!\na!b!\nv!\np!q!r!\nn!\nbad!\n7!\n",
         ),
         ("example/comments.wi", "30\n9223372036854775807\n"),
@@ -848,19 +935,19 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "no message in time\n42\ngave up on the slow worker\n",
         ),
         (
-            "example/channel_temporaries.wi",
+            "tests/regressions/channel_temporaries.wi",
             "nothing arrived\nitem-x\nitem-x\nitem-x\n3\n",
         ),
         (
-            "example/lir_gc_strings.wi",
+            "tests/regressions/lir_gc_strings.wi",
             "[core]\nl1|r2\nabababab\ntrue\nhit:zz\nhit:none\nn=big\nn=small\ntrue\n",
         ),
         (
-            "example/lir_async_await.wi",
+            "tests/regressions/lir_async_await.wi",
             "42\n10\nannounced\n[core]\n41\n46\n4\n42\n1\n[willow]!\n12\n[mid]?\n41\n[loud]!\n3\nbranched\ndone\n",
         ),
         (
-            "example/lir_async_recovery.wi",
+            "tests/regressions/lir_async_recovery.wi",
             "scalar: clean\n100\nscalar: no count\n7\ntext: clean\nreplaced\n\
              text: no label\nkept\nitems: clean\n20\nitems: no items\n9\n\
              holder: clean\nBob:20\nholder: no account\nAlice:10\n\
@@ -871,15 +958,15 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
              scalar: no count\n7\n3\ndone\n",
         ),
         (
-            "example/lir_gc_arrays.wi",
+            "tests/regressions/lir_gc_arrays.wi",
             "[0, 2, 4, 6, 8]\n5\n20\n<head>|<item>|<item>\n[\"<head>\"]\n[4, 3, 7]\n9\n13\n",
         ),
         (
-            "example/lir_gc_objects.wi",
+            "tests/regressions/lir_gc_objects.wi",
             "7\n10\n5\nitem!:ab\n16\n14\n30\n",
         ),
         (
-            "example/lir_gc_collections.wi",
+            "tests/regressions/lir_gc_collections.wi",
             "3\n{alpha:1: 0, beta:1: 1, gamma:1: 2}\ntrue\nfalse\n\
              {1: \"one\", 2: \"two\", 3: \"three\"}\n3\nfalse\n4\n3\nabtail\n2\n4\n",
         ),
@@ -888,23 +975,23 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "true\ntrue\ntrue\ntrue\ntrue\n",
         ),
         (
-            "example/lir_gc_stats.wi",
+            "tests/regressions/lir_gc_stats.wi",
             "true\ntrue\ntrue\ntrue\ntrue\n3\ntrue\nheap: ok\n",
         ),
         (
-            "example/lir_scope_roots.wi",
+            "tests/regressions/lir_scope_roots.wi",
             "0\n0\n0\n0\n0\n0\n0\n100\n101\n0\n6\nescapes into `kept`\n\
              inner: the inner label\ninner: the inner label\nthe outer label\n",
         ),
         (
-            "example/lir_enum_match.wi",
+            "tests/regressions/lir_enum_match.wi",
             "north\neast\nsouth\nwest\nnorth\n0\n48\n15\n0\n\
              nothing\ncircle\nrect\nlabeled plate/plate\n3\n-1\n2.5\n1\n\
              100\n200\n21\nyes\nno\nnorth star\nuntagged\n\
              going north\ngoing elsewhere\n63\neast:rect\n",
         ),
         (
-            "example/lir_option_result.wi",
+            "tests/regressions/lir_option_result.wi",
             "5\n-1\nsome\nnone\n2\n-1\n2\n3\nalice\nunknown\ntrue\nfalse\ntrue\n\
              bob\nunknown\nbob/bob\n?\n25\n-2\n-1\n7\n-1\nok\nnot a digit: x\n\
              true\ntrue\n1\n-1\nnot a digit: x\n7\n9\n-1\n-1\n10\n-1\nsum!sum!\n\
@@ -912,59 +999,59 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
              -1\nal\n(none)\nleft\nnegative\n21\n0\n8\n",
         ),
         (
-            "example/lir_divergence.wi",
+            "tests/regressions/lir_divergence.wi",
             "zero\none\nmany\nnothing\ndescribing 2\nsome (many)\n5\n5\n\
              low\nhigh\norigin\ntop\nbody\n42\n2.5\ntrue\nwillow\n\
              3 items\nleft and right\ntrue / false\n3.141593\n{literal} 9\n\
              no placeholders\n",
         ),
         (
-            "example/lir_function_values.wi",
+            "tests/regressions/lir_function_values.wi",
             "42\n49\n42\n102\n81\n10\n-20\n5\n100\n-10\n17\n\
              hi!!\n[[core]]\nsay hello\n<there>\n\
              40\n-1\nbig\n?\n5\n-1\n4\n99\n\
              40\n-1\n4\ne:odd\n2\nodd\n4\n0\n4\n8\n",
         ),
         (
-            "example/lir_closures.wi",
+            "tests/regressions/lir_closures.wi",
             "8\n15\n5\n18\n9\narea=12\n11.25\n0\n1\n42\n42\n25\n14\n63\n20\n",
         ),
         (
-            "example/lir_interface_boxing.wi",
+            "tests/regressions/lir_interface_boxing.wi",
             "alpha/#7\ngamma/#8\ndelta/#9\n4\nthree!#2three#4\nsolo/#11\n3\n11\nHHTT\n",
         ),
         (
-            "example/lir_interface_dispatch.wi",
+            "tests/regressions/lir_interface_dispatch.wi",
             "36\n40\n[square]\n[rect]\n18\n20\n10\n35\n72\n[rect]\n[square]\n",
         ),
         (
-            "example/lir_class_inheritance.wi",
+            "tests/regressions/lir_class_inheritance.wi",
             "5\n25\n25\n75\nshape=9u\nshape=9u\ncircle=27u\n16\n9\n23\n4\n\
              36\n36\n6\nC:circle/circle2\nB:hi\nu\nu\nu\n",
         ),
         (
-            "example/lir_class_methods.wi",
+            "tests/regressions/lir_class_methods.wi",
             "12\n12\n- left ops\nops:12\n30\n60\nmany\n- left pay\npay:30\n\
              - left void\nvoid:empty\nops+pay\n42\n*seal7*\n112\n24\n11\n",
         ),
         (
-            "example/lir_self_statics.wi",
+            "tests/regressions/lir_self_statics.wi",
             "1\n2\n2\nseat 2\n12\nseat\nrow\nclosed 2\n2\n42\n4\n3\n103\nseat 9\n",
         ),
         (
-            "example/lir_static_initializers.wi",
+            "tests/regressions/lir_static_initializers.wi",
             "42\n-5\ntrue\n3\nwillow\n42\n4\n0\n3\n7\n1\n8\n43\n1\n10\n3\n5\np8\n84\n11\n",
         ),
         (
-            "example/lir_static_property_bodies.wi",
+            "tests/regressions/lir_static_property_bodies.wi",
             "6\n3\n20\nbig\none\nmany\n2\n5\n0\n10\n7\n9\n10\n",
         ),
         (
-            "example/lir_stage5_cutover.wi",
+            "tests/regressions/lir_stage5_cutover.wi",
             "42\nboom at line 33\ncleaned up 8\n15\nnot positive\n99\n1\n",
         ),
         (
-            "example/interface_reference_params.wi",
+            "tests/regressions/interface_reference_params.wi",
             "15\n20\n15\n75\n45\n5\n25\n<name!>\n6\n1\n6\n11\n18\n105\n300\n",
         ),
         (
@@ -973,15 +1060,15 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/tcp_echo.wi", "hello from Willow\n"),
         (
-            "example/lir_io.wi",
+            "tests/regressions/lir_io.wi",
             "on disk\nfalse\ntrue\nwritten by a task\nfalse\nhello over loopback\n",
         ),
         (
-            "example/lir_namespace_aliases.wi",
+            "tests/regressions/lir_namespace_aliases.wi",
             "aliased on disk\nfalse\naliased by a task\nfalse\n0\n[16, 4, 9]\ntrue\n",
         ),
         (
-            "example/lir_match_bodies.wi",
+            "tests/regressions/lir_match_bodies.wi",
             "halt\nstep 6\nlabel x\n101\n12\nlabelled here!\n0\n33 20!50!\n\
              step(2)\nstep\nstep/9\nasync step 12\nok\nrecovered: bad input\n\
              nothing queued\ngot 21\n",
@@ -991,7 +1078,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "1\n-1\n0\n16\n12\n16\n12\n5\n21\n4\n6\n8\n-1\n40\n0\n4\n9\n18\n1\n",
         ),
         (
-            "example/lir_defer_scopes.wi",
+            "tests/regressions/lir_defer_scopes.wi",
             "leave doubled\n6\nleave positive\nleave pick\n1\nleave pick\n0\n0\n1\n2\n3\n\
              leave first_big\n3\n0\nleave inner\n1\nleave inner\n2\nleave deep\n2\n\
              0\n100\n200\n300\n2\n\
@@ -1002,11 +1089,11 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
              leave parse\nleave parse\nleave scaled\nnegative\nbye\n",
         ),
         (
-            "example/lir_main_result.wi",
+            "tests/regressions/lir_main_result.wi",
             "4\n70\nin range\nlevel must not be negative\n60\nnormal\ndone\n",
         ),
         (
-            "example/lir_match_suspend.wi",
+            "tests/regressions/lir_match_suspend.wi",
             "30\n60\n0\n13\n21\n0\n21\n-1\nhello, willow\nhello, stranger\n\
              6\n0\n15\n21\n-2\n-1\n42\n0\n15\n-1\ncleanup\n12\n0\n21\n",
         ),
@@ -1019,9 +1106,12 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "consumer 1 done\n42\nconsumer 2 done\ntrue\n",
         ),
         ("example/bounded_channel.wi", "10\n6\n100\n400\n7\n"),
-        ("example/channel_many_waiters.wi", "500500\ntrue\n1\n3\n"),
         (
-            "example/task_status_frame.wi",
+            "tests/regressions/channel_many_waiters.wi",
+            "500500\ntrue\n1\n3\n",
+        ),
+        (
+            "tests/regressions/task_status_frame.wi",
             "false\n42\nfalse\n42\ntrue\n0\ntrue\n0\n56\n",
         ),
         (
@@ -1049,7 +1139,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         // fib_task(10), fib_task(15), then fib_task(20) = 6765 clamped to 1000.
         // The recursive helpers the example documents are deliberately not
         // called from its async `main` — that is the point of the example.
-        ("example/task_recursion_rejected.wi", "55\n610\n1000\n"),
+        ("example/task_sync_recursion.wi", "55\n610\n1000\n"),
         ("example/task_aware_imported_helper.wi", "4950\n"),
         ("example/task_fan_in.wi", "125250\n9\n900\ntrue\n11\n"),
         (
@@ -1079,12 +1169,12 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             ),
         ),
         (
-            "example/panic_effect_self_dispatch.wi",
+            "tests/regressions/panic_effect_self_dispatch.wi",
             "recovered:child hook\nafter\n",
         ),
-        ("example/panic_allocation_contracts.wi", "42\n"),
+        ("tests/regressions/panic_allocation_contracts.wi", "42\n"),
         (
-            "example/shared_ast_walk.wi",
+            "tests/regressions/shared_ast_walk.wi",
             concat!(
                 "ternary <- ternary\n",
                 "binary <- binary\n",
@@ -1105,7 +1195,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         // landing pad survived a panic that only a subclass override raises;
         // the three balances prove the locked sections still run.
         (
-            "example/shared_call_graph.wi",
+            "tests/regressions/shared_call_graph.wi",
             concat!(
                 "11\n",
                 "12\n",
@@ -1128,7 +1218,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         // `sample` still dispatched on its own class, which the old flat
         // local-name map got wrong in the fail-open direction.
         (
-            "example/shared_effect_fixpoint.wi",
+            "tests/regressions/shared_effect_fixpoint.wi",
             concat!(
                 "20\n",
                 "5\n",
@@ -1160,7 +1250,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         // (shared compiler infrastructure, catalog item 7). A lowering that goes missing changes a
         // line here instead of failing silently.
         (
-            "example/intrinsic_methods.wi",
+            "tests/regressions/intrinsic_methods.wi",
             concat!(
                 // scalar toString: i64, f64, bool, String
                 "42 1.5\n",
@@ -1187,27 +1277,36 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
                 "false\nscope complete\n30\ntrue\nscope task cancelled\n",
             ),
         ),
-        ("example/ai_source_types.wi", "7\ntrue\ndocs\n"),
+        ("tests/regressions/ai_source_types.wi", "7\ntrue\ndocs\n"),
         (
-            "example/callee_type_queries.wi",
+            "tests/regressions/callee_type_queries.wi",
             "4\n5\n15\n7\n9\n1.5\n10\n",
         ),
-        ("example/diagnostic_collections.wi", "2\nb\n"),
-        ("example/diagnostic_workarounds.wi", "9\n6\n2\n4\n7\n"),
-        ("example/effect_precision.wi", "3\n1\neffect precision\n1\n"),
-        ("example/preemption_complete.wi", "[41, 42]\n"),
-        ("example/effect_witness_precision.wi", "slowly\n1\n2\n"),
+        ("tests/regressions/diagnostic_collections.wi", "2\nb\n"),
         (
-            "example/freeze_inference.wi",
+            "tests/regressions/diagnostic_workarounds.wi",
+            "9\n6\n2\n4\n7\n",
+        ),
+        (
+            "tests/regressions/effect_precision.wi",
+            "3\n1\neffect precision\n1\n",
+        ),
+        ("tests/regressions/preemption_complete.wi", "[41, 42]\n"),
+        (
+            "tests/regressions/effect_witness_precision.wi",
+            "slowly\n1\n2\n",
+        ),
+        (
+            "tests/regressions/freeze_inference.wi",
             "0\n0\n0\n0\n1\n7\n42\n0\n0\n",
         ),
         (
-            "example/frozen_iteration.wi",
+            "tests/regressions/frozen_iteration.wi",
             "1\n2\n3\n6\nmade\n4\n5\n1\n2\n3\n6\n",
         ),
         ("example/future_values.wi", "future values ok\n"),
         (
-            "example/generic_closer_equals.wi",
+            "tests/regressions/generic_closer_equals.wi",
             "41\n42\n7\n8\n3\ntrue\n8\n",
         ),
         (
@@ -1219,15 +1318,18 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "positive\ntrue\nfalse\n",
         ),
         ("example/match_arm_diagnostics.wi", "3\n7\n9\n"),
-        ("example/method_owner_cache.wi", "14\n16\n"),
-        ("example/native_stack_slots.wi", "6\n15\n820\n"),
-        ("example/nested_match_arm_leaves.wi", "11\n12\n20\n1\n2\n"),
+        ("tests/regressions/method_owner_cache.wi", "14\n16\n"),
+        ("tests/regressions/native_stack_slots.wi", "6\n15\n820\n"),
         (
-            "example/nonnegative_induction.wi",
+            "tests/regressions/nested_match_arm_leaves.wi",
+            "11\n12\n20\n1\n2\n",
+        ),
+        (
+            "tests/regressions/nonnegative_induction.wi",
             "5005000\n2515000\n790\n791\n792\n793\n794\n795\n796\n797\n798\n799\n800\n801\n802\n803\n804\n805\n806\n",
         ),
         (
-            "example/runtime_direct_calls.wi",
+            "tests/regressions/runtime_direct_calls.wi",
             "38890\n10000\n9999\nruntime direct calls\n",
         ),
         ("example/subclass_constructor.wi", "base:checked\n"),
@@ -1243,13 +1345,13 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/generic_lambda_generic_callers.wi", "3\n2\n2\n6\n"),
         ("example/user_generics.wi", "42\nhello\n7\nwillow\n20\n"),
         (
-            "example/module_tuple_calls/main.wi",
+            "tests/regressions/module_tuple_calls/main.wi",
             "5\n5\n5\n5\n5\n5\n5\n5\n5\n5\nfive\n2.5\ntrue\n5\n5\n5\n5\n5\n5\n5\n",
         ),
-        ("example/rename_values/main.wi", "14\n7\n9\n"),
+        ("tests/regressions/rename_values/main.wi", "14\n7\n9\n"),
         // Examples added without a catalog entry (found by the example audit).
         (
-            "example/array_runtime_marker.wi",
+            "tests/regressions/array_runtime_marker.wi",
             "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
         ),
         (
@@ -1260,73 +1362,103 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/block_arm_control_tails.wi",
             "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n",
         ),
-        ("example/channel_effect_witnesses.wi", "7\n7\n2\n"),
+        ("tests/regressions/channel_effect_witnesses.wi", "7\n7\n2\n"),
         ("example/channel_option_pattern.wi", "30\n"),
-        ("example/closure_effects.wi", "true\nfalse\n"),
+        ("tests/regressions/closure_effects.wi", "true\nfalse\n"),
         ("example/closure_field_binding.wi", "10\n21\n"),
         ("example/const_array_alternative.wi", "alpha\nbeta\n"),
         (
-            "example/gc_allocation_counters.wi",
+            "tests/regressions/gc_allocation_counters.wi",
             "true\ntrue\ntrue\ntrue\ntrue\n",
         ),
-        ("example/generic_diagnostics.wi", "42\nok\n"),
-        ("example/match_import_diagnostics.wi", "7\n42\n2.5\n"),
+        ("tests/regressions/generic_diagnostics.wi", "42\nok\n"),
         (
-            "example/parallel_context_bridge.wi",
+            "tests/regressions/match_import_diagnostics.wi",
+            "7\n42\n2.5\n",
+        ),
+        (
+            "tests/regressions/parallel_context_bridge.wi",
             "4294967297\n-4294967297\n9223372036854775807\n-9223372036854775807\n0\n",
         ),
         ("example/result_void.wi", "validated\nunfinished\n"),
-        ("example/revision_nested_lambdas.wi", "42\n"),
+        ("tests/regressions/revision_nested_lambdas.wi", "42\n"),
         ("example/self_capture.wi", "11\n12\n42\n51\n"),
-        ("example/module_downcast_payload/main.wi", "2\n2\n2\n"),
-        ("example/impact_override_family/src/main.wi", "3\n"),
-        ("example/closure_impact/src/main.wi", "false\nfalse\ntrue\n"),
-        ("example/lock_project_methods/src/main.wi", "1\n7\n"),
-        ("example/semantic_cli_minor/src/main.wi", "1\n1\n2\n"),
         (
-            "example/sync_field_identity/src/main.wi",
+            "tests/regressions/module_downcast_payload/main.wi",
+            "2\n2\n2\n",
+        ),
+        (
+            "tests/regressions/impact_override_family/src/main.wi",
+            "3\n",
+        ),
+        (
+            "tests/regressions/closure_impact/src/main.wi",
+            "false\nfalse\ntrue\n",
+        ),
+        (
+            "tests/regressions/lock_project_methods/src/main.wi",
+            "1\n7\n",
+        ),
+        (
+            "tests/regressions/semantic_cli_minor/src/main.wi",
+            "1\n1\n2\n",
+        ),
+        (
+            "tests/regressions/sync_field_identity/src/main.wi",
             "7\n8000\n16000\n24000\n",
         ),
-        ("example/async_compute_quantum.wi", "213177131\n"),
-        ("example/default_body_fanout.wi", "792\n"),
+        ("tests/regressions/async_compute_quantum.wi", "213177131\n"),
+        ("tests/regressions/default_body_fanout.wi", "792\n"),
         (
-            "example/cleanup_cfg.wi",
+            "tests/regressions/cleanup_cfg.wi",
             "0\n1\n90\n-1\n0\n1\n90\n1\nrecovered\nresumed\n",
         ),
-        ("example/semantic_facts/main.wi", "42\n"),
-        ("example/semantic_facts/references.wi", "1\n2\n9\n9\n"),
+        ("tests/regressions/semantic_facts/main.wi", "42\n"),
         (
-            "example/array_card_remembering.wi",
+            "tests/regressions/semantic_facts/references.wi",
+            "1\n2\n9\n9\n",
+        ),
+        (
+            "tests/regressions/array_card_remembering.wi",
             "true\ntrue\n-4030\ntrue\n-4000\n9096\n8383500\n8033426\n",
         ),
         ("example/async_task_values.wi", "42\n"),
-        ("example/builtin_callee_type_queries.wi", "1a b\n"),
+        ("tests/regressions/builtin_callee_type_queries.wi", "1a b\n"),
         ("example/contextual_new.wi", "3\n3\n3\n3\n"),
         ("example/contract_comparison.wi", "7\n"),
         ("example/contract_repair.wi", "0\n7\n"),
-        ("example/effect_contract_dispatch.wi", "42\n"),
+        ("tests/regressions/effect_contract_dispatch.wi", "42\n"),
         ("example/effect_contracts.wi", "42\n"),
-        ("example/effect_inventory_editor/m2.wi", "ok\n"),
+        ("tests/regressions/effect_inventory_editor/m2.wi", "ok\n"),
         ("example/effect_states.wi", "7\n"),
-        ("example/imported_enum_stack.wi", "2\nsaved\n42\ntrue\n"),
-        ("example/inherited_method_effects.wi", "1\n"),
+        (
+            "tests/regressions/imported_enum_stack.wi",
+            "2\nsaved\n42\ntrue\n",
+        ),
+        ("tests/regressions/inherited_method_effects.wi", "1\n"),
         (
             "example/integer_division.wi",
             "-3\n-1\n-3\n1\ninteger overflow: `i64::MIN / -1`\ninteger overflow: `i64::MIN % -1`\nafter\n",
         ),
-        ("example/lock_await_effects.wi", "3\n"),
+        ("tests/regressions/lock_await_effects.wi", "3\n"),
         ("example/math_helpers.wi", "math helpers ok\n"),
         ("example/numeric_conversions.wi", "4.5\n-4\n"),
-        ("example/open_method_effect_queries.wi", "3\n2\n3\n"),
+        (
+            "tests/regressions/open_method_effect_queries.wi",
+            "3\n2\n3\n",
+        ),
         (
             "example/option_method_handling.wi",
             "true\n6\nfallback\nWILLOW\n",
         ),
         ("example/pure_functions.wi", "30\n"),
-        ("example/reachable_generic_methods.wi", "42\nhello\n0\n"),
+        (
+            "tests/regressions/reachable_generic_methods.wi",
+            "42\nhello\n0\n",
+        ),
         ("example/rename_semantic_verification.wi", "5\n"),
         (
-            "example/runtime_contracts.wi",
+            "tests/regressions/runtime_contracts.wi",
             "90\ncontract violation: requires\nrecovered\n",
         ),
         ("example/select_arm_blocks.wi", "7\n7\n"),
@@ -1745,7 +1877,7 @@ fn test_runnable_example_catalog_is_complete() {
 
 #[test]
 fn test_string_concat_fusion_example() {
-    let path = "example/string_concat_fusion.wi";
+    let path = "tests/regressions/string_concat_fusion.wi";
     let (_, expected) = runnable_example_cases()
         .iter()
         .find(|(entry, _)| *entry == path)
@@ -1793,7 +1925,7 @@ fn test_compound_and_multiline_example() {
 
 #[test]
 fn test_pure_imported_interface_scope_example() {
-    let (out, ok) = compile_file_and_run("example/semantic_scope/main.wi");
+    let (out, ok) = compile_file_and_run("tests/regressions/semantic_scope/main.wi");
     assert!(ok, "{out}");
     assert_eq!(out, "19\n");
 }
@@ -1801,15 +1933,15 @@ fn test_pure_imported_interface_scope_example() {
 #[test]
 fn test_recent_cli_and_language_examples() {
     for path in [
-        "example/language_gaps/main.wi",
+        "tests/regressions/language_gaps/main.wi",
         "example/semantic_cli/src/main.wi",
         "example/semantic_cli_diagnostics.wi",
-        "example/contextual_interface_arrays.wi",
+        "tests/regressions/contextual_interface_arrays.wi",
         "example/contextual_interface_values.wi",
         "example/match_loop_exit_arms.wi",
-        "example/reserved_keyword_names.wi",
+        "tests/regressions/open_prefixed_names.wi",
         "example/semantic_contract_queries.wi",
-        "example/semantic_scope/main.wi",
+        "tests/regressions/semantic_scope/main.wi",
         "example/semantic_local_lock_queries.wi",
         "example/semantic_cli_local_selectors.wi",
     ] {
@@ -1827,7 +1959,7 @@ fn test_recent_cli_and_language_examples() {
 fn test_panic_allocation_contracts_example() {
     let (path, expected) = runnable_example_cases()
         .iter()
-        .find(|(path, _)| *path == "example/panic_allocation_contracts.wi")
+        .find(|(path, _)| *path == "tests/regressions/panic_allocation_contracts.wi")
         .expect("panic allocation contracts example must be cataloged");
     let (out, ok) = compile_file_and_run(path);
     assert!(ok, "{path} failed to compile or run");
@@ -1849,7 +1981,7 @@ fn test_lock_effect_targets_example() {
 fn test_array_push_growth_example() {
     let (path, expected) = runnable_example_cases()
         .iter()
-        .find(|(path, _)| *path == "example/array_push_growth.wi")
+        .find(|(path, _)| *path == "tests/regressions/array_push_growth.wi")
         .expect("array push growth example must be cataloged");
     let (out, ok) = compile_file_and_run(path);
     assert!(ok, "{path} failed to compile or run");
@@ -1860,7 +1992,7 @@ fn test_array_push_growth_example() {
 fn test_array_fast_paths_example() {
     let (path, expected) = runnable_example_cases()
         .iter()
-        .find(|(path, _)| *path == "example/array_fast_paths.wi")
+        .find(|(path, _)| *path == "tests/regressions/array_fast_paths.wi")
         .expect("array fast paths example must be cataloged");
     let (out, ok) = compile_file_and_run(path);
     assert!(ok, "{path} failed to compile or run");
@@ -1881,7 +2013,7 @@ fn test_runnable_example_files_compile_and_run() {
     for &(path, expected) in runnable_example_cases() {
         let (out, ok) = if matches!(
             path,
-            "example/lir_self_statics.wi" | "example/gc_barrier_variants.wi"
+            "tests/regressions/lir_self_statics.wi" | "tests/regressions/gc_barrier_variants.wi"
         ) {
             // `static mut` state with task execution requires one worker.
             let source = fs::read_to_string(path).unwrap();
@@ -2015,11 +2147,8 @@ fn test_future_private_member_diagnostic_example_reports_only_privacy_error() {
     );
 }
 
-/// Both numeric forms have graduated to the runnable root example. Keep the
-/// future catalog clear of the retired E2501 staging artifact.
 #[test]
-fn test_exponentiation_has_no_future_staging_example() {
-    assert!(!Path::new("example/future/exponentiation.wi").exists());
+fn test_exponentiation_example_has_both_numeric_forms() {
     let source = fs::read_to_string("example/exponentiation.wi")
         .expect("missing runnable exponentiation example");
     assert!(source.contains("float_power(2.0, 0.5)"));
@@ -2086,7 +2215,7 @@ fn test_integral_float_display_examples() {
             "example/f64_integral_display.wi"
                 | "example/map_float_keys.wi"
                 | "example/enum_match.wi"
-                | "example/lir_closures.wi"
+                | "tests/regressions/lir_closures.wi"
         ) {
             let (out, ok) = compile_file_and_run(path);
             assert!(ok, "{path}: {out}");
@@ -2100,13 +2229,13 @@ fn test_repaired_example_catalog_entries() {
     for &(path, expected) in runnable_example_cases() {
         if matches!(
             path,
-            "example/reference_roles.wi"
+            "tests/regressions/reference_roles.wi"
                 | "example/overview.wi"
                 | "example/async_capture_diagnostics.wi"
-                | "example/assignment_target_types.wi"
-                | "example/effect_explanations.wi"
+                | "tests/regressions/assignment_target_types.wi"
+                | "tests/regressions/effect_explanations.wi"
                 | "example/void_tasks_frozen_iteration.wi"
-                | "example/shared_cancellation_cleanup.wi"
+                | "tests/regressions/shared_cancellation_cleanup.wi"
         ) {
             let (out, ok) = compile_file_and_run(path);
             assert!(ok, "{path}: {out}");
@@ -2120,21 +2249,21 @@ fn test_october_ci_catalog_additions() {
     for &(path, expected) in runnable_example_cases() {
         if matches!(
             path,
-            "example/assignable_representations.wi"
-                | "example/canonical_identity.wi"
-                | "example/imported_interface_default.wi"
-                | "example/imported_generic_interface_default.wi"
-                | "example/interface_default_receiver_names.wi"
-                | "example/interface_default_receiver_signatures.wi"
-                | "example/interface_qualified_self_reference.wi"
-                | "example/interface_default_self_signature.wi"
-                | "example/generic_interface_default_self.wi"
-                | "example/generic_class_self.wi"
-                | "example/lock_imported_effects/main.wi"
-                | "example/module_generic_members/main.wi"
+            "tests/regressions/assignable_representations.wi"
+                | "tests/regressions/canonical_identity.wi"
+                | "tests/regressions/imported_interface_default.wi"
+                | "tests/regressions/imported_generic_interface_default.wi"
+                | "tests/regressions/interface_default_receiver_names.wi"
+                | "tests/regressions/interface_default_receiver_signatures.wi"
+                | "tests/regressions/interface_qualified_self_reference.wi"
+                | "tests/regressions/interface_default_self_signature.wi"
+                | "tests/regressions/generic_interface_default_self.wi"
+                | "tests/regressions/generic_class_self.wi"
+                | "tests/regressions/lock_imported_effects/main.wi"
+                | "tests/regressions/module_generic_members/main.wi"
                 | "example/semantic_generic_queries.wi"
                 | "example/semantic_generic_closure_calls.wi"
-                | "example/task_frame_lifetime.wi"
+                | "tests/regressions/task_frame_lifetime.wi"
         ) {
             let (out, ok) = compile_file_and_run(path);
             assert!(ok, "{path}: {out}");
@@ -2159,14 +2288,14 @@ fn test_interface_marker_contract_example() {
 
 #[test]
 fn test_standalone_generic_aliases_example() {
-    let (out, ok) = compile_file_and_run("example/standalone_generic_aliases/main.wi");
+    let (out, ok) = compile_file_and_run("tests/regressions/standalone_generic_aliases/main.wi");
     assert!(ok, "{out}");
     assert_eq!(out, "17\n");
 }
 
 #[test]
 fn test_gc_old_cycle_example() {
-    let (out, ok) = compile_file_and_run("example/gc_old_cycle.wi");
+    let (out, ok) = compile_file_and_run("tests/regressions/gc_old_cycle.wi");
     assert!(ok, "{out}");
     assert_eq!(out, "499500\n499500\n499500\n");
 }
@@ -2174,9 +2303,9 @@ fn test_gc_old_cycle_example() {
 #[test]
 fn test_async_scalar_reference_catalog_entries() {
     for path in [
-        "example/async_scalar_reference.wi",
-        "example/stable_borrowed_scalars.wi",
-        "example/generic_import_usage.wi",
+        "tests/regressions/async_scalar_reference.wi",
+        "tests/regressions/stable_borrowed_scalars.wi",
+        "tests/regressions/generic_import_usage.wi",
         "example/mutable_captures.wi",
     ] {
         let (_, expected) = runnable_example_cases()
@@ -2194,14 +2323,14 @@ fn test_async_scalar_reference_catalog_entries() {
 fn a9_restored_sync_helper_examples() {
     let restored = [
         "example/parallel_tasks.wi",
-        "example/task_recursion_rejected.wi",
+        "example/task_sync_recursion.wi",
         "example/task_aware_imported_helper.wi",
-        "example/lir_atomics.wi",
-        "example/lir_class_methods.wi",
-        "example/lir_parallel_map.wi",
-        "example/channel_element_inference.wi",
-        "example/shared_effect_fixpoint.wi",
-        "example/shared_ast_walk.wi",
+        "tests/regressions/lir_atomics.wi",
+        "tests/regressions/lir_class_methods.wi",
+        "tests/regressions/lir_parallel_map.wi",
+        "tests/regressions/channel_element_inference.wi",
+        "tests/regressions/shared_effect_fixpoint.wi",
+        "tests/regressions/shared_ast_walk.wi",
     ];
     for path in restored {
         let expected = runnable_example_cases()

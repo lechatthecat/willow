@@ -22,8 +22,7 @@
 //! unroll the same multiplication order. There is no uniform small-ULP accuracy
 //! guarantee for the integral path: squaring amplifies earlier rounding errors.
 //! The sampled maximum in the floating-point accuracy audit's grid/near-one corpus is 27,174,730,217
-//! ULP, not a global error bound. See
-//! docs/f64_power_contract.md and its reproducible numerical audit.
+//! ULP, not a global error bound.
 
 use anyhow::Result;
 use cranelift_codegen::ir::immediates::Ieee64;

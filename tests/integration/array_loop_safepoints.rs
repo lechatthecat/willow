@@ -10,7 +10,7 @@ const EXPECTED: &str =
 
 #[test]
 fn array_loop_safepoints_example_matches_in_every_mode() {
-    let source = include_str!("../../example/array_loop_safepoints.wi");
+    let source = include_str!("../../tests/regressions/array_loop_safepoints.wi");
     for (out, ok) in [
         compile_and_run(source),
         compile_and_run_release(source),

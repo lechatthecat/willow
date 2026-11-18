@@ -1668,8 +1668,7 @@ struct FlatReferenceDebug {
 /// Size of the reference cell a `&`/`&mut` argument points to: a managed base
 /// word (null for native stack storage) followed by a byte offset. Passing the
 /// owner and offset instead of an interior pointer lets a moving collection
-/// relocate the owner without pinning it (relocatable roots,
-/// docs/decisions/0011-reference-cell-abi.md).
+/// relocate the owner without pinning it (relocatable roots).
 const REFERENCE_CELL_BYTES: u32 = 16;
 
 #[derive(Clone)]

@@ -1,0 +1,41 @@
+// On supported targets, ordinary synchronous loops and recursion called by a
+// task run on a task-owned stack and yield at compiler-inserted safepoints.
+// E0810 remains for unproven calls and targets without sync-stack support.
+
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+// Mutual recursion is preemptible too.
+fn is_even(n: i64) -> bool {
+    if n == 0 {
+        return true;
+    }
+    return is_odd(n - 1);
+}
+
+fn is_odd(n: i64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    return is_even(n - 1);
+}
+
+async fn fib_task(n: i64) -> i64 {
+    return fib(n);
+}
+
+async fn clamped_fib(n: i64) -> i64 {
+    let value = await fib_task(n);
+    return value > 1000 ? 1000 : value;
+}
+
+async fn main() {
+    println(await fib_task(10));      // 55
+    println(await fib_task(15));      // 610
+    println(await clamped_fib(20));   // 1000
+    if !is_even(20) || !is_odd(21) { panic("mutual recursion"); }
+}

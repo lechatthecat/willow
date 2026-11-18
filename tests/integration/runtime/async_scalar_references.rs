@@ -1,6 +1,6 @@
 use super::*;
 
-const EXAMPLE: &str = include_str!("../../../example/async_scalar_reference.wi");
+const EXAMPLE: &str = include_str!("../../../tests/regressions/async_scalar_reference.wi");
 const SCALARS: [(&str, &str, &str, &str); 3] = [
     ("i64", "42", "81", "81\n"),
     ("f64", "2.5", "4.25", "4.25\n"),
@@ -595,7 +595,7 @@ fn async_borrow_unwind_unhandled_panic_keeps_older_defers() {
 
 #[test]
 fn preemption_acceptance_example() {
-    let source = include_str!("../../../example/preemption_acceptance.wi");
+    let source = include_str!("../../../tests/regressions/preemption_acceptance.wi");
     let project = TestProject::new("preemption_acceptance", &[("main.wi", source)]);
     for args in [vec![], vec!["--release"]] {
         let compiled = project.compile_with_args("main.wi", &args);
@@ -613,7 +613,7 @@ fn preemption_acceptance_example() {
 
 #[test]
 fn async_mut_sync_preemption_example_modes() {
-    let source = include_str!("../../../example/async_mut_sync_preemption.wi");
+    let source = include_str!("../../../tests/regressions/async_mut_sync_preemption.wi");
     let project = TestProject::new("mut_sync_example", &[("main.wi", source)]);
     for release in [false, true] {
         let args = if release { vec!["--release"] } else { vec![] };
@@ -791,9 +791,7 @@ fn async_mut_sync_preemption_nested_heap_and_repeated_calls() {
 
 #[test]
 fn async_reference_gate_b9_example_and_unsupported_types() {
-    let (out, ok) = compile_and_run(include_str!(
-        "../../../example/async_reference_escape_rejected.wi"
-    ));
+    let (out, ok) = compile_and_run(include_str!("../../../example/async_reference_lifetime.wi"));
     assert!(ok, "{out}");
     assert_eq!(out, "42\n");
     for ty in ["Choice", "Readable", "Option<String>", "fn(i64) -> i64"] {

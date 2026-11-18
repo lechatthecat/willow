@@ -1,7 +1,7 @@
 //! Legacy futures are native, nonmoving allocations, separate from task frames.
 //! Compatibility ABI v1 (0.1.x) handles are opaque, process-local tokens, never
 //! allocation addresses. Tokens are never reused; all operations check type and
-//! liveness. See docs/audits/legacy-future-abi.md for versioned migration.
+//! liveness.
 //! Deprecated for new integrations since runtime 0.1.0: use typed Rust owners,
 //! Task futures or allocation-free deadline values. The 0.2.x transition will
 //! retain v1 symbols and introduce Rust warnings after replacement bindings are

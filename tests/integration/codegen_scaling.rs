@@ -597,8 +597,9 @@ fn scaling_21_deep_diamond_dispatches_under_gc_stress() {
 
 #[test]
 fn scaling_22_the_widening_example_survives_gc_stress() {
-    let (out, ok) =
-        compile_and_run_gc_stress(include_str!("../../example/interface_diamond_widening.wi"));
+    let (out, ok) = compile_and_run_gc_stress(include_str!(
+        "../../tests/regressions/interface_diamond_widening.wi"
+    ));
     assert!(ok, "{out}");
     assert_eq!(out, "700\n7\n70\ncard\n7\n7\ncard\n");
 }

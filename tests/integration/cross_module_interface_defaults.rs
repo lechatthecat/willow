@@ -72,15 +72,19 @@ fn standalone_imported_default_example_runs() {
         &[
             (
                 "main.wi",
-                include_str!("../../example/imported_interface_default.wi"),
+                include_str!("../../tests/regressions/imported_interface_default.wi"),
             ),
             (
                 "imported_interface_default_support/consumer.wi",
-                include_str!("../../example/imported_interface_default_support/consumer.wi"),
+                include_str!(
+                    "../../tests/regressions/imported_interface_default_support/consumer.wi"
+                ),
             ),
             (
                 "imported_interface_default_support/provider.wi",
-                include_str!("../../example/imported_interface_default_support/provider.wi"),
+                include_str!(
+                    "../../tests/regressions/imported_interface_default_support/provider.wi"
+                ),
             ),
         ],
         "42\n",

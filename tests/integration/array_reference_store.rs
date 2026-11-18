@@ -8,7 +8,7 @@ const EXAMPLE_OUTPUT: &str = "33\n200\n2101\nleft-right\n36\n9\n5\n8\n42\n12\n79
 
 #[test]
 fn array_reference_store_example_in_debug_release_and_gc_stress() {
-    let source = include_str!("../../example/array_reference_store.wi");
+    let source = include_str!("../../tests/regressions/array_reference_store.wi");
     for (out, ok) in [
         compile_and_run(source),
         compile_and_run_release(source),
@@ -22,7 +22,7 @@ fn array_reference_store_example_in_debug_release_and_gc_stress() {
 
 #[test]
 fn array_reference_store_example_passes_barrier_verification() {
-    let source = include_str!("../../example/array_reference_store.wi");
+    let source = include_str!("../../tests/regressions/array_reference_store.wi");
     for env in [
         &[("WILLOW_GC_VERIFY_BARRIER", "1")][..],
         &[
@@ -141,7 +141,7 @@ fn array_card_remembering_example_in_debug_release_stress_and_verification() {
     // Large old buffers are remembered per written card: several cards of one
     // buffer add one remembered entry, children survive across minors and
     // growth, and the barrier verifier accepts the recorded cards.
-    let source = include_str!("../../example/array_card_remembering.wi");
+    let source = include_str!("../../tests/regressions/array_card_remembering.wi");
     for (out, ok) in [
         compile_and_run(source),
         compile_and_run_release(source),

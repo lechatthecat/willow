@@ -777,15 +777,15 @@ fn alias_24_the_example_runs() {
     let files = [
         (
             "signal.wi",
-            include_str!("../../example/enum_identity_aliases/signal.wi"),
+            include_str!("../../tests/regressions/enum_identity_aliases/signal.wi"),
         ),
         (
             "meter.wi",
-            include_str!("../../example/enum_identity_aliases/meter.wi"),
+            include_str!("../../tests/regressions/enum_identity_aliases/meter.wi"),
         ),
         (
             "main.wi",
-            include_str!("../../example/enum_identity_aliases/main.wi"),
+            include_str!("../../tests/regressions/enum_identity_aliases/main.wi"),
         ),
     ];
     let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &PLAIN[..]);

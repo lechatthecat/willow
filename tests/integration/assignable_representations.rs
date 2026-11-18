@@ -2,7 +2,7 @@ use super::support::*;
 
 #[test]
 fn assignable_representations_example_differential_gc_and_placement() {
-    let source = include_str!("../../example/assignable_representations.wi");
+    let source = include_str!("../../tests/regressions/assignable_representations.wi");
     let expected = "value:8\nvalue:7\n9\ntrue\n";
     // Arguments/results, stack/frame locals, fields, array elements and enum
     // payloads cross runtime FFI allocation/collection/print/await boundaries.

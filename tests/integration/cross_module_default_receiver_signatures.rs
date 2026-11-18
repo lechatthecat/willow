@@ -94,12 +94,12 @@ fn example_program() {
         &[
             (
                 "main.wi",
-                include_str!("../../example/interface_default_receiver_signatures.wi"),
+                include_str!("../../tests/regressions/interface_default_receiver_signatures.wi"),
             ),
             (
                 "interface_default_receiver_signatures_support/sizing.wi",
                 include_str!(
-                    "../../example/interface_default_receiver_signatures_support/sizing.wi"
+                    "../../tests/regressions/interface_default_receiver_signatures_support/sizing.wi"
                 ),
             ),
         ],

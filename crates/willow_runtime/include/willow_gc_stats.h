@@ -2,8 +2,7 @@
 #define WILLOW_GC_STATS_H
 #include <stdint.h>
 
-/* Fixed V1 ABI: counters are cumulative and saturating, times are monotonic ns.
- * See docs/gc_telemetry.md for sampling boundaries and memory definitions. */
+/* Fixed V1 ABI: counters are cumulative and saturating, times are monotonic ns. */
 typedef struct {
     uint64_t count, total_ns, max_ns;
     uint64_t buckets[65];

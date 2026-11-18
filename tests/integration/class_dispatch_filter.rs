@@ -553,14 +553,14 @@ fn dispatch_27_unrelated_same_named_classes_cost_little_code() {
 }
 
 /// The runnable example for this behavior, pinned to its output on both
-/// backends. `example/class_method_dispatch.wi` is the user-facing statement of
+/// backends. `tests/regressions/class_method_dispatch.wi` is the user-facing statement of
 /// what the filter guarantees: an unrelated class that shares a method name is
 /// never a dispatch candidate, and everything in the receiver's own hierarchy
 /// still is.
 #[test]
 fn dispatch_28_the_example_prints_what_it_documents() {
     assert_dispatch_output(
-        include_str!("../../example/class_method_dispatch.wi"),
+        include_str!("../../tests/regressions/class_method_dispatch.wi"),
         "100\n220\n300\n22000\nledger\n",
     );
 }

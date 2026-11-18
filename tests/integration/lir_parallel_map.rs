@@ -535,7 +535,7 @@ async fn main() {{
 fn lir_parallel_20_the_example_is_fully_lir() {
     let source = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/example/lir_parallel_map.wi"
+        "/tests/regressions/lir_parallel_map.wi"
     ))
     .expect("the example is checked in");
     assert_walker_compiled(
@@ -566,7 +566,7 @@ fn parallel_mapper_context_bridge_preserves_i64_and_gc_roots() {
         "parallel_context_bridge",
         &[(
             "main.wi",
-            include_str!("../../example/parallel_context_bridge.wi"),
+            include_str!("../../tests/regressions/parallel_context_bridge.wi"),
         )],
     );
     for release in [false, true] {

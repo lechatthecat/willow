@@ -488,7 +488,7 @@ fn lir_atomics_21_the_example_is_fully_lir_compiled() {
     // The example's header claims every function it declares is compiled from
     // the lowered IR. The log check names them, so a coverage regression cannot
     // pass by leaving the run's output unchanged.
-    let source = include_str!("../../example/lir_atomics.wi");
+    let source = include_str!("../../tests/regressions/lir_atomics.wi");
     assert_atomics(
         source,
         "10\n15\n12\n19\ntrue\n48\n23\n18\n18\n100\nfalse\n50\ntrue\ntrue\nfalse\n",
@@ -635,7 +635,7 @@ fn main() {
 
 #[test]
 fn inline_atomics_contention_and_publication() {
-    let source = include_str!("../../example/atomic_inline.wi");
+    let source = include_str!("../../tests/regressions/atomic_inline.wi");
     assert_atomics(
         source,
         "20000\n20000\n42\n",

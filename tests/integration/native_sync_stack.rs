@@ -6,7 +6,7 @@ fn shared_sync_cancellation_nested_gc_captures_and_call_edges() {
     for workers in ["1", "4"] {
         for budget in ["1", "32"] {
             let (out, ok) = compile_and_run_with_runtime_env(
-                include_str!("../../example/shared_cancellation_cleanup.wi"),
+                include_str!("../../tests/regressions/shared_cancellation_cleanup.wi"),
                 &[
                     ("WILLOW_WORKERS", workers),
                     ("WILLOW_TASK_BUDGET", budget),

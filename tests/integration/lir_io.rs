@@ -733,7 +733,8 @@ async fn main() {
 //     just the ones a focused test happens to name.
 #[test]
 fn lir_io_24_example_is_fully_lir() {
-    let source = std::fs::read_to_string("example/lir_io.wi").expect("the example is readable");
+    let source =
+        std::fs::read_to_string("tests/regressions/lir_io.wi").expect("the example is readable");
     assert_io(
         &source,
         "on disk\nfalse\ntrue\nwritten by a task\nfalse\nhello over loopback\n",

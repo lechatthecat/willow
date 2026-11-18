@@ -1107,15 +1107,15 @@ fn msp_33_the_example_project() {
         &[
             (
                 "counting.wi",
-                include_str!("../../example/module_static_properties/counting.wi"),
+                include_str!("../../tests/regressions/module_static_properties/counting.wi"),
             ),
             (
                 "registry.wi",
-                include_str!("../../example/module_static_properties/registry.wi"),
+                include_str!("../../tests/regressions/module_static_properties/registry.wi"),
             ),
             (
                 "main.wi",
-                include_str!("../../example/module_static_properties/main.wi"),
+                include_str!("../../tests/regressions/module_static_properties/main.wi"),
             ),
         ],
         "1\n2\n8\nvault\n2\nledger\n4\ntrue\n",

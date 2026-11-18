@@ -4,8 +4,8 @@
 // In the runtime, wake-deadlines live in their own timer queue behind their own
 // lock, separate from the scheduler's metadata mutex. Registering a sleep,
 // promoting a due timer onto a run queue, and cancelling a sleeper are three
-// independent operations that no longer serialize on one global lock — but the
-// behaviour they implement is unchanged, which is what this program shows.
+// independent operations that do not serialize on one global lock. This program
+// shows the ordering and cancellation behaviour they implement.
 //
 // Timers are promoted in deadline order (30ms, 60ms, 90ms), but parallel
 // workers may print their IDs in any order. The awaited sum prints afterwards.

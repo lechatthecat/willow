@@ -1,9 +1,17 @@
 # Willow Examples
 
-Examples in this directory are split into two groups.
+This directory holds user-facing examples: small programs that show how to use
+a language feature, a standard-library API, a module or package layout, or a
+Rust bridge. It is split into two groups.
 
-- Root `*.wi` files are intended to compile and run as the current compiler grows.
+- Root `*.wi` files and project directories are intended to compile and run as the current compiler grows.
 - `future/**/*.wi` files are intentionally ambitious examples for planned language features. They may not compile yet.
+
+Compiler and runtime regression programs (code-generation, GC, effect-analysis,
+module-resolution and semantic-query reproductions) live in
+[`tests/regressions/`](../tests/regressions/README.md) instead. Both directories
+form one runnable catalog: the example audit runs every entry file in either of
+them and checks its output.
 
 Future examples should start with:
 
@@ -40,9 +48,9 @@ because that method may read the subclass fields. See
 A task can call an ordinary synchronous helper, including loops and recursion,
 on GNU/Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64 MSVC.
 Compiler-inserted safepoints let other tasks run while preserving the helper's
-stack. See `parallel_tasks.wi`, `task_sync_preemption.wi`, and
-`task_aware_imported_helper.wi`. The historical filename
-`task_recursion_rejected.wi` now demonstrates accepted recursive calls.
+stack. See `parallel_tasks.wi`, `task_sync_preemption.wi`,
+`task_sync_recursion.wi` (recursive helpers), and
+`task_aware_imported_helper.wi`.
 
 E0810 still rejects calls whose preemptibility cannot be proven (for example,
 unresolved callbacks or foreign functions without a preemption contract).
@@ -67,7 +75,7 @@ match name {
 The type spelling `T?` is retained as parser sugar and means exactly
 `Option<T>`; repeated suffixes preserve nesting, so `T??` means
 `Option<Option<T>>`. Willow does not implicitly wrap a `T` as `Some(T)`.
-See `option_absence.wi`, `gc_linked_list.wi`, and `nil_safe_chain.wi`.
+See `option_absence.wi`, `gc_linked_list.wi`, and `option_linked_chain.wi`.
 
 ## `if let`, `while let` and match guards
 
@@ -175,7 +183,7 @@ println((await squared).toString());
 
 The v1 mapper is `fn(i64) -> i64` — a bare code address with no environment, so
 the lambda passed here must not capture an enclosing local. A lambda that does
-capture is a `closure` value instead; see `lir_closures.wi`. Cancelling the returned Task cancels all chunk Tasks and exposes no
+capture is a `closure` value instead; see `call_result_binding.wi`. Cancelling the returned Task cancels all chunk Tasks and exposes no
 partial result. A mapper panic follows the normal Task policy and aborts the
 process. See `parallel_map.wi`.
 
@@ -268,7 +276,7 @@ with `push`, then call `join` once instead of repeatedly extending a string with
 `String.len()` returns an `i64` UTF-8 byte count in constant time, excluding
 the trailing NUL: `"".len()` is 0, `"abc".len()` is 3, and `"日本語".len()`
 is 9. It does not measure Unicode characters, grapheme clusters, or terminal
-columns. See `language_gaps/main.wi` for length and imported-array examples.
+columns. See `string_metadata.wi` for byte lengths and substring boundaries.
 
 [Byte access and tokenization](string_bytes.wi) uses
 `s.byte_at(index: i64) -> i64` to read one unsigned UTF-8 byte (0–255).
@@ -351,7 +359,14 @@ they do not establish that regex resolves from crates.io.
 ## Monotonic time
 
 `monotonic_clock.wi` measures elapsed nanoseconds across a sleep using
-`std::time::now_ns`. See [clock semantics](../docs/monotonic-clock.md).
+`std::time::now_ns`. After `import std::time;`, `time::now_ns() -> i64` returns
+nonnegative nanoseconds from a process-local epoch shared by every thread and
+task; it also works in synchronous code. Subtract an earlier reading from a
+later one to measure elapsed time. The value is not Unix, calendar or CPU time,
+so do not compare it across processes or store it as a timestamp. Successive
+readings can be equal, wall-clock adjustments do not move the epoch, and
+readings saturate at `i64::MAX` instead of wrapping. Subtract timestamps rather
+than adding a budget to one, since that addition can overflow.
 
 ### Integer parsing
 

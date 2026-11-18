@@ -4,7 +4,7 @@ use willow_compiler::{
     ai::{QueryRequest, QuerySession, Snapshot},
     diagnostics::HumanEmitter,
 };
-const SOURCE: &str = include_str!("../example/builtin_callee_type_queries.wi");
+const SOURCE: &str = include_str!("../tests/regressions/builtin_callee_type_queries.wi");
 fn snapshot(files: &[(&str, &str)], label: &str) -> Snapshot {
     let directory = std::env::temp_dir().join(format!(
         "willow-builtin-callee-types-{}-{label}",

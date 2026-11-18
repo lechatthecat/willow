@@ -4,7 +4,7 @@ use std::time::Duration;
 
 #[test]
 fn nonnegative_induction_example() {
-    let source = include_str!("../../example/nonnegative_induction.wi");
+    let source = include_str!("../../tests/regressions/nonnegative_induction.wi");
     let expected = format!(
         "5005000\n{}\n{}",
         (0i64..10000)

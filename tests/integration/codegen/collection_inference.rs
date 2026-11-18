@@ -161,7 +161,7 @@ fn contextual_empty_array_allocation_sites_scale_linearly() {
 
 #[test]
 fn freeze_inference_native() {
-    let source = include_str!("../../../example/freeze_inference.wi");
+    let source = include_str!("../../../tests/regressions/freeze_inference.wi");
     for source in [
         source.to_string(),
         source.replace("fn main()", "async fn main()"),
@@ -271,7 +271,7 @@ fn array_literal_tlab_size_boundary_preserves_elements() {
 
 #[test]
 fn enum_array_payload_native() {
-    let source = include_str!("../../../example/enum_array_payload.wi");
+    let source = include_str!("../../../tests/regressions/enum_array_payload.wi");
     for run in [compile_and_run, compile_and_run_release] {
         let (out, ok) = run(source);
         assert!(ok, "{out}");

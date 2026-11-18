@@ -754,7 +754,7 @@ fn main() {
 /// path out of a section appears in a single program.
 #[test]
 fn lir_locks_23_example_compiles_from_lir_end_to_end() {
-    let source = include_str!("../../example/lir_locks.wi");
+    let source = include_str!("../../tests/regressions/lir_locks.wi");
     let (out, ok) = compile_and_run_with_env(source, &PLAIN);
     assert!(ok, "the example must run: {out}");
     assert_walker_owns(

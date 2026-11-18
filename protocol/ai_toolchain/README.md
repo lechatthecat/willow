@@ -111,10 +111,8 @@ Structured editing is documented in [STRUCTURED_EDITS.md](STRUCTURED_EDITS.md),
 including isolation and recovery boundaries. Each query invocation analyzes the
 current source and returns its revision. Re-query after changing source or configuration.
 
-The former `snapshot` commands, file-based `risk`, and `daemon` have been removed.
-There is no replacement baseline file format. Use direct semantic commands for
-current-source facts and `query --requests` for batched integrations. Existing
-saved files are left untouched; this CLI no longer loads or manages them.
+There is no saved baseline file format. Use direct semantic commands for
+current-source facts and `query --requests` for batched integrations.
 
 V2 query batches use [query-v2.schema.json](query-v2.schema.json). `symbols`
 lists compiler-resolved declarations. It accepts optional AND-combined filters
@@ -133,7 +131,7 @@ target's canonical name. Builtins and type parameters keep their spelling.
 `type_display` appears on declarations in `symbols`, `symbol-at`, `symbol-info`
 and on `type-at` results. Use it for reading; compare types by `ty`.
 `symbol-info` and `references` accept either a callable ID or a declaration ID
-in the historical `function` field. Source declarations and references include
+in the `function` field. Source declarations and references include
 bindings, parameters, types, type parameters, fields, enum variants, imports,
 modules, methods and constructors. Builtins have no source declaration location.
 Reference results include value/import uses and possible virtual dispatch;
@@ -162,10 +160,9 @@ One representative location per reason category is retained; null means no
 source location is available. This bounded summary does not enumerate every
 transitive cause or every possible execution path.
 
-This replaces the old effect/impact node schema: effect response bit masks move
-to `bounds.runtime` and `bounds.compiler`; impact nodes no longer expose
-`runtime_effects`, `unknown` or `reason`. Bounds remain conservative inputs to
-safety decisions; **unknown must be treated as possibly present**. `status`
+Effect response bit masks are reported in `bounds.runtime` and
+`bounds.compiler`. Bounds are conservative inputs to safety decisions;
+**unknown must be treated as possibly present**. `status`
 describes query/evidence availability, not any individual effect's state.
 Detailed `effect_evidence`, local `compiler_witnesses` (`--explain`), and
 `unknown_causes` supplement the summary with operation and task relationships.

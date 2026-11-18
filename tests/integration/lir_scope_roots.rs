@@ -863,7 +863,7 @@ const EXAMPLE_OUTPUT: &str = "0\n0\n0\n0\n0\n0\n0\n100\n101\n0\n6\nescapes into 
 // 28. The example program runs and prints what its comments claim.
 #[test]
 fn p28_the_example_runs() {
-    let (out, ok) = compile_file_and_run("example/lir_scope_roots.wi");
+    let (out, ok) = compile_file_and_run("tests/regressions/lir_scope_roots.wi");
     assert!(ok, "example run failed: {out}");
     assert_eq!(out, EXAMPLE_OUTPUT);
 }
@@ -872,8 +872,8 @@ fn p28_the_example_runs() {
 //     documents the walker's scope-root behaviour.
 #[test]
 fn p29_the_example_is_fully_lowered() {
-    let source =
-        std::fs::read_to_string("example/lir_scope_roots.wi").expect("example is readable");
+    let source = std::fs::read_to_string("tests/regressions/lir_scope_roots.wi")
+        .expect("example is readable");
     assert_project_output(&source, EXAMPLE_OUTPUT);
     assert_walker_compiled(
         &source,
@@ -899,8 +899,8 @@ fn p29_the_example_is_fully_lowered() {
 // 30. And it holds under both stress schedules.
 #[test]
 fn p30_the_example_under_gc_stress() {
-    let source =
-        std::fs::read_to_string("example/lir_scope_roots.wi").expect("example is readable");
+    let source = std::fs::read_to_string("tests/regressions/lir_scope_roots.wi")
+        .expect("example is readable");
     assert_survives_gc_stress(&source, EXAMPLE_OUTPUT);
 }
 

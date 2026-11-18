@@ -526,11 +526,12 @@ fn main() {
 //     lowered IR.
 #[test]
 fn gcstat_24_the_example_is_fully_lowered() {
-    let (out, ok) = compile_file_and_run("example/lir_gc_stats.wi");
+    let (out, ok) = compile_file_and_run("tests/regressions/lir_gc_stats.wi");
     assert!(ok, "example run failed: {out}");
     assert_eq!(out, "true\ntrue\ntrue\ntrue\ntrue\n3\ntrue\nheap: ok\n");
 
-    let source = std::fs::read_to_string("example/lir_gc_stats.wi").expect("example is readable");
+    let source =
+        std::fs::read_to_string("tests/regressions/lir_gc_stats.wi").expect("example is readable");
     assert_walker_compiled(
         &source,
         &[

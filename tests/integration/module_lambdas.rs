@@ -120,18 +120,18 @@ fn imported_class_lambda_example_debug_release_and_gc() {
     let files = &[
         (
             "point.wi",
-            include_str!("../../example/imported_class_lambdas/point.wi"),
+            include_str!("../../tests/regressions/imported_class_lambdas/point.wi"),
         ),
         (
             "ops.wi",
-            include_str!("../../example/imported_class_lambdas/ops.wi"),
+            include_str!("../../tests/regressions/imported_class_lambdas/ops.wi"),
         ),
         (
             "main.wi",
-            include_str!("../../example/imported_class_lambdas/main.wi"),
+            include_str!("../../tests/regressions/imported_class_lambdas/main.wi"),
         ),
     ];
-    let (out, ok) = compile_file_and_run("example/imported_class_lambdas/main.wi");
+    let (out, ok) = compile_file_and_run("tests/regressions/imported_class_lambdas/main.wi");
     assert!(ok, "{out}");
     assert_eq!(out, "42\n7\n");
     for env in [ALLOC_STRESS, MINOR_STRESS] {
@@ -753,10 +753,10 @@ fn main() {
 //     function, a lambda argument, and a lambda inside a method.
 #[test]
 fn the_module_lir_bodies_example_lifts_its_lambdas() {
-    let (out, ok) = compile_file_and_run("example/module_lir_bodies/main.wi");
+    let (out, ok) = compile_file_and_run("tests/regressions/module_lir_bodies/main.wi");
     assert!(
         ok,
-        "example/module_lir_bodies/main.wi failed to compile or run"
+        "tests/regressions/module_lir_bodies/main.wi failed to compile or run"
     );
     let lines = out.lines().collect::<Vec<_>>();
     assert_eq!(

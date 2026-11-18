@@ -60,7 +60,7 @@ contains the 0.1.9 changes below.
 
   **This rejection is temporary.** It is lifted once task-aware
   synchronous-stack preemption ships, at which point recursive SCCs preempt
-  instead of erroring. See `example/task_recursion_rejected.wi`.
+  instead of erroring. See `example/task_sync_recursion.wi`.
 
 ### Added
 
@@ -119,7 +119,7 @@ contains the 0.1.9 changes below.
   `new` of any class whose chain reaches a ring skips the constructor arity
   check: cutting the ring is the one fix, and the checks that depend on a
   finished base chain run again once it is cut. Interface `extends` cycles
-  keep E0423. See `example/class_inheritance_cycle_rejected.wi`.
+  keep E0423. See `example/class_inheritance_chain.wi`.
 
 - **A local class may extend a module class of the same short name.**
   `import shapes;` followed by `class Sized extends shapes::Sized { .. }`
@@ -131,4 +131,4 @@ contains the 0.1.9 changes below.
   E0800 ("the field `width` on a `Cube` ... has incompatible operands"). The
   base now keeps its module qualifier and the inherited-member walk stops at
   any repeated class. `import shapes::Sized as Base;` / `class Sized extends
-  Base` was never affected. See `example/module_base_short_name/main.wi`.
+  Base` was never affected. See `tests/regressions/module_base_short_name/main.wi`.

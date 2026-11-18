@@ -51,7 +51,7 @@ fn assignable_representations_example_exits_under_scheduler_gc_stress() {
         "exit_teardown_repr",
         &[(
             "main.wi",
-            include_str!("../../example/assignable_representations.wi"),
+            include_str!("../../tests/regressions/assignable_representations.wi"),
         )],
     );
     let expected = "value:8\nvalue:7\n9\ntrue\n";

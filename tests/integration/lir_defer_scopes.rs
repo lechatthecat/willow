@@ -564,8 +564,8 @@ fn main() { println(run(5)); }
 //     it.
 #[test]
 fn lir_defer_scopes_24_the_example_is_fully_lir() {
-    let source = std::fs::read_to_string("example/lir_defer_scopes.wi")
-        .expect("example/lir_defer_scopes.wi is part of the repository");
+    let source = std::fs::read_to_string("tests/regressions/lir_defer_scopes.wi")
+        .expect("tests/regressions/lir_defer_scopes.wi is part of the repository");
     assert_walker_compiled(
         &source,
         &[

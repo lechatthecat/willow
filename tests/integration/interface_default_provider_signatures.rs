@@ -231,12 +231,12 @@ fn provider_signature_example_runs() {
         &[
             (
                 "main.wi",
-                include_str!("../../example/interface_default_provider_signatures.wi"),
+                include_str!("../../tests/regressions/interface_default_provider_signatures.wi"),
             ),
             (
                 "interface_default_provider_signatures_support/provider.wi",
                 include_str!(
-                    "../../example/interface_default_provider_signatures_support/provider.wi"
+                    "../../tests/regressions/interface_default_provider_signatures_support/provider.wi"
                 ),
             ),
         ],

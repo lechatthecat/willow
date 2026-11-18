@@ -361,11 +361,11 @@ fn lirreq_51_boxing_example_is_fully_lir() {
     // the boxing example must be claimed by the walker. Its class methods hold
     // the virtual calls and compile through `compile_class_method_inner`, which
     // the mode does not police, so this pins exactly what the header claims.
-    let source = include_str!("../../../example/lir_interface_boxing.wi");
+    let source = include_str!("../../../tests/regressions/lir_interface_boxing.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
     assert!(
         ok,
-        "example/lir_interface_boxing.wi must compile with every free function \
+        "tests/regressions/lir_interface_boxing.wi must compile with every free function \
          on the LIR path: {stderr}"
     );
 }

@@ -691,8 +691,8 @@ fn main() {
 ///     compiles end to end with every function claimed by the walker.
 #[test]
 fn alias_24_the_example_is_fully_lir() {
-    let source = std::fs::read_to_string("example/lir_namespace_aliases.wi")
-        .expect("example/lir_namespace_aliases.wi");
+    let source = std::fs::read_to_string("tests/regressions/lir_namespace_aliases.wi")
+        .expect("tests/regressions/lir_namespace_aliases.wi");
     assert_walker_compiled(
         &source,
         &[

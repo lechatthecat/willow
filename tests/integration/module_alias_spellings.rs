@@ -917,19 +917,19 @@ fn mas_24_the_example_runs() {
     let files = [
         (
             "sales.wi",
-            include_str!("../../example/module_alias_spellings/sales.wi"),
+            include_str!("../../tests/regressions/module_alias_spellings/sales.wi"),
         ),
         (
             "ledger.wi",
-            include_str!("../../example/module_alias_spellings/ledger.wi"),
+            include_str!("../../tests/regressions/module_alias_spellings/ledger.wi"),
         ),
         (
             "audit.wi",
-            include_str!("../../example/module_alias_spellings/audit.wi"),
+            include_str!("../../tests/regressions/module_alias_spellings/audit.wi"),
         ),
         (
             "main.wi",
-            include_str!("../../example/module_alias_spellings/main.wi"),
+            include_str!("../../tests/regressions/module_alias_spellings/main.wi"),
         ),
     ];
     assert_prints(&files, "high\nlow\n42\n10\ntrue\n7\ntrue\n");

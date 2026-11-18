@@ -1,0 +1,11 @@
+// `open` is a contextual keyword: names that merely start or end with it, such
+// as `is_open` and `open_gate`, stay ordinary identifiers.
+class Gate {
+    pub is_open: bool;
+    pub fn open_gate(self) -> bool { return self.is_open; }
+}
+fn main() {
+    let opened = new Gate(true);
+    println(opened.open_gate()); // true
+    println(opened.is_open); // true
+}

@@ -665,10 +665,10 @@ fn main() {
 //     module's own enum, and its `9` is the value an unresolved pattern lost.
 #[test]
 fn the_module_lir_bodies_example_matches_its_module_enum() {
-    let (out, ok) = compile_file_and_run("example/module_lir_bodies/main.wi");
+    let (out, ok) = compile_file_and_run("tests/regressions/module_lir_bodies/main.wi");
     assert!(
         ok,
-        "example/module_lir_bodies/main.wi failed to compile or run"
+        "tests/regressions/module_lir_bodies/main.wi failed to compile or run"
     );
     let lines = out.lines().collect::<Vec<_>>();
     assert_eq!(lines[4], "1", "measure_round must take the unit arm: {out}");

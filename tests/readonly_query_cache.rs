@@ -490,15 +490,17 @@ fn readonly_query_cache_isolated_candidate_rejects_foreign_entry() {
 // inventory depend on itself, including with inherited interface implementations.
 #[test]
 fn editor_effect_inventory_cache_check_run_and_queries_match_disabled() {
-    let fixture = Fixture::new(include_str!("../example/effect_inventory_editor/m2.wi"));
+    let fixture = Fixture::new(include_str!(
+        "../tests/regressions/effect_inventory_editor/m2.wi"
+    ));
     for (name, source) in [
         (
             "edit.wi",
-            include_str!("../example/effect_inventory_editor/edit.wi"),
+            include_str!("../tests/regressions/effect_inventory_editor/edit.wi"),
         ),
         (
             "buffer.wi",
-            include_str!("../example/effect_inventory_editor/buffer.wi"),
+            include_str!("../tests/regressions/effect_inventory_editor/buffer.wi"),
         ),
     ] {
         fs::write(fixture.0.join(name), source).unwrap();

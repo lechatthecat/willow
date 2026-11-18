@@ -45,7 +45,7 @@ use super::support::{
 const PLAIN: [(&str, &str); 0] = [];
 const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
-const EXAMPLE: &str = include_str!("../../example/interface_super_coercion.wi");
+const EXAMPLE: &str = include_str!("../../tests/regressions/interface_super_coercion.wi");
 const EXAMPLE_OUTPUT: &str =
     "11\n21\n41\n21\n22\n21\n22\n21\n22\n22\n21\n22\n21\n22\n31\n11\n12\n21\n22\n";
 

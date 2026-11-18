@@ -58,7 +58,7 @@
 //!  25. explicit and implicit receivers in the same class
 //!  26. a subclass's implicit-self method reads an inherited field
 //!  27. every implicit-self body is logged as walker-compiled
-//!  28. every body in `example/lir_self_statics.wi` compiles and runs
+//!  28. every body in `tests/regressions/lir_self_statics.wi` compiles and runs
 //!  29. the two examples that used to be the last corpus holdouts
 
 use super::support::{
@@ -601,8 +601,8 @@ fn main() {
 // 28. The shipped example: the same story at program scale.
 #[test]
 fn lir_self_28_the_example_file_compiles_and_runs() {
-    let src = std::fs::read_to_string("example/lir_self_statics.wi")
-        .expect("example/lir_self_statics.wi must exist");
+    let src = std::fs::read_to_string("tests/regressions/lir_self_statics.wi")
+        .expect("tests/regressions/lir_self_statics.wi must exist");
     // The example keeps `static mut` state, which requires one worker.
     let (out, ok) = compile_with_env_and_run_under(&src, &PLAIN, &[("WILLOW_WORKERS", "1")]);
     assert!(ok, "run failed: {out}");

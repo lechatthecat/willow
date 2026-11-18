@@ -577,7 +577,9 @@ fn effect_contract_polymorphic_generics_and_defaults() {
 
 #[test]
 fn effect_contract_polymorphic_example_runs() {
-    let fixture = Fixture::new(include_str!("../example/effect_contract_dispatch.wi"));
+    let fixture = Fixture::new(include_str!(
+        "../tests/regressions/effect_contract_dispatch.wi"
+    ));
     let out = fixture.command("run");
     assert!(
         out.status.success(),
@@ -721,7 +723,7 @@ fn panic_allocation_imported_contracts() {
 #[test]
 fn panic_allocation_example_runs() {
     let out = Command::new(env!("CARGO_BIN_EXE_willow"))
-        .args(["run", "example/panic_allocation_contracts.wi"])
+        .args(["run", "tests/regressions/panic_allocation_contracts.wi"])
         .output()
         .unwrap();
     assert!(

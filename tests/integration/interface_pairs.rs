@@ -218,7 +218,7 @@ fn main() { let h = make(); let v: Value = h.v; let f = || { gc_collect(); print
 #[test]
 fn iface_pair_28_runnable_example() {
     let (out, ok) = compile_and_run_with_env(
-        include_str!("../../example/interface_pairs.wi"),
+        include_str!("../../tests/regressions/interface_pairs.wi"),
         &[("WILLOW_GC_STRESS", "all")],
     );
     assert!(ok, "{out}");
@@ -411,7 +411,7 @@ fn main() {{
 
 #[test]
 fn iface_pair_owned_growth_example() {
-    let source = include_str!("../../example/array_owned_pair_growth.wi");
+    let source = include_str!("../../tests/regressions/array_owned_pair_growth.wi");
     for stress in ["alloc", "minor", "all"] {
         let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_GC_STRESS", stress)]);
         assert!(ok, "{stress}: {out}");

@@ -286,8 +286,7 @@ This proof supports unconditional body-level calls and awaits, including fresh
 class values, class-field collections, and statically resolved async methods.
 Lending a field also restricts access through the containing object and its aliases.
 Control-flow loans and opaque ownership remain conservatively rejected.
-See [the loan rules and transfer paths](docs/decisions/0009-immediately-awaited-async-captures.md)
-and the runnable [collection](example/owned_task_loans.wi) and
+See the runnable [collection](example/owned_task_loans.wi) and
 [class](example/owned_class_task_loans.wi) examples.
 
 Mutable collections and classes containing them remain non-`Sync`:
@@ -404,7 +403,7 @@ This is deliberately conservative. In particular, the current lock check approxi
 
 Calling an `async fn` creates a Task; it does not by itself suspend its caller. The analysis distinguishes task creation from actually awaiting it. This is another reason a plain text scan is not enough.
 
-See [shared effect fixpoint](example/shared_effect_fixpoint.wi), [virtual dispatch example](example/shared_call_graph.wi), and [indirect calls example](example/lock_function_values.wi).
+See [shared effect fixpoint](tests/regressions/shared_effect_fixpoint.wi), [virtual dispatch example](tests/regressions/shared_call_graph.wi), and [indirect calls example](example/lock_function_values.wi).
 
 ### Effect contracts: declare the property on any function
 
@@ -495,7 +494,7 @@ when the bridge resolves through a native library. `effects` exposes the I/O
 bit (64), and `verify-edit` reports it as `may-io`.
 See [the runnable I/O contract example](example/io_contracts.wi).
 
-See [effect contracts](example/effect_contracts.wi) and [contracts across interface dispatch](example/effect_contract_dispatch.wi).
+See [effect contracts](example/effect_contracts.wi) and [contracts across interface dispatch](tests/regressions/effect_contract_dispatch.wi).
 
 ## Contracts: from run-time checks to proofs
 
@@ -561,7 +560,7 @@ Failures are reported as E2630 (counterexample), E2631 (unsupported construct) a
   See [pure functions](example/pure_functions.wi).
 - **`requires` / `ensures`** clauses are checked at run time in both debug and
   release builds. A violation is a recoverable panic such as
-  `contract violation: ensures`. See [runtime contracts](example/runtime_contracts.wi).
+  `contract violation: ensures`. See [runtime contracts](tests/regressions/runtime_contracts.wi).
 
 ## Locks designed together with the compiler and scheduler
 
@@ -692,7 +691,7 @@ These illustrate the interface; use selectors and source paths from your own pro
 
 This is not the claim that an agent is always correct. Rather, **some mistakes can be turned into deterministic compiler failures with actionable evidence** instead of being left to prompts, tests, or code review alone.
 
-See the [AI toolchain protocol](protocol/ai_toolchain/README.md) and [example effect explanations](example/effect_explanations.wi).
+See the [AI toolchain protocol](protocol/ai_toolchain/README.md) and [example effect explanations](tests/regressions/effect_explanations.wi).
 
 ### Exact rename: change a symbol, preserve unrelated names
 
@@ -857,7 +856,7 @@ and the channels transporting handles. `task.result()` retains the same identity
 Task-handle transfers can also violate the existing exclusive-ownership rules
 (E2408). The compiler retains those errors and additionally reports the wait
 witness; E2607 does not authorize sharing or reuse of a transferred Task handle.
-See the runnable [valid sender and escape example](example/permanent_wait_escapes.wi).
+See the runnable [valid sender and escape example](tests/regressions/permanent_wait_escapes.wi).
 
 The current analysis starts at the process entry `main` and follows its
 straight-line body, local aliases, fresh builtin channels, and direct calls to

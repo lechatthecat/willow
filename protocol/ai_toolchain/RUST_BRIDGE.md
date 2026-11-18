@@ -41,7 +41,7 @@ and unused bridge declarations remain inspectable.
 
 Package manifests using `[willow] manifest-version = 1` retain the existing
 `identity { package, module, symbol }` protocol. Legacy projects can have null
-identities, as in other semantic queries. The ABI binding's historical
+identities, as in other semantic queries. The ABI binding's
 `rust_crate` field is a project namespace, not a Cargo crate name; consumers must
 use the projected crate identities instead.
 

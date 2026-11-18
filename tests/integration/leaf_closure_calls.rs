@@ -487,7 +487,7 @@ fn main() { let f = make(8); println(guarded(f, 2)); println(guarded(f, 0)); pri
 
 #[test]
 fn runnable_example() {
-    let source = include_str!("../../example/leaf_closure_calls.wi");
+    let source = include_str!("../../tests/regressions/leaf_closure_calls.wi");
     for (out, ok) in [
         compile_and_run_gc_stress_all(source),
         compile_and_run_release(source),
@@ -506,7 +506,7 @@ fn indirect_callee_loops_preempt_with_one_worker() {
     // Exercise noncapturing fn values and a closure retaining GC captures.
     for budget in ["1", "1024"] {
         let (out, ok) = super::support::compile_and_run_with_runtime_env(
-            include_str!("../../example/indirect_call_preemption.wi"),
+            include_str!("../../tests/regressions/indirect_call_preemption.wi"),
             &[("WILLOW_WORKERS", "1"), ("WILLOW_TASK_BUDGET", budget)],
             std::time::Duration::from_secs(20),
         );
@@ -518,7 +518,7 @@ fn indirect_callee_loops_preempt_with_one_worker() {
 // guarded scalar expansion preserves all other call paths.
 #[test]
 fn promoted_function_values_cover_storage_and_combinators() {
-    let source = include_str!("../../example/lir_function_values.wi");
+    let source = include_str!("../../tests/regressions/lir_function_values.wi");
     let expected = "42\n49\n42\n102\n81\n10\n-20\n5\n100\n-10\n17\nhi!!\n[[core]]\nsay hello\n<there>\n40\n-1\nbig\n?\n5\n-1\n4\n99\n40\n-1\n4\ne:odd\n2\nodd\n4\n0\n4\n8\n";
     for (out, ok) in both(source) {
         assert!(ok, "{out}");
@@ -593,7 +593,7 @@ fn promoted_function_values_keep_linear_generated_code() {
 
 #[test]
 fn promoted_function_values_guard_target_and_evaluate_operands_once() {
-    for (out, ok) in both(include_str!("../../example/guarded_fn_values.wi")) {
+    for (out, ok) in both(include_str!("../../tests/regressions/guarded_fn_values.wi")) {
         assert!(ok, "{out}");
         assert_eq!(out, "4\n1\n6\n2\nrecovered\n-1\n1\n-3\nfalse\n");
     }

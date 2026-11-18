@@ -136,8 +136,9 @@ stress!(
 
 #[test]
 fn runnable_example() {
-    let (out, ok) =
-        compile_and_run_gc_stress_all(include_str!("../../example/method_receiver_roots.wi"));
+    let (out, ok) = compile_and_run_gc_stress_all(include_str!(
+        "../../tests/regressions/method_receiver_roots.wi"
+    ));
     assert!(ok, "{out}");
     assert_eq!(out, "original!\nreplacement!\n");
 }

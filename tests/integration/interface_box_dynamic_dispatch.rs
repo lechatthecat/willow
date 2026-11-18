@@ -1153,7 +1153,8 @@ fn box_dispatch_29_gc_stress() {
 //     class-typed call printed beside the boxed one.
 #[test]
 fn box_dispatch_30_the_runnable_example() {
-    let source = std::fs::read_to_string("example/interface_box_dynamic_dispatch.wi").unwrap();
+    let source =
+        std::fs::read_to_string("tests/regressions/interface_box_dynamic_dispatch.wi").unwrap();
     let (output, ok) = compile_and_run(&source);
     assert!(ok, "expected the example to compile:\n{output}");
     assert_eq!(output, "20\n60\n200\n90\n140\n18\n9\n");

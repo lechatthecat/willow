@@ -4,7 +4,7 @@
 //! instead of calling `willow_gc_write_barrier`, whose heap lock serialized
 //! parallel async workers, for every store.
 //!
-//! Perspectives covered here and by `example/async_frame_store.wi`:
+//! Perspectives covered here and by `tests/regressions/async_frame_store.wi`:
 //! 1. young value into a frame slot across awaits (`repeated_stores`);
 //! 2. a young chain built through one slot stays reachable;
 //! 3. minor collections between stores clear and re-arm the remembered flag;
@@ -32,7 +32,7 @@ const EXAMPLE_OUTPUT: &str = "201200\n106\n1835976\n";
 
 #[test]
 fn async_frame_store_example_in_debug_release_and_gc_stress() {
-    let source = include_str!("../../example/async_frame_store.wi");
+    let source = include_str!("../../tests/regressions/async_frame_store.wi");
     for (out, ok) in [
         compile_and_run(source),
         compile_and_run_release(source),
@@ -47,7 +47,7 @@ fn async_frame_store_example_in_debug_release_and_gc_stress() {
 
 #[test]
 fn async_frame_store_example_passes_barrier_verification() {
-    let source = include_str!("../../example/async_frame_store.wi");
+    let source = include_str!("../../tests/regressions/async_frame_store.wi");
     for env in [
         &[("WILLOW_GC_VERIFY_BARRIER", "1")][..],
         &[

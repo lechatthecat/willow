@@ -97,11 +97,11 @@ fn imported_error_identity_example() {
         &[
             (
                 "main.wi",
-                include_str!("../../example/imported_error_identity/main.wi"),
+                include_str!("../../tests/regressions/imported_error_identity/main.wi"),
             ),
             (
                 "a.wi",
-                include_str!("../../example/imported_error_identity/a.wi"),
+                include_str!("../../tests/regressions/imported_error_identity/a.wi"),
             ),
         ],
         "main.wi",

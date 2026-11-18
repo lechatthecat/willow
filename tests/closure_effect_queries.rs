@@ -53,7 +53,10 @@ fn closure_effects_comparator_and_route_are_known() {
 #[test]
 fn closure_effects_blocking_body_is_preserved() {
     let result = effects(
-        snapshot(include_str!("../example/closure_effects.wi"), "blocking"),
+        snapshot(
+            include_str!("../tests/regressions/closure_effects.wi"),
+            "blocking",
+        ),
         "apply",
     );
     assert_eq!(result["status"], "ok", "{result}");

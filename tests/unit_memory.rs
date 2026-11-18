@@ -77,7 +77,7 @@ fn lazy_defaults_statics_lambdas_and_later_overrides_run_together() {
     let project = Project::new();
     for file in ["main.wi", "base.wi"] {
         std::fs::copy(
-            format!("example/current_unit_memory/{file}"),
+            format!("tests/regressions/current_unit_memory/{file}"),
             project.0.join(file),
         )
         .unwrap();
@@ -173,7 +173,7 @@ fn codegen_context_keeps_aliases_enums_statics_and_late_callbacks_unit_local() {
         let project = Project::new();
         for file in ["main.wi", "first.wi", "second.wi", "left.wi", "right.wi"] {
             std::fs::copy(
-                format!("example/codegen_unit_context/{file}"),
+                format!("tests/regressions/codegen_unit_context/{file}"),
                 project.0.join(file),
             )
             .unwrap();

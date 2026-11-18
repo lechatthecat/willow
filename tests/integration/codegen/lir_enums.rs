@@ -542,11 +542,11 @@ fn lirreq_53_enum_match_example_is_fully_lir() {
     // function in the example is compiled from the lowered IR, and this mode is
     // what keeps that claim honest. Its class method compiles through
     // `compile_class_method_inner`, which the mode does not police.
-    let source = include_str!("../../../example/lir_enum_match.wi");
+    let source = include_str!("../../../tests/regressions/lir_enum_match.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
     assert!(
         ok,
-        "example/lir_enum_match.wi must compile with every free function on the LIR path: {stderr}"
+        "tests/regressions/lir_enum_match.wi must compile with every free function on the LIR path: {stderr}"
     );
 }
 
@@ -623,11 +623,11 @@ fn lirreq_56_option_result_example_is_fully_lir() {
     // function in the example is compiled from the lowered IR, and this mode is
     // what keeps that claim honest. Its class method compiles through
     // `compile_class_method_inner`, which the mode does not police.
-    let source = include_str!("../../../example/lir_option_result.wi");
+    let source = include_str!("../../../tests/regressions/lir_option_result.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
     assert!(
         ok,
-        "example/lir_option_result.wi must compile with every free function on the LIR path: {stderr}"
+        "tests/regressions/lir_option_result.wi must compile with every free function on the LIR path: {stderr}"
     );
 }
 
@@ -637,10 +637,10 @@ fn lirreq_58_divergence_example_is_fully_lir() {
     // mode: statement panics, formatted panics, `return`-diverging match arms
     // and an all-arms-returning match must every one of them stay inside the
     // walker's subset, or the build is a compile error.
-    let source = include_str!("../../../example/lir_divergence.wi");
+    let source = include_str!("../../../tests/regressions/lir_divergence.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
     assert!(
         ok,
-        "example/lir_divergence.wi must compile with every free function on the LIR path: {stderr}"
+        "tests/regressions/lir_divergence.wi must compile with every free function on the LIR path: {stderr}"
     );
 }

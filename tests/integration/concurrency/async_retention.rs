@@ -2,7 +2,9 @@ use super::*;
 
 #[test]
 fn async_retention_dead_locals_run() {
-    let (output, ok) = compile_and_run(include_str!("../../../example/async_dead_locals.wi"));
+    let (output, ok) = compile_and_run(include_str!(
+        "../../../tests/regressions/async_dead_locals.wi"
+    ));
     assert!(ok, "{output}");
     assert_eq!(output.trim(), "42\n42\n2\n3");
 }
@@ -32,7 +34,7 @@ async fn main() {
 #[test]
 fn async_retention_no_await_forced_preemption() {
     let (output, ok) = compile_and_run_with_runtime_env(
-        include_str!("../../../example/async_dead_locals.wi"),
+        include_str!("../../../tests/regressions/async_dead_locals.wi"),
         &[
             ("WILLOW_WORKERS", "4"),
             ("WILLOW_TASK_BUDGET", "1"),

@@ -254,7 +254,7 @@ fn non_generic_receiver_unchanged() {
 #[test]
 fn example_program() {
     one(
-        include_str!("../../example/generic_class_self.wi"),
+        include_str!("../../tests/regressions/generic_class_self.wi"),
         "5\nsecond\n",
     );
 }

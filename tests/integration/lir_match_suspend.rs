@@ -777,7 +777,7 @@ async fn main() {
 fn lir_suspend_25_the_example_is_fully_lir() {
     let source = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/example/lir_match_suspend.wi"
+        "/tests/regressions/lir_match_suspend.wi"
     ))
     .expect("the example is checked in");
     assert_walker_compiled(

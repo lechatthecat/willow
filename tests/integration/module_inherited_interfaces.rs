@@ -1029,11 +1029,13 @@ fn mi_24_the_runnable_example_program() {
         &[
             (
                 "depot.wi",
-                &std::fs::read_to_string("example/module_inherited_interfaces/depot.wi").unwrap(),
+                &std::fs::read_to_string("tests/regressions/module_inherited_interfaces/depot.wi")
+                    .unwrap(),
             ),
             (
                 "app.wi",
-                &std::fs::read_to_string("example/module_inherited_interfaces/main.wi").unwrap(),
+                &std::fs::read_to_string("tests/regressions/module_inherited_interfaces/main.wi")
+                    .unwrap(),
             ),
         ],
         "app.wi",

@@ -22,7 +22,7 @@ fn snapshot(source: &str, label: &str) -> Snapshot {
 
 #[test]
 fn callee_tokens_report_their_own_types() {
-    let source = include_str!("../example/callee_type_queries.wi");
+    let source = include_str!("../tests/regressions/callee_type_queries.wi");
     let snapshot = snapshot(source, "tokens");
     let roundtrip: Snapshot =
         serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
@@ -61,7 +61,7 @@ fn callee_tokens_report_their_own_types() {
 
 #[test]
 fn non_callee_positions_and_expression_evidence_are_unchanged() {
-    let source = include_str!("../example/callee_type_queries.wi");
+    let source = include_str!("../tests/regressions/callee_type_queries.wi");
     let snapshot = snapshot(source, "boundaries");
     let calls: Vec<_> = snapshot
         .semantic

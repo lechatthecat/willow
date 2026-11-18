@@ -57,7 +57,7 @@
 //!  25. an async method loops across a park
 //!  26. `Self::method` resolves against the class being compiled
 //!  27. the resolved `Self::` call runs
-//!  28. every method in `example/lir_class_methods.wi` is walker-compiled
+//!  28. every method in `tests/regressions/lir_class_methods.wi` is walker-compiled
 
 use super::support::{
     compile_with_compiler_env, compile_with_env_and_run, compile_with_env_and_run_under,
@@ -683,8 +683,8 @@ fn main() {
 // claimed by the walker, and the program must print what it says it prints.
 #[test]
 fn lir_method_28_example_file_compiles_and_runs() {
-    let src = std::fs::read_to_string("example/lir_class_methods.wi")
-        .expect("example/lir_class_methods.wi must exist");
+    let src = std::fs::read_to_string("tests/regressions/lir_class_methods.wi")
+        .expect("tests/regressions/lir_class_methods.wi must exist");
     assert_project_output(
         &src,
         "12\n12\n- left ops\nops:12\n30\n60\nmany\n- left pay\npay:30\n- left void\nvoid:empty\nops+pay\n42\n*seal7*\n112\n24\n11\n",

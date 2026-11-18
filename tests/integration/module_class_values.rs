@@ -693,11 +693,11 @@ fn module_class_25_the_example_project() {
     let files = [
         (
             "geom.wi",
-            include_str!("../../example/module_class_values/geom.wi"),
+            include_str!("../../tests/regressions/module_class_values/geom.wi"),
         ),
         (
             "main.wi",
-            include_str!("../../example/module_class_values/main.wi"),
+            include_str!("../../tests/regressions/module_class_values/main.wi"),
         ),
     ];
     assert_module_class(

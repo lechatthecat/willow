@@ -661,7 +661,7 @@ fn reference_args_28_one_local_per_branch() {
 #[test]
 fn reference_args_29_the_example_is_fully_lir() {
     assert_reference_args(
-        include_str!("../../example/reference_args_control_flow.wi"),
+        include_str!("../../tests/regressions/reference_args_control_flow.wi"),
         "10\n15\n12\n14\n3\n9\n",
         &["main", "add", "halve", "restock"],
     );

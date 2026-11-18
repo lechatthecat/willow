@@ -42,7 +42,7 @@ all resumption costs. Checksums must agree. Counter loads/stores are volatile to
 prevent LLVM deleting the operation being measured. This is a **runtime and
 polling microbenchmark**, not Cranelift-generated application throughput. It
 does not measure arbitrary helper call graphs, allocations, GC stress or many
-short helper calls. `example/preemption_acceptance.wi` and its focused integration
+short helper calls. `tests/regressions/preemption_acceptance.wi` and its focused integration
 test independently exercise actual generated helpers and peer progress.
 
 The wake peer first returns Pending. The helper waits for that handshake, records

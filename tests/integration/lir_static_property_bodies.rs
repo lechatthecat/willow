@@ -707,7 +707,7 @@ fn main() {
 // 24. The example compiles entirely through lowered IR.
 #[test]
 fn lir_static_body_24_the_example_has_no_fallback() {
-    let src = std::fs::read_to_string("example/lir_static_property_bodies.wi")
-        .expect("example/lir_static_property_bodies.wi must exist");
+    let src = std::fs::read_to_string("tests/regressions/lir_static_property_bodies.wi")
+        .expect("tests/regressions/lir_static_property_bodies.wi must exist");
     assert_project_output(&src, "6\n3\n20\nbig\none\nmany\n2\n5\n0\n10\n7\n9\n10\n");
 }

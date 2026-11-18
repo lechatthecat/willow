@@ -1,8 +1,8 @@
 //! Owner-only memberwise construction across module and specialization boundaries.
 use super::support::*;
 
-const CLASSES: &str = include_str!("../../example/memberwise_owner/secrets.wi");
-const MAIN: &str = include_str!("../../example/memberwise_owner/main.wi");
+const CLASSES: &str = include_str!("../../tests/regressions/memberwise_owner/secrets.wi");
+const MAIN: &str = include_str!("../../tests/regressions/memberwise_owner/main.wi");
 
 #[test]
 fn memberwise_owner_single_file() {

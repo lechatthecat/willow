@@ -49,7 +49,7 @@
 //!  24. an inherited static read from inside a method, against a same-named
 //!      static on an unrelated class
 //!  25. the whole hierarchy under GC stress
-//!  26. `example/lir_class_inheritance.wi` compiles with no fallback at all
+//!  26. `tests/regressions/lir_class_inheritance.wi` compiles with no fallback at all
 
 use super::support::{compile_with_compiler_env, compile_with_env_and_run};
 
@@ -710,11 +710,11 @@ fn main() {{
 // header claim is unchecked.
 #[test]
 fn lir_inh_26_example_is_fully_lir() {
-    let source = include_str!("../../example/lir_class_inheritance.wi");
+    let source = include_str!("../../tests/regressions/lir_class_inheritance.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
     assert!(
         ok,
-        "example/lir_class_inheritance.wi must compile with every free function \
+        "tests/regressions/lir_class_inheritance.wi must compile with every free function \
          on the LIR path: {stderr}"
     );
 }

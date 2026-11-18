@@ -309,8 +309,8 @@ fn static_init_14_a_mistyped_initializer_is_a_diagnostic() {
 /// program, and every one of them claimed by the walker.
 #[test]
 fn static_init_15_example_compiles_from_lowered_ir_and_runs() {
-    let src = std::fs::read_to_string("example/lir_static_initializers.wi")
-        .expect("example/lir_static_initializers.wi must exist");
+    let src = std::fs::read_to_string("tests/regressions/lir_static_initializers.wi")
+        .expect("tests/regressions/lir_static_initializers.wi must exist");
     let (out, ok) = compile_with_env_and_run(&src, &PLAIN);
     assert!(ok, "run failed: {out}");
     assert_eq!(

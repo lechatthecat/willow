@@ -3,7 +3,7 @@ use super::support::{compile_and_run_release, compile_and_run_with_env};
 
 #[test]
 fn native_stack_slots_example_and_relocation() {
-    let source = include_str!("../../example/native_stack_slots.wi");
+    let source = include_str!("../../tests/regressions/native_stack_slots.wi");
     for mode in ["", "minor", "alloc", "relocate"] {
         let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_GC_STRESS", mode)]);
         assert!(ok, "{mode}: {out}");

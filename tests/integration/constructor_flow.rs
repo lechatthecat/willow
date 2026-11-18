@@ -125,10 +125,10 @@ fn constructor_flow_cleanup_only_defer_accepts_panicking_constructor() {
 #[test]
 fn constructor_flow_effects_example_runs() {
     let expected = "guarded cleanup\n3\n0\ninner recovered\n7\n";
-    let (out, ok) = compile_file_and_run("example/constructor_flow_effects.wi");
+    let (out, ok) = compile_file_and_run("tests/regressions/constructor_flow_effects.wi");
     assert!(ok, "{out}");
     assert_eq!(out, expected);
-    let source = include_str!("../../example/constructor_flow_effects.wi");
+    let source = include_str!("../../tests/regressions/constructor_flow_effects.wi");
     let (out, ok) = compile_and_run_gc_stress(source);
     assert!(ok, "{out}");
     assert_eq!(out, expected);

@@ -18,7 +18,7 @@ fn lirreq_channels_select_and_lock_20_perspectives() {
     for (name, source) in [
         (
             "channel_temporaries",
-            include_str!("../../../example/channel_temporaries.wi"),
+            include_str!("../../../tests/regressions/channel_temporaries.wi"),
         ),
         (
             "select_blocking",
@@ -26,7 +26,7 @@ fn lirreq_channels_select_and_lock_20_perspectives() {
         ),
     ] {
         let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
-        assert!(ok, "example/{name}.wi must compile: {stderr}");
+        assert!(ok, "{name}.wi must compile: {stderr}");
     }
 }
 
@@ -37,7 +37,7 @@ fn lirreq_channels_select_and_lock_20_perspectives() {
 /// a `Mutex<i64>` field — compiles from lowered IR like any other.
 #[test]
 fn lir_async_lock_compiles_from_lir_with_the_expected_output() {
-    let source = include_str!("../../../example/shared_call_graph.wi");
+    let source = include_str!("../../../tests/regressions/shared_call_graph.wi");
     let expected = "11\n12\nrecovered: BadStep has no amount\nafter the recover\n103\n108\n110\n";
 
     let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
@@ -119,7 +119,7 @@ fn lir_diff_reference_params_20_perspectives() {
 #[test]
 fn lir_diff_interface_reference_params() {
     assert_program_output(
-        include_str!("../../../example/interface_reference_params.wi"),
+        include_str!("../../../tests/regressions/interface_reference_params.wi"),
         "15\n20\n15\n75\n45\n5\n25\n<name!>\n6\n1\n6\n11\n18\n105\n300\n",
     );
 }

@@ -10,7 +10,7 @@ const EXAMPLE_OUTPUT: &str =
 
 #[test]
 fn object_field_store_example_in_debug_release_and_gc_stress() {
-    let source = include_str!("../../example/object_field_store.wi");
+    let source = include_str!("../../tests/regressions/object_field_store.wi");
     for (out, ok) in [
         compile_and_run(source),
         compile_and_run_release(source),
@@ -24,7 +24,7 @@ fn object_field_store_example_in_debug_release_and_gc_stress() {
 
 #[test]
 fn object_field_store_example_passes_barrier_verification() {
-    let source = include_str!("../../example/object_field_store.wi");
+    let source = include_str!("../../tests/regressions/object_field_store.wi");
     for env in [
         &[("WILLOW_GC_VERIFY_BARRIER", "1")][..],
         &[

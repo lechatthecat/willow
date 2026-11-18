@@ -358,11 +358,11 @@ fn lirreq_52_dispatch_example_is_fully_lir() {
     // Every free function in the dispatch example — `main` included — must be
     // claimed by the walker, which is what makes the example's own header claim
     // ("every function here is compiled from the lowered IR") a checked one.
-    let source = include_str!("../../../example/lir_interface_dispatch.wi");
+    let source = include_str!("../../../tests/regressions/lir_interface_dispatch.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
     assert!(
         ok,
-        "example/lir_interface_dispatch.wi must compile with every free function \
+        "tests/regressions/lir_interface_dispatch.wi must compile with every free function \
          on the LIR path: {stderr}"
     );
 }

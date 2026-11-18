@@ -776,12 +776,12 @@ fn imported_interface_all_pure_implementations_have_no_waiting_evidence() {
     let f = Fixture::new();
     fs::write(
         f.0.join("src/players.wi"),
-        include_str!("../example/interface_effect_evidence/players.wi"),
+        include_str!("../tests/regressions/interface_effect_evidence/players.wi"),
     )
     .unwrap();
     fs::write(
         f.0.join("src/main.wi"),
-        include_str!("../example/interface_effect_evidence/main.wi"),
+        include_str!("../tests/regressions/interface_effect_evidence/main.wi"),
     )
     .unwrap();
     let result = f.json(&["effects", "main::serve"], 0);
@@ -1098,17 +1098,17 @@ fn class_method_impact_includes_override_family_and_callers() {
     let f = Fixture::new();
     fs::write(
         f.0.join("src/base.wi"),
-        include_str!("../example/impact_override_family/src/base.wi"),
+        include_str!("../tests/regressions/impact_override_family/src/base.wi"),
     )
     .unwrap();
     fs::write(
         f.0.join("src/children.wi"),
-        include_str!("../example/impact_override_family/src/children.wi"),
+        include_str!("../tests/regressions/impact_override_family/src/children.wi"),
     )
     .unwrap();
     fs::write(
         f.0.join("src/main.wi"),
-        include_str!("../example/impact_override_family/src/main.wi"),
+        include_str!("../tests/regressions/impact_override_family/src/main.wi"),
     )
     .unwrap();
     for selected in [
@@ -2347,7 +2347,7 @@ fn length_queries_attribute_only_panic_allocation_and_resolved_dispatch_stays_kn
     let f = Fixture::new();
     fs::write(
         f.0.join("src/main.wi"),
-        include_str!("../example/effect_explanations.wi"),
+        include_str!("../tests/regressions/effect_explanations.wi"),
     )
     .unwrap();
     for name in [
@@ -2436,7 +2436,7 @@ fn constants_report_their_value_type_and_references() {
 #[test]
 fn callee_type_cli_reports_callable_types() {
     let f = Fixture::new();
-    let source = include_str!("../example/callee_type_queries.wi");
+    let source = include_str!("../tests/regressions/callee_type_queries.wi");
     fs::write(f.0.join("src/main.wi"), source).unwrap();
     for (needle, expected) in [
         ("callback(value)", "closure(i64) -> f64"),
@@ -2764,7 +2764,7 @@ fn effect_precision_arithmetic_select_concat_and_allocation() {
     let f = Fixture::new();
     fs::write(
         f.0.join("src/main.wi"),
-        include_str!("../example/effect_precision.wi"),
+        include_str!("../tests/regressions/effect_precision.wi"),
     )
     .unwrap();
     for name in [
@@ -3206,7 +3206,7 @@ fn effect_witness_precision_literals_scheduler_and_unknown_origins() {
     let f = Fixture::new();
     fs::write(
         f.0.join("src/main.wi"),
-        include_str!("../example/effect_witness_precision.wi"),
+        include_str!("../tests/regressions/effect_witness_precision.wi"),
     )
     .unwrap();
     for name in ["literal", "literal_relay"] {
@@ -4048,7 +4048,7 @@ fn channel_effect_sites_and_unresolved_callee_locations() {
     let f = Fixture::new();
     fs::write(
         f.0.join("src/main.wi"),
-        include_str!("../example/channel_effect_witnesses.wi"),
+        include_str!("../tests/regressions/channel_effect_witnesses.wi"),
     )
     .unwrap();
     for name in ["exchange", "relay", "optional"] {
@@ -4239,7 +4239,7 @@ fn minor_semantic_cli_source_spellings_calls_and_coverage() {
     let f = Fixture::new();
     fs::write(
         f.0.join("src/main.wi"),
-        include_str!("../example/semantic_cli_minor/src/main.wi"),
+        include_str!("../tests/regressions/semantic_cli_minor/src/main.wi"),
     )
     .unwrap();
     let check = f.run(&["check"]);
@@ -4520,12 +4520,12 @@ fn imported_constructor_effects_match_local_field_initialization() {
     fs::create_dir_all(f.0.join("src/imported_constructor_effects_support")).unwrap();
     fs::write(
         f.0.join("src/imported_constructor_effects_support/model.wi"),
-        include_str!("../example/imported_constructor_effects_support/model.wi"),
+        include_str!("../tests/regressions/imported_constructor_effects_support/model.wi"),
     )
     .unwrap();
     fs::write(
         f.0.join("src/main.wi"),
-        include_str!("../example/imported_constructor_effects.wi"),
+        include_str!("../tests/regressions/imported_constructor_effects.wi"),
     )
     .unwrap();
     let local = f.json(&["effects", "main::local", "--explain"], 0);
@@ -5855,7 +5855,7 @@ fn main() {}
 fn task_effect_evidence_keeps_local_sites_and_labels_task_boundaries() {
     use willow_compiler::semantic::effects::RuntimeEffects as E;
     let f = Fixture::new();
-    let source = include_str!("../example/task_effect_evidence.wi");
+    let source = include_str!("../tests/regressions/task_effect_evidence.wi");
     fs::write(f.0.join("src/main.wi"), source).unwrap();
     for source_mode in [false, true] {
         for name in ["parent", "child", "waits"] {
@@ -6164,7 +6164,7 @@ fn generic_declaration_signatures() {
     let f = Fixture::new();
     fs::write(
         f.0.join("src/main.wi"),
-        include_str!("../example/generic_signature_queries.wi"),
+        include_str!("../tests/regressions/generic_signature_queries.wi"),
     )
     .unwrap();
     for (name, expected) in [
@@ -6392,7 +6392,7 @@ fn open_self_call_effects_use_closed_dispatch_family() {
         "class Sibling extends Base { pub override fn weight(self) -> i64 { return 3; } } class Child extends Base {}",
     ] {
         let f = Fixture::new();
-        let source = include_str!("../example/open_method_effect_queries.wi");
+        let source = include_str!("../tests/regressions/open_method_effect_queries.wi");
         let begin = source.find("class Child").unwrap();
         let end = source.find("fn through_interface").unwrap();
         let source = format!("{}{}\n{}", &source[..begin], classes, &source[end..]);
@@ -6426,8 +6426,8 @@ fn open_self_call_effects_preserve_effectful_overrides() {
         ("return 1 / 0;", 32),
     ] {
         let f = Fixture::new();
-        let source =
-            include_str!("../example/open_method_effect_queries.wi").replace("return 2;", body);
+        let source = include_str!("../tests/regressions/open_method_effect_queries.wi")
+            .replace("return 2;", body);
         fs::write(f.0.join("src/main.wi"), source).unwrap();
         for name in ["Base::count", "through_interface", "relay"] {
             let value = f.json(&["effects", &format!("main::{name}")], 0);
@@ -6482,7 +6482,7 @@ fn inherited_method_effects_match_base_and_contract() {
     let f = Fixture::new();
     fs::write(
         f.0.join("src/main.wi"),
-        include_str!("../example/inherited_method_effects.wi"),
+        include_str!("../tests/regressions/inherited_method_effects.wi"),
     )
     .unwrap();
     let base = f.json(&["effects", "main::Base::charge"], 0);

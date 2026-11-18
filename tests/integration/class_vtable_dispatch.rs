@@ -912,7 +912,7 @@ fn main() {
 #[test]
 fn vtable_27_the_example_prints_what_it_documents() {
     assert_project_output(
-        include_str!("../../example/class_vtable_dispatch.wi"),
+        include_str!("../../tests/regressions/class_vtable_dispatch.wi"),
         "shape=4\nshape=16\nshape=16\ncircle=48\n5\ninvoice\n",
     );
 }

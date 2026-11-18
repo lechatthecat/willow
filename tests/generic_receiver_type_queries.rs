@@ -6,7 +6,7 @@ use willow_compiler::{
     diagnostics::HumanEmitter,
 };
 
-const SOURCE: &str = include_str!("../example/generic_receiver_type_queries.wi");
+const SOURCE: &str = include_str!("../tests/regressions/generic_receiver_type_queries.wi");
 
 fn snapshot(files: &[(&str, &str)], label: &str) -> Snapshot {
     let directory = std::env::temp_dir().join(format!(

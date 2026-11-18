@@ -33,7 +33,7 @@ fn sync_poll_gates_have_no_lookup_calls_and_scale_linearly() {
             previous = Some((count, gates));
         }
         let events = compile_and_collect_panic_events_mode(
-            include_str!("../../example/sync_poll_gates.wi"),
+            include_str!("../../tests/regressions/sync_poll_gates.wi"),
             &[],
             release,
         );
@@ -49,8 +49,8 @@ fn sync_poll_gates_have_no_lookup_calls_and_scale_linearly() {
 #[test]
 fn sync_poll_gates_runnable_recursive_example() {
     for (out, ok) in [
-        compile_and_run(include_str!("../../example/sync_poll_gates.wi")),
-        compile_and_run_release(include_str!("../../example/sync_poll_gates.wi")),
+        compile_and_run(include_str!("../../tests/regressions/sync_poll_gates.wi")),
+        compile_and_run_release(include_str!("../../tests/regressions/sync_poll_gates.wi")),
     ] {
         assert!(ok, "{out}");
         assert_eq!(out, "1\n2\n4\n8\n");

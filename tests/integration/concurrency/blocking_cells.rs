@@ -151,7 +151,7 @@ fn bcgc_14_cell_as_map_value_is_traced() {
 
 #[test]
 fn bcgc_15_runnable_example_prints_its_transcript() {
-    let source = std::fs::read_to_string("example/blocking_cell_gc.wi").unwrap();
+    let source = std::fs::read_to_string("tests/regressions/blocking_cell_gc.wi").unwrap();
     let (out, ok) = compile_and_run_gc_stress_mode(&source, "minor");
     assert!(ok, "{out}");
     assert_eq!(out, "1999000\n6\ntrue\n");

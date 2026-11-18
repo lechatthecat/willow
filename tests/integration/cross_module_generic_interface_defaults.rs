@@ -81,12 +81,12 @@ fn standalone_generic_imported_default_example_runs() {
         &[
             (
                 "main.wi",
-                include_str!("../../example/imported_generic_interface_default.wi"),
+                include_str!("../../tests/regressions/imported_generic_interface_default.wi"),
             ),
             (
                 "imported_generic_interface_default_support/provider.wi",
                 include_str!(
-                    "../../example/imported_generic_interface_default_support/provider.wi"
+                    "../../tests/regressions/imported_generic_interface_default_support/provider.wi"
                 ),
             ),
         ],

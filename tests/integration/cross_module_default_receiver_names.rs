@@ -91,11 +91,13 @@ fn example_program() {
         &[
             (
                 "main.wi",
-                include_str!("../../example/interface_default_receiver_names.wi"),
+                include_str!("../../tests/regressions/interface_default_receiver_names.wi"),
             ),
             (
                 "interface_default_receiver_names_support/shapes.wi",
-                include_str!("../../example/interface_default_receiver_names_support/shapes.wi"),
+                include_str!(
+                    "../../tests/regressions/interface_default_receiver_names_support/shapes.wi"
+                ),
             ),
         ],
         "provider point\n1019\nprovider point\n1007\n",

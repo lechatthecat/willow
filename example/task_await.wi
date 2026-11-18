@@ -2,8 +2,7 @@ import std::collections::Array;
 
 // task_await.wi — one way to wait for a task: `await`.
 //
-// `Task.join()` and `Task.try_join()` no longer exist. The complete surface for
-// finishing a task is:
+// The complete surface for finishing a task is:
 //
 //   | expression          | waits | value                        | cancelled  |
 //   |---------------------|-------|------------------------------|------------|
@@ -109,9 +108,8 @@ async fn main() {
         sleep(5000) => { println("too slow"); }
     }
 
-    // 11. `JoinHandle<T>` is the legacy spelling of the very same handle, so it
-    //     awaits exactly like `Task<T>` — which is what makes the migration
-    //     advice "replace `h.join()` with `await h`" true for both.
+    // 11. `JoinHandle<T>` is another spelling of the very same handle, so it
+    //     awaits exactly like `Task<T>`.
     let handle: JoinHandle<i64> = double(15);
     println(await handle);                // 30
 

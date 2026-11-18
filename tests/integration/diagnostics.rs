@@ -1052,7 +1052,7 @@ fn main() { let reader: Reader = new Box(1); println(reader.read()); }
 
 #[test]
 fn frozen_array_import() {
-    let source = include_str!("../../example/diagnostic_collections.wi");
+    let source = include_str!("../../tests/regressions/diagnostic_collections.wi");
     let (out, ok) = compile_and_run(source);
     assert!(ok, "{out}");
     assert_eq!(out, "2\nb\n");
@@ -1112,7 +1112,9 @@ fn generic_interface_extends_has_one_dedicated_diagnostic() {
 
 #[test]
 fn diagnostic_workarounds_run() {
-    let (output, ok) = compile_and_run(include_str!("../../example/diagnostic_workarounds.wi"));
+    let (output, ok) = compile_and_run(include_str!(
+        "../../tests/regressions/diagnostic_workarounds.wi"
+    ));
     assert!(ok, "{output}");
     assert_eq!(output, "9\n6\n2\n4\n7\n");
 }
@@ -1264,15 +1266,15 @@ fn import_usage_generic_import_example_runs_without_warnings() {
         &[
             (
                 "main.wi",
-                include_str!("../../example/generic_import_usage.wi"),
+                include_str!("../../tests/regressions/generic_import_usage.wi"),
             ),
             (
                 "generic_import_usage_support/util.wi",
-                include_str!("../../example/generic_import_usage_support/util.wi"),
+                include_str!("../../tests/regressions/generic_import_usage_support/util.wi"),
             ),
             (
                 "generic_import_usage_support/numbers.wi",
-                include_str!("../../example/generic_import_usage_support/numbers.wi"),
+                include_str!("../../tests/regressions/generic_import_usage_support/numbers.wi"),
             ),
         ],
     );
@@ -1502,8 +1504,9 @@ fn diagnostic_recovery_end_to_end() {
 
 #[test]
 fn supported_example_runs() {
-    let (output, success) =
-        compile_and_run(include_str!("../../example/match_import_diagnostics.wi"));
+    let (output, success) = compile_and_run(include_str!(
+        "../../tests/regressions/match_import_diagnostics.wi"
+    ));
     assert!(success, "{output}");
     assert_eq!(output, "7\n42\n2.5\n");
 }

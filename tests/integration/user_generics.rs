@@ -22,7 +22,7 @@ const BOX: &str = "class Box<T> { pub value: T; pub fn get(self) -> T { return s
 #[test]
 fn nominal_alias_example_runs() {
     runs(
-        include_str!("../../example/generic_nominal_bindings.wi"),
+        include_str!("../../tests/regressions/generic_nominal_bindings.wi"),
         "17\n79\n80\n",
     );
 }
@@ -1410,7 +1410,7 @@ fn generic_lambda_annotations_private_import_rejected() {
 #[test]
 fn sentinel_diagnostics_valid_example_runs() {
     runs(
-        include_str!("../../example/diagnostic_recovery_if.wi"),
+        include_str!("../../tests/regressions/diagnostic_recovery_if.wi"),
         "7\na.b\nnone\n",
     );
 }
@@ -1418,7 +1418,7 @@ fn sentinel_diagnostics_valid_example_runs() {
 #[test]
 fn generic_variant_context_example_runs() {
     runs(
-        include_str!("../../example/generic_variant_context.wi"),
+        include_str!("../../tests/regressions/generic_variant_context.wi"),
         "7\n9\nhello\ntrue\n11\n13\n15\n16\n18\n19\ntrue\n",
     );
 }
@@ -1527,7 +1527,7 @@ fn imported_template_collection_spelling_follows_provider_imports() {
 #[test]
 fn generic_parameter_method_diagnostics_example_runs() {
     runs(
-        include_str!("../../example/generic_parameter_methods.wi"),
+        include_str!("../../tests/regressions/generic_parameter_methods.wi"),
         "6\nhello\n9\n",
     );
 }

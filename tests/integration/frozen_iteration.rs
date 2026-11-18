@@ -104,7 +104,7 @@ fn frozen_iteration_runtime_matrix() {
 
 #[test]
 fn frozen_iteration_fields_calls_async_and_roots() {
-    let source = include_str!("../../example/frozen_iteration.wi");
+    let source = include_str!("../../tests/regressions/frozen_iteration.wi");
     for run in [
         compile_and_run,
         compile_and_run_release,

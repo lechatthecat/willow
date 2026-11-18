@@ -47,7 +47,7 @@ fn run_with_stats(
 
 #[test]
 fn task_publication_example_in_debug_release_and_gc_stress() {
-    let source = include_str!("../../example/task_publication.wi");
+    let source = include_str!("../../tests/regressions/task_publication.wi");
     for (out, ok) in [
         compile_and_run(source),
         compile_and_run_release(source),
@@ -61,7 +61,7 @@ fn task_publication_example_in_debug_release_and_gc_stress() {
 
 #[test]
 fn task_publication_example_passes_the_verifier_at_every_point() {
-    let source = include_str!("../../example/task_publication.wi");
+    let source = include_str!("../../tests/regressions/task_publication.wi");
     for env in [
         &[VERIFY][..],
         &[VERIFY, ("WILLOW_GC_STRESS", "minor")][..],

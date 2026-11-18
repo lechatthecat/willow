@@ -148,7 +148,7 @@ fn main() {
 
 #[test]
 fn source_arrays_example() {
-    let source = include_str!("../../example/source_arrays.wi");
+    let source = include_str!("../../tests/regressions/source_arrays.wi");
     let (out, ok) = compile_and_run(source);
     assert!(ok, "{out}");
     assert_eq!(out, "source methods\nmethods\n2\n[\"source\"]\n42\n");

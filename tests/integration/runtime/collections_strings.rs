@@ -29,7 +29,7 @@ fn test_map_scalar_aliases_through_distinct_mutexes_and_original() {
 
 #[test]
 fn test_map_scalar_storage_example() {
-    let source = include_str!("../../../example/map_scalar_storage.wi");
+    let source = include_str!("../../../tests/regressions/map_scalar_storage.wi");
     for run in [
         compile_and_run,
         compile_and_run_release,

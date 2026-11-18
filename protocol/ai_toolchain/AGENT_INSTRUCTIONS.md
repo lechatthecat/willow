@@ -30,7 +30,7 @@ Coverage and truncation must still be read. Rename may be previewed with
 A disabled direct rename capability alone enables the legacy edit fallback.
 After modifications run `willow check .`, and build when executable validation
 is needed. Advanced query/edit integrations use current-source queries and reject
-stale revisions. Snapshot and daemon capabilities are no longer advertised.
+stale revisions.
 
 `willow agent sync` examines AGENTS.md and CLAUDE.md in the current directory.
 It prints instruction-version transitions and asks `[Y/n]` before updating;

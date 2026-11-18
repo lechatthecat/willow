@@ -219,11 +219,11 @@ fn lirreq_57_function_values_example_is_fully_lir() {
     // as values, lifted lambdas, indirect calls and the callable-taking
     // combinators all have to stay inside the walker's subset, since a body
     // outside it is a compile error.
-    let source = include_str!("../../../example/lir_function_values.wi");
+    let source = include_str!("../../../tests/regressions/lir_function_values.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
     assert!(
         ok,
-        "example/lir_function_values.wi must compile with every free function on the LIR path: {stderr}"
+        "tests/regressions/lir_function_values.wi must compile with every free function on the LIR path: {stderr}"
     );
 }
 
@@ -234,10 +234,10 @@ fn lirreq_59_closures_example_is_fully_lir() {
     // indirect call whose address comes out of a heap word, so a body that
     // slipped out of the walker's subset would show up here as a compile error
     // rather than as a fallback.
-    let source = include_str!("../../../example/lir_closures.wi");
+    let source = include_str!("../../../tests/regressions/lir_closures.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
     assert!(
         ok,
-        "example/lir_closures.wi must compile with every free function on the LIR path: {stderr}"
+        "tests/regressions/lir_closures.wi must compile with every free function on the LIR path: {stderr}"
     );
 }

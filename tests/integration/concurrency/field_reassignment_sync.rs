@@ -686,23 +686,23 @@ fn test_sync_receiver_sync_atomic_stats_and_namesake_run() {
         &[
             (
                 "project.toml",
-                include_str!("../../../example/sync_field_identity/project.toml"),
+                include_str!("../../../tests/regressions/sync_field_identity/project.toml"),
             ),
             (
                 "src/main.wi",
-                include_str!("../../../example/sync_field_identity/src/main.wi"),
+                include_str!("../../../tests/regressions/sync_field_identity/src/main.wi"),
             ),
             (
                 "src/readonly.wi",
-                include_str!("../../../example/sync_field_identity/src/readonly.wi"),
+                include_str!("../../../tests/regressions/sync_field_identity/src/readonly.wi"),
             ),
             (
                 "src/mutable.wi",
-                include_str!("../../../example/sync_field_identity/src/mutable.wi"),
+                include_str!("../../../tests/regressions/sync_field_identity/src/mutable.wi"),
             ),
             (
                 "src/stats.wi",
-                include_str!("../../../example/sync_field_identity/src/stats.wi"),
+                include_str!("../../../tests/regressions/sync_field_identity/src/stats.wi"),
             ),
         ],
     );

@@ -1229,7 +1229,7 @@ mod tests {
         let f = Fixture::new();
         f.write(
             "stk.wi",
-            &include_str!("../../example/imported_enum_stack_support/stack.wi")
+            &include_str!("../../tests/regressions/imported_enum_stack_support/stack.wi")
                 .replace("module imported_enum_stack_support::stack;", "module stk;"),
         );
         f.write("main.wi", "import mid::exercise; fn main() { exercise(); }");
@@ -2325,13 +2325,13 @@ mod tests {
         let _symbols = warm.symbols.enter();
         f.write(
             "main.wi",
-            include_str!("../../example/effect_inventory_editor/m2.wi"),
+            include_str!("../../tests/regressions/effect_inventory_editor/m2.wi"),
         );
         f.write(
             "buffer.wi",
-            include_str!("../../example/effect_inventory_editor/buffer.wi"),
+            include_str!("../../tests/regressions/effect_inventory_editor/buffer.wi"),
         );
-        let editor = include_str!("../../example/effect_inventory_editor/edit.wi");
+        let editor = include_str!("../../tests/regressions/effect_inventory_editor/edit.wi");
         for replacement in ["", "println(pos);", "", "println(s);"] {
             f.write(
                 "edit.wi",

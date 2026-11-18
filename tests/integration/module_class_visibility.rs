@@ -556,19 +556,19 @@ fn the_module_class_visibility_example_is_fully_lowered() {
     let files = &[
         (
             "shapes.wi",
-            include_str!("../../example/module_class_visibility/shapes.wi"),
+            include_str!("../../tests/regressions/module_class_visibility/shapes.wi"),
         ),
         (
             "grid.wi",
-            include_str!("../../example/module_class_visibility/grid.wi"),
+            include_str!("../../tests/regressions/module_class_visibility/grid.wi"),
         ),
         (
             "report.wi",
-            include_str!("../../example/module_class_visibility/report.wi"),
+            include_str!("../../tests/regressions/module_class_visibility/report.wi"),
         ),
         (
             "main.wi",
-            include_str!("../../example/module_class_visibility/main.wi"),
+            include_str!("../../tests/regressions/module_class_visibility/main.wi"),
         ),
     ];
     let (out, ok) = compile_temp_project_with_env_and_run(files, "main.wi", &PLAIN[..]);

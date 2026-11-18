@@ -1527,10 +1527,11 @@ mod tests {
     /// lambda types identically with per-lambda records and inline checking.
     #[test]
     fn lambda_examples_match_inline_typing() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("example");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut checked = 0;
-        let mut entries: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
+        let mut entries: Vec<_> = ["example", "tests/regressions"]
+            .into_iter()
+            .flat_map(|corpus| std::fs::read_dir(root.join(corpus)).unwrap())
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "wi"))
             .collect();

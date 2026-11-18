@@ -129,11 +129,11 @@ fn imported_generic_callable_example() {
         &[
             (
                 "util.wi",
-                include_str!("../../example/imported_generic_callable/util.wi"),
+                include_str!("../../tests/regressions/imported_generic_callable/util.wi"),
             ),
             (
                 "main.wi",
-                include_str!("../../example/imported_generic_callable/main.wi"),
+                include_str!("../../tests/regressions/imported_generic_callable/main.wi"),
             ),
         ],
     );

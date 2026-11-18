@@ -532,7 +532,9 @@ fn main() {
 
 #[test]
 fn cumulative_allocation_bytes_builtin_runs_example() {
-    let (out, ok) = compile_and_run(include_str!("../../../example/gc_allocation_counters.wi"));
+    let (out, ok) = compile_and_run(include_str!(
+        "../../../tests/regressions/gc_allocation_counters.wi"
+    ));
     assert!(ok, "compilation failed");
     assert_eq!(out, "true\ntrue\ntrue\ntrue\ntrue\n");
 }

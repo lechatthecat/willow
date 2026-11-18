@@ -757,8 +757,8 @@ fn main() { println(impls::both()); }
 // 25. The example program compiles entirely through lowered IR.
 #[test]
 fn cutover_25_the_example_has_no_fallback() {
-    let src = std::fs::read_to_string("example/lir_stage5_cutover.wi")
-        .expect("example/lir_stage5_cutover.wi must exist");
+    let src = std::fs::read_to_string("tests/regressions/lir_stage5_cutover.wi")
+        .expect("tests/regressions/lir_stage5_cutover.wi must exist");
     assert_project_output(
         &src,
         "42\nboom at line 33\ncleaned up 8\n15\nnot positive\n99\n1\n",

@@ -1,6 +1,6 @@
 use super::*;
 
-const EXAMPLE: &str = include_str!("../../../example/async_string_reference.wi");
+const EXAMPLE: &str = include_str!("../../../tests/regressions/async_string_reference.wi");
 
 // Both dispatch paths can select an async body despite a synchronous signature.
 fn dispatch_reference_source(interface: bool, mode: &str, ty: &str, body: &str) -> String {

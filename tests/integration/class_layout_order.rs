@@ -707,7 +707,7 @@ fn main() {
 /// runnable-examples table in `runtime.rs`.
 #[test]
 fn layout_23_the_example_program_runs() {
-    let source = std::fs::read_to_string("example/class_layout_declaration_order.wi")
-        .expect("example/class_layout_declaration_order.wi is missing");
+    let source = std::fs::read_to_string("tests/regressions/class_layout_declaration_order.wi")
+        .expect("tests/regressions/class_layout_declaration_order.wi is missing");
     assert_project_output(&source, "6\n1\n2\n3\n1001\n2,4,8\n");
 }

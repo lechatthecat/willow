@@ -610,7 +610,7 @@ async fn main() {{ println(await relay(4)); }}
 fn channel_element_20_example_is_fully_lir() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/example/channel_element_inference.wi"
+        "/tests/regressions/channel_element_inference.wi"
     );
     let source = std::fs::read_to_string(path).expect("the example is present");
     assert!(

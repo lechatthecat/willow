@@ -1369,7 +1369,7 @@ fn lock_imported_default_from_third_module() {
 
 #[test]
 fn stable_borrowed_scalars_example() {
-    let source = include_str!("../../../example/stable_borrowed_scalars.wi");
+    let source = include_str!("../../../tests/regressions/stable_borrowed_scalars.wi");
     for env in [
         vec![("WILLOW_WORKERS", "1")],
         vec![("WILLOW_WORKERS", "2"), ("WILLOW_GC_STRESS", "alloc")],

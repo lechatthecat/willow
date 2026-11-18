@@ -456,7 +456,7 @@ fn field_only_function_is_no_panic_for_callers() {
 
 #[test]
 fn runnable_example() {
-    let source = include_str!("../../example/leaf_method_calls.wi");
+    let source = include_str!("../../tests/regressions/leaf_method_calls.wi");
     for (out, ok) in [
         compile_and_run_gc_stress_all(source),
         compile_and_run_release(source),

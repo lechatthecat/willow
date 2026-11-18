@@ -484,8 +484,8 @@ fn main() {{
 //     pins its output; this pins the emitter that produced it.
 #[test]
 fn lir_defer_block_order_21_the_examples_merges_are_lir() {
-    let source = std::fs::read_to_string("example/lir_defer_scopes.wi")
-        .expect("example/lir_defer_scopes.wi is part of the repository");
+    let source = std::fs::read_to_string("tests/regressions/lir_defer_scopes.wi")
+        .expect("tests/regressions/lir_defer_scopes.wi is part of the repository");
     assert_walker_compiled(&source, &["merged", "merged_scope", "merged_loop"]);
 }
 

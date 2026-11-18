@@ -76,7 +76,7 @@ fn async_frame_call_safepoints_narrow_straight_line_locals() {
     );
 }
 
-/// `example/async_frame_narrowing.wi` walks through every shape
+/// `tests/regressions/async_frame_narrowing.wi` walks through every shape
 /// the frame-slot analysis distinguishes (dead-before-await, live-across-await,
 /// the loop back edge, branch union, shadowing, and GC-managed locals both read
 /// across a suspension and never read at all).
@@ -86,7 +86,7 @@ fn async_frame_call_safepoints_narrow_straight_line_locals() {
 /// `WILLOW_ASYNC_FRAME_ALL=1` turning it off.
 #[test]
 fn async_frame_narrowing_example_output_is_independent_of_framing() {
-    let source = include_str!("../../../example/async_frame_narrowing.wi");
+    let source = include_str!("../../../tests/regressions/async_frame_narrowing.wi");
     const EXPECTED: &str = "2\n1\n102\n13\n12\n3\n30\ntask\n4\n7\nhello\n6\n";
 
     let (out, ok) = compile_and_run_with_env(source, &[]);

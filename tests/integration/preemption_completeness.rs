@@ -2,7 +2,9 @@ use crate::support::*;
 
 #[test]
 fn a7_example_runs() {
-    let (out, ok) = compile_and_run(include_str!("../../example/preemption_complete.wi"));
+    let (out, ok) = compile_and_run(include_str!(
+        "../../tests/regressions/preemption_complete.wi"
+    ));
     assert!(ok, "{out}");
     assert_eq!(out, "[41, 42]\n");
 }

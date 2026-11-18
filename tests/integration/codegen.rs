@@ -459,7 +459,7 @@ fn assert_refmode_output_under_gc_stress(source: &str, expected: &str) {
 //
 // Scope: this polices `compile_function_named` (sync and async free functions
 // and `main`). Class methods go through `compile_class_method`, which has the
-// same hard requirement; `example/lir_gc_objects.wi` below covers that side.
+// same hard requirement; `tests/regressions/lir_gc_objects.wi` below covers that side.
 //
 // Perspectives 39-51:
 // 39 an all-eligible program compiles AND runs, 40 an ineligible function

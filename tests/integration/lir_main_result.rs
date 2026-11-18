@@ -589,7 +589,7 @@ fn lir_main_result_25_async_failing_try_reports_and_fails() {
 fn lir_main_result_26_the_example_is_fully_lir() {
     let source = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/example/lir_main_result.wi"
+        "/tests/regressions/lir_main_result.wi"
     ))
     .expect("the example is checked in");
     assert_walker_compiled(

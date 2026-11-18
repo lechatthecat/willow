@@ -1,4 +1,4 @@
-//! Integer overflow policy (docs/decisions/0012).
+//! Integer overflow policy.
 //!
 //! Debug builds check `+ - * **` and prefix `-` on `i64` and raise a
 //! recoverable panic; release builds wrap. `wrapping_*` / `checked_*` behave

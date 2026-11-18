@@ -120,7 +120,7 @@ fn permanent_wait_valid_example() {
         "permanent_wait_escapes",
         &[(
             "main.wi",
-            include_str!("../../../example/permanent_wait_escapes.wi"),
+            include_str!("../../../tests/regressions/permanent_wait_escapes.wi"),
         )],
     );
     let output = project.compile("main.wi");

@@ -508,7 +508,7 @@ fn main() {
 #[test]
 fn contextual_interface_arrays_example() {
     let (out, ok) = compile_and_run(include_str!(
-        "../../../example/contextual_interface_arrays.wi"
+        "../../../tests/regressions/contextual_interface_arrays.wi"
     ));
     assert!(ok);
     assert_eq!(out, "30\n30\n30\n30\n30\n30\n");
@@ -517,7 +517,7 @@ fn contextual_interface_arrays_example() {
 #[test]
 fn contextual_interface_arrays_example_release() {
     let (out, ok) = compile_and_run_release(include_str!(
-        "../../../example/contextual_interface_arrays.wi"
+        "../../../tests/regressions/contextual_interface_arrays.wi"
     ));
     assert!(ok);
     assert_eq!(out, "30\n30\n30\n30\n30\n30\n");

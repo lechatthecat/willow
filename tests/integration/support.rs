@@ -99,9 +99,12 @@ pub(super) fn collect_wi_files(root: &str) -> Vec<String> {
     files
 }
 
+/// Runnable entry files in both catalogs: user-facing `example/` programs and
+/// the compiler/runtime regression programs under `tests/regressions/`.
 pub(super) fn collect_runnable_example_entries() -> Vec<String> {
-    collect_wi_files("example")
+    ["example", "tests/regressions"]
         .into_iter()
+        .flat_map(collect_wi_files)
         .filter(|path| !path.contains("/future/"))
         .filter(|path| {
             fs::read_to_string(path)

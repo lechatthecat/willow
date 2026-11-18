@@ -4671,13 +4671,15 @@ mod prune_and_corpus_tests {
         }
     }
 
-    // 25. corpus: every example/*.wi parses and survives HIR→LIR lowering
+    // 25. corpus: every example and regression program parses and survives HIR→LIR lowering
     // without panicking (coverage diagnostics are allowed; crashes are not).
     #[test]
     fn l25_examples_corpus_lowers_without_panic() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("example");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut sources = Vec::new();
-        collect_wi_files(&root, &mut sources);
+        for corpus in ["example", "tests/regressions"] {
+            collect_wi_files(&root.join(corpus), &mut sources);
+        }
         assert!(
             sources.len() > 30,
             "expected a real corpus, got {sources:?}"

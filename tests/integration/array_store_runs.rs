@@ -9,7 +9,7 @@ const EXPECTED: &str = "499500\ntrue\ntrue\n21\n69\n9\n41\n78\n41\n81\n21\n14\n3
 
 #[test]
 fn array_store_runs_example_matches_in_every_mode() {
-    let source = include_str!("../../example/array_store_runs.wi");
+    let source = include_str!("../../tests/regressions/array_store_runs.wi");
     for (out, ok) in [
         compile_and_run(source),
         compile_and_run_release(source),

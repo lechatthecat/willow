@@ -210,11 +210,11 @@ fn tuple_same_module_signatures_check_debug_release() {
         &[
             (
                 "pairs.wi",
-                include_str!("../../example/module_tuple_calls/pairs.wi"),
+                include_str!("../../tests/regressions/module_tuple_calls/pairs.wi"),
             ),
             (
                 "main.wi",
-                include_str!("../../example/module_tuple_calls/main.wi"),
+                include_str!("../../tests/regressions/module_tuple_calls/main.wi"),
             ),
         ],
     );

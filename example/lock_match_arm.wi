@@ -58,7 +58,7 @@ async fn classify_amount(account: Mutex<i64>, amount: i64) -> String {
 // The helper's acquisition sits at the top level of its own body, so it has a
 // resume point there. The arm only awaits a task, which the cooperative path
 // already knows how to suspend on -- lowering splits the arm into its own block
-// so the `await` has a resume point too (see `example/lir_match_suspend.wi`).
+// so the `await` has a resume point too (see `tests/regressions/lir_match_suspend.wi`).
 // It really suspends rather than pinning its worker: 20 of these awaiting a
 // 200ms sleep finish in 200ms on the runtime's 5-worker default, not in the
 // 800ms four serialised waves would take.

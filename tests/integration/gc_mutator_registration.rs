@@ -598,7 +598,7 @@ async fn main() {
 
 #[test]
 fn gcreg_21_the_example_program_under_stress() {
-    let source = include_str!("../../example/gc_mutator_registration.wi");
+    let source = include_str!("../../tests/regressions/gc_mutator_registration.wi");
     assert_env(
         source,
         &[("WILLOW_WORKERS", "4"), ("WILLOW_GC_STRESS", "alloc")],

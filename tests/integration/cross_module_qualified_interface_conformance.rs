@@ -85,11 +85,13 @@ fn example_program() {
         &[
             (
                 "main.wi",
-                include_str!("../../example/interface_qualified_self_reference.wi"),
+                include_str!("../../tests/regressions/interface_qualified_self_reference.wi"),
             ),
             (
                 "interface_qualified_self_reference_support/shapes.wi",
-                include_str!("../../example/interface_qualified_self_reference_support/shapes.wi"),
+                include_str!(
+                    "../../tests/regressions/interface_qualified_self_reference_support/shapes.wi"
+                ),
             ),
         ],
         "36\n16\n25\n",

@@ -613,15 +613,18 @@ fn async_lir_26_await_example_is_fully_lir() {
     // The await example exists to be compiled this way:
     // every one of its `async fn`s — leaf calls, builtin awaits, suspending
     // loops and branches — must stay on the LIR path.
-    let source = include_str!("../../example/lir_async_await.wi");
+    let source = include_str!("../../tests/regressions/lir_async_await.wi");
     let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
-    assert!(ok, "example/lir_async_await.wi did not compile: {stderr}");
+    assert!(
+        ok,
+        "tests/regressions/lir_async_await.wi did not compile: {stderr}"
+    );
     // Compiling at all is the proof since the lowered-IR cutover — a body outside the
     // subset is a hard `E0800` — so what is left to check is that the async
     // bodies really went through the async LIR path and not some other one.
     assert!(
         stderr.contains("[lir] compiling async `main` from lowered IR"),
-        "example/lir_async_await.wi must be entirely LIR-compiled: {stderr}"
+        "tests/regressions/lir_async_await.wi must be entirely LIR-compiled: {stderr}"
     );
 }
 

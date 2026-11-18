@@ -733,7 +733,7 @@ fn main() {
 /// program, compiled entirely from lowered IR.
 #[test]
 fn lbo_24_example_compiles_from_lir_end_to_end() {
-    let source = include_str!("../../example/lir_local_binding_order.wi");
+    let source = include_str!("../../tests/regressions/lir_local_binding_order.wi");
     let (out, ok) = compile_and_run_with_env(source, &PLAIN);
     assert!(ok, "the example must run: {out}");
     assert_eq!(out, "41\n10\n307\n10\nheld\nboxed\n42\nmany\n16\n5\n-1\n");
