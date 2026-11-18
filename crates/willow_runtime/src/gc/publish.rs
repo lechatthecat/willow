@@ -438,6 +438,8 @@ pub(super) fn install_chunk_owner(
         let publication = unsafe { log.publication() };
         publication.apply(state, &owner.gc.publication);
         publication.start_chunk(base);
+        // SAFETY: as above.
+        unsafe { log.note_young_chunk(base) };
     }
     if tracks_owners(owner) {
         // A reused chunk base drops the owners of its previous life.

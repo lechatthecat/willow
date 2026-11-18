@@ -49,6 +49,105 @@ const ROOT_CANCEL_WINDOW: usize = 8;
 /// Task switches that moved this thread's allocation cursor, held before
 /// flushing. A switch that allocated nothing overwrites the last entry.
 pub(super) const OWNER_LOG_CAPACITY: usize = 64;
+/// TLAB chunks this mutator installed since the last stop, remembered as a
+/// lock-free young-address proof for header-unproven stored values.
+const YOUNG_CHUNKS: usize = 4;
+
+/// Bases of the TLAB chunks this mutator installed since the last stop.
+///
+/// Such a chunk holds only young objects: generations change only inside
+/// stops, a nursery chunk is installed young, and its storage is reclaimed or
+/// reused only by a collection, which runs inside a stop that clears these
+/// entries first ([`drain_stopped`]). An address inside one of them is
+/// therefore proven young without reading a header or taking the heap lock.
+/// The proof only decides whether an owner may be claimed at record time; an
+/// unproven value is logged exactly instead, so a missing entry never loses an
+/// edge, and a stale one could only remember an owner conservatively.
+#[derive(Clone, Copy, Default)]
+struct YoungChunks {
+    bases: [usize; YOUNG_CHUNKS],
+    next: usize,
+}
+
+impl YoungChunks {
+    fn note(&mut self, base: usize) {
+        self.bases[self.next] = base;
+        self.next = (self.next + 1) % YOUNG_CHUNKS;
+    }
+
+    /// O(`YOUNG_CHUNKS`) unsigned range checks, no memory access beyond the log.
+    fn contains(&self, address: usize) -> bool {
+        self.bases
+            .iter()
+            .any(|&base| base != 0 && address.wrapping_sub(base) < GC_TLAB_CHUNK_SIZE)
+    }
+}
+
+/// Entries of the per-mutator cache of values proven outside every TLAB chunk.
+const OLD_VALUES: usize = 16;
+
+/// Chunk epoch of one runtime (`GcRuntime::chunk_epoch`). It gets a cache line
+/// of its own: every TLAB install advances it, and a neighbouring hot field
+/// would otherwise bounce with each install.
+#[repr(align(128))]
+pub(super) struct ChunkEpoch(AtomicU64);
+
+impl ChunkEpoch {
+    pub(super) const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+}
+
+impl std::ops::Deref for ChunkEpoch {
+    type Target = AtomicU64;
+
+    fn deref(&self) -> &AtomicU64 {
+        &self.0
+    }
+}
+
+/// Values this mutator's own log flushes found outside every TLAB chunk, valid
+/// while the runtime's chunk epoch is unchanged.
+///
+/// Only a TLAB chunk holds young objects, and a chunk joins the heap only
+/// through a TLAB install or a survivor destination, both of which advance the
+/// epoch under the heap lock. An address outside every chunk at an epoch
+/// therefore stays not young until the epoch moves, so a later header-unproven
+/// store of the same value adds no edge and is dropped without a log entry.
+/// This bounds repeated stores of one old value (a shared object stored into
+/// many owners) to one exact entry per epoch, as a claimed owner byte bounds
+/// stores of young values.
+#[derive(Clone, Copy, Default)]
+struct OldValues {
+    epoch: u64,
+    values: [usize; OLD_VALUES],
+}
+
+impl OldValues {
+    fn index(value: usize) -> usize {
+        // Payload starts are 8-aligned; fold higher bits in so objects of one
+        // size class do not share a few entries.
+        ((value >> 3) ^ (value >> 9)) % OLD_VALUES
+    }
+
+    /// One thread-local compare; the shared epoch is read only on a slot hit,
+    /// so a miss touches no cache line other mutators write.
+    fn contains(&self, value: usize, epoch: &AtomicU64) -> bool {
+        value != 0
+            && self.values[Self::index(value)] == value
+            && self.epoch == epoch.load(Ordering::Acquire)
+    }
+
+    fn note(&mut self, value: usize, epoch: u64) {
+        if self.epoch != epoch {
+            *self = Self {
+                epoch,
+                ..Self::default()
+            };
+        }
+        self.values[Self::index(value)] = value;
+    }
+}
 
 /// Publication counters of one mutator (`gc::publish`), merged into the
 /// runtime's shared counters when the log is applied, so a publication or a
@@ -138,12 +237,12 @@ impl PublicationLog {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Edge {
-    /// A header-proven old owner of a possibly young value. The logging thread
-    /// already claimed the owner's remembered byte, which deduplicates the
-    /// owner across all threads until the next minor. An unproven value may be
-    /// old: the owner is then remembered conservatively, which costs one scan
-    /// at the next minor, and that scan re-remembers it only with a young
-    /// child, as the inline filter's claimed byte does after a locked store.
+    /// A header-proven old owner of a proven young value: its header says it
+    /// is not old, or it lies in a chunk this mutator installed since the last
+    /// stop ([`YoungChunks`]). The logging thread already claimed the owner's
+    /// remembered byte, which deduplicates the owner across all threads until
+    /// the next minor. A store whose value is not proven young is logged as
+    /// `Unresolved` instead, so an old value never remembers its owner.
     Owner(usize),
     /// A header-proven old card-remembered buffer and the card of a store whose
     /// value may be young (remembered conservatively like `Owner`).
@@ -160,6 +259,8 @@ pub(super) enum Edge {
 
 pub(super) struct MutatorLog {
     edges: UnsafeCell<Vec<Edge>>,
+    young_chunks: UnsafeCell<YoungChunks>,
+    old_values: UnsafeCell<OldValues>,
     roots: UnsafeCell<Vec<(usize, isize)>>,
     publication: UnsafeCell<PublicationLog>,
     /// Net registrations held in `roots`. Stored only by whoever owns the log
@@ -181,6 +282,8 @@ impl MutatorLog {
     pub(super) fn new() -> Self {
         Self {
             edges: UnsafeCell::new(Vec::with_capacity(EDGE_LOG_CAPACITY)),
+            young_chunks: UnsafeCell::new(YoungChunks::default()),
+            old_values: UnsafeCell::new(OldValues::default()),
             roots: UnsafeCell::new(Vec::with_capacity(ROOT_LOG_CAPACITY)),
             publication: UnsafeCell::new(PublicationLog {
                 owners: Vec::with_capacity(OWNER_LOG_CAPACITY),
@@ -218,6 +321,34 @@ impl MutatorLog {
     )]
     pub(super) unsafe fn publication(&self) -> &mut PublicationLog {
         unsafe { &mut *self.publication.get() }
+    }
+
+    /// # Safety
+    /// As for [`Self::edges`].
+    #[allow(
+        clippy::mut_from_ref,
+        reason = "only the bound owner thread, or a stopper while it is parked, reaches the log"
+    )]
+    unsafe fn young_chunks(&self) -> &mut YoungChunks {
+        unsafe { &mut *self.young_chunks.get() }
+    }
+
+    /// # Safety
+    /// As for [`Self::edges`].
+    #[allow(
+        clippy::mut_from_ref,
+        reason = "only the bound owner thread, or a stopper while it is parked, reaches the log"
+    )]
+    unsafe fn old_values(&self) -> &mut OldValues {
+        unsafe { &mut *self.old_values.get() }
+    }
+
+    /// Record the TLAB chunk at `base` that this mutator just installed.
+    ///
+    /// # Safety
+    /// As for [`Self::edges`].
+    pub(super) unsafe fn note_young_chunk(&self, base: usize) {
+        unsafe { self.young_chunks() }.note(base);
     }
 
     pub(super) fn pending_root_net(&self) -> isize {
@@ -293,6 +424,11 @@ fn try_claim_remembered(owner: usize) -> bool {
 ///
 /// `owner_proven` means the inline-filter facts hold for `owner`: it is an
 /// old, unremembered payload start and `slot` is not an interior reference.
+/// `value_proven` means the value's header proved it is not old.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the barrier's store facts are passed through unpacked on the store path"
+)]
 pub(super) fn record_edge_in(
     runtime_owner: &crate::runtime::Runtime,
     owner: *mut u8,
@@ -300,12 +436,20 @@ pub(super) fn record_edge_in(
     value: *mut u8,
     kind: i64,
     owner_proven: bool,
+    value_proven: bool,
     serves_thread: bool,
 ) -> bool {
     let gc = &*runtime_owner.gc;
     let Some(log) = bound_in(gc) else {
         return false;
     };
+    // A value one of this log's flushes found outside every TLAB chunk, with
+    // no chunk added since, is still not young: the store adds no edge.
+    // SAFETY: the bound thread owns its log while running.
+    if !value_proven && unsafe { log.old_values() }.contains(value as usize, &gc.chunk_epoch) {
+        count_old_value_drop();
+        return true;
+    }
     let card = (owner_proven && !slot.is_null())
         .then(|| barrier::slot_card(owner as usize, slot as usize))
         .flatten();
@@ -321,7 +465,14 @@ pub(super) fn record_edge_in(
                 card,
             }
         }
-        None if owner_proven => {
+        // Claim only for a value proven young. Without that proof the value
+        // may be old (no generation is readable lock-free), and a claim would
+        // keep the owner remembered until the next minor rescans it.
+        // SAFETY: the bound thread owns its log while running.
+        None if owner_proven
+            && (value_proven || unsafe { log.young_chunks() }.contains(value as usize)) =>
+        {
+            count_owner_claim(value_proven);
             if !try_claim_remembered(owner as usize) {
                 // Another thread logged this owner; its entry covers ours.
                 return true;
@@ -348,7 +499,13 @@ pub(super) fn record_edge_in(
         return true;
     }
     if edges.len() == EDGE_LOG_CAPACITY {
-        flush_edges(runtime_owner, edges, serves_thread);
+        // SAFETY: as above; a different cell from `edges`.
+        flush_edges(
+            runtime_owner,
+            edges,
+            unsafe { log.old_values() },
+            serves_thread,
+        );
     }
     edges.push(edge);
     true
@@ -381,11 +538,13 @@ pub(super) fn record_root_in(owner: &crate::runtime::Runtime, slot: usize, delta
 }
 
 /// Apply edge entries to the remembered set. `card_proof` receives each card
-/// a resolved entry proved recorded, for a caller filling its own card cache.
+/// a resolved entry proved recorded, for a caller filling its own card cache;
+/// `outside_chunks` each unresolved value found outside every TLAB chunk.
 fn apply_edges(
     state: &mut GcState,
     edges: &mut Vec<Edge>,
     mut card_proof: impl FnMut(usize, usize),
+    mut outside_chunks: impl FnMut(usize),
 ) {
     let mut new_entries = 0u64;
     for edge in edges.drain(..) {
@@ -417,8 +576,13 @@ fn apply_edges(
                 value,
                 kind,
             } => {
-                if barrier::tlab_payload_generation(state, value) != Some(GC_GENERATION_YOUNG) {
-                    continue;
+                match barrier::tlab_chunk_generation(state, value) {
+                    Some(Some(GC_GENERATION_YOUNG)) => {}
+                    Some(_) => continue,
+                    None => {
+                        outside_chunks(value);
+                        continue;
+                    }
                 }
                 let Some(payload) = barrier::barrier_owner_payload(state, owner as *mut u8, kind)
                 else {
@@ -463,6 +627,7 @@ fn apply_roots(gc: &GcRuntime, log: &MutatorLog, roots: &mut Vec<(usize, isize)>
 fn flush_edges(
     runtime_owner: &crate::runtime::Runtime,
     edges: &mut Vec<Edge>,
+    old_values: &mut OldValues,
     serves_thread: bool,
 ) {
     let _interval = crate::gc_telemetry::observations::Span::new_in(
@@ -477,11 +642,19 @@ fn flush_edges(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     count_shared_lock();
-    apply_edges(&mut state, edges, |owner, card| {
-        if serves_thread {
-            barrier::card_cache_fill(owner, card);
-        }
-    });
+    // Chunks join the heap only under this lock, so the epoch read here
+    // matches every classification below.
+    let epoch = runtime_owner.gc.chunk_epoch.load(Ordering::Relaxed);
+    apply_edges(
+        &mut state,
+        edges,
+        |owner, card| {
+            if serves_thread {
+                barrier::card_cache_fill(owner, card);
+            }
+        },
+        |value| old_values.note(value, epoch),
+    );
 }
 
 /// Slow path of a full root log: apply it to the shared shards. Takes the
@@ -504,7 +677,8 @@ pub(super) fn flush_current_in(owner: &crate::runtime::Runtime) {
     let edges = unsafe { log.edges() };
     if !edges.is_empty() {
         let serves_thread = std::ptr::eq(owner, crate::runtime::current());
-        flush_edges(owner, edges, serves_thread);
+        // SAFETY: as above; a different cell from `edges`.
+        flush_edges(owner, edges, unsafe { log.old_values() }, serves_thread);
     }
     let roots = unsafe { log.roots() };
     if !roots.is_empty() {
@@ -541,6 +715,11 @@ pub(super) fn drain_stopped(owner: &crate::runtime::Runtime, coord: &GcCoord) {
             .map(|(_, log)| log)
     };
     // SAFETY (all log accesses below): owners are parked, idle or this thread.
+    // This stop may change generations or reuse chunk storage, so no chunk
+    // installed before it proves an address young any more.
+    for log in logs() {
+        *unsafe { log.young_chunks() } = YoungChunks::default();
+    }
     if logs().all(|log| unsafe { log.is_empty() }) {
         return;
     }
@@ -555,7 +734,9 @@ pub(super) fn drain_stopped(owner: &crate::runtime::Runtime, coord: &GcCoord) {
             let edges = unsafe { log.edges() };
             entries += edges.len() as u64;
             // Another thread's card cache is not ours to fill.
-            apply_edges(&mut state, edges, |_, _| {});
+            // A collection may follow in this stop and add survivor chunks
+            // after the drain, so nothing is cached here.
+            apply_edges(&mut state, edges, |_, _| {}, |_| {});
             let publication = unsafe { log.publication() };
             entries += publication.owners.len() as u64;
             publication.apply(&mut state, &owner.gc.publication);
@@ -643,6 +824,56 @@ pub(super) fn count_shared_lock() {
 #[cfg(test)]
 pub(super) fn shared_locks_for_test() -> u64 {
     SHARED_LOCKS.get()
+}
+
+thread_local! {
+    /// Owner claims by this thread, split by the young proof of the value:
+    /// `[header, own chunk]` (test probe).
+    #[cfg(test)]
+    static OWNER_CLAIMS: Cell<[u64; 2]> = const { Cell::new([0; 2]) };
+}
+
+#[inline]
+fn count_owner_claim(header_proven: bool) {
+    #[cfg(test)]
+    OWNER_CLAIMS.set({
+        let mut claims = OWNER_CLAIMS.get();
+        claims[usize::from(!header_proven)] += 1;
+        claims
+    });
+    #[cfg(not(test))]
+    let _ = header_proven;
+}
+
+#[cfg(test)]
+pub(super) fn owner_claims_for_test() -> [u64; 2] {
+    OWNER_CLAIMS.get()
+}
+
+thread_local! {
+    /// Stores dropped by this thread's old-value cache (test probe).
+    #[cfg(test)]
+    static OLD_VALUE_DROPS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[inline]
+fn count_old_value_drop() {
+    #[cfg(test)]
+    OLD_VALUE_DROPS.set(OLD_VALUE_DROPS.get() + 1);
+}
+
+#[cfg(test)]
+pub(super) fn old_value_drops_for_test() -> u64 {
+    OLD_VALUE_DROPS.get()
+}
+
+/// Cache `value` in this thread's log as outside every chunk at the current
+/// epoch, as a flush would (test hook for stale-cache negative checks).
+#[cfg(test)]
+pub(super) fn note_old_value_for_test(owner: &crate::runtime::Runtime, value: usize) {
+    let epoch = owner.gc.chunk_epoch.load(Ordering::Relaxed);
+    let log = bound_in(&owner.gc).unwrap();
+    unsafe { log.old_values() }.note(value, epoch);
 }
 
 #[cfg(test)]

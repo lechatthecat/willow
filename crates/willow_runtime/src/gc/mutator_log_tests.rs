@@ -712,7 +712,7 @@ fn owner_proven_stores_with_unproven_values_log_once_per_owner() {
 }
 
 #[test]
-fn owner_proven_store_of_an_old_value_is_dropped_by_the_next_minor() {
+fn owner_proven_store_of_an_old_value_remembers_no_owner() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
@@ -722,15 +722,16 @@ fn owner_proven_store_of_an_old_value_is_dropped_by_the_next_minor() {
     let parent = old_object();
     let other = old_object();
     store_unproven_value(parent, other);
+    // No young proof: the store is logged exactly instead of claiming.
+    assert_eq!(pending_edges(), 1);
     stop();
-    // Conservative: the unproven value is old, yet the owner is remembered.
-    assert!(remembered(parent));
-    verify().unwrap();
-    minor();
     assert!(
         !remembered(parent),
-        "a minor keeps only owners of young children"
+        "an old value must not remember its owner"
     );
+    verify().unwrap();
+    minor();
+    assert!(!remembered(parent));
     verify().unwrap();
     reset_internal_for_test();
 }
@@ -1044,5 +1045,354 @@ fn telemetry_snapshot_flushes_pending_edges_after_a_heap_poisoning_panic() {
     gc.heap.clear_poison();
     assert!(remembered(parent));
     verify().unwrap();
+    reset_internal_for_test();
+}
+
+fn owner_claims() -> [u64; 2] {
+    owner_claims_for_test()
+}
+
+/// Deterministic probe of conservative claims per minor: old values stored
+/// without a header proof claim no owner, so the remembered set the next
+/// minor scans holds none of their owners, for any number of stores.
+#[test]
+fn unproven_old_value_stores_remember_no_owner_for_any_n() {
+    let _guard = isolated_runtime();
+    for owners in [1usize, 10, 100] {
+        quiet_heap();
+        let registration = MutatorRegistration::new();
+        let mut tls = tlab_state_for_test();
+        // Any nursery makes old-to-young edges possible.
+        let _ = young_object(&mut tls, 0);
+        let values: Vec<_> = (0..owners).map(|_| old_object()).collect();
+        let parents: Vec<_> = (0..owners).map(|_| old_object()).collect();
+        let claims = owner_claims();
+        for (&parent, &value) in parents.iter().zip(&values) {
+            store_unproven_value(parent, value);
+            // A repeated store logs nothing new.
+            store_unproven_value(parent, value);
+        }
+        assert_eq!(owner_claims(), claims, "owners={owners}");
+        for &parent in &parents {
+            let header = HeapObject::from_payload(GcPayload::from_raw(parent).unwrap());
+            assert!(!header.remembered(), "an old value claimed its owner");
+        }
+        stop();
+        // The remembered owners the next minor would scan.
+        assert_eq!(remembered_len(), 0, "owners={owners}");
+        verify().unwrap();
+        drop(registration);
+        reset_internal_for_test();
+    }
+}
+
+/// A young value from a chunk this mutator installed since the last stop is
+/// proven young without its header: the owner is claimed once and the claim
+/// filters every later store, exactly as for header-proven values.
+#[test]
+fn unproven_young_value_from_the_own_chunk_claims_the_owner() {
+    let _guard = isolated_runtime();
+    quiet_heap();
+    let _registration = MutatorRegistration::new();
+    let mut tls = tlab_state_for_test();
+    let mut parent = old_object();
+    willow_push_root(&mut parent);
+    let claims = owner_claims();
+    let locks = shared_locks();
+    for value in 0..1000 {
+        store_unproven_value(parent, young_object(&mut tls, value));
+    }
+    assert_eq!(shared_locks(), locks);
+    let after = owner_claims();
+    assert_eq!((after[0] - claims[0], after[1] - claims[1]), (0, 1));
+    assert_eq!(pending_edges(), 1);
+    stop();
+    assert!(remembered(parent));
+    assert_eq!(remembered_len(), 1);
+    verify().unwrap();
+    minor();
+    let child = unsafe { *parent.cast::<*mut u8>() };
+    assert_eq!(unsafe { *child.cast::<u64>() }, 999);
+    willow_pop_root();
+    reset_internal_for_test();
+}
+
+/// Header-proven young values keep claiming through the header proof.
+#[test]
+fn header_proven_young_value_claims_through_the_header() {
+    let _guard = isolated_runtime();
+    quiet_heap();
+    let _registration = MutatorRegistration::new();
+    let mut tls = tlab_state_for_test();
+    let parent = old_object();
+    let claims = owner_claims();
+    store(parent, young_object(&mut tls, 1));
+    let after = owner_claims();
+    assert_eq!((after[0] - claims[0], after[1] - claims[1]), (1, 0));
+    stop();
+    assert!(remembered(parent));
+    reset_internal_for_test();
+}
+
+/// A young value allocated before the last stop is no longer proven by its
+/// chunk: the store is logged exactly and still remembered, so the minor keeps
+/// the child. Negative: a drain that lost that entry fails verification.
+#[test]
+fn unproven_young_value_from_before_a_stop_is_logged_exactly() {
+    let _guard = isolated_runtime();
+    quiet_heap();
+    let _registration = MutatorRegistration::new();
+    let mut tls = tlab_state_for_test();
+    let mut parent = old_object();
+    willow_push_root(&mut parent);
+    let mut child = young_object(&mut tls, 31);
+    willow_push_root(&mut child);
+    stop();
+    let claims = owner_claims();
+    store_unproven_value(parent, child);
+    assert_eq!(owner_claims(), claims, "a stop must end the chunk proof");
+    assert_eq!(pending_edges(), 1);
+    let header = HeapObject::from_payload(GcPayload::from_raw(parent).unwrap());
+    assert!(!header.remembered());
+    stop();
+    assert!(remembered(parent));
+    verify().unwrap();
+    willow_pop_root();
+    minor();
+    let moved = unsafe { *parent.cast::<*mut u8>() };
+    assert_eq!(unsafe { *moved.cast::<u64>() }, 31);
+    willow_pop_root();
+    reset_internal_for_test();
+
+    // Negative: dropping the exact entry loses the edge, and verification
+    // detects it.
+    quiet_heap();
+    let _registration = MutatorRegistration::new();
+    let mut tls = tlab_state_for_test();
+    let parent = old_object();
+    let child = young_object(&mut tls, 32);
+    stop();
+    store_unproven_value(parent, child);
+    unsafe { bound_in(&owner().gc).unwrap().edges() }.clear();
+    stop();
+    assert!(!remembered(parent));
+    assert!(
+        verify().is_err(),
+        "lost unproven young edge went undetected"
+    );
+    reset_internal_for_test();
+}
+
+/// A young value from another mutator's chunk is not proven by this
+/// mutator's chunks: it is logged exactly, remembered at the stop, and the
+/// child survives the minor.
+#[test]
+fn unproven_young_value_from_another_mutators_chunk_is_logged_exactly() {
+    let _guard = isolated_runtime();
+    quiet_heap();
+    let _registration = MutatorRegistration::new();
+    let mut tls = tlab_state_for_test();
+    let mut parent = old_object();
+    willow_push_root(&mut parent);
+    let child = young_object(&mut tls, 77);
+    let (parent_address, child_address) = (parent as usize, child as usize);
+    // Idle, this thread's log is drained by the other thread's stop.
+    let idle = unsafe { safepoint::IdleMutator::enter() };
+    std::thread::scope(|scope| {
+        scope
+            .spawn(crate::runtime::serving(move || {
+                let _registration = MutatorRegistration::new();
+                let mut tls = tlab_state_for_test();
+                // This mutator has a chunk of its own; it proves nothing about
+                // the other mutator's value.
+                let _ = young_object(&mut tls, 1);
+                let claims = owner_claims();
+                store_unproven_value(parent_address as *mut u8, child_address as *mut u8);
+                assert_eq!(owner_claims(), claims);
+                assert_eq!(pending_edges(), 1);
+                stop();
+                assert!(remembered(parent_address as *mut u8));
+            }))
+            .join()
+            .unwrap();
+    });
+    drop(idle);
+    verify().unwrap();
+    minor();
+    let moved = unsafe { *parent.cast::<*mut u8>() };
+    assert_eq!(unsafe { *moved.cast::<u64>() }, 77);
+    willow_pop_root();
+    reset_internal_for_test();
+}
+
+/// Old and young unproven values into the same owners: only owners holding a
+/// young value are remembered, whatever the store order.
+#[test]
+fn mixed_unproven_stores_remember_exactly_the_young_owners() {
+    let _guard = isolated_runtime();
+    quiet_heap();
+    let _registration = MutatorRegistration::new();
+    let mut tls = tlab_state_for_test();
+    let young_first = old_object();
+    let old_first = old_object();
+    let old_only = old_object();
+    let old_value = old_object();
+    let young_value = young_object(&mut tls, 5);
+    store_unproven_value(young_first, young_value);
+    store_unproven_value(old_first, old_value);
+    store_unproven_value(old_only, old_value);
+    store_unproven_value(old_first, young_value);
+    // An old value into an already claimed owner is filtered inline.
+    store_unproven_value(young_first, old_value);
+    stop();
+    assert!(remembered(young_first));
+    assert!(remembered(old_first));
+    assert!(!remembered(old_only));
+    assert_eq!(remembered_len(), 2);
+    verify().unwrap();
+    reset_internal_for_test();
+}
+
+fn chunk_epoch() -> u64 {
+    owner().gc.chunk_epoch.load(Ordering::Relaxed)
+}
+
+#[test]
+fn repeated_unproven_stores_of_one_old_value_log_once_per_epoch() {
+    let _guard = isolated_runtime();
+    quiet_heap();
+    let _registration = MutatorRegistration::new();
+    let mut tls = tlab_state_for_test();
+    // A published nursery makes young edges possible at all.
+    young_object(&mut tls, 0);
+    let shared = old_object();
+    for n in [
+        EDGE_LOG_CAPACITY + 1,
+        4 * EDGE_LOG_CAPACITY,
+        64 * EDGE_LOG_CAPACITY,
+    ] {
+        let owners: Vec<_> = (0..n).map(|_| old_object()).collect();
+        stop();
+        // A fresh TLAB installs a chunk, so the cache starts cold for each n.
+        young_object(&mut tlab_state_for_test(), 1);
+        let (locks, drops) = (shared_locks(), old_value_drops_for_test());
+        for &parent in &owners {
+            store_unproven_value(parent, shared);
+        }
+        // The first full log flushes once and proves the value outside every
+        // chunk; every later store of it is dropped without an entry.
+        assert_eq!(shared_locks() - locks, 1, "n={n}");
+        assert_eq!(
+            old_value_drops_for_test() - drops,
+            (n - EDGE_LOG_CAPACITY - 1) as u64,
+            "n={n}"
+        );
+        assert_eq!(pending_edges(), 1, "n={n}");
+        stop();
+        assert_eq!(remembered_len(), 0, "n={n}");
+        verify().unwrap();
+    }
+    minor();
+    verify().unwrap();
+    reset_internal_for_test();
+}
+
+#[test]
+fn a_chunk_install_invalidates_the_old_value_cache() {
+    let _guard = isolated_runtime();
+    quiet_heap();
+    let _registration = MutatorRegistration::new();
+    let mut tls = tlab_state_for_test();
+    young_object(&mut tls, 0);
+    let shared = old_object();
+    note_old_value_for_test(owner(), shared as usize);
+    let parent = old_object();
+    let drops = old_value_drops_for_test();
+    store_unproven_value(parent, shared);
+    assert_eq!(old_value_drops_for_test() - drops, 1);
+    assert_eq!(pending_edges(), 0);
+    // Another TLAB installs a chunk: the epoch moves and the cache is void.
+    let epoch = chunk_epoch();
+    let mut other = tlab_state_for_test();
+    young_object(&mut other, 1);
+    assert!(chunk_epoch() > epoch);
+    store_unproven_value(old_object(), shared);
+    assert_eq!(old_value_drops_for_test() - drops, 1);
+    assert_eq!(pending_edges(), 1);
+    stop();
+    assert_eq!(remembered_len(), 0);
+    verify().unwrap();
+    reset_internal_for_test();
+}
+
+#[test]
+fn a_survivor_destination_advances_the_chunk_epoch() {
+    let _guard = isolated_runtime();
+    quiet_heap();
+    let _registration = MutatorRegistration::new();
+    let mut tls = tlab_state_for_test();
+    let mut parent = old_object();
+    willow_push_root(&mut parent);
+    store(parent, young_object(&mut tls, 41));
+    stop();
+    let epoch = chunk_epoch();
+    minor();
+    let moved = unsafe { *parent.cast::<*mut u8>() };
+    assert_eq!(unsafe { *moved.cast::<u64>() }, 41);
+    let state = runtime().heap.lock().unwrap();
+    let survivor = crate::gc::find_tlab_chunk(&state, moved as usize).is_some();
+    drop(state);
+    // The survivor copy lands in a chunk that joined the heap in this minor.
+    assert!(survivor, "the child must be copied to a survivor chunk");
+    assert!(chunk_epoch() > epoch);
+    willow_pop_root();
+    reset_internal_for_test();
+}
+
+#[test]
+fn young_values_are_never_cached_as_old() {
+    let _guard = isolated_runtime();
+    quiet_heap();
+    let _registration = MutatorRegistration::new();
+    let mut tls = tlab_state_for_test();
+    let mut child = young_object(&mut tls, 51);
+    willow_push_root(&mut child);
+    // The stop ends the chunk proof: stores of `child` are logged exactly.
+    stop();
+    let owners: Vec<_> = (0..2 * EDGE_LOG_CAPACITY).map(|_| old_object()).collect();
+    let drops = old_value_drops_for_test();
+    for &parent in &owners {
+        store_unproven_value(parent, child);
+    }
+    assert_eq!(
+        old_value_drops_for_test(),
+        drops,
+        "a young value was cached"
+    );
+    stop();
+    for &parent in &owners {
+        assert!(remembered(parent));
+    }
+    verify().unwrap();
+    willow_pop_root();
+    reset_internal_for_test();
+
+    // Negative: a wrongly cached young value drops its edge, and verification
+    // detects the loss.
+    quiet_heap();
+    let _registration = MutatorRegistration::new();
+    let mut tls = tlab_state_for_test();
+    let child = young_object(&mut tls, 52);
+    stop();
+    let parent = old_object();
+    note_old_value_for_test(owner(), child as usize);
+    store_unproven_value(parent, child);
+    assert_eq!(pending_edges(), 0);
+    stop();
+    assert!(!remembered(parent));
+    assert!(
+        verify().is_err(),
+        "a young edge dropped by the old-value cache went undetected"
+    );
     reset_internal_for_test();
 }

@@ -63,15 +63,20 @@ pub(super) fn payload_generation(state: &GcState, payload: *mut u8) -> Option<u8
 // Old-region objects cannot be young. Callers testing only for a young edge
 // must not search the old-region and per-region allocation indexes first.
 pub(super) fn tlab_payload_generation(state: &GcState, address: usize) -> Option<u8> {
-    if let Some(chunk) = find_tlab_chunk(state, address) {
-        // Active generated chunks are exclusively young. Their header prefix
-        // is still advancing, so do not inspect unpublished headers here.
-        if chunk.owner_state.is_some() {
-            return Some(GC_GENERATION_YOUNG);
-        }
-        return object_in_retired_chunk(chunk, address, false).map(|object| object.generation());
+    tlab_chunk_generation(state, address).flatten()
+}
+
+/// [`tlab_payload_generation`] of an address inside a TLAB chunk, or `None`
+/// when `address` lies outside every TLAB chunk (so it is not young until a
+/// chunk joins the heap). One chunk lookup.
+pub(super) fn tlab_chunk_generation(state: &GcState, address: usize) -> Option<Option<u8>> {
+    let chunk = find_tlab_chunk(state, address)?;
+    // Active generated chunks are exclusively young. Their header prefix is
+    // still advancing, so do not inspect unpublished headers here.
+    if chunk.owner_state.is_some() {
+        return Some(Some(GC_GENERATION_YOUNG));
     }
-    None
+    Some(object_in_retired_chunk(chunk, address, false).map(|object| object.generation()))
 }
 
 /// Record an old owner with a young child: its card, its remembered-set
@@ -648,6 +653,8 @@ pub(crate) fn write_barrier_in(
             value,
             destination_kind,
             owner_has_header && destination_kind != GcStoreDestination::IndirectReference as i64,
+            // `young_edge_possible` already rejected a header-proven old value.
+            value_has_header,
             serves_thread(),
         )
     {

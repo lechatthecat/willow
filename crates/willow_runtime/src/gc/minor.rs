@@ -495,6 +495,12 @@ impl<'a> MinorCollector<'a> {
             }
             self.owner.gc.root_tlabs.insert(&chunk);
             self.state.tlab_chunks.push(chunk);
+            // A survivor chunk joins the heap: cached outside-chunk values
+            // may lie in it now.
+            self.owner
+                .gc
+                .chunk_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
             self.index_chunk(index);
             self.state.survivor_stats.survivor_space_reserved += GC_TLAB_CHUNK_SIZE as u64;
             self.survivor_destination = Some(index);

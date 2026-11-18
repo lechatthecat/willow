@@ -1244,6 +1244,10 @@ pub(crate) struct GcRuntime {
     /// publish an object, and cleared only by the quiescent runtime reset.
     /// Keeping it set after collection avoids racing a concurrent refill.
     tlab_ever_allocated: std::sync::atomic::AtomicBool,
+    /// Advanced, under the heap lock, whenever a TLAB chunk joins the heap (a
+    /// TLAB install or a survivor destination). Mutator logs cache values
+    /// found outside every chunk only for an unchanged epoch.
+    chunk_epoch: mutator_log::ChunkEpoch,
     /// Always acquired before `heap`; marking temporarily releases the heap
     /// lock while registered trace callbacks run.
     collect_lock: Mutex<()>,
@@ -1338,6 +1342,7 @@ impl GcRuntime {
             write_barrier_calls: barrier::BarrierCallCounter::new(),
             mutator_log_drained_entries: AtomicU64::new(0),
             tlab_ever_allocated: std::sync::atomic::AtomicBool::new(false),
+            chunk_epoch: mutator_log::ChunkEpoch::new(),
             collect_lock: Mutex::new(()),
             root_stack_owner: Mutex::new(None),
             skipped_foreign_owner_collections: std::sync::atomic::AtomicU64::new(0),

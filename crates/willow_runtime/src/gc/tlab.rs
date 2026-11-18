@@ -576,6 +576,9 @@ pub(super) fn install_tlab_chunk(
         concurrent_marks,
         header_offsets,
     });
+    // Release pairs with the barrier's acquire: a value allocated here and
+    // handed to another mutator invalidates that mutator's old-value cache.
+    owner.gc.chunk_epoch.fetch_add(1, Ordering::Release);
     super::publish::install_chunk_owner(owner, state, state.tlab_chunks.len() - 1);
     let chunk = state.tlab_chunks.last().unwrap();
     owner.gc.root_tlabs.insert(chunk);
