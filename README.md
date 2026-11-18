@@ -5,7 +5,7 @@
 [![CI](https://github.com/lechatthecat/willow/actions/workflows/ci.yml/badge.svg)](https://github.com/lechatthecat/willow/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**A native, garbage-collected language whose compiler enforces concurrency rules, proves function contracts, and explains program semantics to humans and AI coding agents.**
+**A native, garbage-collected language whose compiler enforces specific concurrency rules, proves opt-in function contracts, and explains program semantics to humans and AI coding agents.**
 
 Willow is statically typed and compiles to native code using [Cranelift](https://cranelift.dev/). It pairs Rust-style enums and pattern matching with classes, a garbage collector and lightweight async tasks, and includes its own async runtime, package manager, and incremental compiler infrastructure.
 
@@ -15,7 +15,7 @@ Its premise is simple: **when a person or an AI agent changes a program, the com
 
 **Readable first, proven where it matters.** Willow code is meant to be read, by people and by AI agents alike. Its syntax is deliberately familiar, so anyone who knows Rust or Kotlin can follow it and agents can apply what they already know. Concurrency checks run in the compiler without adding concepts to everyday code, and proof is opt-in: mark the functions that matter with [`@verified`](#verified-prove-a-contract-with-z3) and leave the rest as ordinary code.
 
-**Status:** Experimental research/engineering project. **Not production-ready.** The compiler rejects specific classes of concurrency mistakes—non-`Sync` references shared without exclusive access across async calls (E2402), modeled waits inside Willow lexical locks (E2604), and unsafe lock nesting or acquisition cycles (E2605)—but this is not a proof that arbitrary Willow programs are free of deadlocks, races, or other bugs. See [Current boundaries](#current-boundaries).
+**Status:** Experimental research/engineering project. **Not production-ready.** An accepted program has specific guarantees: async calls capture only shareable or exclusively lent values (E2402), a `lock` body never waits (E2604), and nested locks follow one acyclic order (E2605). These are not a proof that a Willow program is free of deadlocks, data races or other bugs. See [what each check guarantees](#concurrency-checks-what-the-compiler-guarantees) and [Current boundaries](#current-boundaries).
 
 This README describes the current `main` branch. Some features are newer than the latest prebuilt release; see [Try Willow](#try-willow).
 
@@ -23,7 +23,7 @@ This README describes the current `main` branch. Some features are newer than th
 - [A taste of Willow](#a-taste-of-willow)
 - [Try Willow](#try-willow)
 - [Rust interop](#rust-interop)
-- [Concurrency guarantees](#concurrency-the-compiler-follows-the-wait)
+- [Concurrency guarantees](#concurrency-checks-what-the-compiler-guarantees)
 - [Proven contracts](#contracts-from-run-time-checks-to-proofs)
 - [Locks](#locks-designed-together-with-the-compiler-and-scheduler)
 - [Semantic tooling](#semantic-tooling-for-people-and-ai-agents)
@@ -269,27 +269,56 @@ for review freshness, stack limits and remaining effects.
 For dependency inspection, update impact and adapter diagnostics, see the
 [Rust bridge guide](protocol/ai_toolchain/RUST_BRIDGE.md).
 
-## Concurrency: the compiler follows the wait
+## Concurrency checks: what the compiler guarantees
 
-### E2402: prevent unsafe sharing across tasks
+These checks run during ordinary `willow check` and `willow build`, and each
+rejects a program with a compile-time error. The table states what every
+**accepted** program is guaranteed. Each section below shows the check and
+then lists its limits, with the test or source location that establishes each
+limit.
 
-Willow infers `Send` and `Sync` structurally; user code cannot implement these
-markers manually. Calling an `async fn` captures its arguments into a Task.
-Shared reference arguments must be `Sync`. Fresh, unescaped local `Array`,
-`Map`, and class values whose contents are `Send` can instead be lent exclusively: after
-`let t = change(values)`, neither `values` nor its aliases can be used until
-`await t` completes. `await change(values)` restores access immediately afterward.
-Independent collections can run in parallel tasks. Async collection parameters
-cannot escape into another task, shared storage, or an opaque helper.
+| Check | Guarantee for an accepted program | Main limit |
+| --- | --- | --- |
+| [E2402, E2408](#e2402-async-calls-capture-only-shareable-or-exclusively-lent-values) | Every reference an `async fn` call captures is `Sync`, or is a fresh local value that nothing else can use until the Task is awaited. A value sent on a channel or put in a `Mutex` cannot be used through its old aliases. | Only these task boundaries are checked: static fields are shared without a check |
+| [E2604](#e2604-a-lock-body-never-waits) | A `lock` body never awaits, selects, waits on a channel, uses a blocking cell, calls a synchronous file API or calls foreign code, directly or through any chain of calls. A callee without effect evidence counts as waiting. | Console output is allowed; foreign code declared `nonblocking` is trusted |
+| [E2605](#e2605-nested-locks-follow-one-acyclic-order) | Nested `lock` statements across the whole project follow one acyclic order, and no lock is acquired again while held. | Locks that the compiler cannot tell apart cannot be nested; use a group `lock` |
+| [`@effects(...)`, E2610–E2612](#effect-contracts-declare-the-property-on-any-function) | A function with an effect contract performs the forbidden effect nowhere, directly or through helpers, dispatch and imports. A call whose effect is unknown is rejected as well. | Foreign declarations that promise `no_io` are trusted |
+| [E2607](#e2607-a-bug-finder-for-some-permanent-waits) | None. E2607 is a bug finder that reports some certain permanent waits. | It analyzes only very simple straight-line code reachable from `main` |
 
-This proof supports unconditional body-level calls and awaits, including fresh
-class values, class-field collections, and statically resolved async methods.
-Lending a field also restricts access through the containing object and its aliases.
-Control-flow loans and opaque ownership remain conservatively rejected.
-See the runnable [collection](example/owned_task_loans.wi) and
-[class](example/owned_class_task_loans.wi) examples.
+No check proves deadlock freedom: Tasks can still wait for each other forever
+through channels and `await` outside locks.
 
-Mutable collections and classes containing them remain non-`Sync`:
+### E2402: async calls capture only shareable or exclusively lent values
+
+**Guarantee.** Calling an `async fn` captures its arguments into a Task that
+may run on another worker. Each captured reference must be `Sync`, or it must
+be a fresh, unescaped local `Array`, `Map` or class value whose contents are
+`Send`. Such a value is *lent*: after `let t = change(values)`, neither
+`values` nor its aliases can be used until `await t` completes, and
+`await change(values)` restores access immediately. Independent values can be
+lent to parallel Tasks, and lending a class field also locks out the containing
+object and its aliases. A Task moves between workers only if its parameters,
+result and locals live across `await` are `Send`. After a value is sent on a
+channel (whose item type must be `Send`, E2403) or placed in a `Mutex`, its
+previous aliases cannot be used (E2408).
+
+`Send` and `Sync` are inferred structurally; user code cannot implement them
+(E2401):
+
+| Type | `Send` | `Sync` |
+| --- | --- | --- |
+| Scalars, `String`, fieldless enums, atomics, function pointers | Yes | Yes |
+| `Array<T>`, `Map<K, V>` | When the elements are | Never |
+| `FrozenArray<T>`, `FrozenMap<K, V>`, `Option`, `Result`, payload enums | When the contents are | When the contents are |
+| `Mutex<T>`, `Channel<T>` | When `T` is `Send` | When `T` is `Send` |
+| `Task<T>` | When `T` is `Send` | Never |
+| `RwLock<T>` | When `T` is `Send` and `Sync` | When `T` is `Send` and `Sync` |
+| Classes | When all fields are | When all fields are, and no field is reassigned after construction |
+| Interfaces | When the interface extends `Send` or `Sync` | When the interface extends `Sync` |
+| Closures | Never | Never |
+
+A mutable collection or a class containing one is not `Sync`, so it can only be
+lent:
 
 ```willow
 import std::collections::Array;
@@ -310,7 +339,7 @@ async fn main() {
 }
 ```
 
-Protect a shared mutable value with `Mutex<T>` instead:
+To share a mutable value between running Tasks, protect it with `Mutex<T>`:
 
 ```willow
 import std::collections::Array;
@@ -329,19 +358,32 @@ async fn main() {
 }
 ```
 
-`Mutex<T>` and `Channel<T>` can be shared when `T` is `Send`; `RwLock<T>`
-requires both `Send` and `Sync` because multiple readers can access its value.
-Atomics also support shared mutable state. For read-only data, `String`, scalars,
-`FrozenArray`/`FrozenMap` with `Sync` elements, and classes whose fields are all
-`Sync` and never reassigned after construction can be shared. These checks
-cover modeled task boundaries, not every possible data race.
+See the runnable [collection](example/owned_task_loans.wi),
+[class](example/owned_class_task_loans.wi) and
+[ownership transfer](example/ownership_transfer.wi) examples.
 
-See [`send_sync.rs`](src/semantic/type_checker/send_sync.rs) and the
-[`capture_checking.rs`](tests/integration/concurrency/capture_checking.rs) tests.
+**Limits**
 
-### E2604: no suspension or blocking wait while holding a Willow lock
+| Limit | Effect | Evidence |
+| --- | --- | --- |
+| Static class fields are not a checked task boundary | Tasks can mutate a non-`Sync` static field concurrently without a diagnostic. Protect such state with `Mutex<T>` or atomics yourself. | The check runs on async call arguments only: `check_async_capture` in [`send_sync.rs`](src/semantic/type_checker/send_sync.rs) |
+| Loans inside `if`, loops, `defer` or a closure capture | Rejected, even when safe. Lend at the top level of the function body. | `task_loans_accept_owned_and_reject_alias_hazards` in [`transfer_ownership.rs`](src/semantic/type_checker/transfer_ownership.rs) |
+| Lending an async parameter to another Task or storing it in shared state | Rejected | `owned_task_loans_imported_callee_and_escape_contract` in [`capture_checking.rs`](tests/integration/concurrency/capture_checking.rs) |
+| Closure values | Never `Send` or `Sync`, so they cannot be passed to an async call; environment-free function pointers can | `test_closure_async_e2402_help` in [`capture_checking.rs`](tests/integration/concurrency/capture_checking.rs) |
+| Memory inside Rust adapters and native libraries | Not analyzed | [Where the guarantees stop](#where-the-guarantees-stop) |
 
-This deliberately invalid program demonstrates the compile-time diagnostic:
+### E2604: a lock body never waits
+
+**Guarantee.** A `lock` body (allowed only in an `async fn`, E2603) is rejected
+if it may wait while the lock is held. The compiler treats these operations as
+waiting: `await`, `select`, `Channel` `send`/`recv`/`recv_opt`,
+`BlockingCell`/`BlockingRwCell` access, synchronous `std::fs` calls, and calls
+to Rust adapters. Calls are followed through synchronous helper chains, virtual
+methods and interface dispatch, function values and closures, and imported
+modules. A callee without effect evidence counts as waiting. Nested locks are
+checked by [E2605](#e2605-nested-locks-follow-one-acyclic-order).
+
+This deliberately invalid program demonstrates the diagnostic:
 
 ```willow
 fn receive(ch: Channel<i64>) -> i64 {
@@ -358,11 +400,10 @@ async fn main() {
 }
 ```
 
-`receive` contains no `await`, and the critical section calls only an ordinary synchronous helper. But `receive` can wait on `Channel.recv()`. Willow follows the call and rejects it **at compile time** instead of allowing a task to wait while still holding the mutex.
-
-The same rule rejects a direct `await`, `select`, waiting channel operation, or a call whose transitive effects include `MAY_BLOCK` or `MAY_SUSPEND`.
-
-Move the waiting operation outside the critical section:
+`receive` contains no `await`, and the critical section calls only an ordinary
+synchronous helper. But `receive` can wait on `Channel.recv()`. Willow follows
+the call and rejects it instead of letting a Task wait while it holds the
+mutex. Move the waiting operation outside the critical section:
 
 ```willow
 fn receive(ch: Channel<i64>) -> i64 {
@@ -381,43 +422,65 @@ async fn main() {
 }
 ```
 
-The compiler is enforcing a **semantic constraint**, not looking for the literal word `await`. That distinction matters when an AI agent edits a helper several calls away from the critical section.
+The compiler enforces a **semantic constraint**, not a search for the literal
+word `await`. That matters when an AI agent edits a helper several calls away
+from the critical section.
 
-The implementation and regression tests are in [`src/semantic/effects.rs`](src/semantic/effects.rs), [`src/compiler_db/effects.rs`](src/compiler_db/effects.rs), and [`tests/integration/concurrency/lock_restrictions.rs`](tests/integration/concurrency/lock_restrictions.rs). See the runnable [scheduler-aware lock example](example/scheduler_aware_lock.wi).
+**Limits**
 
-### The analysis follows the program, not just the local syntax
+| Limit | Effect | Evidence |
+| --- | --- | --- |
+| Console output | `print` and `println` are allowed in a lock body, although `@effects(no_block)` counts them as blocking. A slow or full stdout can stall the lock holder. | The lock-wait operations listed in `record_builtin_lock_effect` and `record_static_builtin_lock_effect` in [`check.rs`](src/semantic/type_checker/check.rs) |
+| Foreign calls declared `nonblocking("<review_fingerprint>")` | Allowed in a lock body. This is a developer assertion, not a proof about the Rust code. | `nonblocking_task_scalar_aggregate_indirect_lock_and_no_wait` in [`rust_scalar_bridge.rs`](tests/rust_scalar_bridge.rs) |
+| Calls through function values | Matched by parameter count: a harmless indirect call is rejected if any function value with the same number of parameters may wait | `IndirectLockSession` in [`compiler_db/effects.rs`](src/compiler_db/effects.rs); `indirect_lock_11_arity_mismatch_accepted` in [`indirect_lock.rs`](tests/integration/concurrency/indirect_lock.rs) |
+| Long or endless computation | Not rejected: there is no termination effect, so a lock body can loop forever | The effect bits in `RuntimeEffects`, [`willow_abi`](crates/willow_abi/src/lib.rs) |
+| Blocking compatibility types used outside a `lock` body | `BlockingCell` and `BlockingRwCell` block their worker and are not part of the lock checks | `rwlock_lower_08_blocking_compatibility_type_is_explicit` in [`lock_restrictions.rs`](tests/integration/concurrency/lock_restrictions.rs) |
 
-Willow computes effect summaries over the compiler's call graph using a monotone fixed point. Important cases include:
+The implementation and regression tests are in
+[`src/semantic/effects.rs`](src/semantic/effects.rs),
+[`src/compiler_db/effects.rs`](src/compiler_db/effects.rs) and
+[`lock_restrictions.rs`](tests/integration/concurrency/lock_restrictions.rs).
+See the runnable [scheduler-aware lock example](example/scheduler_aware_lock.wi).
+
+### How the effect analysis follows calls
+
+Willow computes effect summaries over the compiler's call graph with a monotone
+fixed point. E2604, effect contracts, recoverable-panic handling and
+scheduler/preemption analysis share these summaries.
 
 | Situation | What the compiler accounts for |
 | --- | --- |
-| Direct `await`, `select`, and channel operations | Local suspension/wait effects |
+| Direct `await`, `select` and channel operations | Local suspension or wait |
 | Synchronous helper chains | Transitive `MAY_BLOCK` / `MAY_SUSPEND` |
-| Virtual methods and interface dispatch | Reachable overrides, including a waiting override hidden behind a non-waiting base method |
+| Virtual methods and interface dispatch | Every reachable override, including a waiting override behind a non-waiting base method |
 | Function values and closures | Indirect calls, including calls reached through other helpers |
-| Unknown or unavailable callees | Conservative bounds rather than silently assuming the call is safe |
+| Unknown or unavailable callees | A conservative bound, never an assumption that the call is safe |
 
-Effects have **witnesses**: compiler evidence that can point to the operation responsible for a property. The propagation machinery is shared by multiple consumers, including E2604's lock check, recoverable-panic handling, and scheduler/preemption analysis.
+Effects have **witnesses**: compiler evidence that points to the operation
+responsible for a property. Calling an `async fn` creates a Task but does not
+suspend its caller; only awaiting the Task does. This is another reason a plain
+text scan is not enough.
 
-This is deliberately conservative. In particular, the current lock check approximates indirect function-value targets by parameter count; it can reject a harmless indirect call if another compatible-arity function value may wait. A proof of *no waiting effect* requires sufficient information.
-
-Calling an `async fn` creates a Task; it does not by itself suspend its caller. The analysis distinguishes task creation from actually awaiting it. This is another reason a plain text scan is not enough.
-
-See [shared effect fixpoint](tests/regressions/shared_effect_fixpoint.wi), [virtual dispatch example](tests/regressions/shared_call_graph.wi), and [indirect calls example](example/lock_function_values.wi).
+See the [shared effect fixpoint](tests/regressions/shared_effect_fixpoint.wi),
+[virtual dispatch](tests/regressions/shared_call_graph.wi) and
+[indirect calls](example/lock_function_values.wi) examples.
 
 ### Effect contracts: declare the property on any function
 
-E2604 applies the waiting analysis to lock bodies. `@effects(...)` applies the
-same solved effects to a declaration, so a function can promise the property to
-its callers whether or not it runs under a lock:
+**Guarantee.** `@effects(...)` applies the solved effects to a declaration. A
+function with a contract contains no proven source of the forbidden effect
+(E2610) and no call whose effect is unknown (E2612), through helpers, virtual
+and interface dispatch, and imported modules. An override cannot weaken an
+inherited contract (E2611); an override that declares nothing inherits the base
+contract and is checked against it.
 
 | Contract | Forbids | Still allowed |
 | --- | --- | --- |
 | `no_block` | Blocking waits such as stdout writes or `BlockingCell` reads | `await` and other suspension |
 | `no_suspend` | Suspension such as `await`, `select` and waiting channel operations | Blocking waits |
 | `no_wait` | Both | Creating a Task without awaiting it |
-| `no_panic` | Explicit panic and checked language faults, including bounds, integer arithmetic and requires/ensures guards | Operations whose panic-free behavior is established by the effect analysis |
-| `no_alloc` | Managed allocation, including literals, objects, closures, tasks and allocating runtime calls | Scalar computation and access to existing values |
+| `no_panic` | Explicit panic and checked language faults, including bounds, integer arithmetic and `requires`/`ensures` guards | Operations that the effect analysis proves panic-free |
+| `no_alloc` | Managed allocation, including literals, objects, closures, Tasks and allocating runtime calls | Scalar computation and access to existing values |
 | `no_io` | External resource access: console output, filesystem, network, process arguments and explicit clock reads, including async operations | Computation, allocation and synchronization |
 
 ```willow
@@ -438,46 +501,9 @@ error[E2610]: effect contract `no_wait` violated by `guard`
 note: certainty: compiler-proven; call chain: guard -> helper -> $output::println
 ```
 
-Contracts are checked fail-closed:
-
-- **E2610**: a proven witness violates the contract, transitively through helpers, dispatch and imported modules.
-- **E2611**: an override weakens an inherited contract. Overrides that declare nothing inherit the base contract and are checked against it.
-- **E2612**: the property cannot be proven, for example when the function calls an arbitrary function-value parameter. Missing evidence is not treated as success.
-
-`no_panic` includes checked integer faults even in profiles that wrap integer
-arithmetic. It is a conservative effect proof, not a value-range proof: a
-potential guard is rejected even when an application invariant would prevent
-it from failing. It does not promise termination or prevent hardware faults,
-out-of-memory aborts, stack exhaustion, or failures inside runtime housekeeping.
-
-`no_alloc` forbids managed/GC allocation at language operations and runtime ABI
-calls. String literals count because first use initializes their cached managed
-object. Materialized ranges and implicit interface/scalar-pair boxes used by
-storage operations count too; a syntactic `for i in start..end` uses scalar
-bounds without creating a Range object. Iterating a Map allocates an entries
-snapshot; iterating an existing array or range does not. Tag-only enums, scalar Option/Result
-pairs, and nullable-pointer Options do not allocate on construction. Options
-containing interfaces, and `Option<T>` of a generic parameter `T`, use or may
-use a heap box, including `None` and `?` failure values. The `?`
-operator counts only allocations required by its failure representation or
-implicit error conversion, including the conversion method's effects.
-Allocations solely for compiler-generated fault reporting (for example the
-message of a failed bounds check, `len()` on a null array or `unwrap()` of an
-empty value), GC and scheduler bookkeeping are outside this contract; it is not a promise of zero
-native allocator calls or of no GC safepoints. Explicit allocating expressions
-on a panic branch still count. Foreign implementations and arbitrary callbacks
-remain unknown for both contracts; extern declarations accept only
-`@effects(no_io)`. Combine `no_alloc` and `no_panic` when both are required.
-Loop invariants and variants are verifier-only and contribute no effects;
-`requires`/`ensures` guards run and count.
-
-`no_io` applies transitively, including virtual calls and imported functions. It is
-an effect contract, not an operating-system sandbox. Runtime housekeeping (GC,
-scheduling, clocks and fault reporting) is outside its external-resource scope.
-
-Foreign Rust and native-library implementations are opaque. Their I/O behavior
-is **UNKNOWN**, and a caller's `no_io` proof fails with E2612 unless the foreign
-declaration explicitly promises no I/O:
+Rust adapters and native libraries are opaque. A caller's `no_io` proof fails
+with E2612 unless the foreign declaration promises no I/O; extern declarations
+accept only `@effects(no_io)`:
 
 ```willow
 extern rust {
@@ -486,15 +512,92 @@ extern rust {
 ```
 
 This declaration is a **trusted developer boundary**: Willow does not inspect
-or verify the foreign implementation, its dependencies, or destructors. An
-incorrect declaration invalidates the guarantee. It does not imply nonblocking;
-the existing `nonblocking("<review_fingerprint>")` modifier remains independent
-and follows the annotation when both are used. The same declaration applies
-when the bridge resolves through a native library. `effects` exposes the I/O
-bit (64), and `verify-edit` reports it as `may-io`.
-See [the runnable I/O contract example](example/io_contracts.wi).
+the foreign implementation, its dependencies or destructors, and an incorrect
+declaration invalidates the guarantee. It does not imply `nonblocking`; the two
+modifiers are independent, and `@effects(no_io)` comes first when both are
+used. `willow effects` reports the I/O bit (64), and `verify-edit` reports it
+as `may-io`.
 
-See [effect contracts](example/effect_contracts.wi) and [contracts across interface dispatch](tests/regressions/effect_contract_dispatch.wi).
+**Limits**
+
+| Limit | Effect | Evidence |
+| --- | --- | --- |
+| A function-value parameter | Its target is unknown, so a `no_wait` caller fails with E2612 | `effect_contract_polymorphic_perspectives` in [`effect_contracts.rs`](src/semantic/type_checker/effect_contracts.rs) |
+| Foreign declarations | Unknown for every contract; `@effects(no_io)` on the declaration is trusted, not verified | `io_contract_permission_matrix` and `panic_allocation_contract_matrix` in [`effect_contracts.rs`](src/semantic/type_checker/effect_contracts.rs) |
+| `no_panic` is an effect proof, not a value-range proof | A potential guard is rejected even when an application invariant prevents it. Checked integer faults count even in profiles that wrap integer arithmetic. | `panic_allocation_checked_profiles` in [`tests/effect_contracts.rs`](tests/effect_contracts.rs) |
+| `no_panic` does not cover the process | It does not promise termination and does not exclude hardware faults, out-of-memory aborts, stack exhaustion or failures inside runtime housekeeping | The effect bits in `RuntimeEffects`, [`willow_abi`](crates/willow_abi/src/lib.rs) |
+| `no_alloc` covers managed allocation by language operations only | Allocation used only to report a compiler-generated fault (such as a failed bounds check or `unwrap()` of an empty value), GC and scheduler bookkeeping are excluded. It does not promise zero native allocator calls or no GC safepoints. `requires`/`ensures` guards count; loop invariants and variants are verifier-only and do not. | `no_alloc_fault_reporting_and_proof_only_clauses` in [`tests/effect_contracts.rs`](tests/effect_contracts.rs) |
+| `no_io` is not an operating-system sandbox | Runtime housekeeping (GC, scheduling, clocks and fault reporting) is outside its scope | `io_contract_std_resource_catalog_is_complete` in [`effect_contracts.rs`](src/semantic/type_checker/effect_contracts.rs) |
+
+What `no_alloc` counts in detail: string literals count, because first use
+initializes their cached managed object. Materialized ranges and the implicit
+interface and scalar-pair boxes used by storage operations count, but a
+syntactic `for i in start..end` uses scalar bounds without a Range object.
+Iterating a Map allocates an entries snapshot; iterating an existing array or
+range does not. Tag-only enums, scalar Option/Result pairs and nullable-pointer
+Options do not allocate on construction. Options containing interfaces, and
+`Option<T>` of a generic parameter `T`, use or may use a heap box, including
+`None` and `?` failure values. The `?` operator counts only allocations required
+by its failure representation or implicit error conversion, including the
+conversion method's effects. Explicit allocating expressions on a panic branch
+still count. Combine `no_alloc` and `no_panic` when both are required.
+
+See [effect contracts](example/effect_contracts.wi),
+[I/O contracts](example/io_contracts.wi) and
+[contracts across interface dispatch](tests/regressions/effect_contract_dispatch.wi).
+
+### E2607: a bug finder for some permanent waits
+
+**What it reports.** E2607 is an error with a witness chain for three shapes
+that wait forever:
+
+- A receive (`recv` or `recv_opt`) on a fresh local channel that nothing in the
+  analyzed program sends to or closes.
+- A Task that awaits itself, including through a handle delivered on a local
+  channel.
+- Tasks that form an await cycle reached from `main`'s own wait chain.
+
+For example, `let ch = Channel<i64>::new(); ch.recv();` is rejected. A self-wait
+arises when `waiter(ch)` receives a Task handle and awaits it, while its caller
+does `let t = waiter(ch); ch.send(t); await t;`. Witnesses identify each Task
+creation and await, and the channels transporting handles. Task-handle
+transfers can also violate the exclusive-ownership rules (E2408); the compiler
+reports both. See the runnable
+[valid sender and escape example](tests/regressions/permanent_wait_escapes.wi).
+
+**Absence of E2607 is not evidence of anything.** The analysis covers `main` of
+the entry module and the same-module functions it calls, and only when all of
+that code uses the small subset below. One construct outside the subset anywhere
+in that code leaves the **whole program** unanalyzed.
+
+| Supported | Not supported: the program is left unanalyzed |
+| --- | --- |
+| `let`, expression statements and `return` | `if`, `match`, loops, `lock`, `defer`, assignment and every other statement |
+| Integer, float, bool and string literals, variables and local aliases | Arithmetic, comparisons, closures, `new`, field access, indexing, collections and every other expression |
+| `Channel<T>::new()` and `with_capacity(n)` with a positive integer literal `n`; `send`, `recv`, `recv_opt` and `close` | `select`, timeouts, cancellation, other methods (including user methods) and other builtin functions such as `sleep` |
+| `await`, `task.result()`, `print` and `println` | Function values, imported and foreign functions, generic templates, functions with `requires`/`ensures` |
+| Calls to same-module top-level functions that themselves call no function; such a function may receive a Task handle as an argument or through a channel | A called function that calls another function (nested or recursive Task factories) |
+
+Inside that subset the analysis is also deliberately cautious, so it misses
+some real permanent waits:
+
+| Rule | Evidence |
+| --- | --- |
+| Any send or close of the channel anywhere in the analyzed code, even after the wait, suppresses the no-sender error | `sender_in_other_task` and `close_in_other_task` in [`permanent_wait/tests.rs`](src/semantic/permanent_wait/tests.rs); the `sends == 0` test in `diagnose`, [`permanent_wait.rs`](src/semantic/permanent_wait.rs) |
+| A receive from a channel that has a send is never reported, even when there are more receives than sends. A Task handle passed on a channel is followed only with exactly one send and one receive. | `ambiguous_task_delivery`; `diagnose` and `target` in [`permanent_wait.rs`](src/semantic/permanent_wait.rs) |
+| A bounded send, or a send on a possibly closed channel, stops the wait chain because it can block or panic first | `bounded_send_before_cycle`, `closed_send_prevents_later_wait`, `peer_close_may_prevent_later_wait` |
+| A channel capacity that is not a positive integer literal stops the proof | `zero_capacity_panics_before_receive`, `unknown_capacity_is_not_proven` |
+| Only the first unresolved await of each Task is followed, because a later await may be unreachable after a panic or cancellation | `diagnose` in [`permanent_wait.rs`](src/semantic/permanent_wait.rs) |
+| Uncalled helpers, detached Tasks and an imported module's `main` are not roots | `unused_helper_is_unknown`, `detached_local_blocked_task`, `imported_main_is_not_a_process_root` |
+| The check does not run when the program has other type or flow errors (E2408 excepted) | The entry condition before `permanent_wait::check` in [`check.rs`](src/semantic/type_checker/check.rs); `type_errors_do_not_trigger_wait_cascades` |
+| An unsupported construct stops the proof | `conditional_receive`, `loop_is_unknown`, `assignment_is_unknown`, `select_timeout`, `function_value`, `escaped_to_collection`, and the syntax filter in [`permanent_wait.rs`](src/semantic/permanent_wait.rs) |
+
+The pass runs in expected linear time and memory in the source size, the
+instantiated summary operations, Tasks, channels and recorded wait edges. Each
+summary is built once and keeps only the first two sends per channel, so
+repeated calls and repeated sends do not multiply. Deterministic tests count
+syntax visits, operations, Tasks, channels, waits and graph steps for growing
+inputs. The pass adds no generated code or runtime bookkeeping.
 
 ## Contracts: from run-time checks to proofs
 
@@ -581,15 +684,55 @@ async fn main() {
 
 - **Task-aware acquisition:** a contended `Mutex<T>` or `RwLock<T>` acquisition parks the Willow task rather than blocking its scheduler worker.
 - **Compiler-managed exit:** the lock is released across supported exits, including fallthrough, early `return`, `break`, `continue`, `?` propagation, and panic unwinding; cancellation also uses the compiler's cleanup path.
-- **No wait inside:** E2604 rejects suspension/blocking waits within the critical section.
-- **Checked nesting:** E2605 rejects cyclic acquisition order, same-lock reacquisition (including read-read), and nesting whose identities cannot be proved safe. Distinct allocation classes with consistent ordering may nest.
+- **No wait inside:** [E2604](#e2604-a-lock-body-never-waits) rejects suspension and blocking waits within the critical section.
+- **Checked nesting:** [E2605](#e2605-nested-locks-follow-one-acyclic-order) rejects cyclic acquisition order and reacquisition.
 - **Read/write modes:** `lock read` and `lock write` provide lexical access to `RwLock<T>`.
 
 These features belong together: the parser, effect checker, async lowering, cleanup logic, and runtime cooperate to enforce a restricted locking discipline. Willow uses a GC rather than a borrow checker or general destructor-based ownership system; the compiler-owned lock scope is part of its design.
 
-**Scope of the claim:** E2604 applies to Willow's modeled scheduler-aware lock sections and known effects. It does **not** imply universal deadlock freedom, absence of all data races, or correct behavior from arbitrary native code. Blocking compatibility primitives and external/foreign calls have separate semantics and must not be mistaken for the lexical lock guarantee.
+The guarantees cover Willow `lock` statements only. `BlockingCell` and
+`BlockingRwCell` are blocking compatibility types with their own semantics, and
+locks inside native code are outside the analysis.
 
 See [Mutex example](example/scheduler_aware_lock.wi), [RwLock example](example/scheduler_aware_rwlock.wi), and [concurrency regression tests](tests/integration/concurrency/).
+
+### E2605: nested locks follow one acyclic order
+
+**Guarantee.** Across the whole project, nested `lock` statements follow one
+acyclic acquisition order, and no lock is acquired again while it is held
+(including two read acquisitions of one `RwLock`). E2605 reports the acquisition
+sites of a cycle. Together with E2604, this rules out a cycle of Tasks in which
+each holds a Willow lock while waiting to acquire another.
+
+Locks are told apart by where they were created. A lock of unknown origin, such
+as a parameter or the value held by another lock, is identified by its value
+type instead, and its order applies to every known lock of that type. This makes
+parent and child locks work without group syntax, because the child is known
+only after the parent is held:
+
+```willow
+async fn bump(parent: Mutex<Mutex<i64>>) {
+    lock parent as child {
+        lock child as mut value { value = value + 1; }
+    }
+}
+```
+
+Taking them in the opposite order elsewhere is reported as a cycle. Awaiting an
+async helper inside a lock is still E2604: compute awaited values before
+entering the critical section, or acquire the required locks together. Merely
+creating an async Task does not run its body on the caller's stack.
+
+**Limits**
+
+| Limit | Effect | Evidence |
+| --- | --- | --- |
+| Two locks the compiler cannot tell apart may be the same lock | Nesting them is rejected: two parameters of one type (such as two `Mutex<i64>`), two locks from one factory function, or collection elements. Use a [group `lock`](#acquiring-multiple-locks). | `ordered_locks_same_type_parameters_need_a_group`, `ordered_locks_factory_locks_are_told_to_use_a_group`, `ordered_locks_collection_elements_of_one_type_are_rejected` in [`ordered_locks.rs`](tests/integration/concurrency/ordered_locks.rs) |
+| A recursive type such as `Mutex<Node>` reached through a `Node` field | Holding one node while locking the next (hand-over-hand traversal) is rejected. A loop that locks one node at a time works, but another Task can change the list between two steps. | `ordered_locks_recursive_lock_type_is_rejected`; [`parent_child_locks.wi`](example/parent_child_locks.wi) |
+| A generic `Mutex<T>` has no type order | Nesting inside a generic function or class stays conservative; use group syntax there | `ordered_locks_type_parameter_has_no_type_class`, `ordered_locks_known_locks_in_generic_bodies_stay_conservative` |
+| Order between Tasks waiting on channels or `await` | Not covered: a Task can still hold no lock and wait forever for another Task | [E2607](#e2607-a-bug-finder-for-some-permanent-waits) covers only some of these waits |
+
+See [ordered locks](example/ordered_locks.wi) and [parent and child locks](example/parent_child_locks.wi) for runnable examples.
 
 ### Acquiring multiple locks
 
@@ -611,51 +754,18 @@ source order. Duplicate handles are rejected, including two read acquisitions
 of the same RwLock. Each member may specify its own mode, for example
 `lock account as mut value, read rates as rate { ... }`.
 
-A contended group releases everything it holds before parking in the busy
-lock's FIFO queue, and normally keeps that lock when its turn comes while it
-tries the other members. It never holds a member while waiting, so a group
-cannot deadlock with nested locks taken in another order. Retries sleep rather
-than spin, but group acquisition is **not fair** and has no retry limit: if other
-tasks keep different members busy in turn, one group can wait indefinitely. Avoid
-holding a member of a heavily contended group for long.
+**Guarantee.** A group never holds a member while it waits, so it cannot
+deadlock with nested locks taken in another order. A contended group releases
+everything it holds before parking in the busy lock's FIFO queue, and normally
+keeps that lock when its turn comes while it tries the other members. Retries
+sleep rather than spin.
 
-Scope exits, panic and cancellation release acquired locks in reverse order;
-writes already made are committed, not rolled back. This provides mutual
-exclusion, not transactional rollback.
+**Limits**
 
-Ordinary nested locks require an acyclic acquisition order. E2605 reports the
-acquisition sites involved in a cycle. Locks are told apart by where they were
-created; a lock of unknown origin, such as a parameter or the value held by
-another lock, is identified by its value type instead. This makes parent and
-child locks work without group syntax, because the child is only known after
-the parent is held:
-
-```willow
-async fn bump(parent: Mutex<Mutex<i64>>) {
-    lock parent as child {
-        lock child as mut value { value = value + 1; }
-    }
-}
-```
-
-Taking them in the opposite order elsewhere is reported as a cycle. Nesting two
-locks that cannot be told apart is rejected, because they may be the same lock:
-two parameters of one type, two locks from one factory function, collection
-elements, or a recursive type such as `Mutex<Node>` reached through a `Node`
-field. Two `Mutex<i64>` parameters are the common case; use group syntax for the
-first three. Holding one node while locking the next (hand-over-hand traversal)
-is not supported for a recursive type. A loop that locks one node at a time works,
-as `example/parent_child_locks.wi` shows, but another task can change the list
-between two steps. A lock of unknown origin may be any lock of its type, so its
-order applies to each known lock of that type, while known locks stay distinct
-from one another. Generic `Mutex<T>` values have no type order, and
-nesting inside a generic function or class stays conservative: use group syntax
-there. Awaiting an async helper inside a lock is
-still E2604: compute awaited values before entering the critical section, or
-acquire the required locks together. Merely creating an async task does not
-execute its body on the caller's stack.
-
-See [ordered locks](example/ordered_locks.wi) and [parent and child locks](example/parent_child_locks.wi) for runnable examples.
+| Limit | Effect | Evidence |
+| --- | --- | --- |
+| Group acquisition is not fair and has no retry limit | If other Tasks keep different members busy in turn, one group can wait indefinitely. Avoid holding a member of a heavily contended group for long. | Module documentation of [`lock_group.rs`](crates/willow_runtime/src/lock_group.rs) |
+| No rollback | Scope exits, panic and cancellation release acquired locks in reverse order; writes already made are committed. This is mutual exclusion, not a transaction. | `ordered_locks_recovered_panic_commits_and_releases_all`, `ordered_locks_held_cancellation_commits_before_outer_cleanup` in [`ordered_locks.rs`](tests/integration/concurrency/ordered_locks.rs) |
 
 ## Semantic tooling for people and AI agents
 
@@ -733,7 +843,7 @@ stated scope.
 
 | Result | Compiler-backed information | Unknowns or assumptions |
 | --- | --- | --- |
-| Accepted lexical lock body | No blocking/suspending effect under the compiler's modeled lock rules | Not a proof of global deadlock freedom or arbitrary native-code behavior |
+| Accepted lexical lock body | No operation the [E2604 rules](#e2604-a-lock-body-never-waits) classify as waiting, directly or through calls | Console output and `nonblocking` foreign calls are allowed; not a proof of global deadlock freedom or native-code behavior |
 | Successful exact rename | Resolved occurrences of the selected symbol are edited and the candidate passes validation | Limited to the loaded project and supported symbols; not a proof of application correctness |
 | Effect `MAY` (`may` in JSON) | A source or known-callee witness supports the capability | It may not occur on every runtime path; uncertainty can coexist in `unknown_reasons` |
 | Effect `UNKNOWN` (`unknown` in JSON) | A conservative capability is retained without a supporting witness | Indirect/unresolved calls, missing bodies, incomplete flow, or external interop require assumptions; this is not evidence that the effect occurs or is absent |
@@ -826,72 +936,15 @@ In the idle-spawn measurement, memory after parking 100,000 tasks was about **74
 
 ## Current boundaries
 
-Willow is an experimental language and compiler, **not yet suitable for production deployment**. Its compiler checks and effect guarantees are scoped to supported language operations and available compiler/runtime knowledge. In particular:
+Willow is an experimental language and compiler, **not yet suitable for production deployment**. Each check guarantees only what its section states; the limits tables list what falls outside it. In particular:
 
-- E2402 checks `Send`/`Sync` constraints on async-call captures and movable Task frames, not arbitrary shared-memory accesses. Closure values are conservatively neither `Send` nor `Sync`; environment-free function pointers can be both. Foreign/native memory is outside this check.
-- E2604 prevents modeled blocking/suspending behavior in Willow lexical lock bodies; it does not prove arbitrary programs deadlock-free.
-- E2607 rejects the [limited permanent-wait shapes](#e2607-certain-permanent-waits) below with a source witness. Absence of E2607 is **not** evidence of deadlock freedom.
-- Conservative dynamic/indirect-call analysis may reject code that is actually safe. Unavailable evidence is not treated as proof of purity.
-- Lock-order analysis conservatively rejects uncertain identities and acquisition cycles (E2605); simultaneous acquisition handles runtime ordering of distinct objects in the same class.
-- Native/foreign boundaries, compiler defects, and runtime defects are outside the guarantee of a static effect check.
+- No check proves deadlock freedom or the absence of all data races. Tasks can wait for each other forever through channels and `await` outside locks, and E2607 reports only some such waits; its absence is **not** evidence of anything.
+- E2402 checks async-call arguments and movable Task frames, not every shared-memory access: static fields are shared without a check.
+- E2604 does not count console output as a wait and does not bound computation time inside a lock body.
+- Conservative analysis of dynamic and indirect calls may reject code that is actually safe. Unavailable evidence is never treated as proof of purity.
+- Rust adapters, native libraries and the declarations that describe them (`nonblocking`, `@effects(no_io)`) are trusted, not verified. Compiler and runtime defects are outside every static guarantee.
 - The runtime benchmarks and agent-token experiment measure limited, published workloads.
 
 **The goal:** make semantic safety properties part of the compiler's ordinary contract, and make their evidence accessible to both humans and coding agents.
-
-### E2607: certain permanent waits
-
-The compiler reports an **error**, with the receive/channel creation or Task
-creation/await chain as its witness, for these closed, statically traceable shapes:
-
-- A fresh local channel is received from with no possible send or close in the
-  analyzed region. This includes `recv_opt`, which also waits on an open channel.
-- A Task awaits itself, including a handle delivered through a local channel.
-- Tasks form an await cycle reached by the creating function's own wait chain.
-
-For example, `let ch = Channel<i64>::new(); ch.recv();` is rejected. A self-wait
-can arise when `waiter(ch)` receives a Task handle and awaits it, while its caller
-does `let t = waiter(ch); ch.send(t); await t;`. Two such Tasks receiving each
-other's handles form a cycle. Witnesses identify each Task creation and await,
-and the channels transporting handles. `task.result()` retains the same identity.
-Task-handle transfers can also violate the existing exclusive-ownership rules
-(E2408). The compiler retains those errors and additionally reports the wait
-witness; E2607 does not authorize sharing or reuse of a transferred Task handle.
-See the runnable [valid sender and escape example](tests/regressions/permanent_wait_escapes.wi).
-
-The current analysis starts at the process entry `main` and follows its
-straight-line body, local aliases, fresh builtin channels, and direct calls to
-same-module leaf functions. Async calls create Task identities; synchronous
-calls run on the caller's Task. Uncalled helpers and a function named `main` in
-an imported module are not assumed to be process roots. Leaf bodies may receive Task arguments or receive a Task through a
-channel with exactly one send and one receive. Summaries are built once rather
-than recursively expanding the call tree. Only the first unresolved await in a
-Task is followed: a later await may be unreachable after panic or cancellation.
-Detached cycles are not reported when the creating function can return.
-
-A sender in another Task or a close prevents the no-sender diagnostic. Select,
-timeout, cancellation, branches, loops, mutable assignments, defer, function
-values, collections, object fields/methods, imported/foreign calls and other
-unsupported operations cause the containing region to be left **unanalyzed**.
-Nested or recursive Task factories and ambiguous channel deliveries are also
-outside this proof. Bounded sends and sends on possibly closed channels stop the wait-chain proof
-because they can block or panic before a subsequent await. A bounded channel
-constructor is followed only when its capacity is a positive integer literal;
-other capacities might panic before a wait and are left unknown. These exclusions preserve valid programs;
-they do not certify those programs as safe. Even a possible close/send appearing
-after a wait suppresses the no-sender finding, so this intentionally misses some
-real deadlocks. General deadlock freedom remains a non-goal.
-
-The pass uses expected O(S + I + T + C + E) time and O(S + I + T + C + E) memory:
-S is source syntax, I is instantiated summary operations and argument bindings,
-T is Task instances (including the entry root), C is fresh channel instances,
-and E is recorded receive/await edges. Each summary operation is interpreted once
-per instance; each followed Task and wait edge is visited at most once per
-region. Scalar-only body syntax is not re-walked for repeated calls. Each summary keeps
-only the first two sends per channel slot (zero, one, or many deliveries); later
-arguments are still analyzed. Repeated equivalent sends therefore do not expand
-as the product of sends per body and calls to that body. Deterministic
-tests count syntax visits, summary operations, Tasks, channels, waits and graph
-steps for increasing cycles and repeated calls. The pass adds no generated code
-or runtime bookkeeping.
 
 MIT licensed. See [LICENSE](LICENSE).
