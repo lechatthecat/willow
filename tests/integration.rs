@@ -212,6 +212,8 @@ mod exponentiation;
 mod integer_overflow;
 #[path = "integration/match_guards_if_let.rs"]
 mod match_guards_if_let;
+#[path = "integration/nested_patterns.rs"]
+mod nested_patterns;
 #[path = "integration/option_interface_context.rs"]
 mod option_interface_context;
 #[path = "integration/option_nil_deprecation.rs"]

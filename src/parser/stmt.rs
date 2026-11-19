@@ -30,12 +30,18 @@ impl Parser {
                     )
                     .with_label(Label::secondary(start, "block opened here")));
             }
-            // Bind once, then put the remaining lexical scope in the sole
-            // tuple arm. Folding these segments after parsing moves each
-            // statement once instead of repeatedly copying the block tail.
-            if self.check(TokenKind::Let) && self.peek_kind_at(1) == &TokenKind::LParen {
+            // Bind once, then put the remaining lexical scope in the first
+            // arm. Folding these segments after parsing moves each statement
+            // once instead of repeatedly copying the block tail.
+            if self.at_pattern_binding() {
                 let depth = self.brace_depth;
-                let (pattern, ty, mut init, span) = match self.parse_tuple_binding() {
+                let PatternBinding {
+                    pattern,
+                    ty,
+                    mut init,
+                    else_block,
+                    span,
+                } = match self.parse_pattern_binding() {
                     Ok(binding) => binding,
                     Err(error) => {
                         self.recovered_errors.push(error);
@@ -56,7 +62,7 @@ impl Parser {
                     init = Expr::Var(name, span, ExprId::fresh());
                 }
                 self.default_import_usage.bind_pattern(&pattern);
-                tuple_scopes.push((std::mem::take(&mut stmts), pattern, init, span));
+                tuple_scopes.push((std::mem::take(&mut stmts), pattern, init, else_block, span));
                 continue;
             }
             let statement_depth = self.brace_depth;
@@ -74,7 +80,29 @@ impl Parser {
         let end = self.current_span();
         self.expect(TokenKind::RBrace)
             .map_err(|error| error.with_label(Label::secondary(start, "block opened here")))?;
-        while let Some((mut prefix, pattern, init, span)) = tuple_scopes.pop() {
+        while let Some((mut prefix, pattern, init, else_block, span)) = tuple_scopes.pop() {
+            let mut arms = vec![MatchArm {
+                pattern,
+                guard: Vec::new(),
+                span: span.to(end),
+                body: MatchBody::Block(Block {
+                    id: BodyId::fresh(),
+                    stmts,
+                    span: span.to(end),
+                }),
+            }];
+            let source = match else_block {
+                Some(else_block) => {
+                    arms.push(MatchArm {
+                        pattern: Pattern::Wildcard(else_block.span, PatternId::fresh()),
+                        guard: Vec::new(),
+                        span: else_block.span,
+                        body: MatchBody::Block(else_block),
+                    });
+                    MatchSource::LetElse
+                }
+                None => MatchSource::TupleLet,
+            };
             prefix.push(Stmt::Expr(ExprStmt {
                 span: span.to(end),
                 expr: Expr::Match(Box::new(MatchExpr {
@@ -82,17 +110,8 @@ impl Parser {
                     id: ExprId::fresh(),
                     scrutinee: Box::new(init),
                     span: span.to(end),
-                    source: MatchSource::TupleLet,
-                    arms: vec![MatchArm {
-                        pattern,
-                        guard: None,
-                        span: span.to(end),
-                        body: MatchBody::Block(Block {
-                            id: BodyId::fresh(),
-                            stmts,
-                            span: span.to(end),
-                        }),
-                    }],
+                    source,
+                    arms,
                 })),
             }));
             stmts = prefix;
@@ -104,7 +123,29 @@ impl Parser {
         })
     }
 
-    fn parse_tuple_binding(&mut self) -> Result<(Pattern, Option<Type>, Expr, Span), Diagnostic> {
+    /// `let (a, b) = e;`, `let Some(x) = e else { ... };` or
+    /// `let Shape::Circle(r) = e else { ... };`: a `let` whose left side is a
+    /// pattern rather than one name. A bare `let None = e` still declares a
+    /// variable, so a payload-free variant must be qualified there.
+    fn at_pattern_binding(&self) -> bool {
+        self.check(TokenKind::Let)
+            && match self.peek_kind_at(1) {
+                TokenKind::LParen => true,
+                TokenKind::Ident(name) => {
+                    name != "_"
+                        && matches!(
+                            self.peek_kind_at(2),
+                            TokenKind::LParen | TokenKind::ColonColon
+                        )
+                }
+                _ => false,
+            }
+    }
+
+    /// The pattern, optional annotation, initializer and optional `else`
+    /// block of a pattern `let`. The else block is parsed before the
+    /// pattern's names are bound, so it cannot see them.
+    fn parse_pattern_binding(&mut self) -> Result<PatternBinding, Diagnostic> {
         let span = self.current_span();
         self.expect(TokenKind::Let)?;
         let pattern = self.parse_pattern()?;
@@ -115,8 +156,19 @@ impl Parser {
         };
         self.expect(TokenKind::Eq)?;
         let init = self.parse_expr()?;
+        let else_block = if self.eat(TokenKind::Else) {
+            Some(self.parse_block()?)
+        } else {
+            None
+        };
         self.expect(TokenKind::Semicolon)?;
-        Ok((pattern, ty, init, span.to(self.previous_span())))
+        Ok(PatternBinding {
+            pattern,
+            ty,
+            init,
+            else_block,
+            span: span.to(self.previous_span()),
+        })
     }
 
     /// Skip to the start of the next statement after a statement-level parse
@@ -477,6 +529,14 @@ impl Parser {
         self.expect(TokenKind::Eq)?;
         let init = self.parse_expr()?;
         let span = span.to(self.current_span());
+        if self.check(TokenKind::Else) {
+            return Err(self
+                .err(
+                    ErrorCode::E0102,
+                    format!("`let {name} = ... else` never runs its `else` block: a name always matches"),
+                )
+                .with_help("remove the `else` block; to require a payload-free variant, qualify it, for example `let Option::None = value else { ... };`"));
+        }
         self.expect(TokenKind::Semicolon)?;
         self.default_import_usage.bind(&name);
         Ok(Stmt::Let(LetStmt {
@@ -535,24 +595,18 @@ impl Parser {
     /// `match e { P => { then }, _ => { else } }`, so pattern checking,
     /// exhaustiveness, binding scopes and GC roots are the `match` ones.
     pub(super) fn parse_if(&mut self) -> Result<Stmt, Diagnostic> {
-        enum Head {
-            Cond(Expr),
-            Let(Pattern, Expr),
-        }
         let mut rungs = Vec::new();
         let mut else_block = loop {
             let span = self.current_span();
             self.expect(TokenKind::If)?;
-            let head = if self.eat(TokenKind::Let) {
-                let (pattern, scrutinee) = self.parse_let_head()?;
-                Head::Let(pattern, scrutinee)
-            } else {
-                Head::Cond(self.parse_control_head()?)
-            };
             let scope = self.default_import_usage.scope();
-            if let Head::Let(pattern, _) = &head {
-                self.default_import_usage.bind_pattern(pattern);
-            }
+            let head = match self.parse_condition_head(false) {
+                Ok(head) => head,
+                Err(error) => {
+                    self.default_import_usage.restore(scope);
+                    return Err(error);
+                }
+            };
             let result = self.parse_if_statement_block();
             self.default_import_usage.restore(scope);
             let then_block = result?;
@@ -569,14 +623,14 @@ impl Parser {
             let end = else_block
                 .as_ref()
                 .map_or(then_block.span, |b: &Block| b.span);
-            let stmt = match head {
-                Head::Cond(cond) => Stmt::If(IfStmt {
+            let stmt = match Self::plain_condition(head) {
+                Ok(cond) => Stmt::If(IfStmt {
                     cond,
                     then_block,
                     else_block,
                     span,
                 }),
-                Head::Let(pattern, scrutinee) => {
+                Err(links) => {
                     let fallback = else_block.unwrap_or_else(|| Block {
                         id: crate::parser::ast::BodyId::fresh(),
                         stmts: Vec::new(),
@@ -585,8 +639,7 @@ impl Parser {
                     Self::let_match(
                         MatchSource::IfLet,
                         span.to(end),
-                        pattern,
-                        scrutinee,
+                        links,
                         then_block,
                         fallback,
                     )
@@ -610,63 +663,131 @@ impl Parser {
     pub(super) fn parse_while(&mut self) -> Result<Stmt, Diagnostic> {
         let span = self.current_span();
         self.expect(TokenKind::While)?;
-        if self.eat(TokenKind::Let) {
-            let (pattern, scrutinee) = self.parse_let_head()?;
-            let scope = self.default_import_usage.scope();
-            self.default_import_usage.bind_pattern(&pattern);
-            let result = self.parse_block();
-            self.default_import_usage.restore(scope);
-            let body = result?;
-            let whole = span.to(body.span);
-            let exit = Block {
-                id: crate::parser::ast::BodyId::fresh(),
-                stmts: vec![Stmt::Break(span)],
-                span: body.span,
-            };
-            let matched =
-                Self::let_match(MatchSource::WhileLet, whole, pattern, scrutinee, body, exit);
-            return Ok(Stmt::While(WhileStmt {
-                cond: Expr::Bool(true, span, ExprId::fresh()),
-                invariants: Vec::new(),
-                variant: None,
-                body: Block {
-                    id: crate::parser::ast::BodyId::fresh(),
-                    stmts: vec![matched],
-                    span: whole,
-                },
-                span,
-            }));
-        }
-        let cond = self.parse_control_head()?;
-        let (invariants, variant) = self.parse_loop_annotations()?;
-        let body = self.parse_block()?;
+        let scope = self.default_import_usage.scope();
+        let head = self.parse_condition_head(false);
+        let head = match head.map(Self::plain_condition) {
+            Ok(Err(links)) => links,
+            Ok(Ok(cond)) => {
+                self.default_import_usage.restore(scope);
+                let (invariants, variant) = self.parse_loop_annotations()?;
+                let body = self.parse_block()?;
+                return Ok(Stmt::While(WhileStmt {
+                    cond,
+                    invariants,
+                    variant,
+                    body,
+                    span,
+                }));
+            }
+            Err(error) => {
+                self.default_import_usage.restore(scope);
+                return Err(error);
+            }
+        };
+        let result = self.parse_block();
+        self.default_import_usage.restore(scope);
+        let body = result?;
+        let whole = span.to(body.span);
+        let exit = Block {
+            id: crate::parser::ast::BodyId::fresh(),
+            stmts: vec![Stmt::Break(span)],
+            span: body.span,
+        };
+        let matched = Self::let_match(MatchSource::WhileLet, whole, head, body, exit);
         Ok(Stmt::While(WhileStmt {
-            cond,
-            invariants,
-            variant,
-            body,
+            cond: Expr::Bool(true, span, ExprId::fresh()),
+            invariants: Vec::new(),
+            variant: None,
+            body: Block {
+                id: crate::parser::ast::BodyId::fresh(),
+                stmts: vec![matched],
+                span: whole,
+            },
             span,
         }))
     }
 
-    /// `P = e` after `if let` / `while let`. The scrutinee is a control head,
-    /// so `{` opens the body rather than an object literal.
-    fn parse_let_head(&mut self) -> Result<(Pattern, Expr), Diagnostic> {
-        let pattern = self.parse_pattern()?;
-        self.expect(TokenKind::Eq)?;
-        let scrutinee = self.parse_control_head()?;
-        Ok((pattern, scrutinee))
+    /// The condition after `if`, `while`, or a match arm's `if`: one boolean,
+    /// or a chain `c && let P = e && ...` whose `let` links each bind names
+    /// visible to later links and to the body. Every `let` scrutinee and
+    /// later condition is one `&&` operand, so `if let P = e && c` tests `c`
+    /// after matching. Bindings are recorded in the caller's open scope.
+    pub(super) fn parse_condition_head(&mut self, guard: bool) -> Result<Vec<Guard>, Diagnostic> {
+        let mut links = Vec::new();
+        if !self.check(TokenKind::Let) {
+            let cond = if guard {
+                self.parse_expr()?
+            } else {
+                self.parse_control_head()?
+            };
+            links.push(Guard::If(cond));
+            if !self.at_chain_link() {
+                return Ok(links);
+            }
+            self.advance();
+        }
+        loop {
+            if self.check(TokenKind::Let) {
+                let start = self.current_span();
+                self.advance();
+                let pattern = self.parse_pattern()?;
+                self.expect(TokenKind::Eq)?;
+                let scrutinee = self.parse_chain_operand()?;
+                self.default_import_usage.bind_pattern(&pattern);
+                links.push(Guard::Let(LetGuard {
+                    pattern,
+                    span: start.to(self.previous_span()),
+                    scrutinee,
+                }));
+            } else {
+                links.push(Guard::If(self.parse_chain_operand()?));
+            }
+            if !self.eat(TokenKind::And) {
+                return Ok(links);
+            }
+        }
     }
 
-    /// The two-arm `match` an `if let` / `while let` stands for.
+    /// A chain without any `let` is an ordinary condition.
+    fn plain_condition(mut links: Vec<Guard>) -> Result<Expr, Vec<Guard>> {
+        match links.as_slice() {
+            [Guard::If(_)] => match links.pop() {
+                Some(Guard::If(cond)) => Ok(cond),
+                _ => unreachable!("single condition link"),
+            },
+            _ => Err(links),
+        }
+    }
+
+    /// The two-arm `match` an `if let` / `while let` chain stands for:
+    /// `match first { P if rest => { then }, _ => { fallback } }`, where a
+    /// leading boolean `c` becomes `match true { _ if c && rest => .. }`. The fallback
+    /// block exists once however many links can fail.
     fn let_match(
         source: MatchSource,
         span: Span,
-        pattern: Pattern,
-        scrutinee: Expr,
+        links: Vec<Guard>,
         then_block: Block,
         fallback: Block,
     ) -> Stmt {
+        let mut links = links.into_iter();
+        let (pattern, scrutinee, guard) = match links.next() {
+            Some(Guard::Let(LetGuard {
+                pattern, scrutinee, ..
+            })) => (pattern, scrutinee, links.collect()),
+            // A leading condition stays a condition step, checked like every
+            // later one (E0203 for a non-`bool`), on a constant scrutinee.
+            Some(Guard::If(cond)) => {
+                let span = cond.span();
+                (
+                    Pattern::Wildcard(span, PatternId::fresh()),
+                    Expr::Bool(true, span, ExprId::fresh()),
+                    std::iter::once(Guard::If(cond)).chain(links).collect(),
+                )
+            }
+            None => unreachable!("a let chain has a first link"),
+        };
+        let guard: Vec<Guard> = guard;
         let then_span = pattern.span().to(then_block.span);
         let fallback_span = fallback.span;
         Stmt::Expr(ExprStmt {
@@ -677,13 +798,13 @@ impl Parser {
                 arms: vec![
                     MatchArm {
                         pattern,
-                        guard: None,
+                        guard,
                         body: MatchBody::Block(then_block),
                         span: then_span,
                     },
                     MatchArm {
                         pattern: Pattern::Wildcard(fallback_span, PatternId::fresh()),
-                        guard: None,
+                        guard: Vec::new(),
                         body: MatchBody::Block(fallback),
                         span: fallback_span,
                     },
@@ -1002,4 +1123,13 @@ pub(super) fn compound_assignment_op(token: &TokenKind) -> Option<BinOp> {
         TokenKind::CaretEq => BinOp::BitXor,
         _ => return None,
     })
+}
+
+/// A parsed pattern `let`: `let P[: T] = init [else { ... }];`.
+struct PatternBinding {
+    pattern: Pattern,
+    ty: Option<Type>,
+    init: Expr,
+    else_block: Option<Block>,
+    span: Span,
 }

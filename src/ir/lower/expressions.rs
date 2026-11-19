@@ -473,7 +473,7 @@ fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
                 scrutinee: Box::new(lit(HirExprKind::Bool(true), Type::Bool, span)),
                 arms: vec![HirMatchArm {
                     pattern: HirPattern::Wildcard,
-                    guard: None,
+                    guard: Vec::new(),
                     body: statements,
                     ty: Type::Bool,
                     span,
@@ -1634,125 +1634,67 @@ fn lower_match(
     m: &crate::parser::ast::MatchExpr,
     ctx: &mut LowerCtx,
 ) -> Result<HirExpr, Diagnostic> {
-    use crate::parser::ast::{MatchBody, Pattern};
+    use crate::parser::ast::{Guard, MatchBody};
 
     let scrutinee = lower_expr(&m.scrutinee, ctx)?;
-
-    // The scrutinee's enum context: its EnumInfo plus the substitution from the
-    // enum's type parameters to the scrutinee's type arguments.
-    let enum_context: Option<(String, EnumInfo, HashMap<String, Type>)> =
-        match &scrutinee.ty.to_source() {
-            Type::Named(name) => ctx
-                .enums
-                .map
-                .get(name)
-                .map(|info| (name.clone(), info.clone(), HashMap::new())),
-            Type::Generic(name, args) => ctx.enums.map.get(name).map(|info| {
-                let subst = info
-                    .type_params
-                    .iter()
-                    .cloned()
-                    .zip(args.iter().cloned())
-                    .collect();
-                (name.clone(), info.clone(), subst)
-            }),
-            _ => None,
-        };
+    let scrutinee_ty = scrutinee.ty.to_source();
+    // The checker owns whether a bare spelling is a variant visible in this
+    // unit. Structural inference is only for lowering without checker tables;
+    // redoing it for checked input would turn catch-all bindings into
+    // inaccessible imported variants.
+    let infer_variant = ctx.tables.pattern_resolutions.is_none();
 
     let mut arms = Vec::with_capacity(m.arms.len());
+    // Nested payload patterns of the step being lowered, reused across arms.
+    let mut nested = Vec::new();
     for arm in &m.arms {
         ctx.push_scope();
-        // The checker owns whether a bare spelling is a variant visible in
-        // this unit. Structural inference is only for lowering without checker
-        // tables; redoing it for checked input would turn catch-all bindings
-        // into inaccessible imported variants.
-        let infer_variant = ctx.tables.pattern_resolutions.is_none();
         let checked_pattern = ctx
             .tables
             .pattern_resolutions
             .and_then(|patterns| patterns.get(&arm.pattern.id()))
             .unwrap_or(&arm.pattern);
-        let pattern = match checked_pattern {
-            Pattern::Wildcard(_, _) => HirPattern::Wildcard,
-            Pattern::LiteralBool(b, _, _) => HirPattern::LiteralBool(*b),
-            Pattern::LiteralInt(n, _, _) => HirPattern::LiteralInt(*n),
-            Pattern::Binding { name, .. } => {
-                if let Some((enum_name, info, _)) = &enum_context
-                    && infer_variant
-                    && info.variants.get(name).is_some_and(Vec::is_empty)
-                {
-                    HirPattern::EnumVariant {
-                        enum_name: enum_name.clone().into(),
-                        variant: name.clone(),
-                    }
-                } else {
-                    HirPattern::Binding {
-                        name: ctx.bind(name.clone(), (scrutinee.ty.clone()).to_source()),
-                        ty: scrutinee.ty.clone(),
-                    }
+        let pattern = lower_flat_pattern(
+            checked_pattern,
+            &scrutinee_ty,
+            infer_variant,
+            arm.span,
+            ctx,
+            &mut nested,
+        )?;
+        // Nested tests run before the source guard chain: the chain may use
+        // their bindings.
+        let mut guard = Vec::with_capacity(arm.guard.len());
+        drain_nested_patterns(&mut nested, infer_variant, ctx, &mut guard)?;
+        for step in &arm.guard {
+            match step {
+                Guard::If(cond) => {
+                    let cond = lower_expr(cond, ctx)?;
+                    guard.push(HirGuard::If(cond));
                 }
-            }
-            Pattern::EnumVariant { variant, .. } => {
-                let Some((enum_name, _, _)) = &enum_context else {
-                    ctx.pop_scope();
-                    return Err(unsupported(
-                        arm.span,
-                        "enum pattern on a non-enum scrutinee",
-                    ));
-                };
-                HirPattern::EnumVariant {
-                    enum_name: enum_name.clone().into(),
-                    variant: variant.clone(),
-                }
-            }
-            Pattern::EnumVariantTuple {
-                variant, bindings, ..
-            } => bind_variant_tuple(&enum_context, variant, bindings, arm.span, ctx)?,
-            Pattern::ClassDowncast {
-                class_name,
-                binding,
-                ..
-            } => {
-                // Unqualified variant like `Some(x)` if it names a variant of the
-                // scrutinee's enum; otherwise a real interface downcast.
-                if infer_variant
-                    && enum_context
-                        .as_ref()
-                        .is_some_and(|(_, info, _)| info.variants.contains_key(class_name))
-                {
-                    bind_variant_tuple(
-                        &enum_context,
-                        class_name,
-                        std::slice::from_ref(binding),
-                        arm.span,
+                Guard::Let(step) => {
+                    let value = lower_expr(&step.scrutinee, ctx)?;
+                    let checked = ctx
+                        .tables
+                        .pattern_resolutions
+                        .and_then(|patterns| patterns.get(&step.pattern.id()))
+                        .unwrap_or(&step.pattern);
+                    let pattern = lower_flat_pattern(
+                        checked,
+                        &value.ty.to_source(),
+                        infer_variant,
+                        step.span,
                         ctx,
-                    )?
-                } else {
-                    // Pattern spellings are unit-local, just like annotations.
-                    // Both the runtime class test and its payload local must use
-                    // the canonical identity used by checked field/method uses.
-                    let binding_ty = ctx.tables.normalize(&Type::Named(class_name.clone()));
-                    let Type::Named(canonical_class) = &binding_ty else {
-                        return Err(unsupported(arm.span, "non-class downcast target"));
-                    };
-                    let binding = if binding == "_" {
-                        binding.clone()
-                    } else {
-                        ctx.bind(binding.clone(), binding_ty.clone())
-                    };
-                    HirPattern::ClassDowncast {
-                        class_name: canonical_class.clone().into(),
-                        binding,
-                        binding_ty: binding_ty.into(),
-                    }
+                        &mut nested,
+                    )?;
+                    guard.push(HirGuard::Let {
+                        scrutinee: value,
+                        pattern,
+                    });
+                    drain_nested_patterns(&mut nested, infer_variant, ctx, &mut guard)?;
                 }
             }
-        };
-
-        let guard = match &arm.guard {
-            Some(guard) => Some(lower_expr(guard, ctx)?),
-            None => None,
-        };
+        }
         let (body, arm_ty) = match &arm.body {
             MatchBody::Expr(e) => {
                 let value = lower_expr(e, ctx)?;
@@ -1815,40 +1757,249 @@ fn lower_match(
     })
 }
 
-/// Build an `EnumVariantTuple` pattern, binding each payload name to the
-/// variant's (substituted) payload type. `_` bindings match without binding.
-fn bind_variant_tuple(
-    enum_context: &Option<(String, EnumInfo, HashMap<String, Type>)>,
+/// A nested payload pattern whose test still has to be emitted: the payload
+/// is bound to the synthetic local `local` of type `ty`.
+struct PendingPattern<'p> {
+    local: String,
+    ty: Type,
+    pattern: &'p crate::parser::ast::Pattern,
+    span: Span,
+}
+
+/// The payload positions of an enum pattern: nested patterns, or the single
+/// name of a bare `V(x)` that parsed as a class downcast.
+#[derive(Clone, Copy)]
+enum PayloadFields<'p> {
+    Patterns(&'p [crate::parser::ast::Pattern]),
+    Name(&'p String),
+}
+
+/// Emit one `let` step per pending nested pattern, in FIFO order. Each step
+/// may queue its own payload patterns, so every source pattern node is
+/// visited exactly once.
+fn drain_nested_patterns<'p>(
+    nested: &mut Vec<PendingPattern<'p>>,
+    infer_variant: bool,
+    ctx: &mut LowerCtx,
+    steps: &mut Vec<HirGuard>,
+) -> Result<(), Diagnostic> {
+    let mut next = 0;
+    while next < nested.len() {
+        let pending = &mut nested[next];
+        let local = std::mem::take(&mut pending.local);
+        let ty = std::mem::replace(&mut pending.ty, Type::Void);
+        let (pattern, span) = (pending.pattern, pending.span);
+        next += 1;
+        let flat = lower_flat_pattern(pattern, &ty, infer_variant, span, ctx, nested)?;
+        steps.push(HirGuard::Let {
+            scrutinee: HirExpr {
+                kind: HirExprKind::Var(local),
+                ty: ty.into(),
+                span,
+            },
+            pattern: flat,
+        });
+    }
+    nested.clear();
+    Ok(())
+}
+
+/// The enum named by `ty` and the payload types of its `variant` with the
+/// enum's type parameters substituted (`None` when the enum lacks the
+/// variant). `None` for a non-enum type.
+fn enum_variant_payload(
+    ctx: &LowerCtx,
+    ty: &Type,
     variant: &str,
-    bindings: &[String],
+) -> Option<(String, Option<Vec<Type>>)> {
+    let (name, args) = match ty {
+        Type::Named(name) => (name, &[][..]),
+        Type::Generic(name, args) => (name, args.as_slice()),
+        _ => return None,
+    };
+    let info = ctx.enums.map.get(name)?;
+    let payload = info.variants.get(variant).map(|payload| {
+        if args.is_empty() {
+            return payload.clone();
+        }
+        let subst = info
+            .type_params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        payload.iter().map(|ty| subst_type(ty, &subst)).collect()
+    });
+    Some((name.clone(), payload))
+}
+
+/// Whether `name` is a fieldless variant of the enum `ty` (structural
+/// inference for lowering without checker tables).
+fn infers_fieldless_variant(ctx: &LowerCtx, ty: &Type, name: &str) -> bool {
+    let name_of = match ty {
+        Type::Named(enum_name) | Type::Generic(enum_name, _) => enum_name,
+        _ => return false,
+    };
+    ctx.enums
+        .map
+        .get(name_of)
+        .and_then(|info| info.variants.get(name))
+        .is_some_and(Vec::is_empty)
+}
+
+/// Lower one pattern node over a value of type `ty` to a flat HIR pattern.
+/// Payload positions that are neither a binding nor `_` bind a synthetic local
+/// and are queued on `nested` for a later `let` step.
+fn lower_flat_pattern<'p>(
+    pattern: &'p crate::parser::ast::Pattern,
+    ty: &Type,
+    infer_variant: bool,
     span: Span,
     ctx: &mut LowerCtx,
+    nested: &mut Vec<PendingPattern<'p>>,
 ) -> Result<HirPattern, Diagnostic> {
-    let Some((enum_name, info, subst)) = enum_context else {
+    use crate::parser::ast::Pattern;
+    Ok(match pattern {
+        Pattern::Wildcard(_, _) => HirPattern::Wildcard,
+        Pattern::LiteralBool(b, _, _) => HirPattern::LiteralBool(*b),
+        Pattern::LiteralInt(n, _, _) => HirPattern::LiteralInt(*n),
+        Pattern::Binding { name, .. } => {
+            if infer_variant && infers_fieldless_variant(ctx, ty, name) {
+                let (Type::Named(enum_name) | Type::Generic(enum_name, _)) = ty else {
+                    unreachable!("only enum types infer variants");
+                };
+                HirPattern::EnumVariant {
+                    enum_name: enum_name.clone().into(),
+                    variant: name.clone(),
+                }
+            } else {
+                HirPattern::Binding {
+                    name: ctx.bind(name.clone(), ty.clone()),
+                    ty: ty.clone().into(),
+                }
+            }
+        }
+        Pattern::EnumVariant { variant, .. } => {
+            let Some((enum_name, _)) = enum_variant_payload(ctx, ty, variant) else {
+                return Err(unsupported(span, "enum pattern on a non-enum scrutinee"));
+            };
+            HirPattern::EnumVariant {
+                enum_name: enum_name.into(),
+                variant: variant.clone(),
+            }
+        }
+        Pattern::EnumVariantTuple {
+            variant, fields, ..
+        } => bind_variant_tuple(
+            ty,
+            variant,
+            PayloadFields::Patterns(fields),
+            infer_variant,
+            span,
+            ctx,
+            nested,
+        )?,
+        Pattern::ClassDowncast {
+            class_name,
+            binding,
+            ..
+        } => {
+            // Unqualified variant like `Some(x)` if it names a variant of the
+            // scrutinee's enum; otherwise a real interface downcast.
+            if infer_variant
+                && matches!(
+                    enum_variant_payload(ctx, ty, class_name),
+                    Some((_, Some(_)))
+                )
+            {
+                bind_variant_tuple(
+                    ty,
+                    class_name,
+                    PayloadFields::Name(binding),
+                    infer_variant,
+                    span,
+                    ctx,
+                    nested,
+                )?
+            } else {
+                // Pattern spellings are unit-local, just like annotations.
+                // Both the runtime class test and its payload local must use
+                // the canonical identity used by checked field/method uses.
+                let binding_ty = ctx.tables.normalize(&Type::Named(class_name.clone()));
+                let Type::Named(canonical_class) = &binding_ty else {
+                    return Err(unsupported(span, "non-class downcast target"));
+                };
+                let binding = if binding == "_" {
+                    binding.clone()
+                } else {
+                    ctx.bind(binding.clone(), binding_ty.clone())
+                };
+                HirPattern::ClassDowncast {
+                    class_name: canonical_class.clone().into(),
+                    binding,
+                    binding_ty: binding_ty.into(),
+                }
+            }
+        }
+    })
+}
+
+/// Build an `EnumVariantTuple` pattern, binding each payload position to the
+/// variant's (substituted) payload type. `_` positions match without binding;
+/// nested positions bind a synthetic local queued on `nested`.
+fn bind_variant_tuple<'p>(
+    ty: &Type,
+    variant: &str,
+    fields: PayloadFields<'p>,
+    infer_variant: bool,
+    span: Span,
+    ctx: &mut LowerCtx,
+    nested: &mut Vec<PendingPattern<'p>>,
+) -> Result<HirPattern, Diagnostic> {
+    use crate::parser::ast::Pattern;
+    let Some((enum_name, payload)) = enum_variant_payload(ctx, ty, variant) else {
         return Err(unsupported(span, "enum pattern on a non-enum scrutinee"));
     };
-    let Some(payload) = info.variants.get(variant) else {
+    let Some(payload) = payload else {
         return Err(unsupported(span, "unknown enum variant in pattern"));
     };
-    if payload.len() != bindings.len() {
+    let arity = match fields {
+        PayloadFields::Patterns(fields) => fields.len(),
+        PayloadFields::Name(_) => 1,
+    };
+    if payload.len() != arity {
         return Err(unsupported(span, "enum pattern arity mismatch"));
     }
-    let mut typed = Vec::with_capacity(bindings.len());
-    for (name, payload_ty) in bindings.iter().zip(payload) {
-        let ty = subst_type(payload_ty, subst);
-        let name = if name == "_" {
-            name.clone()
-        } else {
-            ctx.bind(name.clone(), ty.clone())
+    let mut bindings = Vec::with_capacity(arity);
+    for (index, payload_ty) in payload.into_iter().enumerate() {
+        let name = match fields {
+            PayloadFields::Name(name) if name == "_" => name.clone(),
+            PayloadFields::Name(name) => ctx.bind(name.clone(), payload_ty.clone()),
+            PayloadFields::Patterns(fields) => match &fields[index] {
+                Pattern::Wildcard(_, _) => "_".to_string(),
+                Pattern::Binding { name, .. }
+                    if !(infer_variant && infers_fieldless_variant(ctx, &payload_ty, name)) =>
+                {
+                    ctx.bind(name.clone(), payload_ty.clone())
+                }
+                sub => {
+                    // `$` cannot appear in a source identifier.
+                    let local = ctx.bind("$pat".to_string(), payload_ty.clone());
+                    nested.push(PendingPattern {
+                        local: local.clone(),
+                        ty: payload_ty.clone(),
+                        pattern: sub,
+                        span,
+                    });
+                    local
+                }
+            },
         };
-        typed.push((name, ty));
+        bindings.push((name, payload_ty.into()));
     }
     Ok(HirPattern::EnumVariantTuple {
-        enum_name: enum_name.clone().into(),
+        enum_name: enum_name.into(),
         variant: variant.to_string(),
-        bindings: typed
-            .into_iter()
-            .map(|(name, ty)| (name, ty.into()))
-            .collect(),
+        bindings,
     })
 }

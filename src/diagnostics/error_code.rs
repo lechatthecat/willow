@@ -194,6 +194,10 @@ error_codes! {
     E1207,
     E1208,
     E1209,
+    E1210,
+    E1211,
+    E1212,
+    E1213,
     // Match warnings W12xx (stored as Error severity with W prefix conceptually — use E code)
     W1201,
     // Standard library imports E20xx

@@ -24,6 +24,12 @@ pub struct Parser {
     rust_records: std::collections::HashMap<String, crate::rust_bridge_ir::Record>,
     rust_opaque_names: std::collections::HashSet<String>,
     tuple_arities: std::collections::HashSet<usize>,
+    /// Payload nesting of the pattern being parsed; bounded by
+    /// `pattern::MAX_PATTERN_DEPTH` so every pattern walk has a bounded depth.
+    pattern_depth: usize,
+    /// Parsing one operand of an `if let ... && ...` chain: `&&` ends the
+    /// operand instead of combining it. Nested delimiters reset it.
+    in_let_chain: bool,
     type_uses: Vec<TypeUse>,
     tokens: Vec<Token>,
     pos: usize,
@@ -129,6 +135,8 @@ impl Parser {
             rust_namespaces,
             default_import_usage: Default::default(),
             tuple_arities: Default::default(),
+            pattern_depth: 0,
+            in_let_chain: false,
             type_uses: Vec::new(),
             tokens,
             pos: 0,

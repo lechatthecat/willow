@@ -143,7 +143,7 @@ mod tests {
             "{diagnostics:?}"
         );
         let (program, diagnostics) = Parser::new(
-            Lexer::new("fn main() { let (a, a) = (1, 2); println(3); } fn after() {}")
+            Lexer::new("fn main() { let (a, 1.5) = (1, 2); println(3); } fn after() {}")
                 .tokenize()
                 .unwrap(),
         )

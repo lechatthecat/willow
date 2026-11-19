@@ -1,8 +1,13 @@
 use super::Parser;
 use super::ast::*;
 use super::import_usage::ReferenceKind;
-use crate::diagnostics::{Diagnostic, ErrorCode};
+use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 use crate::lexer::token::TokenKind;
+
+/// Deepest payload nesting a pattern may have. Real patterns nest a few
+/// levels; the bound keeps every recursive pattern walk (checking, coverage,
+/// lowering, cloning, dropping) within a fixed native-stack budget.
+pub(crate) const MAX_PATTERN_DEPTH: usize = 64;
 
 #[willow_continuations::parser]
 impl Parser {
@@ -15,28 +20,24 @@ impl Parser {
             }
             TokenKind::LParen => {
                 self.advance();
-                let mut bindings = vec![self.expect_ident()?];
-                self.expect(TokenKind::Comma)?;
-                while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
-                    bindings.push(self.expect_ident()?);
-                    if !self.eat(TokenKind::Comma) {
+                let mut fields = Vec::new();
+                loop {
+                    fields.push(self.parse_sub_pattern()?);
+                    if fields.len() == 1 {
+                        self.expect(TokenKind::Comma)?;
+                    } else if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                    if matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
                         break;
                     }
                 }
                 self.expect(TokenKind::RParen)?;
-                let mut seen = std::collections::HashSet::new();
-                for binding in &bindings {
-                    if binding != "_" && !seen.insert(binding) {
-                        return Err(
-                            self.err(ErrorCode::E0102, "duplicate binding in tuple pattern")
-                        );
-                    }
-                }
-                self.tuple_arities.insert(bindings.len());
+                self.tuple_arities.insert(fields.len());
                 Ok(Pattern::EnumVariantTuple {
-                    enum_name: super::tuples::name(bindings.len()),
+                    enum_name: super::tuples::name(fields.len()),
                     variant: super::tuples::VARIANT.into(),
-                    bindings,
+                    fields,
                     variant_span: span,
                     span: span.to(self.previous_span()),
                     id: PatternId::fresh(),
@@ -60,15 +61,18 @@ impl Parser {
                     "string literal patterns are not supported",
                 )
                 .with_help("use if/else with string equality (==) instead")),
+            TokenKind::Float(_) | TokenKind::Nil => Err(self.unsupported_literal_pattern(span)),
             TokenKind::Minus => {
                 self.advance();
-                if let TokenKind::Integer(n) = self.peek_kind().clone() {
-                    let end = self.current_span();
-                    self.advance();
-                    let merged = span.to(end);
-                    Ok(Pattern::LiteralInt(-n, merged, PatternId::fresh()))
-                } else {
-                    Err(self.err(ErrorCode::E0102, "expected integer after '-' in pattern"))
+                match self.peek_kind().clone() {
+                    TokenKind::Integer(n) => {
+                        let end = self.current_span();
+                        self.advance();
+                        let merged = span.to(end);
+                        Ok(Pattern::LiteralInt(-n, merged, PatternId::fresh()))
+                    }
+                    TokenKind::Float(_) => Err(self.unsupported_literal_pattern(span)),
+                    _ => Err(self.err(ErrorCode::E0102, "expected integer after '-' in pattern")),
                 }
             }
             TokenKind::Ident(name) => {
@@ -91,27 +95,25 @@ impl Parser {
                     let name = segments.join("::");
                     if matches!(self.peek_kind(), TokenKind::LParen) {
                         self.advance(); // consume (
-                        let mut bindings = Vec::new();
+                        let mut fields = Vec::new();
                         while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
-                            bindings.push(self.parse_payload_binding(&name, Some(&variant))?);
-                            if matches!(self.peek_kind(), TokenKind::Comma) {
-                                self.advance();
+                            fields.push(self.parse_sub_pattern()?);
+                            if !self.eat(TokenKind::Comma) {
+                                break;
                             }
                         }
                         self.expect(TokenKind::RParen)?;
-                        let end = self.current_span();
-                        let merged = span.to(end);
+                        let merged = span.to(self.previous_span());
                         Ok(Pattern::EnumVariantTuple {
                             enum_name: name,
                             variant,
                             variant_span,
-                            bindings,
+                            fields,
                             span: merged,
                             id: PatternId::fresh(),
                         })
                     } else {
-                        let end = self.current_span();
-                        let merged = span.to(end);
+                        let merged = span.to(self.previous_span());
                         Ok(Pattern::EnumVariant {
                             enum_name: name,
                             variant,
@@ -123,26 +125,28 @@ impl Parser {
                 } else if matches!(self.peek_kind(), TokenKind::LParen) {
                     self.default_import_usage
                         .reference(&name, ReferenceKind::Type);
-                    // One binding remains ambiguous with a class downcast;
-                    // zero or multiple bindings can only be an enum pattern.
+                    // One plain name or `_` remains ambiguous with a class
+                    // downcast; anything else can only be an enum pattern
+                    // whose enum the checker takes from the scrutinee type.
                     self.advance();
-                    let mut bindings = Vec::new();
-                    if !matches!(self.peek_kind(), TokenKind::RParen) {
-                        loop {
-                            bindings.push(self.parse_payload_binding(&name, None)?);
-                            if !self.eat(TokenKind::Comma)
-                                || matches!(self.peek_kind(), TokenKind::RParen)
-                            {
-                                break;
-                            }
+                    let mut fields = Vec::new();
+                    while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
+                        fields.push(self.parse_sub_pattern()?);
+                        if !self.eat(TokenKind::Comma) {
+                            break;
                         }
                     }
                     self.expect(TokenKind::RParen)?;
-                    let merged = span.to(self.current_span());
-                    if bindings.len() == 1 {
+                    let merged = span.to(self.previous_span());
+                    let downcast = match fields.as_slice() {
+                        [Pattern::Binding { name, .. }] => Some(name.clone()),
+                        [Pattern::Wildcard(..)] => Some("_".to_string()),
+                        _ => None,
+                    };
+                    if let Some(binding) = downcast {
                         Ok(Pattern::ClassDowncast {
                             class_name: name,
-                            binding: bindings.pop().unwrap(),
+                            binding,
                             span: merged,
                             id: PatternId::fresh(),
                         })
@@ -151,7 +155,7 @@ impl Parser {
                             enum_name: String::new(),
                             variant: name,
                             variant_span: span,
-                            bindings,
+                            fields,
                             span: merged,
                             id: PatternId::fresh(),
                         })
@@ -168,71 +172,76 @@ impl Parser {
         }
     }
 
-    fn parse_payload_binding(
-        &mut self,
-        outer: &str,
-        variant: Option<&str>,
-    ) -> Result<String, Diagnostic> {
-        let start = self.current_span();
-        let literal = matches!(
-            self.peek_kind(),
-            TokenKind::True
-                | TokenKind::False
-                | TokenKind::Nil
-                | TokenKind::Integer(_)
-                | TokenKind::Float(_)
-                | TokenKind::StringLiteral(_)
-        ) || (matches!(self.peek_kind(), TokenKind::Minus)
-            && matches!(
-                self.peek_kind_at(1),
-                TokenKind::Integer(_) | TokenKind::Float(_)
-            ));
-        if literal {
-            return Err(Diagnostic::new(
-                crate::diagnostics::Severity::Error,
-                ErrorCode::E0102,
-                "literal patterns are not supported in variant payloads",
-            )
-            .with_label(crate::diagnostics::Label::primary(start, "literal payload pattern"))
-            .with_help("bind the payload to a variable and use a match guard to test its value; for example, `Fracture(o) if o` for a true boolean payload, or `Value(n) if n == 42` for an integer payload"));
+    /// One payload or tuple element: a full pattern one level deeper.
+    fn parse_sub_pattern(&mut self) -> Result<Pattern, Diagnostic> {
+        if self.pattern_depth + 1 >= MAX_PATTERN_DEPTH {
+            return Err(self
+                .err(
+                    ErrorCode::E0102,
+                    format!("pattern nests more than {MAX_PATTERN_DEPTH} levels deep"),
+                )
+                .with_help("bind an inner payload to a name and match it separately"));
         }
-        let name = self.expect_ident()?;
-        if matches!(self.peek_kind(), TokenKind::ColonColon | TokenKind::LParen) {
-            let outer = variant.map_or_else(
-                || outer.to_string(),
-                |variant| format!("{outer}::{variant}"),
-            );
-            let mut inner = name.clone();
-            let mut offset = 0;
-            while self.peek_kind_at(offset) == &TokenKind::ColonColon {
-                if let TokenKind::Ident(segment) = self.peek_kind_at(offset + 1) {
-                    inner.push_str("::");
-                    inner.push_str(segment);
-                    offset += 2;
-                } else {
-                    break;
-                }
-            }
-            return Err(Diagnostic::new(
-                crate::diagnostics::Severity::Error,
-                ErrorCode::E0102,
-                "nested patterns are not supported; bind and match again",
-            )
-            .with_label(crate::diagnostics::Label::primary(
-                start,
-                "nested constructor pattern",
-            ))
-            .with_help(format!("bind the payload of `{outer}` to a local variable, then match that variable against `{inner}` in the arm body")));
-        }
-        Ok(name)
+        self.pattern_depth += 1;
+        let pattern = self.parse_pattern();
+        self.pattern_depth -= 1;
+        pattern
     }
 
-    // --- helpers ---
+    fn unsupported_literal_pattern(&self, start: crate::diagnostics::Span) -> Diagnostic {
+        let what = match self.peek_kind() {
+            TokenKind::Nil => "`nil` patterns are not supported",
+            _ => "float literal patterns are not supported",
+        };
+        Diagnostic::new(Severity::Error, ErrorCode::E0102, what)
+            .with_label(Label::primary(start, "unsupported literal pattern"))
+            .with_help("bind the value to a name and compare it in a match guard, for example `Value(x) if x == 1.5`")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{lexer::Lexer, parser::Parser};
+
+    /// Operators weaker than `&&` regroup silently next to a let chain, so
+    /// every unparenthesized `||`, `? :` and `..` in or around a chain is a
+    /// diagnostic; parenthesized, the same operands parse.
+    #[test]
+    fn weak_operators_in_let_chains_need_parentheses() {
+        for (head, operator) in [
+            ("let Some(x) = o && x > 0 || flag", "||"),
+            ("let Some(x) = o || p", "||"),
+            ("a || b && let Some(x) = o", "||"),
+            ("let Some(x) = o && let Some(y) = p || q", "||"),
+            ("let Some(x) = o && c ? a : b", "? :"),
+            ("c ? a : b && let Some(x) = o", "? :"),
+            ("let Some(x) = o && 0..x", ".."),
+        ] {
+            for form in ["if", "while"] {
+                let source = format!("fn f() {{ {form} {head} {{ println(1); }} }}");
+                let (_, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+                assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+                assert_eq!(
+                    errors[0].message,
+                    format!("`{operator}` cannot appear unparenthesized next to a `let` chain"),
+                    "{source}"
+                );
+            }
+        }
+        for head in [
+            "let Some(x) = o && (x > 0 || flag)",
+            "let Some(x) = (o || p)",
+            "(a || b) && let Some(x) = o",
+            "let Some(x) = o && (c ? a : b)",
+            "a || b",
+            "c ? a : b",
+            "let Some(x) = o && x > 0 && flag",
+        ] {
+            let source = format!("fn f() {{ if {head} {{ println(1); }} }}");
+            let (_, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+            assert!(errors.is_empty(), "{source}: {errors:?}");
+        }
+    }
     #[test]
     fn string_pattern_diagnostic_perspectives() {
         for literal in [
@@ -294,7 +303,7 @@ mod tests {
         use crate::parser::PARSER_TOKEN_READS;
         for count in [16, 64, 256] {
             let prefix = "binding, ".repeat(count);
-            let source = format!("fn f() {{ match value {{ Value({prefix}-42) => 1, }} }}");
+            let source = format!("fn f() {{ match value {{ Value({prefix}-1.5) => 1, }} }}");
             let tokens = Lexer::new(&source).tokenize().unwrap();
             PARSER_TOKEN_READS.with(|reads| reads.set(0));
             let (_, errors) = Parser::new(tokens).parse();
@@ -306,6 +315,26 @@ mod tests {
         }
     }
 
+    /// The first arm pattern of the `match` that is `f`'s first statement.
+    fn first_arm_pattern(program: &crate::parser::ast::Program) -> &crate::parser::ast::Pattern {
+        use crate::parser::ast::{Expr, Item, Stmt};
+        let f = program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Function(f) if f.name == "f" => Some(f),
+                _ => None,
+            })
+            .expect("fn f");
+        let Some(Stmt::Expr(stmt)) = f.body.stmts.first() else {
+            panic!("f starts with a match statement");
+        };
+        let Expr::Match(m) = &stmt.expr else {
+            panic!("f starts with a match");
+        };
+        &m.arms[0].pattern
+    }
+
     #[test]
     fn literal_payload_diagnostic_perspectives() {
         for outer in [
@@ -314,9 +343,7 @@ mod tests {
             "pkg::Condition::Fracture",
             "Value",
         ] {
-            for literal in [
-                "true", "false", "0", "42", "-42", "1.5", "-1.5", "\"text\"", "nil",
-            ] {
+            for literal in ["1.5", "-1.5", "\"text\"", "nil"] {
                 for prefix in ["", "first, "] {
                     let source = format!(
                         "fn f() {{ match value {{\n{outer}({prefix}{literal}) => println(1),\n}} }}\nasync fn main() {{ await sleep(0); }}"
@@ -327,14 +354,12 @@ mod tests {
                     let error = &errors[0];
                     assert_eq!(error.code, crate::diagnostics::ErrorCode::E0102);
                     assert!(
-                        error.message.contains("literal patterns"),
+                        error.message.contains("literal patterns")
+                            || error.message.contains("`nil` patterns"),
                         "{source}: {error:?}"
                     );
                     assert!(!error.message.contains("reserved keyword"));
                     assert!(error.helps.iter().all(|help| !help.contains("rename")));
-                    assert!(error.helps[0].contains("bind the payload"));
-                    assert!(error.helps[0].contains("match guard"));
-                    assert!(error.helps[0].contains("Fracture(o) if o"));
                     assert_eq!(
                         error.primary_span().unwrap().start,
                         source.find(&format!("{literal})")).unwrap()
@@ -342,16 +367,30 @@ mod tests {
                     assert!(program.items.iter().any(|item| matches!(item, crate::parser::ast::Item::Function(f) if f.name == "main" && f.is_async)));
                 }
             }
+            // `bool` and integer literals are ordinary nested patterns.
+            for literal in ["true", "false", "0", "42", "-42"] {
+                for prefix in ["", "first, "] {
+                    let source = format!(
+                        "fn f() {{ match value {{\n{outer}({prefix}{literal}) => println(1),\n}} }}"
+                    );
+                    let (program, errors) =
+                        Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+                    assert!(errors.is_empty(), "{source}: {errors:?}");
+                    let pattern = first_arm_pattern(&program);
+                    assert!(pattern.is_nested(), "{source}");
+                    assert_eq!(pattern.to_string(), format!("{outer}({prefix}{literal})"));
+                }
+            }
         }
     }
 
     #[test]
-    fn nested_pattern_twenty_diagnostic_perspectives() {
+    fn nested_pattern_twenty_parse_perspectives() {
         for outer in ["Result::Err", "Err", "pkg::Result::Err", "Wrap::Value"] {
             for inner in [
                 "E::Bad(n)",
                 "E::Bad(_)",
-                "Bad(n)",
+                "Bad(n, m)",
                 "E::Empty",
                 "E::Bad(E::Bad(n))",
             ] {
@@ -361,21 +400,32 @@ mod tests {
                 let (program, errors) =
                     Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
                 assert!(program.items.iter().any(|item| matches!(item, crate::parser::ast::Item::Function(f) if f.name == "main" && f.is_async)), "{outer}/{inner}: following async modifier was lost");
+                assert!(errors.is_empty(), "{source}: {errors:?}");
+                let pattern = first_arm_pattern(&program);
+                assert!(pattern.is_nested(), "{outer}/{inner}");
+                assert_eq!(pattern.to_string(), format!("{outer}({inner})"));
+                assert_eq!(pattern.fields().len(), 1);
                 assert!(
-                    errors[0]
-                        .message
-                        .contains("nested patterns are not supported; bind and match again"),
-                    "{outer}/{inner}: {errors:?}"
+                    pattern.fields()[0].span().start > pattern.span().start,
+                    "{outer}/{inner}: inner span lies inside the outer pattern"
                 );
-                assert_eq!(errors.len(), 1, "{source}: {errors:?}");
-                assert!(errors[0].helps[0].contains(outer));
-                assert!(errors[0].helps[0].contains(inner.split('(').next().unwrap()));
-                assert_eq!(errors[0].primary_span().unwrap().line, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn pattern_depth_limit_is_a_diagnostic_not_a_stack_overflow() {
+        use super::MAX_PATTERN_DEPTH;
+        for depth in [MAX_PATTERN_DEPTH - 2, MAX_PATTERN_DEPTH + 10, 10_000] {
+            let pattern = format!("{}x{}", "Some(".repeat(depth), ")".repeat(depth));
+            let source = format!("fn f() {{ match value {{ {pattern} => 1, _ => 0 }}; }}");
+            let (_, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+            if depth < MAX_PATTERN_DEPTH {
+                assert!(errors.is_empty(), "{depth}: {errors:?}");
+            } else {
                 assert!(
-                    errors
-                        .windows(2)
-                        .all(|pair| pair[0].primary_span().unwrap().start
-                            <= pair[1].primary_span().unwrap().start)
+                    errors[0].message.contains("levels deep"),
+                    "{depth}: {errors:?}"
                 );
             }
         }

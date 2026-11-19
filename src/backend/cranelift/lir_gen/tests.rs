@@ -1544,7 +1544,7 @@ fn divergence_nested_if_and_match_use_a_one_megabyte_stack() {
                                 )),
                                 arms: vec![HirMatchArm {
                                     pattern: HirPattern::Wildcard,
-                                    guard: None,
+                                    guard: Vec::new(),
                                     body,
                                     ty: Type::Void,
                                     span,
@@ -1665,7 +1665,7 @@ fn eligibility_deep_scoped_match_and_select_use_one_megabyte() {
                                     )),
                                     arms: vec![HirMatchArm {
                                         pattern: HirPattern::Wildcard,
-                                        guard: None,
+                                        guard: Vec::new(),
                                         body: vec![HirStmt::Expr(expr)],
                                         ty: Type::I64,
                                         span,
@@ -7098,7 +7098,7 @@ fn d25_a_value_match_with_only_diverging_arms_is_refused() {
     let span = crate::diagnostics::Span::dummy();
     let arm = |value: i64| HirMatchArm {
         pattern: HirPattern::LiteralInt(value),
-        guard: None,
+        guard: Vec::new(),
         body: vec![HirStmt::Return {
             value: Some(HirExpr {
                 kind: HirExprKind::Int(value),
@@ -7113,7 +7113,7 @@ fn d25_a_value_match_with_only_diverging_arms_is_refused() {
     let mut arms = vec![arm(0)];
     arms.push(HirMatchArm {
         pattern: HirPattern::Wildcard,
-        guard: None,
+        guard: Vec::new(),
         ..arm(1)
     });
     let scrutinee = HirExpr {
@@ -7160,7 +7160,7 @@ fn d26_arm_divergence_is_decided_by_the_tail_statement() {
     };
     let arm = |body: Vec<HirStmt>| HirMatchArm {
         pattern: HirPattern::Wildcard,
-        guard: None,
+        guard: Vec::new(),
         body,
         ty: Type::Never,
         span,
@@ -7307,7 +7307,7 @@ fn d32_an_all_leaving_match_is_admitted_only_where_nothing_follows() {
     let span = crate::diagnostics::Span::dummy();
     let arm = |value: i64| HirMatchArm {
         pattern: HirPattern::LiteralInt(value),
-        guard: None,
+        guard: Vec::new(),
         body: vec![HirStmt::Return {
             value: Some(HirExpr {
                 kind: HirExprKind::Int(value),
@@ -7322,7 +7322,7 @@ fn d32_an_all_leaving_match_is_admitted_only_where_nothing_follows() {
     let mut arms = vec![arm(0)];
     arms.push(HirMatchArm {
         pattern: HirPattern::Wildcard,
-        guard: None,
+        guard: Vec::new(),
         ..arm(1)
     });
     assert!(match_diverges(&arms));

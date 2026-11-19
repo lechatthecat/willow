@@ -1289,11 +1289,14 @@ pub enum Pattern {
         span: Span,
         id: PatternId,
     },
-    /// `Shape::Circle(r)` or `Shape::Rectangle(w, h)` — associated value enum variant
+    /// `Shape::Circle(r)` or `Shape::Rectangle(w, h)` — associated value enum
+    /// variant. Each payload position is itself a pattern, so `Some(Ok(v))` or
+    /// `Pair(_, Color::Red)` nest; `enum_name` is empty for a bare `Ok(v)`,
+    /// which the checker resolves against the scrutinee type.
     EnumVariantTuple {
         enum_name: String,
         variant: String,
-        bindings: Vec<String>,
+        fields: Vec<Pattern>,
         variant_span: Span,
         span: Span,
         id: PatternId,
@@ -1322,6 +1325,18 @@ impl Pattern {
         }
     }
 
+    pub fn id_mut(&mut self) -> &mut PatternId {
+        match self {
+            Self::Wildcard(_, id)
+            | Self::LiteralBool(_, _, id)
+            | Self::LiteralInt(_, _, id)
+            | Self::Binding { id, .. }
+            | Self::EnumVariant { id, .. }
+            | Self::EnumVariantTuple { id, .. }
+            | Self::ClassDowncast { id, .. } => id,
+        }
+    }
+
     pub fn span(&self) -> Span {
         match self {
             Pattern::Wildcard(s, _) => *s,
@@ -1331,6 +1346,211 @@ impl Pattern {
             Pattern::EnumVariant { span, .. } => *span,
             Pattern::EnumVariantTuple { span, .. } => *span,
             Pattern::ClassDowncast { span, .. } => *span,
+        }
+    }
+
+    /// The payload sub-patterns directly inside this one.
+    pub fn fields(&self) -> &[Pattern] {
+        match self {
+            Self::EnumVariantTuple { fields, .. } => fields,
+            _ => &[],
+        }
+    }
+
+    /// Every name this pattern binds, outermost first and left to right, with
+    /// the span of the sub-pattern that binds it. `_` is a hole, not a name.
+    /// Iterative, so the walk costs no native stack per nesting level.
+    pub fn bindings(&self) -> Vec<(&str, Span)> {
+        let mut out = Vec::new();
+        let mut pending = vec![self];
+        while let Some(pattern) = pending.pop() {
+            match pattern {
+                Self::Binding { name, span, .. } => out.push((name.as_str(), *span)),
+                Self::ClassDowncast { binding, span, .. } if binding != "_" => {
+                    out.push((binding.as_str(), *span));
+                }
+                Self::EnumVariantTuple { fields, .. } => pending.extend(fields.iter().rev()),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The source name of every binding `resolved` (the checker's reading of
+    /// this pattern) introduces, in `resolved.bindings()` order. Positions
+    /// the checker read as payload-free variants (`None` inside `Some(..)`)
+    /// bind nothing, so they are skipped rather than misaligned.
+    pub fn source_bindings<'a>(&'a self, resolved: &Pattern) -> Vec<&'a String> {
+        let mut out = Vec::new();
+        let mut pending = vec![(self, resolved)];
+        while let Some((source, resolved)) = pending.pop() {
+            match (source, resolved) {
+                (Self::Binding { name, .. }, Self::Binding { .. }) => out.push(name),
+                (Self::ClassDowncast { binding, .. }, Self::ClassDowncast { .. })
+                    if binding != "_" =>
+                {
+                    out.push(binding);
+                }
+                // `Some(x)` read as a variant binds `x`; `Some(None)` read as
+                // a variant holding a fieldless variant binds nothing.
+                (
+                    Self::ClassDowncast { binding, .. },
+                    Self::EnumVariantTuple { fields: read, .. },
+                ) if binding != "_" && matches!(read.as_slice(), [Self::Binding { .. }]) => {
+                    out.push(binding);
+                }
+                (
+                    Self::EnumVariantTuple { fields, .. },
+                    Self::EnumVariantTuple { fields: read, .. },
+                ) => {
+                    pending.extend(fields.iter().zip(read).rev());
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// A copy of this node without its payload sub-patterns, for rebuilding
+    /// a resolved tree without cloning the subtrees being replaced.
+    pub fn without_fields(&self) -> Self {
+        match self {
+            Self::EnumVariantTuple {
+                enum_name,
+                variant,
+                variant_span,
+                span,
+                id,
+                ..
+            } => Self::EnumVariantTuple {
+                enum_name: enum_name.clone(),
+                variant: variant.clone(),
+                variant_span: *variant_span,
+                fields: Vec::new(),
+                span: *span,
+                id: *id,
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// Whether this (resolved) pattern matches every value without a test:
+    /// a name or `_`. Tuples of those are irrefutable too, but still take
+    /// the tag test that lowering emits, so they are not "test-free".
+    pub fn is_irrefutable_shape(&self) -> bool {
+        matches!(self, Self::Wildcard(..) | Self::Binding { .. })
+    }
+
+    /// Whether any payload position holds a refutable or binding-free
+    /// sub-pattern other than a plain name or `_`, i.e. whether this pattern
+    /// needs more than one tag test.
+    pub fn is_nested(&self) -> bool {
+        self.fields()
+            .iter()
+            .any(|field| !matches!(field, Self::Binding { .. } | Self::Wildcard(..)))
+    }
+}
+
+/// Source-like spelling: `E::V(a, (b, _))`, `Some(None)`, `Dog(d)`.
+/// Iterative, so deep patterns cost no native stack.
+impl std::fmt::Display for Pattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        enum Part<'a> {
+            Pattern(&'a Pattern),
+            Text(&'static str),
+        }
+        let mut stack = vec![Part::Pattern(self)];
+        while let Some(part) = stack.pop() {
+            let pattern = match part {
+                Part::Text(text) => {
+                    f.write_str(text)?;
+                    continue;
+                }
+                Part::Pattern(pattern) => pattern,
+            };
+            match pattern {
+                Self::Wildcard(..) => f.write_str("_")?,
+                Self::Binding { name, .. } => f.write_str(name)?,
+                Self::LiteralBool(value, ..) => write!(f, "{value}")?,
+                Self::LiteralInt(value, ..) => write!(f, "{value}")?,
+                Self::EnumVariant {
+                    enum_name, variant, ..
+                } if enum_name.is_empty() => f.write_str(variant)?,
+                Self::EnumVariant {
+                    enum_name, variant, ..
+                } => write!(f, "{enum_name}::{variant}")?,
+                Self::ClassDowncast {
+                    class_name,
+                    binding,
+                    ..
+                } => write!(f, "{class_name}({binding})")?,
+                Self::EnumVariantTuple {
+                    enum_name,
+                    variant,
+                    fields,
+                    ..
+                } => {
+                    if super::tuples::is_tuple(enum_name) {
+                        f.write_str("(")?;
+                        stack.push(Part::Text(if fields.len() == 1 { ",)" } else { ")" }));
+                    } else {
+                        if !enum_name.is_empty() {
+                            write!(f, "{enum_name}::")?;
+                        }
+                        write!(f, "{variant}(")?;
+                        stack.push(Part::Text(")"));
+                    }
+                    for (i, field) in fields.iter().enumerate().rev() {
+                        stack.push(Part::Pattern(field));
+                        if i > 0 {
+                            stack.push(Part::Text(", "));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One condition of a match arm after its pattern matched: `if cond`, or one
+/// `let P = e` link of an `if let ... && let ...` chain. Steps run in order,
+/// see the bindings of earlier steps, and a failing step falls through to the
+/// next arm exactly as a false guard does.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum Guard {
+    If(Expr),
+    Let(LetGuard),
+}
+
+/// `let pattern = scrutinee` inside a let chain.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LetGuard {
+    pub pattern: Pattern,
+    pub scrutinee: Expr,
+    pub span: Span,
+}
+
+impl Guard {
+    /// The expression this step evaluates.
+    pub fn expr(&self) -> &Expr {
+        match self {
+            Self::If(expr) => expr,
+            Self::Let(step) => &step.scrutinee,
+        }
+    }
+
+    pub fn expr_mut(&mut self) -> &mut Expr {
+        match self {
+            Self::If(expr) => expr,
+            Self::Let(step) => &mut step.scrutinee,
+        }
+    }
+
+    pub fn pattern(&self) -> Option<&Pattern> {
+        match self {
+            Self::If(_) => None,
+            Self::Let(step) => Some(&step.pattern),
         }
     }
 }
@@ -1344,10 +1564,11 @@ pub enum MatchBody {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MatchArm {
     pub pattern: Pattern,
-    /// `pattern if guard => body`. Evaluated after the
-    /// pattern's bindings are in scope; a false guard falls through to the
+    /// `pattern if guard => body`, and the remaining links of an
+    /// `if let A = x && let B = y && cond` chain. Evaluated in order after the
+    /// pattern's bindings are in scope; a failing step falls through to the
     /// next arm, so a guarded arm never counts toward exhaustiveness.
-    pub guard: Option<Expr>,
+    pub guard: Vec<Guard>,
     pub body: MatchBody,
     pub span: Span,
 }
@@ -1378,6 +1599,9 @@ pub enum MatchSource {
     WhileLet,
     /// Destructuring let's remainder: a binding scope, not a source block.
     TupleLet,
+    /// `let P = e else { diverge };` → `match e { P => { rest }, _ => { diverge } }`.
+    /// The first arm is the rest of the enclosing block.
+    LetElse,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

@@ -96,8 +96,27 @@ A `match` arm may add a guard, `P if cond => ...`. The guard runs after `P`
 binds and sees its bindings. When the guard is false, the next arm is tried. A
 guarded arm never makes a match exhaustive, so `match n { x if x > 0 => 1, 0 =>
 2 }` is still error E1206; add an unguarded arm such as `_ => ...`. A guard must
-be `bool` (E0203). Let chains (`if let P = e && cond`) and nested patterns are
-not supported; bind first and test inside the block.
+be `bool` (E0203).
+
+## Nested patterns and let chains
+
+[nested_patterns.wi](nested_patterns.wi) nests patterns to any depth in
+`match`, `if let`, `while let` and `let ... else`:
+
+```willow
+match r { Ok(Some(n)) => n, Ok(None) => 0, Err(_) => -1 }
+if let (Some(a), Some(b)) = pair && a + b < limit { println(a + b); }
+let Item::Plain(Some(shape)) = item else { continue; };
+```
+
+Inside a pattern the enum name may be omitted when the expected type is a known
+enum that declares the variant (`Circle(r)` for a `Shape`). A let chain runs its
+steps left to right and each step sees the earlier bindings; `||`, `?:` and
+ranges next to a chain need parentheses. Exhaustiveness checks nested
+payloads: a missing case is reported with a witness such as `Ok(Option::None)`
+(E1202), and an arm that can never match warns (W1201). Payload literals may be
+`bool` or integers; duplicate bindings in one pattern are E1210, a `let ... else`
+whose else block falls through is E1212, and a refutable tuple `let` is E1213.
 
 ## Asynchronous filesystem operations
 

@@ -181,7 +181,7 @@ fn recovery_reads_scale_linearly() {
     for nested in [false, true] {
         let mut samples = Vec::new();
         for count in [8, 16, 32, 64] {
-            let bad = "match value { Wrap::Value(Inner::Bad(n)) => 0 }";
+            let bad = "match value { Wrap::Value(Inner::Bad(1.5)) => 0 }";
             let source = if nested {
                 format!(
                     "fn bad() {{ {} {bad} {} }}",

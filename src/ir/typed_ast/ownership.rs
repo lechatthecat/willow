@@ -220,7 +220,11 @@ fn shallow_expr(source: &HirExpr) -> HirExpr {
                 .iter()
                 .map(|arm| HirMatchArm {
                     pattern: arm.pattern.clone(),
-                    guard: arm.guard.as_ref().map(|_| empty_expr()),
+                    guard: arm
+                        .guard
+                        .iter()
+                        .map(|step| step.with_expr(empty_expr()))
+                        .collect(),
                     body: stmt_slots(arm.body.len()),
                     ty: arm.ty.clone(),
                     span: arm.span,
@@ -484,7 +488,11 @@ fn expr_children_mut(source: &mut HirExpr) -> Vec<NodeMut<'_>> {
         HirExprKind::Match { scrutinee, arms } => {
             out.push(NodeMut::Expr(scrutinee));
             for arm in arms {
-                out.extend(arm.guard.as_mut().map(NodeMut::Expr));
+                out.extend(
+                    arm.guard
+                        .iter_mut()
+                        .map(|step| NodeMut::Expr(step.expr_mut())),
+                );
                 out.extend(arm.body.iter_mut().map(NodeMut::Stmt));
             }
         }
@@ -585,7 +593,7 @@ fn expr_children(source: &HirExpr) -> Vec<NodeRef<'_>> {
         HirExprKind::Match { scrutinee, arms } => {
             out.push(NodeRef::Expr(scrutinee));
             for arm in arms {
-                out.extend(arm.guard.as_ref().map(NodeRef::Expr));
+                out.extend(arm.guard.iter().map(|step| NodeRef::Expr(step.expr())));
                 out.extend(arm.body.iter().map(NodeRef::Stmt));
             }
         }
@@ -912,7 +920,7 @@ mod tests {
                 scrutinee: Box::new(leaf()),
                 arms: vec![HirMatchArm {
                     pattern: HirPattern::Wildcard,
-                    guard: None,
+                    guard: Vec::new(),
                     body: vec![HirStmt::Expr(child)],
                     ty: Type::I64,
                     span,

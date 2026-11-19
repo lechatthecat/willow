@@ -407,3 +407,38 @@ async fn main() {
     assert!(ok, "{out}");
     assert_eq!(out, "5\n9\n");
 }
+
+#[test]
+fn ownership_transfer_follows_let_chain_step_bindings() {
+    let class = "class Box { pub n: i64; pub fn set(self, n: i64) { self.n = n; } }";
+    // A name bound by a chain step owns what its step scrutinee owns, like
+    // the same name bound by a plain `if let`.
+    for body in [
+        "if let Option::Some(b) = Option::Some(new Box(0)) { let m = Mutex::new(b); }",
+        "let go = true; if go && let Option::Some(b) = Option::Some(new Box(0)) { let m = Mutex::new(b); }",
+        "let o = Option::Some(1); if let Option::Some(k) = o && let Option::Some(b) = Option::Some(new Box(k)) { let m = Mutex::new(b); }",
+        "let o = Option::Some(1); match o { Option::Some(k) if let Option::Some(b) = Option::Some(new Box(k)) => { let m = Mutex::new(b); }, _ => {} }",
+    ] {
+        let (ok, diagnostics) =
+            compile_with_data_race_check(&format!("{class} async fn main() {{ {body} }}"));
+        assert!(ok, "{body}: {diagnostics}");
+    }
+    // ... and stays an alias of it: the original is unusable after transfer.
+    for body in [
+        "let b0 = new Box(0); if let Option::Some(b) = Option::Some(b0) { let m = Mutex::new(b); b0.set(1); }",
+        "let go = true; let b0 = new Box(0); if go && let Option::Some(b) = Option::Some(b0) { let m = Mutex::new(b); b0.set(1); }",
+        "let b0 = new Box(0); let o = Option::Some(1); if let Option::Some(k) = o && let Option::Some(b) = Option::Some(b0) { let m = Mutex::new(b); b0.set(k); }",
+        "let b0 = new Box(0); let o = Option::Some(1); match o { Option::Some(k) if let Option::Some(b) = Option::Some(b0) => { let m = Mutex::new(b); b0.set(k); }, _ => {} }",
+    ] {
+        let (ok, diagnostics) =
+            compile_with_data_race_check(&format!("{class} async fn main() {{ {body} }}"));
+        assert!(
+            !ok && diagnostics.contains("use of a non-Sync value after ownership transfer"),
+            "{body}: {diagnostics}"
+        );
+        assert!(
+            !diagnostics.contains("cannot transfer a borrowed"),
+            "{body}: {diagnostics}"
+        );
+    }
+}

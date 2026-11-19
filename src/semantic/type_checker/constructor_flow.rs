@@ -606,10 +606,11 @@ impl<'a, 'f> Graph<'a, 'f> {
                                 };
                                 // A failed guard falls through to a later
                                 // arm, which the fork already reaches.
-                                arms.push(match &arm.guard {
-                                    Some(guard) => self.expr(guard, body, flow),
-                                    None => body,
-                                });
+                                let mut target = body;
+                                for guard in arm.guard.iter().rev() {
+                                    target = self.expr(guard.expr(), target, flow);
+                                }
+                                arms.push(target);
                             }
                             // Exhaustiveness is checked separately (E1206).
                             let fork = self.fork(arms);

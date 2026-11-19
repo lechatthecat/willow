@@ -325,13 +325,13 @@ mod tests {
                 arms: vec![
                     MatchArm {
                         pattern: Pattern::Wildcard(span, PatternId::fresh()),
-                        guard: None,
+                        guard: Vec::new(),
                         body: MatchBody::Block(block()),
                         span,
                     },
                     MatchArm {
                         pattern: Pattern::Wildcard(span, PatternId::fresh()),
-                        guard: None,
+                        guard: Vec::new(),
                         body: MatchBody::Expr(Box::new(leaf(0))),
                         span,
                     },

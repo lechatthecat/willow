@@ -48,8 +48,8 @@ use crate::semantic::type_checker::LambdaCapture;
 use crate::semantic::type_checker::types::await_output_type;
 
 use super::typed_ast::{
-    HirCapture, HirClass, HirDeferBody, HirDeferId, HirExpr, HirExprKind, HirFunction, HirMatchArm,
-    HirParam, HirPattern, HirProgram, HirSelectCase, HirSelectCaseKind, HirStmt,
+    HirCapture, HirClass, HirDeferBody, HirDeferId, HirExpr, HirExprKind, HirFunction, HirGuard,
+    HirMatchArm, HirParam, HirPattern, HirProgram, HirSelectCase, HirSelectCaseKind, HirStmt,
 };
 
 /// Complete semantic input to production lowering. Sparse maps represent

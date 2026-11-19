@@ -389,7 +389,7 @@ impl HirExpr {
             HirExprKind::Match { scrutinee, arms } => {
                 let mut out = vec![&**scrutinee];
                 for arm in arms {
-                    out.extend(&arm.guard);
+                    out.extend(arm.guard.iter().map(HirGuard::expr));
                     out.extend(nested_exprs(&arm.body));
                 }
                 out
@@ -693,12 +693,59 @@ pub enum HirSelectCaseKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirMatchArm {
     pub pattern: HirPattern,
-    /// `pattern if guard`: a `bool` evaluated with the
-    /// pattern's bindings in scope. False falls through to the next arm.
-    pub guard: Option<HirExpr>,
+    /// Steps run in order after `pattern` matched, each with the bindings of
+    /// the pattern and of earlier steps in scope. A false `if` or a failed
+    /// `let` falls through to the next arm. Nested source patterns are
+    /// flattened into `let` steps over synthetic payload locals.
+    pub guard: Vec<HirGuard>,
     pub body: Vec<HirStmt>,
     pub ty: Type,
     pub span: Span,
+}
+
+/// One step of a match arm's guard chain.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HirGuard {
+    /// `if cond` / `&& cond`.
+    If(HirExpr),
+    /// `&& let pattern = scrutinee`: `pattern` is flat (its payload positions
+    /// are bindings or `_`).
+    Let {
+        scrutinee: HirExpr,
+        pattern: HirPattern,
+    },
+}
+
+impl HirGuard {
+    /// The expression this step evaluates.
+    pub fn expr(&self) -> &HirExpr {
+        match self {
+            Self::If(expr)
+            | Self::Let {
+                scrutinee: expr, ..
+            } => expr,
+        }
+    }
+
+    pub fn expr_mut(&mut self) -> &mut HirExpr {
+        match self {
+            Self::If(expr)
+            | Self::Let {
+                scrutinee: expr, ..
+            } => expr,
+        }
+    }
+
+    /// The same step evaluating `expr` instead.
+    pub fn with_expr(&self, expr: HirExpr) -> Self {
+        match self {
+            Self::If(_) => Self::If(expr),
+            Self::Let { pattern, .. } => Self::Let {
+                scrutinee: expr,
+                pattern: pattern.clone(),
+            },
+        }
+    }
 }
 
 /// A match pattern with resolved binding types.

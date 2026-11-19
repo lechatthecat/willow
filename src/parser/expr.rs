@@ -10,8 +10,10 @@ impl Parser {
         // Keep this wrapper direct: an extra continuation per expression would
         // allocate two more boxes for every ordinary expression.
         let saved = std::mem::replace(&mut self.allow_object_literals, true);
+        let chain = std::mem::replace(&mut self.in_let_chain, false);
         let result = self.parse_range();
         self.allow_object_literals = saved;
+        self.in_let_chain = chain;
         let expr = result?;
         self.reject_as_cast()?;
         Ok(expr)
@@ -20,8 +22,10 @@ impl Parser {
     /// A lock target ends at its binding `as`; nested expressions still reject casts.
     pub(super) fn parse_expr_before_as(&mut self) -> Result<Expr, Diagnostic> {
         let saved = std::mem::replace(&mut self.allow_object_literals, true);
+        let chain = std::mem::replace(&mut self.in_let_chain, false);
         let result = self.parse_range();
         self.allow_object_literals = saved;
+        self.in_let_chain = chain;
         result
     }
 
@@ -29,11 +33,47 @@ impl Parser {
     /// Nested expression delimiters re-enable object literals via `parse_expr`.
     pub(super) fn parse_control_head(&mut self) -> Result<Expr, Diagnostic> {
         let saved = std::mem::replace(&mut self.allow_object_literals, false);
+        let chain = std::mem::replace(&mut self.in_let_chain, false);
         let result = self.parse_range();
         self.allow_object_literals = saved;
+        self.in_let_chain = chain;
         let expr = result?;
         self.reject_as_cast()?;
         Ok(expr)
+    }
+
+    /// One `&&` operand of a let chain, in control-head position.
+    pub(super) fn parse_chain_operand(&mut self) -> Result<Expr, Diagnostic> {
+        let saved = std::mem::replace(&mut self.allow_object_literals, false);
+        let chain = std::mem::replace(&mut self.in_let_chain, true);
+        let result = self.parse_range();
+        self.allow_object_literals = saved;
+        self.in_let_chain = chain;
+        let expr = result?;
+        self.reject_as_cast()?;
+        Ok(expr)
+    }
+
+    /// Whether the next `&&` links a let chain rather than combining two
+    /// booleans: inside a chain operand, or directly before `let`.
+    pub(super) fn at_chain_link(&self) -> bool {
+        self.check(TokenKind::And)
+            && (self.in_let_chain || matches!(self.peek_kind_at(1), TokenKind::Let))
+    }
+
+    /// `a || b && let ...`, `let P = e && a || b` and similar would
+    /// silently regroup; require parentheses for any operator weaker than
+    /// `&&` formed before a chain link or inside any chain operand.
+    fn reject_unparenthesized_in_chain(&self, operator: &str) -> Result<(), Diagnostic> {
+        if self.in_let_chain || self.at_chain_link() {
+            return Err(self
+                .err(
+                    ErrorCode::E0102,
+                    format!("`{operator}` cannot appear unparenthesized next to a `let` chain"),
+                )
+                .with_help("wrap that operand in parentheses"));
+        }
+        Ok(())
     }
 
     fn reject_as_cast(&self) -> Result<(), Diagnostic> {
@@ -51,6 +91,7 @@ impl Parser {
             return Ok(lhs);
         }
         let rhs = self.parse_ternary()?;
+        self.reject_unparenthesized_in_chain("..")?;
         let start = lhs.span();
         let end = rhs.span();
         let span = start.to(end);
@@ -76,10 +117,12 @@ impl Parser {
             },
         }
         let mut frames = Vec::new();
+        let mut formed = false;
         loop {
             let span = self.current_span();
             let mut value = self.parse_or()?;
             if self.eat(TokenKind::Question) {
+                formed = true;
                 frames.push(Frame::Then {
                     condition: value,
                     span,
@@ -88,7 +131,12 @@ impl Parser {
             }
             loop {
                 match frames.pop() {
-                    None => return Ok(value),
+                    None => {
+                        if formed {
+                            self.reject_unparenthesized_in_chain("? :")?;
+                        }
+                        return Ok(value);
+                    }
                     Some(Frame::Then { condition, span }) => {
                         self.reject_as_cast()?;
                         if !self.eat(TokenKind::Colon) {
@@ -202,10 +250,12 @@ impl Parser {
 
     pub(super) fn parse_or(&mut self) -> Result<Expr, Diagnostic> {
         let mut lhs = self.parse_and()?;
+        let mut formed = false;
         while self.check(TokenKind::Or) {
             let span = self.current_span();
             self.advance();
             let rhs = self.parse_and()?;
+            formed = true;
             lhs = Expr::Binary(Box::new(BinaryExpr {
                 op: BinOp::Or,
                 lhs,
@@ -214,12 +264,17 @@ impl Parser {
                 id: ExprId::fresh(),
             }));
         }
+        if formed {
+            self.reject_unparenthesized_in_chain("||")?;
+        }
         Ok(lhs)
     }
 
     pub(super) fn parse_and(&mut self) -> Result<Expr, Diagnostic> {
         let mut lhs = self.parse_cmp()?;
-        while self.check(TokenKind::And) {
+        // `&&` before `let` links a chain; inside a chain operand every `&&`
+        // does. The enclosing `if`/`while`/guard consumes those.
+        while self.check(TokenKind::And) && !self.at_chain_link() {
             let span = self.current_span();
             self.advance();
             let rhs = self.parse_cmp()?;
@@ -526,7 +581,7 @@ impl Parser {
                                     span,
                                     id: PatternId::fresh(),
                                 },
-                                guard: None,
+                                guard: Vec::new(),
                                 body: MatchBody::Expr(Box::new(Expr::Call(Box::new(CallExpr {
                                     type_args: vec![],
                                     callee: name,
@@ -1368,11 +1423,11 @@ impl Parser {
             let pattern = self.parse_pattern()?;
             let scope = self.default_import_usage.scope();
             self.default_import_usage.bind_pattern(&pattern);
-            // `pattern if guard => body`.
+            // `pattern if guard => body`, where the guard may be a let chain.
             let guard = if self.eat(TokenKind::If) {
-                Some(self.parse_expr()?)
+                self.parse_condition_head(true)?
             } else {
-                None
+                Vec::new()
             };
             self.expect(TokenKind::FatArrow)?;
             let body = if matches!(self.peek_kind(), TokenKind::LBrace) {

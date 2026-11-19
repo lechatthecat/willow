@@ -31,7 +31,7 @@
 //!  21  non-exhaustive errors when only a guarded arm covers a case (CLI)
 //!  22  non-`bool` guard (CLI)
 //!  23  irrefutable `if let` warns and still runs
-//!  24  nested patterns remain rejected in `if let`
+//!  24  (nested `if let` patterns now run; see `nested_patterns.rs`)
 //!  25  the example program runs (see `runtime/examples.rs`)
 
 use crate::support::*;
@@ -287,10 +287,6 @@ fn guarded_only_coverage_is_rejected_by_the_cli() {
         "fn f(n: i64) -> i64 { return match n { x if x => 1, _ => 2 }; } fn main() { println(f(1)); }",
         &["E0203", "match guard must be `bool`, found `i64`"],
     );
-    assert_compile_error_contains(
-        "fn main() { let o: Option<Option<i64>> = None; if let Some(Some(x)) = o { println(x); } }",
-        &["E0102", "nested patterns are not supported"],
-    );
 }
 
 #[test]
@@ -312,19 +308,30 @@ fn literal_payload_guard_workaround_runs() {
 
 #[test]
 fn literal_payload_patterns_have_actionable_cli_errors() {
-    for literal in ["true", "false", "42", "-42", "1.5", "\"text\""] {
+    for (literal, expected) in [
+        ("1.5", ["E0102", "float literal patterns", "match guard"]),
+        ("-1.5", ["E0102", "float literal patterns", "match guard"]),
+        ("nil", ["E0102", "`nil` patterns", "match guard"]),
+        ("\"text\"", ["E0102", "string literal patterns", "=="]),
+    ] {
         assert_compile_error_contains(
             &format!(
-                "fn main() {{ match value {{ Condition::Fracture({literal}) => println(1), }} }}"
+                "enum Condition {{ Fracture(bool) }} fn main() {{ let value = Condition::Fracture(true); match value {{ Condition::Fracture({literal}) => println(1), _ => println(0), }} }}"
             ),
-            &[
-                "E0102",
-                "literal patterns",
-                "bind the payload",
-                "match guard",
-            ],
+            &expected,
         );
     }
+    // `bool` and integer payloads are matched directly.
+    assert_runs(
+        "enum Condition { Fracture(bool), Value(i64) } \
+         fn classify(c: Condition) -> i64 { return match c { \
+         Condition::Fracture(true) => 2, Condition::Fracture(false) => 0, \
+         Condition::Value(-42) => 3, Condition::Value(_) => 1 }; } \
+         fn main() { println(classify(Condition::Fracture(true))); \
+         println(classify(Condition::Fracture(false))); \
+         println(classify(Condition::Value(-42))); println(classify(Condition::Value(7))); }",
+        "2\n0\n3\n1\n",
+    );
 }
 
 #[test]

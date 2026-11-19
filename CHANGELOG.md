@@ -4,6 +4,22 @@ Notable user-facing changes to the Willow compiler, runtime, and toolchain.
 
 ## Unreleased
 
+### Added
+
+- **Nested patterns, let chains and omitted enum names in patterns.**
+  Patterns nest to any depth in `match`, `if let`, `while let` and
+  `let ... else` (`Ok(Some(n))`, `Item::Painted(Circle(r), Red)`,
+  `(Some(a), None)`), with `bool` and integer literals allowed in payloads.
+  `if let A = x && let B = y && cond { ... }` chains steps left to right; each
+  step sees the bindings before it. Inside a pattern the enum name may be left
+  out when the expected type is a known enum declaring the variant; otherwise
+  the bare name is an error. Exhaustiveness checking understands nesting and
+  reports a missing witness such as `Ok(Option::None)` (E1202); a nested arm
+  that can never match is warning W1201. New errors: duplicate binding in one
+  pattern (E1210), a bare variant name that cannot be resolved (E1211), a
+  `let ... else` whose else block does not diverge (E1212), and a refutable
+  tuple `let` (E1213). See `example/nested_patterns.wi`.
+
 ## 0.1.11 - 2026-11-12
 
 ### Breaking

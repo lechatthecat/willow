@@ -19,6 +19,7 @@ mod check_concurrency;
 use builtin_methods::{ArityText, BuiltinArgument, BuiltinArity, constructor_arity, method_arity};
 mod check_decls;
 mod check_lambda_match;
+mod exhaustiveness;
 pub(crate) mod generics;
 pub(crate) mod precheck;
 pub(crate) mod precheck_journal;
@@ -37,6 +38,8 @@ mod diagnostics;
 mod indirect_lock;
 #[cfg(test)]
 mod match_guard_tests;
+#[cfg(test)]
+mod nested_pattern_tests;
 #[cfg(test)]
 mod never_tests;
 mod resolve;

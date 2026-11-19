@@ -212,11 +212,14 @@ impl TypeChecker {
                 if m.arms.is_empty() {
                     return false;
                 }
-                for arm in &m.arms {
-                    let diverges = match &arm.body {
-                        MatchBody::Block(block) => self.block_diverges(block),
-                        MatchBody::Expr(expr) => self.expr_diverges(expr),
-                    };
+                for (index, arm) in m.arms.iter().enumerate() {
+                    // A `let ... else` block must diverge; one that does not
+                    // is E1212 already, so it never adds a second error here.
+                    let diverges = (m.source == MatchSource::LetElse && index == 1)
+                        || match &arm.body {
+                            MatchBody::Block(block) => self.block_diverges(block),
+                            MatchBody::Expr(expr) => self.expr_diverges(expr),
+                        };
                     if !diverges {
                         return false;
                     }

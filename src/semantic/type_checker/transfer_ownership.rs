@@ -657,13 +657,22 @@ impl TypeChecker {
 
     fn enter_transfer_expr(&mut self, state: &mut OwnershipState, expr: &Expr) -> bool {
         if let Expr::Match(m) = expr {
+            // Each name aliases the value its pattern destructures: the
+            // arm pattern the scrutinee, a guard `let` step its own scrutinee.
             for arm in &m.arms {
-                let pattern = &arm.pattern;
-                for event in AstWalk::new(AstEvent::Pattern(pattern)) {
-                    if let AstEvent::Bind(name) = event {
-                        state
-                            .pending_bindings
-                            .insert(name.as_ptr() as usize, m.scrutinee.id());
+                let steps = arm.guard.iter().filter_map(|step| match step {
+                    Guard::Let(step) => Some((&step.pattern, step.scrutinee.id())),
+                    Guard::If(_) => None,
+                });
+                for (pattern, source) in
+                    std::iter::once((&arm.pattern, m.scrutinee.id())).chain(steps)
+                {
+                    for event in AstWalk::new(AstEvent::Pattern(pattern)) {
+                        if let AstEvent::Bind(name) = event {
+                            state
+                                .pending_bindings
+                                .insert(name.as_ptr() as usize, source);
+                        }
                     }
                 }
             }

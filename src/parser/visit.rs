@@ -264,8 +264,11 @@ pub fn walk_expr<V: AstVisitor + ?Sized>(visitor: &mut V, expr: &Expr) {
             for arm in &expr.arms {
                 visitor.enter_scope();
                 visitor.visit_pattern(&arm.pattern);
-                if let Some(guard) = &arm.guard {
-                    visitor.visit_expr(guard);
+                for guard in &arm.guard {
+                    visitor.visit_expr(guard.expr());
+                    if let Some(pattern) = guard.pattern() {
+                        visitor.visit_pattern(pattern);
+                    }
                 }
                 match &arm.body {
                     MatchBody::Expr(body) => visitor.visit_expr(body),
@@ -306,15 +309,8 @@ pub fn walk_pattern<V: AstVisitor + ?Sized>(visitor: &mut V, pattern: &Pattern) 
         Pattern::Wildcard(_, _) | Pattern::LiteralBool(..) | Pattern::LiteralInt(..) => {}
         Pattern::Binding { name, .. } => visitor.bind(name),
         Pattern::EnumVariant { .. } => {}
-        Pattern::EnumVariantTuple { bindings, .. } => {
-            for binding in bindings {
-                if binding != "_" {
-                    visitor.bind(binding);
-                }
-            }
-        }
-        Pattern::ClassDowncast { binding, .. } => {
-            if binding != "_" {
+        Pattern::EnumVariantTuple { .. } | Pattern::ClassDowncast { .. } => {
+            for (binding, _) in pattern.bindings() {
                 visitor.bind(binding);
             }
         }

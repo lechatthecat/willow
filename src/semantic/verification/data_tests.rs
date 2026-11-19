@@ -415,3 +415,34 @@ fn verified_data_replay_determinism() {
     let mut solver = solver::Solver::new(&Options::default().solver, 5000).unwrap();
     assert!(!solver.exchange(&first.smt).unwrap().contains("unknown"));
 }
+
+#[test]
+fn verified_nested_patterns_and_let_chains() {
+    let decls = "enum Inner { Num(i64), Flag(bool), Empty } enum Outer { Wrap(Inner), Pair(Inner, Inner), Nothing }";
+    for (source, expected) in [
+        (
+            "@pure @verified fn f(o:Outer)->i64 ensures result>=0 {return match o {Outer::Wrap(Inner::Num(n)) if n>0 =>n, Outer::Pair(Inner::Flag(true), Inner::Num(m)) if m>=0 =>m, _=>0};}",
+            Status::Proven,
+        ),
+        (
+            "@pure @verified fn f(o:Outer)->i64 ensures result>=0 {return match o {Outer::Wrap(Inner::Num(n))=>n, _=>0};}",
+            Status::Counterexample,
+        ),
+        (
+            "@pure @verified fn f(o:Outer)->i64 ensures result!=7 {return match o {Outer::Pair(Inner::Empty, Inner::Flag(false))=>7, Outer::Pair(Inner::Empty, Inner::Flag(b))=>1, _=>0};}",
+            Status::Counterexample,
+        ),
+        (
+            "@pure @verified fn f(o:Outer, p:Inner)->i64 ensures result>=0 {return match o {Outer::Wrap(Inner::Num(n)) if let Inner::Num(m) = p && n>0 && m>0 =>m, _=>0};}",
+            Status::Proven,
+        ),
+        (
+            "@pure @verified fn f(o:Outer, p:Inner)->i64 ensures result>=0 {return match o {Outer::Wrap(Inner::Num(n)) if let Inner::Num(m) = p && n>0 =>m, _=>0};}",
+            Status::Counterexample,
+        ),
+    ] {
+        let source = format!("{decls} {source}");
+        let v = prove(&source);
+        assert_eq!(v.reports[0].status, expected, "{source}\n{:?}", v.reports);
+    }
+}

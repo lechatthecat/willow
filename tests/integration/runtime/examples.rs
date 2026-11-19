@@ -903,6 +903,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/if_let_guards.wi",
             "square\nrectangle\npoint\nnegative\nzero\n8080\n8081\n7\n",
         ),
+        (
+            "example/nested_patterns.wi",
+            "red circle 2\nsquare\ngreen 10\nred other\nplain 3\nnothing\nzero\nnumber 7\nempty\nerror bad input\n5\n-1\n-1\n24\n",
+        ),
         ("example/grouped_imports.wi", "42\n"),
         ("example/std_imports.wi", "1\n42\n7\n-1\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),
@@ -1878,6 +1882,18 @@ fn test_runnable_example_catalog_is_complete() {
 #[test]
 fn test_string_concat_fusion_example() {
     let path = "tests/regressions/string_concat_fusion.wi";
+    let (_, expected) = runnable_example_cases()
+        .iter()
+        .find(|(entry, _)| *entry == path)
+        .expect("example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected, "{path} output mismatch");
+}
+
+#[test]
+fn test_nested_patterns_example() {
+    let path = "example/nested_patterns.wi";
     let (_, expected) = runnable_example_cases()
         .iter()
         .find(|(entry, _)| *entry == path)

@@ -7,7 +7,7 @@
 use crate::parser::ast::{BinOp, Type, UnaryOp};
 
 use super::typed_ast::{
-    HirDeferBody, HirExpr, HirExprKind, HirFunction, HirPattern, HirProgram, HirStmt,
+    HirDeferBody, HirExpr, HirExprKind, HirFunction, HirGuard, HirPattern, HirProgram, HirStmt,
 };
 
 /// Render a whole HIR program as indented pseudo-code with inline types.
@@ -385,11 +385,16 @@ fn format_expr(e: &HirExpr) -> String {
                     for s in &arm.body {
                         format_stmt(s, 0, &mut body_text);
                     }
-                    let guard = arm
-                        .guard
-                        .as_ref()
-                        .map(|guard| format!(" if {}", format_expr(guard)))
-                        .unwrap_or_default();
+                    let mut guard = String::new();
+                    for (index, step) in arm.guard.iter().enumerate() {
+                        guard.push_str(if index == 0 { " if " } else { " && " });
+                        if let HirGuard::Let { pattern, .. } = step {
+                            guard.push_str("let ");
+                            guard.push_str(&format_pattern(pattern));
+                            guard.push_str(" = ");
+                        }
+                        guard.push_str(&format_expr(step.expr()));
+                    }
                     format!(
                         "{}{guard} => {{ {} }}",
                         format_pattern(&arm.pattern),

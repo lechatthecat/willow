@@ -2,6 +2,7 @@
 //! Production eligibility operates on lowered LIR in `validation`.
 
 use super::*;
+use crate::ir::typed_ast::HirGuard;
 
 /// Does this expression suspend the running task where it stands? `await`,
 /// `select`, and a channel `send`/`recv` all return control to the scheduler.
@@ -224,10 +225,20 @@ fn minimal_unsupported_scoped_expr<'e>(
                 if !supported_pattern(&arm.pattern, &scrutinee.ty, ctx, &mut arm_names) {
                     continue;
                 }
-                if let Some(guard) = &arm.guard
-                    && let Some(inner) = minimal_unsupported_expr(guard, ctx, &arm_names)
-                {
-                    return Some(inner);
+                let mut steps_supported = true;
+                for step in &arm.guard {
+                    if let Some(inner) = minimal_unsupported_expr(step.expr(), ctx, &arm_names) {
+                        return Some(inner);
+                    }
+                    if let HirGuard::Let { scrutinee, pattern } = step
+                        && !supported_pattern(pattern, &scrutinee.ty, ctx, &mut arm_names)
+                    {
+                        steps_supported = false;
+                        break;
+                    }
+                }
+                if !steps_supported {
+                    continue;
                 }
                 // A diverging arm is admissible on its own terms, so it must
                 // not be reported as the reason a match around it failed.
@@ -647,10 +658,15 @@ fn supported_match<'n>(
         if !supported_pattern(&arm.pattern, &scrutinee.ty, ctx, &mut arm_names) {
             return false;
         }
-        if let Some(guard) = &arm.guard
-            && !supported_expr(guard, ctx, &arm_names)
-        {
-            return false;
+        for step in &arm.guard {
+            if !supported_expr(step.expr(), ctx, &arm_names) {
+                return false;
+            }
+            if let HirGuard::Let { scrutinee, pattern } = step
+                && !supported_pattern(pattern, &scrutinee.ty, ctx, &mut arm_names)
+            {
+                return false;
+            }
         }
         if arm_diverges(arm) {
             // A diverging arm hands nothing to the merge block, so the

@@ -649,27 +649,14 @@ fn contract_text(expr: &Expr) -> String {
                         };
                         stack.push(Part::Expr(body));
                         stack.push(Part::Text(" => ".into()));
-                        if let Some(guard) = &arm.guard {
-                            stack.push(Part::Expr(guard));
-                            stack.push(Part::Text(" if ".into()));
+                        for (i, guard) in arm.guard.iter().enumerate().rev() {
+                            stack.push(Part::Expr(guard.expr()));
+                            if let Guard::Let(step) = guard {
+                                stack.push(Part::Text(format!("let {} = ", step.pattern)));
+                            }
+                            stack.push(Part::Text(if i == 0 { " if " } else { " && " }.into()));
                         }
-                        let pattern = match &arm.pattern {
-                            Pattern::Wildcard(..) => "_".into(),
-                            Pattern::Binding { name, .. } => name.clone(),
-                            Pattern::LiteralBool(b, ..) => b.to_string(),
-                            Pattern::LiteralInt(n, ..) => n.to_string(),
-                            Pattern::EnumVariant {
-                                enum_name, variant, ..
-                            } => format!("{enum_name}::{variant}"),
-                            Pattern::EnumVariantTuple {
-                                enum_name,
-                                variant,
-                                bindings,
-                                ..
-                            } => format!("{enum_name}::{variant}({})", bindings.join(", ")),
-                            _ => "<unsupported pattern>".into(),
-                        };
-                        stack.push(Part::Text(pattern));
+                        stack.push(Part::Text(arm.pattern.to_string()));
                     }
                     stack.push(Part::Text(" { ".into()));
                     stack.push(Part::Expr(&m.scrutinee));

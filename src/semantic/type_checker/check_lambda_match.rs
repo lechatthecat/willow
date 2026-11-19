@@ -3,17 +3,16 @@ use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::symbols::*;
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use super::*;
 
-/// Which values the unguarded arms of a `match` cover so far.
-#[derive(Default)]
-struct MatchCoverage {
-    covered_variants: HashSet<String>,
-    has_wildcard: bool,
-    has_true: bool,
-    has_false: bool,
+/// One name a checked pattern binds: the source spelling (whose address
+/// keys async retention), its type, and the binding sub-pattern's span.
+pub(super) struct PatternBinding<'p> {
+    pub(super) name: &'p str,
+    pub(super) ty: Type,
+    pub(super) span: Span,
 }
 
 #[cfg(test)]
@@ -627,7 +626,9 @@ impl TypeChecker {
     /// as `ClassDowncast` → `EnumVariantTuple`; a bare `Closed` parses as
     /// `Binding` → `EnumVariant` (only for a fieldless variant; otherwise it is a
     /// genuine catch-all binding). Returns `None` when no reinterpretation
-    /// applies.
+    /// applies. Only this node is rewritten: a reinterpreted `E::V(..)`
+    /// comes back with no fields, for the caller to fill with its checked
+    /// payload patterns.
     pub(super) fn normalize_match_pattern(
         &self,
         pattern: &Pattern,
@@ -654,6 +655,15 @@ impl TypeChecker {
                 if !bare || variant.payload_types.is_empty() {
                     return None;
                 }
+                let field = if binding == "_" {
+                    Pattern::Wildcard(*span, PatternId::fresh())
+                } else {
+                    Pattern::Binding {
+                        name: binding.clone(),
+                        span: *span,
+                        id: PatternId::fresh(),
+                    }
+                };
                 Some(Pattern::EnumVariantTuple {
                     enum_name: enum_name.clone(),
                     variant: class_name.clone(),
@@ -661,7 +671,7 @@ impl TypeChecker {
                         end: span.start + class_name.len(),
                         ..*span
                     },
-                    bindings: vec![binding.clone()],
+                    fields: vec![field],
                     span: *span,
                     id: PatternId::fresh(),
                 })
@@ -706,10 +716,11 @@ impl TypeChecker {
                 enum_name: written,
                 variant,
                 variant_span,
-                bindings,
                 span,
                 ..
-            } if (written.is_empty() && bare)
+            } if (written.is_empty()
+                && bare
+                && info.variants.iter().any(|v| v.name == *variant))
                 || (written != enum_name
                     && self.static_call_enum_key(written).as_deref()
                         == Some(info.name.as_str())) =>
@@ -718,7 +729,8 @@ impl TypeChecker {
                     enum_name: enum_name.clone(),
                     variant: variant.clone(),
                     variant_span: *variant_span,
-                    bindings: bindings.clone(),
+                    // The caller fills in the checked payload patterns.
+                    fields: Vec::new(),
                     span: *span,
                     id: PatternId::fresh(),
                 })
@@ -757,27 +769,79 @@ impl TypeChecker {
         }
     }
 
-    /// Bind each failed pattern payload once so body diagnostics remain local.
+    /// Bind every name of a failed pattern once, poisoned, so body
+    /// diagnostics stay local.
     fn bind_invalid_pattern(&mut self, pattern: &Pattern) {
-        let names: &[String] = match pattern {
-            Pattern::Binding { name, .. } => std::slice::from_ref(name),
-            Pattern::ClassDowncast { binding, .. } => std::slice::from_ref(binding),
-            Pattern::EnumVariantTuple { bindings, .. } => bindings,
-            _ => &[],
-        };
-        for name in names {
+        for (name, span) in pattern.bindings() {
             #[cfg(test)]
             INVALID_PATTERN_BINDINGS.with(|count| count.set(count.get() + 1));
-            if name != "_" {
-                self.define_var(
-                    name.clone(),
-                    VarInfo {
-                        ty: Self::error_type(),
-                        mutable: false,
-                        is_param: false,
-                        declaration_span: pattern.span(),
-                    },
+            self.define_var(
+                name.to_owned(),
+                VarInfo {
+                    ty: Self::error_type(),
+                    mutable: false,
+                    is_param: false,
+                    declaration_span: span,
+                },
+            );
+        }
+    }
+
+    /// Bring a checked pattern's names into the current scope with their
+    /// types, poisoned when the pattern is invalid. In async code each name
+    /// is keyed by its source spelling's address, which the retention
+    /// analysis binds too.
+    fn bind_checked_pattern(
+        &mut self,
+        source: &Pattern,
+        bindings: Vec<PatternBinding<'_>>,
+        invalid: bool,
+    ) {
+        for binding in bindings {
+            let ty = if invalid {
+                Self::error_type()
+            } else {
+                binding.ty
+            };
+            if self.local.current_async_context && !invalid {
+                self.record_async_local(
+                    ty.clone(),
+                    binding.name,
+                    source.span(),
+                    super::async_retention::Key::binding(binding.name),
                 );
+            }
+            self.define_var(
+                binding.name.to_owned(),
+                VarInfo {
+                    ty,
+                    mutable: false,
+                    is_param: false,
+                    declaration_span: binding.span,
+                },
+            );
+        }
+    }
+
+    /// Run an arm's guard steps in order: `if` conditions must be `bool`;
+    /// each `let P = e` link checks `e` with the names bound so far, then
+    /// binds `P`'s names for the steps after it and the arm body.
+    fn check_match_guards(&mut self, guards: &[Guard]) {
+        for guard in guards {
+            match guard {
+                Guard::If(condition) => self.check_match_guard(condition),
+                Guard::Let(step) => {
+                    let ty = self.check_expr(&step.scrutinee);
+                    let errors_before = self.error_generation;
+                    let bindings = if Self::contains_error_type(&ty) {
+                        self.bind_invalid_pattern(&step.pattern);
+                        continue;
+                    } else {
+                        self.check_pattern(Some(&step.scrutinee), &step.pattern, &ty)
+                    };
+                    let invalid = self.error_generation != errors_before;
+                    self.bind_checked_pattern(&step.pattern, bindings, invalid);
+                }
             }
         }
     }
@@ -807,35 +871,19 @@ impl TypeChecker {
             return Type::Void;
         }
 
-        let mut coverage = MatchCoverage::default();
         let mut result_type: Option<Type> = None;
-        let mut found_unreachable = false;
         let mut invalid_patterns = false;
 
-        for arm in &m.arms {
-            // Check if arm is unreachable (after a wildcard/binding)
-            if coverage.has_wildcard && !found_unreachable {
-                self.push(Self::unreachable_arm_diagnostic(m, arm));
-                found_unreachable = true;
-            }
-            // A guarded arm may decline a value its pattern matches, so it
-            // covers nothing for exhaustiveness.
-            let covers = arm.guard.is_none();
-
+        for (index, arm) in m.arms.iter().enumerate() {
             let errors_before_pattern = self.error_generation;
-            let reinterpreted = self.resolve_arm_pattern(arm, &scrutinee_ty);
-            let pattern: &Pattern = reinterpreted.as_ref().unwrap_or(&arm.pattern);
-            self.check_arm_pattern(m, pattern, &scrutinee_ty, covers, &mut coverage);
-
+            let bindings = self.check_pattern(Some(&m.scrutinee), &arm.pattern, &scrutinee_ty);
             let invalid_pattern = self.error_generation != errors_before_pattern;
             invalid_patterns |= invalid_pattern;
 
             // Check invalid arms too, but their bindings cannot constrain types.
             self.symbols.push_scope();
-            self.bind_arm_pattern(arm, pattern, &scrutinee_ty, invalid_pattern);
-            if let Some(guard) = &arm.guard {
-                self.check_match_guard(guard);
-            }
+            self.bind_checked_pattern(&arm.pattern, bindings, invalid_pattern);
+            self.check_match_guards(&arm.guard);
             let errors_before_body = self.error_generation;
             let arm_ty = self.check_match_body(
                 &arm.body,
@@ -845,6 +893,9 @@ impl TypeChecker {
                 m.source,
             );
             self.symbols.pop_scope();
+            if m.source == MatchSource::LetElse && index == 1 && arm_ty != Type::Never {
+                self.push_let_else_must_diverge(arm);
+            }
 
             // Invalid bodies already have a diagnostic; do not turn their
             // recovery type (often void) into a misleading arm mismatch.
@@ -864,17 +915,9 @@ impl TypeChecker {
             );
         }
 
-        // Exhaustiveness check
-        if !invalid_patterns && !coverage.has_wildcard {
-            self.check_match_exhaustiveness(m, &scrutinee_ty, &coverage);
-        }
-        self.finish_match_expr(
-            m,
-            &scrutinee_ty,
-            &coverage,
-            result_type,
-            errors_before_match,
-        )
+        // Reachability and exhaustiveness need every pattern well typed.
+        let exhaustive = !invalid_patterns && self.check_match_coverage(m, &scrutinee_ty);
+        self.finish_match_expr(m, exhaustive, result_type, errors_before_match)
     }
 
     /// The failed scrutinee cannot constrain patterns. Keep checking arm
@@ -887,64 +930,121 @@ impl TypeChecker {
         for arm in &m.arms {
             self.symbols.push_scope();
             self.bind_invalid_pattern(&arm.pattern);
-            if let Some(guard) = &arm.guard {
-                self.check_match_guard(guard);
-            }
+            self.check_match_guards(&arm.guard);
             self.check_match_body(&arm.body, expected, m.source);
             self.symbols.pop_scope();
         }
         Self::error_type()
     }
 
-    fn unreachable_arm_diagnostic(m: &MatchExpr, arm: &MatchArm) -> Diagnostic {
-        match m.source {
-            MatchSource::Match | MatchSource::TupleLet => {
-                Diagnostic::new(Severity::Warning, ErrorCode::W1201, "unreachable match arm")
-                    .with_label(Label::primary(arm.span, "this arm is unreachable"))
-            }
-            // The unreachable arm is the synthetic `_`:
-            // point at the pattern that made it so.
-            MatchSource::IfLet | MatchSource::WhileLet => {
-                let form = if m.source == MatchSource::IfLet {
-                    "if let"
-                } else {
-                    "while let"
-                };
-                let mut diagnostic = Diagnostic::new(
-                    Severity::Warning,
-                    ErrorCode::W1201,
-                    format!("irrefutable `{form}` pattern"),
-                )
-                .with_label(Label::primary(
-                    m.arms[0].pattern.span(),
-                    "this pattern always matches",
-                ));
-                diagnostic = if m.source == MatchSource::IfLet {
-                    diagnostic.with_help("use `let` instead; the `else` branch never runs")
-                } else {
-                    diagnostic.with_help("the loop only ends through `break` or `return`")
-                };
-                diagnostic
-            }
-        }
+    fn push_let_else_must_diverge(&mut self, arm: &MatchArm) {
+        self.push(
+            Self::error_at(
+                ErrorCode::E1212,
+                "the `else` block of `let ... else` must not fall through",
+                arm.span,
+                "this block can finish normally",
+            )
+            .with_help("end it with `return`, `break` or `continue`"),
+        );
     }
 
-    /// Record the source spelling of an arm pattern and return its
-    /// reinterpretation against the scrutinee type, if any.
-    fn resolve_arm_pattern(&mut self, arm: &MatchArm, scrutinee_ty: &Type) -> Option<Pattern> {
-        // Reinterpret `Ok(v)` / `Closed` as enum-variant patterns when the
-        // scrutinee is an enum, and record the reinterpretation for the
-        // backend. Everything below uses `pattern`.
-        match &arm.pattern {
+    pub(super) fn unreachable_arm_diagnostic(m: &MatchExpr, arm: &MatchArm) -> Diagnostic {
+        let form = match m.source {
+            MatchSource::Match | MatchSource::TupleLet => {
+                return Diagnostic::new(
+                    Severity::Warning,
+                    ErrorCode::W1201,
+                    "unreachable match arm",
+                )
+                .with_label(Label::primary(arm.span, "this arm is unreachable"));
+            }
+            MatchSource::IfLet => "if let",
+            MatchSource::WhileLet => "while let",
+            MatchSource::LetElse => "let ... else",
+        };
+        // The unreachable arm is the synthetic `_`:
+        // point at the pattern that made it so.
+        let diagnostic = Diagnostic::new(
+            Severity::Warning,
+            ErrorCode::W1201,
+            format!("irrefutable `{form}` pattern"),
+        )
+        .with_label(Label::primary(
+            m.arms[0].pattern.span(),
+            "this pattern always matches",
+        ));
+        diagnostic.with_help(match m.source {
+            MatchSource::IfLet => "use `let` instead; the `else` branch never runs",
+            MatchSource::WhileLet => "the loop only ends through `break` or `return`",
+            _ => "use a plain `let`; the `else` block never runs",
+        })
+    }
+
+    /// Check `pattern` against a value of type `ty`, record its resolution
+    /// (the whole tree, keyed by the root pattern's id, only when some node
+    /// was reinterpreted) and return the names it binds in source order.
+    /// Names bound twice by one pattern are rejected.
+    pub(super) fn check_pattern<'p>(
+        &mut self,
+        scrutinee: Option<&Expr>,
+        pattern: &'p Pattern,
+        ty: &Type,
+    ) -> Vec<PatternBinding<'p>> {
+        let mut bindings = Vec::new();
+        if let Some(resolved) = self.check_sub_pattern(scrutinee, pattern, ty, &mut bindings) {
+            self.pattern_resolutions.insert(pattern.id(), resolved);
+        }
+        if bindings.len() > 1 {
+            let mut seen: HashMap<&str, Span> = HashMap::with_capacity(bindings.len());
+            for binding in &bindings {
+                if let Some(first) = seen.insert(binding.name, binding.span) {
+                    self.push(
+                        Self::error_at(
+                            ErrorCode::E1210,
+                            format!(
+                                "`{}` is bound more than once in the same pattern",
+                                binding.name
+                            ),
+                            binding.span,
+                            "bound again here",
+                        )
+                        .with_label(Label::secondary(first, "first bound here"))
+                        .with_help("rename one of the bindings, or use `_` for a value you ignore"),
+                    );
+                }
+            }
+        }
+        bindings
+    }
+
+    /// Check one node and its payloads. Returns the node's resolved form when
+    /// it or a descendant was reinterpreted (`Some(x)` read as the
+    /// scrutinee's `Option::Some`, a bare `None` as the variant), else
+    /// `None`, so an unchanged subtree is cloned at most once, by the
+    /// nearest rebuilt ancestor. The parser bounds nesting depth, which
+    /// bounds this recursion.
+    fn check_sub_pattern<'p>(
+        &mut self,
+        scrutinee: Option<&Expr>,
+        source: &'p Pattern,
+        ty: &Type,
+        out: &mut Vec<PatternBinding<'p>>,
+    ) -> Option<Pattern> {
+        if Self::contains_error_type(ty) {
+            self.poison_bindings(source, out);
+            return None;
+        }
+        match source {
             Pattern::EnumVariant {
                 enum_name, span, ..
             }
             | Pattern::EnumVariantTuple {
                 enum_name, span, ..
-            } => {
+            } if !enum_name.is_empty() => {
                 self.check_source_type_name(enum_name, *span);
                 // Preserve the source alias before normalization canonicalizes it.
-                self.record_type_use(enum_name, scrutinee_ty, *span);
+                self.record_type_use(enum_name, ty, *span);
             }
             Pattern::ClassDowncast {
                 class_name, span, ..
@@ -953,112 +1053,276 @@ impl TypeChecker {
             }
             _ => {}
         }
-        let reinterpreted = self.normalize_match_pattern(&arm.pattern, scrutinee_ty);
-        if let Some(p) = &reinterpreted {
-            self.pattern_resolutions.insert(arm.pattern.id(), p.clone());
-        }
-        let pattern: &Pattern = reinterpreted.as_ref().unwrap_or(&arm.pattern);
-
-        if let Pattern::EnumVariant {
-            enum_name,
-            variant,
-            variant_span,
-            ..
-        }
-        | Pattern::EnumVariantTuple {
-            enum_name,
-            variant,
-            variant_span,
-            ..
-        } = pattern
-        {
-            self.record_variant_pattern(enum_name, variant, *variant_span);
-        }
-        if let Pattern::ClassDowncast {
-            class_name, span, ..
-        } = pattern
-        {
-            self.record_type_use(
-                class_name,
-                &Type::Named(self.canonical_type_name(class_name)),
-                *span,
-            );
-        }
-        reinterpreted
-    }
-
-    /// Validate one arm pattern against the scrutinee and track coverage.
-    fn check_arm_pattern(
-        &mut self,
-        m: &MatchExpr,
-        pattern: &Pattern,
-        scrutinee_ty: &Type,
-        covers: bool,
-        coverage: &mut MatchCoverage,
-    ) {
-        if self.is_option_spelling_pattern(pattern)
-            && builtin_types::unary_arg(scrutinee_ty, B::Option).is_none()
-        {
-            self.push_option_pattern_mismatch(m, pattern, scrutinee_ty);
-            return;
-        }
-        match pattern {
-            Pattern::Wildcard(_, _) => {
-                coverage.has_wildcard |= covers;
+        let head = self.normalize_match_pattern(source, ty);
+        let node: &Pattern = head.as_ref().unwrap_or(source);
+        match node {
+            Pattern::EnumVariant {
+                enum_name,
+                variant,
+                variant_span,
+                ..
             }
-            Pattern::Binding { name, span, .. } => {
-                coverage.has_wildcard |= covers; // binding covers everything
+            | Pattern::EnumVariantTuple {
+                enum_name,
+                variant,
+                variant_span,
+                ..
+            } if !enum_name.is_empty() => {
+                self.record_variant_pattern(enum_name, variant, *variant_span);
+            }
+            Pattern::ClassDowncast {
+                class_name, span, ..
+            } => {
+                self.record_type_use(
+                    class_name,
+                    &Type::Named(self.canonical_type_name(class_name)),
+                    *span,
+                );
+            }
+            _ => {}
+        }
+        if self.is_option_spelling_pattern(node)
+            && builtin_types::unary_arg(ty, B::Option).is_none()
+        {
+            self.push_option_pattern_mismatch(scrutinee, node, ty);
+            self.poison_bindings(source, out);
+            return None;
+        }
+        match node {
+            Pattern::Wildcard(..) => {}
+            // Normalization never produces names or downcasts, so these two
+            // nodes are the source's own and their names borrow from it.
+            Pattern::Binding { .. } => {
+                let Pattern::Binding { name, span, .. } = source else {
+                    unreachable!("normalized patterns bind no names");
+                };
                 self.check_binding_pattern(name, *span);
+                out.push(PatternBinding {
+                    name,
+                    ty: ty.clone(),
+                    span: *span,
+                });
             }
-            Pattern::LiteralBool(b, span, _) => {
-                self.check_bool_pattern(*b, *span, scrutinee_ty, covers, coverage);
-            }
-            Pattern::LiteralInt(_, span, _) => {
-                self.check_int_pattern(*span, scrutinee_ty);
-            }
+            Pattern::LiteralBool(_, span, _) => self.check_bool_pattern(*span, ty),
+            Pattern::LiteralInt(_, span, _) => self.check_int_pattern(*span, ty),
             Pattern::EnumVariant {
                 enum_name,
                 variant,
                 span,
                 ..
-            } => {
-                self.check_enum_variant_pattern(enum_name, variant, *span, scrutinee_ty);
-                if covers {
-                    coverage.covered_variants.insert(variant.clone());
-                }
+            } => self.check_enum_variant_pattern(enum_name, variant, *span, ty),
+            Pattern::EnumVariantTuple {
+                enum_name,
+                variant,
+                span,
+                ..
+            } if enum_name.is_empty() => {
+                self.push_unresolved_bare_variant(variant, *span, ty);
+                self.poison_bindings(source, out);
             }
             Pattern::EnumVariantTuple {
                 enum_name,
                 variant,
-                bindings,
+                fields,
                 span,
                 ..
             } => {
-                self.check_enum_variant_tuple_pattern(
-                    enum_name,
-                    variant,
-                    bindings.len(),
-                    *span,
-                    scrutinee_ty,
-                );
-                if covers {
-                    coverage.covered_variants.insert(variant.clone());
+                let written = if matches!(source, Pattern::ClassDowncast { .. }) {
+                    fields.len()
+                } else {
+                    source.fields().len()
+                };
+                let Some(payload) =
+                    self.check_enum_variant_tuple_pattern(enum_name, variant, written, *span, ty)
+                else {
+                    self.poison_bindings(source, out);
+                    return head;
+                };
+                if let Pattern::ClassDowncast { binding, span, .. } = source {
+                    // `Some(x)` read as a variant: the one payload binds the
+                    // downcast spelling's name; its node is already in `head`.
+                    // A name that is a fieldless variant of the payload's
+                    // enum (`Some(None)`) is that variant, exactly as a bare
+                    // `None` is at the top level.
+                    let field = Pattern::Binding {
+                        name: binding.clone(),
+                        span: *span,
+                        id: PatternId::fresh(),
+                    };
+                    if binding != "_"
+                        && let Some(variant_node) =
+                            self.normalize_match_pattern(&field, &payload[0])
+                    {
+                        if let Pattern::EnumVariant {
+                            enum_name,
+                            variant,
+                            variant_span,
+                            span,
+                            ..
+                        } = &variant_node
+                        {
+                            self.record_variant_pattern(enum_name, variant, *variant_span);
+                            self.check_enum_variant_pattern(enum_name, variant, *span, &payload[0]);
+                        }
+                        let mut head = head;
+                        if let Some(Pattern::EnumVariantTuple { fields, .. }) = &mut head {
+                            fields[0] = variant_node;
+                        }
+                        return head;
+                    }
+                    if binding != "_" {
+                        out.push(PatternBinding {
+                            name: binding,
+                            ty: payload[0].clone(),
+                            span: *span,
+                        });
+                    }
+                    return head;
+                }
+                let children: Vec<Option<Pattern>> = source
+                    .fields()
+                    .iter()
+                    .zip(&payload)
+                    .map(|(field, field_ty)| self.check_sub_pattern(None, field, field_ty, out))
+                    .collect();
+                if head.is_none() && children.iter().all(Option::is_none) {
+                    return None;
+                }
+                let mut rebuilt = head.unwrap_or_else(|| source.without_fields());
+                if let Pattern::EnumVariantTuple { fields, .. } = &mut rebuilt {
+                    *fields = source
+                        .fields()
+                        .iter()
+                        .zip(children)
+                        .map(|(field, child)| child.unwrap_or_else(|| field.clone()))
+                        .collect();
+                }
+                return Some(rebuilt);
+            }
+            Pattern::ClassDowncast { .. } => {
+                let Pattern::ClassDowncast {
+                    class_name,
+                    binding,
+                    span,
+                    ..
+                } = source
+                else {
+                    unreachable!("normalized patterns bind no names");
+                };
+                if self.push_misused_variant_downcast(class_name, *span, ty) {
+                    self.poison_bindings(source, out);
+                    return None;
+                }
+                self.check_class_downcast_pattern(class_name, *span, ty);
+                if binding != "_" {
+                    out.push(PatternBinding {
+                        name: binding,
+                        ty: Type::Named(class_name.clone()),
+                        span: *span,
+                    });
                 }
             }
-            Pattern::ClassDowncast {
-                class_name, span, ..
-            } => self.check_class_downcast_pattern(class_name, *span, scrutinee_ty),
         }
+        head
     }
 
-    fn check_bool_pattern(
-        &mut self,
-        value: bool,
-        span: Span,
-        scrutinee_ty: &Type,
-        covers: bool,
-        coverage: &mut MatchCoverage,
-    ) {
+    /// Every name under a pattern that cannot be typed, bound as the error
+    /// type so later uses stay quiet.
+    fn poison_bindings<'p>(&self, source: &'p Pattern, out: &mut Vec<PatternBinding<'p>>) {
+        out.extend(source.bindings().into_iter().map(|(name, span)| {
+            #[cfg(test)]
+            INVALID_PATTERN_BINDINGS.with(|count| count.set(count.get() + 1));
+            PatternBinding {
+                name,
+                ty: Self::error_type(),
+                span,
+            }
+        }));
+    }
+
+    /// A bare `V(..)` with several or nested payloads that the scrutinee
+    /// type does not name: say whether the variant exists but must be
+    /// qualified here, is missing from the enum, or has no enum to come from.
+    fn push_unresolved_bare_variant(&mut self, variant: &str, span: Span, ty: &Type) {
+        let enum_name = match ty {
+            Type::Named(name) | Type::Generic(name, _) => {
+                self.symbols.lookup_enum(name).map(|info| info.name.clone())
+            }
+            _ => None,
+        };
+        let diagnostic = match enum_name {
+            Some(enum_name)
+                if self
+                    .symbols
+                    .lookup_enum(&enum_name)
+                    .is_some_and(|info| info.variants.iter().any(|v| v.name == variant)) =>
+            {
+                Self::bare_variant_not_nameable(&enum_name, variant, span)
+            }
+            Some(enum_name) => Self::error_at(
+                ErrorCode::E1208,
+                format!("no variant `{variant}` in enum `{enum_name}`"),
+                span,
+                "unknown enum variant",
+            ),
+            None => Self::error_at(
+                ErrorCode::E1205,
+                format!(
+                    "variant pattern `{variant}(..)` cannot match a value of type `{}`",
+                    self.diagnostic_type_name(ty)
+                ),
+                span,
+                "no enum decides this variant",
+            )
+            .with_help("a variant name without its enum needs an enum-typed value; write `Enum::Variant(..)`"),
+        };
+        self.push(diagnostic);
+    }
+
+    fn bare_variant_not_nameable(enum_name: &str, variant: &str, span: Span) -> Diagnostic {
+        Self::error_at(
+            ErrorCode::E1211,
+            format!("variant `{variant}` of `{enum_name}` cannot be named without its enum here"),
+            span,
+            "ambiguous bare variant",
+        )
+        .with_help(format!(
+            "write `{enum_name}::{variant}`, or import `{enum_name}` by name"
+        ))
+    }
+
+    /// `V(x)` on an enum value whose variant `V` is not readable as the
+    /// payload pattern it spells: the enum is not bare-nameable here, or `V`
+    /// carries no payload. Returns whether it reported.
+    fn push_misused_variant_downcast(&mut self, name: &str, span: Span, ty: &Type) -> bool {
+        let (Type::Named(enum_name) | Type::Generic(enum_name, _)) = ty else {
+            return false;
+        };
+        let Some(info) = self.symbols.lookup_enum(enum_name) else {
+            return false;
+        };
+        let Some(variant) = info.variants.iter().find(|v| v.name == name) else {
+            return false;
+        };
+        let diagnostic = if !self.enum_nameable_bare(&info.name) {
+            Self::bare_variant_not_nameable(&info.name, name, span)
+        } else {
+            debug_assert!(variant.payload_types.is_empty());
+            Self::error_at(
+                ErrorCode::E1209,
+                format!(
+                    "variant `{}::{name}` has no payload; remove `(..)`",
+                    info.name
+                ),
+                span,
+                "fieldless variant used with payload pattern",
+            )
+        };
+        self.push(diagnostic);
+        true
+    }
+
+    fn check_bool_pattern(&mut self, span: Span, scrutinee_ty: &Type) {
         if *scrutinee_ty != Type::Bool {
             self.push_pattern_type_mismatch(
                 format!(
@@ -1067,11 +1331,6 @@ impl TypeChecker {
                 ),
                 span,
             );
-        }
-        if value {
-            coverage.has_true |= covers;
-        } else {
-            coverage.has_false |= covers;
         }
     }
 
@@ -1109,7 +1368,7 @@ impl TypeChecker {
 
     fn push_option_pattern_mismatch(
         &mut self,
-        m: &MatchExpr,
+        scrutinee: Option<&Expr>,
         pattern: &Pattern,
         scrutinee_ty: &Type,
     ) {
@@ -1125,7 +1384,7 @@ impl TypeChecker {
             pattern.span(),
             "expected an Option scrutinee",
         ));
-        if let Expr::MethodCall(call) = &*m.scrutinee
+        if let Some(Expr::MethodCall(call)) = scrutinee
             && call.method == "recv"
             && self
                 .expr_types
@@ -1211,16 +1470,18 @@ impl TypeChecker {
         binding_count: usize,
         span: Span,
         scrutinee_ty: &Type,
-    ) {
+    ) -> Option<Vec<Type>> {
         // Generic enum variant: resolve concrete payload types from scrutinee.
         let builtin_payload: Option<Vec<Type>> =
             self.resolve_generic_variant_payload(enum_name, variant, scrutinee_ty);
 
-        if let Some(ref pts) = builtin_payload {
+        if let Some(pts) = builtin_payload {
             // Built-in generic variant — validate binding count
             if binding_count != pts.len() {
                 self.push_variant_binding_count(enum_name, variant, pts.len(), binding_count, span);
+                return None;
             }
+            Some(pts)
         } else {
             // User-defined enum variant
             match scrutinee_ty {
@@ -1268,6 +1529,8 @@ impl TypeChecker {
                     }
                 }
             }
+            // The scrutinee does not have this enum's type: always reported.
+            None
         }
     }
 
@@ -1344,99 +1607,6 @@ impl TypeChecker {
         );
     }
 
-    /// Bind an arm's pattern variables in the arm scope. Bindings of an
-    /// invalid pattern are poisoned so they cannot constrain types.
-    fn bind_arm_pattern(
-        &mut self,
-        arm: &MatchArm,
-        pattern: &Pattern,
-        scrutinee_ty: &Type,
-        invalid_pattern: bool,
-    ) {
-        if invalid_pattern {
-            self.bind_invalid_pattern(pattern);
-            return;
-        }
-        // For EnumVariantTuple: bind payload variables in arm scope
-        if let Pattern::EnumVariantTuple {
-            enum_name,
-            variant,
-            bindings,
-            ..
-        } = pattern
-        {
-            // Resolve payload types: first check built-in generic types
-            // Resolve concrete payload types: use generic instantiation when available.
-            let payload_types: Vec<Type> = self
-                .resolve_generic_variant_payload(enum_name, variant, scrutinee_ty)
-                .unwrap_or_default();
-            for (binding, ty) in bindings.iter().zip(payload_types.iter()) {
-                self.define_var(
-                    binding.clone(),
-                    VarInfo {
-                        ty: ty.clone(),
-                        mutable: false,
-                        is_param: false,
-                        declaration_span: pattern.span(),
-                    },
-                );
-            }
-        }
-        // For a class downcast pattern, bind the downcast value as the
-        // concrete class. `_` does not bind.
-        if let Pattern::ClassDowncast {
-            class_name,
-            binding,
-            span: bspan,
-            ..
-        } = pattern
-            && binding != "_"
-        {
-            self.define_var(
-                binding.clone(),
-                VarInfo {
-                    ty: Type::Named(class_name.clone()),
-                    mutable: false,
-                    is_param: false,
-                    declaration_span: *bspan,
-                },
-            );
-        }
-        // For binding patterns, define the variable
-        if let Pattern::Binding {
-            name, span: bspan, ..
-        } = pattern
-        {
-            self.define_var(
-                name.clone(),
-                VarInfo {
-                    ty: scrutinee_ty.clone(),
-                    mutable: false,
-                    is_param: false,
-                    declaration_span: *bspan,
-                },
-            );
-        }
-        if self.local.current_async_context {
-            // Use original AST name addresses, not normalized pattern clones.
-            for (source, resolved) in super::async_retention::pattern_bindings(&arm.pattern)
-                .iter()
-                .zip(super::async_retention::pattern_bindings(pattern))
-            {
-                if resolved != "_"
-                    && let Some(info) = self.symbols.lookup_var(resolved)
-                {
-                    self.record_async_local(
-                        info.ty.clone(),
-                        source,
-                        arm.pattern.span(),
-                        super::async_retention::Key::binding(source),
-                    );
-                }
-            }
-        }
-    }
-
     /// Fold one valid arm's type into the match result type.
     fn merge_match_arm_type(
         &mut self,
@@ -1505,73 +1675,10 @@ impl TypeChecker {
         }
     }
 
-    fn check_match_exhaustiveness(
-        &mut self,
-        m: &MatchExpr,
-        scrutinee_ty: &Type,
-        coverage: &MatchCoverage,
-    ) {
-        match scrutinee_ty {
-            Type::Bool if (!coverage.has_true || !coverage.has_false) => {
-                self.push(
-                    Self::error_at(
-                        ErrorCode::E1207,
-                        "non-exhaustive match: missing bool patterns",
-                        m.span,
-                        "match is not exhaustive",
-                    )
-                    .with_help("add `true` and `false` patterns, or use a wildcard `_`"),
-                );
-            }
-            Type::I64 => {
-                self.push_error(
-                    ErrorCode::E1206,
-                    "non-exhaustive match on `i64`: add a wildcard arm `_ => ...`",
-                    m.span,
-                    "match is not exhaustive",
-                );
-            }
-            // Enum: check all variants are covered. Uses registered enum info
-            // so any stdlib or user enum, generic or not, is handled.
-            Type::Named(enum_name) | Type::Generic(enum_name, _) => {
-                // Only the generic form has always carried the help line.
-                let generic = matches!(scrutinee_ty, Type::Generic(..));
-                if let Some(enum_info) = self.symbols.lookup_enum(enum_name) {
-                    let missing: Vec<Diagnostic> = enum_info
-                        .variants
-                        .iter()
-                        .filter(|variant| !coverage.covered_variants.contains(&variant.name))
-                        .map(|variant| {
-                            let diag = Self::error_at(
-                                ErrorCode::E1202,
-                                format!(
-                                    "non-exhaustive match: variant `{}::{}` not covered",
-                                    enum_name, variant.name
-                                ),
-                                m.span,
-                                "match is not exhaustive",
-                            );
-                            if generic {
-                                diag.with_help("add the missing variant or use a wildcard `_` arm")
-                            } else {
-                                diag
-                            }
-                        })
-                        .collect();
-                    for diag in missing {
-                        self.push(diag);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn finish_match_expr(
         &mut self,
         m: &MatchExpr,
-        scrutinee_ty: &Type,
-        coverage: &MatchCoverage,
+        exhaustive: bool,
         result_type: Option<Type>,
         errors_before_match: usize,
     ) -> Type {
@@ -1581,17 +1688,8 @@ impl TypeChecker {
         if self.error_generation != errors_before_match {
             return Self::error_type();
         }
-        // Reuse the coverage check above; guards only contribute when an
-        // unguarded fallback covers the remaining values.
-        if coverage.has_wildcard
-            || *scrutinee_ty == Type::Bool
-            || match scrutinee_ty {
-                Type::Named(name) | Type::Generic(name, _) => {
-                    self.symbols.lookup_enum(name).is_some()
-                }
-                _ => false,
-            }
-        {
+        // Every value reaches an arm whose pattern and guards accept it.
+        if exhaustive {
             self.local.exhaustive_matches.insert(m.id);
         }
         let result = result_type.unwrap_or(Type::Void);

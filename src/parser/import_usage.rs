@@ -109,15 +109,8 @@ impl DefaultImportUsage {
         if !self.active {
             return;
         }
-        match pattern {
-            Pattern::Binding { name, .. } => self.bind(name),
-            Pattern::ClassDowncast { binding, .. } => self.bind(binding),
-            Pattern::EnumVariantTuple { bindings, .. } => {
-                for name in bindings {
-                    self.bind(name);
-                }
-            }
-            _ => {}
+        for (name, _) in pattern.bindings() {
+            self.bind(name);
         }
     }
 

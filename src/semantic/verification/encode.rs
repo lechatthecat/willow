@@ -381,70 +381,22 @@ impl Encoder<'_> {
         let mut result: Option<Value> = None;
         for arm in &m.arms {
             let mut branch = state.clone();
-            let condition = match &arm.pattern {
-                Pattern::Wildcard(..) => Value::literal("true", true),
-                Pattern::Binding { name, .. } => {
-                    branch.env.insert(name.clone(), value.clone());
-                    Value::literal("true", true)
-                }
-                Pattern::LiteralBool(b, ..) if value.ty == Type::Bool => {
-                    self.node(format!("(= {} {b})", value.text), true)?
-                }
-                Pattern::LiteralInt(n, ..) if value.ty == Type::I64 => {
-                    self.node(format!("(= {} {})", value.text, integer(*n)), true)?
-                }
-                Pattern::EnumVariant {
-                    enum_name, variant, ..
-                }
-                | Pattern::EnumVariantTuple {
-                    enum_name, variant, ..
-                } => {
-                    if value.ty != Type::Named(enum_name.clone()) {
-                        return Err("unsupported enum pattern type".into());
-                    }
-                    let ctors = self
-                        .data
-                        .constructors
-                        .get(&value.ty)
-                        .ok_or("unsupported enum")?;
-                    let i = *self
-                        .data
-                        .variants
-                        .get(&value.ty)
-                        .and_then(|variants| variants.get(variant))
-                        .ok_or("unknown enum variant")?;
-                    let ctor = &ctors[i];
-                    if let Pattern::EnumVariantTuple { bindings, .. } = &arm.pattern {
-                        if bindings.len() != ctor.fields.len() {
-                            return Err("enum pattern arity mismatch".into());
-                        }
-                        for (j, (binding, (_, ty))) in bindings.iter().zip(&ctor.fields).enumerate()
-                        {
-                            branch.env.insert(
-                                binding.clone(),
-                                Value {
-                                    text: format!("({} {})", selector(&value.ty, i, j), value.text),
-                                    boolean: *ty == Type::Bool,
-                                    ty: ty.clone(),
-                                },
-                            );
-                        }
-                    } else if !ctor.fields.is_empty() {
-                        return Err("enum payload required".into());
-                    }
-                    self.node(
-                        format!("((_ is {}) {})", constructor(&value.ty, i), value.text),
-                        true,
-                    )?
-                }
-                _ => return Err("unsupported match pattern".into()),
-            };
+            let condition = self.pattern_test(&arm.pattern, &value, &mut branch)?;
             let mut selected = self.and(&remaining, &condition)?;
-            if let Some(guard) = &arm.guard {
-                let test = self.expr(guard, &branch, &selected)?;
-                if !test.boolean {
-                    return Err("non-boolean match guard".into());
-                }
+            for guard in &arm.guard {
+                let test = match guard {
+                    Guard::If(guard) => {
+                        let test = self.expr(guard, &branch, &selected)?;
+                        if !test.boolean {
+                            return Err("non-boolean match guard".into());
+                        }
+                        test
+                    }
+                    Guard::Let(step) => {
+                        let scrutinee = self.expr(&step.scrutinee, &branch, &selected)?;
+                        self.pattern_test(&step.pattern, &scrutinee, &mut branch)?
+                    }
+                };
                 selected = self.and(&selected, &test)?;
             }
             let MatchBody::Expr(expression) = &arm.body else {
@@ -480,6 +432,113 @@ impl Encoder<'_> {
         }
         self.guard(gate, format!("(not {})", remaining.text))?;
         result.ok_or_else(|| "empty match".into())
+    }
+
+    /// The condition under which `value` matches `pattern`, binding the
+    /// pattern's names in `branch`. Payloads nest by recursion over the
+    /// pattern, whose depth the parser bounds; each node adds one VC node.
+    /// Unqualified spellings resolve against `value`'s enum as the checker
+    /// resolves them: `Some(x)` and `Circle(r)` as that enum's variant, a
+    /// bare name as its fieldless variant.
+    fn pattern_test(
+        &mut self,
+        pattern: &Pattern,
+        value: &Value,
+        branch: &mut State,
+    ) -> Result<Value, String> {
+        let variant_index = |this: &Self, name: &str| {
+            this.data
+                .variants
+                .get(&value.ty)
+                .and_then(|variants| variants.get(name))
+                .copied()
+        };
+        let binding_field;
+        let (enum_name, variant, fields): (&str, &str, &[Pattern]) = match pattern {
+            Pattern::Wildcard(..) => return Ok(Value::literal("true", true)),
+            Pattern::Binding { name, .. } => {
+                let fieldless = variant_index(self, name).is_some_and(|i| {
+                    self.data
+                        .constructors
+                        .get(&value.ty)
+                        .is_some_and(|ctors| ctors[i].fields.is_empty())
+                });
+                if !fieldless {
+                    branch.env.insert(name.clone(), value.clone());
+                    return Ok(Value::literal("true", true));
+                }
+                ("", name, &[])
+            }
+            Pattern::LiteralBool(b, ..) if value.ty == Type::Bool => {
+                return self.node(format!("(= {} {b})", value.text), true);
+            }
+            Pattern::LiteralInt(n, ..) if value.ty == Type::I64 => {
+                return self.node(format!("(= {} {})", value.text, integer(*n)), true);
+            }
+            Pattern::EnumVariant {
+                enum_name, variant, ..
+            } => (enum_name, variant, &[]),
+            Pattern::EnumVariantTuple {
+                enum_name,
+                variant,
+                fields,
+                ..
+            } => (enum_name, variant, fields),
+            Pattern::ClassDowncast {
+                class_name,
+                binding,
+                span,
+                ..
+            } if variant_index(self, class_name).is_some() => {
+                binding_field = [if binding == "_" {
+                    Pattern::Wildcard(*span, PatternId::fresh())
+                } else {
+                    Pattern::Binding {
+                        name: binding.clone(),
+                        span: *span,
+                        id: PatternId::fresh(),
+                    }
+                }];
+                ("", class_name, &binding_field)
+            }
+            _ => return Err("unsupported match pattern".into()),
+        };
+        if !enum_name.is_empty() && value.ty != Type::Named(enum_name.to_owned()) {
+            return Err("unsupported enum pattern type".into());
+        }
+        let i = variant_index(self, variant).ok_or("unknown enum variant")?;
+        let field_types: Vec<Type> = self
+            .data
+            .constructors
+            .get(&value.ty)
+            .ok_or("unsupported enum")?[i]
+            .fields
+            .iter()
+            .map(|(_, ty)| ty.clone())
+            .collect();
+        if fields.len() != field_types.len() {
+            return Err(if fields.is_empty() {
+                "enum payload required".into()
+            } else {
+                "enum pattern arity mismatch".into()
+            });
+        }
+        let mut condition = self.node(
+            format!("((_ is {}) {})", constructor(&value.ty, i), value.text),
+            true,
+        )?;
+        for (j, (field, ty)) in fields.iter().zip(field_types).enumerate() {
+            let field_value = Value {
+                text: format!("({} {})", selector(&value.ty, i, j), value.text),
+                boolean: ty == Type::Bool,
+                ty,
+            };
+            let test = self.pattern_test(field, &field_value, branch)?;
+            if test.text != "true" {
+                condition = self.and(&condition, &test)?;
+            }
+        }
+        Ok(condition)
     }
 
     fn block(&mut self, block: &Block, state: &mut State, depth: usize) -> Result<(), String> {

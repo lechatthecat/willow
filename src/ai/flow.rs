@@ -405,8 +405,8 @@ impl Body {
                     };
                     // A guard runs before the body; when it fails, a later
                     // arm (another fork branch) is taken instead.
-                    if let Some(guard) = &arm.guard {
-                        target = self.expr(jobs, guard, target, exits);
+                    for guard in arm.guard.iter().rev() {
+                        target = self.expr(jobs, guard.expr(), target, exits);
                     }
                     // Literal scrutinees rule out impossible literal arms. For
                     // other predicates retain structural alternatives, not a
@@ -419,7 +419,7 @@ impl Body {
                     if compatible && !covered {
                         arms.push(target);
                     }
-                    covered |= arm.guard.is_none()
+                    covered |= arm.guard.is_empty()
                         && (matches!(pattern, Pattern::Wildcard(..) | Pattern::Binding { .. })
                             || compatible
                                 && matches!(

@@ -28,8 +28,8 @@ use crate::semantic::ids::{FunctionId, SemanticType as Type, TypeId};
 use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type};
 
 use super::typed_ast::{
-    HirCapture, HirDeferBody, HirDeferId, HirExpr, HirExprKind, HirFunction, HirParam, HirPattern,
-    HirProgram, HirStmt,
+    HirCapture, HirDeferBody, HirDeferId, HirExpr, HirExprKind, HirFunction, HirGuard, HirParam,
+    HirPattern, HirProgram, HirStmt,
 };
 
 pub mod async_liveness;
@@ -2017,7 +2017,7 @@ impl Builder {
                 arm.pattern,
                 HirPattern::Wildcard | HirPattern::Binding { .. }
             );
-            let always_matches = irrefutable && arm.guard.is_none();
+            let always_matches = irrefutable && arm.guard.is_empty();
             let is_last = index + 1 == arms.len();
             let arm_block = self.new_block();
             let next = (!always_matches && !is_last).then(|| self.new_block());
@@ -2059,50 +2059,76 @@ impl Builder {
                 self.locals.len(),
                 self.scope_roots.len(),
             ));
-            let bindings: Vec<_> = pattern_bindings(&arm.pattern)
-                .into_iter()
-                .map(|(name, ty)| {
-                    // Discarded payloads still occupy binding positions but
-                    // must not alias another arm's discarded payload local.
-                    let name = if name == "_" {
-                        self.synthetic_name("discard")
-                    } else {
-                        name
-                    };
-                    self.declare_local(
-                        name,
-                        ty,
-                        Some(arm.span),
-                        LocalOptions {
-                            synthetic: false,
-                            parameter: false,
-                        },
-                    )
-                })
-                .collect();
-            if !bindings.is_empty() {
-                self.push(SourceInst::MatchBind {
-                    scrutinee: scrutinee_local,
-                    pattern: arm.pattern.clone(),
-                    bindings,
-                    span: arm.span,
-                });
+            self.declare_match_bindings(scrutinee_local, &arm.pattern, arm.span);
+            // The guard chain sees the bindings of the pattern and of earlier
+            // steps. A rejected step leaves the arm scope, dropping the roots
+            // declared so far exactly as the body's fallthrough does, and
+            // tries the next arm. Rejections share one clear ladder: rung `k`
+            // clears only the roots declared since rung `k - 1`'s point and
+            // falls into it, so the clears stay linear in the chain length.
+            let mut rejections: Vec<(BlockId, usize)> = Vec::new();
+            for step in &arm.guard {
+                match step {
+                    HirGuard::If(cond) => {
+                        let accepted = self.lower_condition(cond);
+                        let rejected = self.new_block();
+                        let accepted_block = self.new_block();
+                        rejections.push((rejected, self.scope_roots.len()));
+                        self.terminate(SourceTerminator::Branch {
+                            cond: accepted,
+                            then_block: accepted_block,
+                            else_block: rejected,
+                        });
+                        self.switch_to(accepted_block);
+                    }
+                    HirGuard::Let { scrutinee, pattern } => {
+                        let local = self.guard_scrutinee_local(scrutinee);
+                        if !matches!(pattern, HirPattern::Wildcard | HirPattern::Binding { .. }) {
+                            let test_name = self.synthetic_name("match_test");
+                            let test = self.declare_local(
+                                test_name,
+                                Type::Bool,
+                                None,
+                                LocalOptions {
+                                    synthetic: true,
+                                    parameter: false,
+                                },
+                            );
+                            self.push(SourceInst::MatchTest {
+                                scrutinee: local,
+                                pattern: pattern.clone(),
+                                result: test,
+                                span: scrutinee.span,
+                            });
+                            let rejected = self.new_block();
+                            let accepted_block = self.new_block();
+                            rejections.push((rejected, self.scope_roots.len()));
+                            self.terminate(SourceTerminator::Branch {
+                                cond: self.local_expr(test, scrutinee.span),
+                                then_block: accepted_block,
+                                else_block: rejected,
+                            });
+                            self.switch_to(accepted_block);
+                        }
+                        self.declare_match_bindings(local, pattern, scrutinee.span);
+                    }
+                }
             }
-            // `pattern if guard`: the guard sees the bindings.
-            // A false guard leaves the arm scope, dropping its roots exactly
-            // as the body's fallthrough does, and tries the next arm.
-            if let Some(guard) = &arm.guard {
-                let accepted = self.lower_condition(guard);
-                let body_block = self.new_block();
-                let rejected = self.new_block();
-                self.terminate(SourceTerminator::Branch {
-                    cond: accepted,
-                    then_block: body_block,
-                    else_block: rejected,
-                });
-                self.switch_to(rejected);
-                self.push_scope_root_clears(arm_scope);
-                self.terminate(SourceTerminator::Jump(next.unwrap_or(merge)));
+            if !rejections.is_empty() {
+                let body_block = BlockId(self.current);
+                let first_root = self.scope_starts[arm_scope].first_root;
+                let mut fall_to = next.unwrap_or(merge);
+                let mut cleared_to = first_root;
+                for (rejected, roots) in &rejections {
+                    self.switch_to(*rejected);
+                    let locals = self.scope_roots[cleared_to..*roots].to_vec();
+                    if !locals.is_empty() {
+                        self.push(SourceInst::ClearScopeRoots { locals });
+                    }
+                    self.terminate(SourceTerminator::Jump(fall_to));
+                    fall_to = *rejected;
+                    cleared_to = *roots;
+                }
                 self.switch_to(body_block);
             }
             self.lower_match_arm_body(&arm.body, destination);
@@ -2124,6 +2150,65 @@ impl Builder {
         self.push_scope_root_clears(construct);
         self.pop_root_scope();
         Some(destination.map(|local| self.local_expr(local, value.span)))
+    }
+
+    /// Declare `pattern`'s bindings in the current scope and bind them from
+    /// `scrutinee`.
+    fn declare_match_bindings(&mut self, scrutinee: LirLocalId, pattern: &HirPattern, span: Span) {
+        let bindings: Vec<_> = pattern_bindings(pattern)
+            .into_iter()
+            .map(|(name, ty)| {
+                // Discarded payloads still occupy binding positions but
+                // must not alias another arm's discarded payload local.
+                let name = if name == "_" {
+                    self.synthetic_name("discard")
+                } else {
+                    name
+                };
+                self.declare_local(
+                    name,
+                    ty,
+                    Some(span),
+                    LocalOptions {
+                        synthetic: false,
+                        parameter: false,
+                    },
+                )
+            })
+            .collect();
+        if !bindings.is_empty() {
+            self.push(SourceInst::MatchBind {
+                scrutinee,
+                pattern: pattern.clone(),
+                bindings,
+                span,
+            });
+        }
+    }
+
+    /// The local a guard `let` step tests. A plain local (every nested payload
+    /// local is one) is tested in place; any other value is evaluated once
+    /// into a rooted temp of the arm scope.
+    fn guard_scrutinee_local(&mut self, scrutinee: &HirExpr) -> LirLocalId {
+        if let HirExprKind::Var(name) = &scrutinee.kind
+            && let Some(&local) = self.local_by_name.get(name)
+            && self.locals[local.0 as usize].storage_kind != LirStorageKind::ReferenceCell
+        {
+            return local;
+        }
+        let name = self.synthetic_name("guard_scrutinee");
+        let local = self.declare_local(
+            name,
+            scrutinee.ty.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
+        self.scope_roots.push(local);
+        self.lower_value_into(local, scrutinee);
+        local
     }
 
     fn push_compute(&mut self, value: LirRvalue, ty: Type, span: Span, label: &str) -> LirLocalId {

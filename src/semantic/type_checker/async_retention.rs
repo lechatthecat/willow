@@ -57,10 +57,14 @@ impl Names {
                 }
                 AstEvent::Pattern(pattern) => {
                     // Bare fieldless variants parse as bindings. Do not let
-                    // their spelling shadow an outer local in the arm body.
+                    // their spelling shadow an outer local in the arm body:
+                    // bind only the names the checker's reading binds.
+                    // Resolutions are keyed by root patterns, so the nested
+                    // sub-pattern events are replaced, never visited.
                     let resolved = patterns.get(&pattern.id()).unwrap_or(pattern);
-                    if pattern_bindings(resolved).is_empty() {
-                        walk.skip_children();
+                    walk.skip_children();
+                    for name in pattern.source_bindings(resolved).into_iter().rev() {
+                        walk.push(AstEvent::Bind(name));
                     }
                 }
                 AstEvent::Bind(name) if name != "_" => {
@@ -312,15 +316,6 @@ pub(super) fn analyze(
     let entry = graph.schedule(Input::Block(body), 0, Flow::default());
     graph.build();
     graph.solve(entry)
-}
-
-pub(super) fn pattern_bindings(pattern: &Pattern) -> &[String] {
-    match pattern {
-        Pattern::Binding { name, .. } => std::slice::from_ref(name),
-        Pattern::ClassDowncast { binding, .. } => std::slice::from_ref(binding),
-        Pattern::EnumVariantTuple { bindings, .. } => bindings,
-        _ => &[],
-    }
 }
 
 fn deferred_operands(body: &DeferBody) -> Vec<&Expr> {
@@ -864,22 +859,39 @@ impl<'a> Graph<'a> {
                                     MatchBody::Block(b) => Input::Block(b),
                                 };
                                 let body = self.schedule(input, next, flow);
-                                let matched = if let Some(guard) = &arm.guard {
-                                    let branch = self.node(body);
-                                    self.nodes[branch].edges.push(following);
-                                    if let Expr::Bool(value, ..) = guard {
-                                        self.nodes[branch].edges =
-                                            vec![if *value { body } else { following }];
-                                    }
-                                    self.schedule(Input::Expr(guard), branch, flow)
-                                } else {
-                                    body
-                                };
+                                // Guard steps run in order after the pattern
+                                // binds; each failing step resumes matching.
+                                let mut matched = body;
+                                for guard in arm.guard.iter().rev() {
+                                    matched = match guard {
+                                        Guard::If(guard) => {
+                                            let branch = self.node(matched);
+                                            self.nodes[branch].edges.push(following);
+                                            if let Expr::Bool(value, ..) = guard {
+                                                self.nodes[branch].edges =
+                                                    vec![if *value { matched } else { following }];
+                                            }
+                                            self.schedule(Input::Expr(guard), branch, flow)
+                                        }
+                                        Guard::Let(step) => {
+                                            let step_pattern = self
+                                                .patterns
+                                                .get(&step.pattern.id())
+                                                .unwrap_or(&step.pattern);
+                                            let mut bound = matched;
+                                            for name in step.pattern.source_bindings(step_pattern) {
+                                                bound = self.binding(name, bound);
+                                            }
+                                            let test = self.node(bound);
+                                            if !step_pattern.is_irrefutable_shape() {
+                                                self.nodes[test].edges.push(following);
+                                            }
+                                            self.schedule(Input::Expr(&step.scrutinee), test, flow)
+                                        }
+                                    };
+                                }
                                 let mut bound = matched;
-                                for (name, _) in pattern_bindings(&arm.pattern)
-                                    .iter()
-                                    .zip(pattern_bindings(pattern))
-                                {
+                                for name in arm.pattern.source_bindings(pattern) {
                                     bound = self.binding(name, bound);
                                 }
                                 let dispatch = self.node(bound);
@@ -890,10 +902,7 @@ impl<'a> Graph<'a> {
                                         .reads
                                         .push(self.names.temporaries[&e.scrutinee.id()]);
                                 }
-                                if !matches!(
-                                    pattern,
-                                    Pattern::Wildcard(..) | Pattern::Binding { .. }
-                                ) {
+                                if !pattern.is_irrefutable_shape() {
                                     self.nodes[dispatch].edges.push(following);
                                 }
                                 following = dispatch;
@@ -1634,6 +1643,16 @@ async fn check(flag: bool) {{ let op: closure(i64) -> i64 = |x| x; {body} }}
                 "let obj: Value = new Holder(op); match obj { Holder(h) => { let callback = h.value; println(callback(1)); await sleep(0); }, _ => {} }",
                 false,
             ),
+            (
+                "fieldless nested variant binds nothing",
+                "let Red = op; match Tint::Paint(Color::Red) { Paint(Red) => { await sleep(0); println(Red(1)); }, _ => {} }",
+                true,
+            ),
+            (
+                "fieldless nested variant outer dead",
+                "let Red = op; match Tint::Paint(Color::Red) { Paint(Red) => { println(Red(1)); await sleep(0); }, _ => {} }",
+                false,
+            ),
             ("defer live", "defer op(1); await sleep(0);", true),
             (
                 "defer reassigned",
@@ -1667,6 +1686,8 @@ async fn check(flag: bool) {{ let op: closure(i64) -> i64 = |x| x; {body} }}
             let program = parse(&format!(
                 r#"
 enum Boxed {{ One(closure(i64) -> i64), Empty }}
+enum Color {{ Red, Green }}
+enum Tint {{ Paint(Color), Blank }}
 interface Value {{}}
 class Holder implements Value {{ pub value: closure(i64) -> i64; }}
 fn plain(x: i64) {{ println(x); }}

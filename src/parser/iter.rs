@@ -256,8 +256,11 @@ fn push_expr<'a>(pending: &mut Vec<AstEvent<'a>>, node: &'a Expr) {
             for arm in &expr.arms {
                 pending.push(AstEvent::EnterScope);
                 pending.push(AstEvent::Pattern(&arm.pattern));
-                if let Some(guard) = &arm.guard {
-                    pending.push(AstEvent::Expr(guard));
+                for guard in &arm.guard {
+                    pending.push(AstEvent::Expr(guard.expr()));
+                    if let Some(pattern) = guard.pattern() {
+                        pending.push(AstEvent::Pattern(pattern));
+                    }
                 }
                 match &arm.body {
                     MatchBody::Expr(body) => pending.push(AstEvent::Expr(body)),
@@ -300,13 +303,8 @@ fn push_pattern<'a>(pending: &mut Vec<AstEvent<'a>>, pattern: &'a Pattern) {
         | Pattern::LiteralInt(..)
         | Pattern::EnumVariant { .. } => {}
         Pattern::Binding { name, .. } => pending.push(AstEvent::Bind(name)),
-        Pattern::EnumVariantTuple { bindings, .. } => {
-            pending.extend(
-                bindings
-                    .iter()
-                    .filter(|name| name.as_str() != "_")
-                    .map(|name| AstEvent::Bind(name)),
-            );
+        Pattern::EnumVariantTuple { fields, .. } => {
+            pending.extend(fields.iter().map(AstEvent::Pattern));
         }
         Pattern::ClassDowncast { binding, .. } => {
             if binding != "_" {
