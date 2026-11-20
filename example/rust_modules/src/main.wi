@@ -1,0 +1,10 @@
+import native;
+import math::value as answer;
+fn main() {
+    let message = native::message("Willow");
+    println(native::echo(message).count == answer());
+    let counter = native::counter(42);
+    println(native::value(counter) == answer());
+    native::Counter_close(counter);
+    println(message.text);
+}

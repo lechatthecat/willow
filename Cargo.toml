@@ -47,6 +47,8 @@ serde_json = { version = "1.0.152", features = ["raw_value"] }
 willow_abi = { path = "crates/willow_abi" }
 willow_continuations = { path = "crates/willow_continuations" }
 toml_edit = "0.25.17"
+syn = { version = "3.0.7", features = ["full", "visit"] }
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 im = { version = "15.1.0", features = ["serde"] }
 
 # The runtime's hot FFI entry points (willow_sync_poll_counter, safepoint and

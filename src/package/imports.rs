@@ -162,7 +162,11 @@ impl<'a> PackageImports<'a> {
         logical: &str,
     ) -> Result<Option<PathBuf>, PackageImportError> {
         let relative: PathBuf = QualifiedName::new(&logical).segments().collect();
-        for candidate in [relative.with_extension("wi"), relative.join("mod.wi")] {
+        for candidate in [
+            relative.with_extension("wi"),
+            relative.with_extension("rs"),
+            relative.join("mod.wi"),
+        ] {
             if !crate::compiler_db::captured::source_is_visible(
                 &package.source_root().join(&candidate),
             ) {

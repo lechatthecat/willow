@@ -26,6 +26,10 @@ struct Lock {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub(crate) struct RustLock {
+    /// Retain a module bridge even with no direct dependencies. This capability
+    /// marker is not Cargo resolution: inspection may discover additional roots.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub modules: bool,
     pub cargo_lock_hash: String,
     pub bridge_input_hash: String,
     pub dependencies: std::collections::BTreeMap<String, String>,
@@ -440,7 +444,11 @@ fn resolve_source(
     graph.native = native;
     let mut expected = Lock::from_graph(&graph)?;
     expected.rust = current.as_ref().and_then(|lock| lock.rust.clone());
-    if !has_rust_dependencies && current.as_ref().is_some_and(|lock| lock.rust.is_some()) {
+    if !has_rust_dependencies
+        && current
+            .as_ref()
+            .is_some_and(|lock| lock.rust.as_ref().is_some_and(|rust| !rust.modules))
+    {
         anyhow::ensure!(
             !locked,
             "rust_lockfile_stale: Rust dependencies were removed"

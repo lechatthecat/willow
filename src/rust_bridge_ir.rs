@@ -177,8 +177,38 @@ pub struct Record {
     pub fields: Vec<(String, Scalar)>,
 }
 
+/// Copy-on-write declarations: repeated native signatures share their record
+/// closure, while existing callers can still mutate a symbol's own records.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RecordDefinitions(std::sync::Arc<Vec<Record>>);
+impl std::ops::Deref for RecordDefinitions {
+    type Target = Vec<Record>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for RecordDefinitions {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+impl From<Vec<Record>> for RecordDefinitions {
+    fn from(records: Vec<Record>) -> Self {
+        Self(std::sync::Arc::new(records))
+    }
+}
+#[cfg(test)]
+impl RecordDefinitions {
+    pub(crate) fn shares_storage(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RustBridgeSymbol {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<crate::rust_module::NativeBridge>,
     #[serde(default)]
     pub is_async: bool,
     pub rust_crate: String,
@@ -186,7 +216,7 @@ pub struct RustBridgeSymbol {
     pub abi_symbol: String,
     pub input_types: Vec<Scalar>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub records: Vec<Record>,
+    pub records: RecordDefinitions,
     pub output_type: Scalar,
     pub effects: u8,
     /// Trusted declaration that the foreign implementation does not access external resources.
@@ -199,6 +229,16 @@ pub struct RustBridgeSymbol {
     pub nonblocking: Option<Box<NonblockingReview>>,
 }
 impl RustBridgeSymbol {
+    /// Native wire type names are unique across Rust modules; Willow names
+    /// remain local to the owning source module.
+    pub(crate) fn willow_record_name<'a>(&self, wire: &'a str) -> &'a str {
+        self.native
+            .as_ref()
+            .and_then(|native| wire.strip_prefix(&native.module))
+            .and_then(|name| name.strip_prefix('_'))
+            .unwrap_or(wire)
+    }
+
     pub fn resolve_records(&mut self, definitions: &std::collections::HashMap<String, Record>) {
         let mut seen = std::collections::HashSet::new();
         let mut pending: Vec<_> = self.input_types.iter().chain([&self.output_type]).collect();
@@ -218,7 +258,7 @@ impl RustBridgeSymbol {
                 _ => {}
             }
         }
-        self.records = records;
+        self.records = records.into();
     }
     pub fn aggregate(&self) -> bool {
         self.is_async
@@ -235,6 +275,7 @@ impl RustBridgeSymbol {
             .union(willow_abi::RuntimeEffects::MAY_ALLOCATE)
             .union(willow_abi::RuntimeEffects::MAY_IO);
         Self {
+            native: None,
             is_async: false,
             no_io: false,
             rust_crate: String::new(),
@@ -243,7 +284,7 @@ impl RustBridgeSymbol {
             abi_symbol: name.clone(),
             willow_function: name,
             input_types: inputs,
-            records: Vec::new(),
+            records: RecordDefinitions::default(),
             output_type: output,
             effects: effects.bits() | willow_abi::ffi::FOREIGN_CALL,
         }
@@ -339,7 +380,10 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
         }
     }
     source.push_str("}\n");
-    if symbols.iter().any(RustBridgeSymbol::aggregate) {
+    if symbols
+        .iter()
+        .any(|s| s.aggregate() || s.native.as_ref().is_some_and(|n| !n.definitions.is_empty()))
+    {
         source.push_str(include_str!("rust_bridge_ir/support.rs"));
     }
     if symbols.iter().any(|s| s.is_async) {
@@ -351,7 +395,10 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
             aggregate_wrapper(&mut source, symbol, revision);
             continue;
         }
-        let target = QualifiedName::new(&symbol.willow_function).last_segment();
+        let target = symbol.native.as_ref().map_or_else(
+            || QualifiedName::new(&symbol.willow_function).last_segment(),
+            |native| native.target.as_str(),
+        );
         write!(
             source,
             "#[unsafe(no_mangle)]\npub extern \"C\" fn {}(",

@@ -513,6 +513,53 @@ fn resolve_one(
         return;
     }
     let path = key.path.0.as_str();
+    if matches!(
+        module_path.extension().and_then(|e| e.to_str()),
+        Some("wi" | "rs")
+    ) {
+        let alternatives = if module_path.extension().unwrap() == "rs" {
+            vec![
+                module_path.with_extension("wi"),
+                module_path.with_extension("").join("mod.wi"),
+            ]
+        } else if module_path.file_name().is_some_and(|name| name == "mod.wi") {
+            vec![module_path.parent().unwrap().with_extension("rs")]
+        } else {
+            vec![module_path.with_extension("rs")]
+        };
+        if let Some(other) = alternatives
+            .into_iter()
+            .find(|other| other.is_file() && crate::compiler_db::captured::source_is_visible(other))
+        {
+            errors.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0401,
+                    format!(
+                        "ambiguous module `{path}`: both {} and {} exist",
+                        module_path.display(),
+                        other.display()
+                    ),
+                )
+                .with_label(Label::primary(span, "conflicting Willow and Rust modules")),
+            );
+            return;
+        }
+    }
+
+    if module_path.extension().is_some_and(|e| e == "rs") {
+        let physical = std::fs::canonicalize(&module_path).unwrap_or_else(|_| module_path.clone());
+        if let Some(previous) = graph.rust_source_paths.get(&physical) {
+            if previous != key {
+                errors.push(Diagnostic::new(Severity::Error,ErrorCode::E0401,
+                    format!("Rust source {} has multiple module paths (`{}` and `{path}`); import one module with `as` aliases", physical.display(), previous.path.0))
+                    .with_label(Label::primary(span,"ambiguous Rust source identity")));
+                return;
+            }
+        } else {
+            graph.rust_source_paths.insert(physical, key.clone());
+        }
+    }
 
     if graph
         .entry_path
@@ -621,6 +668,9 @@ fn load_module_program(
     #[cfg(test)]
     {
         graph.source_loads += 1;
+        if module_path.extension().is_some_and(|e| e == "rs") {
+            graph.rust_source_loads += 1;
+        }
     }
     let source = if let Some((module, None)) = std_registry::source_std_module(path) {
         module.source.to_owned()
@@ -692,6 +742,9 @@ fn load_module_program(
     } else {
         match cached {
             Some(program) => (program, Vec::new()),
+            None if module_path.extension().is_some_and(|e| e == "rs") => {
+                crate::rust_module::parse(&module_path, &source, module_id.file_id())
+            }
             None => {
                 let tokens = match Lexer::with_file_id(&source, module_id.file_id()).tokenize() {
                     Ok(t) => t,
@@ -792,6 +845,7 @@ fn candidate_module_paths(src_root: &Path, path: &str) -> Vec<PathBuf> {
     let path_buf = module_path_buf(path);
     vec![
         src_root.join(path_buf.with_extension("wi")),
+        src_root.join(path_buf.with_extension("rs")),
         src_root.join(path_buf).join("mod.wi"),
     ]
 }

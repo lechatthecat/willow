@@ -18,6 +18,28 @@ pub(super) struct RustCommand {
     mutation: Option<Box<Mutation>>,
 }
 
+/// Native-only projects have no legacy bridge setting. Discover presence using
+/// directory entries only; signature derivation owns the one source read.
+fn has_native_sources(root: &std::path::Path) -> Result<bool> {
+    if !root.is_dir() {
+        return Ok(false);
+    }
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                return Ok(true);
+            }
+            if entry.file_type()?.is_dir() && entry.file_name() != ".willow-edits" {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(false)
+}
+
 impl RustCommand {
     pub(super) fn parse(command: &str, args: &[String]) -> Result<Self> {
         let (operation, args) = if command == "doctor" {
@@ -155,6 +177,45 @@ impl RustCommand {
         })
     }
 
+    fn query_bridge(
+        &mut self,
+        project: &ProjectManifest,
+        root: &std::path::Path,
+        snapshot: &mut willow_compiler::ai::Snapshot,
+        enabled: bool,
+    ) -> Result<()> {
+        self.options.read_only = true;
+        let has_native_sources = snapshot.sources.keys().any(|path| {
+            std::path::Path::new(path)
+                .extension()
+                .is_some_and(|ext| ext == "rs")
+        });
+        let graph = &mut snapshot.semantic.interop;
+        let mut review = None;
+        let has_legacy = self
+            .options
+            .symbols
+            .iter()
+            .any(|symbol| symbol.native.is_none());
+        if enabled && (!has_native_sources || has_legacy) {
+            let build =
+                inspect_bridge(project, root, &self.options)?.context("Rust bridge missing")?;
+            graph.resolved_crates(&build.direct_dependencies)?;
+            review = Some(build.review_fingerprint);
+        }
+        let mut value = graph.query(self.selector.as_deref());
+        value["review_fingerprint"] = serde_json::json!(review);
+        for bridge in value["bridges"].as_array_mut().unwrap() {
+            bridge["review_current"] = serde_json::json!(
+                review
+                    .as_ref()
+                    .is_some_and(|r| bridge["nonblocking"].as_str() == Some(r))
+            );
+        }
+        super::write_machine_output(&value)?;
+        Ok(())
+    }
+
     pub(super) fn execute(mut self) -> Result<()> {
         let directory = std::fs::canonicalize(&self.directory)?;
         let (_, root) =
@@ -164,7 +225,8 @@ impl RustCommand {
         let entry = project.entry_point(&root);
         let mut snapshot = if (self.operation == "check"
             || self.operation == "rust-bridge"
-            || self.options.read_only)
+            || self.options.read_only
+            || (entry.try_exists()? && has_native_sources(&root.join("src"))?))
             && (entry.try_exists()?
                 || project.project.entry.is_some()
                 || root.join("src").try_exists()?)
@@ -186,31 +248,20 @@ impl RustCommand {
         } else {
             None
         };
+        enabled |= self
+            .options
+            .symbols
+            .iter()
+            .any(|symbol| symbol.native.is_some());
         if self.operation == "rust-bridge" {
-            self.options.read_only = true;
-            let graph = &mut snapshot
-                .as_mut()
-                .context("query rust-bridge requires Willow sources")?
-                .semantic
-                .interop;
-            let mut review = None;
-            if enabled {
-                let build = inspect_bridge(&project, &root, &self.options)?
-                    .context("Rust bridge missing")?;
-                graph.resolved_crates(&build.direct_dependencies)?;
-                review = Some(build.review_fingerprint);
-            }
-            let mut value = graph.query(self.selector.as_deref());
-            value["review_fingerprint"] = serde_json::json!(review);
-            for bridge in value["bridges"].as_array_mut().unwrap() {
-                bridge["review_current"] = serde_json::json!(
-                    review
-                        .as_ref()
-                        .is_some_and(|r| bridge["nonblocking"].as_str() == Some(r))
-                );
-            }
-            super::write_machine_output(&value)?;
-            return Ok(());
+            return self.query_bridge(
+                &project,
+                &root,
+                snapshot
+                    .as_mut()
+                    .context("query rust-bridge requires Willow sources")?,
+                enabled,
+            );
         }
         let mut value = if let Some(mutation) = self.mutation {
             let mut value = commands::mutate(&root, &self.options, *mutation)?;
@@ -276,7 +327,7 @@ impl RustCommand {
             if let Some(build) = build {
                 value["toolchain"] = json!({"cargo":build.toolchain.cargo_version, "rustc":build.toolchain.rustc_version});
                 value["direct_dependencies"] = build.direct_dependencies;
-                value["bridge"] = json!({"source":project.rust.as_ref().unwrap().resolve_bridge(&root)?, "artifact":build.staticlib,
+                value["bridge"] = json!({"source":project.rust.as_ref().map(|rust|rust.resolve_bridge(&root)).transpose()?, "artifact":build.staticlib,
                     "manifest":build.directory.join("Cargo.toml")});
                 value["diagnostics"] = json!(build.messages.diagnostics);
                 if self.operation == "tree" {

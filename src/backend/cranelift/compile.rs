@@ -1772,7 +1772,7 @@ impl UnitCodegenContext<'_> {
             match (boundary, ty) {
                 (Scalar::Record(name), crate::parser::ast::Type::Named(actual)) => {
                     namespace = actual
-                        .strip_suffix(name)
+                        .strip_suffix(bridge.willow_record_name(name))
                         .context("record signature identity mismatch")?;
                     break;
                 }
@@ -1787,8 +1787,8 @@ impl UnitCodegenContext<'_> {
             }
         }
         let mut descriptors = Vec::new();
-        for record in &bridge.records {
-            let name = &record.name;
+        for record in bridge.records.iter() {
+            let name = bridge.willow_record_name(&record.name);
             let name = format!("{namespace}{name}");
             self.declare_one_class_descriptor(&name, f.span)?;
             descriptors.push(

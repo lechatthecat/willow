@@ -1230,8 +1230,13 @@ impl<'a> SourceIndex<'a> {
                 );
             }
         }
+        let rust = Path::new(&path).extension().is_some_and(|ext| ext == "rs");
         self.sources.insert(path, hash(source));
-        let tokens = TokenHashes::new(source)?;
+        let tokens = if rust {
+            TokenHashes::rust(source)?
+        } else {
+            TokenHashes::new(source)?
+        };
         if let Some(spans) = ranges.remove(&unit) {
             for span in spans {
                 self.fingerprints.insert(span, tokens.range(span));
@@ -2227,6 +2232,75 @@ impl TokenHashes {
                 power[i] = result.powers.last().unwrap()[i].wrapping_mul(base);
             }
             result.spans.push((token.span.start, token.span.end));
+            result.prefix.push(next);
+            result.powers.push(power);
+        }
+        Ok(result)
+    }
+    /// Rust units have their own lexical grammar (lifetimes, raw strings and
+    /// attributes). Fingerprint their tokens without sending them to Willow's lexer.
+    fn rust(source: &str) -> Result<Self> {
+        use proc_macro2::{Delimiter, TokenStream, TokenTree};
+        let stream: TokenStream = source
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Rust snapshot lexing failed: {e}"))?;
+        let mut result = Self {
+            names: HashMap::new(),
+            spans: vec![],
+            prefix: vec![[0, 0]],
+            powers: vec![[1, 1]],
+        };
+        let mut pending = stream
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(Ok)
+            .collect::<Vec<Result<TokenTree, proc_macro2::Span>>>();
+        while let Some(token) = pending.pop() {
+            let span = match token {
+                Ok(TokenTree::Group(group)) => {
+                    if group.delimiter() != Delimiter::None {
+                        pending.push(Err(group.span_close()));
+                    }
+                    pending.extend(
+                        group
+                            .stream()
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .map(Ok),
+                    );
+                    if group.delimiter() == Delimiter::None {
+                        continue;
+                    }
+                    group.span_open()
+                }
+                Ok(token) => token.span(),
+                Err(span) => span,
+            };
+            let range = span.byte_range();
+            let text = &source[range.clone()];
+            result
+                .names
+                .entry(text.to_owned())
+                .or_default()
+                .push((range.start, range.end));
+            let hash = Sha256::digest(text.as_bytes());
+            let mut next = [0; 2];
+            let mut power = [0; 2];
+            for (i, base) in [0x9e3779b185ebca87u64, 0xc2b2ae3d27d4eb4fu64]
+                .into_iter()
+                .enumerate()
+            {
+                let value = u64::from_le_bytes(hash[i * 8..i * 8 + 8].try_into().unwrap());
+                next[i] = result.prefix.last().unwrap()[i]
+                    .wrapping_mul(base)
+                    .wrapping_add(value);
+                power[i] = result.powers.last().unwrap()[i].wrapping_mul(base);
+            }
+            result.spans.push((range.start, range.end));
             result.prefix.push(next);
             result.powers.push(power);
         }

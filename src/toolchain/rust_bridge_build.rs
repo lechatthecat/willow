@@ -241,7 +241,8 @@ fn resolution_changes(
         hash(&bytes) == resolution.cargo_lock_hash,
         "Cargo candidate lock changed"
     );
-    let summary = (!resolution.dependencies.is_empty()).then(|| resolution.clone());
+    let summary =
+        (resolution.modules || !resolution.dependencies.is_empty()).then(|| resolution.clone());
     let lock = crate::package::lock::candidate_rust_lock(root, project, summary, options.offline)?;
     Ok(vec![
         FileChange::new(
@@ -536,7 +537,11 @@ fn prepare_bridge(
         !options.read_only || matches!(action, BridgeAction::Metadata | BridgeAction::Edit { .. }),
         "read-only Rust resolution cannot compile adapters"
     );
-    if project.rust_dependencies.is_empty() && !matches!(action, BridgeAction::Edit { .. }) {
+    let has_native_modules = options.symbols.iter().any(|symbol| symbol.native.is_some());
+    if project.rust_dependencies.is_empty()
+        && !has_native_modules
+        && !matches!(action, BridgeAction::Edit { .. })
+    {
         return Ok(None);
     }
     if !options.symbols.is_empty()
@@ -556,8 +561,12 @@ fn prepare_bridge(
     let bridge = project
         .rust
         .as_ref()
-        .context("rust_bridge_missing: [rust] bridge is required")?
-        .resolve_bridge(&root)?;
+        .map(|rust| rust.resolve_bridge(&root))
+        .transpose()?;
+    anyhow::ensure!(
+        bridge.is_some() || has_native_modules,
+        "rust_bridge_missing: [rust] bridge is required"
+    );
     let toolchain = RustToolchain::detect(&options.cargo, &options.rustc, &root)?;
     let target = options.target.as_deref().unwrap_or(&toolchain.host);
     // Parse before Cargo/linking; Cargo validates installation of the target.
@@ -609,21 +618,8 @@ fn prepare_bridge(
     )?;
     let previous = prepare_bridge_lock(&root, &directory, options, action, &input_hash)?;
     write_changed(&manifest_path, manifest.as_bytes())?;
-    let mut source = format!(
-        "#[path = {:?}]\npub mod bridge;\n",
-        bridge.to_str().context("non-UTF8 bridge path")?
-    );
-    if !options.symbols.is_empty() {
-        write_changed(
-            &directory.join("src/willow_bridge_abi.rs"),
-            include_bytes!("../../crates/willow_abi/src/ffi.rs"),
-        )?;
-        source.push_str(&crate::rust_bridge_ir::wrappers(
-            &options.symbols,
-            &directory.join("src/willow_bridge_abi.rs"),
-            willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION,
-        ));
-    }
+    let (source, native_hash) =
+        generated_bridge_source(&root, &directory, bridge.as_deref(), &options.symbols)?;
     // Cargo metadata needs a lib target, but never rewrite a previous fingerprint
     // before determining the new key: that would invalidate every warm build.
     if !lib_path.exists() {
@@ -645,18 +641,32 @@ fn prepare_bridge(
         project.rust_dependencies.keys().map(String::as_str),
     )?;
     let rust_lock = crate::package::lock::RustLock {
+        modules: has_native_modules || previous.as_ref().is_some_and(|lock| lock.modules),
         cargo_lock_hash: lock_hash.clone(),
         bridge_input_hash: input_hash,
         dependencies: direct_versions(&direct_dependencies)?,
     };
-    if options.locked && previous.as_ref() != Some(&rust_lock) {
+    if options.locked
+        && !previous.as_ref().is_some_and(|lock| {
+            lock.cargo_lock_hash == rust_lock.cargo_lock_hash
+                && lock.bridge_input_hash == rust_lock.bridge_input_hash
+                && lock.dependencies == rust_lock.dependencies
+        })
+    {
         bail!("rust_lockfile_stale: Cargo resolution or direct version summary changed");
     }
     // Compute once for all declarations. Source and manifest changes require
     // review even when Cargo's resolved package versions have not changed.
     // Line endings carry no Rust meaning and differ between checkouts (CRLF on
     // Windows), so a reviewed fingerprint stays portable across platforms.
-    let bridge_hash = hash_source_file(&bridge)?;
+    let legacy_hash = bridge.as_deref().map(hash_source_file).transpose()?;
+    // Nonblocking reviews retain the explicit legacy adapter's source boundary.
+    // Native exports cannot claim nonblocking; their source still participates in
+    // the build key below. Project-wide inspection may discover unused modules
+    // that an executable does not import, without changing a legacy review.
+    let bridge_hash = legacy_hash
+        .or(native_hash)
+        .context("rust_bridge_missing: bridge source is required")?;
     let review = hash(&serde_json::to_vec(&(
         &lock_hash,
         &bridge_hash,
@@ -730,6 +740,110 @@ fn prepare_bridge(
         _project_lease: project_lease,
         resolution: rust_lock,
     }))
+}
+
+fn generated_bridge_source(
+    root: &Path,
+    directory: &Path,
+    legacy: Option<&Path>,
+    symbols: &[crate::rust_bridge_ir::RustBridgeSymbol],
+) -> Result<(String, Option<String>)> {
+    let (mut source, native_hash) = module_sources(root, legacy, symbols)?;
+    if !symbols.is_empty() {
+        let abi = directory.join("src/willow_bridge_abi.rs");
+        write_changed(&abi, include_bytes!("../../crates/willow_abi/src/ffi.rs"))?;
+        source.push_str(&crate::rust_bridge_ir::wrappers(
+            symbols,
+            &abi,
+            willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION,
+        ));
+    }
+    Ok((source, native_hash))
+}
+
+fn review_module_path(root: &Path, path: &Path) -> String {
+    fn portable(path: &Path) -> String {
+        let path = path.to_string_lossy().replace('\\', "/");
+        if let Some(path) = path.strip_prefix("//?/UNC/") {
+            format!("//{path}")
+        } else {
+            path.strip_prefix("//?/").unwrap_or(&path).to_owned()
+        }
+    }
+    let root = portable(root);
+    let path = portable(path);
+    path.strip_prefix(&format!("{}/", root.trim_end_matches('/')))
+        .unwrap_or(&path)
+        .to_owned()
+}
+
+/// Fingerprint captured modules without rereading them. Rustc receives original
+/// source paths so relative modules, includes and diagnostics retain Rust semantics.
+/// Adapters share the existing bridge namespace and therefore the existing ABI.
+fn module_sources(
+    root: &Path,
+    legacy: Option<&Path>,
+    symbols: &[crate::rust_bridge_ir::RustBridgeSymbol],
+) -> Result<(String, Option<String>)> {
+    let mut module_index = std::collections::HashMap::new();
+    let mut modules = Vec::new();
+    let mut adapters = String::new();
+    for native in symbols.iter().filter_map(|symbol| symbol.native.as_ref()) {
+        let index = *module_index
+            .entry(native.module.as_str())
+            .or_insert_with(|| {
+                let index = modules.len();
+                modules.push((native.module.as_str(), native.source_path.as_path(), None));
+                index
+            });
+        let source = &mut modules[index].2;
+        if let Some(captured) = &native.source {
+            anyhow::ensure!(source.is_none(), "duplicate captured Rust module source");
+            *source = Some(captured.as_str());
+        }
+        adapters.push_str(&native.adapter);
+        adapters.push('\n');
+    }
+    if modules.is_empty() {
+        let legacy = legacy.context("rust_bridge_missing: bridge source is required")?;
+        return Ok((
+            format!(
+                "#[path = {:?}]\npub mod bridge;\n",
+                legacy.to_str().context("non-UTF8 bridge path")?
+            ),
+            None,
+        ));
+    }
+    let mut source = String::new();
+    let mut module_hashes = Vec::with_capacity(modules.len());
+    for (module, path, captured) in modules {
+        let captured = captured.context("Rust module source was not captured")?;
+        source.push_str(&format!(
+            "#[path = {:?}] pub mod {module};\n",
+            path.to_str().context("non-UTF8 Rust module path")?
+        ));
+        module_hashes.push((
+            review_module_path(root, path),
+            hash_source_bytes(captured.as_bytes()),
+        ));
+    }
+    if let Some(legacy) = legacy {
+        source.push_str(&format!(
+            "#[path = {:?}]\npub mod legacy_bridge;\n",
+            legacy.to_str().context("non-UTF8 bridge path")?
+        ));
+    }
+    source.push_str("pub mod bridge {\n#[allow(unused_imports, reason = \"Native type adapters share the bridge namespace\")] use crate::bridge;\n");
+    if legacy.is_some() {
+        source.push_str("pub use crate::legacy_bridge::*;\n");
+    }
+    source.push_str(&adapters);
+    source.push_str("}\n");
+    // Generated names contain absolute-path hashes solely for ABI disambiguation.
+    // A source review uses project-relative paths and a native adapter schema so
+    // moving the checkout does not invalidate a mixed legacy nonblocking review.
+    let fingerprint = hash(&serde_json::to_vec(&("native-modules-v1", module_hashes))?);
+    Ok((source, Some(fingerprint)))
 }
 
 #[cfg(test)]
@@ -957,8 +1071,12 @@ fn canonical_output_path(path: &Path) -> Result<PathBuf> {
 
 fn hash_source_file(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path)?;
+    Ok(hash_source_bytes(&bytes))
+}
+
+fn hash_source_bytes(bytes: &[u8]) -> String {
     let mut digest = Sha256::new();
-    let mut rest = bytes.as_slice();
+    let mut rest = bytes;
     // Feed each CRLF as LF without allocating a normalized copy.
     while let Some(at) = rest.windows(2).position(|pair| pair == b"\r\n") {
         digest.update(&rest[..at]);
@@ -966,7 +1084,7 @@ fn hash_source_file(path: &Path) -> Result<String> {
         rest = &rest[at + 2..];
     }
     digest.update(rest);
-    Ok(format!("{:x}", crate::hex::Hex(&digest.finalize())))
+    format!("{:x}", crate::hex::Hex(&digest.finalize()))
 }
 
 fn hash_file(path: &Path) -> Result<String> {
@@ -987,6 +1105,131 @@ fn hash_file(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use crate::project::RustDependencySpec;
+
+    fn native_symbol(
+        module: &str,
+        source: Option<&str>,
+        adapter: &str,
+    ) -> crate::rust_bridge_ir::RustBridgeSymbol {
+        let mut symbol = crate::rust_bridge_ir::RustBridgeSymbol::new(
+            format!("{module}::value"),
+            vec![],
+            crate::rust_bridge_ir::Scalar::I64,
+        );
+        symbol.native = Some(crate::rust_module::NativeBridge {
+            definitions: vec![],
+            module: module.into(),
+            source_path: PathBuf::from("/source-must-not-be-read.rs"),
+            source: source.map(str::to_owned),
+            adapter: adapter.into(),
+            target: format!("{module}_value"),
+        });
+        symbol
+    }
+
+    #[test]
+    fn native_module_sources_use_captures_and_share_one_crate() {
+        let directory =
+            std::env::temp_dir().join(format!("willow-native-source-{}", std::process::id()));
+        fs::create_dir_all(directory.join("src")).unwrap();
+        let mut symbols = vec![
+            native_symbol(
+                "first",
+                Some("pub fn value() -> i64 { 1 }\n"),
+                "pub use crate::first::value as first_value;",
+            ),
+            native_symbol(
+                "first",
+                None,
+                "pub use crate::first::value as another_value;",
+            ),
+            native_symbol(
+                "second",
+                Some("pub fn value() -> i64 { 2 }\n"),
+                "pub use crate::second::value as second_value;",
+            ),
+        ];
+        let legacy = directory.join("absent-legacy.rs");
+        let (source, fingerprint) = module_sources(&directory, Some(&legacy), &symbols).unwrap();
+        assert_eq!(source.matches("pub mod first;").count(), 1);
+        assert_eq!(source.matches("pub mod second;").count(), 1);
+        assert!(source.contains("pub use crate::legacy_bridge::*;"));
+        assert!(source.contains("another_value;"));
+        assert!(source.contains("/source-must-not-be-read.rs"));
+        assert!(!directory.join("src/first.rs").exists());
+        symbols[0].native.as_mut().unwrap().source = Some("pub fn value() -> i64 { 1 }\r\n".into());
+        assert_eq!(
+            module_sources(&directory, Some(&legacy), &symbols)
+                .unwrap()
+                .1,
+            fingerprint
+        );
+        symbols[0].native.as_mut().unwrap().source = Some("pub fn value() -> i64 { 3 }\n".into());
+        assert_ne!(
+            module_sources(&directory, Some(&legacy), &symbols)
+                .unwrap()
+                .1,
+            fingerprint
+        );
+        symbols[0].native.as_mut().unwrap().source = None;
+        assert!(module_sources(&directory, None, &symbols).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_review_paths_normalize_windows_prefixes_without_io() {
+        assert_eq!(
+            review_module_path(
+                Path::new("C:/work"),
+                Path::new(r"\\?\C:\work\src\native.rs")
+            ),
+            "src/native.rs"
+        );
+        assert_eq!(
+            review_module_path(
+                Path::new(r"\\server\share\work"),
+                Path::new(r"\\?\UNC\server\share\work\src\native.rs")
+            ),
+            "src/native.rs"
+        );
+        assert_eq!(
+            review_module_path(Path::new("/work"), Path::new("/work/src/native.rs")),
+            "src/native.rs"
+        );
+        assert_eq!(
+            review_module_path(Path::new("/work"), Path::new("/work-other/src/native.rs")),
+            "/work-other/src/native.rs"
+        );
+    }
+
+    #[test]
+    fn native_review_fingerprint_ignores_checkout_location() {
+        let first_root = Path::new("/checkout-a");
+        let second_root = Path::new("/checkout-b");
+        let mut first = native_symbol(
+            "native_first",
+            Some("pub fn value() -> i64 { 42 }"),
+            "pub use crate::native_first::value as native_first_value;",
+        );
+        first.native.as_mut().unwrap().source_path = first_root.join("src/native.rs");
+        let mut second = first.clone();
+        let native = second.native.as_mut().unwrap();
+        native.module = "native_second".into();
+        native.source_path = second_root.join("src/native.rs");
+        native.adapter = native.adapter.replace("native_first", "native_second");
+        let first_hash = module_sources(first_root, None, &[first]).unwrap().1;
+        assert_eq!(
+            first_hash,
+            module_sources(second_root, None, &[second.clone()])
+                .unwrap()
+                .1
+        );
+        second.native.as_mut().unwrap().source = Some("pub fn value() -> i64 { 43 }".into());
+        assert_ne!(
+            first_hash,
+            module_sources(second_root, None, &[second]).unwrap().1
+        );
+    }
 
     #[test]
     fn direct_projection_preserves_aliases_and_sources_without_transitives() {

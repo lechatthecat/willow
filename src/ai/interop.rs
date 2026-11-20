@@ -46,6 +46,12 @@ impl InteropGraph {
             if !b.symbol.records.is_empty() {
                 record["records"] = json!(b.symbol.records);
             }
+            if b.symbol.native.is_some() {
+                native_signature_names(&b.symbol, &mut record["signature"]);
+                if let Some(records) = record.get_mut("records") {
+                    native_signature_names(&b.symbol, records);
+                }
+            }
             record
         }).collect();
         json!({"schema":1,"kind":"rust-bridge","status":if selector.is_some() && records.is_empty() {"unknown"} else {"ok"},"bridges":records,"crate_candidates":self.crates})
@@ -125,6 +131,36 @@ impl InteropGraph {
                 "coverage":"conservative adapter dependency set"})
             })
             .collect()
+    }
+}
+
+/// Wire names disambiguate independent Rust modules inside the generated crate.
+/// Query consumers need the qualified Willow names they can write in source.
+fn native_signature_names(symbol: &crate::rust_bridge_ir::RustBridgeSymbol, value: &mut Value) {
+    let namespace = crate::qualified_name::QualifiedName::new(&symbol.willow_function).qualifier();
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Array(values) => pending.extend(values),
+            Value::Object(values) => {
+                for (key, value) in values {
+                    if matches!(key.as_str(), "Record" | "Opaque" | "name")
+                        && let Value::String(name) = value
+                    {
+                        let local = symbol.willow_record_name(name);
+                        *name = namespace.map_or_else(
+                            || local.to_owned(),
+                            |namespace| {
+                                crate::qualified_name::QualifiedName::join(namespace, local)
+                            },
+                        );
+                    } else {
+                        pending.push(value);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -242,6 +278,87 @@ impl<'a> CallerIndex<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_query_uses_willow_names_in_nested_record_and_handle_types() {
+        let (program, diagnostics) = crate::rust_module::parse(
+            Path::new("src/native.rs"),
+            "pub struct Leaf { pub count: i64 }\n\
+             pub struct Packet { pub leaf: Option<Leaf> }\n\
+             pub struct Handle { value: i64 }\n\
+             pub fn transfer(packet: Option<Packet>, handle: &Handle) -> Result<Packet, Box<Handle>> { todo!() }",
+            crate::diagnostics::FileId(1),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let mut symbol = program
+            .items
+            .into_iter()
+            .find_map(|item| match item {
+                crate::parser::ast::Item::Function(function) if function.name == "transfer" => {
+                    function.rust_bridge.map(|symbol| *symbol)
+                }
+                _ => None,
+            })
+            .unwrap();
+        symbol.willow_function = "nested::native::transfer".into();
+        let original = serde_json::to_value(&symbol).unwrap();
+        let graph = InteropGraph {
+            bridges: vec![Bridge {
+                function: "transfer-id".into(),
+                identity: None,
+                declaration: vec![],
+                declaration_text: String::new(),
+                symbol,
+            }],
+            ..Default::default()
+        };
+        let query = graph.query(None);
+        let bridge = &query["bridges"][0];
+        assert_eq!(
+            bridge["signature"],
+            json!({
+                "inputs": [{"Option": {"Record": "nested::native::Packet"}}, {"Opaque": "nested::native::Handle"}],
+                "output": {"Result": [{"Record": "nested::native::Packet"}, {"Opaque": "nested::native::Handle"}]}
+            })
+        );
+        let packet = bridge["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["name"] == "nested::native::Packet")
+            .unwrap();
+        assert_eq!(
+            packet["fields"],
+            json!([["leaf", {"Option": {"Record": "nested::native::Leaf"}}]])
+        );
+        assert_eq!(
+            serde_json::to_value(&graph.bridges[0].symbol).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn legacy_query_preserves_unqualified_bridge_type_names() {
+        use crate::rust_bridge_ir::{RustBridgeSymbol, Scalar};
+        let graph = InteropGraph {
+            bridges: vec![Bridge {
+                function: "legacy-id".into(),
+                identity: None,
+                declaration: vec![],
+                declaration_text: String::new(),
+                symbol: RustBridgeSymbol::new(
+                    "legacy::read".into(),
+                    vec![Scalar::Opaque("Handle".into())],
+                    Scalar::String,
+                ),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            graph.query(None)["bridges"][0]["signature"]["inputs"],
+            json!([{"Opaque": "Handle"}])
+        );
+    }
 
     #[test]
     fn shared_bridge_caller_index_counts_each_edge_once() {

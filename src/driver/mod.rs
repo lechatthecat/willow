@@ -230,9 +230,23 @@ impl<'a> CompilerSession<'a> {
             }
         }
         let bound = frontend.db.rust_bridge_symbols.clone();
+        let has_native_modules = bound.iter().any(|(_, symbol)| symbol.native.is_some());
+        let has_native_sources = frontend
+            .module_graph
+            .files
+            .iter()
+            .any(|file| file.path.extension().is_some_and(|ext| ext == "rs"));
+        let has_legacy_symbols = bound.iter().any(|(_, symbol)| symbol.native.is_none());
+        // Derived interfaces are checked entirely by the frontend. Cargo is
+        // reserved for an explicit native build or legacy adapter validation.
+        if !build && has_native_sources && !has_legacy_symbols {
+            return Ok(());
+        }
         let rust_bridge = if let Some(project_root) = &self.project_root {
             let manifest = project::ProjectManifest::load(&project_root.join("project.toml"))?;
-            if manifest.rust_dependencies.is_empty() {
+            if (manifest.rust_dependencies.is_empty() && !has_native_modules)
+                || (has_native_sources && bound.is_empty() && manifest.rust.is_none())
+            {
                 anyhow::ensure!(
                     bound.is_empty(),
                     "rust_bridge_missing: extern rust requires Rust dependencies and [rust] bridge"
@@ -244,7 +258,7 @@ impl<'a> CompilerSession<'a> {
                 options.locked = self.opts.locked;
                 options.offline = self.opts.offline;
                 options.symbols = bound.iter().map(|(_, symbol)| symbol.clone()).collect();
-                if build && !bound.is_empty() {
+                if build && !bound.is_empty() && !has_native_modules {
                     drop(toolchain::rust_bridge_build::build_bridge(
                         &manifest,
                         project_root,

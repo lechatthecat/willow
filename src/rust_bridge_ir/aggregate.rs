@@ -36,7 +36,7 @@ impl Scalar {
     fn niche(&self) -> bool {
         matches!(self, Self::Option(t) if t.reference() && !matches!(**t, Self::Option(_)))
     }
-    fn rust_type(&self, input: bool) -> String {
+    pub(crate) fn rust_type(&self, input: bool) -> String {
         let mut result = String::new();
         self.append_rust_type(&mut result, input, None);
         result
@@ -129,6 +129,11 @@ impl Scalar {
             }
             _ => output.push_str(self.rust()),
         }
+    }
+    pub(crate) fn owned_rust_type(&self) -> String {
+        let mut output = String::new();
+        self.append_owned_type(&mut output);
+        output
     }
     fn append_owned_type(&self, output: &mut String) {
         match self {
@@ -325,7 +330,10 @@ impl Scalar {
 }
 
 pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, revision: u32) {
-    let target = QualifiedName::new(&symbol.willow_function).last_segment();
+    let target = symbol.native.as_ref().map_or_else(
+        || QualifiedName::new(&symbol.willow_function).last_segment(),
+        |native| native.target.as_str(),
+    );
     let guard = symbol.entry_guard();
     let records = &symbol.records;
     let metadata = if records.is_empty() {
@@ -406,7 +414,11 @@ pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, 
 pub(super) fn record_structs(source: &mut String, symbols: &[RustBridgeSymbol]) {
     let mut seen = std::collections::HashMap::new();
     let mut records = Vec::new();
-    for record in symbols.iter().flat_map(|s| &s.records) {
+    for record in symbols.iter().flat_map(|s| {
+        s.records
+            .iter()
+            .chain(s.native.iter().flat_map(|native| native.definitions.iter()))
+    }) {
         if let Some(previous) = seen.insert(&record.name, record) {
             if previous != record {
                 writeln!(

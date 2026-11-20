@@ -1573,7 +1573,14 @@ impl QueryProvider for SyntaxProvider<'_> {
                 let input = table.input(&InputNode::Source(path.clone()))?;
                 let source = input.get::<Source>();
                 let mut inventory = Vec::new();
-                let (program, diagnostics, lexer_failed) =
+                let (program, diagnostics, lexer_failed) = if path
+                    .extension()
+                    .is_some_and(|e| e == "rs")
+                {
+                    let (program, diagnostics) =
+                        crate::rust_module::parse(path, &source.text, source.file);
+                    (program, diagnostics, false)
+                } else {
                     match crate::lexer::Lexer::with_file_id(&source.text, source.file).tokenize() {
                         Ok(tokens) => {
                             inventory = tokens
@@ -1603,7 +1610,8 @@ impl QueryProvider for SyntaxProvider<'_> {
                             diagnostics.into_iter().collect::<Vec<_>>(),
                             true,
                         ),
-                    };
+                    }
+                };
                 let parsed = serde_json::to_value((program, diagnostics, lexer_failed))?;
                 let mut index = serde_json::Map::new();
                 index_declarations(&parsed[0]["items"], "", &mut index);

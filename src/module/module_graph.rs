@@ -66,8 +66,11 @@ struct Dependencies {
 #[derive(Debug, Default)]
 pub struct ModuleGraph {
     pub root: PathBuf,
+    pub(crate) rust_source_paths: HashMap<PathBuf, ModuleKey>,
     #[cfg(test)]
     pub(crate) source_loads: usize,
+    #[cfg(test)]
+    pub(crate) rust_source_loads: usize,
     #[cfg(test)]
     pub(crate) import_routes: usize,
     pub package_graph: Option<std::sync::Arc<crate::package::PackageGraph>>,

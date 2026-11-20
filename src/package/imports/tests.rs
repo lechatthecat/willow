@@ -464,12 +464,12 @@ fn item_and_missing_routes_have_bounded_filesystem_work() {
         resolved(&imports, 0, "a::util::format").2.as_deref(),
         Some("format")
     );
-    assert_eq!(imports.file_probes.get(), 3);
+    assert_eq!(imports.file_probes.get(), 4);
     assert!(matches!(
         imports.resolve(graph.root, "a::missing::item"),
         Err(PackageImportError::ModuleNotFound { .. })
     ));
-    assert_eq!(imports.file_probes.get(), 7);
+    assert_eq!(imports.file_probes.get(), 10);
     assert_eq!(imports.alias_lookups.get(), 2);
 }
 
