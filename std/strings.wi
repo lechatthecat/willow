@@ -1,0 +1,59 @@
+import std::collections::Array;
+import std::text;
+
+// Mutable text accumulator. append is amortized O(1) (one array push per
+// piece); to_string() concatenates every pending piece once, O(total bytes),
+// and keeps the result as the only piece, so repeated to_string() calls with
+// no appends in between do not copy again.
+pub class StringBuilder {
+    pieces: Array<String>;
+    byte_len: i64;
+
+    pub init(self) {
+        self.pieces = Array::new();
+        self.byte_len = 0;
+    }
+
+    pub static fn with_text(text: String) -> StringBuilder {
+        let builder = new StringBuilder();
+        builder.append(text);
+        return builder;
+    }
+
+    pub fn append(text: String) {
+        if text.len() == 0 { return; }
+        self.pieces.push(text);
+        self.byte_len = self.byte_len + text.len();
+    }
+
+    pub fn append_line(text: String) {
+        self.append(text);
+        self.append("\n");
+    }
+
+    pub fn append_i64(value: i64) { self.append(value.to_string()); }
+    pub fn append_f64(value: f64) { self.append(value.to_string()); }
+    pub fn append_bool(value: bool) { self.append(value.to_string()); }
+
+    // Appends one Unicode scalar value; panics on a surrogate or out-of-range
+    // value, like text::from_scalar.
+    pub fn append_scalar(scalar: i64) { self.append(text::from_scalar(scalar)); }
+
+    // Length in UTF-8 bytes, like String::len().
+    pub fn len() -> i64 { return self.byte_len; }
+    pub fn is_empty() -> bool { return self.byte_len == 0; }
+
+    pub fn clear() {
+        self.pieces = Array::new();
+        self.byte_len = 0;
+    }
+
+    pub fn to_string() -> String {
+        if self.pieces.len() == 0 { return ""; }
+        if self.pieces.len() > 1 {
+            let joined = self.pieces.join("");
+            self.pieces = [joined];
+        }
+        return self.pieces[0];
+    }
+}

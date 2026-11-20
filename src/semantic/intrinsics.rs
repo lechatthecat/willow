@@ -2483,6 +2483,14 @@ pub(crate) fn namespace_builtin(class: &str, method: &str) -> Option<NamespaceBu
         ("env", "args") => rt::willow_runtime_args_array,
         ("env", "program_name") => rt::willow_runtime_program_name,
         ("env", "arg") => rt::willow_runtime_arg,
+        ("env", "var") => rt::willow_env_var,
+
+        ("path", "join") => rt::willow_path_join,
+        ("path", "parent") => rt::willow_path_parent,
+        ("path", "file_name") => rt::willow_path_file_name,
+        ("path", "extension") => rt::willow_path_extension,
+        ("path", "file_stem") => rt::willow_path_file_stem,
+        ("path", "is_absolute") => rt::willow_path_is_absolute,
 
         ("fs", "temp_path") => rt::willow_fs_temp_path,
         ("fs", "read_to_string") => rt::willow_fs_read_to_string,
@@ -2527,6 +2535,6 @@ pub(crate) fn namespace_builtin(class: &str, method: &str) -> Option<NamespaceBu
             .map(|ty| ty.to_ast_type().map(Into::into))
             .collect::<Option<Vec<_>>>()?,
         ret: return_type.to_ast_type()?.into(),
-        narrow_to_bool: (class, method) == ("fs", "exists"),
+        narrow_to_bool: matches!((class, method), ("fs", "exists") | ("path", "is_absolute")),
     })
 }

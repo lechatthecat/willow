@@ -1,0 +1,11 @@
+// env::var reads an environment variable: None when it is unset, not valid
+// Unicode, or the name is empty or contains `=`.
+fn main() {
+    match env::var("WILLOW_EXAMPLE_UNSET_VARIABLE") {
+        Some(value) => { println("set: " + value); }
+        None => { println("unset, using default"); }
+    }
+    println(env::var("PATH").is_some());
+    println(env::var("").is_none());
+    println(env::var("A=B").is_none());
+}

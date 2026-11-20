@@ -1,0 +1,341 @@
+import std::collections::Array;
+
+// Key-ordered map: an AVL tree stored in parallel arrays (slot -1 is "no
+// node"). insert is amortized O(log n) because the arrays grow; get, contains,
+// remove, first/last and floor/ceiling are O(log n) key comparisons.
+// keys(), values() and entries() are O(n) in ascending key order;
+// range_keys(from, to) is O(log n + m) for m returned keys. Keys are i64, f64
+// or String; a NaN key panics because it has no place in the order.
+pub class SortedMap<K, V> {
+    node_keys: Array<K>;
+    node_values: Array<V>;
+    left: Array<i64>;
+    right: Array<i64>;
+    height: Array<i64>;
+    root: i64;
+    freed: i64;
+
+    pub init(self) {
+        self.node_keys = Array::new();
+        self.node_values = Array::new();
+        self.left = Array::new();
+        self.right = Array::new();
+        self.height = Array::new();
+        self.root = -1;
+        self.freed = -1;
+    }
+
+    pub fn len() -> i64 { return self.node_keys.len(); }
+    pub fn is_empty() -> bool { return self.node_keys.len() == 0; }
+
+    pub fn clear() {
+        self.node_keys = Array::new();
+        self.node_values = Array::new();
+        self.left = Array::new();
+        self.right = Array::new();
+        self.height = Array::new();
+        self.root = -1;
+    }
+
+    // Adds key or replaces its value, like Map::insert.
+    pub fn insert(key: K, value: V) where K: i64 | f64 | String {
+        if key != key { panic("SortedMap key must not be NaN"); }
+        self.root = self.insert_at(self.root, key, value);
+    }
+
+    pub fn get(key: K) -> Option<V> where K: i64 | f64 | String {
+        let node = self.find(key);
+        if node < 0 { return None; }
+        return Some(self.node_values[node]);
+    }
+
+    pub fn contains(key: K) -> bool where K: i64 | f64 | String {
+        return self.find(key) >= 0;
+    }
+
+    // Removes key and returns its value, like Map::remove.
+    pub fn remove(key: K) -> Option<V> where K: i64 | f64 | String {
+        let node = self.find(key);
+        if node < 0 { return None; }
+        let value = self.node_values[node];
+        self.root = self.remove_at(self.root, key);
+        self.compact(self.freed);
+        return Some(value);
+    }
+
+    pub fn first_key() -> Option<K> {
+        let mut node = self.root;
+        if node < 0 { return None; }
+        while self.left[node] >= 0 { node = self.left[node]; }
+        return Some(self.node_keys[node]);
+    }
+
+    pub fn last_key() -> Option<K> {
+        let mut node = self.root;
+        if node < 0 { return None; }
+        while self.right[node] >= 0 { node = self.right[node]; }
+        return Some(self.node_keys[node]);
+    }
+
+    // Greatest key <= key; None for a NaN key.
+    pub fn floor_key(key: K) -> Option<K> where K: i64 | f64 | String {
+        if key != key { return None; }
+        let mut node = self.root;
+        let mut best = -1;
+        while node >= 0 {
+            if key < self.node_keys[node] {
+                node = self.left[node];
+            } else {
+                best = node;
+                node = self.right[node];
+            }
+        }
+        if best < 0 { return None; }
+        return Some(self.node_keys[best]);
+    }
+
+    // Least key >= key; None for a NaN key.
+    pub fn ceiling_key(key: K) -> Option<K> where K: i64 | f64 | String {
+        if key != key { return None; }
+        let mut node = self.root;
+        let mut best = -1;
+        while node >= 0 {
+            if self.node_keys[node] < key {
+                node = self.right[node];
+            } else {
+                best = node;
+                node = self.left[node];
+            }
+        }
+        if best < 0 { return None; }
+        return Some(self.node_keys[best]);
+    }
+
+    pub fn keys() -> Array<K> {
+        let order = self.in_order();
+        let result: Array<K> = Array::new();
+        for index in 0..order.len() { result.push(self.node_keys[order[index]]); }
+        return result;
+    }
+
+    pub fn values() -> Array<V> {
+        let order = self.in_order();
+        let result: Array<V> = Array::new();
+        for index in 0..order.len() { result.push(self.node_values[order[index]]); }
+        return result;
+    }
+
+    pub fn entries() -> Array<(K, V)> {
+        let order = self.in_order();
+        let result: Array<(K, V)> = Array::new();
+        for index in 0..order.len() {
+            let node = order[index];
+            result.push((self.node_keys[node], self.node_values[node]));
+        }
+        return result;
+    }
+
+    // Ascending keys in the half-open range [from, to); empty when either
+    // bound is NaN.
+    pub fn range_keys(from: K, to: K) -> Array<K> where K: i64 | f64 | String {
+        let result: Array<K> = Array::new();
+        if from != from || to != to { return result; }
+        let stack: Array<i64> = Array::new();
+        let mut node = self.root;
+        let mut scanning = true;
+        while scanning {
+            while node >= 0 {
+                if self.node_keys[node] < from {
+                    node = self.right[node];
+                } else {
+                    stack.push(node);
+                    node = self.left[node];
+                }
+            }
+            if stack.len() == 0 {
+                scanning = false;
+            } else {
+                let next = stack.pop();
+                if self.node_keys[next] < to {
+                    result.push(self.node_keys[next]);
+                    node = self.right[next];
+                } else {
+                    scanning = false;
+                }
+            }
+        }
+        return result;
+    }
+
+    // NaN equals no stored key (insert rejects it), so it is never found.
+    fn find(key: K) -> i64 where K: i64 | f64 | String {
+        if key != key { return -1; }
+        let mut node = self.root;
+        while node >= 0 {
+            let current = self.node_keys[node];
+            if key < current {
+                node = self.left[node];
+            } else if current < key {
+                node = self.right[node];
+            } else {
+                return node;
+            }
+        }
+        return -1;
+    }
+
+    // Slots in ascending key order, iteratively (no recursion depth limit).
+    fn in_order() -> Array<i64> {
+        let result: Array<i64> = Array::new();
+        let stack: Array<i64> = Array::new();
+        let mut node = self.root;
+        while node >= 0 || stack.len() > 0 {
+            while node >= 0 {
+                stack.push(node);
+                node = self.left[node];
+            }
+            let next = stack.pop();
+            result.push(next);
+            node = self.right[next];
+        }
+        return result;
+    }
+
+    fn insert_at(node: i64, key: K, value: V) -> i64 where K: i64 | f64 | String {
+        if node < 0 {
+            let slot = self.node_keys.len();
+            self.node_keys.push(key);
+            self.node_values.push(value);
+            self.left.push(-1);
+            self.right.push(-1);
+            self.height.push(1);
+            return slot;
+        }
+        let current = self.node_keys[node];
+        if key < current {
+            let child = self.insert_at(self.left[node], key, value);
+            self.left[node] = child;
+        } else if current < key {
+            let child = self.insert_at(self.right[node], key, value);
+            self.right[node] = child;
+        } else {
+            self.node_values[node] = value;
+            return node;
+        }
+        return self.rebalance(node);
+    }
+
+    // Unlinks key (known to be present) and records the vacated slot in
+    // self.freed; returns the new subtree root.
+    fn remove_at(node: i64, key: K) -> i64 where K: i64 | f64 | String {
+        let current = self.node_keys[node];
+        if key < current {
+            let child = self.remove_at(self.left[node], key);
+            self.left[node] = child;
+        } else if current < key {
+            let child = self.remove_at(self.right[node], key);
+            self.right[node] = child;
+        } else if self.left[node] < 0 {
+            self.freed = node;
+            return self.right[node];
+        } else if self.right[node] < 0 {
+            self.freed = node;
+            return self.left[node];
+        } else {
+            // Two children: adopt the successor's entry, then unlink it.
+            let mut successor = self.right[node];
+            while self.left[successor] >= 0 { successor = self.left[successor]; }
+            let successor_key = self.node_keys[successor];
+            self.node_keys[node] = successor_key;
+            self.node_values[node] = self.node_values[successor];
+            let child = self.remove_at(self.right[node], successor_key);
+            self.right[node] = child;
+        }
+        return self.rebalance(node);
+    }
+
+    // Keeps storage dense: the last slot moves into the vacated one and its
+    // parent link (found by one key search) is redirected. O(log n).
+    fn compact(vacated: i64) where K: i64 | f64 | String {
+        let last = self.node_keys.len() - 1;
+        if vacated != last {
+            let key = self.node_keys[last];
+            let mut parent = -1;
+            let mut node = self.root;
+            while node != last {
+                parent = node;
+                if key < self.node_keys[node] {
+                    node = self.left[node];
+                } else {
+                    node = self.right[node];
+                }
+            }
+            self.node_keys[vacated] = key;
+            self.node_values[vacated] = self.node_values[last];
+            self.left[vacated] = self.left[last];
+            self.right[vacated] = self.right[last];
+            self.height[vacated] = self.height[last];
+            if parent < 0 {
+                self.root = vacated;
+            } else if self.left[parent] == last {
+                self.left[parent] = vacated;
+            } else {
+                self.right[parent] = vacated;
+            }
+        }
+        self.node_keys.pop();
+        self.node_values.pop();
+        self.left.pop();
+        self.right.pop();
+        self.height.pop();
+    }
+
+    fn depth(node: i64) -> i64 {
+        if node < 0 { return 0; }
+        return self.height[node];
+    }
+
+    fn update_height(node: i64) {
+        let left = self.depth(self.left[node]);
+        let right = self.depth(self.right[node]);
+        if left > right { self.height[node] = left + 1; } else { self.height[node] = right + 1; }
+    }
+
+    fn rotate_right(node: i64) -> i64 {
+        let pivot = self.left[node];
+        self.left[node] = self.right[pivot];
+        self.right[pivot] = node;
+        self.update_height(node);
+        self.update_height(pivot);
+        return pivot;
+    }
+
+    fn rotate_left(node: i64) -> i64 {
+        let pivot = self.right[node];
+        self.right[node] = self.left[pivot];
+        self.left[pivot] = node;
+        self.update_height(node);
+        self.update_height(pivot);
+        return pivot;
+    }
+
+    fn rebalance(node: i64) -> i64 {
+        self.update_height(node);
+        let balance = self.depth(self.left[node]) - self.depth(self.right[node]);
+        if balance > 1 {
+            let child = self.left[node];
+            if self.depth(self.left[child]) < self.depth(self.right[child]) {
+                self.left[node] = self.rotate_left(child);
+            }
+            return self.rotate_right(node);
+        }
+        if balance < -1 {
+            let child = self.right[node];
+            if self.depth(self.right[child]) < self.depth(self.left[child]) {
+                self.right[node] = self.rotate_right(child);
+            }
+            return self.rotate_left(node);
+        }
+        return node;
+    }
+}

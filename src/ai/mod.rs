@@ -58,10 +58,8 @@ use std::{
 pub(crate) fn bundled_source(path: &str) -> Option<&'static str> {
     if Path::new(path) == Path::new("<std>/collections.wi") {
         Some(include_str!("../../std/collections.wi"))
-    } else if Path::new(path) == Path::new("<std>/json.wi") {
-        Some(include_str!("../../std/json.wi"))
     } else {
-        None
+        crate::module::std_registry::source_std_file(path).map(|module| module.source)
     }
 }
 pub(crate) fn source_path(path: &Path) -> Result<std::path::PathBuf> {

@@ -406,12 +406,11 @@ fn resolve_import(
     {
         graph.import_routes += 1;
     }
-    let resolved = if std_registry::is_source_std_path(path) {
-        let item = path.strip_prefix("std::json::").map(str::to_owned);
+    let resolved = if let Some((module, item)) = std_registry::source_std_module(path) {
         Some((
-            ModuleKey::new(PackageId(0), "std::json"),
-            PathBuf::from("<std>/json.wi"),
-            item,
+            ModuleKey::new(PackageId(0), module.path),
+            PathBuf::from(module.file),
+            item.map(str::to_owned),
         ))
     } else if let Some(routing) = routing {
         match routing.resolve(consumer, path) {
@@ -623,8 +622,8 @@ fn load_module_program(
     {
         graph.source_loads += 1;
     }
-    let source = if path == "std::json" {
-        include_str!("../../std/json.wi").to_owned()
+    let source = if let Some((module, None)) = std_registry::source_std_module(path) {
+        module.source.to_owned()
     } else {
         match crate::compiler_db::captured::FileInput::read(module_path.clone()) {
             Ok(input) => input.source,

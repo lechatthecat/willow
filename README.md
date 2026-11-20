@@ -100,6 +100,7 @@ A few things to notice:
 | Functions | Closures and function values | [closures](example/function_closure_wrappers.wi) |
 | Concurrency | Tasks, channels, `select`, cancellation, `Mutex`, `RwLock` | [channels](example/bounded_channel.wi), [select](example/select.wi), [parallel map](example/parallel_map.wi) |
 | I/O | Files and TCP | [files](example/file_io.wi), [TCP echo](example/tcp_echo.wi) |
+| Standard library | `HashSet`, ordered `SortedMap`, `StringBuilder`, `ByteBuffer`, paths, environment, JSON; [API and complexity reference](std/README.md) | [sets](example/hash_set.wi), [byte buffers](example/byte_buffer.wi), [paths](example/path_ops.wi) |
 | Packages | Modules and `willow add` dependencies | [imports](example/import_demo) |
 | Rust crates | `extern rust` adapters for `[rust-dependencies]` | [regex bridge](example/rust_regex), [bridge protocol](protocol/ai_toolchain/RUST_BRIDGE.md) |
 

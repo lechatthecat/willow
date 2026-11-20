@@ -1918,7 +1918,7 @@ mod tests {
                     continue;
                 }
                 // Pure value modules, or callback-driven effects classified at call sites.
-                "text" | "collections" | "option" | "result" | "parallel" => continue,
+                "text" | "collections" | "option" | "result" | "parallel" | "path" => continue,
                 other => panic!("classify external access for new standard module {other}"),
             }
             for item in module.items {

@@ -1,0 +1,28 @@
+// std::bytes::ByteBuffer: a growable byte sequence with fixed-width integer
+// encoding and strict UTF-8 decoding.
+import std::bytes::ByteBuffer;
+
+fn main() {
+    let packet = new ByteBuffer();
+    packet.write_i64_be(2026);
+    packet.write_string("héllo");
+    packet.push(0x21);
+    println(packet.len());
+    println(packet.read_i64_be(0));
+    match packet.slice(8, packet.len()).decode_utf8() {
+        Ok(text) => { println(text); }
+        Err(error) => { println("invalid UTF-8 at " + error.position.to_string()); }
+    }
+
+    // 0xC3 starts a two-byte sequence, but 0x28 is not a continuation byte.
+    let broken = ByteBuffer::from_array([0x6F, 0x6B, 0xC3, 0x28]);
+    match broken.decode_utf8() {
+        Ok(text) => { println(text); }
+        Err(error) => { println("invalid UTF-8 at " + error.position.to_string()); }
+    }
+
+    let little = new ByteBuffer();
+    little.write_i64_le(-2);
+    println(little.to_string());
+    println(little.read_i64_le(0));
+}

@@ -1,0 +1,26 @@
+// std::set::HashSet: an unordered set with expected O(1) insert, contains
+// and remove. Elements are i64, f64, bool or String.
+import std::set::HashSet;
+
+fn main() {
+    let seen: HashSet<String> = new HashSet();
+    let words = "the quick fox jumps over the lazy fox".split(" ");
+    let mut repeated = 0;
+    for word in words {
+        // insert reports whether the element was new.
+        if !seen.insert(word) { repeated += 1; }
+    }
+    println(seen.len());
+    println(repeated);
+    println(seen.contains("fox"));
+    println(seen.remove("fox"));
+    println(seen.contains("fox"));
+
+    let evens: HashSet<i64> = HashSet<i64>::from_array([2, 4, 6, 8]);
+    let small: HashSet<i64> = HashSet<i64>::from_array([1, 2, 3, 4]);
+    // to_string lists elements in ascending order.
+    println(evens.union(small).to_string());
+    println(evens.intersection(small).to_string());
+    println(small.difference(evens).to_string());
+    println(evens.intersection(small).is_subset(evens));
+}

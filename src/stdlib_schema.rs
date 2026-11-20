@@ -197,6 +197,18 @@ const ENV: &[StdItemSchema] = &[
     std_function!("arg", [T::I64] -> T::Option(&T::String)),
     std_function!("args_len", [] -> T::I64),
     std_function!("program_name", [] -> T::String),
+    std_function!("var", [T::String] -> T::Option(&T::String)),
+];
+
+// Lexical path operations with the host platform's separator and prefix rules.
+// None of them reads the file system.
+const PATH: &[StdItemSchema] = &[
+    std_function!("join", [T::String, T::String] -> T::String),
+    std_function!("parent", [T::String] -> T::Option(&T::String)),
+    std_function!("file_name", [T::String] -> T::Option(&T::String)),
+    std_function!("extension", [T::String] -> T::Option(&T::String)),
+    std_function!("file_stem", [T::String] -> T::Option(&T::String)),
+    std_function!("is_absolute", [T::String] -> T::Bool),
 ];
 
 // Addresses are numeric `IP:port` strings in v1, so no hidden DNS lookup can
@@ -266,7 +278,20 @@ pub const STDLIB_SCHEMA: &[StdModuleSchema] = &[
         name: "parallel",
         items: PARALLEL,
     },
+    StdModuleSchema {
+        name: "path",
+        items: PATH,
+    },
 ];
+
+/// Builtin modules whose items are runtime functions called as
+/// `module::function(...)`. Console output (`io`) is excluded: its functions
+/// are overloaded syntax rather than namespace calls.
+pub const FUNCTION_MODULES: &[&str] = &["time", "env", "fs", "net", "parallel", "text", "path"];
+
+pub fn is_function_module(name: &str) -> bool {
+    FUNCTION_MODULES.contains(&name)
+}
 
 pub fn module(name: &str) -> Option<&'static StdModuleSchema> {
     STDLIB_SCHEMA.iter().find(|module| module.name == name)
@@ -768,7 +793,8 @@ mod recursive_schema_tests {
                 "env",
                 "fs",
                 "net",
-                "parallel"
+                "parallel",
+                "path"
             ]
         );
         for (name, count) in [
@@ -778,10 +804,11 @@ mod recursive_schema_tests {
             ("result", 1),
             ("io", 3),
             ("time", 1),
-            ("env", 4),
+            ("env", 5),
             ("fs", 9),
             ("net", 12),
             ("parallel", 1),
+            ("path", 6),
         ] {
             assert_eq!(
                 module(name).expect("module exists").items.len(),

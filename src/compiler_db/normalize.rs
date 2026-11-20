@@ -197,10 +197,7 @@ pub(crate) fn std_collection_imports(program: &Program) -> StdCollectionImports 
                 modules.insert("collections".to_string());
             }
             Ok(std_registry::StdImport::Module { module })
-                if matches!(
-                    module.as_str(),
-                    "time" | "fs" | "env" | "net" | "parallel" | "text"
-                ) =>
+                if crate::stdlib_schema::is_function_module(&module) =>
             {
                 if let Some(alias) = &import.alias {
                     builtin_module_aliases.insert(alias.clone(), module.clone());

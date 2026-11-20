@@ -107,6 +107,7 @@ mod observation;
 pub mod panic;
 pub mod panic_context;
 pub mod parallel;
+pub mod path;
 pub mod plugin;
 pub mod preempt;
 pub mod print;

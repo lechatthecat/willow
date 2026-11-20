@@ -142,6 +142,22 @@ pub extern "C" fn willow_runtime_arg(index: i64) -> *mut u8 {
     default_args().arg(index, willow_string_from_str)
 }
 
+/// `env::var(name) -> Option<String>`: the variable's value, or the null niche
+/// when it is unset, not valid Unicode, or `name` cannot name a variable (empty,
+/// or containing `=` or NUL — names the platform APIs reject or misread).
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_env_var(name: *const u8) -> *mut u8 {
+    let value = {
+        let name = unsafe { crate::string::willow_string_as_str(name) };
+        if name.is_empty() || name.contains(['=', '\0']) {
+            return std::ptr::null_mut();
+        }
+        std::env::var(name).ok()
+    };
+    value.map_or(std::ptr::null_mut(), |value| willow_string_from_str(&value))
+}
+
 /// Build a GC-managed `Array<String>` of the user arguments (excluding the
 /// program name). Used for `env::args()` and to bind a `fn main(args:
 /// Array<String>)` parameter.
@@ -192,6 +208,22 @@ mod tests {
             return "(null)".to_string();
         }
         unsafe { willow_string_as_str(ptr) }.to_string()
+    }
+
+    #[test]
+    fn env_var_reads_set_variables_and_rejects_invalid_names() {
+        let _guard = isolated_runtime();
+        willow_gc_init();
+        let read = |name: &str| ws_text(willow_env_var(willow_string_from_str(name)));
+        // PATH exists on every CI host; Windows names are case-insensitive.
+        assert_eq!(
+            read("PATH"),
+            std::env::var("PATH").unwrap_or_else(|_| "(null)".into())
+        );
+        assert_eq!(read("WILLOW_SURELY_UNSET_VARIABLE_8f3a"), "(null)");
+        for invalid in ["", "A=B", "=", "A\0B"] {
+            assert_eq!(read(invalid), "(null)", "{invalid:?}");
+        }
     }
 
     #[test]

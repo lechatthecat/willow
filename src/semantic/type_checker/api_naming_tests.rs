@@ -281,7 +281,7 @@ fn bundled_public_names(source: &str) -> Vec<(String, bool)> {
 
 /// The public naming inventory: builtin intrinsic methods, Option/Result
 /// methods, namespace and static builtins, the `std` schema, and the bundled
-/// Willow sources (prelude, `std::collections`, `std::json`). Callable names
+/// Willow sources (prelude, `std::collections`, every source std module). Callable names
 /// are snake_case; type and variant names are PascalCase.
 #[test]
 fn public_builtin_and_std_names_follow_the_naming_rule() {
@@ -390,14 +390,17 @@ fn public_builtin_and_std_names_follow_the_naming_rule() {
             }
         }
     }
-    for (origin, source) in [
+    let bundled = [
         ("prelude", crate::prelude::PRELUDE_SOURCE),
         (
             "std::collections",
             include_str!("../../../std/collections.wi"),
         ),
-        ("std::json", include_str!("../../../std/json.wi")),
-    ] {
+    ];
+    let source_modules = crate::module::std_registry::SOURCE_STD_MODULES
+        .iter()
+        .map(|module| (module.path, module.source));
+    for (origin, source) in bundled.into_iter().chain(source_modules) {
         // `$`-prefixed items are parser-synthesized (tuple desugaring) and
         // cannot be spelled in source.
         for (name, is_type) in bundled_public_names(source)

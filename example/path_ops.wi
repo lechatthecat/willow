@@ -1,0 +1,21 @@
+// std::path: lexical path operations with the host platform's separator and
+// prefix rules. Nothing here touches the file system.
+fn show(part: Option<String>) -> String {
+    match part {
+        Some(text) => { return text; }
+        None => { return "(none)"; }
+    }
+}
+
+fn main() {
+    let archive = path::join("build", "release.tar.gz");
+    println(show(path::file_name(archive)));
+    println(show(path::extension(archive)));
+    println(show(path::file_stem(archive)));
+    println(show(path::parent("assets/images/logo.png")));
+    println(show(path::extension("README")));
+    println(show(path::extension(".gitignore")));
+    println(path::is_absolute(archive));
+    // An empty base adds no separator.
+    println(path::join("", "notes.txt"));
+}

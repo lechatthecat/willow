@@ -359,7 +359,7 @@ impl TypeChecker {
     }
 
     pub(super) fn register_builtin_modules(&mut self) {
-        for module_name in ["time", "env", "fs", "net", "parallel", "text"] {
+        for &module_name in crate::stdlib_schema::FUNCTION_MODULES {
             self.register_schema_module(module_name);
         }
     }
@@ -1069,9 +1069,7 @@ impl TypeChecker {
                     let local = import.alias.as_deref().unwrap_or(module);
                     self.imported_names
                         .insert(local.to_string(), Some(import.span));
-                    if import.alias.is_some()
-                        && matches!(*module, "time" | "env" | "fs" | "net" | "parallel" | "text")
-                    {
+                    if import.alias.is_some() && crate::stdlib_schema::is_function_module(module) {
                         self.register_schema_module_as(module, local);
                     }
                     // Type-bearing modules need their alias too: res::Result

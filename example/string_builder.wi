@@ -1,0 +1,26 @@
+// std::strings::StringBuilder: append is amortized O(1); to_string()
+// concatenates the pending pieces once.
+import std::strings::StringBuilder;
+
+fn main() {
+    let out = new StringBuilder();
+    for row in 1..4 {
+        out.append("row ");
+        out.append_i64(row);
+        out.append(": ");
+        for column in 0..row {
+            if column > 0 { out.append(", "); }
+            out.append_i64(row * 10 + column);
+        }
+        out.append(" ok=");
+        out.append_bool(row % 2 == 1);
+        out.append_line("");
+    }
+    out.append_f64(0.25);
+    out.append(" ");
+    out.append_scalar(0x2713);
+    out.append_line(" done");
+    print(out.to_string());
+    // len() counts UTF-8 bytes, like String::len().
+    println(out.len());
+}

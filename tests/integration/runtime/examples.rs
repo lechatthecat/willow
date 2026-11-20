@@ -19,6 +19,30 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/json.wi",
             "Willow\n{\"name\":\"Willow\",\"count\":18446744073709551615,\"tags\":[true,null]}\n3\n",
         ),
+        (
+            "example/hash_set.wi",
+            "6\n2\ntrue\ntrue\nfalse\n{1, 2, 3, 4, 6, 8}\n{2, 4}\n{1, 3}\ntrue\n",
+        ),
+        (
+            "example/sorted_map.wi",
+            "alice=95\nbob=85\ncarol=72\n30\n40\n[20, 30, 40]\nremoved event@10\n20\n4\n",
+        ),
+        (
+            "example/string_builder.wi",
+            "row 1: 10 ok=true\nrow 2: 20, 21 ok=false\nrow 3: 30, 31, 32 ok=true\n0.25 \u{2713} done\n81\n",
+        ),
+        (
+            "example/byte_buffer.wi",
+            "15\n2026\nh\u{e9}llo!\ninvalid UTF-8 at 2\n[254, 255, 255, 255, 255, 255, 255, 255]\n-2\n",
+        ),
+        (
+            "example/path_ops.wi",
+            "release.tar.gz\ngz\nrelease.tar\nassets/images\n(none)\n(none)\nfalse\nnotes.txt\n",
+        ),
+        (
+            "example/env_var.wi",
+            "unset, using default\ntrue\ntrue\ntrue\n",
+        ),
         ("example/owned_class_task_loans.wi", "11\n13\n23\n14\n"),
         ("example/owned_task_loans.wi", "11\n13\n23\n1\n"),
         ("example/ownership_transfer.wi", "42\n7\n"),

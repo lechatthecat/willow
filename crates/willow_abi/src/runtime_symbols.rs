@@ -184,6 +184,15 @@ runtime_abi_schema! {
     IO_ALLOC; willow_runtime_arg => ([I64] -> Some(Ptr));
     IO_ALLOC; willow_runtime_program_name => ([] -> Some(Ptr));
     IO_ALLOC; willow_runtime_args_array => ([] -> Some(Ptr));
+    // Reads process state outside the program, like the argument accessors.
+    IO_ALLOC; willow_env_var => ([Ptr] -> Some(Ptr));
+    // --- path (lexical; no file-system access) ---
+    ALLOC; willow_path_join => ([Ptr, Ptr] -> Some(Ptr));
+    ALLOC; willow_path_parent => ([Ptr] -> Some(Ptr));
+    ALLOC; willow_path_file_name => ([Ptr] -> Some(Ptr));
+    ALLOC; willow_path_extension => ([Ptr] -> Some(Ptr));
+    ALLOC; willow_path_file_stem => ([Ptr] -> Some(Ptr));
+    NONE; willow_path_is_absolute => ([Ptr] -> Some(I64));
     // --- GC allocation ---
     ALLOC; willow_alloc => ([I64] -> Some(Ptr));
     ALLOC; willow_alloc_typed => ([I64, I64] -> Some(Ptr));
@@ -614,6 +623,7 @@ mod io_classification_tests {
                         | "willow_runtime_args_array"
                         | "willow_runtime_program_name"
                         | "willow_runtime_arg"
+                        | "willow_env_var"
                         | "willow_time_now_ns"
                 );
             assert_eq!(
@@ -624,7 +634,7 @@ mod io_classification_tests {
             );
             classified += usize::from(external);
         }
-        assert_eq!(classified, 33);
+        assert_eq!(classified, 34);
         assert!(!RuntimeEffects::MAY_CHECKED_PANIC.intersects(RuntimeEffects::ALL));
         assert_eq!(RuntimeEffects::from_bit(6), RuntimeEffects::MAY_IO);
     }

@@ -950,6 +950,49 @@ mod tests {
         }
     }
 
+    /// `Array.push` lowers to a one-element resize. Every reallocation copies
+    /// the current elements, so the copies summed over n pushes measure the
+    /// amortized cost: doubling keeps them below 2n for every n, scalar or
+    /// reference elements, so each push is amortized O(1).
+    #[test]
+    fn push_growth_copies_stay_linear_in_pushes() {
+        let _guard = isolated_runtime();
+        willow_gc_init();
+        for elem_is_ref in [0, 1] {
+            for count in [1_i64, 5, 64, 1000, 4096, 100_000] {
+                let mut array = willow_array_new(0, elem_is_ref);
+                willow_push_root(&mut array);
+                let mut copied = 0;
+                let mut reallocations = 0;
+                for i in 0..count {
+                    let (len, cap) =
+                        unsafe { (handle_word(array, H_LEN), handle_word(array, H_CAP)) };
+                    assert_eq!(len, i);
+                    if len == cap {
+                        copied += len;
+                        reallocations += 1;
+                    }
+                    let value = if elem_is_ref == 0 { i } else { 0 };
+                    willow_array_resize(array, i + 1, -1);
+                    if elem_is_ref == 0 {
+                        willow_array_set(array, i, value);
+                    }
+                }
+                assert_eq!(willow_array_len(array), count);
+                assert!(copied < 2 * count, "count={count} copied={copied}");
+                // Geometric growth: one reallocation per doubling.
+                assert!(
+                    reallocations <= 2 + (count as f64).log2().ceil() as i64,
+                    "count={count} reallocations={reallocations}"
+                );
+                eprintln!(
+                    "array push elem_is_ref={elem_is_ref} count={count} copied={copied} reallocations={reallocations}"
+                );
+                willow_pop_roots(1);
+            }
+        }
+    }
+
     #[test]
     fn array_shared_layout_matches_allocated_payload() {
         let _guard = isolated_runtime();

@@ -1,0 +1,39 @@
+// std::sorted_map::SortedMap: a key-ordered map (balanced tree). Lookups and
+// updates take O(log n) key comparisons (insertion is amortized over array
+// growth); keys() and entries() come back in ascending order.
+import std::sorted_map::SortedMap;
+
+fn show(key: Option<i64>) -> String {
+    match key {
+        Some(value) => { return value.to_string(); }
+        None => { return "none"; }
+    }
+}
+
+fn main() {
+    let scores: SortedMap<String, i64> = new SortedMap();
+    scores.insert("carol", 72);
+    scores.insert("alice", 90);
+    scores.insert("bob", 85);
+    scores.insert("alice", 95);
+    for entry in scores.entries() {
+        let (name, score) = entry;
+        println(name + "=" + score.to_string());
+    }
+
+    let events: SortedMap<i64, String> = new SortedMap();
+    for time in [30, 10, 50, 20, 40] {
+        events.insert(time, "event@" + time.to_string());
+    }
+    // Neighbours of a key that is not present.
+    println(show(events.floor_key(35)));
+    println(show(events.ceiling_key(35)));
+    // Keys in the half-open range [15, 45).
+    println(events.range_keys(15, 45).to_string());
+    match events.remove(10) {
+        Some(name) => { println("removed " + name); }
+        None => { println("missing"); }
+    }
+    println(show(events.first_key()));
+    println(events.len());
+}

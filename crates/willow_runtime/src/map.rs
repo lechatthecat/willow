@@ -1139,6 +1139,76 @@ pub extern "C" fn willow_map_to_string(map: *mut u8) -> *mut u8 {
 mod tests {
     use super::*;
 
+    /// Expected O(1) per operation: key equality checks per lookup, measured
+    /// on the exact table types and hashers the maps use (`WordHasher` for
+    /// scalar keys, the default hashbrown builder for string keys). Hits must
+    /// average close to one comparison and misses close to zero at every size
+    /// and key shape, including strided and negative words that defeat weak
+    /// mixers; the averages must not grow with n.
+    #[test]
+    fn hash_lookups_compare_a_constant_number_of_keys() {
+        use std::cell::Cell;
+        thread_local! { static COMPARISONS: Cell<usize> = const { Cell::new(0) }; }
+        #[derive(Clone)]
+        struct Counted<K>(K);
+        impl<K: PartialEq> PartialEq for Counted<K> {
+            fn eq(&self, other: &Self) -> bool {
+                COMPARISONS.with(|count| count.set(count.get() + 1));
+                self.0 == other.0
+            }
+        }
+        impl<K: Eq> Eq for Counted<K> {}
+        impl<K: Hash> Hash for Counted<K> {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.0.hash(state);
+            }
+        }
+        fn measure<K: Hash + Eq + Clone, S: std::hash::BuildHasher + Default>(
+            keys: &[K],
+            absent: &[K],
+        ) -> (f64, f64) {
+            let mut table: hashbrown::HashMap<Counted<K>, usize, S> = hashbrown::HashMap::default();
+            for (index, key) in keys.iter().enumerate() {
+                table.insert(Counted(key.clone()), index);
+            }
+            COMPARISONS.with(|count| count.set(0));
+            for (index, key) in keys.iter().enumerate() {
+                assert_eq!(table.get(&Counted(key.clone())), Some(&index));
+            }
+            let hits = COMPARISONS.with(Cell::get) as f64 / keys.len() as f64;
+            COMPARISONS.with(|count| count.set(0));
+            for key in absent {
+                assert_eq!(table.get(&Counted(key.clone())), None);
+            }
+            let misses = COMPARISONS.with(Cell::get) as f64 / absent.len() as f64;
+            (hits, misses)
+        }
+        for count in [1_i64 << 10, 1 << 13, 1 << 16, 1 << 18] {
+            for stride in [1_i64, 1 << 32, -1, 1024, 2654435761] {
+                let keys: Vec<i64> = (0..count).map(|i| i.wrapping_mul(stride)).collect();
+                let absent: Vec<i64> = (count..2 * count).map(|i| i.wrapping_mul(stride)).collect();
+                let (hits, misses) = measure::<_, BuildHasherDefault<WordHasher>>(&keys, &absent);
+                eprintln!(
+                    "word count={count} stride={stride} hit_cmp={hits:.4} miss_cmp={misses:.4}"
+                );
+                assert!(
+                    hits < 1.25,
+                    "word count={count} stride={stride} hits={hits}"
+                );
+                assert!(
+                    misses < 0.25,
+                    "word count={count} stride={stride} misses={misses}"
+                );
+            }
+            let keys: Vec<String> = (0..count).map(|i| format!("key-{i}")).collect();
+            let absent: Vec<String> = (0..count).map(|i| format!("other-{i}")).collect();
+            let (hits, misses) = measure::<_, hashbrown::DefaultHashBuilder>(&keys, &absent);
+            eprintln!("string count={count} hit_cmp={hits:.4} miss_cmp={misses:.4}");
+            assert!(hits < 1.25, "string count={count} hits={hits}");
+            assert!(misses < 0.25, "string count={count} misses={misses}");
+        }
+    }
+
     #[test]
     fn confined_string_maps_scale_without_lookup_allocation_and_skip_gc_borrows() {
         use crate::scheduler::scaling_measurements::counting_allocator as counter;

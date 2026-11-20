@@ -413,3 +413,6 @@ mod static_verification;
 
 #[path = "integration/json.rs"]
 mod json;
+
+#[path = "integration/std_additions.rs"]
+mod std_additions;

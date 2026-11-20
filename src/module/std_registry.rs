@@ -35,9 +35,68 @@ pub fn is_std_path(path: &str) -> bool {
     import_segments(path).first() == Some(&STD_ROOT)
 }
 
+/// A standard module written in Willow and bundled into the compiler. These
+/// use ordinary module binding and checking; only the source text is built in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceStdModule {
+    /// Canonical import path, e.g. `std::json`.
+    pub path: &'static str,
+    /// Display path of the bundled file, e.g. `<std>/json.wi`.
+    pub file: &'static str,
+    pub source: &'static str,
+}
+
+/// Every bundled source module. One row per module: the resolver, the
+/// dependency index and source queries all read this table.
+pub const SOURCE_STD_MODULES: &[SourceStdModule] = &[
+    SourceStdModule {
+        path: "std::json",
+        file: "<std>/json.wi",
+        source: include_str!("../../std/json.wi"),
+    },
+    SourceStdModule {
+        path: "std::set",
+        file: "<std>/set.wi",
+        source: include_str!("../../std/set.wi"),
+    },
+    SourceStdModule {
+        path: "std::sorted_map",
+        file: "<std>/sorted_map.wi",
+        source: include_str!("../../std/sorted_map.wi"),
+    },
+    SourceStdModule {
+        path: "std::strings",
+        file: "<std>/strings.wi",
+        source: include_str!("../../std/strings.wi"),
+    },
+    SourceStdModule {
+        path: "std::bytes",
+        file: "<std>/bytes.wi",
+        source: include_str!("../../std/bytes.wi"),
+    },
+];
+
+/// The bundled source module an import path names (the module itself or one of
+/// its items), with the item segment when present.
+pub fn source_std_module(path: &str) -> Option<(&'static SourceStdModule, Option<&str>)> {
+    let find = |module: &str| SOURCE_STD_MODULES.iter().find(|m| m.path == module);
+    if let Some(module) = find(path) {
+        return Some((module, None));
+    }
+    let (parent, item) = path.rsplit_once("::")?;
+    find(parent).map(|module| (module, Some(item)))
+}
+
+/// The bundled source module whose display file is `file`.
+pub fn source_std_file(file: &str) -> Option<&'static SourceStdModule> {
+    SOURCE_STD_MODULES
+        .iter()
+        .find(|candidate| candidate.file == file)
+}
+
 /// Source-backed standard modules use ordinary module binding and checking.
 pub fn is_source_std_path(path: &str) -> bool {
-    path == "std::json" || path.starts_with("std::json::")
+    source_std_module(path).is_some()
 }
 
 pub fn is_builtin_std_path(path: &str) -> bool {
@@ -53,12 +112,17 @@ fn find_module(name: &str) -> Option<&'static StdModuleSchema> {
     STDLIB_SCHEMA.iter().find(|m| m.name == name)
 }
 
+/// Builtin and bundled-source module names, in registry order.
+fn module_names() -> impl Iterator<Item = &'static str> {
+    STDLIB_SCHEMA.iter().map(|m| m.name).chain(
+        SOURCE_STD_MODULES
+            .iter()
+            .filter_map(|m| m.path.strip_prefix("std::")),
+    )
+}
+
 fn available_modules() -> String {
-    STDLIB_SCHEMA
-        .iter()
-        .map(|m| m.name)
-        .collect::<Vec<_>>()
-        .join(", ")
+    module_names().collect::<Vec<_>>().join(", ")
 }
 
 /// Case-sensitive Levenshtein distance, used only for "did you mean" hints.
@@ -163,7 +227,7 @@ fn unknown_module(module: &str, span: Span) -> Diagnostic {
     )
     .with_label(Label::primary(span, "no such module in `std`"))
     .with_help(format!("available std modules: {}", available_modules()));
-    if let Some(suggestion) = nearest(module, STDLIB_SCHEMA.iter().map(|m| m.name)) {
+    if let Some(suggestion) = nearest(module, module_names()) {
         diag = diag.with_note(format!("did you mean `std::{}`?", suggestion));
     }
     diag
@@ -237,6 +301,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn source_modules_resolve_by_path_item_and_file() {
+        for module in SOURCE_STD_MODULES {
+            assert_eq!(source_std_module(module.path), Some((module, None)));
+            let item = format!("{}::Item", module.path);
+            assert_eq!(source_std_module(&item), Some((module, Some("Item"))));
+            assert_eq!(source_std_file(module.file), Some(module));
+            assert!(is_source_std_path(module.path));
+            assert!(!is_builtin_std_path(module.path));
+            let name = module.path.strip_prefix("std::").expect("std path");
+            assert!(
+                find_module(name).is_none(),
+                "{name} is both builtin and source"
+            );
+            assert!(module_names().any(|known| known == name));
+        }
+        // Only one item segment below a source module is an import path.
+        assert_eq!(source_std_module("std::set::HashSet::new"), None);
+        assert_eq!(source_std_module("std::sets"), None);
+        assert_eq!(source_std_file("<std>/missing.wi"), None);
+        assert!(is_builtin_std_path("std::path"));
+        let err = resolve_std_import("std::sett", span()).unwrap_err();
+        assert!(
+            err.notes.iter().any(|n| n.contains("set")),
+            "{:?}",
+            err.notes
+        );
     }
 
     #[test]

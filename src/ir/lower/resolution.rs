@@ -20,7 +20,8 @@ pub(super) fn lower_resolution_partial(
 }
 
 fn lower_namespaces(program: &Program, out: &mut HirResolution) {
-    for namespace in ["time", "env", "fs", "net", "parallel", "text", "f64", "i64"] {
+    let modules = crate::stdlib_schema::FUNCTION_MODULES.iter().copied();
+    for namespace in modules.chain(["f64", "i64"]) {
         out.namespaces
             .insert(TypeId::local(namespace), namespace.to_owned());
     }
@@ -29,10 +30,7 @@ fn lower_namespaces(program: &Program, out: &mut HirResolution) {
         if std_registry::is_builtin_std_path(&import.path) {
             if let Ok(std_registry::StdImport::Module { module }) =
                 std_registry::resolve_std_import(&import.path, import.span)
-                && matches!(
-                    module.as_str(),
-                    "time" | "env" | "fs" | "net" | "parallel" | "text"
-                )
+                && crate::stdlib_schema::is_function_module(&module)
             {
                 out.namespaces.insert(
                     TypeId::local(import.alias.as_deref().unwrap_or(&module)),
