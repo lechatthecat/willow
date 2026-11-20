@@ -152,9 +152,9 @@ fn verified_data_proof_perspectives() {
             Proven,
         ),
         (
-            "for missing annotations",
+            "for inferred annotations",
             "@pure @verified fn f()->i64 {for i in 0..1 {}return 0;}",
-            Unknown,
+            Proven,
         ),
     ];
     for (name, source, expected) in cases {

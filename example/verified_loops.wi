@@ -21,9 +21,9 @@ fn count_to(limit: i64) -> i64
     ensures result == limit
 {
     let mut count = 0;
-    while count < limit
-        invariant count >= 0 && count <= limit
-        variant limit - count
+    // Bounds and termination are inferred; only the counting relation is ours.
+    for i in 0..limit
+        invariant count == i
     {
         count = count + 1;
     }

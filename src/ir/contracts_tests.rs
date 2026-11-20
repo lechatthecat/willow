@@ -90,3 +90,51 @@ fn contracts_deep_arithmetic_has_one_runtime_operation_per_node() {
         println!("arithmetic_depth={depth} checked_ops={operations}");
     }
 }
+
+#[test]
+fn inferred_loop_annotations_add_no_runtime_instructions() {
+    for (parameters, iterable, annotations) in [
+        ("", "0..3", "invariant i>=0 && i<=3 variant 3-i"),
+        (
+            "a:FrozenArray<i64>",
+            "a",
+            "invariant iteration>=0 && iteration<=a.len() variant a.len()-iteration",
+        ),
+    ] {
+        let mut counts = Vec::new();
+        for (attributes, clauses) in [
+            ("@pure", ""),
+            ("@pure @verified", ""),
+            ("@pure @verified", annotations),
+        ] {
+            let source = format!(
+                "{attributes} fn f({parameters})->i64 {{for i in {iterable} {clauses} {{}}return 0;}} fn main() {{}}"
+            );
+            let lir = lowered(&source);
+            let f = lir
+                .functions
+                .iter()
+                .find(|f| f.name.is_free_named("f"))
+                .unwrap();
+            let instructions: usize = f.blocks.iter().map(|b| b.instrs.len()).sum();
+            let calls = f
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instrs)
+                .filter(|i| {
+                    matches!(i,
+                LirInst::Compute { value: LirRvalue::BuiltinCall { callee, .. }, .. }
+                if callee.is_free_named("$contract_check") || callee.is_free_named("$contract_i64"))
+                })
+                .count();
+            assert_eq!(calls, 0);
+            counts.push((f.blocks.len(), instructions, f.locals.len()));
+        }
+        assert_eq!(counts[0], counts[1]);
+        assert_eq!(counts[1], counts[2]);
+        eprintln!(
+            "inferred runtime iterable={iterable} blocks/instructions/locals={:?}",
+            counts[0]
+        );
+    }
+}

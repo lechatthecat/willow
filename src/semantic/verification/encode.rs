@@ -39,6 +39,7 @@ pub(super) struct Summary {
     pub nodes: usize,
     pub dependencies: BTreeSet<usize>,
     pub loop_symbols: std::collections::BTreeMap<String, String>,
+    pub inferred_loop_annotations: Vec<InferredLoopAnnotations>,
 }
 // Every assignment and return carries its reachability guard. Branches can
 // update one symbolic environment sequentially without copying or re-merging
@@ -60,6 +61,7 @@ struct LoopShape<'a> {
     span: Span,
     step: Option<&'a str>,
     element: Option<(&'a str, &'a Value)>,
+    bounds: Option<(&'a Value, &'a Value)>,
 }
 struct Encoder<'a> {
     data: &'a DataTypes,
@@ -79,6 +81,7 @@ struct Encoder<'a> {
     next_quantifier: usize,
     scoped_nodes: usize,
     fragments: Vec<String>,
+    inferred_loop_annotations: Vec<InferredLoopAnnotations>,
 }
 impl Encoder<'_> {
     fn typed_node(&mut self, expr: String, ty: &Type) -> Result<Value, String> {
@@ -600,6 +603,7 @@ impl Encoder<'_> {
                         span: s.span,
                         step: None,
                         element: None,
+                        bounds: None,
                     },
                     state,
                     depth + 1,
@@ -683,8 +687,20 @@ impl Encoder<'_> {
         state: &State,
         gate: &Value,
         index: Option<&str>,
+        automatic: Option<(&str, &Value, &Value)>,
     ) -> Result<Value, String> {
         let mut result = gate.clone();
+        if let Some((counter, start, upper)) = automatic {
+            let counter = &state.env[counter].text;
+            let value = self.node(
+                format!(
+                    "(and (<= {} {counter}) (<= {counter} {}))",
+                    start.text, upper.text
+                ),
+                true,
+            )?;
+            result = self.and(&result, &value)?;
+        }
         for expr in invariants {
             let value = self.loop_annotation(expr, state, &result, index)?;
             if !value.boolean {
@@ -709,16 +725,20 @@ impl Encoder<'_> {
             span,
             step,
             element,
+            bounds: automatic_bounds,
         } = shape;
         if !self.verified {
             return Err("a helper containing loops must itself be @verified".into());
         }
         let variant = variant
-            .filter(|_| !invariants.is_empty())
+            .filter(|_| automatic_bounds.is_some() || !invariants.is_empty())
             .ok_or("while verification requires both invariant and variant")?;
         let incoming = state.alive.clone();
         let annotation_index = element.and(step);
-        let entry = self.loop_invariant(invariants, state, &incoming, annotation_index)?;
+        let automatic =
+            automatic_bounds.map(|(start, upper)| (step.expect("for counter"), start, upper));
+        let entry =
+            self.loop_invariant(invariants, state, &incoming, annotation_index, automatic)?;
         self.guard(&incoming, entry.text)?;
 
         // One arbitrary loop head represents every iteration. Only writes to
@@ -762,22 +782,13 @@ impl Encoder<'_> {
             )?;
             head.env.insert(name, merged);
         }
-        if let Some((_, array)) = element {
-            let index = &head.env[step.expect("array iteration index")];
-            let valid = self.node(
-                format!(
-                    "(and (<= 0 {}) (<= {} (len_{} {})))",
-                    index.text,
-                    index.text,
-                    type_key(&array.ty),
-                    array.text
-                ),
-                true,
-            )?;
-            head.alive = self.and(&head.alive, &valid)?;
-        }
-        head.alive =
-            self.loop_invariant(invariants, &head, &head.alive.clone(), annotation_index)?;
+        head.alive = self.loop_invariant(
+            invariants,
+            &head,
+            &head.alive.clone(),
+            annotation_index,
+            automatic,
+        )?;
         let condition = self.expr(cond, &head, &head.alive.clone())?;
         if !condition.boolean {
             return Err("non-boolean loop condition".into());
@@ -818,8 +829,13 @@ impl Encoder<'_> {
             )?;
             body.env.insert(name.to_owned(), next);
         }
-        let preserved =
-            self.loop_invariant(invariants, &body, &body.alive.clone(), annotation_index)?;
+        let preserved = self.loop_invariant(
+            invariants,
+            &body,
+            &body.alive.clone(),
+            annotation_index,
+            automatic,
+        )?;
         self.guard(&body.alive, preserved.text)?;
         let next = self.loop_annotation(variant, &body, &body.alive.clone(), annotation_index)?;
         if next.ty != Type::I64 {
@@ -881,7 +897,16 @@ impl Encoder<'_> {
         if start.ty != Type::I64 || end.ty != Type::I64 {
             return Err("non-integer for range".into());
         }
-        let saved = state.env.insert(counter.clone(), start);
+        // Bounds are snapshots, not expressions re-evaluated at an arbitrary
+        // head. max(start, end) also admits the initial head of reversed ranges.
+        let upper = self.node(
+            format!(
+                "(ite (< {} {}) {} {})",
+                start.text, end.text, end.text, start.text
+            ),
+            false,
+        )?;
+        let saved = state.env.insert(counter.clone(), start.clone());
         let saved_element = state.env.get(&s.name).cloned();
         let limit = format!("$for_end_{}", s.body.id);
         state.env.insert(limit.clone(), end);
@@ -892,15 +917,40 @@ impl Encoder<'_> {
             rhs: Expr::Var(limit.clone(), s.span, ExprId::fresh()),
             span: s.span,
         }));
+        let default_variant = Expr::Binary(Box::new(BinaryExpr {
+            id: ExprId::fresh(),
+            lhs: Expr::Var(limit.clone(), s.span, ExprId::fresh()),
+            op: BinOp::Sub,
+            rhs: Expr::Var(counter.clone(), s.span, ExprId::fresh()),
+            span: s.span,
+        }));
+        self.inferred_loop_annotations.push(InferredLoopAnnotations {
+            location: s.span,
+            kind: if element.is_some() { "frozen_array" } else { "range" },
+            counter: if element.is_some() { "iteration".into() } else { counter.clone() },
+            captured_start: if let Expr::Range(range) = &s.iterable {
+                contract_text(&range.start)
+            } else {
+                "0".into()
+            },
+            captured_end: if let Expr::Range(range) = &s.iterable {
+                contract_text(&range.end)
+            } else {
+                format!("({}).len()", contract_text(&s.iterable))
+            },
+            invariant: "captured_start <= counter && counter <= max(captured_start, captured_end)",
+            variant: s.variant.is_none().then_some("captured_end - counter"),
+        });
         self.loop_body(
             LoopShape {
                 cond: &cond,
                 invariants: &s.invariants,
-                variant: s.variant.as_ref(),
+                variant: Some(s.variant.as_ref().unwrap_or(&default_variant)),
                 body: &s.body,
                 span: s.span,
                 step: Some(&counter),
                 element,
+                bounds: Some((&start, &upper)),
             },
             state,
             depth,
@@ -1097,6 +1147,7 @@ pub(super) fn encode(
         next_quantifier: 0,
         scoped_nodes: 0,
         fragments: Vec::new(),
+        inferred_loop_annotations: Vec::new(),
     };
     let pre = e.clauses(&f.requires, &state)?;
     let pre_safe = e.safety();
@@ -1181,6 +1232,7 @@ pub(super) fn encode(
         next_quantifier: 0,
         scoped_nodes: 0,
         fragments: Vec::new(),
+        inferred_loop_annotations: Vec::new(),
     };
     let mut cs = initial;
     cs.env.insert(
@@ -1225,6 +1277,7 @@ pub(super) fn encode(
         nodes: e.nodes.len() + c.nodes.len() + e.scoped_nodes + c.scoped_nodes,
         dependencies: e.dependencies,
         loop_symbols: e.loop_symbols,
+        inferred_loop_annotations: e.inferred_loop_annotations,
     })
 }
 // Summarize lexical writes once, bottom-up. Nested loops reuse their summary;
@@ -1354,6 +1407,7 @@ pub(super) fn contract_predicates(
         next_quantifier: 0,
         scoped_nodes: 0,
         fragments: Vec::new(),
+        inferred_loop_annotations: Vec::new(),
     };
     let pre = e.clauses(&f.requires, &state)?;
     let safety = e.safety();

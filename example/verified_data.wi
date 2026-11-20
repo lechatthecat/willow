@@ -34,8 +34,6 @@ fn count(values: FrozenArray<i64>) -> i64
     let mut total = 0;
     for value in values
         invariant total == iteration
-        invariant total >= 0 && total <= values.len()
-        variant values.len() - total
     {
         total = total + 1;
         continue;
@@ -51,9 +49,7 @@ fn stop_at_three(n: i64) -> i64
 {
     let mut total = 0;
     for i in 0..n
-        invariant i >= 0 && i <= n
         invariant total == i && total <= 3
-        variant n - i
     {
         if total == 3 { break; }
         total = total + 1;

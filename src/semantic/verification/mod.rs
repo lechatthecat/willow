@@ -36,6 +36,19 @@ pub struct Obligation {
     pub counterexample_candidate: Option<String>,
 }
 #[derive(Debug, Serialize)]
+pub struct InferredLoopAnnotations {
+    pub location: Span,
+    pub kind: &'static str,
+    pub counter: String,
+    pub captured_start: String,
+    pub captured_end: String,
+    /// `captured_start/end` are the once-evaluated range bounds, or 0 and
+    /// the once-evaluated FrozenArray length. `counter` names the field above.
+    pub invariant: &'static str,
+    /// None means the user's variant is used instead. Arithmetic is checked i64.
+    pub variant: Option<&'static str>,
+}
+#[derive(Debug, Serialize)]
 pub struct Report {
     #[serde(skip)]
     diagnostic_code: ErrorCode,
@@ -64,6 +77,7 @@ pub struct Report {
     pub unknown_reasons: Vec<String>,
     pub obligations: Vec<Obligation>,
     pub vc_nodes: usize,
+    pub inferred_loop_annotations: Vec<InferredLoopAnnotations>,
 }
 pub struct Options {
     pub solver: PathBuf,
@@ -126,7 +140,7 @@ fn report(f: &FunctionDecl, options: &Options) -> Report {
         status: Status::Unknown,
         model: "checked-i64",
         verified_scope: "checked scalars, immutable data, bounded quantifiers and annotated loops",
-        analyzer_version: "3",
+        analyzer_version: "4",
         solver_version: solver::VERSION,
         solver_timeout_ms: options.timeout_ms,
         approval_status: "UNVERIFIED",
@@ -137,6 +151,7 @@ fn report(f: &FunctionDecl, options: &Options) -> Report {
         unknown_reasons: Vec::new(),
         obligations: Vec::new(),
         vc_nodes: 0,
+        inferred_loop_annotations: Vec::new(),
     }
 }
 
@@ -387,6 +402,7 @@ fn verify_with_data(
                 return Ok(());
             }
             let cache_key = cache::identity(&summary, &r.dependency_digests, f, options);
+            r.inferred_loop_annotations = summary.inferred_loop_annotations;
             let cached = cache.get(&cache_key);
             let mut args = Vec::new();
             let mut domain = vec!["true".to_string()];
@@ -674,3 +690,6 @@ mod loop_tests;
 
 #[cfg(test)]
 mod data_tests;
+
+#[cfg(test)]
+mod inferred_loop_tests;

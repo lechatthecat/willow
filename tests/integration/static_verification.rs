@@ -239,3 +239,96 @@ fn verified_immutable_data_fail_closed_build_gate() {
         assert_compile_error_contains(&format!("{source} fn main(){{}}"), &[code]);
     }
 }
+
+#[test]
+fn inferred_loop_artifacts_and_build_gate() {
+    let id = unique_test_id();
+    let path = temp_path(format!("inferred_loops_{id}.wi"));
+    let artifacts = temp_path(format!("inferred_loops_{id}"));
+    fs::write(&path, include_str!("../../example/verified_data.wi")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .args(["check", &path])
+        .env("WILLOW_VERIFICATION_DIR", &artifacts)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut inferred = Vec::new();
+    for entry in fs::read_dir(&artifacts).unwrap() {
+        let json = fs::read(entry.unwrap().path().join("verification.json")).unwrap();
+        let reports: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        for report in reports.as_array().unwrap() {
+            inferred.extend(
+                report["inferred_loop_annotations"]
+                    .as_array()
+                    .unwrap()
+                    .clone(),
+            );
+        }
+    }
+    assert!(
+        inferred
+            .iter()
+            .any(|r| r["kind"] == "range" && r["captured_end"] == "n")
+    );
+    assert!(
+        inferred
+            .iter()
+            .any(|r| r["kind"] == "frozen_array" && r["captured_end"] == "(values).len()")
+    );
+    assert!(
+        inferred
+            .iter()
+            .all(|r| r["variant"] == "captured_end - counter")
+    );
+    fs::remove_dir_all(&artifacts).unwrap();
+    fs::remove_file(&path).unwrap();
+    for source in [
+        "@pure @verified fn f()->i64 {for i in 0..3 variant 1 {}return 0;}",
+        "@pure @verified fn f()->i64 {for i in (-9223372036854775807-1)..9223372036854775807 {}return 0;}",
+        "@pure @verified fn f()->i64 ensures result==1 {for i in 3..0 {}return 0;}",
+        "@pure @verified fn f(a:FrozenArray<i64>)->i64 {for v in a variant 1 {}return 0;}",
+    ] {
+        assert_compile_error_contains(&format!("{source} fn main(){{}}"), &["E2630"]);
+    }
+}
+
+#[test]
+fn inferred_loop_runtime_boundaries_and_captures_both_modes() {
+    let source = r#"
+@pure @verified fn boundaries()->i64 ensures result==0 {
+    for i in 3..0 {return 1/0;}
+    for i in 9223372036854775807..(-9223372036854775807-1) {return 1/0;}
+    for i in 9223372036854775806..9223372036854775807 {let x=i+1;continue;}
+    for i in (-9223372036854775807-1)..(-9223372036854775806) {let x=i+1;}
+    return 0;
+}
+@pure @verified fn capture()->i64 ensures result==3 {
+    let mut n=3;let mut x=0;
+    for i in 0..n invariant x==i {n=0;x=x+1;continue;}
+    return x;
+}
+@pure @verified fn array_capture(a:FrozenArray<i64>,b:FrozenArray<i64>)->i64 ensures result==a.len() {
+    let mut values=a;let mut x=0;
+    for v in values invariant x==iteration {values=b;x=x+1;}
+    return x;
+}
+@pure @verified fn nested(a:FrozenArray<i64>)->i64 ensures result>=0 && result<=a.len() {
+    let mut x=0;
+    for v in a invariant x==iteration {
+        for i in 0..2 {if i==1 {break;} continue;}
+        if x==2 {break;}
+        x=x+1;
+    }
+    return x;
+}
+fn main(){let a=[1,2,3].freeze();let b=[9].freeze();println(boundaries());println(capture());println(array_capture(a,b));println(nested(a));}
+"#;
+    for (output, ok) in [compile_and_run(source), compile_and_run_release(source)] {
+        assert!(ok, "{output}");
+        assert_eq!(output, "0\n3\n3\n2\n");
+    }
+}

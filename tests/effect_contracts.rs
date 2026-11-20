@@ -1537,6 +1537,17 @@ fn no_alloc_fault_reporting_and_proof_only_clauses() {
             "no_alloc",
             Some("E2610"),
         ),
+        // Inferred annotations must not contribute runtime effects either.
+        (
+            "@pure @verified fn f(a: FrozenArray<i64>) -> i64 { for v in a {} return 0; }",
+            "no_panic, no_alloc",
+            None,
+        ),
+        (
+            "@pure @verified fn f(n: i64) -> i64 requires n >= 0 { for i in 0..n {} return 0; }",
+            "no_alloc",
+            None,
+        ),
         // Loop invariants/variants are dropped by lowering.
         (
             "fn f(a: FrozenArray<i64>) -> i64 { let mut t = 0; for v in a invariant t >= 0 && t <= a.len() variant a.len() - t { t = t + 1; } return t; }",
