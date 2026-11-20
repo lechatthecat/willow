@@ -100,7 +100,7 @@ extern rust {
     async fn boolean(x: bool) -> bool;
     async fn touch();
     async fn text(x: String) -> String;
-    async fn bytes(x: Array<i64>) -> Array<i64>;
+    async fn bytes(x: Array<u8>) -> Array<u8>;
     async fn texts(x: Array<String>) -> Array<String>;
     async fn floats(x: Array<f64>) -> Array<f64>;
     async fn bools(x: Array<bool>) -> Array<bool>;

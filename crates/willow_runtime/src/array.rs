@@ -338,6 +338,42 @@ pub(crate) fn new_old_array(len: i64, elem_is_ref: i64) -> *mut u8 {
     handle
 }
 
+/// Borrow packed byte storage without a safepoint or an element-wise conversion.
+///
+/// # Safety
+/// `array` is a live Array<u8>. The borrow must end before any GC safepoint,
+/// array mutation, or foreign call; native allocation alone is safe.
+pub(crate) unsafe fn packed_bytes<'a>(array: *mut u8) -> &'a [u8] {
+    if array.is_null() {
+        return &[];
+    }
+    let flags = unsafe { handle_word(array, H_IS_REF) };
+    if flags != willow_abi::array_layout::storage_flags(1, false) {
+        crate::failure::fatal_invariant("expected packed Array<u8>");
+    }
+    let len = unsafe { handle_word(array, H_LEN) } as usize;
+    unsafe { std::slice::from_raw_parts(element_slot(handle_buffer(array), 0, flags), len) }
+}
+
+/// Copy native bytes into packed GC storage in one bulk transfer. The input
+/// must be native storage, not an unrooted slice into the moving GC heap.
+pub(crate) fn from_native_bytes(bytes: &[u8]) -> *mut u8 {
+    let length = i64::try_from(bytes.len()).expect("byte buffer length exceeds i64");
+    let flags = willow_abi::array_layout::storage_flags(1, false);
+    let array = new_old_array(length, flags);
+    if !bytes.is_empty() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                element_slot(handle_buffer(array), 0, flags),
+                bytes.len(),
+            );
+        }
+        crate::observation::record(crate::observation::Event::OutputCopies, 1);
+    }
+    array
+}
+
 /// Fill a fresh zeroed handle with its length, capacity and zeroed buffer.
 ///
 /// # Safety

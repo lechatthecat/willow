@@ -383,11 +383,8 @@ unsafe fn poll_read(
     match stream_ref.read(&mut bytes) {
         Ok(read) => {
             if binary {
-                let mut array = crate::array::willow_array_new(read as i64, 0);
+                let mut array = crate::array::from_native_bytes(&bytes[..read]);
                 willow_push_root(&mut array);
-                for (index, byte) in bytes[..read].iter().enumerate() {
-                    crate::array::willow_array_set(array, index as i64, i64::from(*byte));
-                }
                 let result = crate::fs::alloc_ok(array as i64, true);
                 willow_pop_roots(1);
                 return unsafe { finish(frame, result, Some(fd)) };
@@ -687,20 +684,11 @@ pub extern "C" fn willow_net_read_bytes_async(stream: *mut u8, max_bytes: i64) -
     spawn_operation(stream, operation)
 }
 
-/// Snapshot and validate bytes before handing ownership to the scheduler.
+/// Snapshot packed bytes before handing ownership to the scheduler.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_net_write_bytes_async(stream: *mut u8, contents: *mut u8) -> *mut c_void {
-    let len = crate::array::willow_array_len(contents);
-    let mut bytes = Vec::with_capacity(len as usize);
-    for index in 0..len {
-        let Ok(byte) = u8::try_from(crate::array::willow_array_get(contents, index)) else {
-            return spawn_operation(
-                stream,
-                NetOperation::ImmediateError("net::write_bytes_async: byte outside 0..255".into()),
-            );
-        };
-        bytes.push(byte);
-    }
+    // Snapshot before scheduler admission; no managed borrow crosses a safepoint.
+    let bytes = unsafe { crate::array::packed_bytes(contents) }.to_vec();
     spawn_operation(stream, NetOperation::Write { bytes, offset: 0 })
 }

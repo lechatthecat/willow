@@ -1,16 +1,16 @@
 import std::collections::Array;
 extern rust {
     fn text(value: String) -> String;
-    fn bytes(value: Array<i64>) -> Array<i64>;
+    fn bytes(value: Array<u8>) -> Array<u8>;
     fn maybe(value: Option<i64>) -> Option<i64>;
     fn maybe_text(value: Option<String>) -> Option<String>;
-    fn maybe_bytes(value: Option<Array<i64>>) -> Option<Array<i64>>;
+    fn maybe_bytes(value: Option<Array<u8>>) -> Option<Array<u8>>;
     fn checked(value: bool) -> Result<bool, String>;
-    fn checked_bytes(value: Array<i64>) -> Result<Array<i64>, String>;
+    fn checked_bytes(value: Array<u8>) -> Result<Array<u8>, String>;
     fn nested(value: Option<Option<i64>>) -> Option<Option<i64>>;
     fn nested_text(value: Option<Option<String>>) -> Option<Option<String>>;
     fn scalar_result(value: Result<f64, bool>) -> Result<f64, bool>;
-    fn result_input(value: Result<Array<i64>, String>) -> Result<Array<i64>, String>;
+    fn result_input(value: Result<Array<u8>, String>) -> Result<Array<u8>, String>;
     fn concurrent(value: String) -> String;
 }
 fn main() {
@@ -18,9 +18,9 @@ fn main() {
     println(text("日本語🙂") == "日本語🙂");
     let indirect = text;
     println(indirect("indirect") == "indirect");
-    let empty: Array<i64> = [];
+    let empty: Array<u8> = [];
     println(bytes(empty).len() == 0);
-    let input = [0, 127, 128, 255];
+    let input: Array<u8> = [0, 127, 128, 255];
     let output = bytes(input);
     println(output.len() == 4 && output[0] == 0 && output[3] == 255);
     println(maybe(Some(-42)).unwrap() == -42);

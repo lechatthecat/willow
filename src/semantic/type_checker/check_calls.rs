@@ -231,6 +231,15 @@ impl TypeChecker {
         expected: &Type,
         actual: &Type,
     ) -> Diagnostic {
+        if crate::rust_bridge_ir::Scalar::from_type(expected)
+            == Some(crate::rust_bridge_ir::Scalar::Bytes)
+            && crate::rust_bridge_ir::Scalar::from_type(actual)
+                == Some(crate::rust_bridge_ir::Scalar::Array(Box::new(
+                    crate::rust_bridge_ir::Scalar::I64,
+                )))
+        {
+            return diagnostic.with_help("byte APIs now use `Array<u8>`; annotate byte literals as `Array<u8>`, or convert each integer with `checked_to_u8()` and handle `None` before pushing into an `Array<u8>`");
+        }
         if expected == actual || !expected.same_modulo_callable_kind(actual) {
             return diagnostic;
         }

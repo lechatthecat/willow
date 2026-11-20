@@ -1,5 +1,5 @@
 //! Canonical Rust bridge ABI. Aggregates use pointer transport and explicit tags.
-pub const WILLOW_RUST_BRIDGE_ABI_REVISION: u32 = 1;
+pub const WILLOW_RUST_BRIDGE_ABI_REVISION: u32 = 2;
 
 /// Bridge metadata flag, separate from the runtime effect lattice.
 pub const FOREIGN_CALL: u8 = 1 << 7;

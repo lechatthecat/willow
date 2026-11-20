@@ -26,6 +26,7 @@ use crate::parser::ast::Type;
 /// constant; that also keeps the enum `Copy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StdType {
+    U8,
     I64,
     Bool,
     String,
@@ -62,6 +63,7 @@ impl StdType {
     pub fn to_ast_type(&self) -> Option<Type> {
         Some(match self {
             StdType::I64 => Type::I64,
+            StdType::U8 => Type::U8,
             StdType::Bool => Type::Bool,
             StdType::String => Type::String,
             StdType::Void => Type::Void,
@@ -214,7 +216,7 @@ const PATH: &[StdItemSchema] = &[
 // Addresses are numeric `IP:port` strings in v1, so no hidden DNS lookup can
 // block a scheduler worker. Socket readiness operations return Tasks and are
 // driven by the platform netpoll backend.
-const BYTES_IO: T = T::Result(&T::Array(&T::I64), &T::Named("IoError"));
+const BYTES_IO: T = T::Result(&T::Array(&T::U8), &T::Named("IoError"));
 const NET: &[StdItemSchema] = &[
     std_type!("TcpListener", 0, "TcpListener"),
     std_type!("TcpStream", 0, "TcpStream"),
@@ -225,7 +227,7 @@ const NET: &[StdItemSchema] = &[
     std_function!("connect_async", [T::String] -> T::Task(&STREAM_IO)),
     std_function!("accept_async", [TCP_LISTENER] -> T::Task(&STREAM_IO)),
     std_function!("read_bytes_async", [TCP_STREAM, T::I64] -> T::Task(&BYTES_IO)),
-    std_function!("write_bytes_async", [TCP_STREAM, T::Array(&T::I64)] -> T::Task(&VOID_IO)),
+    std_function!("write_bytes_async", [TCP_STREAM, T::Array(&T::U8)] -> T::Task(&VOID_IO)),
     std_function!("read_async", [TCP_STREAM, T::I64] -> T::Task(&STRING_IO)),
     std_function!("write_async", [TCP_STREAM, T::String] -> T::Task(&VOID_IO)),
 ];

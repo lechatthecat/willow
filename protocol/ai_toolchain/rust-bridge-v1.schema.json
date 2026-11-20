@@ -170,6 +170,7 @@
           "type": "string"
         },
         "async": { "type": "boolean" },
+        "no_io": { "type": "boolean" },
         "effects": {
           "type": "integer",
           "minimum": 0,
@@ -206,13 +207,22 @@
       "oneOf": [
         {
           "enum": [
+            "I8",
+            "I16",
+            "I32",
             "I64",
+            "U8",
+            "U16",
+            "U32",
+            "U64",
+            "Char",
             "F64",
             "Bool",
             "Void",
             "String",
             "Bytes"
-          ]
+          ],
+          "description": "Bytes is packed Array<u8>; synchronous input &[u8], async input and all outputs Vec<u8>."
         },
         {
           "type": "object",
@@ -264,6 +274,14 @@
           "properties": {
             "Array": {
               "enum": [
+                "I8",
+                "I16",
+                "I32",
+                "I64",
+                "U16",
+                "U32",
+                "U64",
+                "Char",
                 "String",
                 "F64",
                 "Bool"

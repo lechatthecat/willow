@@ -374,7 +374,7 @@ fn byte_buffer_integers_copies_and_strict_utf8() {
 import std::bytes::{ByteBuffer, Utf8Error};
 import std::collections::Array;
 
-fn decode(bytes: Array<i64>) -> String {
+fn decode(bytes: Array<u8>) -> String {
     match ByteBuffer::from_array(bytes).decode_utf8() {
         Ok(text) => { return "ok:" + text; }
         Err(error) => { return "err@" + error.position.to_string(); }
@@ -477,22 +477,6 @@ fn main() {
 #[test]
 fn invalid_bytes_keys_and_scalars_panic_with_messages() {
     let cases = [
-        (
-            "import std::bytes::ByteBuffer; fn main() { new ByteBuffer().push(256); }",
-            "byte value must be in 0..=255",
-        ),
-        (
-            "import std::bytes::ByteBuffer; fn main() { new ByteBuffer().push(-1); }",
-            "byte value must be in 0..=255",
-        ),
-        (
-            "import std::bytes::ByteBuffer; fn main() { ByteBuffer::from_array([1, 999]); }",
-            "byte value must be in 0..=255",
-        ),
-        (
-            "import std::bytes::ByteBuffer; fn main() { let b = ByteBuffer::from_string(\"a\"); b.set(0, 300); }",
-            "byte value must be in 0..=255",
-        ),
         (
             "import std::bytes::ByteBuffer; fn main() { let b = new ByteBuffer(); b.write_i64_le(1); b.read_i64_le(1); }",
             "byte buffer read out of bounds",
@@ -924,4 +908,48 @@ fn main() {
     eprintln!(
         "HashSet/StringBuilder n inserts lookups removes appends pieces_joined bytes interleaved_copied once_copied once_after_repeat: {rows:?}"
     );
+}
+
+#[test]
+fn byte_api_migration_diagnostics_and_literal_ranges() {
+    for body in [
+        "new ByteBuffer().push(256);",
+        "new ByteBuffer().push(-1);",
+        "net::write_bytes_async(s, [-1]);",
+        "net::write_bytes_async(s, [256]);",
+        "ByteBuffer::from_array([1, 999]);",
+        "ByteBuffer::from_string(\"a\").set(0, 300);",
+        "let a: Array<i64> = [0, 255]; ByteBuffer::from_array(a);",
+        "let a: Array<i64> = [0]; new ByteBuffer().extend(a);",
+        "let a: Array<i64> = [0]; accept(a);",
+        "let a: Array<i64> = [0]; write(a);",
+        "let a: Array<i64> = [0]; net::write_bytes_async(s, a);",
+    ] {
+        let source = format!(
+            "import std::bytes::ByteBuffer; import std::net; import std::collections::Array;
+             extern rust {{ fn accept(a: Array<u8>); }}
+             fn write(a: Array<u8>) {{}}
+             fn probe(s: TcpStream) {{ {body} }} fn main() {{}}"
+        );
+        let path = temp_path(format!("byte_api_diagnostic_{}.wi", unique_test_id()));
+        fs::write(&path, source).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .args(["check", &path])
+            .output()
+            .unwrap();
+        let _ = fs::remove_file(path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{body}");
+        if body.contains("Array<i64>") {
+            assert!(
+                stderr.contains("Array<u8>") && stderr.contains("checked_to_u8"),
+                "{stderr}"
+            );
+        } else {
+            assert!(
+                stderr.contains("range") || stderr.contains("0..=255"),
+                "{stderr}"
+            );
+        }
+    }
 }

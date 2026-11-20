@@ -188,20 +188,25 @@ These are the supported **synchronous** adapter mappings:
 
 | Willow declaration | Rust adapter input | Rust adapter output |
 | --- | --- | --- |
-| `i64`, `f64`, `bool` | Same scalar | Same scalar |
+| `i8`–`i64`, `u8`–`u64`, `char`, `f64`, `bool` | Same scalar | Same scalar |
 | Omitted return / `void` | Not a parameter type | `()` |
 | `String` | `&str` | `String` |
-| `Array<i64>` | `&[u8]` (checked bytes, 0–255) | `Vec<u8>` |
+| `Array<u8>` | `&[u8]` (packed bytes) | `Vec<u8>` |
+| `Array<i64>` | `Vec<i64>` (numeric values) | `Vec<i64>` |
 | `Array<f64>`, `Array<bool>` | `Vec<f64>`, `Vec<bool>` | Same vector type |
 | `Array<String>` | `Vec<&str>` | `Vec<String>` |
 | `opaque Handle;` | `&Handle` | `Box<Handle>` |
 | Record declared inside `extern rust` | Generated borrowed input record | Generated owned output record |
 | `Option<T>`, `Result<T, E>` | Rust `Option` / `Result` of mapped inputs | Rust `Option` / `Result` of mapped outputs |
 
-Option and Result can nest supported boundary types. Arrays are limited to the
-four element types above: `Array<i64>` is a byte buffer, not a general integer
-vector. Arbitrary Willow classes, maps, tuples, function/closure values, raw
-pointers and arbitrary Rust structs are not boundary types. Records require
+Option and Result can nest supported boundary types. Arrays support integer,
+character, float, boolean and String elements. Byte transport uses one bulk copy
+per direction, including async inputs (owned `Vec<u8>`). To migrate old byte
+declarations, replace `Array<i64>` with `Array<u8>`; annotate byte array literals
+and convert computed integers using `checked_to_u8()`, handling `None`.
+`ByteBuffer::from_string(text).to_array()` extracts UTF-8 bytes;
+`ByteBuffer::from_array(bytes).decode_utf8()` returns a strict UTF-8 Result.
+Arbitrary Willow classes, maps, tuples, function/closure values, raw pointers and arbitrary Rust structs are not boundary types. Records require
 public value fields, with no methods, inheritance, generic parameters or recursive
 layout; declare nested records first. See the [record mapping and ownership
 rules](example/rust_record_bridge/README.md) and [opaque handle example](example/rust_opaque_bridge).

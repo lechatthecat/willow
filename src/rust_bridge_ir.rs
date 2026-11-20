@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
-pub(crate) const WRAPPER_SCHEMA: &str = "9";
+pub(crate) const WRAPPER_SCHEMA: &str = "10";
 
 pub type RustBridgeSymbols = Vec<((u32, String), RustBridgeSymbol)>;
 
@@ -76,13 +76,13 @@ impl Scalar {
             Type::Bool => Self::Bool,
             Type::Void => Self::Void,
             Type::String => Self::String,
-            Type::Array(inner) if **inner == Type::I64 => Self::Bytes,
+            Type::Array(inner) if **inner == Type::U8 => Self::Bytes,
             Type::Array(inner) => Self::array(inner)?,
             // `Array` is a source-defined class, so the parser keeps
-            // `Array<i64>` as a plain generic application.
+            // `Array<u8>` as a plain generic application.
             Type::Generic(name, args)
                 if Builtin::from_name(name) == Some(Builtin::Array)
-                    && args.as_slice() == [Type::I64] =>
+                    && args.as_slice() == [Type::U8] =>
             {
                 Self::Bytes
             }
@@ -111,6 +111,7 @@ impl Scalar {
     }
     fn array(inner: &Type) -> Option<Self> {
         let element = match inner {
+            Type::I64 => Self::I64,
             Type::I8 => Self::I8,
             Type::I16 => Self::I16,
             Type::I32 => Self::I32,

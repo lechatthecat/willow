@@ -24,8 +24,11 @@ Boundary signatures encode scalar types as strings, `Array` with its element typ
 and `Record` with its declared name. Each bridge's optional `records` array defines
 reachable record names and ordered `[field_name, value_type]` pairs. Nested records
 refer to this table by name, keeping repeated type references compact. Existing
-responses without `records` remain valid. `Bytes` retains the legacy checked
-`Array<i64>` representation. See
+responses without `records` remain valid. `Bytes` denotes packed `Array<u8>`,
+with `&[u8]` synchronous inputs,
+owned `Vec<u8>` async inputs and `Vec<u8>` outputs. `Array<i64>` is encoded as
+`{"Array":"I64"}` and maps to numeric `Vec<i64>`. Migrate byte declarations to
+`Array<u8>` and convert integer values with `checked_to_u8()`. See
 [`rust_record_bridge`](../../example/rust_record_bridge/README.md) for the adapter
 mapping, ownership rules, supported subset, and an executable example.
 

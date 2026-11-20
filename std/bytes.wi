@@ -7,19 +7,19 @@ pub class Utf8Error {
     pub position: i64;
 }
 
-// Growable byte sequence. Each element is an i64 in 0..=255, the same byte
+// Growable packed byte sequence. Each element is a u8, the same byte
 // representation the net byte APIs use, so to_array()/from_array() pass data
 // to them without conversion. push, get and set are O(1) (push amortized).
 // Fixed-width integers are 8 bytes, two's complement.
 pub class ByteBuffer {
-    data: Array<i64>;
+    data: Array<u8>;
 
     pub init(self) {
         self.data = Array::new();
     }
 
-    // Copies values; panics when any element is outside 0..=255.
-    pub static fn from_array(values: Array<i64>) -> ByteBuffer {
+    // Copies packed bytes.
+    pub static fn from_array(values: Array<u8>) -> ByteBuffer {
         let buffer = new ByteBuffer();
         buffer.extend(values);
         return buffer;
@@ -36,46 +36,45 @@ pub class ByteBuffer {
     pub fn is_empty() -> bool { return self.data.len() == 0; }
 
     // Panics when index is out of bounds.
-    pub fn get(index: i64) -> i64 { return self.data[index]; }
+    pub fn get(index: i64) -> u8 { return self.data[index]; }
 
-    pub fn set(index: i64, value: i64) {
-        check_byte(value);
+    pub fn set(index: i64, value: u8) {
         self.data[index] = value;
     }
 
-    pub fn push(value: i64) {
-        check_byte(value);
+    pub fn push(value: u8) {
         self.data.push(value);
     }
 
-    pub fn extend(values: Array<i64>) {
+    pub fn extend(values: Array<u8>) {
         for index in 0..values.len() { self.push(values[index]); }
     }
 
     pub fn write_string(text: String) {
-        for index in 0..text.len() { self.data.push(text.byte_at(index)); }
+        // byte_at already guarantees 0..=255; no second range check is needed.
+        for index in 0..text.len() { self.data.push(text.byte_at(index).wrapping_to_u8()); }
     }
 
     pub fn write_i64_le(value: i64) {
-        for index in 0..8 { self.data.push((value >> (index * 8)) & 0xFF); }
+        for index in 0..8 { self.data.push(((value >> (index * 8)) & 0xFF).wrapping_to_u8()); }
     }
 
     pub fn write_i64_be(value: i64) {
-        for index in 0..8 { self.data.push((value >> ((7 - index) * 8)) & 0xFF); }
+        for index in 0..8 { self.data.push(((value >> ((7 - index) * 8)) & 0xFF).wrapping_to_u8()); }
     }
 
     // Reads 8 bytes starting at offset; panics when they are not all present.
     pub fn read_i64_le(offset: i64) -> i64 {
         self.check_read(offset);
         let mut value = 0;
-        for index in 0..8 { value = value | (self.data[offset + index] << (index * 8)); }
+        for index in 0..8 { value = value | (self.data[offset + index].to_i64() << (index * 8)); }
         return value;
     }
 
     pub fn read_i64_be(offset: i64) -> i64 {
         self.check_read(offset);
         let mut value = 0;
-        for index in 0..8 { value = (value << 8) | self.data[offset + index]; }
+        for index in 0..8 { value = (value << 8) | self.data[offset + index].to_i64(); }
         return value;
     }
 
@@ -87,7 +86,7 @@ pub class ByteBuffer {
     }
 
     // Independent copy of the bytes.
-    pub fn to_array() -> Array<i64> {
+    pub fn to_array() -> Array<u8> {
         return self.data.slice(0, self.data.len());
     }
 
@@ -102,7 +101,7 @@ pub class ByteBuffer {
         let length = self.data.len();
         let mut index = 0;
         while index < length {
-            let lead = self.data[index];
+            let lead = self.data[index].to_i64();
             let mut width = 0;
             let mut low = 0x80;
             let mut high = 0xBF;
@@ -125,7 +124,7 @@ pub class ByteBuffer {
             if width == 3 { scalar = lead & 0x0F; }
             if width == 4 { scalar = lead & 0x07; }
             for offset in 1..width {
-                let next = self.data[index + offset];
+                let next = self.data[index + offset].to_i64();
                 // Only the second byte has a lead-specific range.
                 if offset > 1 {
                     low = 0x80;
@@ -150,8 +149,4 @@ pub class ByteBuffer {
         // untrusted offset: even i64::MAX must reach this bounds diagnostic.
         if offset < 0 || offset > self.data.len() - 8 { panic("byte buffer read out of bounds"); }
     }
-}
-
-fn check_byte(value: i64) {
-    if value < 0 || value > 255 { panic("byte value must be in 0..=255"); }
 }

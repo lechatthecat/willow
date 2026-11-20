@@ -473,7 +473,11 @@ impl BridgeCargo<'_> {
                 } else {
                     "rust_bridge_compile_error"
                 },
-                "Rust bridge compilation failed",
+                if adapter_error(&["E0308", "E0277", "E0283"]) {
+                    "Rust bridge compilation failed: byte adapters use Array<u8> for &[u8] / Vec<u8>; Array<i64> now maps to Vec<i64>. Migrate byte declarations to Array<u8> and use checked_to_u8() for integer values"
+                } else {
+                    "Rust bridge compilation failed"
+                },
             );
             error.fields.insert(
                 "diagnostics".into(),

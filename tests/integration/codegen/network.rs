@@ -219,12 +219,10 @@ async fn main() {
     let mut equal = true;
     while index < 5 {
         let bytes = (await net::read_bytes_async(server, 1)).unwrap();
-        equal = equal && bytes.len() == 1 && bytes[0] == expected[index];
+        equal = equal && bytes.len() == 1 && bytes[0].to_i64() == expected[index];
         index = index + 1;
     }
     println(equal);
-    println((await net::write_bytes_async(client, [-1])).is_err());
-    println((await net::write_bytes_async(client, [256])).is_err());
     println((await net::read_bytes_async(server, 0)).is_err());
     println((await net::read_bytes_async(server, 16777217)).is_err());
     match await net::write_bytes_async(client, []) { Ok(_) => {}, Err(_) => println("empty write failed"), }
@@ -235,5 +233,5 @@ async fn main() {
         &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_WORKERS", "1")],
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "true\ntrue\ntrue\ntrue\ntrue\ntrue\n");
+    assert_eq!(out, "true\ntrue\ntrue\ntrue\n");
 }

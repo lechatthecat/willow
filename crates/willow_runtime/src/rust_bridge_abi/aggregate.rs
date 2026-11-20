@@ -70,14 +70,10 @@ pub extern "C" fn willow_rust_bridge_bytes_copy(object: u64, out: *mut u8, len: 
     if len != willow_rust_bridge_bytes_len(object) {
         crate::failure::fatal_invariant("rust_bridge_bytes_length");
     }
-    for index in 0..len {
-        let value = array::willow_array_get(object as *mut u8, index as i64);
-        let Ok(byte) = u8::try_from(value) else {
-            crate::failure::fatal_invariant("rust_bridge_byte_out_of_range");
-        };
-        unsafe {
-            *out.add(index) = byte;
-        }
+    if len != 0 {
+        // No allocation or safepoint occurs while the managed slice is live.
+        let bytes = unsafe { array::packed_bytes(object as *mut u8) };
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, len) };
         crate::observation::record(crate::observation::Event::InputCopies, 1);
     }
 }
@@ -96,15 +92,14 @@ pub extern "C" fn willow_rust_bridge_buffer(
     let object = if is_string != 0 {
         string::willow_string_alloc(bytes, length)
     } else {
-        array::new_old_array(length, 0)
+        let bytes = if len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(bytes, len) }
+        };
+        array::from_native_bytes(bytes)
     };
     willow_rust_bridge_root(frame, object as u64);
-    if is_string == 0 {
-        for index in 0..len {
-            array::willow_array_set(object, index as i64, unsafe { *bytes.add(index) } as i64);
-            crate::observation::record(crate::observation::Event::OutputCopies, 1);
-        }
-    }
     object as u64
 }
 
@@ -216,11 +211,12 @@ mod tests {
             let bytes: Vec<u8> = (0..len).map(|index| index as u8).collect();
             let object = willow_rust_bridge_buffer(frame, bytes.as_ptr(), len, 0);
             assert_eq!(willow_rust_bridge_bytes_len(object), len);
+            gc::willow_gc_collect();
             let mut output = vec![0; len];
             willow_rust_bridge_bytes_copy(object, output.as_mut_ptr(), len);
             assert_eq!(output, bytes);
-            assert_eq!(INPUT_COPIES.get(), len);
-            assert_eq!(OUTPUT_COPIES.get(), len);
+            assert_eq!(INPUT_COPIES.get(), usize::from(len != 0));
+            assert_eq!(OUTPUT_COPIES.get(), usize::from(len != 0));
             eprintln!(
                 "bytes length={len} input_copy={} output_copy={}",
                 INPUT_COPIES.get(),

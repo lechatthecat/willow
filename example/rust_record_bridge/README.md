@@ -11,8 +11,9 @@ Boundary conversions:
 | Willow | Rust input | Rust output |
 | --- | --- | --- |
 | `String` | `&str` | `String` |
-| `Array<i64>` (legacy bytes, values 0–255) | `&[u8]` | `Vec<u8>` |
+| `Array<u8>` (packed bytes) | `&[u8]` | `Vec<u8>` |
 | `Array<String>` | `Vec<&str>` | `Vec<String>` |
+| `Array<i64>` | `Vec<i64>` | `Vec<i64>` |
 | `Array<f64>` | `Vec<f64>` | `Vec<f64>` |
 | `Array<bool>` | `Vec<bool>` | `Vec<bool>` |
 | declared record | generated input alias | generated output alias |

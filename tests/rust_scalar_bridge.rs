@@ -874,7 +874,7 @@ fn aggregate_bridge_large_buffers_forced_collection_and_properties() {
         import std::collections::Array;
         extern rust {
             fn text(value: String) -> String;
-            fn bytes(value: Array<i64>) -> Array<i64>;
+            fn bytes(value: Array<u8>) -> Array<u8>;
             fn collect(value: String) -> String;
             fn collect_nested(value: Option<Option<String>>) -> Option<Option<String>>;
         }
@@ -884,11 +884,11 @@ fn aggregate_bridge_large_buffers_forced_collection_and_properties() {
                 println(text(input) == input);
                 println(collect(text(input)) == input);
                 println(collect_nested(Some(Some(text(input)))).unwrap().unwrap() == input);
-                let data: Array<i64> = [];
-                for i in 0..n { data.push(i % 256); }
+                let data: Array<u8> = [];
+                for i in 0..n { data.push((i % 256).checked_to_u8().unwrap()); }
                 let output = bytes(data);
                 let mut same = output.len() == n;
-                for i in 0..n { if output[i] != i % 256 { same = false; } }
+                for i in 0..n { if output[i].to_i64() != i % 256 { same = false; } }
                 println(same);
             }
         }
@@ -942,13 +942,13 @@ fn aggregate_bridge_panics_and_invalid_bytes_are_diagnostics() {
             "fn fail(a: Array<i64>);",
             "fail([-1])",
             "pub fn fail(_: &[u8]) {}",
-            "rust_bridge_byte_out_of_range",
+            "byte adapters use Array<u8>",
         ),
         (
             "fn fail(a: Array<i64>);",
             "fail([256])",
             "pub fn fail(_: &[u8]) {}",
-            "rust_bridge_byte_out_of_range",
+            "byte adapters use Array<u8>",
         ),
     ] {
         let f = Fixture::new();
@@ -959,6 +959,113 @@ fn aggregate_bridge_panics_and_invalid_bytes_are_diagnostics() {
         assert!(stderr.contains(expected), "{stderr}");
         assert!(!stderr.contains("BAD_DROP"), "{stderr}");
         assert!(!String::from_utf8_lossy(&output.stdout).contains("987654321"));
+    }
+}
+
+#[test]
+fn packed_byte_bridge_gc_task_and_panic_release_exactly_once() {
+    let rust = include_str!("fixtures/rust_bridge/byte_lifetime.rs");
+    for kind in ["sync", "task", "async"] {
+        for fail in [false, true] {
+            let f = Fixture::new();
+            let qualifier = match kind {
+                "task" => "nonblocking(\"REVIEW\") ",
+                "async" => "async ",
+                _ => "",
+            };
+            let asynchronous = if kind == "sync" { "" } else { "async " };
+            let wait = if kind == "async" { "await " } else { "" };
+            let entry = if kind == "async" {
+                "owned"
+            } else {
+                "transform"
+            };
+            let rust = if kind == "async" {
+                format!(
+                    "{rust}\npub async fn owned(bytes: Vec<u8>, fail: bool) -> Vec<u8> {{ transform(&bytes, fail) }}\npub async fn done() -> bool {{ released() }}"
+                )
+            } else {
+                rust.to_owned()
+            };
+            let done = if kind == "async" { "done" } else { "released" };
+            let input = if kind == "async" {
+                "[0, 128, 255]"
+            } else {
+                "bytes"
+            };
+            let willow = format!(
+                "import std::collections::Array; extern rust {{ {qualifier}fn {entry}(bytes: Array<u8>, fail: bool) -> Array<u8>; {qualifier}fn {done}() -> bool; }}
+                 {asynchronous}fn main() {{ let bytes: Array<u8> = [0, 128, 255]; gc_minor_collect();
+                 let output = {wait}{entry}({input}, {fail}); gc_collect();
+                 println(output.content_equals(bytes)); println({wait}{done}()); }}"
+            );
+            if kind == "task" {
+                f.reviewed_sources(&willow, &rust);
+            } else {
+                f.sources(&willow, &rust);
+            }
+            let output = f.command_env(
+                &["run", "--offline"],
+                &[("WILLOW_GC_STRESS", "alloc,relocate")],
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), !fail, "{stderr}");
+            assert_eq!(stderr.matches("BYTE_INPUT_RELEASED").count(), 1, "{stderr}");
+            assert_eq!(
+                stderr.matches("BYTE_OUTPUT_RELEASED").count(),
+                1,
+                "{stderr}"
+            );
+            if fail {
+                assert!(stderr.contains("byte lifetime panic"), "{stderr}");
+            } else {
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "true\ntrue\n");
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_byte_bridge_type_mapping_and_owned_copy_emission() {
+    use willow_compiler::parser::ast::Type;
+    for generic in [false, true] {
+        for (element, mapped) in [
+            (Type::U8, Scalar::Bytes),
+            (Type::I64, Scalar::Array(Box::new(Scalar::I64))),
+        ] {
+            let ty = if generic {
+                Type::Generic("Array".into(), vec![element])
+            } else {
+                Type::Array(Box::new(element))
+            };
+            assert_eq!(Scalar::from_type(&ty), Some(mapped));
+        }
+    }
+    let abi = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/willow_abi/src/ffi.rs");
+    for count in [1, 4, 16, 64] {
+        let symbols: Vec<_> = (0..count)
+            .map(|i| {
+                let mut symbol =
+                    RustBridgeSymbol::new(format!("bytes{i}"), vec![Scalar::Bytes], Scalar::Bytes);
+                symbol.is_async = true;
+                symbol
+            })
+            .collect();
+        let source = wrappers(
+            &symbols,
+            &abi,
+            willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION,
+        );
+        assert_eq!(source.matches("= frame.owned_bytes(").count(), count);
+        assert_eq!(
+            source
+                .matches("willow_rust_bridge_bytes_copy(object,")
+                .count(),
+            1
+        );
+        assert!(!source.contains(".to_vec()"));
+        assert!(!source.contains("frame.array_get("));
+        eprintln!("byte adapters={count} owned_decodes={count} shared_bulk_copy_sites=1");
     }
 }
 
@@ -2221,7 +2328,7 @@ fn main() {
 pub fn byte(x: u8) -> u8 { x }
 pub fn maybe(x: Option<u8>) -> Option<u8> { x }
 pub fn result(x: Result<u8, u8>) -> Result<u8, u8> { x }
-pub fn bytes(x: Vec<u8>) -> Vec<u8> { x }
+pub fn bytes(x: &[u8]) -> Vec<u8> { x.to_vec() }
 "#,
     );
     for args in [
@@ -2245,6 +2352,7 @@ fn scalar_widths_native_abi_and_aggregate_payloads() {
     let mut rust = String::new();
     let mut expected = String::new();
     for (ty, boundary, other) in [
+        ("i64", "-9223372036854775808", "9223372036854775807"),
         ("i8", "-128", "127"),
         ("i16", "-32768", "32767"),
         ("i32", "-2147483648", "2147483647"),

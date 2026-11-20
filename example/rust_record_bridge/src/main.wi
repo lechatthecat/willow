@@ -1,7 +1,7 @@
 import std::collections::Array;
 extern rust {
     class Packet {
-        pub body: Array<i64>;
+        pub body: Array<u8>;
         pub labels: Array<String>;
         pub ratio: f64;
         pub active: bool;

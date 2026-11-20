@@ -171,7 +171,7 @@ impl Scalar {
         match self {
             Self::Opaque(name) if owned => writeln!(source, "let {out} = AsyncHandle::<bridge::r#{name}>::new(frame.payload({value}, false).low, std::any::TypeId::of::<opaque_tags::r#{name}>());").unwrap(),
             Self::String if owned => writeln!(source, "let {out} = frame.string({value}.low).to_owned();").unwrap(),
-            Self::Bytes if owned => writeln!(source, "let {out} = frame.bytes({value}.low).to_vec();").unwrap(),
+            Self::Bytes if owned => writeln!(source, "let {out} = frame.owned_bytes({value}.low);").unwrap(),
             Self::Record(name) if owned => writeln!(source, "let {out} = decode_owned_record_{name}(&frame, {value});").unwrap(),
             Self::Opaque(name) => writeln!(source, "let {out} = frame.handle::<bridge::r#{name}>(frame.payload({value}, false).low, std::any::TypeId::of::<opaque_tags::r#{name}>());").unwrap(),
             Self::I8 | Self::I16 | Self::I32 | Self::I64

@@ -74,10 +74,19 @@ impl BridgeFrame {
                 .expect("Willow UTF-8 invariant")
         }
     }
-    fn bytes(&self, object: u64) -> &[u8] {
+    fn owned_bytes(&self, object: u64) -> Vec<u8> {
         let len = unsafe { willow_rust_bridge_bytes_len(object) };
-        let mut bytes = vec![0; len];
-        unsafe { willow_rust_bridge_bytes_copy(object, bytes.as_mut_ptr(), len) };
+        let mut bytes = Vec::with_capacity(len);
+        // The runtime fills the entire native allocation in one bulk copy.
+        unsafe {
+            willow_rust_bridge_bytes_copy(object, bytes.as_mut_ptr(), len);
+            bytes.set_len(len);
+        }
+        bytes
+    }
+    fn bytes(&self, object: u64) -> &[u8] {
+        let bytes = self.owned_bytes(object);
+        let len = bytes.len();
         let ptr = bytes.as_ptr();
         self.bytes.borrow_mut().push(bytes);
         unsafe { std::slice::from_raw_parts(ptr, len) }

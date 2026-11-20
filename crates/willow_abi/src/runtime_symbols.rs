@@ -522,6 +522,11 @@ runtime_abi_schema! {
     NONE; willow_rust_bridge_frame_drop => ([Ptr] -> None);
     NONE; willow_rust_bridge_root => ([Ptr, I64] -> None);
     NONE; willow_rust_bridge_string_data => ([I64, Ptr] -> None);
+    // Revision 2: bytes_copy accepts packed Array<u8>, checks length once,
+    // then copies N bytes into caller-owned native storage without a safepoint.
+    // bytes_len also serves general numeric/reference arrays (element count).
+    // buffer(string=0) copies native bytes into a rooted packed Array<u8>;
+    // buffer(string!=0) validates UTF-8 and returns a rooted String.
     NONE; willow_rust_bridge_bytes_len => ([I64] -> Some(I64));
     NONE; willow_rust_bridge_bytes_copy => ([I64, Ptr, I64] -> None);
     ALLOC; willow_rust_bridge_buffer => ([Ptr, Ptr, I64, I32] -> Some(I64));

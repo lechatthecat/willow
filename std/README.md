@@ -258,24 +258,25 @@ b.write_i64_be(2026);
 match b.slice(0, 6).decode_utf8() { Ok(t) => println(t), Err(e) => println(e.position) }
 ```
 
-A growable buffer of bytes, each an `i64` in `0..=255`. It interoperates with
-the `Array<i64>` byte arrays of `std::net`. Storing a value outside `0..=255`
-panics with `byte value must be in 0..=255`; reading integers past the end
+A growable buffer of packed `u8` bytes. It interoperates with
+the `Array<u8>` byte arrays of `std::net`. Convert computed integers using
+`checked_to_u8()` and handle `None`; out-of-range byte literals are rejected
+at compile time. Reading integers past the end
 panics with `byte buffer read out of bounds`.
 
 | Method | Result | Cost |
 | --- | --- | --- |
 | `new ByteBuffer()` | `ByteBuffer` | O(1) |
-| `ByteBuffer::from_array(bytes)` | `ByteBuffer` (validated copy) | O(m) |
+| `ByteBuffer::from_array(bytes)` | `ByteBuffer` (packed copy) | O(m) |
 | `ByteBuffer::from_string(s)` | `ByteBuffer` (UTF-8 bytes) | O(m) |
 | `len()`, `is_empty()` | `i64`, `bool` | O(1) |
-| `get(i)`, `set(i, byte)` | `i64` / | O(1) |
+| `get(i)`, `set(i, byte)` | `u8` / | O(1) |
 | `push(byte)` | | Amortized O(1) |
 | `extend(bytes)`, `write_string(s)` | | Amortized O(m) |
 | `write_i64_le(x)`, `write_i64_be(x)` | | Amortized O(1) (8 bytes) |
 | `read_i64_le(offset)`, `read_i64_be(offset)` | `i64` | O(1) |
 | `slice(start, end)` | `ByteBuffer` (copy) | O(end - start) |
-| `to_array()` | `Array<i64>` (copy) | O(n) |
+| `to_array()` | `Array<u8>` (copy) | O(n) |
 | `clear()` | | O(1) |
 | `decode_utf8()` | `Result<String, Utf8Error>` | O(n) |
 | `to_string()` | `String` | O(n); `[104, 195, 169]` |
@@ -388,7 +389,7 @@ TCP with numeric `IP:port` addresses (no DNS lookup).
 | `net::local_addr(listener)` | `Result<String, IoError>` |
 | `net::accept_async(listener)`, `net::connect_async(addr)` | `Task<Result<TcpStream, IoError>>` |
 | `net::read_async(stream, max)`, `net::write_async(stream, text)` | `Task<Result<String, IoError>>`, `Task<Result<(), IoError>>` |
-| `net::read_bytes_async(stream, max)`, `net::write_bytes_async(stream, bytes)` | `Task<Result<Array<i64>, IoError>>`, `Task<Result<(), IoError>>` |
+| `net::read_bytes_async(stream, max)`, `net::write_bytes_async(stream, bytes)` | `Task<Result<Array<u8>, IoError>>`, `Task<Result<(), IoError>>` |
 | `net::peer_addr(stream)`, `net::shutdown(stream)` | `Result<String, IoError>`, `Result<(), IoError>` |
 
 ## `std::parallel`, `std::time`
