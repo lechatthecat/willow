@@ -790,7 +790,7 @@ impl Graph<'_, '_> {
                 (self.call_may_panic)(expr)
             }
             // Scalar display uses the runtime print rows directly; only
-            // object/interface display can run user `toString` code.
+            // object/interface display can run user `to_string` code.
             Expr::Print(value, ..) => !matches!(
                 self.types.get(&value.id()),
                 Some(Type::I64 | Type::F64 | Type::Bool | Type::String)

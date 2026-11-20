@@ -3651,7 +3651,7 @@ impl TypeChecker {
                     "printable types are i64, f64, bool, and String",
                 ))
                 .with_help(
-                    "convert the value first, e.g. with `match`, `.toString()`, or `format`",
+                    "convert the value first, e.g. with `match`, `.to_string()`, or `format`",
                 ),
             );
         }
@@ -3924,6 +3924,12 @@ impl TypeChecker {
             }
             return Self::error_type();
         }
+        if let Some(current) = crate::semantic::intrinsics::renamed_method(&m.method)
+            && !self.type_has_method(obj_ty, &m.method)
+            && self.type_has_method(obj_ty, current)
+        {
+            return self.check_renamed_method_call(obj_ty, m, current);
+        }
         self.record_builtin_lock_effect(obj_ty, m);
         if let Some(ret) = self.check_option_result_method_call(obj_ty, m) {
             return ret;
@@ -3950,6 +3956,41 @@ impl TypeChecker {
         }
 
         self.resolve_method(obj_ty, m, true)
+    }
+
+    /// A call spelled with a retired builtin name (`x.toString()`): report the
+    /// current name, then check the call as if it were written with it, so the
+    /// result type and argument diagnostics are those of the real method. Only
+    /// erroneous programs reach this, so the receiver clone is off the hot path.
+    fn check_renamed_method_call(
+        &mut self,
+        obj_ty: &Type,
+        m: &MethodCallExpr,
+        current: &'static str,
+    ) -> Type {
+        let mut diagnostic = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0201,
+            format!(
+                "no method `{}` on type `{}`; it was renamed to `{current}`",
+                m.method,
+                self.diagnostic_type_name(obj_ty)
+            ),
+        )
+        .with_label(Label::primary(m.span, "old method name"))
+        .with_help(format!(
+            "builtin and std method names are snake_case: write `.{current}(...)`"
+        ));
+        self.label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
+        self.push(diagnostic);
+        let renamed = MethodCallExpr {
+            id: m.id,
+            object: m.object.clone(),
+            method: current.to_string(),
+            args: m.args.clone(),
+            span: m.span,
+        };
+        self.check_receiver_method_call(obj_ty, &renamed)
     }
 }
 

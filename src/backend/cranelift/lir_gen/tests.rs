@@ -999,7 +999,7 @@ fn local_maps_confinement_twenty_perspectives() {
         "m.get(1);",
         "m.contains(1);",
         "m.len();",
-        "m.toString();",
+        "m.to_string();",
         "m.freeze();",
         "let a = m; a.insert(1, 2);",
         "m = Map::new(); m.insert(1, 2);",
@@ -1066,12 +1066,12 @@ fn local_string_maps_confinement_twenty_perspectives() {
         r#"m.get("x");"#,
         r#"m.contains("x");"#,
         "m.len();",
-        "m.toString();",
+        "m.to_string();",
         "m.freeze();",
         r#"let a = m; a.insert("x", 2);"#,
         r#"m = Map::new(); m.insert("x", 2);"#,
         "let a = m; m = a;",
-        r#"let mut i = 0; while i < 10 { m.insert(i.toString(), i); i = i + 1; }"#,
+        r#"let mut i = 0; while i < 10 { m.insert(i.to_string(), i); i = i + 1; }"#,
         r#"println(match m.get("x") { Some(x) => x, None => 0 });"#,
         r#"if true { m.insert("x", 2); } else { m.insert("y", 4); }"#,
     ] {
@@ -1129,7 +1129,7 @@ import std::collections::Array;
 fn main() {
  let words: Array<String> = [];
  let mut i = 0;
- while i < 4096 { words.push("token_" + i.toString() + "_" + (i * 31).toString()); i = i + 1; }
+ while i < 4096 { words.push("token_" + i.to_string() + "_" + (i * 31).to_string()); i = i + 1; }
  let counts: Map<String, i64> = Map::new();
  i = 0;
  while i < 6000000 {
@@ -2226,7 +2226,7 @@ fn e25_class_object_now_eligible() {
 //  3. indexing an array is eligible
 //  4. index-assignment (`a[i] = v`) is eligible
 //  5. `push` / `pop` are eligible
-//  6. `toString()` is eligible for every renderable element kind
+//  6. `to_string()` is eligible for every renderable element kind
 //  7. an array of `String` is eligible (GC element type)
 //  8. `Array<Array<i64>>` is eligible (element type checked recursively)
 //  9. an empty array literal never reaches the predicate: HIR lowering
@@ -2236,7 +2236,7 @@ fn e25_class_object_now_eligible() {
 // 12. an unsupported array method (`freeze`) is rejected
 // 13. a `FrozenArray<T>` receiver is rejected (different runtime call)
 // 14. a `Map<K, V>` receiver/index is rejected
-// 15. `toString()` on a non-renderable element type is rejected
+// 15. `to_string()` on a non-renderable element type is rejected
 // ---------------------------------------------------------------------
 
 // 26. array parameters and array returns are eligible
@@ -2268,7 +2268,7 @@ fn e29_push_pop_eligible() {
     assert!(eligible_checked(src, "f", &["f"]));
 }
 
-// 30. toString is eligible for each element kind the runtime can render
+// 30. to_string is eligible for each element kind the runtime can render
 #[test]
 fn e30_to_string_eligible_for_scalar_kinds() {
     for (decl, lit) in [
@@ -2278,9 +2278,12 @@ fn e30_to_string_eligible_for_scalar_kinds() {
         ("String", "[\"a\"]"),
     ] {
         let src = format!(
-            "import std::collections::Array; fn f() -> String {{ let xs: Array<{decl}> = {lit}; return xs.toString(); }}"
+            "import std::collections::Array; fn f() -> String {{ let xs: Array<{decl}> = {lit}; return xs.to_string(); }}"
         );
-        assert!(eligible_checked(&src, "f", &["f"]), "{decl} array toString");
+        assert!(
+            eligible_checked(&src, "f", &["f"]),
+            "{decl} array to_string"
+        );
     }
 }
 
@@ -2322,7 +2325,7 @@ fn e34_class_and_interface_element_arrays_eligible() {
 }
 
 // 35. `freeze` completed the array method
-// surface — `len`/`push`/`pop`/`toString`/`freeze` is all of it, so there is
+// surface — `len`/`push`/`pop`/`to_string`/`freeze` is all of it, so there is
 // no longer an unsupported array method. Kept as a positive check.
 #[test]
 fn e35_array_freeze_now_eligible() {
@@ -2340,10 +2343,10 @@ fn e36_map_now_eligible() {
     assert!(eligible_checked(src, "f", &["f"]));
 }
 
-// 37. `toString()` on an element type the runtime cannot render is rejected
+// 37. `to_string()` on an element type the runtime cannot render is rejected
 #[test]
 fn e37_nested_array_to_string_ineligible() {
-    let src = "fn f() -> String { let xs = [[1], [2]]; return xs.toString(); }";
+    let src = "fn f() -> String { let xs = [[1], [2]]; return xs.to_string(); }";
     assert!(!eligible_lenient(src, "f", &["f"]));
 }
 
@@ -3248,7 +3251,7 @@ fn e64_array_representation_requires_exact_element_type() {
 // j19. an optional interface (`Iface?`) is rejected
 // j20. a ternary whose arms are classes but whose type is the interface is
 //      rejected: both arms feed one variable and neither gets boxed
-// j21. `Array<Iface>.toString()` is rejected — no element kind
+// j21. `Array<Iface>.to_string()` is rejected — no element kind
 // ---------------------------------------------------------------------
 
 /// An interface, a simple class implementing it, and a holder class with an
@@ -3558,10 +3561,10 @@ fn j20_widening_ternary_rejected() {
     assert!(!eligible_lenient(&src, "f", &["f"]));
 }
 
-// j21. `toString()` on an `Array<Iface>` has no runtime element kind
+// j21. `to_string()` on an `Array<Iface>` has no runtime element kind
 #[test]
 fn j21_interface_array_to_string_rejected() {
-    let src = format!("{NAMED} fn f(xs: Array<Named>) -> String {{ return xs.toString(); }}");
+    let src = format!("{NAMED} fn f(xs: Array<Named>) -> String {{ return xs.to_string(); }}");
     assert!(!eligible_lenient(&src, "f", &["f"]));
 }
 
@@ -3589,7 +3592,7 @@ const MULTI: &str = "interface Shape { \
                          class Sq implements Shape { pub side: i64; \
                          pub fn area(self) -> i64 { return self.side * self.side; } \
                          pub fn describe(self, prefix: String, n: i64) -> String { \
-                         return prefix + n.toString(); } \
+                         return prefix + n.to_string(); } \
                          pub fn stamp(self) { println(self.side); } } ";
 
 /// Two interfaces, because an interface cannot name ITSELF as a return type
@@ -4120,8 +4123,8 @@ fn p5_string_pow_is_not_lir_eligible() {
 // c02. an `i64` key and a GC-managed value is eligible
 // c03. `Map::new()` + `insert` is eligible despite its `Map<Void, Void>`
 // c04. `contains` is eligible
-// c05. `toString` on a renderable value type is eligible
-// c06. `toString` on a non-renderable value type is rejected
+// c05. `to_string` on a renderable value type is eligible
+// c06. `to_string` on a non-renderable value type is rejected
 // c07. `freeze` on a map is eligible
 // c08. `FrozenMap` answers `len` and `contains`
 // c09. `FrozenArray` answers `len`
@@ -4201,12 +4204,12 @@ fn c04_map_contains_eligible() {
     assert!(eligible_checked(&src, "f", &["f"]));
 }
 
-// c05. `toString` renders in the runtime, which knows the four scalar and
+// c05. `to_string` renders in the runtime, which knows the four scalar and
 // string value kinds
 #[test]
 fn c05_map_to_string_eligible() {
     let src =
-        format!("{MAP_IMPORT} fn f(m: Map<String, i64>) -> String {{ return m.toString(); }}");
+        format!("{MAP_IMPORT} fn f(m: Map<String, i64>) -> String {{ return m.to_string(); }}");
     assert!(eligible_checked(&src, "f", &["f"]));
 }
 
@@ -4226,7 +4229,7 @@ fn c06_map_to_string_unrenderable_value_ineligible() {
                 ty: map_ty(Type::String, value),
                 span,
             }),
-            method: "toString".to_string(),
+            method: "to_string".to_string(),
             args: Vec::new(),
             super_class: None,
         },
@@ -6186,7 +6189,7 @@ fn r20_first_blocker_in_program_order_wins() {
 // same method name on two receivers is two different gaps.
 #[test]
 fn r21_method_call_names_method_and_receiver() {
-    // Scalar `toString` joined the subset in, so the shape
+    // Scalar `to_string` joined the subset in, so the shape
     // that still gets refused is the one k17 covers: an interface method
     // the backend's tables do not register a slot for.
     let src = format!("{NAMED} fn f(n: Named) -> String {{ return n.name(); }}");
@@ -6460,7 +6463,7 @@ fn f13_void_returning_function_value() {
 // parameters, not against a symbol's signature — there is no symbol.
 #[test]
 fn f14_indirect_call_arguments_are_vetted_against_the_fn_type() {
-    let src = "fn join(a: String, b: i64) -> String { return a + b.toString(); }
+    let src = "fn join(a: String, b: i64) -> String { return a + b.to_string(); }
                    fn caller() -> String {
                        let g: fn(String, i64) -> String = join;
                        return g(\"n=\", 2);
@@ -6658,7 +6661,7 @@ fn f24_recursion_through_a_function_value() {
 }
 
 // ---------------------------------------------------------------------
-// d. divergence, scalar `toString` and `format`.
+// d. divergence, scalar `to_string` and `format`.
 //
 // Divergence is a property of the POSITION, not of the expression: a
 // `!`-typed expression ends its Cranelift block with a terminator, so the
@@ -6667,7 +6670,7 @@ fn f24_recursion_through_a_function_value() {
 // is the string machinery those panics need to build their messages.
 // ---------------------------------------------------------------------
 
-// d01. all four scalar receivers convert. `toString` is the only builtin
+// d01. all four scalar receivers convert. `to_string` is the only builtin
 // the walker resolves by intrinsic rather than by name, so each arm of that
 // table needs its own witness.
 #[test]
@@ -6679,22 +6682,22 @@ fn d01_every_scalar_to_string_is_eligible() {
         ("String", "n: String", "n"),
     ];
     for (label, param, recv) in cases {
-        let src = format!("fn f({param}) -> String {{ return {recv}.toString(); }}");
+        let src = format!("fn f({param}) -> String {{ return {recv}.to_string(); }}");
         assert!(eligible_checked(&src, "f", &["f"]), "{label} must convert");
     }
 }
 
-// d02. `String::toString` is the identity, not a no-op the resolver drops:
+// d02. `String::to_string` is the identity, not a no-op the resolver drops:
 // it must still resolve, and to `String`.
 #[test]
 fn d02_string_to_string_is_the_identity() {
     assert_eq!(
-        scalar_to_string(&Type::String, "toString", &[]),
+        scalar_to_string(&Type::String, "to_string", &[]),
         Some(Type::String)
     );
 }
 
-// d03. arity is part of the match. A one-argument `toString` is not the
+// d03. arity is part of the match. A one-argument `to_string` is not the
 // intrinsic, and admitting it would emit a call with a stranded operand.
 #[test]
 fn d03_scalar_to_string_is_arity_checked() {
@@ -6704,7 +6707,7 @@ fn d03_scalar_to_string_is_arity_checked() {
         span: crate::diagnostics::Span::dummy(),
     };
     assert_eq!(
-        scalar_to_string(&Type::I64, "toString", std::slice::from_ref(&arg)),
+        scalar_to_string(&Type::I64, "to_string", std::slice::from_ref(&arg)),
         None
     );
 }
@@ -6719,7 +6722,7 @@ fn d04_non_scalar_receivers_are_not_scalar_to_string() {
         Type::Named("Widget".to_string().into()),
         Type::Void,
     ] {
-        assert_eq!(scalar_to_string(&recv, "toString", &[]), None, "{recv:?}");
+        assert_eq!(scalar_to_string(&recv, "to_string", &[]), None, "{recv:?}");
     }
 }
 
@@ -6861,7 +6864,7 @@ fn d12_formatted_panic_is_eligible() {
 #[test]
 fn d13_single_argument_panic_takes_a_computed_message() {
     let src = "fn f(n: i64) -> i64 {
-                       if n <= 0 { panic(\"bad value: \" + n.toString()); }
+                       if n <= 0 { panic(\"bad value: \" + n.to_string()); }
                        return n;
                    }";
     assert!(eligible_checked(src, "f", &["f"]));

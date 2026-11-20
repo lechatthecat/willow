@@ -27,7 +27,7 @@ fn churn(count: i64) -> i64 {
     let mut sum = 0;
     while i < count {
         let node = BlockingCell::new(new Node(i));
-        let text = BlockingRwCell::new("v" + i.toString());
+        let text = BlockingRwCell::new("v" + i.to_string());
         sum = sum + node.get().v;
         text.write(text.read() + "!");
         i = i + 1;

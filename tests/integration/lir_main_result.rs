@@ -343,7 +343,7 @@ fn lir_main_result_13_i64_payload_reports_generically() {
 fn lir_main_result_14_runtime_string_payload_survives() {
     assert_main(
         "fn describe(n: i64) -> Result<i64, String> {
-    if n < 0 { return Result::Err(\"negative: \" + n.toString()); }
+    if n < 0 { return Result::Err(\"negative: \" + n.to_string()); }
     return Result::Ok(n);
 }
 fn main() -> Result<void, String> {
@@ -385,7 +385,7 @@ fn main(args: Array<String>) -> Result<void, String> {{
 #[test]
 fn lir_main_result_16_ok_path_under_gc_stress() {
     let source = "fn build(n: i64) -> String {
-    return \"value \" + n.toString();
+    return \"value \" + n.to_string();
 }
 fn main() -> Result<void, String> {
     let mut i = 0;
@@ -409,7 +409,7 @@ fn main() -> Result<void, String> {
 #[test]
 fn lir_main_result_17_err_path_under_gc_stress() {
     let source = "fn build(n: i64) -> Result<i64, String> {
-    if n > 3 { return Result::Err(\"stopped at \" + n.toString()); }
+    if n > 3 { return Result::Err(\"stopped at \" + n.to_string()); }
     return Result::Ok(n);
 }
 fn main() -> Result<void, String> {

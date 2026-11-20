@@ -143,7 +143,7 @@ fn nested_bindings_get_payload_types() {
     );
     assert!(!found.is_empty(), "String + i64 must not type-check");
     assert_clean(
-        "fn f(t: Tagged) -> String { return match t { Tagged::Named(name, Some(v)) => name + v.toString(), _ => \"\" }; }",
+        "fn f(t: Tagged) -> String { return match t { Tagged::Named(name, Some(v)) => name + v.to_string(), _ => \"\" }; }",
     );
     // Generic payloads are substituted before nested patterns are typed.
     assert_clean(

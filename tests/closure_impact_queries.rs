@@ -123,9 +123,9 @@ pub fn ints(k: i64) -> bool { return merge_sort(3, |a: i64, b: i64| a < b + k); 
 const MAIN: &str = "import sim;
 import fuzz;
 fn main() {
-    println(sim::run(0).toString());
-    println(fuzz::run(0).toString());
-    println(fuzz::ints(0).toString());
+    println(sim::run(0).to_string());
+    println(fuzz::run(0).to_string());
+    println(fuzz::ints(0).to_string());
 }
 ";
 
@@ -611,7 +611,7 @@ class Two implements Sized<A>, Sized<B> { pub fn size(self) -> i64 { return targ
 class One implements Sized<A> { pub fn size(self) -> i64 { return other(); } }
 fn use_a(s: Sized<A>) -> i64 { return s.size(); }
 fn use_b(s: Sized<B>) -> i64 { return s.size(); }
-fn main() { println((use_a(new One()) + use_a(new Two()) + use_b(new Two())).toString()); }",
+fn main() { println((use_a(new One()) + use_a(new Two()) + use_b(new Two())).to_string()); }",
         ),
     ])
     .snapshot();
@@ -641,7 +641,7 @@ class Sub extends Base { pub override fn size(self) -> i64 { return target(); } 
 class Other implements Sized<B> { pub fn size(self) -> i64 { return 2; } }
 fn use_a(s: Sized<A>) -> i64 { return s.size(); }
 fn use_b(s: Sized<B>) -> i64 { return s.size(); }
-fn main() { println((use_a(new Sub()) + use_b(new Other())).toString()); }",
+fn main() { println((use_a(new Sub()) + use_b(new Other())).to_string()); }",
         ),
     ])
     .snapshot();
@@ -677,7 +677,7 @@ fn other() -> i64 { return 2; }
 class X implements Pair<A> { pub fn m(self) -> i64 { return target(); } }
 class Y implements Pair<B> { pub fn m(self) -> i64 { return other(); } }
 fn use_d(p: Pair<A>, q: Pair<B>) -> i64 { return p.d(q); }
-fn main() { println(use_d(new X(), new Y()).toString()); }",
+fn main() { println(use_d(new X(), new Y()).to_string()); }",
         ),
     ])
     .snapshot();

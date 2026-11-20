@@ -32,7 +32,7 @@ fn lir_diff_j38_two_boxes_share_one_concrete_object() {
     // `Meter`, the ticks go through an interface box, and the direct field read
     // has to see them. A box that copied the object would leave `m.hits` at 0.
     // The two readings are packed as `interface * 100 + direct` so one number
-    // shows both; `.toString()` on a free function's value is outside the LIR
+    // shows both; `.to_string()` on a free function's value is outside the LIR
     // subset, so the tests here compare integers rather than formatted text.
     assert_program_output(
         &boxing_source(

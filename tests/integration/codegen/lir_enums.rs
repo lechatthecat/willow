@@ -595,7 +595,7 @@ fn lirreq_55b_an_unsupported_lambda_body_fails_the_build() {
     // reported even though the function that takes it is perfectly eligible.
     // The unsupported body here is a static property whose TYPE is outside the
     // subset: a map keyed by a reference that is not a `String` has no `MapKey`
-    // spelling the walker can pass. (Scalar `toString` served until it joined
+    // spelling the walker can pass. (Scalar `to_string` served until it joined
     // the subset in lowered-IR interface support, any static property read until
     // lowered-IR inheritance support gave the walker the same ancestry walk
     // `emit_static_field_read` uses, and an f64-keyed map until the lowered-IR cutover

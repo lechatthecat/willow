@@ -269,7 +269,7 @@ pub fn boxed(n: i64) -> i64 {
 
 // A String-returning lambda, so a lifted body can allocate.
 pub fn label(n: i64) -> String {
-    let name: fn(i64) -> String = |x| "n=" + x.toString();
+    let name: fn(i64) -> String = |x| "n=" + x.to_string();
     return name(n);
 }
 

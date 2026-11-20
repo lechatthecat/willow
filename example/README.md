@@ -197,7 +197,7 @@ ordering:
 ```willow
 let values: Array<i64> = [5, 1, 4, 2, 3];
 let squared = parallel::map(values.freeze(), |value| value * value);
-println((await squared).toString());
+println((await squared).to_string());
 ```
 
 The v1 mapper is `fn(i64) -> i64` — a bare code address with no environment, so
@@ -218,7 +218,7 @@ zeros use the single canonical `+0.0` key. All other non-NaN numbers, including
 infinities, retain their bits. NaN keys raise the recoverable runtime panic
 `NaN cannot be used as a Map key` in `insert`, `get`, and `contains`.
 `FrozenMap` uses the same rules. Ordinary floating-point arithmetic and `==`
-keep IEEE semantics, and NaN remains valid as a map value. Map `toString()`
+keep IEEE semantics, and NaN remains valid as a map value. Map `to_string()`
 sorts entries by rendered key text for deterministic output.
 
 ## Integer arithmetic
@@ -317,31 +317,45 @@ used in arithmetic, or stored in existing `Array<i64>` values.
 | Method | Result and semantics |
 | --- | --- |
 | `substring(start: i64, end: i64)` / `slice(start: i64, end: i64)` | New `String` containing the byte range `[start, end)`. Both positions must be UTF-8 boundaries, with `0 <= start <= end <= len()`. Invalid ranges raise a recoverable panic. |
-| `find(needle: String)` | `i64` byte offset of the first exact match, or `-1`. An empty needle returns `0`. |
+| `find(needle: String)` | `Option<i64>`: `Some` byte offset of the first exact match, or `None` when absent. An empty needle returns `Some(0)`. |
 | `contains(needle: String)` | `bool` indicating an exact substring match. An empty needle always matches. |
 | `starts_with(prefix: String)` | `bool` indicating an exact prefix match. An empty prefix always matches. |
 | `split(separator: String)` | `Array<String>` of non-overlapping literal matches; preserves leading, trailing, and adjacent empty fields. Empty separator splits at Unicode scalar boundaries, including leading/trailing empty fields: `"é".split("")` gives `["", "é", ""]`, and `"".split("")` gives `["", ""]`. |
 | `trim()` | New `String` with Unicode whitespace removed from both ends. Interior whitespace is preserved. |
 | `repeat(count: i64)` | New `String` repeated `count` times; zero produces `""`. Negative counts and size overflow raise recoverable panics. |
-| `toString()` | The original `String`, unchanged. |
+| `to_string()` | The original `String`, unchanged. |
 
 Matching is case-sensitive and performs no Unicode normalization. Embedded NUL
 bytes are ordinary string content. Slicing copies bytes and does not retain the
-original allocation. `"日本語".find("本")` returns `3`, and
+original allocation. `"日本語".find("本")` returns `Some(3)`, and
 `"日本語".slice(3, 6)` returns `"本"`. Slicing at byte `1` panics because it
 would split a UTF-8 character. `split` returns a normal mutable array; an explicit
 `Array<String>` type annotation requires `import std::collections::Array;`.
 
-`String.find` deliberately retains its `i64` sentinel API for compatibility with
-existing offset arithmetic and comparisons. Unlike `Map.get`, it does not return
-an `Option`: `.unwrap_or(...)` and `Some`/`None` patterns cannot be used on its
-result. Check `index >= 0` before slicing; `0` is a successful match, and `-1`
-means absence. Use `contains` when only existence matters. See
-[string_find.wi](string_find.wi) for a runnable example.
+`String.find` reports absence as `None`, like `Map.get` and `Array.index_of`;
+no Willow API answers "not found" with a sentinel value such as `-1`. Use
+`match`, `if let Some(index) = ...` or `.unwrap_or(...)` on its result, and
+`contains` when only existence matters. See [string_find.wi](string_find.wi)
+for a runnable example.
+
+### Method naming
+
+Every builtin and `std` method and function name is `snake_case`:
+`to_string`, `is_some`, `wrapping_add`, `trim_start`, `read_to_string`.
+Types are `PascalCase` and modules are lowercase. The former `toString`
+spelling was retired without a transition period; calling it on a value that
+has `to_string` is an error that names the replacement:
+
+```text
+error[E0201]: no method `toString` on type `i64`; it was renamed to `to_string`
+```
+
+A class that declares its own `toString` keeps it; the rule covers the names
+Willow provides. See [method_naming.wi](method_naming.wi).
 
 ### Default floating-point display
 
-`println(value)`, `value.toString()`, `format("{}", value)`, and
+`println(value)`, `value.to_string()`, `format("{}", value)`, and
 `f64::to_string(value)` omit the fractional suffix for integral `f64` values:
 `2.0` displays as `2`, `0.0` as `0`, and negative zero as `-0`.
 `f64::parse` round-trips these strings, preserving negative zero's sign.

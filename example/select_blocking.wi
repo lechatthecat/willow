@@ -36,7 +36,7 @@ fn wait_for_one() {
     let ch = Channel<i64>::new();
     let p = producer(ch);
     select {
-        let v = ch.recv() => { println("got " + v.toString()); }
+        let v = ch.recv() => { println("got " + v.to_string()); }
     }
 }
 

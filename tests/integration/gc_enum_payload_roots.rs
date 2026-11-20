@@ -86,8 +86,8 @@ fn main() {
     let mut i = 0;
     let mut last = \"\";
     while i < 300 {
-        let b: Result<i64, String> = Err(\"bad\" + i.toString());
-        last = match b.map_err(bang) { Ok(v) => v.toString(), Err(e) => e };
+        let b: Result<i64, String> = Err(\"bad\" + i.to_string());
+        last = match b.map_err(bang) { Ok(v) => v.to_string(), Err(e) => e };
         i = i + 1;
     }
     println(last);
@@ -101,7 +101,7 @@ fn main() {
 #[test]
 fn gc_enum_payload_02_map_rewraps_a_produced_string() {
     assert_rooted(
-        "fn tag(n: i64) -> String { return \"v\" + n.toString(); }
+        "fn tag(n: i64) -> String { return \"v\" + n.to_string(); }
 fn main() {
     let mut i = 0;
     let mut last = \"\";
@@ -123,12 +123,12 @@ fn main() {
 #[test]
 fn gc_enum_payload_03_map_passes_the_err_string_through() {
     assert_rooted(
-        "fn tag(n: i64) -> String { return \"v\" + n.toString(); }
+        "fn tag(n: i64) -> String { return \"v\" + n.to_string(); }
 fn main() {
     let mut i = 0;
     let mut last = \"\";
     while i < 300 {
-        let c: Result<i64, String> = Err(\"keep\" + i.toString());
+        let c: Result<i64, String> = Err(\"keep\" + i.to_string());
         last = match c.map(tag) { Ok(s) => s, Err(e) => e };
         i = i + 1;
     }
@@ -149,8 +149,8 @@ fn main() {
     let mut i = 0;
     let mut last = \"\";
     while i < 300 {
-        let d: Result<String, i64> = Ok(\"held\" + i.toString());
-        last = match d.map_err(code) { Ok(s) => s, Err(e) => e.toString() };
+        let d: Result<String, i64> = Ok(\"held\" + i.to_string());
+        last = match d.map_err(code) { Ok(s) => s, Err(e) => e.to_string() };
         i = i + 1;
     }
     println(last);
@@ -172,7 +172,7 @@ fn main() {
     let mut i = 0;
     let mut last = \"\";
     while i < 300 {
-        let o: Option<String> = Some(\"opt\" + i.toString());
+        let o: Option<String> = Some(\"opt\" + i.to_string());
         last = match o.map(upper) { Some(s) => s, None => \"none\" };
         i = i + 1;
     }
@@ -188,7 +188,7 @@ fn main() {
 #[test]
 fn gc_enum_payload_06_option_and_then() {
     assert_rooted(
-        "fn tag(n: i64) -> Option<String> { return Some(\"v\" + n.toString()); }
+        "fn tag(n: i64) -> Option<String> { return Some(\"v\" + n.to_string()); }
 fn main() {
     let mut i = 0;
     let mut last = \"\";
@@ -209,7 +209,7 @@ fn main() {
 #[test]
 fn gc_enum_payload_07_result_and_then() {
     assert_rooted(
-        "fn tag(n: i64) -> String { return \"v\" + n.toString(); }
+        "fn tag(n: i64) -> String { return \"v\" + n.to_string(); }
 fn wrap(n: i64) -> Result<String, String> { return Ok(tag(n)); }
 fn main() {
     let mut i = 0;
@@ -232,12 +232,12 @@ fn main() {
 fn gc_enum_payload_08_try_propagation_builds_an_err_string() {
     assert_rooted(
         "fn split(n: i64) -> Result<i64, String> {
-    if n < 0 { return Err(\"neg\" + n.toString()); }
+    if n < 0 { return Err(\"neg\" + n.to_string()); }
     return Ok(n);
 }
 fn chain(n: i64) -> Result<String, String> {
     let v = split(n)?;
-    return Ok(\"ok\" + v.toString());
+    return Ok(\"ok\" + v.to_string());
 }
 fn main() {
     let mut i = 0;
@@ -262,14 +262,14 @@ fn main() {
 fn gc_enum_payload_09_a_user_enum_with_one_string_payload() {
     assert_rooted(
         "enum Note { Text(String), Code(i64), Empty }
-fn build(i: i64) -> Note { return Note::Text(\"n\" + i.toString()); }
+fn build(i: i64) -> Note { return Note::Text(\"n\" + i.to_string()); }
 fn main() {
     let mut i = 0;
     let mut last = \"\";
     while i < 300 {
         last = match build(i) {
             Note::Text(s) => s,
-            Note::Code(c) => c.toString(),
+            Note::Code(c) => c.to_string(),
             Note::Empty => \"empty\",
         };
         i = i + 1;
@@ -287,13 +287,13 @@ fn main() {
 fn gc_enum_payload_10_a_string_beside_a_scalar() {
     assert_rooted(
         "enum Pair { Both(String, i64), None }
-fn build(i: i64) -> Pair { return Pair::Both(\"p\" + i.toString(), i); }
+fn build(i: i64) -> Pair { return Pair::Both(\"p\" + i.to_string(), i); }
 fn main() {
     let mut i = 0;
     let mut last = \"\";
     while i < 300 {
         last = match build(i) {
-            Pair::Both(s, n) => s + \"/\" + n.toString(),
+            Pair::Both(s, n) => s + \"/\" + n.to_string(),
             Pair::None => \"none\",
         };
         i = i + 1;
@@ -311,7 +311,7 @@ fn main() {
 fn gc_enum_payload_11_two_string_payloads() {
     assert_rooted(
         "enum Two { Strings(String, String), None }
-fn build(i: i64) -> Two { return Two::Strings(\"a\" + i.toString(), \"b\" + i.toString()); }
+fn build(i: i64) -> Two { return Two::Strings(\"a\" + i.to_string(), \"b\" + i.to_string()); }
 fn main() {
     let mut i = 0;
     let mut last = \"\";
@@ -410,7 +410,7 @@ fn main() {
 fn gc_enum_interface_payload_dispatch_without_self_with_conditional_argument() {
     assert_rooted(
         "interface Greeter { fn hello(n: i64) -> String; }
-class Dog implements Greeter { pub fn hello(n: i64) -> String { return n.toString(); } }
+class Dog implements Greeter { pub fn hello(n: i64) -> String { return n.to_string(); } }
 enum Held { One(Greeter), None }
 fn build() -> Held { return Held::One(new Dog()); }
 fn choose(g: Greeter, yes: bool) -> String { return g.hello(yes ? 17 : 23); }
@@ -432,14 +432,14 @@ fn gc_enum_payload_15_a_nested_result_payload() {
         "enum Outer { Inner(Result<i64, String>), None }
 fn build(i: i64) -> Outer {
     if i % 2 == 0 { return Outer::Inner(Ok(i)); }
-    return Outer::Inner(Err(\"e\" + i.toString()));
+    return Outer::Inner(Err(\"e\" + i.to_string()));
 }
 fn main() {
     let mut i = 0;
     let mut last = \"\";
     while i < 300 {
         last = match build(i) {
-            Outer::Inner(r) => match r { Ok(v) => v.toString(), Err(e) => e },
+            Outer::Inner(r) => match r { Ok(v) => v.to_string(), Err(e) => e },
             Outer::None => \"none\",
         };
         i = i + 1;
@@ -457,7 +457,7 @@ fn main() {
 #[test]
 fn gc_enum_payload_16_a_payload_only_in_a_register() {
     assert_rooted(
-        "fn make(n: i64) -> String { return \"m\" + n.toString(); }
+        "fn make(n: i64) -> String { return \"m\" + n.to_string(); }
 enum Boxed { Held(String), None }
 fn build(i: i64) -> Boxed { return Boxed::Held(make(i)); }
 fn main() {
@@ -480,7 +480,7 @@ fn main() {
 #[test]
 fn gc_enum_payload_17_a_payload_built_by_two_allocations() {
     assert_rooted(
-        "fn make(n: i64) -> String { return \"m\" + n.toString(); }
+        "fn make(n: i64) -> String { return \"m\" + n.to_string(); }
 enum Note { Text(String), None }
 fn build(i: i64) -> Note { return Note::Text(make(i) + \"x\"); }
 fn main() {
@@ -528,7 +528,7 @@ fn main() {
 fn gc_enum_payload_19_construction_in_an_async_function() {
     assert_rooted(
         "enum Note { Text(String), None }
-async fn build(i: i64) -> Note { return Note::Text(\"a\" + i.toString()); }
+async fn build(i: i64) -> Note { return Note::Text(\"a\" + i.to_string()); }
 async fn main() {
     let mut i = 0;
     let mut last = \"\";
@@ -549,7 +549,7 @@ async fn main() {
 #[test]
 fn gc_enum_payload_20_payload_and_payload_free_variants() {
     assert_rooted(
-        "fn label(n: i64) -> String { return \"L\" + n.toString(); }
+        "fn label(n: i64) -> String { return \"L\" + n.to_string(); }
 enum Step { Next(String, i64), Stop }
 fn build(i: i64) -> Step {
     if i > 250 { return Step::Stop; }
@@ -559,11 +559,11 @@ fn main() {
     let mut i = 0;
     let mut last = \"\";
     while i < 300 {
-        last = match build(i) { Step::Next(s, n) => s + \"/\" + n.toString(), Step::Stop => \"stop\" };
+        last = match build(i) { Step::Next(s, n) => s + \"/\" + n.to_string(), Step::Stop => \"stop\" };
         i = i + 1;
     }
     println(last);
-    println(match build(10) { Step::Next(s, n) => s + \"/\" + n.toString(), Step::Stop => \"stop\" });
+    println(match build(10) { Step::Next(s, n) => s + \"/\" + n.to_string(), Step::Stop => \"stop\" });
 }
 ",
         "stop\nL10/10\n",
@@ -577,13 +577,13 @@ fn gc_enum_payload_21_the_walker_really_compiled_these() {
     assert_walker_compiled(
         "enum Note { Text(String), Code(i64), Empty }
 fn bang(e: String) -> String { return \"!\" + e; }
-fn build(i: i64) -> Note { return Note::Text(\"n\" + i.toString()); }
+fn build(i: i64) -> Note { return Note::Text(\"n\" + i.to_string()); }
 fn main() {
     let b: Result<i64, String> = Err(\"bad\");
-    println(match b.map_err(bang) { Ok(v) => v.toString(), Err(e) => e });
+    println(match b.map_err(bang) { Ok(v) => v.to_string(), Err(e) => e });
     println(match build(1) {
         Note::Text(s) => s,
-        Note::Code(c) => c.toString(),
+        Note::Code(c) => c.to_string(),
         Note::Empty => \"empty\",
     });
 }

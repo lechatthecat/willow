@@ -80,7 +80,7 @@ pub class Amount {
     pub label: String;
 
     pub fn describe(self) -> String {
-        return self.label + ":" + self.value.toString();
+        return self.label + ":" + self.value.to_string();
     }
 }
 

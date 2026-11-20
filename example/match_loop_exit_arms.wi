@@ -90,7 +90,7 @@ fn first_present(xs: Array<Option<i64>>) -> String {
         found = v;
         break;
     }
-    return "found " + found.toString() + " after " + skipped.toString();
+    return "found " + found.to_string() + " after " + skipped.to_string();
 }
 
 fn main() {

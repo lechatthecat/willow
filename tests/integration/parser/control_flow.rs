@@ -780,7 +780,7 @@ fn main() {
     println(new Label("abc").size());
     println(new Label("abc").text.len());
     println(["ab", "c"][0].len());
-    println(s.toString().len());
+    println(s.to_string().len());
     println(s.len() + 2);
     if s.len() == 4 { println(1); }
     let mut i = 0;

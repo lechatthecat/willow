@@ -377,7 +377,7 @@ pub struct GcLayoutDescriptor {
 pub mod string_concat {
     /// `value` is a WillowString payload pointer; null is the empty string.
     pub const PART_STRING: u64 = 0;
-    /// `value` is an `i64` written in decimal, as by `i64.toString()`.
+    /// `value` is an `i64` written in decimal, as by `i64.to_string()`.
     pub const PART_I64: u64 = 1;
 }
 

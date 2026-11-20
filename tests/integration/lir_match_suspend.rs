@@ -339,7 +339,7 @@ fn lir_suspend_10_gc_value_allocated_in_the_arm() {
         "async fn label(n: i64) -> String {
     match n {
         1 => {
-            let tag = \"tag-\" + n.toString();
+            let tag = \"tag-\" + n.to_string();
             await yield();
             return tag + \"!\";
         }

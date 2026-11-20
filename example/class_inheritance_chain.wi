@@ -44,7 +44,7 @@ class Leaf extends Mid {
     pub z: i64;
 
     pub fn describe(self) -> String {
-        return "Leaf: " + self.x.toString() + " " + self.y.toString() + " " + self.z.toString();
+        return "Leaf: " + self.x.to_string() + " " + self.y.to_string() + " " + self.z.to_string();
     }
 }
 
@@ -52,5 +52,5 @@ fn main() {
     // The memberwise constructor takes the fields root-first: x, y, z.
     let leaf = new Leaf(1, 2, 3);
     println(leaf.describe());
-    println("sum: " + (leaf.sum() + leaf.y + leaf.z).toString());
+    println("sum: " + (leaf.sum() + leaf.y + leaf.z).to_string());
 }

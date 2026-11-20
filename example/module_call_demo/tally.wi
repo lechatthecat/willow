@@ -16,7 +16,7 @@ pub class Entry {
     }
 
     pub fn describe(self) -> String {
-        return self.label + "=" + self.score.toString();
+        return self.label + "=" + self.score.to_string();
     }
 }
 
@@ -33,7 +33,7 @@ pub fn is_even(n: i64) -> bool {
 }
 
 pub fn label(name: String, score: i64) -> String {
-    return name + ": " + score.toString();
+    return name + ": " + score.to_string();
 }
 
 pub fn entry(name: String, score: i64) -> Entry {

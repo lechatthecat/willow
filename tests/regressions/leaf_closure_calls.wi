@@ -30,7 +30,7 @@ fn divider(n: i64) -> fn(i64) -> i64 {
 
 // Not a leaf: it allocates a string.
 fn labeller(prefix: String) -> fn(i64) -> String {
-    return |v: i64| { return prefix + v.toString(); };
+    return |v: i64| { return prefix + v.to_string(); };
 }
 
 fn main() {

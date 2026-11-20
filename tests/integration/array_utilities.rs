@@ -33,12 +33,12 @@ fn array_utilities_values_and_boundaries() {
         ),
         (
             "insertion positions",
-            "let a: Array<i64> = []; a.insert(0, 2); a.insert(0, 1); a.insert(2, 4); a.insert(2, 3); println(a.toString());",
+            "let a: Array<i64> = []; a.insert(0, 2); a.insert(0, 1); a.insert(2, 4); a.insert(2, 3); println(a.to_string());",
             "[1, 2, 3, 4]\n",
         ),
         (
             "removal positions",
-            "let a = [1, 2, 3, 4]; println(a.remove(0)); println(a.remove(1)); println(a.remove(1)); println(a.toString());",
+            "let a = [1, 2, 3, 4]; println(a.remove(0)); println(a.remove(1)); println(a.remove(1)); println(a.to_string());",
             "1\n3\n4\n[2]\n",
         ),
         (
@@ -68,47 +68,47 @@ fn array_utilities_values_and_boundaries() {
         ),
         (
             "duplicate sort",
-            "let a = [2, 1, 2, 1, 2]; a.sort(); println(a.toString());",
+            "let a = [2, 1, 2, 1, 2]; a.sort(); println(a.to_string());",
             "[1, 1, 2, 2, 2]\n",
         ),
         (
             "sorted sort",
-            "let a = [1, 2, 3, 4, 5]; a.sort(); println(a.toString());",
+            "let a = [1, 2, 3, 4, 5]; a.sort(); println(a.to_string());",
             "[1, 2, 3, 4, 5]\n",
         ),
         (
             "reverse even sort",
-            "let a = [6, 5, 4, 3, 2, 1]; a.sort(); println(a.toString());",
+            "let a = [6, 5, 4, 3, 2, 1]; a.sort(); println(a.to_string());",
             "[1, 2, 3, 4, 5, 6]\n",
         ),
         (
             "integer extremes",
-            "let a = [9223372036854775807, -9223372036854775807 - 1, 0]; a.sort(); println(a.toString());",
+            "let a = [9223372036854775807, -9223372036854775807 - 1, 0]; a.sort(); println(a.to_string());",
             "[-9223372036854775808, 0, 9223372036854775807]\n",
         ),
         (
             "floating order",
-            "let a = [2.5, -1.0, 0.0, 2.5]; a.sort(); println(a.toString());",
+            "let a = [2.5, -1.0, 0.0, 2.5]; a.sort(); println(a.to_string());",
             "[-1, 0, 2.5, 2.5]\n",
         ),
         (
             "descending comparator",
-            "let a = [1, 4, 2, 3]; a.sort_by(|a, b| a > b); println(a.toString());",
+            "let a = [1, 4, 2, 3]; a.sort_by(|a, b| a > b); println(a.to_string());",
             "[4, 3, 2, 1]\n",
         ),
         (
             "boolean comparator",
-            "let a = [true, false, true, false]; a.sort_by(|a, b| !a && b); println(a.toString());",
+            "let a = [true, false, true, false]; a.sort_by(|a, b| !a && b); println(a.to_string());",
             "[false, false, true, true]\n",
         ),
         (
             "swap and same slot",
-            "let a = [1, 2, 3]; a.swap(0, 2); a.swap(1, 1); println(a.toString());",
+            "let a = [1, 2, 3]; a.swap(0, 2); a.swap(1, 1); println(a.to_string());",
             "[3, 2, 1]\n",
         ),
         (
             "fixed array nonresizing",
-            "let a: [i64; 3] = [3, 1, 2]; a.sort(); a.swap(0, 2); println(a.slice(0, 3).toString()); a.fill(8); println(a[1]);",
+            "let a: [i64; 3] = [3, 1, 2]; a.sort(); a.swap(0, 2); println(a.slice(0, 3).to_string()); a.fill(8); println(a[1]);",
             "[3, 2, 1]\n8\n",
         ),
         (
@@ -118,7 +118,7 @@ fn array_utilities_values_and_boundaries() {
         ),
         (
             "aliased construction",
-            "let a = Items::with_len(2, 3); println(a.toString());",
+            "let a = Items::with_len(2, 3); println(a.to_string());",
             "[3, 3]\n",
         ),
     ] {

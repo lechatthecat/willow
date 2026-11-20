@@ -44,7 +44,7 @@ const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 const PAD: &str = "    let mut padding = \"\";
     let mut p = 0;
     while p < 120 {
-        padding = \"pad \" + p.toString();
+        padding = \"pad \" + p.to_string();
         p = p + 1;
     }
 ";
@@ -82,7 +82,7 @@ fn channel_element_01_annotated_string_round_trip() {
     let ch: Channel<String> = Channel::new();
     let mut i = 0;
     while i < count {{
-        ch.send(\"value \" + i.toString());
+        ch.send(\"value \" + i.to_string());
         i = i + 1;
     }}
 {PAD}    let mut out = \"\";
@@ -112,7 +112,7 @@ fn channel_element_02_explicit_type_argument_unchanged() {
     let ch = Channel<String>::new();
     let mut i = 0;
     while i < count {{
-        ch.send(\"value \" + i.toString());
+        ch.send(\"value \" + i.to_string());
         i = i + 1;
     }}
 {PAD}    let mut out = \"\";
@@ -152,7 +152,7 @@ fn channel_element_03_annotated_i64_stays_a_scalar() {
     }}
     return sum;
 }}
-async fn main() {{ println((await total(5)).toString()); }}
+async fn main() {{ println((await total(5)).to_string()); }}
 "
         ),
         "30\n",
@@ -175,7 +175,7 @@ fn channel_element_04_annotated_bool() {
 {PAD}    let mut out = \"\";
     let mut k = 0;
     while k < 3 {{
-        out = out + ch.recv().toString() + \";\";
+        out = out + ch.recv().to_string() + \";\";
         k = k + 1;
     }}
     return out;
@@ -200,7 +200,7 @@ fn channel_element_05_annotated_f64() {
 {PAD}    let mut out = \"\";
     let mut k = 0;
     while k < 2 {{
-        out = out + ch.recv().toString() + \";\";
+        out = out + ch.recv().to_string() + \";\";
         k = k + 1;
     }}
     return out;
@@ -228,7 +228,7 @@ async fn notes(count: i64) -> String {{
     let ch: Channel<Note> = Channel::new();
     let mut i = 0;
     while i < count {{
-        ch.send(new Note(\"note \" + i.toString(), i));
+        ch.send(new Note(\"note \" + i.to_string(), i));
         i = i + 1;
     }}
 {PAD}    let mut out = \"\";
@@ -240,7 +240,7 @@ async fn notes(count: i64) -> String {{
         out = out + note.text + \";\";
         k = k + 1;
     }}
-    return sum.toString() + \" \" + out;
+    return sum.to_string() + \" \" + out;
 }}
 async fn main() {{ println(await notes(4)); }}
 "
@@ -289,7 +289,7 @@ fn channel_element_08_deep_buffer_across_a_collection() {
     let ch: Channel<String> = Channel::new();
     let mut i = 0;
     while i < count {{
-        ch.send(\"v\" + i.toString());
+        ch.send(\"v\" + i.to_string());
         i = i + 1;
     }}
 {PAD}    let mut first = \"\";
@@ -382,7 +382,7 @@ fn channel_element_11_two_element_types_side_by_side() {
     let b = counts.recv();
     let c = words.recv();
     let d = counts.recv();
-    return a + \"/\" + b.toString() + \"/\" + c + \"/\" + d.toString();
+    return a + \"/\" + b.to_string() + \"/\" + c + \"/\" + d.to_string();
 }}
 async fn main() {{ println(await both()); }}
 "
@@ -448,14 +448,14 @@ fn channel_element_14_buffer_reused_after_a_drain() {
     let mut padding = \"\";
     let mut p = 0;
     while p < 60 {
-        padding = \"pad \" + p.toString();
+        padding = \"pad \" + p.to_string();
         p = p + 1;
     }
     let a = ch.recv();
     ch.send(\"second \" + \"round\");
     p = 0;
     while p < 60 {
-        padding = \"pad \" + p.toString();
+        padding = \"pad \" + p.to_string();
         p = p + 1;
     }
     let b = ch.recv();
@@ -484,7 +484,7 @@ async fn rows() -> String {{
     ch.send(second);
 {PAD}    let a = ch.recv();
     let b = ch.recv();
-    return a.len().toString() + \"/\" + b.len().toString() + \"/\" + a[2].toString();
+    return a.len().to_string() + \"/\" + b.len().to_string() + \"/\" + a[2].to_string();
 }}
 async fn main() {{ println(await rows()); }}
 "
@@ -519,7 +519,7 @@ fn channel_element_16_no_annotation_stays_void() {
 fn channel_element_17_constructor_argument_uses_field_context() {
     assert_channels(
         &format!(
-            "class Hub {{ pub inbox: Channel<String>; }}\nasync fn main() {{\nlet hub = new Hub(Channel::new());\nhub.inbox.send(\"x\" + 1.toString());\n{PAD}println(hub.inbox.recv());\n}}"
+            "class Hub {{ pub inbox: Channel<String>; }}\nasync fn main() {{\nlet hub = new Hub(Channel::new());\nhub.inbox.send(\"x\" + 1.to_string());\n{PAD}println(hub.inbox.recv());\n}}"
         ),
         "x1\n",
         &["main"],
@@ -542,7 +542,7 @@ fn channel_element_18_with_capacity_infers_from_the_annotation() {
     let ch: Channel<String> = Channel::with_capacity(8);
     let mut i = 0;
     while i < 4 {{
-        ch.send(\"held \" + i.toString());
+        ch.send(\"held \" + i.to_string());
         i = i + 1;
     }}
 {PAD}    let mut out = \"\";
@@ -566,7 +566,7 @@ fn channel_element_18_with_capacity_infers_from_the_annotation() {
 fn channel_element_18b_with_capacity_uses_field_context() {
     assert_channels(
         &format!(
-            "class Hub {{ pub inbox: Channel<String>; }}\nasync fn main() {{\nlet hub = new Hub(Channel::with_capacity(4));\nhub.inbox.send(\"x\" + 1.toString());\n{PAD}println(hub.inbox.recv());\n}}"
+            "class Hub {{ pub inbox: Channel<String>; }}\nasync fn main() {{\nlet hub = new Hub(Channel::with_capacity(4));\nhub.inbox.send(\"x\" + 1.to_string());\n{PAD}println(hub.inbox.recv());\n}}"
         ),
         "x1\n",
         &["main"],
@@ -584,7 +584,7 @@ fn channel_element_19_bounded_channel_traces_its_buffer() {
     let ch = Channel<String>::with_capacity(64);
     let mut i = 0;
     while i < count {{
-        ch.send(\"value \" + i.toString());
+        ch.send(\"value \" + i.to_string());
         i = i + 1;
     }}
 {PAD}    let mut out = \"\";

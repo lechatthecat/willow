@@ -1,7 +1,7 @@
 // Fused String concatenation.
 //
-// A chain such as `a + ":" + n.toString() + ":" + b` used to allocate one
-// intermediate String per `+` and one more per `toString()`, copying the
+// A chain such as `a + ":" + n.to_string() + ":" + b` used to allocate one
+// intermediate String per `+` and one more per `to_string()`, copying the
 // growing prefix every time. The compiler now lowers a chain whose
 // intermediates are temporaries to ONE runtime call that sums the part sizes,
 // allocates the result once, and formats each i64 operand's decimal digits
@@ -20,30 +20,30 @@ fn main() {
     let name = "willow";
     let version = 8;
     let build = -29;
-    println(name + " v" + version.toString() + " build " + build.toString() + "!");
+    println(name + " v" + version.to_string() + " build " + build.to_string() + "!");
 
     // Left-to-right evaluation is unchanged.
-    let order = trace("a") + trace("b") + 1.toString() + trace("c");
+    let order = trace("a") + trace("b") + 1.to_string() + trace("c");
     println(order);
 
     // Empty and non-ASCII operands are copied byte for byte.
     let empty = "";
     println("[" + empty + "é水" + empty + "🌲" + "]");
 
-    // Integer extremes format exactly like toString().
+    // Integer extremes format exactly like to_string().
     let min = -9223372036854775807 - 1;
-    println("min=" + min.toString() + " max=" + 9223372036854775807.toString());
+    println("min=" + min.to_string() + " max=" + 9223372036854775807.to_string());
 
     // A named intermediate is still its own value.
-    let left = "L" + version.toString();
-    println(left + "|" + left + "|" + left.len().toString());
+    let left = "L" + version.to_string();
+    println(left + "|" + left + "|" + left.len().to_string());
 
     // A loop that appends several parts per iteration builds each step with
     // one allocation instead of one per `+`.
     let mut csv = "";
     let mut i = 0;
     while i < 5 {
-        csv = csv + i.toString() + "=" + (i * i).toString() + ";";
+        csv = csv + i.to_string() + "=" + (i * i).to_string() + ";";
         i = i + 1;
     }
     println(csv);

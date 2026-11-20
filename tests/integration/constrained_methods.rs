@@ -5,7 +5,7 @@ fn constrained_methods_scalar_domains_execute() {
     let source = r#"
 class Box<T> {
     pub value: T;
-    pub fn render() -> String where T: i64 | f64 | bool | String { return self.value.toString(); }
+    pub fn render() -> String where T: i64 | f64 | bool | String { return self.value.to_string(); }
     pub fn suffix(s: String) -> String where T: String { return self.value + s; }
     pub fn get() -> T { return self.value; }
 }
@@ -55,8 +55,8 @@ fn main() {
     let frozen = xs.freeze();
     xs[0] = [9];
     println(frozen[0][0]);
-    println([true, false].toString());
-    println([1.5, 2.0].toString());
+    println([true, false].to_string());
+    println([1.5, 2.0].to_string());
 }
 "#;
     for run in [
@@ -208,7 +208,7 @@ fn cell(xs: Array<Cell>) -> Cell {
 fn main() {
     let xs: Array<i64> = [];
     receiver(xs).push(argument(xs));
-    println(xs.toString());
+    println(xs.to_string());
     let cells = [new Cell("first")];
     cells.push(cell(cells));
     gc_collect();

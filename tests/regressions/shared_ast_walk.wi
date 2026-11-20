@@ -95,7 +95,7 @@ fn hidden_in_nested_statement(n: i64) -> i64 {
 // ── Each hazard is recovered by its caller ──
 
 fn attempt(label: String, value: i64) {
-    println(label + " survived with " + value.toString());
+    println(label + " survived with " + value.to_string());
 }
 
 fn run_ternary() {

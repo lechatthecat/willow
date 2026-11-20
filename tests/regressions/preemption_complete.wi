@@ -14,5 +14,5 @@ async fn main() {
     let values: Array<i64> = Array::new();
     values.push(read(new Box(40)));
     values.push(apply(increment, 40));
-    println((await parallel::map(values.freeze(), increment)).toString());
+    println((await parallel::map(values.freeze(), increment)).to_string());
 }

@@ -257,7 +257,7 @@ fn main() { println(new Sum().total(4)); }",
 fn lir_self_10_inside_a_match_arm() {
     assert_project_output(
         "class Grade {
-    pub static fn label(n: i64) -> String { return \"n\" + n.toString(); }
+    pub static fn label(n: i64) -> String { return \"n\" + n.to_string(); }
     pub fn of(self, kind: i64) -> String {
         match kind {
             0 => { return Self::label(0); }
@@ -370,7 +370,7 @@ async fn main() { println(await new Slow(21).doubled()); }",
 fn lir_self_16_an_allocating_static_under_gc_stress() {
     let src = "class Naming {
     pub n: i64;
-    pub static fn tag(v: i64) -> String { return \"tag-\" + v.toString(); }
+    pub static fn tag(v: i64) -> String { return \"tag-\" + v.to_string(); }
     pub fn named(self) -> String { return Self::tag(self.n) + \"!\"; }
 }
 
@@ -522,7 +522,7 @@ fn lir_self_24_an_implicit_self_method_satisfies_an_interface() {
 
 class Ticket implements Describes {
     pub seat: i64;
-    pub fn describe() -> String { return \"seat \" + self.seat.toString(); }
+    pub fn describe() -> String { return \"seat \" + self.seat.to_string(); }
 }
 
 fn spoken() -> String {

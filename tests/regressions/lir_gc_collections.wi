@@ -6,7 +6,7 @@
 // `Array<T>` and `String`, so a collection local uses the same
 // entry-allocated, entry-rooted stack slot, and a receiver is kept rooted
 // across every runtime call that can allocate — an insert that builds its key,
-// a `toString` that builds a String, a `freeze` that copies.
+// a `to_string` that builds a String, a `freeze` that copies.
 //
 // One restriction is deliberate and visible in what this program does NOT do:
 // a map key is a `String` or a scalar, never another reference type. The
@@ -97,11 +97,11 @@ fn main() {
     let words: Array<String> = ["alpha", "beta", "gamma"];
     let m = counts(words.freeze());
     println(m.len());
-    println(m.toString());
+    println(m.to_string());
     println(m.contains("beta:1"));
     println(m.contains("delta:1"));
 
-    println(lookup_table().toString());
+    println(lookup_table().to_string());
 
     let frozen = snapshot(m);
     println(frozen.len());

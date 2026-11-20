@@ -27,7 +27,7 @@ fn positive(value: i64) -> Result<i64, String> {
 
 fn describe_panic() {
     defer match recover() {
-        Some(info) => println(info.message + " at line " + info.line.toString()),
+        Some(info) => println(info.message + " at line " + info.line.to_string()),
         None => {}
     }
     panic("boom");
@@ -36,7 +36,7 @@ fn describe_panic() {
 fn cleanup(value: i64) {
     defer {
         let doubled = value * 2;
-        println("cleaned up " + doubled.toString());
+        println("cleaned up " + doubled.to_string());
     }
 }
 

@@ -746,7 +746,7 @@ fn main() {
     let mut labels: Array<String> = [];
     let mut i = 0;
     while i < 20 {
-        labels.push("row " + i.toString());
+        labels.push("row " + i.to_string());
         i = i + 1;
     }
     println(labels.len());

@@ -6,8 +6,8 @@ fn builtin_method_diagnostic_receivers_and_names() {
     for (receiver, ty, available) in [
         ("s", "String", "substring"),
         ("n", "i64", "wrapping_add"),
-        ("f", "f64", "toString"),
-        ("b", "bool", "toString"),
+        ("f", "f64", "to_string"),
+        ("b", "bool", "to_string"),
         ("a", "Array<i64>", "push"),
         ("m", "Map<String, i64>", "insert"),
     ] {
@@ -32,7 +32,8 @@ fn builtin_method_diagnostic_receivers_and_names() {
 #[test]
 fn builtin_method_diagnostic_call_origins() {
     for (prefix, receiver, ty) in [
-        ("", "\"abc\".find(\"b\")", "i64"),
+        ("", "\"abc\".len()", "i64"),
+        ("", "\"abc\".find(\"b\")", "Option<i64>"),
         ("", "\"abc\".trim()", "String"),
         ("", "\"abc\".contains(\"b\")", "bool"),
         ("fn value() -> f64 { return 1.0; }", "value()", "f64"),
@@ -70,7 +71,7 @@ fn builtin_method_diagnostic_output_scales_linearly() {
     for count in [1, 8, 64, 256] {
         let source = format!(
             "fn main() {{ {} }}",
-            "\"abc\".find(\"b\").unwrap_or(0);".repeat(count)
+            "\"abc\".len().unwrap_or(0);".repeat(count)
         );
         let diagnostics = check_source(&source);
         assert_eq!(diagnostics.len(), count);
@@ -80,7 +81,7 @@ fn builtin_method_diagnostic_output_scales_linearly() {
         );
         assert_eq!(
             diagnostics.iter().map(|d| d.helps.len()).sum::<usize>(),
-            2 * count
+            count
         );
     }
 }
@@ -89,7 +90,7 @@ fn builtin_method_diagnostic_output_scales_linearly() {
 fn generic_parameter_method_diagnostics_declaration_shapes() {
     // Five receiver shapes by four names exercise twenty independent cases.
     for receiver in ["x", "xs.pop()", "identity(x)", "xs[0]", "(x)"] {
-        for method in ["unwrap", "missing", "toString", "len"] {
+        for method in ["unwrap", "missing", "to_string", "len"] {
             let source = format!(
                 "import std::collections::Array; fn identity<T>(x: T) -> T {{ return x; }} fn bad<T>(x: T, xs: Array<T>) {{ {receiver}.{method}(); }}"
             );
@@ -206,8 +207,8 @@ fn option_method_diagnostics_existing_payload_methods() {
         ("", "String", "substring", ""),
         ("", "i64", "checked_add", "1"),
         ("", "i64", "wrapping_neg", ""),
-        ("", "f64", "toString", ""),
-        ("", "bool", "toString", ""),
+        ("", "f64", "to_string", ""),
+        ("", "bool", "to_string", ""),
         (
             "class Node { pub fn get(self) -> i64 { return 1; } }",
             "Node",

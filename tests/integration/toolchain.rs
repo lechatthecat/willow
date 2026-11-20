@@ -1590,7 +1590,7 @@ fn parse(text: String) -> Result<i64, ParseIntError> {
 fn display(text: String) -> String {
     let result: Result<i64, ParseIntError> = parse(text);
     return match result {
-        Result::Ok(value) => value.toString(),
+        Result::Ok(value) => value.to_string(),
         Result::Err(error) => match error { ParseIntError::Invalid(message) => "invalid", },
     };
 }
@@ -1611,7 +1611,7 @@ fn main() {
         r#"
     println(true ? i64::parse("7").unwrap() : 0);
     println(false ? 0 : i64::parse("8").unwrap());
-    println(i64::parse((-42).toString()).unwrap() + 43);
+    println(i64::parse((-42).to_string()).unwrap() + 43);
     println(true ? f64::parse("2.5").unwrap() : 0.0);
 }
 "#,
@@ -1652,7 +1652,7 @@ fn test_i64_parse_gc_stress() {
 fn main() {
     let mut sum = 0;
     for i in 0..100 {
-        let text = i.toString();
+        let text = i.to_string();
         let result = i64::parse(text);
         let error = i64::parse(text + "x");
         sum += result.unwrap();

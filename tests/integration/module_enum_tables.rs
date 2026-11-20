@@ -241,7 +241,7 @@ pub fn repeated(n: i64) -> String {
 pub fn chained(n: i64) -> String {
     let c = signal::chain_of(n);
     let filler: String = "!" + "!";
-    return signal::own_depth(n).toString() + filler;
+    return signal::own_depth(n).to_string() + filler;
 }
 "#;
 

@@ -4771,7 +4771,7 @@ fn pow_type_08_bool_operands_are_rejected() {
 }
 
 // Perspective 9: `String ** String` is rejected with the exponent message,
-// not the string-concatenation `toString()` help.
+// not the string-concatenation `to_string()` help.
 #[test]
 fn pow_type_09_string_operands_are_rejected() {
     let errors = pow_errors_ignoring_gate("fn main() { let x = \"a\" ** \"b\"; }");
@@ -4787,7 +4787,7 @@ fn pow_type_09_string_operands_are_rejected() {
         !diagnostic
             .helps
             .iter()
-            .any(|help| help.contains("toString")),
+            .any(|help| help.contains("to_string")),
         "{diagnostic:?}"
     );
 }

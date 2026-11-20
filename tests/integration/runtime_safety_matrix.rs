@@ -496,7 +496,7 @@ fn rsm_20_while_string_capture_survives_gc_stress() {
 async fn main() {
     let mut i = 0;
     while i < 3 {
-        let text = "item-" + i.toString();
+        let text = "item-" + i.to_string();
         defer println(text);
         let noise = "a" + "b";
         println(noise);
@@ -582,7 +582,7 @@ fn rsm_26_absent_array_must_be_unwrapped_before_freeze() {
 #[test]
 fn rsm_27_absent_array_must_be_unwrapped_before_to_string() {
     assert_unhandled_fault(
-        &absent_i64_array_program("println(values.toString());"),
+        &absent_i64_array_program("println(values.to_string());"),
         false,
         "called `Option::unwrap()` on a `None` value",
     );
@@ -780,7 +780,7 @@ fn rsm_38_gc_all_and_one_poll_budget_keep_defer_operands_alive() {
 async fn main() {
     let mut i = 0;
     while i < 5 {
-        let value = "v" + i.toString();
+        let value = "v" + i.to_string();
         defer println(value);
         await sleep(0);
         i = i + 1;
@@ -1461,11 +1461,11 @@ fn rsm_69_while_array_operand_survives_gc_stress() {
     assert_async_output(
         r#"
 import std::collections::Array;
-fn show(values: Array<String>) { println(values.toString()); }
+fn show(values: Array<String>) { println(values.to_string()); }
 async fn main() {
     let mut i = 0;
     while i < 2 {
-        let values: Array<String> = ["v" + i.toString()];
+        let values: Array<String> = ["v" + i.to_string()];
         defer show(values);
         let noise = "g" + "c";
         println(noise);
@@ -1513,7 +1513,7 @@ fn rsm_71_release_absent_array_index_requires_unwrap() {
 #[test]
 fn rsm_72_release_absent_array_to_string_requires_unwrap() {
     assert_unhandled_fault(
-        &absent_i64_array_program("println(values.toString());"),
+        &absent_i64_array_program("println(values.to_string());"),
         true,
         "called `Option::unwrap()` on a `None` value",
     );
@@ -1572,7 +1572,7 @@ fn rsm_76_absent_reference_array_to_string_requires_unwrap() {
 import std::collections::Array;
 fn main() {
     let values: Option<Array<String>> = None;
-    println(values.unwrap().toString());
+    println(values.unwrap().to_string());
 }
 "#,
         false,
@@ -1721,7 +1721,7 @@ fn rsm_85_absent_bool_array_to_string_requires_unwrap() {
 import std::collections::Array;
 fn main() {
     let values: Option<Array<bool>> = None;
-    println(values.unwrap().toString());
+    println(values.unwrap().to_string());
 }
 "#,
         false,
@@ -2191,7 +2191,7 @@ fn rsm_102_cancelled_array_defer_survives_gc_stress() {
     assert_async_output(
         r#"
 import std::collections::Array;
-fn show(values: Array<String>) { println(values.toString()); }
+fn show(values: Array<String>) { println(values.to_string()); }
 async fn waiting(ready: Channel<i64>) {
     let values: Array<String> = ["left" + "-value", "right" + "-value"];
     defer show(values);

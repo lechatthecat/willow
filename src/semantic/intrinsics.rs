@@ -1,6 +1,6 @@
 //! Resolved identity for Willow's builtin methods (shared compiler infrastructure, catalog item 7).
 //!
-//! A call like `ch.recv()` or `arr.toString()` is not a user method call: it is
+//! A call like `ch.recv()` or `arr.to_string()` is not a user method call: it is
 //! a compiler intrinsic that lowers to a specific runtime symbol. Deciding
 //! *which* intrinsic a call denotes used to be done by comparing the method
 //! name and the receiver's type name against string literals, and that decision
@@ -14,7 +14,7 @@
 //!
 //! Four string waterfalls answering the same question is four chances to
 //! disagree, and they did: the backend's type walk knew `Array::freeze` but not
-//! `Array::toString`, typed `Map::toString` as `void`, and did not know
+//! `Array::to_string`, typed `Map::to_string` as `void`, and did not know
 //! `Task::result` at all. Those gaps were masked only because the checker's
 //! span→type side-map takes priority over the structural walk for expressions
 //! that appear in source.
@@ -54,11 +54,11 @@ use willow_abi::runtime_symbols::names as rt;
 /// enumerated exhaustively by [`Intrinsic::ALL`] for round-trip tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Intrinsic {
-    /// `i64.toString()` → `willow_i64_to_string`.
+    /// `i64.to_string()` → `willow_i64_to_string`.
     I64ToString,
-    /// `f64.toString()` → `willow_f64_to_string`.
+    /// `f64.to_string()` → `willow_f64_to_string`.
     F64ToString,
-    /// `bool.toString()` → `willow_bool_to_string`.
+    /// `bool.to_string()` → `willow_bool_to_string`.
     BoolToString,
     /// `i64.wrapping_add(i64)`: two's-complement `+` in every build mode. Inline, like the
     /// other explicit overflow operations.
@@ -77,7 +77,7 @@ pub enum Intrinsic {
     I64CheckedMul,
     /// `i64.checked_neg()` → `Option<i64>`, `None` for `i64::MIN`.
     I64CheckedNeg,
-    /// `String.toString()` — the identity, and the only intrinsic that emits no
+    /// `String.to_string()` — the identity, and the only intrinsic that emits no
     /// code at all.
     StringToString,
     /// UTF-8 byte length, excluding the trailing NUL.
@@ -86,6 +86,9 @@ pub enum Intrinsic {
     StringByteAt,
     StringSplit,
     StringContains,
+    /// `String.find(needle)` → `Option<i64>`: the first byte offset, `None`
+    /// when absent. The runtime call answers `-1` for absence (an ABI detail);
+    /// the lowering turns that into the inline `Option<i64>` pair.
     StringFind,
     StringEndsWith,
     StringReplace,
@@ -184,7 +187,7 @@ pub enum Intrinsic {
     MapContains,
     /// `Map<K, V>::len()`.
     MapLen,
-    /// `Map<K, V>::toString()` → `"{k: v, ...}"` sorted by key.
+    /// `Map<K, V>::to_string()` → `"{k: v, ...}"` sorted by key.
     MapToString,
     /// `Map<K, V>::freeze()` → `FrozenMap<K, V>`.
     MapFreeze,
@@ -327,6 +330,75 @@ impl Intrinsic {
         Intrinsic::FrozenMapContains,
         Intrinsic::FrozenMapLen,
     ];
+
+    /// The source-level method names [`resolve`] maps to this intrinsic. The
+    /// match is exhaustive, so a new builtin method cannot skip the naming
+    /// inventory (`public_builtin_names_are_snake_case`). `__abi_*` names are
+    /// private `std` plumbing, not public API.
+    #[cfg(test)]
+    pub fn source_names(self) -> &'static [&'static str] {
+        use Intrinsic::*;
+        match self {
+            I64ToString | F64ToString | BoolToString | StringToString | MapToString => {
+                &["to_string"]
+            }
+            I64WrappingAdd => &["wrapping_add"],
+            I64WrappingSub => &["wrapping_sub"],
+            I64WrappingMul => &["wrapping_mul"],
+            I64WrappingNeg => &["wrapping_neg"],
+            I64CheckedAdd => &["checked_add"],
+            I64CheckedSub => &["checked_sub"],
+            I64CheckedMul => &["checked_mul"],
+            I64CheckedNeg => &["checked_neg"],
+            StringLen | FrozenArrayLen | MapLen | FrozenMapLen => &["len"],
+            StringSubstring => &["substring", "slice"],
+            StringByteAt => &["byte_at"],
+            StringSplit => &["split"],
+            StringContains | MapContains | FrozenMapContains => &["contains"],
+            StringFind => &["find"],
+            StringEndsWith => &["ends_with"],
+            StringReplace => &["replace"],
+            StringTrimStart => &["trim_start"],
+            StringTrimEnd => &["trim_end"],
+            StringToLower => &["to_lower"],
+            StringToUpper => &["to_upper"],
+            StringTrim => &["trim"],
+            StringRepeat => &["repeat"],
+            StringStartsWith => &["starts_with"],
+            TaskCancel | TokenCancel | ScopeCancel => &["cancel"],
+            TaskIsCancelled | TokenIsCancelled | ScopeIsCancelled => &["is_cancelled"],
+            TaskResult => &["result"],
+            TokenChild | ScopeChild => &["child"],
+            TokenAttach => &["attach"],
+            ScopeAdd => &["add"],
+            ScopeFinish => &["finish"],
+            AtomicLoad => &["load"],
+            AtomicStore => &["store"],
+            AtomicSwap => &["swap"],
+            AtomicCompareExchange => &["compare_exchange"],
+            AtomicAdd => &["add"],
+            AtomicSub => &["sub"],
+            CellGet | MapGet | FrozenMapGet => &["get"],
+            CellSet => &["set"],
+            RwCellRead => &["read"],
+            RwCellWrite => &["write"],
+            ChannelSend => &["send"],
+            ChannelRecv => &["recv"],
+            ChannelRecvOpt => &["recv_opt"],
+            ChannelClose => &["close"],
+            ArrayLen => &["__abi_len"],
+            StringConcatArray => &["__abi_concat"],
+            ArrayResize => &["__abi_resize"],
+            StringDebug => &["__abi_debug"],
+            ArrayCopy => &["__abi_copy"],
+            MapInsert => &["insert"],
+            MapRemove => &["remove"],
+            MapKeys => &["keys"],
+            MapValues => &["values"],
+            MapEntries => &["entries"],
+            MapFreeze => &["freeze"],
+        }
+    }
 
     /// Whether lowering this intrinsic can suspend the calling task.
     ///
@@ -681,7 +753,7 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
             ("substring" | "slice", 2) => Some((Intrinsic::StringSubstring, Type::String)),
             ("split", 1) => Some((Intrinsic::StringSplit, Type::Array(Box::new(Type::String)))),
             ("contains", 1) => Some((Intrinsic::StringContains, Type::Bool)),
-            ("find", 1) => Some((Intrinsic::StringFind, Type::I64)),
+            ("find", 1) => Some((Intrinsic::StringFind, B::Option.apply(vec![Type::I64]))),
             ("ends_with", 1) => Some((Intrinsic::StringEndsWith, Type::Bool)),
             ("replace", 2) => Some((Intrinsic::StringReplace, Type::String)),
             ("trim_start", 0) => Some((Intrinsic::StringTrimStart, Type::String)),
@@ -716,8 +788,8 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
             return Some(ResolvedMethod::fixed(intrinsic, ty));
         }
     }
-    // Scalar `toString` conversions.
-    if method == "toString" && arity == 0 {
+    // Scalar `to_string` conversions.
+    if method == "to_string" && arity == 0 {
         match recv {
             Type::I64 => return Some(ResolvedMethod::fixed(Intrinsic::I64ToString, Type::String)),
             Type::F64 => return Some(ResolvedMethod::fixed(Intrinsic::F64ToString, Type::String)),
@@ -904,7 +976,7 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
             )),
             ("contains", 1) => Some(ResolvedMethod::fixed(Intrinsic::MapContains, Type::Bool)),
             ("len", 0) => Some(ResolvedMethod::fixed(Intrinsic::MapLen, Type::I64)),
-            ("toString", 0) => Some(ResolvedMethod::fixed(Intrinsic::MapToString, Type::String)),
+            ("to_string", 0) => Some(ResolvedMethod::fixed(Intrinsic::MapToString, Type::String)),
             ("freeze", 0) => Some(ResolvedMethod::fixed(
                 Intrinsic::MapFreeze,
                 B::FrozenMap.apply(args.to_vec()),
@@ -931,6 +1003,21 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
     }
 }
 
+/// Builtin and `std` method names retired by the naming rule: every public
+/// method and function name is `snake_case`. A call written with the old name
+/// on a receiver that has the new one is rejected with a diagnostic naming the
+/// replacement; there is no deprecation period because no released code
+/// depends on the old spelling. A type that declares the old name itself keeps
+/// it: user names are the user's.
+const RENAMED_METHODS: &[(&str, &str)] = &[("toString", "to_string")];
+
+/// The current name of a retired builtin method name, if `old` is one.
+pub(crate) fn renamed_method(old: &str) -> Option<&'static str> {
+    RENAMED_METHODS
+        .iter()
+        .find_map(|&(retired, current)| (retired == old).then_some(current))
+}
+
 /// Convenience wrapper for callers that only want the intrinsic identity.
 pub fn resolve_intrinsic<N: builtin_types::TypeName + Clone + From<&'static str>>(
     recv: &Type<N>,
@@ -954,7 +1041,7 @@ mod tests {
             ("slice", 2, Type::String, true, true),
             ("split", 1, Type::Array(Box::new(Type::String)), true, false),
             ("contains", 1, Type::Bool, false, false),
-            ("find", 1, Type::I64, false, false),
+            ("find", 1, generic("Option", vec![Type::I64]), false, false),
             ("ends_with", 1, Type::Bool, false, false),
             ("replace", 2, Type::String, true, true),
             ("trim_start", 0, Type::String, true, false),
@@ -964,7 +1051,7 @@ mod tests {
             ("trim", 0, Type::String, true, false),
             ("repeat", 1, Type::String, true, true),
             ("starts_with", 1, Type::Bool, false, false),
-            ("toString", 0, Type::String, false, false),
+            ("to_string", 0, Type::String, false, false),
         ] {
             let resolved = resolve(&Type::String, method, arity).unwrap();
             assert_eq!(resolved.return_type(|_| None), result);
@@ -1002,40 +1089,40 @@ mod tests {
         resolve(recv, method, arity).map(|r| r.return_type(|_| None))
     }
 
-    /// Perspective 1: every scalar `toString` resolves to its own intrinsic, and
+    /// Perspective 1: every scalar `to_string` resolves to its own intrinsic, and
     /// each produces a String. These four are the whole reason the backend had a
-    /// `m.method == "toString"` test ahead of everything else.
+    /// `m.method == "to_string"` test ahead of everything else.
     #[test]
     fn scalar_to_string_resolves_per_receiver() {
         assert_eq!(
-            resolve_intrinsic(&Type::I64, "toString", 0),
+            resolve_intrinsic(&Type::I64, "to_string", 0),
             Some(Intrinsic::I64ToString)
         );
         assert_eq!(
-            resolve_intrinsic(&Type::F64, "toString", 0),
+            resolve_intrinsic(&Type::F64, "to_string", 0),
             Some(Intrinsic::F64ToString)
         );
         assert_eq!(
-            resolve_intrinsic(&Type::Bool, "toString", 0),
+            resolve_intrinsic(&Type::Bool, "to_string", 0),
             Some(Intrinsic::BoolToString)
         );
         assert_eq!(
-            resolve_intrinsic(&Type::String, "toString", 0),
+            resolve_intrinsic(&Type::String, "to_string", 0),
             Some(Intrinsic::StringToString)
         );
         for recv in [Type::I64, Type::F64, Type::Bool, Type::String] {
-            assert_eq!(ret_of(&recv, "toString", 0), Some(Type::String));
+            assert_eq!(ret_of(&recv, "to_string", 0), Some(Type::String));
         }
     }
 
-    /// Perspective 2: `toString` with an argument is not the intrinsic. The
+    /// Perspective 2: `to_string` with an argument is not the intrinsic. The
     /// backend used to guard this with `m.args.is_empty()`; arity is now part of
     /// the key, so the guard cannot be forgotten at one call site and kept at
     /// another.
     #[test]
     fn scalar_to_string_with_arguments_does_not_resolve() {
-        assert_eq!(resolve(&Type::I64, "toString", 1), None);
-        assert_eq!(resolve(&Type::String, "toString", 2), None);
+        assert_eq!(resolve(&Type::I64, "to_string", 1), None);
+        assert_eq!(resolve(&Type::String, "to_string", 2), None);
     }
 
     #[test]
@@ -1045,7 +1132,7 @@ mod tests {
             ("push", 1),
             ("pop", 0),
             ("join", 1),
-            ("toString", 0),
+            ("to_string", 0),
             ("freeze", 0),
         ] {
             for element in [Type::I64, Type::String, named("Point")] {
@@ -1086,7 +1173,7 @@ mod tests {
         assert_eq!(resolve(&fa, "push", 1), None);
         assert_eq!(resolve(&fa, "pop", 0), None);
         assert_eq!(resolve(&fa, "freeze", 0), None);
-        assert_eq!(resolve(&fa, "toString", 0), None);
+        assert_eq!(resolve(&fa, "to_string", 0), None);
     }
 
     /// Perspective 8: `Map<K, V>::get` produces `Option<V>`, picking the *second*
@@ -1102,13 +1189,13 @@ mod tests {
         );
     }
 
-    /// Perspective 9: `Map::toString` produces a String. The backend's
+    /// Perspective 9: `Map::to_string` produces a String. The backend's
     /// structural walk used to answer `void` here, because its `Map` arm ended
     /// in a catch-all that swallowed every unlisted method.
     #[test]
     fn map_to_string_returns_string_not_void() {
         let map = generic("Map", vec![Type::String, Type::I64]);
-        assert_eq!(ret_of(&map, "toString", 0), Some(Type::String));
+        assert_eq!(ret_of(&map, "to_string", 0), Some(Type::String));
     }
 
     /// Perspective 10: `Map::freeze` preserves both type arguments in order.
@@ -1143,7 +1230,7 @@ mod tests {
         assert_eq!(resolve(&fm, "insert", 2), None);
         assert_eq!(resolve(&fm, "remove", 1), None);
         assert_eq!(resolve(&fm, "freeze", 0), None);
-        assert_eq!(resolve(&fm, "toString", 0), None);
+        assert_eq!(resolve(&fm, "to_string", 0), None);
     }
 
     /// Perspective 12: `Map` and `FrozenMap` resolve to *distinct* intrinsics
@@ -1426,8 +1513,20 @@ mod tests {
     fn user_class_receivers_never_resolve() {
         let user = named("Point");
         for method in [
-            "len", "push", "pop", "get", "set", "send", "recv", "recv_opt", "close", "cancel",
-            "toString", "freeze", "child", "finish",
+            "len",
+            "push",
+            "pop",
+            "get",
+            "set",
+            "send",
+            "recv",
+            "recv_opt",
+            "close",
+            "cancel",
+            "to_string",
+            "freeze",
+            "child",
+            "finish",
         ] {
             for arity in 0..3 {
                 assert_eq!(resolve(&user, method, arity), None, "Point::{method}");
@@ -1440,7 +1539,7 @@ mod tests {
     #[test]
     fn user_generic_receivers_never_resolve() {
         let user = generic("Stack", vec![Type::I64]);
-        for method in ["len", "push", "pop", "recv", "toString"] {
+        for method in ["len", "push", "pop", "recv", "to_string"] {
             for arity in 0..3 {
                 assert_eq!(resolve(&user, method, arity), None, "Stack::{method}");
             }
@@ -1469,7 +1568,7 @@ mod tests {
     #[test]
     fn uninhabited_and_unit_receivers_do_not_resolve() {
         for recv in [Type::Void, Type::Never] {
-            for method in ["toString", "len", "recv"] {
+            for method in ["to_string", "len", "recv"] {
                 assert_eq!(resolve(&recv, method, 0), None);
             }
         }
@@ -1547,7 +1646,7 @@ mod tests {
             "to_lower",
             "to_upper",
             "starts_with",
-            "toString",
+            "to_string",
             "len",
             "push",
             "pop",
@@ -1833,10 +1932,10 @@ fn f() {
     let r = 1.5;
     let b = true;
     let s = "willow";
-    let a = n.toString();
-    let c = r.toString();
-    let d = b.toString();
-    let e = s.toString();
+    let a = n.to_string();
+    let c = r.to_string();
+    let d = b.to_string();
+    let e = s.to_string();
     let size = s.len();
 }
 "#;
@@ -1863,7 +1962,7 @@ fn f() {
     xs.push(4);
     let last = xs.pop();
     let size = xs.len();
-    let text = xs.toString();
+    let text = xs.to_string();
     let frozen = xs.freeze();
     let frozen_size = frozen.len();
     let joined = ["a", "b"].join(",");
@@ -1883,7 +1982,7 @@ fn f() {
     let hit = m.get("ann");
     let has = m.contains("ann");
     let size = m.len();
-    let text = m.toString();
+    let text = m.to_string();
     let frozen = m.freeze();
     let frozen_hit = frozen.get("ann");
     let frozen_has = frozen.contains("ann");
@@ -1975,7 +2074,7 @@ async fn f() {
 }
 "#;
 
-    /// Perspective 37: `toString` on i64, f64, bool and String. The checker and
+    /// Perspective 37: `to_string` on i64, f64, bool and String. The checker and
     /// the resolver must agree that all four produce a String even though each
     /// lowers to a different runtime symbol.
     #[test]
@@ -2061,13 +2160,13 @@ async fn f() {
 class Bag {
     pub count: i64;
     pub fn len(self) -> i64 { return self.count; }
-    pub fn toString(self) -> String { return "bag"; }
+    pub fn to_string(self) -> String { return "bag"; }
 }
 
 fn f() {
     let b = new Bag(3);
     let n = b.len();
-    let s = b.toString();
+    let s = b.to_string();
 }
 "#,
             0,
@@ -2104,7 +2203,7 @@ import std::collections::Array;
 fn f() {
     let xs: Array<i64> = [1, 2, 3];
     let total = xs.len() + xs.freeze().len();
-    println(xs.toString());
+    println(xs.to_string());
 }
 "#,
             4,
@@ -2144,7 +2243,7 @@ import std::collections::Array;
 fn f() {
     let names: Array<String> = ["ann", "ben"];
     let last = names.pop();
-    let text = names.toString();
+    let text = names.to_string();
 }
 "#,
             2,

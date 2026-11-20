@@ -48,7 +48,7 @@ fn classify(r: Result<Option<i64>, String>) -> String {
     return match r {
         Ok(Some(0)) => "zero",
         Ok(Some(n)) if n < 0 => "negative",
-        Ok(Some(n)) => "positive " + n.toString(),
+        Ok(Some(n)) => "positive " + n.to_string(),
         Ok(None) => "none",
         Err(e) => "error " + e,
     };
@@ -56,11 +56,11 @@ fn classify(r: Result<Option<i64>, String>) -> String {
 
 fn tag(t: Tagged) -> String {
     return match t {
-        Tagged::Pair(Shape::Circle(r), Color::Red) => "red circle " + r.toString(),
+        Tagged::Pair(Shape::Circle(r), Color::Red) => "red circle " + r.to_string(),
         Tagged::Pair(Shape::Rect(w, h), _) if w == h => "square",
         Tagged::Pair(_, Color::Blue) => "blue thing",
         Tagged::Pair(_, _) => "other pair",
-        Tagged::Named(name, Some(v)) => name + "=" + v.toString(),
+        Tagged::Named(name, Some(v)) => name + "=" + v.to_string(),
         Tagged::Named(name, None) => name,
     };
 }
@@ -68,8 +68,8 @@ fn tag(t: Tagged) -> String {
 fn tup(p: (i64, Option<String>)) -> String {
     return match p {
         (0, None) => "origin",
-        (x, Some(s)) => s + x.toString(),
-        (x, None) => x.toString(),
+        (x, Some(s)) => s + x.to_string(),
+        (x, None) => x.to_string(),
     };
 }
 
@@ -168,7 +168,7 @@ fn main() {
     let mut j = 0;
     while j < words.len() {
         let Some((w, n)) = words[j] else { j = j + 1; continue; };
-        println(w + n.toString());
+        println(w + n.to_string());
         j = j + 1;
     }
 }
@@ -262,7 +262,7 @@ enum Tree { Leaf(Node), Branch(Tree, Tree) }
 fn churn() -> bool {
     let mut i = 0;
     while i < 500 {
-        let n = new Node(i, "x" + i.toString());
+        let n = new Node(i, "x" + i.to_string());
         i = i + n.label.len() - n.label.len() + 1;
     }
     gc_minor_collect();
@@ -287,7 +287,7 @@ fn main() {
     println(sum(t));
     let o: Option<(Node, Option<Node>)> = Some((new Node(7, "seven"), Some(new Node(8, "eight"))));
     if let Some((first, Some(second))) = o && churn() && let Some(n) = Option::Some(first.value + second.value) {
-        println(first.label + second.label + n.toString());
+        println(first.label + second.label + n.to_string());
     }
 }
 "#,

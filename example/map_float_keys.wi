@@ -18,7 +18,7 @@ fn main() {
     println(keys.len()); // 1
     println(keys.get(0.0).unwrap()); // 20
     println(keys.get(-0.0).unwrap()); // 20
-    println(keys.toString()); // {0.0: 20}
+    println(keys.to_string()); // {0.0: 20}
     println(keys.freeze().contains(-0.0)); // true
 
     let nan = 0.0 / 0.0; // ordinary f64 arithmetic still permits NaN

@@ -58,7 +58,7 @@ fn apply_fn(f: fn(i64) -> i64, v: i64) -> i64 {
 fn describe(label: String, factor: i64) -> fn(i64) -> String {
     // Two captures of different types, and the environment lays its slots out
     // in first-mention order.
-    return |x: i64| label + "=" + (x * factor).toString();
+    return |x: i64| label + "=" + (x * factor).to_string();
 }
 
 fn scaled_sum(scale: f64, on: bool) -> f64 {

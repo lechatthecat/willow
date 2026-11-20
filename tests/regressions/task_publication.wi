@@ -98,7 +98,7 @@ async fn main() {
     let shared: Mutex<Array<String>> = Mutex::new([]);
     i = 0;
     while i < 50 {
-        lock shared as mut s { s.push("v" + i.toString()); }
+        lock shared as mut s { s.push("v" + i.to_string()); }
         i = i + 1;
     }
     gc_minor_collect();

@@ -4,6 +4,21 @@ Notable user-facing changes to the Willow compiler, runtime, and toolchain.
 
 ## Unreleased
 
+### Breaking
+
+- **Builtin and `std` method names are snake_case; `toString` is now
+  `to_string`.** Every builtin scalar, `String`, `Array` and `Map` conversion is
+  spelled `x.to_string()`. There is no transition period: `x.toString()` on a
+  receiver that has `to_string` is error E0201 "no method `toString` on type
+  `i64`; it was renamed to `to_string`", and the call is still checked as
+  `to_string` so no follow-on errors appear. User classes that declare their own
+  `toString` keep working. See `example/method_naming.wi`.
+- **`String.find` returns `Option<i64>` instead of `-1`.** A match is
+  `Some(byte_offset)` (`Some(0)` for an empty needle) and absence is `None`.
+  Code comparing the result with `-1` or `>= 0` is now a type error; use
+  `match`, `if let`, `is_some()`/`is_none()`, `unwrap_or(-1)` or `?`. See
+  `example/string_find.wi`.
+
 ### Added
 
 - **Nested patterns, let chains and omitted enum names in patterns.**

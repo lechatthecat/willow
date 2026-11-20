@@ -111,14 +111,14 @@ pub extern "C" fn willow_f64_to_string(value: f64) -> *mut u8 {
     crate::string::alloc_native_string(&format_f64_shortest(value))
 }
 
-/// `i64.toString()` — GC-managed WillowString of the decimal representation.
+/// `i64.to_string()` — GC-managed WillowString of the decimal representation.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_i64_to_string(value: i64) -> *mut u8 {
     crate::string::i64_to_string(value)
 }
 
-/// `bool.toString()` — GC-managed WillowString `"true"` or `"false"`. The value
+/// `bool.to_string()` — GC-managed WillowString `"true"` or `"false"`. The value
 /// is the usual nonzero-is-true encoding.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]

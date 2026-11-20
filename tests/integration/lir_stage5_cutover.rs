@@ -796,7 +796,7 @@ fn main() {
     defer {
         let mut joined = "";
         for value in values { joined = joined + value; }
-        for i in 0..3 { joined = joined + i.toString(); }
+        for i in 0..3 { joined = joined + i.to_string(); }
         println(joined);
     }
 }

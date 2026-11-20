@@ -328,8 +328,8 @@ fn main() {
         total = total + values[i] ** 3;
         i = i + 1;
     }
-    println(label + total.toString());
-    println(label + pow(values[0], values[2]).toString());
+    println(label + total.to_string());
+    println(label + pow(values[0], values[2]).to_string());
 }
 "#,
     );

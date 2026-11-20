@@ -600,7 +600,7 @@ fn lir_static_body_20_a_string_property_under_allocation_stress() {
     let src = with_registry(
         "fn tag(n: i64) -> i64 {
     defer {
-        Registry::label = \"tag-\" + n.toString();
+        Registry::label = \"tag-\" + n.to_string();
     }
     return n;
 }

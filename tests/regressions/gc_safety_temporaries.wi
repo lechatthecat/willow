@@ -39,7 +39,7 @@ enum Note {
 }
 
 fn stamp(n: i64) -> String {
-    return n.toString() + "!";
+    return n.to_string() + "!";
 }
 
 fn combine(a: String, b: String) -> String {
@@ -68,14 +68,14 @@ fn main() {
     // variant object that is about to hold it.
     println(match Note::Text(tag("n")) {
         Note::Text(s) => s,
-        Note::Code(c) => c.toString(),
+        Note::Code(c) => c.to_string(),
     });
 
     // `map_err` runs the function, then allocates a fresh `Err` to rewrap the
     // result: the mapped String exists only in a register in between.
     let failed: Result<i64, String> = Err("bad");
     println(match failed.map_err(tag) {
-        Ok(v) => v.toString(),
+        Ok(v) => v.to_string(),
         Err(msg) => msg,
     });
 

@@ -37,7 +37,7 @@ open class Shape {
 
     // No slot. Its `self.area()` call is still virtual, so a subclass reaching
     // here through inheritance runs its OWN `area`.
-    pub fn report(self) -> String { return self.name() + "=" + self.area().toString(); }
+    pub fn report(self) -> String { return self.name() + "=" + self.area().to_string(); }
 }
 
 open class Square extends Shape {

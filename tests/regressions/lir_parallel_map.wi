@@ -34,7 +34,7 @@ fn plus_ten(value: i64) -> i64 {
 // array can be compared against a literal.
 async fn squares(values: FrozenArray<i64>) -> String {
     let mapped = await parallel::map(values, square);
-    return mapped.toString();
+    return mapped.to_string();
 }
 
 // A `Task<Array<i64>>` is an ordinary value: a sync helper may start the work
@@ -61,7 +61,7 @@ fn counting(n: i64) -> FrozenArray<i64> {
 async fn twice_over(values: FrozenArray<i64>) -> String {
     let once = await parallel::map(values, square);
     let again = await parallel::map(once.freeze(), plus_ten);
-    return again.toString();
+    return again.to_string();
 }
 
 // The same frozen input mapped repeatedly in a loop. The handle is rooted for
@@ -83,8 +83,8 @@ async fn repeated(values: FrozenArray<i64>, rounds: i64) -> i64 {
 async fn interleaved(left: FrozenArray<i64>, right: FrozenArray<i64>) -> String {
     let first = parallel::map(left, square);
     let second = parallel::map(right, plus_ten);
-    let tail = (await second).toString();
-    return (await first).toString() + " " + tail;
+    let tail = (await second).to_string();
+    return (await first).to_string() + " " + tail;
 }
 
 // Cancelling the task reports `Cancelled` rather than a partial result: there
@@ -103,19 +103,19 @@ async fn main() {
     let frozen = values.freeze();
 
     println(await squares(frozen));
-    println((await start(frozen)).toString());
+    println((await start(frozen)).to_string());
 
     // A contextual lambda is a mapper too, and cannot capture.
     let doubled = parallel::map(frozen, |value| value * 2);
-    println((await doubled).toString());
+    println((await doubled).to_string());
 
     println(await twice_over(frozen));
-    println((await repeated(frozen, 4)).toString());
+    println((await repeated(frozen, 4)).to_string());
     println(await interleaved(frozen, frozen));
 
     // An empty input and a single element both complete without a chunk split.
     let empty: Array<i64> = [];
-    println((await parallel::map(empty.freeze(), square)).toString());
+    println((await parallel::map(empty.freeze(), square)).to_string());
 
     // Large enough that the cancel lands before the mapping finishes.
     let big = counting(50000);

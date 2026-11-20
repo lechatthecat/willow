@@ -18,9 +18,9 @@ async fn main() {
     let mut snapshot = new Knobs(0);
     lock read knobs as r { snapshot = r; }
     await replace(knobs);
-    println("snapshot " + snapshot.seed.toString());
-    lock read knobs as r { println("replacement " + r.seed.toString()); }
+    println("snapshot " + snapshot.seed.to_string());
+    lock read knobs as r { println("replacement " + r.seed.to_string()); }
     let counter = Mutex::new(new Counter(1));
     await increment(counter);
-    lock counter as r { println("mutex " + r.count.toString()); }
+    lock counter as r { println("mutex " + r.count.to_string()); }
 }

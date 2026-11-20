@@ -54,7 +54,7 @@ open class Shape {
     // compile time. The `self.label()` and `self.area()` inside it are still
     // virtual, so a subclass reaching here by inheritance runs its OWN bodies.
     pub fn report(self) -> String {
-        return self.label() + "=" + self.area().toString() + Shape::unit;
+        return self.label() + "=" + self.area().to_string() + Shape::unit;
     }
 }
 
@@ -75,7 +75,7 @@ class Circle extends Shape implements Named {
     // Boxing a SUBCLASS into an interface: the box carries this object and
     // `Circle`'s interface vtable, which exists per concrete class regardless
     // of what that class extends.
-    pub fn name(self) -> String { return "circle" + self.size.toString(); }
+    pub fn name(self) -> String { return "circle" + self.size.to_string(); }
 }
 
 // A base-typed parameter. The caller may hand it any descendant; `s.area()`

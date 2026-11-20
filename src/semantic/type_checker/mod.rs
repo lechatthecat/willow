@@ -4,8 +4,6 @@ mod contracts_tests;
 mod effect_contracts;
 pub(crate) mod lock_order;
 pub(crate) mod purity;
-// Conditional advice also covers stored results without tracking value provenance.
-const STRING_FIND_SENTINEL_HELP: &str = "if this i64 came from String.find(needle), it is a byte offset, not an Option: -1 means not found; test `index >= 0` before using it, or use `contains(needle)` for a bool";
 
 use crate::qualified_name::QualifiedName;
 use crate::semantic::async_borrows::ReferenceArgMode;
@@ -25,6 +23,8 @@ pub(crate) mod precheck;
 pub(crate) mod precheck_journal;
 mod signature;
 pub use check_lambda_match::LambdaCapture;
+#[cfg(test)]
+mod api_naming_tests;
 mod async_retention;
 #[cfg(test)]
 mod builtin_contract_tests;
@@ -45,8 +45,6 @@ mod never_tests;
 mod resolve;
 mod returns;
 mod send_sync;
-#[cfg(test)]
-mod string_find_tests;
 #[cfg(test)]
 mod subclass_constructor_tests;
 #[cfg(test)]

@@ -1408,7 +1408,7 @@ fn generic_lambda_annotations_private_import_rejected() {
 }
 
 #[test]
-fn sentinel_diagnostics_valid_example_runs() {
+fn diagnostic_recovery_valid_example_runs() {
     runs(
         include_str!("../../tests/regressions/diagnostic_recovery_if.wi"),
         "7\na.b\nnone\n",

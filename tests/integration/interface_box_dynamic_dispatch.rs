@@ -606,7 +606,7 @@ open class Base implements Mixed {
 
     pub open fn blend(self, k: i64, f: f64, flag: bool, name: String) -> String {
         if flag {
-            return self.tag + name + k.toString() + f.toString();
+            return self.tag + name + k.to_string() + f.to_string();
         }
         return self.tag;
     }
@@ -615,7 +615,7 @@ open class Base implements Mixed {
 class Sub extends Base {
     pub override fn blend(self, k: i64, f: f64, flag: bool, name: String) -> String {
         if flag {
-            return "sub:" + name + k.toString() + f.toString();
+            return "sub:" + name + k.to_string() + f.to_string();
         }
         return "sub";
     }

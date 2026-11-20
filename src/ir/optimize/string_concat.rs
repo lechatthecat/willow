@@ -1,13 +1,13 @@
 //! Fuse string concatenation chains into one sized allocation.
 //!
 //!
-//! `"k" + i.toString() + ":" + j.toString()` lowers to a left-nested chain of
+//! `"k" + i.to_string() + ":" + j.to_string()` lowers to a left-nested chain of
 //! two-operand `String` additions whose every intermediate result is a fresh
 //! temporary read exactly once. Evaluated pairwise, a chain of `n` parts
 //! allocates `n - 1` strings and copies `O(n * total_len)` bytes. This pass
 //! rewrites the chain into one [`LirRvalue::StringConcat`], which the runtime
 //! sizes first and fills once: one allocation and `O(total_len)` copying.
-//! `i64.toString()` and `{i64}` interpolation operands become decimal parts
+//! `i64.to_string()` and `{i64}` interpolation operands become decimal parts
 //! that are formatted straight into the result, never allocated on their own.
 //!
 //! Only the order of the intermediate allocations changes. Operands are still
@@ -437,8 +437,8 @@ mod tests {
     #[test]
     fn i64_to_string_operands_become_decimal_parts() {
         let program = lowered(
-            r#"fn f(a: String, n: i64) -> String { return a + n.toString(); }
-               fn g(n: i64) -> String { return "k" + n.toString() + ":" + (n * 7).toString(); }
+            r#"fn f(a: String, n: i64) -> String { return a + n.to_string(); }
+               fn g(n: i64) -> String { return "k" + n.to_string() + ":" + (n * 7).to_string(); }
                fn main() { println(f("x", 1)); println(g(2)); }"#,
         );
         assert_eq!(concats(function(&program, "f")), vec![vec![S, I64]]);
@@ -449,7 +449,7 @@ mod tests {
     #[test]
     fn a_lone_to_string_is_left_alone() {
         let program = lowered(
-            r#"fn f(n: i64) -> String { return n.toString(); }
+            r#"fn f(n: i64) -> String { return n.to_string(); }
                fn main() { println(f(1)); }"#,
         );
         let f = function(&program, "f");
@@ -462,7 +462,7 @@ mod tests {
         let program = lowered(
             r#"fn r(a: String, b: String, c: String) -> String { return a + (b + c); }
                fn q(a: String, b: String, c: String, n: i64) -> String {
-                   return (a + n.toString()) + (b + c);
+                   return (a + n.to_string()) + (b + c);
                }
                fn main() { println(r("a", "b", "c")); println(q("a", "b", "c", 1)); }"#,
         );
@@ -524,7 +524,7 @@ mod tests {
     fn defer_and_lambda_bodies_fuse() {
         let program = lowered(
             r#"fn f(a: String, n: i64) {
-                   defer println(a + "-" + n.toString());
+                   defer println(a + "-" + n.to_string());
                    println("body");
                }
                fn main() {

@@ -445,7 +445,7 @@ unsafe fn write_decimal(out: *mut u8, value: i64) -> *mut u8 {
     }
 }
 
-/// `i64.toString()`: decimal digits written straight into the new string.
+/// `i64.to_string()`: decimal digits written straight into the new string.
 pub(crate) fn i64_to_string(value: i64) -> *mut u8 {
     let mut parts = [PART_I64, value as u64];
     concat_parts(&mut parts)

@@ -2,7 +2,7 @@ use super::*;
 
 // ── LIR backend: Array<T> ───────────────────────────────────
 // The walker now emits array literals, indexing, index-assignment and the
-// builtin len/push/pop/toString. An array is a GC handle whose pointer is
+// builtin len/push/pop/to_string. An array is a GC handle whose pointer is
 // stable across growth, so an array local uses the same entry-rooted slot a
 // String local does; temporaries are rooted around any sub-expression that can
 // collect. Eligibility perspectives 1-15 are unit tests in
@@ -11,7 +11,7 @@ use super::*;
 // `WILLOW_GC_STRESS=alloc`: 16 literal + len + index, 17 element kinds
 // round-trip through the 64-bit word ABI (i64/f64/bool), 18 push past the
 // initial capacity, 19 pop, 20 index assignment, 21 for-over-array, 22 array
-// passed to and returned from a function, 23 toString, 24 nested arrays,
+// passed to and returned from a function, 23 to_string, 24 nested arrays,
 // 25 array of String built by concatenation, 26 array local live across later
 // allocations (stress), 27 array of String under stress, 28 array literal whose
 // elements allocate (stress), 29 index expression that allocates while the
@@ -171,9 +171,9 @@ import std::collections::Array;
 fn f() -> String {
     let mut xs = [1, 2];
     xs.push(3);
-    return xs.toString();
+    return xs.to_string();
 }
-fn g() -> String { let xs = ["a", "b"]; return xs.toString(); }
+fn g() -> String { let xs = ["a", "b"]; return xs.to_string(); }
 fn main() { println(f()); println(g()); }
 "#,
         "[1, 2, 3]\n[\"a\", \"b\"]\n",

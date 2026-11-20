@@ -45,7 +45,7 @@ fn main() {
     let label = "id";
     let k = 3;
     let flag = true;
-    let f = |x: i64| label + ":" + (flag ? x * k : 0).toString();
+    let f = |x: i64| label + ":" + (flag ? x * k : 0).to_string();
     println(f(4));
 }
 "#,
@@ -306,7 +306,7 @@ fn churn(n: i64) -> i64 {
 fn main() {
     let label = "kept";
     let xs: Array<i64> = [11, 22];
-    let f = |k: i64| label + ":" + (xs[0] + k).toString();
+    let f = |k: i64| label + ":" + (xs[0] + k).to_string();
     println(churn(200));
     println(f(1));
     println(churn(200));

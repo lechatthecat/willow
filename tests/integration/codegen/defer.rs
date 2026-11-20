@@ -699,7 +699,7 @@ fn dfr_86_none_branch_does_not_register_defer() {
 #[test]
 fn dfr_87_to_string_argument() {
     assert_dfr_runs(
-        "fn c(s: String) { println(s); }\nfn main() { let x = 5; defer c(x.toString()); println(1); }",
+        "fn c(s: String) { println(s); }\nfn main() { let x = 5; defer c(x.to_string()); println(1); }",
         "1\n5\n",
     );
 }

@@ -32,7 +32,7 @@ fn main() {
     println(source().len());
     println(("é" + "水").len());
     let n = 12345;
-    println(n.toString().len());
+    println(n.to_string().len());
     println("  é  ".trim().len());
     println("ab".repeat(8192).len());
     let parts = "é,水".split(",");

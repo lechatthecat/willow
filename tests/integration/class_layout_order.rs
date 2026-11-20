@@ -318,7 +318,7 @@ fn layout_10_constructor_argument_order_follows_the_layout() {
 class Leaf extends Middle {
     pub third: i64;
     pub fn show(self) -> String {
-        return self.first.toString() + "," + self.second.toString() + "," + self.third.toString();
+        return self.first.to_string() + "," + self.second.to_string() + "," + self.third.to_string();
     }
 }
 open class Middle extends Root { pub second: i64; }
@@ -688,8 +688,8 @@ open class M2 extends M1 { pub f3: i64; }
 class Leaf extends M3 {
     pub f5: i64;
     pub fn show(self) -> String {
-        return self.f1.toString() + self.f2.toString() + self.f3.toString()
-             + self.f4.toString() + self.f5.toString();
+        return self.f1.to_string() + self.f2.to_string() + self.f3.to_string()
+             + self.f4.to_string() + self.f5.to_string();
     }
 }
 open class M1 extends Root { pub f2: i64; }

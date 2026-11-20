@@ -1,5 +1,5 @@
-// Collection debug display: Array<T>.toString() and
-// Map<K,V>.toString() for printable element types (i64, f64, bool, String).
+// Collection debug display: Array<T>.to_string() and
+// Map<K,V>.to_string() for printable element types (i64, f64, bool, String).
 // Strings are quoted like Rust's Debug; map entries are sorted by key.
 
 import std::collections::Array;
@@ -7,15 +7,15 @@ import std::collections::Map;
 
 fn main() {
     let nums: Array<i64> = [3, 1, 4, 1, 5];
-    println(nums.toString());
+    println(nums.to_string());
 
     let names: Array<String> = ["ann", "ben"];
-    println(names.toString());
+    println(names.to_string());
 
     let scores: Map<String, i64> = Map::new();
     scores.insert("ben", 92);
     scores.insert("ann", 87);
-    println(scores.toString());
+    println(scores.to_string());
 
-    println(format("all {} of {}", nums.len(), nums.toString()));
+    println(format("all {} of {}", nums.len(), nums.to_string()));
 }

@@ -936,7 +936,7 @@ fn async_lir_40_awaited_value_is_the_method_receiver() {
     assert_lir_logged(
         r#"
 async fn seven() -> i64 { return 7; }
-async fn main() { println("v=" + (await seven()).toString()); }
+async fn main() { println("v=" + (await seven()).to_string()); }
 "#,
         "v=7\n",
         &["main"],
@@ -1526,7 +1526,7 @@ async fn main() {
     let slow = Channel<i64>::new();
     let waiter = late(slow);
     select {
-        let v = slow.recv() => { println("woke " + v.toString()); }
+        let v = slow.recv() => { println("woke " + v.to_string()); }
     }
     await waiter;
 
@@ -1715,7 +1715,7 @@ async fn run(fail: bool) -> String {
         if fail { panic("stop"); }
         account = new Account("Bob", 20);
     }
-    return account.owner + ":" + account.balance.toString();
+    return account.owner + ":" + account.balance.to_string();
 }
 async fn main() {
     println(await run(false));
@@ -1924,7 +1924,7 @@ async fn run(n: i64) -> i64 {
                 None => println("loop: ok")
             }
             await sleep(1);
-            if i == 1 { panic("iteration " + i.toString()); }
+            if i == 1 { panic("iteration " + i.to_string()); }
             done = done + 1;
         }
         i = i + 1;
@@ -1949,8 +1949,8 @@ async fn run() -> i64 {
     for i in 0..4 {
         if true {
             defer match recover() {
-                Some(_) => println("skip " + i.toString()),
-                None => println("take " + i.toString())
+                Some(_) => println("skip " + i.to_string()),
+                None => println("take " + i.to_string())
             }
             await sleep(1);
             if i == 2 { panic("bad"); }
@@ -1985,7 +1985,7 @@ async fn run(fail: bool) -> i64 {
             None => println("d: clean")
         }
         let got = ch.recv();
-        if fail { panic("dropped " + got.toString()); }
+        if fail { panic("dropped " + got.to_string()); }
         seen = got;
     }
     await producer;
@@ -2021,7 +2021,7 @@ async fn run(fail: bool) -> i64 {
         }
         select {
             let v = ch.recv() => {
-                if fail { panic("dropped " + v.toString()); }
+                if fail { panic("dropped " + v.to_string()); }
                 seen = v;
             }
         }
@@ -2052,7 +2052,7 @@ async fn run(fail: bool) -> i64 {
             None => println("d: clean")
         }
         let doubled = await double(20);
-        if fail { panic("drop " + doubled.toString()); }
+        if fail { panic("drop " + doubled.to_string()); }
         kept = doubled;
     }
     return kept;

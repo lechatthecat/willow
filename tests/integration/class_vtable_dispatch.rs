@@ -539,13 +539,13 @@ fn vtable_18_a_virtual_method_with_several_parameters() {
 open class Base {
     pub n: i64;
     pub open fn mix(self, a: i64, b: String, c: bool) -> String {
-        if c { return b + a.toString(); }
+        if c { return b + a.to_string(); }
         return "base";
     }
 }
 class Derived extends Base {
     pub override fn mix(self, a: i64, b: String, c: bool) -> String {
-        if c { return b + (a * 2).toString(); }
+        if c { return b + (a * 2).to_string(); }
         return "derived";
     }
 }
@@ -610,8 +610,8 @@ class Circ implements Shape {
 }
 fn describe(s: Shape) -> String {
     return match s {
-        Sq(sq) => "square " + sq.side.toString(),
-        Circ(c) => "circle " + c.r.toString(),
+        Sq(sq) => "square " + sq.side.to_string(),
+        Circ(c) => "circle " + c.r.to_string(),
         _ => "other",
     };
 }

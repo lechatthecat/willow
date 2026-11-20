@@ -61,7 +61,7 @@ fn arg_count() -> i64 {
 // `parallel::map` under an alias: a frozen array and a bare function address.
 async fn squares(values: FrozenArray<i64>) -> String {
     let mapped = await par::map(values, square);
-    return mapped.toString();
+    return mapped.to_string();
 }
 
 // `net` is NOT aliased in this file, so the same dispatch answers a canonical
@@ -87,7 +87,7 @@ async fn main() {
     }
     println(await files::exists_async(path));
 
-    println(arg_count().toString());
+    println(arg_count().to_string());
 
     let values: Array<i64> = [4, 2, 3];
     println(await squares(values.freeze()));

@@ -77,7 +77,7 @@ async fn main() {
 
     // Ordinary uncancelled maps, for contrast: order preserved, one pass each.
     let small: Array<i64> = [5, 1, 4, 2, 3];
-    println((await parallel::map(small.freeze(), triple)).toString());
+    println((await parallel::map(small.freeze(), triple)).to_string());
 
     // Many small mappings awaited back to back. Every one of them ends its own
     // drive, so this is the tightest loop of "stop the pool, start it again"

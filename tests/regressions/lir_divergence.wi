@@ -1,4 +1,4 @@
-// Diverging code, formatted strings and scalar `toString` on the LIR backend.
+// Diverging code, formatted strings and scalar `to_string` on the LIR backend.
 //
 //
 // Every function here stays inside the LIR walker's subset, which since
@@ -14,7 +14,7 @@
 //     (`println(panic("x"))`) it still falls back to the AST backend.
 //   * a `match` arm may `return` instead of producing a value; when EVERY arm
 //     leaves, the `match` itself is typed `!`.
-//   * `format(spec, args...)` and `x.toString()` build strings from scalars.
+//   * `format(spec, args...)` and `x.to_string()` build strings from scalars.
 //
 // The panics below are all on guarded paths that this run does not take, so
 // the program exits normally — see `example/panic_format.wi` for a panic
@@ -38,7 +38,7 @@ fn describe(n: i64) -> String {
     return match n {
         0 => "nothing",
         _ => {
-            println("describing " + n.toString());
+            println("describing " + n.to_string());
             return "some (" + classify(n) + ")";
         }
     };
@@ -57,7 +57,7 @@ fn checked_div(a: i64, b: i64) -> i64 {
 // assembled by any expression the walker can emit.
 fn require_positive(n: i64) -> i64 {
     if n <= 0 {
-        panic("expected a positive value, got " + n.toString());
+        panic("expected a positive value, got " + n.to_string());
     }
     return n;
 }
@@ -89,11 +89,11 @@ fn render_scalars() {
     let flag = true;
     let text = "willow";
 
-    println(n.toString());
-    println(x.toString());
-    println(flag.toString());
-    // `String::toString` is the identity: it converts nothing.
-    println(text.toString());
+    println(n.to_string());
+    println(x.to_string());
+    println(flag.to_string());
+    // `String::to_string` is the identity: it converts nothing.
+    println(text.to_string());
 }
 
 // `format` interpolates by argument type; `{:.Nf}` keeps its fixed f64

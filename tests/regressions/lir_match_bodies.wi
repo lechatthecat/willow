@@ -44,7 +44,7 @@ fn describe(signal: Signal) -> String {
         },
         Step(n) => {
             let doubled = n * 2;
-            let text = "step " + doubled.toString();
+            let text = "step " + doubled.to_string();
             out = text;
         },
         Label(name) => {
@@ -101,7 +101,7 @@ async fn total(count: i64) -> String {
         }
         i = i + 1;
     }
-    return sum.toString() + " " + trail;
+    return sum.to_string() + " " + trail;
 }
 
 // Three shapes in rotation, so the loop above visits every arm.
@@ -109,7 +109,7 @@ fn pick(i: i64) -> Signal {
     return match i % 3 {
         0 => Signal::Halt,
         1 => Signal::Step(i),
-        _ => Signal::Label((i * 10).toString()),
+        _ => Signal::Label((i * 10).to_string()),
     };
 }
 
@@ -121,7 +121,7 @@ fn nested(signal: Signal, verbose: bool) -> String {
         Step(n) => {
             match verbose {
                 true => {
-                    let detail = "step(" + n.toString() + ")";
+                    let detail = "step(" + n.to_string() + ")";
                     label = detail;
                 },
                 false => {
@@ -147,7 +147,7 @@ fn route_for(signal: Signal) -> String {
     match signal {
         Step(n) => {
             let route = new Route("step", n);
-            let tag = route.name + "/" + route.cost.toString();
+            let tag = route.name + "/" + route.cost.to_string();
             summary = tag;
         },
         Halt => {
@@ -168,7 +168,7 @@ async fn describe_async(signal: Signal) -> String {
     match signal {
         Step(n) => {
             let doubled = n + n;
-            out = "async step " + doubled.toString();
+            out = "async step " + doubled.to_string();
         },
         Halt => {
             out = "async halt";
@@ -214,7 +214,7 @@ fn drain(ch: Channel<i64>) -> String {
     let mut label = "empty";
     select {
         let v = ch.recv() => {
-            let tag = "got " + v.toString();
+            let tag = "got " + v.to_string();
             label = tag;
         }
         default => {
@@ -229,9 +229,9 @@ async fn main() {
     println(describe(Signal::Halt));
     println(describe(Signal::Step(3)));
     println(describe(Signal::Label("x")));
-    println(cost_of(Signal::Halt).toString());
-    println(cost_of(Signal::Step(4)).toString());
-    println(cost_of(Signal::Label("here")).toString());
+    println(cost_of(Signal::Halt).to_string());
+    println(cost_of(Signal::Step(4)).to_string());
+    println(cost_of(Signal::Label("here")).to_string());
 
     let totals = await total(6);
     println(totals);

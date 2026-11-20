@@ -96,7 +96,7 @@ fn static_init_03_string_initializers_allocate_then_store() {
         &one_static("s: String = \"wil\" + \"low\";", "Cfg::s"),
         "willow\n",
     );
-    assert_output(&one_static("s: String = 42.toString();", "Cfg::s"), "42\n");
+    assert_output(&one_static("s: String = 42.to_string();", "Cfg::s"), "42\n");
 }
 
 /// Perspectives 9-11: GC-managed initializers. The slot starts null so a
@@ -202,7 +202,7 @@ fn static_init_09_an_interface_slot_holds_a_box() {
     let src = "interface Named { fn name(self) -> String; }
 class Point implements Named {
     pub x: i64;
-    pub fn name(self) -> String { return \"p\" + self.x.toString(); }
+    pub fn name(self) -> String { return \"p\" + self.x.to_string(); }
 }
 class Cfg { pub static named: Named = new Point(8); }
 fn main() { println(Cfg::named.name()); }

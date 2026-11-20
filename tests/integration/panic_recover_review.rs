@@ -535,9 +535,9 @@ fn main() {
     if true {
         defer match recover() {
             Some(info) => {
-                println("empty_file=" + (info.file == "").toString());
-                println("line=" + info.line.toString());
-                println("positive_column=" + (info.column > 0).toString());
+                println("empty_file=" + (info.file == "").to_string());
+                println("line=" + info.line.to_string());
+                println("positive_column=" + (info.column > 0).to_string());
             },
             None => println("none")
         }
@@ -563,7 +563,7 @@ fn main() {
     let value: Option<i64> = None;
     if true {
         defer match recover() {
-            Some(info) => println("line=" + info.line.toString()),
+            Some(info) => println("line=" + info.line.to_string()),
             None => println("none")
         }
         println(value.unwrap());
@@ -588,7 +588,7 @@ fn main() {
         defer match recover() {
             Some(info) => {
                 println(info.message);
-                println("line=" + info.line.toString());
+                println("line=" + info.line.to_string());
             },
             None => println("none")
         }
@@ -619,8 +619,8 @@ async fn main() {
         defer match recover() {
             Some(info) => {
                 println(info.message);
-                println("empty_file=" + (info.file == "").toString());
-                println("positive_line=" + (info.line > 0).toString());
+                println("empty_file=" + (info.file == "").to_string());
+                println("positive_line=" + (info.line > 0).to_string());
             },
             None => println("none")
         }
@@ -649,8 +649,8 @@ fn main() {
     if true {
         defer match recover() {
             Some(info) => {
-                println("empty_file=" + (info.file == "").toString());
-                println("line=" + info.line.toString());
+                println("empty_file=" + (info.file == "").to_string());
+                println("line=" + info.line.to_string());
             },
             None => println("none")
         }
@@ -687,7 +687,7 @@ fn main() {
     let values: Array<i64> = [1, 2, 3];
     if true {
         defer match recover() {
-            Some(info) => println("line=" + info.line.toString()),
+            Some(info) => println("line=" + info.line.to_string()),
             None => println("none")
         }
         println(lookup(values, 9));
@@ -738,9 +738,9 @@ fn guarded(values: Array<i64>, which: i64) -> i64 {
 
 fn main() {
     let values: Array<i64> = [1, 2, 3];
-    println(guarded(values, 1).toString());
-    println(ok_call(values).toString());
-    println(guarded(values, 2).toString());
+    println(guarded(values, 1).to_string());
+    println(ok_call(values).to_string());
+    println(guarded(values, 2).to_string());
 }
 "#,
     );

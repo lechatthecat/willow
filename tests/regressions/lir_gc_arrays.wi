@@ -78,14 +78,14 @@ fn grid() -> i64 {
 
 fn main() {
     let xs = evens(5);
-    println(xs.toString());
+    println(xs.to_string());
     println(xs.len());
     println(total(xs));
 
     println(joined(tagged(2)));
-    println(tagged(0).toString());
+    println(tagged(0).to_string());
 
-    println(swapped(3, 4).toString());
+    println(swapped(3, 4).to_string());
     println(last([7, 8, 9]));
     println(grid());
 }

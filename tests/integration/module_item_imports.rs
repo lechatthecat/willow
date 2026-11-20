@@ -501,7 +501,7 @@ import leaf::ratio;
 import leaf::yes;
 
 pub fn run() -> String {
-    return name() + \" \" + ratio().toString() + \" \" + yes().toString();
+    return name() + \" \" + ratio().to_string() + \" \" + yes().to_string();
 }
 ",
             ),

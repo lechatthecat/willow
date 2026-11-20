@@ -31,7 +31,7 @@ fn report(label: String, line: i64) {
         Some(info) => println("  BUG: helper stole " + info.message),
         None => {}
     }
-    println("  " + label + " at line " + line.toString());
+    println("  " + label + " at line " + line.to_string());
 }
 
 fn read_slot(values: Array<i64>, index: i64) -> i64 {
@@ -42,7 +42,7 @@ fn read_slot(values: Array<i64>, index: i64) -> i64 {
                 // Message and location are both populated, so a handler can log
                 // the fault without any cooperation from the failing code.
                 println("  message: " + info.message);
-                println("  file set: " + (info.file != "").toString());
+                println("  file set: " + (info.file != "").to_string());
                 report("raised", info.line);
             },
             None => {}
@@ -76,17 +76,17 @@ fn main() {
     let values = [10, 20, 30];
 
     println("in-range read:");
-    println(read_slot(values, 1).toString());
+    println(read_slot(values, 1).to_string());
 
     println("out-of-range read:");
-    println(read_slot(values, 9).toString());
+    println(read_slot(values, 9).to_string());
 
     println("missing value:");
     let missing: Option<i64> = None;
-    println(require(missing).toString());
+    println(require(missing).to_string());
 
     println("present value:");
-    println(require(Some(7)).toString());
+    println(require(Some(7)).to_string());
 
     // Recovery is scoped to the deferred block that ran as cleanup. Once it has
     // returned, the process is in ordinary state again: tasks may run, and the
@@ -95,7 +95,7 @@ fn main() {
     let channel = Channel<i64>::new();
     let producer = produce(channel);
     select {
-        let value = channel.recv() => { println("  received " + value.toString()); }
+        let value = channel.recv() => { println("  received " + value.to_string()); }
     }
 }
 

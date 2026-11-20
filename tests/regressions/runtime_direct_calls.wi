@@ -6,7 +6,7 @@ fn main() {
     let mut checksum = 0;
     while i < 10000 {
         values.push(i);
-        checksum = checksum + i.toString().len();
+        checksum = checksum + i.to_string().len();
         i = i + 1;
     }
     println(checksum);

@@ -11,7 +11,7 @@ fn add(a: i64, b: i64) -> i64 {
 fn show(value: Option<i64>) -> String {
     match value {
         Some(n) => {
-            return "Some(" + n.toString() + ")";
+            return "Some(" + n.to_string() + ")";
         }
         None => {
             return "None";

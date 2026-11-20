@@ -84,9 +84,9 @@ fn weight(signal: Signal) -> i64 {{
     return out;
 }}
 fn main() {{
-    println(weight(Signal::Halt).toString());
-    println(weight(Signal::Step(5)).toString());
-    println(weight(Signal::Label(\"x\")).toString());
+    println(weight(Signal::Halt).to_string());
+    println(weight(Signal::Step(5)).to_string());
+    println(weight(Signal::Label(\"x\")).to_string());
 }}
 "
         ),
@@ -106,7 +106,7 @@ fn describe(signal: Signal) -> String {{
     let mut out = \"\";
     match signal {{
         Halt => {{ out = \"halt\"; }},
-        Step(n) => {{ out = \"step \" + n.toString(); }},
+        Step(n) => {{ out = \"step \" + n.to_string(); }},
         Label(name) => {{ out = \"label \" + name; }},
     }}
     return out;
@@ -141,7 +141,7 @@ fn doubled(signal: Signal) -> i64 {{
     }}
     return out;
 }}
-fn main() {{ println(doubled(Signal::Step(4)).toString()); }}
+fn main() {{ println(doubled(Signal::Step(4)).to_string()); }}
 "
         ),
         "9\n",
@@ -161,7 +161,7 @@ fn describe(signal: Signal) -> String {{
     let mut out = \"\";
     match signal {{
         Step(n) => {{
-            let text = \"step \" + n.toString();
+            let text = \"step \" + n.to_string();
             out = text + \"!\";
         }},
         Halt => {{ out = \"halt\"; }},
@@ -192,7 +192,7 @@ fn trace(signal: Signal) -> String {{
         Step(n) => {{
             log = log + \"a\";
             let mid = n + 1;
-            log = log + mid.toString();
+            log = log + mid.to_string();
             log = log + \"b\";
         }},
         Halt => {{ log = \"halt\"; }},
@@ -235,9 +235,9 @@ fn pick(signal: Signal) -> i64 {{
     return out;
 }}
 fn main() {{
-    println(pick(Signal::Halt).toString());
-    println(pick(Signal::Step(2)).toString());
-    println(pick(Signal::Label(\"z\")).toString());
+    println(pick(Signal::Halt).to_string());
+    println(pick(Signal::Step(2)).to_string());
+    println(pick(Signal::Label(\"z\")).to_string());
 }}
 "
         ),
@@ -261,7 +261,7 @@ fn shadowed(signal: Signal) -> String {{
             let value = \"inner\";
             seen = value;
         }},
-        Step(n) => {{ seen = n.toString(); }},
+        Step(n) => {{ seen = n.to_string(); }},
         Label(name) => {{ seen = name; }},
     }}
     return seen + \"/\" + value;
@@ -289,7 +289,7 @@ fn cost(signal: Signal) -> String {{
         }},
         Step(n) => {{
             let scaled = n * 3;
-            return scaled.toString();
+            return scaled.to_string();
         }},
         Label(name) => {{
             let padded = name + \"?\";
@@ -321,7 +321,7 @@ fn pick(i: i64) -> Signal {{
     return match i % 3 {{
         0 => Signal::Halt,
         1 => Signal::Step(i),
-        _ => Signal::Label(i.toString()),
+        _ => Signal::Label(i.to_string()),
     }};
 }}
 fn run(count: i64) -> String {{
@@ -346,7 +346,7 @@ fn run(count: i64) -> String {{
         }}
         i = i + 1;
     }}
-    return sum.toString() + \" \" + tail;
+    return sum.to_string() + \" \" + tail;
 }}
 fn main() {{ println(run(100)); }}
 "
@@ -371,7 +371,7 @@ fn nested(signal: Signal, verbose: bool) -> String {{
         Step(n) => {{
             match verbose {{
                 true => {{
-                    let detail = \"step(\" + n.toString() + \")\";
+                    let detail = \"step(\" + n.to_string() + \")\";
                     label = detail;
                 }},
                 false => {{
@@ -421,9 +421,9 @@ fn adjust(signal: Signal) -> i64 {{
     return reported;
 }}
 fn main() {{
-    println(adjust(Signal::Halt).toString());
-    println(adjust(Signal::Step(3)).toString());
-    println(adjust(Signal::Label(\"z\")).toString());
+    println(adjust(Signal::Halt).to_string());
+    println(adjust(Signal::Step(3)).to_string());
+    println(adjust(Signal::Label(\"z\")).to_string());
 }}
 "
         ),
@@ -491,7 +491,7 @@ fn route_for(signal: Signal) -> String {{
     match signal {{
         Step(n) => {{
             let route = new Route(\"step\", n);
-            let tag = route.name + \"/\" + route.cost.toString();
+            let tag = route.name + \"/\" + route.cost.to_string();
             summary = tag;
         }},
         Halt => {{ summary = \"halt\"; }},
@@ -523,7 +523,7 @@ fn combine(signal: Signal) -> String {{
             out = wrapped + name;
         }},
         Halt => {{ out = \"halt\"; }},
-        Step(n) => {{ out = n.toString(); }},
+        Step(n) => {{ out = n.to_string(); }},
     }}
     return out;
 }}
@@ -547,7 +547,7 @@ fn chain(signal: Signal) -> String {{
     let mut out = \"\";
     match signal {{
         Step(n) => {{
-            let a = \"a\" + n.toString();
+            let a = \"a\" + n.to_string();
             let b = a + \"b\";
             let c = b + \"c\";
             let d = c + \"d\";
@@ -580,7 +580,7 @@ async fn describe(signal: Signal) -> String {{
     match signal {{
         Step(n) => {{
             let doubled = n + n;
-            out = \"async step \" + doubled.toString();
+            out = \"async step \" + doubled.to_string();
         }},
         Halt => {{ out = \"async halt\"; }},
         Label(name) => {{ out = \"async \" + name; }},
@@ -623,7 +623,7 @@ fn serve(payload: i64) -> String {
             None => {}
         }
         let body = handle(payload);
-        status = \"200 body=\" + body.toString();
+        status = \"200 body=\" + body.to_string();
     }
     return status;
 }
@@ -675,7 +675,7 @@ fn lir_bodies_19_let_in_a_select_case_admitted() {
     let mut label = \"empty\";
     select {
         let v = ch.recv() => {
-            let tag = \"got \" + v.toString();
+            let tag = \"got \" + v.to_string();
             label = tag;
         }
         default => {
@@ -713,9 +713,9 @@ fn lir_bodies_20_select_case_assigns_outward() {
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    println(drain(ch).toString());
+    println(drain(ch).to_string());
     ch.send(21);
-    println(drain(ch).toString());
+    println(drain(ch).to_string());
 }
 ",
         "-1\n42\n",
@@ -740,8 +740,8 @@ fn only_steps(signal: Signal) -> i64 {{
     return out;
 }}
 fn main() {{
-    println(only_steps(Signal::Step(4)).toString());
-    println(only_steps(Signal::Halt).toString());
+    println(only_steps(Signal::Step(4)).to_string());
+    println(only_steps(Signal::Halt).to_string());
 }}
 "
         ),
@@ -761,7 +761,7 @@ fn lir_bodies_22_wildcard_arm_with_statements() {
         0 => { out = \"zero\"; },
         _ => {
             let doubled = n * 2;
-            let text = doubled.toString();
+            let text = doubled.to_string();
             out = \"other \" + text;
         },
     }
@@ -792,7 +792,7 @@ fn resolve(signal: Signal) -> String {{
             return early;
         }},
         Step(n) => {{
-            let text = n.toString();
+            let text = n.to_string();
             out = out + \"/\" + text;
         }},
         Label(name) => {{ out = name; }},
@@ -869,8 +869,8 @@ fn update_shape(shape: Shape) -> i64 {
     }
 }
 fn main() {
-    println(update_box(Boxed::One(new Node(1))).toString());
-    println(update_shape(new Square(2)).toString());
+    println(update_box(Boxed::One(new Node(1))).to_string());
+    println(update_shape(new Square(2)).to_string());
 }
 ",
         "5\n9\n",

@@ -476,7 +476,7 @@ pub fn set(n: String) -> String { Cfg::name = n; return Cfg::name; }
 pub fn churn(n: i64) -> String {
     let mut i = 0;
     while i < n {
-        Cfg::name = \"x\" + i.toString();
+        Cfg::name = \"x\" + i.to_string();
         i = i + 1;
     }
     return Cfg::name;

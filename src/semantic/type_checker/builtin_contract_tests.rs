@@ -105,20 +105,28 @@ fn builtin_contract_diagnostics() {
         (
             "Map<String, i64>",
             &[
-                "insert", "get", "remove", "contains", "keys", "values", "entries", "len",
-                "freeze", "toString",
+                "insert",
+                "get",
+                "remove",
+                "contains",
+                "keys",
+                "values",
+                "entries",
+                "len",
+                "freeze",
+                "to_string",
             ],
-            6065699962330834382,
+            5151098384264027664,
         ),
         (
             "Array<i64>",
             &["push", "pop", "len", "get", "set"],
-            12525021924727481343,
+            8138042849136865135,
         ),
         (
             "i64",
-            &["toString", "send", "recv", "close"],
-            22192759928931584,
+            &["to_string", "send", "recv", "close"],
+            2276911570535595592,
         ),
     ];
     for (ty, methods, expected) in families {

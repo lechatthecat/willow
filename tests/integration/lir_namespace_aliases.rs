@@ -236,7 +236,7 @@ fn count() -> i64 {
 }
 
 fn main() {
-    println(count().toString());
+    println(count().to_string());
 }
 "#,
         "0\n",
@@ -301,7 +301,7 @@ fn square(value: i64) -> i64 {
 
 async fn squares(values: FrozenArray<i64>) -> String {
     let mapped = await par::map(values, square);
-    return mapped.toString();
+    return mapped.to_string();
 }
 
 async fn main() {
@@ -398,7 +398,7 @@ fn report(path: String) -> String {
     if files::exists(path) {
         return "present";
     }
-    return "absent " + sys::args_len().toString();
+    return "absent " + sys::args_len().to_string();
 }
 
 fn main() {
@@ -430,7 +430,7 @@ fn none_of(path: String, rounds: i64) -> i64 {
 }
 
 fn main() {
-    println(none_of("willow-no-such-file-alias-15", 3).toString());
+    println(none_of("willow-no-such-file-alias-15", 3).to_string());
 }
 "#,
         "0\n",
@@ -561,7 +561,7 @@ fn main() {
     println(rendered());
     println(parsed());
     println(files::exists("willow-no-such-file-alias-20"));
-    println(sys::args_len().toString());
+    println(sys::args_len().to_string());
 }
 "#,
         "true\ntrue\nfalse\n0\n",
@@ -630,12 +630,12 @@ fn bound() -> Result<bool, IoError> {
 
 async fn squares(values: FrozenArray<i64>) -> String {
     let mapped = await par::map(values, square);
-    return mapped.toString();
+    return mapped.to_string();
 }
 
 async fn main() {
     println(missing("willow-no-such-file-alias-22"));
-    println(count().toString());
+    println(count().to_string());
     let values: Array<i64> = [1];
     println(await squares(values.freeze()));
     match bound() {

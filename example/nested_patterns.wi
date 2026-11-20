@@ -24,11 +24,11 @@ fn area(s: Shape) -> i64 {
 
 fn describe(item: Item) -> String {
     return match item {
-        Item::Painted(Circle(r), Red) => "red circle " + r.toString(),
+        Item::Painted(Circle(r), Red) => "red circle " + r.to_string(),
         Item::Painted(Rect(w, h), _) if w == h => "square",
-        Item::Painted(shape, Green) => "green " + area(shape).toString(),
+        Item::Painted(shape, Green) => "green " + area(shape).to_string(),
         Item::Painted(_, Red) => "red other",
-        Item::Plain(Some(shape)) => "plain " + area(shape).toString(),
+        Item::Plain(Some(shape)) => "plain " + area(shape).to_string(),
         Item::Plain(None) => "nothing",
     };
 }
@@ -36,7 +36,7 @@ fn describe(item: Item) -> String {
 fn parse(r: Result<Option<i64>, String>) -> String {
     return match r {
         Ok(Some(0)) => "zero",
-        Ok(Some(n)) => "number " + n.toString(),
+        Ok(Some(n)) => "number " + n.to_string(),
         Ok(None) => "empty",
         Err(e) => "error " + e,
     };

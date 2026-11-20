@@ -73,7 +73,7 @@ impl BuiltinArity {
                 format!("{method} takes {count} argument(s) but {given} were supplied")
             }
             ArityText::Constructor => format!("function `{owner}::{method}` expects no arguments"),
-            ArityText::Display => "`toString()` takes no arguments".into(),
+            ArityText::Display => "`to_string()` takes no arguments".into(),
         };
         let mut diagnostic = Diagnostic::new(Severity::Error, ErrorCode::E0201, message)
             .with_label(Label::primary(span, self.label));
@@ -178,7 +178,7 @@ pub(super) fn method_arity(owner: &str, method: &str) -> BuiltinArity {
             Some(Builtin::CancellationToken | Builtin::TaskScope),
             "cancel" | "is_cancelled" | "child" | "finish",
         ) => BuiltinArity::new(0, QualifiedCount),
-        (None, "toString") if owner == "primitive" => {
+        (None, "to_string") if owner == "primitive" => {
             BuiltinArity::new(0, Display).label("unexpected arguments")
         }
         _ => unreachable!("missing builtin arity: {owner}::{method}"),
@@ -380,7 +380,7 @@ pub(super) fn map_method(method: &str) -> Option<(BuiltinArity, bool, bool)> {
             true,
             false,
         ),
-        "keys" | "values" | "entries" | "len" | "freeze" | "toString" => (
+        "keys" | "values" | "entries" | "len" | "freeze" | "to_string" => (
             BuiltinArity::new(0, Method("")).label("unexpected arguments"),
             false,
             false,

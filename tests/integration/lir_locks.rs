@@ -736,7 +736,7 @@ fn main() {
     let holder = new Holder(BlockingCell<i64>::new(1));
     let mut i = 0;
     while i < 50 {
-        let filler = "pad" + i.toString();
+        let filler = "pad" + i.to_string();
         holder.cell.set(holder.cell.get() + 1);
         i = i + 1;
     }

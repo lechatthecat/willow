@@ -16,7 +16,7 @@ async fn main() {
     println(values.get(0).unwrap()); // 0
     println(match values.get(99) { Some(value) => value, None => -1 }); // -1
     println(values.len()); // 2
-    println(values.toString()); // {0: 0, 7: 42}
+    println(values.to_string()); // {0: 0, 7: 42}
 
     let flags: Map<bool, bool> = Map::new();
     flags.insert(false, true);

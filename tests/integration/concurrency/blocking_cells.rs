@@ -21,7 +21,7 @@ use super::*;
 #[test]
 fn bcgc_01_blocking_cell_churn_bounded_under_stress() {
     let (out, ok) = compile_and_run_gc_stress(
-        "fn main() { let mut i = 0; let mut hits = 0; while i < 3000 { let c = BlockingCell::new(\"x\" + i.toString()); if c.get() == \"x\" + i.toString() { hits = hits + 1; } i = i + 1; } println(hits); }",
+        "fn main() { let mut i = 0; let mut hits = 0; while i < 3000 { let c = BlockingCell::new(\"x\" + i.to_string()); if c.get() == \"x\" + i.to_string() { hits = hits + 1; } i = i + 1; } println(hits); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "3000\n");
@@ -30,7 +30,7 @@ fn bcgc_01_blocking_cell_churn_bounded_under_stress() {
 #[test]
 fn bcgc_02_blocking_rw_cell_churn_bounded_under_stress() {
     let (out, ok) = compile_and_run_gc_stress(
-        "fn main() { let mut i = 0; let mut hits = 0; while i < 3000 { let c = BlockingRwCell::new(\"y\"); c.write(c.read() + i.toString()); if c.read() == \"y\" + i.toString() { hits = hits + 1; } i = i + 1; } println(hits); }",
+        "fn main() { let mut i = 0; let mut hits = 0; while i < 3000 { let c = BlockingRwCell::new(\"y\"); c.write(c.read() + i.to_string()); if c.read() == \"y\" + i.to_string() { hits = hits + 1; } i = i + 1; } println(hits); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "3000\n");
@@ -50,7 +50,7 @@ fn bcgc_03_class_value_churn_under_minor_stress() {
 fn bcgc_04_heap_returns_to_baseline_after_churn() {
     // Warm up once so interned literals exist before the baseline is taken.
     let (out, ok) = compile_and_run(
-        "class Node { pub v: i64; }\nfn churn(n: i64) { let mut i = 0; while i < n { let c = BlockingCell::new(new Node(i)); let r = BlockingRwCell::new(\"s\" + i.toString()); c.set(new Node(c.get().v + 1)); r.write(r.read() + \"!\"); i = i + 1; } }\nfn main() { churn(1); gc_collect(); let base = gc_allocated_bytes(); churn(1000); let grown = gc_allocated_bytes() > base; gc_collect(); println(grown); println(gc_allocated_bytes() == base); }",
+        "class Node { pub v: i64; }\nfn churn(n: i64) { let mut i = 0; while i < n { let c = BlockingCell::new(new Node(i)); let r = BlockingRwCell::new(\"s\" + i.to_string()); c.set(new Node(c.get().v + 1)); r.write(r.read() + \"!\"); i = i + 1; } }\nfn main() { churn(1); gc_collect(); let base = gc_allocated_bytes(); churn(1000); let grown = gc_allocated_bytes() > base; gc_collect(); println(grown); println(gc_allocated_bytes() == base); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\ntrue\n");
@@ -97,7 +97,7 @@ fn bcgc_08_initial_value_survives_collection_inside_new() {
 #[test]
 fn bcgc_09_array_of_cells_traces_every_cell() {
     let (out, ok) = compile_and_run_gc_stress(
-        "import std::collections::Array;\nfn main() { let mut cells: Array<BlockingCell<String>> = []; let mut i = 0; while i < 50 { cells.push(BlockingCell::new(\"n\" + i.toString())); i = i + 1; } gc_collect(); let mut hits = 0; let mut k = 0; while k < cells.len() { if cells[k].get() == \"n\" + k.toString() { hits = hits + 1; } k = k + 1; } println(hits); println(cells[49].get()); }",
+        "import std::collections::Array;\nfn main() { let mut cells: Array<BlockingCell<String>> = []; let mut i = 0; while i < 50 { cells.push(BlockingCell::new(\"n\" + i.to_string())); i = i + 1; } gc_collect(); let mut hits = 0; let mut k = 0; while k < cells.len() { if cells[k].get() == \"n\" + k.to_string() { hits = hits + 1; } k = k + 1; } println(hits); println(cells[49].get()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "50\nn49\n");
@@ -143,7 +143,7 @@ fn bcgc_13_scalar_cells_never_confuse_the_collector() {
 #[test]
 fn bcgc_14_cell_as_map_value_is_traced() {
     let (out, ok) = compile_and_run_gc_stress(
-        "import std::collections::Map;\nfn main() { let mut m: Map<i64, BlockingCell<String>> = Map::new(); let mut i = 0; while i < 20 { m.insert(i, BlockingCell::new(\"k\" + i.toString())); i = i + 1; } gc_collect(); match m.get(17) { Option::Some(c) => { println(c.get()); } Option::None => { println(\"missing\"); } } }",
+        "import std::collections::Map;\nfn main() { let mut m: Map<i64, BlockingCell<String>> = Map::new(); let mut i = 0; while i < 20 { m.insert(i, BlockingCell::new(\"k\" + i.to_string())); i = i + 1; } gc_collect(); match m.get(17) { Option::Some(c) => { println(c.get()); } Option::None => { println(\"missing\"); } } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "k17\n");

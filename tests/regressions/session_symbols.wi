@@ -6,7 +6,7 @@ class Reading {
 }
 
 fn describe(reading: Reading) -> String {
-    return reading.doubled().toString();
+    return reading.doubled().to_string();
 }
 
 fn main() {

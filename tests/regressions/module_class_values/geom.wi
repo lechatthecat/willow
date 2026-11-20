@@ -25,7 +25,7 @@ pub fn shift(p: Point, by: i64) -> Point {
 }
 
 pub fn describe(p: Point) -> String {
-    return "(" + p.x.toString() + ", " + p.y.toString() + ")";
+    return "(" + p.x.to_string() + ", " + p.y.to_string() + ")";
 }
 
 pub fn tagged(label: String, x: i64, y: i64) -> Tagged {

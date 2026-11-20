@@ -6,7 +6,7 @@ use super::*;
 //
 // Runtime allocations normally go to the old generation under the heap lock.
 // String results of operations called directly from generated code
-// (concatenation, `i64.toString`), array literals and grown push buffers are
+// (concatenation, `i64.to_string`), array literals and grown push buffers are
 // short-lived and frequent, so they
 // bump-allocate young objects from a per-thread TLS block exactly as the
 // generated fast path does: same header bytes, same start-bit publication,
@@ -802,7 +802,7 @@ mod tests {
             assert!(young(result), "runtime result {result:p} is young");
         }
         // trim, substring, split (handle + buffer + 4 parts), repeat, join,
-        // Ok, Err (message + ParseError + Result), f64 Ok, two toStrings, debug.
+        // Ok, Err (message + ParseError + Result), f64 Ok, two to_strings, debug.
         assert_eq!(willow_gc_tlab_fast_allocations() - fast_before, 18);
         assert_eq!(
             path_counts(),

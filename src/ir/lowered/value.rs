@@ -315,7 +315,7 @@ pub enum LirRvalue {
     },
     /// Concatenation of `parts` in order, built by one size-summed runtime
     /// allocation. `part_types[i]` is `String`, or `I64` for
-    /// a value written in decimal as by `i64.toString()`.
+    /// a value written in decimal as by `i64.to_string()`.
     StringConcat {
         parts: Vec<LirOperand>,
         part_types: Vec<Type>,

@@ -199,7 +199,7 @@ fn main() {
         &[
             "error[E0202]",
             "cannot concatenate `String` with `i64`",
-            ".toString()",
+            ".to_string()",
         ],
     );
 }

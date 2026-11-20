@@ -225,7 +225,7 @@ fn async_method_keeps_receiver_across_await() {
     // An async method is never a leaf: its frame stores `self` past awaits.
     let source = "class C { pub n: i64; pub s: String;\n\
          pub fn get(self) -> i64 { return self.n; }\n\
-         pub async fn later(self) -> String { await sleep(1); gc_collect(); return self.s + self.get().toString(); } }\n\
+         pub async fn later(self) -> String { await sleep(1); gc_collect(); return self.s + self.get().to_string(); } }\n\
          async fn main() { let c = new C(4, \"n=\"); gc_collect(); println(await c.later()); println(c.get()); }";
     let (out, ok) = compile_and_run_gc_stress_all(source);
     assert!(ok, "{out}");
@@ -342,7 +342,7 @@ fn open_implementer_keeps_bracket() {
 
 #[test]
 fn allocating_implementer_keeps_bracket_but_roots_itself() {
-    let implementers = "class Square implements Shape { pub side: i64; pub fn area(self) -> i64 { println(self.side.toString() + \"!\"); return self.side; } }";
+    let implementers = "class Square implements Shape { pub side: i64; pub fn area(self) -> i64 { println(self.side.to_string() + \"!\"); return self.side; } }";
     assert_eq!(
         interface_delta(implementers, &[], PANIC_DEPTH),
         interface_delta(implementers, &NO_EFFECTS, PANIC_DEPTH)
@@ -403,7 +403,7 @@ class P { pub x: i64; pub y: i64; pub name: String;
 fn main() {
     let mut ps: Array<P> = [];
     let mut i = 0;
-    while i < 50 { ps.push(new P(i, i * 2, "p" + i.toString())); i = i + 1; }
+    while i < 50 { ps.push(new P(i, i * 2, "p" + i.to_string())); i = i + 1; }
     let mut total = 0;
     for p in ps { gc_collect(); total = total + p.sum() + p.half(); println(p.name); }
     println(total);
@@ -507,7 +507,7 @@ fn release_receiver_snapshot_survives_allocating_and_mutating_arguments() {
 interface View { fn get(self, n: i64) -> String; }
 class Item implements View {
     pub s: String;
-    pub fn get(self, n: i64) -> String { gc_collect(); return self.s + n.toString(); }
+    pub fn get(self, n: i64) -> String { gc_collect(); return self.s + n.to_string(); }
     pub fn same(self) -> Item { gc_collect(); return self; }
 }
 fn replace(slot: &mut Item) -> i64 { slot = new Item("new"); gc_collect(); return 7; }

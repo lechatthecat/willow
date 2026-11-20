@@ -209,7 +209,7 @@ class Item implements Named {
 
 class Tag implements Named {
     pub n: i64;
-    pub fn name(self) -> String { return "#" + self.n.toString(); }
+    pub fn name(self) -> String { return "#" + self.n.to_string(); }
 }
 
 class Cell {
@@ -503,7 +503,7 @@ fn main() { println(eligible(1)); }
 // the output changes.
 //
 // c25 an empty map filled by `insert`, c26 `contains` both ways, c27
-// `toString` (sorted by key, so the text is deterministic), c28 an i64-keyed
+// `to_string` (sorted by key, so the text is deterministic), c28 an i64-keyed
 // map with String values, c29 a map as a parameter, c30 a map as a RETURN
 // value, c31 `freeze` into a `FrozenMap` read through `len`/`contains`,
 // c32 an array frozen and then indexed, c33 a `FrozenArray` parameter summed

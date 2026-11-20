@@ -69,7 +69,7 @@ open class Ledger {
         if self.total == 0 {
             return self.name + ":empty";
         }
-        return self.name + ":" + self.total.toString();
+        return self.name + ":" + self.total.to_string();
     }
 
     // A static method: the ABI still reserves the receiver slot, but there is
@@ -119,7 +119,7 @@ class Stamp extends Tag {
     }
 
     pub fn render(self) -> String {
-        return self.seal + self.text + self.weight.toString() + self.seal;
+        return self.seal + self.text + self.weight.to_string() + self.seal;
     }
 }
 

@@ -74,7 +74,7 @@ open class Shape {
     pub size: i64;
     pub open fn area(self) -> i64 { return self.size; }
     pub open fn label(self) -> String { return "shape"; }
-    pub fn report(self) -> String { return self.label() + "=" + self.area().toString(); }
+    pub fn report(self) -> String { return self.label() + "=" + self.area().to_string(); }
 }
 open class Square extends Shape {
     pub open override fn area(self) -> i64 { return self.size * self.size; }
@@ -250,12 +250,12 @@ fn lir_inh_08_virtual_method_with_arguments_and_string_return() {
         r#"
 open class Tag {
     pub open fn render(self, prefix: String, n: i64) -> String {
-        return prefix + "base" + n.toString();
+        return prefix + "base" + n.to_string();
     }
 }
 class Loud extends Tag {
     pub override fn render(self, prefix: String, n: i64) -> String {
-        return prefix + "LOUD" + (n * 2).toString();
+        return prefix + "LOUD" + (n * 2).to_string();
     }
 }
 fn render_with(t: Tag) -> String { return t.render("<", 3) + ">"; }
@@ -495,7 +495,7 @@ open class Dog implements Animal {
 class Puppy extends Dog {
     pub override fn name(self) -> String { return "puppy"; }
 }
-fn describe(a: Animal) -> String { return a.name() + "/" + a.legs().toString(); }
+fn describe(a: Animal) -> String { return a.name() + "/" + a.legs().to_string(); }
 fn main() {
     println(describe(new Dog()));
     println(describe(new Puppy()));
@@ -581,7 +581,7 @@ open class Dog implements Animal {
 class Puppy extends Dog { pub override fn name(self) -> String { return "puppy"; } }
 fn info(a: Animal) -> String {
     return match a {
-        Puppy(p) => p.name() + ":" + p.tag_twice().toString() + ":" + p.tag.toString(),
+        Puppy(p) => p.name() + ":" + p.tag_twice().to_string() + ":" + p.tag.to_string(),
         _ => "?",
     };
 }
@@ -656,7 +656,7 @@ class Widget extends Base { pub static count: i64 = 3; }
 class Other { pub static kind: String = "other"; }
 class Reader {
     pub fn read(self) -> String {
-        return Widget::kind + "/" + Other::kind + "/" + Widget::limit.toString();
+        return Widget::kind + "/" + Other::kind + "/" + Widget::limit.to_string();
     }
 }
 fn main() {

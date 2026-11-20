@@ -6,7 +6,7 @@ const CLASSES: &str = r#"
 class Item {
     pub value: String;
     pub fn read(self) -> String { gc_collect(); return self.value + "!"; }
-    pub fn with_arg(self, n: i64) -> String { gc_collect(); return self.value + n.toString(); }
+    pub fn with_arg(self, n: i64) -> String { gc_collect(); return self.value + n.to_string(); }
     pub fn nested(self) -> String { return self.read(); }
     pub fn same(self) -> Item { gc_collect(); return self; }
     pub fn replace(self, slot: &mut Item) -> String {

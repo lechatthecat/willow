@@ -20,7 +20,7 @@ class Robot implements Greeter {
     pub id: i64;
 
     pub fn greet(self) -> String {
-        return "robot:" + self.id.toString();
+        return "robot:" + self.id.to_string();
     }
 }
 

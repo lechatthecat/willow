@@ -138,7 +138,7 @@ fn lir_method_04_four_parameters_keep_order_and_type() {
     let src = "class Mixer {
     pub tag: String;
     pub fn mix(self, a: i64, b: String, c: bool, d: f64) -> String {
-        return self.tag + \"/\" + a.toString() + b + c.toString() + d.toString();
+        return self.tag + \"/\" + a.to_string() + b + c.to_string() + d.to_string();
     }
 }
 
@@ -535,7 +535,7 @@ class Report {
         let out: Array<String> = [];
         let mut i = 0;
         while i < n {
-            out.push(self.title + \"-\" + i.toString());
+            out.push(self.title + \"-\" + i.to_string());
             i = i + 1;
         }
         return out;
@@ -585,7 +585,7 @@ fn lir_method_23_async_method_parameter_order_survives_a_park() {
     pub head: String;
     pub async fn join(self, a: i64, b: String, c: bool) -> String {
         await sleep(1);
-        return self.head + a.toString() + b + c.toString();
+        return self.head + a.to_string() + b + c.to_string();
     }
 }
 

@@ -4,7 +4,7 @@ fn main() {
     println(i64::parse("+42").unwrap());
     println(i64::parse("-9223372036854775808").unwrap());
     let message = match i64::parse("9223372036854775808") {
-        Result::Ok(value) => value.toString(),
+        Result::Ok(value) => value.to_string(),
         Result::Err(error) => match error {
             ParseIntError::Invalid(message) => "parse failed",
         },

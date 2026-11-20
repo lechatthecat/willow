@@ -2,14 +2,14 @@ import std::collections::{Array, Map};
 // These successful calls demonstrate the methods listed by unknown-method errors.
 fn main() {
     println("abc".substring(0, 1));
-    println(3.wrapping_add(2).toString());
-    println(1.5.toString());
-    println(true.toString());
+    println(3.wrapping_add(2).to_string());
+    println(1.5.to_string());
+    println(true.to_string());
     let values: Array<i64> = [1, 2];
     values.push(3);
-    println(values.len().toString());
+    println(values.len().to_string());
     let entries = Map<String, i64>::new();
     entries.insert("key", 7);
-    println(entries.len().toString());
-    println("abc".find("b").toString());
+    println(entries.len().to_string());
+    println("abc".find("b").unwrap_or(-1).to_string());
 }

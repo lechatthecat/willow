@@ -1965,7 +1965,7 @@ mod tests {
             ),
             (
                 "allocation",
-                "@effects(no_io) fn f()->String { return 3.toString(); }",
+                "@effects(no_io) fn f()->String { return 3.to_string(); }",
                 None,
             ),
             (

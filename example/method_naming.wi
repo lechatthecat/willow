@@ -1,0 +1,28 @@
+// Builtin and std methods are snake_case. `to_string` converts scalars,
+// Strings, arrays and maps; String.find reports absence as None.
+import std::collections::{Array, Map};
+
+class Point {
+    pub x: i64;
+    pub y: i64;
+    pub fn to_string(self) -> String {
+        return "(" + self.x.to_string() + ", " + self.y.to_string() + ")";
+    }
+}
+
+fn main() {
+    println(42.to_string() + " " + 2.5.to_string() + " " + true.to_string());
+    let xs: Array<i64> = [1, 2, 3];
+    println(xs.to_string());
+    let ages = Map<String, i64>::new();
+    ages.insert("ada", 36);
+    println(ages.to_string());
+    println(new Point(3, 4).to_string());
+    let text = "key=value";
+    match text.find("=") {
+        Some(at) => println(text.slice(0, at) + " / " + text.slice(at + 1, text.len())),
+        None => println("no separator"),
+    }
+    println(text.find("#").is_none());
+    println(7.wrapping_add(1).to_string());
+}

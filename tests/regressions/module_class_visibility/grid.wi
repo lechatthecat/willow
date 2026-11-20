@@ -8,7 +8,7 @@ pub class Point {
     pub tag: String;
 
     pub fn label(self) -> String {
-        return self.tag + ":" + self.row.toString() + "," + self.col.toString();
+        return self.tag + ":" + self.row.to_string() + "," + self.col.to_string();
     }
 }
 

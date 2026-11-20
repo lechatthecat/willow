@@ -2,7 +2,7 @@
 //
 // A left-nested `+` chain whose intermediates are compiler temporaries is
 // lowered to one `willow_string_concat_n` call that sizes the result once and
-// formats `i64.toString()` operands directly into it. These tests pin the
+// formats `i64.to_string()` operands directly into it. These tests pin the
 // observable semantics the rewrite must preserve: operand evaluation order,
 // empty and non-ASCII operands, integer extremes, results larger than a TLAB
 // object, collections (including relocation) while operands are evaluated,
@@ -20,7 +20,7 @@ fn main() {
     let b = "é水";
     let n = 0;
     println("[" + a + empty() + a + "]");
-    println(a + b + n.toString() + a + "🌲" + b);
+    println(a + b + n.to_string() + a + "🌲" + b);
     println((a + b + a + a).len());
 }
 "#;
@@ -37,12 +37,12 @@ fn main() {
     let min = -9223372036854775807 - 1;
     let zero = 0;
     let neg = -7;
-    println("max=" + max.toString() + " min=" + min.toString() + " zero=" + zero.toString() + " neg=" + neg.toString() + ".");
+    println("max=" + max.to_string() + " min=" + min.to_string() + " zero=" + zero.to_string() + " neg=" + neg.to_string() + ".");
     let mut digits = "";
     let mut i = 0;
     while i < 20 {
         let p = i * 1000003 - 9;
-        digits = digits + p.toString() + ",";
+        digits = digits + p.to_string() + ",";
         i = i + 1;
     }
     println(digits);
@@ -70,7 +70,7 @@ fn main() {
         i = i + 1;
     }
     let n = 12345;
-    let joined = block + "|" + n.toString() + "|" + block + "|" + block;
+    let joined = block + "|" + n.to_string() + "|" + block + "|" + block;
     println(joined.len());
     println(joined.substring(4795, 4812));
 }
@@ -89,11 +89,11 @@ fn part(tag: String) -> String {
     return tag;
 }
 fn num(v: i64) -> i64 {
-    println("num " + v.toString());
+    println("num " + v.to_string());
     return v;
 }
 fn main() {
-    let s = part("a") + part("b") + num(1).toString() + part("c") + num(2).toString();
+    let s = part("a") + part("b") + num(1).to_string() + part("c") + num(2).to_string();
     println(s);
 }
 "#;
@@ -107,19 +107,19 @@ fn churn(tag: String) -> String {
     let mut junk = "";
     let mut i = 0;
     while i < 200 {
-        junk = junk + "x" + i.toString();
+        junk = junk + "x" + i.to_string();
         i = i + 1;
     }
     gc_minor_collect();
     gc_collect();
-    return tag + junk.len().toString();
+    return tag + junk.len().to_string();
 }
 fn main() {
     let head = "head-" + "é";
     let mut round = 0;
     while round < 3 {
         let n = round * 11;
-        let s = head + ":" + churn("a") + ":" + n.toString() + ":" + churn("b") + ":" + head;
+        let s = head + ":" + churn("a") + ":" + n.to_string() + ":" + churn("b") + ":" + head;
         println(s);
         round = round + 1;
     }
@@ -168,12 +168,12 @@ fn concat_fusion_across_an_await() {
     let src = r#"
 async fn later(v: i64) -> String {
     await sleep(1);
-    return "<" + v.toString() + ">";
+    return "<" + v.to_string() + ">";
 }
 async fn main() {
     let name = "wí";
     let n = 41;
-    let s = name + "=" + n.toString() + await later(n + 1) + "/" + name;
+    let s = name + "=" + n.to_string() + await later(n + 1) + "/" + name;
     println(s);
 }
 "#;
@@ -186,12 +186,12 @@ async fn main() {
 fn concat_fusion_inside_defer_and_lambda_bodies() {
     let src = r#"
 fn describe(label: String, factor: i64) -> fn(i64) -> String {
-    return |x: i64| label + "=" + (x * factor).toString() + ";" + label;
+    return |x: i64| label + "=" + (x * factor).to_string() + ";" + label;
 }
 fn main() {
     let tag = "τ";
     let n = -3;
-    defer println("defer " + tag + n.toString() + "/" + tag);
+    defer println("defer " + tag + n.to_string() + "/" + tag);
     let f = describe("k", 7);
     println(f(6));
 }
@@ -230,7 +230,7 @@ fn boom(v: i64) -> String {
 fn main() {
     let n = 5;
     println("before");
-    let s = "a" + n.toString() + boom(n) + "z";
+    let s = "a" + n.to_string() + boom(n) + "z";
     println(s);
 }
 "#;
@@ -257,7 +257,7 @@ fn attempt(v: i64) -> String {
             Some(info) => println("recovered: " + info.message),
             None => {}
         }
-        status = "s" + v.toString() + boom(v) + "e" + v.toString();
+        status = "s" + v.to_string() + boom(v) + "e" + v.to_string();
     }
     return status;
 }
@@ -278,7 +278,7 @@ fn main() {
     let mut text = "";
     let mut i = 0;
     while i < 5 {
-        text = text + "[" + i.toString() + "]";
+        text = text + "[" + i.to_string() + "]";
         i = i + 1;
     }
     println(text);
@@ -294,8 +294,8 @@ fn concat_fusion_keeps_named_intermediates_observable() {
     let src = r#"
 fn main() {
     let n = 9;
-    let left = "L" + n.toString();
-    let both = left + "-" + left + "-" + n.toString();
+    let left = "L" + n.to_string();
+    let both = left + "-" + left + "-" + n.to_string();
     println(left);
     println(both);
 }
@@ -336,7 +336,7 @@ fn concat_fusion_emits_one_n_ary_call_for_the_chain() {
 fn main() {
     let a = "x";
     let n = 3;
-    let s = a + ":" + n.toString() + ":" + a;
+    let s = a + ":" + n.to_string() + ":" + a;
     println(s);
 }
 "#;
@@ -353,7 +353,7 @@ fn main() {
         );
         assert!(
             !targets.iter().any(|name| name == "willow_i64_to_string"),
-            "toString must be formatted in place: {targets:?}"
+            "to_string must be formatted in place: {targets:?}"
         );
         assert!(
             targets.iter().any(|name| name == "inline_panic_depth"),
@@ -387,7 +387,7 @@ fn concat_fusion_with_many_parts_in_one_expression() {
     let mut expr = String::from("\"\"");
     let mut expected = String::new();
     for i in 0..300 {
-        expr.push_str(&format!(" + \"p\" + ({i} - 150).toString()"));
+        expr.push_str(&format!(" + \"p\" + ({i} - 150).to_string()"));
         expected.push_str(&format!("p{}", i - 150));
     }
     let src = format!("fn main() {{\n    let s = {expr};\n    println(s);\n}}\n");
@@ -403,7 +403,7 @@ async fn label(id: i64) -> String {
     let mut acc = "";
     let mut i = 0;
     while i < 50 {
-        acc = acc + "t" + id.toString() + "." + i.toString() + ";";
+        acc = acc + "t" + id.to_string() + "." + i.to_string() + ";";
         i = i + 1;
     }
     return acc;

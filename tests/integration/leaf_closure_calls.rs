@@ -155,7 +155,7 @@ fn function_value_call_keeps_panic_bracket() {
 
 #[test]
 fn allocating_lambda_keeps_roots() {
-    let body = "{ let t = p.s + x.toString(); return t.len() + p.n; }";
+    let body = "{ let t = p.s + x.to_string(); return t.len() + p.n; }";
     assert!(lambda_delta(body, ROOT).iter().all(|&d| d >= 4));
 }
 
@@ -214,7 +214,7 @@ fn parameter_divisor_lambda_panics_on_zero() {
 fn no_panic_allocating_lambda_survives_gc_stress() {
     let source = r#"
 fn make(prefix: String) -> fn(i64) -> String {
-    return |x: i64| { let s = prefix + x.toString(); return s + "!"; };
+    return |x: i64| { let s = prefix + x.to_string(); return s + "!"; };
 }
 fn main() {
     let f = make("v");
@@ -236,12 +236,12 @@ fn reader(p: P, k: i64) -> fn(i64) -> i64 { return |y| p.x * k + y; }
 fn main() {
     let mut fs: Array<fn(i64) -> i64> = [];
     let mut i = 0;
-    while i < 40 { fs.push(reader(new P(i, "p" + i.toString()), 3)); i = i + 1; }
+    while i < 40 { fs.push(reader(new P(i, "p" + i.to_string()), 3)); i = i + 1; }
     let mut total = 0;
     i = 0;
     while i < 40 {
         gc_minor_collect();
-        let garbage = "g" + i.toString();
+        let garbage = "g" + i.to_string();
         gc_collect();
         let f = fs[i];
         total = total + f(garbage.len());
@@ -269,9 +269,9 @@ class P { pub x: i64; pub name: String; }
 fn make(p: P, tag: String) -> fn(i64) -> String {
     return |y: i64| {
         gc_minor_collect();
-        let junk = tag + y.toString();
+        let junk = tag + y.to_string();
         gc_collect();
-        return p.name + ":" + (p.x + junk.len()).toString() + tag;
+        return p.name + ":" + (p.x + junk.len()).to_string() + tag;
     };
 }
 fn main() {
@@ -299,7 +299,7 @@ fn make(sep: String) -> fn(String, String) -> String {
 fn main() {
     let f = make("-");
     let mut i = 0;
-    while i < 3 { println(f("a" + i.toString(), "b" + i.toString())); i = i + 1; }
+    while i < 3 { println(f("a" + i.to_string(), "b" + i.to_string())); i = i + 1; }
 }
 "#;
     let (out, ok) = compile_and_run_gc_stress_all(source);
@@ -332,7 +332,7 @@ fn leaf_returning_captured_reference_under_gc_stress() {
     let source = r#"
 fn make(a: String, b: String) -> fn(bool) -> String { return |first| first ? a : b; }
 fn main() {
-    let f = make("left" + 1.toString(), "right" + 2.toString());
+    let f = make("left" + 1.to_string(), "right" + 2.to_string());
     let mut i = 0;
     while i < 4 { gc_minor_collect(); println(f(i % 2 == 0)); i = i + 1; }
 }
@@ -625,7 +625,7 @@ fn promoted_function_values_reject_faulting_effectful_and_large_bodies() {
         "return 2 ** x;",
         "println(x); return x;",
         "let mut i = 0; while i < x { i = i + 1; } return i;",
-        "return x.toString().len();",
+        "return x.to_string().len();",
         "return (((((((((x + 1) * 2 + 3) * 4 + 5) * 6 + 7) * 8 + 9) * 10 + 11) * 12 + 13) * 14 + 15) * 16 + 17);",
     ] {
         let source = format!(

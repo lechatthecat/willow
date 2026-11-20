@@ -192,7 +192,7 @@ impl TypeChecker {
                 }
 
                 // String concatenation is strongly typed: `String + non-String`
-                // (or the reverse) is rejected with a `toString()` suggestion
+                // (or the reverse) is rejected with a `to_string()` suggestion
                 // rather than an implicit stringify.
                 if b.op == BinOp::Add && (lty == Type::String || rty == Type::String) {
                     let (non_str, side) = if lty == Type::String {
@@ -219,7 +219,7 @@ impl TypeChecker {
                         diagnostic.with_help("use an expression that produces a String value")
                     } else {
                         diagnostic.with_help(
-                            "convert explicitly with `.toString()`, e.g. `\"x = \" + value.toString()`",
+                            "convert explicitly with `.to_string()`, e.g. `\"x = \" + value.to_string()`",
                         )
                     });
                     return Type::String;

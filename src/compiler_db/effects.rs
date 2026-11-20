@@ -3606,7 +3606,7 @@ impl<N> HazardVisitor<'_, N> {
             // retaining a check is conservative.
             Expr::Await(_) => self.mark_direct(expression.span()),
             Expr::Select(_) => self.mark_direct(expression.span()),
-            // Object/interface display may invoke user `toString` code.
+            // Object/interface display may invoke user `to_string` code.
             Expr::Print(..) => self.mark_direct(expression.span()),
             // Bounds guard.
             Expr::Index(..) => self.mark_direct(expression.span()),

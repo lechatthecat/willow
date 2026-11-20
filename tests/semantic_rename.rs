@@ -890,7 +890,7 @@ const BUILTIN_NAMED_VEC: &str = "pub class Vec3 {
     pub fn len(self) -> f64 { return self.x; }
     pub fn add(self, o: Vec3) -> Vec3 { return new Vec3(self.x + o.x); }
     pub fn unwrap(self) -> f64 { return self.x; }
-    pub fn toString(self) -> String { return \"v\" + self.x.toString(); }
+    pub fn to_string(self) -> String { return \"v\" + self.x.to_string(); }
 }
 pub interface Sized { fn len(self) -> f64; }
 pub class Box implements Sized { pub n: f64; pub fn len(self) -> f64 { return self.n; } }
@@ -911,13 +911,13 @@ fn main() {
     rays.add(items.len() + frozen.len() + words.len() + s.len() + o.unwrap());
     let v = new Vec3(1.0).add(new Vec3(2.0));
     println(v.len() + v.unwrap() + size(new Box(2.0)) + max(1.0, 2.0) + min(1.0, 2.0));
-    println(v.toString() + items.len().toString() + s.toString());
+    println(v.to_string() + items.len().to_string() + s.to_string());
     println(rays.load());
 }
 ";
 
 /// Builtin member calls (Array/FrozenArray/Map/String/Option/AtomicI64 and
-/// primitive `toString`) are proven non-targets, so user methods sharing their
+/// primitive `to_string`) are proven non-targets, so user methods sharing their
 /// spelling rename without touching builtin calls and the program still runs.
 #[test]
 fn user_methods_named_like_builtins_rename_without_touching_builtin_calls() {
@@ -925,7 +925,7 @@ fn user_methods_named_like_builtins_rename_without_touching_builtin_calls() {
         ("vec::Vec3::len", "len", "length", 2),
         ("vec::Vec3::add", "add", "plus", 2),
         ("vec::Vec3::unwrap", "unwrap", "value", 2),
-        ("vec::Vec3::toString", "toString", "show", 2),
+        ("vec::Vec3::to_string", "to_string", "show", 2),
         ("vec::Sized::len", "len", "measure", 3),
         ("vec::Box::len", "len", "measure", 3),
     ] {
@@ -949,8 +949,8 @@ fn user_methods_named_like_builtins_rename_without_touching_builtin_calls() {
             "s.len()",
             "o.unwrap()",
             "rays.add(",
-            "items.len().toString()",
-            "s.toString()",
+            "items.len().to_string()",
+            "s.to_string()",
         ] {
             assert!(
                 main.contains(builtin),
@@ -1079,7 +1079,7 @@ fn nested_builtin_arguments_and_chains_are_proven_non_targets() {
     for depth in [1usize, 16, 64] {
         let nested = format!("{}0{}", "rays.add(".repeat(depth), ")".repeat(depth));
         let source = format!(
-            "class P {{ pub n: i64; pub fn add(self, x: i64) -> i64 {{ return self.n + x; }} }}\nfn main() {{ let rays = AtomicI64::new(0); let p = new P(1); println(p.add({nested}).toString() + p.add(1).toString().len().toString()); }}"
+            "class P {{ pub n: i64; pub fn add(self, x: i64) -> i64 {{ return self.n + x; }} }}\nfn main() {{ let rays = AtomicI64::new(0); let p = new P(1); println(p.add({nested}).to_string() + p.add(1).to_string().len().to_string()); }}"
         );
         let f = Fixture::new(&source);
         let applied = f.run(&["rename", "main::P::add", "plus"], 0);

@@ -83,10 +83,10 @@ fn constructor_inference_void_concat_help() {
         ));
         assert_eq!(ds.len(), 1, "{ds:?}");
         assert!(ds[0].message.contains("cannot concatenate"));
-        assert!(!ds[0].helps.join(" ").contains("toString"));
+        assert!(!ds[0].helps.join(" ").contains("to_string"));
     }
     let (_, ds) = errors("fn main() { let s = \"n\" + 1; }");
-    assert!(ds[0].helps.join(" ").contains("toString"));
+    assert!(ds[0].helps.join(" ").contains("to_string"));
 }
 
 #[test]

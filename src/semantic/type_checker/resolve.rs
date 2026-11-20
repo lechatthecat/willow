@@ -1630,9 +1630,10 @@ impl TypeChecker {
         }
     }
 
+    /// Whether `ty` has a method named `method` (builtin, `std` or declared).
     /// Inspect method declarations only: never check the receiver/arguments again
     /// or request a generic body merely to choose an error message.
-    fn option_payload_has_method(&self, ty: &Type, method: &str) -> bool {
+    pub(super) fn type_has_method(&self, ty: &Type, method: &str) -> bool {
         use crate::semantic::intrinsics;
 
         if method.starts_with("__abi_") || method == "init" {
@@ -1708,10 +1709,10 @@ impl TypeChecker {
         {
             return ty;
         }
-        // Built-in `toString()` on primitives: `i64`/`f64`/`bool`/`String` ->
-        // `String`. Class `toString()` falls through to normal
+        // Built-in `to_string()` on primitives: `i64`/`f64`/`bool`/`String` ->
+        // `String`. Class `to_string()` falls through to normal
         // instance-method resolution.
-        if method_name == "toString"
+        if method_name == "to_string"
             && matches!(obj_ty, Type::I64 | Type::F64 | Type::Bool | Type::String)
         {
             self.check_builtin_arity(
@@ -1727,7 +1728,7 @@ impl TypeChecker {
             obj_ty,
             crate::semantic::builtin_types::BuiltinTypeId::Option,
         ) {
-            let mut diagnostic = if self.option_payload_has_method(inner, method_name) {
+            let mut diagnostic = if self.type_has_method(inner, method_name) {
                 Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0201,
@@ -1817,33 +1818,18 @@ impl TypeChecker {
                 .with_label(Label::primary(span, "unknown method"));
                 let methods = match obj_ty {
                     Type::String => {
-                        "len, byte_at, trim, substring, slice, repeat, split, contains, find, starts_with, ends_with, replace, trim_start, trim_end, to_lower, to_upper, toString"
+                        "len, byte_at, trim, substring, slice, repeat, split, contains, find, starts_with, ends_with, replace, trim_start, trim_end, to_lower, to_upper, to_string"
                     }
                     Type::I64 => {
-                        "wrapping_add, wrapping_sub, wrapping_mul, wrapping_neg, checked_add, checked_sub, checked_mul, checked_neg, toString"
+                        "wrapping_add, wrapping_sub, wrapping_mul, wrapping_neg, checked_add, checked_sub, checked_mul, checked_neg, to_string"
                     }
-                    Type::F64 | Type::Bool => "toString",
+                    Type::F64 | Type::Bool => "to_string",
                     _ => "",
                 };
                 if !methods.is_empty() {
                     diagnostic = diagnostic.with_help(format!("available methods: {methods}"));
                 }
                 self.label_receiver_call_origin(&mut diagnostic, receiver, obj_ty);
-                if *obj_ty == Type::I64
-                    && matches!(
-                        method_name,
-                        "unwrap"
-                            | "expect"
-                            | "unwrap_or"
-                            | "is_some"
-                            | "is_none"
-                            | "map"
-                            | "and_then"
-                            | "or_else"
-                    )
-                {
-                    diagnostic = diagnostic.with_help(STRING_FIND_SENTINEL_HELP);
-                }
                 self.push(diagnostic);
                 return Type::Void;
             }

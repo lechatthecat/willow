@@ -4,7 +4,7 @@ class Gen<T> {
     pub static fn make(x: T) -> Gen<T> { return new Gen<T>(x); }
 }
 fn choose(s: String) -> String {
-    let i = s.find(".");
+    let i = s.find(".").unwrap_or(0);
     return if i > 0 { s } else { "none" };
 }
 fn propagate() -> Option<i64> {

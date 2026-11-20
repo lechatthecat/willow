@@ -152,8 +152,8 @@ async fn main() {
     let first = await parallel::map(frozen, triple);
     println(await churn(48));
     let second = await parallel::map(frozen, triple);
-    println(first.toString());
-    println(second.toString());
+    println(first.to_string());
+    println(second.to_string());
 }
 "#,
         "alloc",
@@ -246,7 +246,7 @@ async fn main() {
         gc_collect();
         gc_minor_collect();
         if round == 5 {
-            println(mapped.toString());
+            println(mapped.to_string());
         }
         round = round + 1;
     }
@@ -297,7 +297,7 @@ import std::parallel;
 async fn main() {
     let values: Array<i64> = [2, 4, 6, 8];
     let mapped = await parallel::map(values.freeze(), |value| value + 1);
-    println(mapped.toString());
+    println(mapped.to_string());
 }
 "#,
         "alloc",
@@ -326,7 +326,7 @@ async fn main() {
         gc_collect();
         round = round + 1;
     }
-    println(mapped.toString());
+    println(mapped.to_string());
     println(mapped[0] + mapped[1] + mapped[2]);
 }
 "#,
@@ -421,7 +421,7 @@ import std::collections::Array;
 import std::parallel;
 
 fn tag(value: i64) -> i64 {
-    let text = "value-" + value.toString();
+    let text = "value-" + value.to_string();
     if text == "value-22" {
         return 1;
     }
@@ -431,7 +431,7 @@ fn tag(value: i64) -> i64 {
 async fn main() {
     let values: Array<i64> = [1, 22, 333];
     let mapped = await parallel::map(values.freeze(), tag);
-    println(mapped.toString());
+    println(mapped.to_string());
 }
 "#,
         &[("WILLOW_WORKERS", "4"), ("WILLOW_GC_STRESS", "alloc")],
@@ -463,7 +463,7 @@ async fn main() {
     let values: Array<i64> = [2, 3, 4];
     let mapped = await parallel::map(values.freeze(), width);
     gc_collect();
-    println(mapped.toString());
+    println(mapped.to_string());
 }
 "#,
         &[("WILLOW_WORKERS", "4"), ("WILLOW_GC_STRESS", "alloc")],

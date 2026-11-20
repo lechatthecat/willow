@@ -485,7 +485,7 @@ pub(super) fn supported_panic<'e>(
     }
 }
 
-/// The result type of a scalar `toString`, or `None` when this receiver and
+/// The result type of a scalar `to_string`, or `None` when this receiver and
 /// method are not one — the walker's only entry point into the intrinsic table.
 ///
 /// The four scalar conversions are the whole set with a primitive receiver, and
@@ -1557,7 +1557,7 @@ fn supported_expr_node<'n>(
                     // (`map_key_supported` allows only those four), but the
                     // check is written out so the emitter's `expect` stays
                     // honest if either subset moves.
-                    (LirCollection::Map, "toString") => {
+                    (LirCollection::Map, "to_string") => {
                         args.is_empty()
                             && e.ty == Type::String
                             && collection_elem_kind(&targs[0]).is_some()
@@ -1659,7 +1659,7 @@ fn supported_expr_node<'n>(
                     && child_supported(object)
                     && args.iter().all(child_supported)
             }
-            // Scalar `toString` — the only builtin method with a primitive
+            // Scalar `to_string` — the only builtin method with a primitive
             // receiver. Which intrinsic a call denotes is answered by the
             // shared table rather than re-derived from the method name here,
             // so the walker cannot disagree with the checker about what the

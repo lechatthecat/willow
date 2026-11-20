@@ -5,9 +5,9 @@ class Boxed { pub value: i64; }
 
 fn helper(value: i64) -> i64 {
     let boxed = new Boxed(value);
-    let text = value.toString();
+    let text = value.to_string();
     gc_minor_collect();
-    if text != value.toString() { panic("lost mapper string"); }
+    if text != value.to_string() { panic("lost mapper string"); }
     return boxed.value;
 }
 

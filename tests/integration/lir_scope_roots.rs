@@ -611,7 +611,7 @@ fn p19_a_string_binding_in_a_loop_prints_every_round() {
     let before = gc_allocated_bytes();
     let mut i = 0;
     while i < rounds {
-        let text = \"row \" + i.toString();
+        let text = \"row \" + i.to_string();
         println(text);
         i = i + 1;
     }

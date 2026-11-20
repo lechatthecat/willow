@@ -111,7 +111,7 @@ async fn main() {
     let frozen = strings.freeze();
     println(frozen[0]);
     println(strings.join(","));
-    println(xs.toString());
+    println(xs.to_string());
     let f = |v: [i64; 1]| v[0];
     println(f(xs));
 }

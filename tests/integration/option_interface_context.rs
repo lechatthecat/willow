@@ -316,7 +316,7 @@ fn option_iface_18_heap_field_survives_allocation_stress() {
 fn main() {
     let holder = new Holder(Some(new Cat("heap")));
     let mut i = 0;
-    while i < 64 { let noise = "n" + i.toString(); i = i + 1; }
+    while i < 64 { let noise = "n" + i.to_string(); i = i + 1; }
     println(read(holder.value));
 }
 "#,

@@ -26,7 +26,7 @@ class Square extends Shape {
         println(self.area());
     }
     pub override fn describe(self) -> String {
-        return self.name + "(" + self.side.toString() + ")";
+        return self.name + "(" + self.side.to_string() + ")";
     }
     fn area(self) -> i64 { return self.side * self.side; }
 }

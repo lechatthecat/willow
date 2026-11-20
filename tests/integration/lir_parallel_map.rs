@@ -83,7 +83,7 @@ fn lir_parallel_01_named_mapper_keeps_source_order() {
 fn square(value: i64) -> i64 {{ return value * value; }}
 async fn main() {{
     let values: Array<i64> = [5, 1, 4, 2, 3];
-    println((await parallel::map(values.freeze(), square)).toString());
+    println((await parallel::map(values.freeze(), square)).to_string());
 }}
 "
         ),
@@ -101,7 +101,7 @@ fn lir_parallel_02_a_lambda_is_a_mapper_too() {
             "{IMPORTS}
 async fn main() {{
     let values: Array<i64> = [1, 2, 3, 4];
-    println((await parallel::map(values.freeze(), |value| value * 2)).toString());
+    println((await parallel::map(values.freeze(), |value| value * 2)).to_string());
 }}
 "
         ),
@@ -121,8 +121,8 @@ fn increment(value: i64) -> i64 {{ return value + 1; }}
 async fn main() {{
     let empty: Array<i64> = [];
     let one: Array<i64> = [41];
-    println((await parallel::map(empty.freeze(), increment)).toString());
-    println((await parallel::map(one.freeze(), increment)).toString());
+    println((await parallel::map(empty.freeze(), increment)).to_string());
+    println((await parallel::map(one.freeze(), increment)).to_string());
 }}
 "
         ),
@@ -146,7 +146,7 @@ fn start(values: FrozenArray<i64>) -> Task<Array<i64>> {{
 }}
 async fn main() {{
     let values: Array<i64> = [1, 2, 3];
-    println((await start(values.freeze())).toString());
+    println((await start(values.freeze())).to_string());
 }}
 "
         ),
@@ -168,7 +168,7 @@ async fn main() {{
     let values: Array<i64> = [1, 2, 3];
     let once = await parallel::map(values.freeze(), twice);
     let again = await parallel::map(once.freeze(), plus_one);
-    println(again.toString());
+    println(again.to_string());
 }}
 "
         ),
@@ -195,7 +195,7 @@ async fn main() {{
         total = total + mapped[i];
         i = i + 1;
     }}
-    println(total.toString());
+    println(total.to_string());
 }}
 "
         ),
@@ -218,8 +218,8 @@ async fn main() {{
     let right: Array<i64> = [9, 8, 7];
     let first = parallel::map(left.freeze(), twice);
     let second = parallel::map(right.freeze(), plus_ten);
-    println((await second).toString());
-    println((await first).toString());
+    println((await second).to_string());
+    println((await first).to_string());
 }}
 "
         ),
@@ -242,7 +242,7 @@ async fn doubled(values: FrozenArray<i64>) -> Array<i64> {{
 }}
 async fn main() {{
     let values: Array<i64> = [1, 2, 3, 4];
-    println((await doubled(values.freeze())).toString());
+    println((await doubled(values.freeze())).to_string());
 }}
 "
         ),
@@ -267,7 +267,7 @@ async fn main() {{
     let mut i = 0;
     while i < 200 {{ junk = junk + \"x\"; i = i + 1; }}
     gc_collect();
-    println(mapped.toString());
+    println(mapped.to_string());
 }}
 "
         ),
@@ -294,8 +294,8 @@ async fn main() {{
     while i < 64 {{ values.push(i); i = i + 1; }}
     let mapped = await parallel::map(values.freeze(), square);
     gc_collect();
-    println(mapped.len().toString());
-    println(mapped[63].toString());
+    println(mapped.len().to_string());
+    println(mapped[63].to_string());
 }}
 "
         ),
@@ -370,7 +370,7 @@ async fn main() {{
     let values: Array<i64> = [7, 8];
     let job = new Job(parallel::map(values.freeze(), twice));
     gc_collect();
-    println((await job.work).toString());
+    println((await job.work).to_string());
 }}
 "
         ),
@@ -398,7 +398,7 @@ async fn main() {{
         true => {{ task = parallel::map(frozen, thrice); }},
         false => {{ task = parallel::map(frozen, twice); }},
     }}
-    println((await task).toString());
+    println((await task).to_string());
 }}
 "
         ),
@@ -420,10 +420,10 @@ async fn main() {{
     while i < 1000 {{ values.push(i); i = i + 1; }}
     let mapped = await parallel::map(values.freeze(), transform);
     gc_collect();
-    println(mapped.len().toString());
-    println(mapped[0].toString());
-    println(mapped[511].toString());
-    println(mapped[999].toString());
+    println(mapped.len().to_string());
+    println(mapped[0].to_string());
+    println(mapped[511].to_string());
+    println(mapped[999].to_string());
 }}
 "
     );
@@ -442,7 +442,7 @@ async fn main() {{
 }
 
 // 16. `len` and indexing are the ordinary `Array<i64>` methods: what comes back
-//     is a real array, not an opaque handle that only knows `toString`.
+//     is a real array, not an opaque handle that only knows `to_string`.
 #[test]
 fn lir_parallel_16_len_and_indexing_read_the_result() {
     assert_maps(
@@ -452,9 +452,9 @@ fn square(value: i64) -> i64 {{ return value * value; }}
 async fn main() {{
     let values: Array<i64> = [6, 7, 8];
     let mapped = await parallel::map(values.freeze(), square);
-    println(mapped.len().toString());
-    println(mapped[0].toString());
-    println(mapped[2].toString());
+    println(mapped.len().to_string());
+    println(mapped[0].to_string());
+    println(mapped[2].to_string());
 }}
 "
         ),
@@ -474,8 +474,8 @@ fn square(value: i64) -> i64 {{ return value * value; }}
 async fn main() {{
     let left: Array<i64> = [1, 2];
     let right: Array<i64> = [3, 4];
-    println((await parallel::map(left.freeze(), square)).toString());
-    println((await parallel::map(right.freeze(), square)).toString());
+    println((await parallel::map(left.freeze(), square)).to_string());
+    println((await parallel::map(right.freeze(), square)).to_string());
 }}
 "
         ),
@@ -495,7 +495,7 @@ fn triple(value: i64) -> i64 {{ return value * 3; }}
 fn shifted(value: i64) -> i64 {{ return triple(value) + 1; }}
 async fn main() {{
     let values: Array<i64> = [1, 2, 3];
-    println((await parallel::map(values.freeze(), shifted)).toString());
+    println((await parallel::map(values.freeze(), shifted)).to_string());
 }}
 "
         ),
@@ -516,7 +516,7 @@ fn checked(value: i64) -> i64 {{
 }}
 async fn main() {{
     let values: Array<i64> = [1, 2, 3];
-    println((await parallel::map(values.freeze(), checked)).toString());
+    println((await parallel::map(values.freeze(), checked)).to_string());
 }}
 "
     );

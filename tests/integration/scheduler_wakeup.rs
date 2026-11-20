@@ -399,7 +399,7 @@ fn sched_wake_34_interleaved_awaits_complete_on_every_run() {
         r#"
 async fn worker(id: i64) -> i64 {
     await sleep(1);
-    let s = "worker-" + id.toString();
+    let s = "worker-" + id.to_string();
     await sleep(1);
     return id * 10;
 }

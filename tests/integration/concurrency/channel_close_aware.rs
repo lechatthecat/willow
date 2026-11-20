@@ -161,7 +161,7 @@ fn close_aware_06_bool_payload() {
     let (out, ok) = compile_and_run(
         r#"
 fn show(v: Option<bool>) -> String {
-    return match v { Some(b) => b.toString(), None => "closed" };
+    return match v { Some(b) => b.to_string(), None => "closed" };
 }
 fn main() {
     let ch = Channel<bool>::new();
@@ -212,7 +212,7 @@ fn close_aware_08_nested_option_element_stays_distinct() {
         r#"
 fn describe(v: Option<Option<i64>>) -> String {
     return match v {
-        Some(inner) => match inner { Some(x) => x.toString(), None => "inner-none" },
+        Some(inner) => match inner { Some(x) => x.to_string(), None => "inner-none" },
         None => "closed",
     };
 }
@@ -239,7 +239,7 @@ async fn producer(ch: Channel<String>) -> i64 {
     let mut i = 0;
     while i < 4 {
         await sleep(1);
-        ch.send("item" + i.toString());
+        ch.send("item" + i.to_string());
         i = i + 1;
     }
     ch.close();
@@ -497,7 +497,7 @@ fn close_aware_19_sync_select_observes_close() {
 fn poll(ch: Channel<i64>) -> String {
     select {
         let v = ch.recv_opt() => {
-            return match v { Some(x) => x.toString(), None => "closed" };
+            return match v { Some(x) => x.to_string(), None => "closed" };
         }
         default => { return "empty"; }
     }

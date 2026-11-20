@@ -95,7 +95,7 @@ async fn holder(fail: bool) -> String {
         }
         account = new Account("Bob", 20);
     }
-    return account.owner + ":" + account.balance.toString();
+    return account.owner + ":" + account.balance.to_string();
 }
 
 // Nested scopes. The inner `defer` recovers, so an inner panic never reaches
@@ -141,7 +141,7 @@ async fn looped(n: i64) -> i64 {
             }
             await sleep(1);
             if i == 1 {
-                panic("iteration " + i.toString());
+                panic("iteration " + i.to_string());
             }
             done = done + 1;
         }
@@ -169,7 +169,7 @@ async fn piped(fail: bool) -> i64 {
         }
         let got = ch.recv();
         if fail {
-            panic("dropped " + got.toString());
+            panic("dropped " + got.to_string());
         }
         seen = got;
     }

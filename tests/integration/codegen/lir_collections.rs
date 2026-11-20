@@ -46,7 +46,7 @@ fn render() -> String {
     let m: Map<String, i64> = Map::new();
     m.insert("b", 2);
     m.insert("a", 1);
-    return m.toString();
+    return m.to_string();
 }
 fn main() { println(render()); }
 "#,
@@ -66,7 +66,7 @@ fn render() -> String {
     let m: Map<i64, String> = Map::new();
     m.insert(2, "two");
     m.insert(1, "one");
-    return m.toString();
+    return m.to_string();
 }
 fn main() { println(render()); }
 "#,
@@ -285,7 +285,7 @@ fn lir_diff_c38_receiver_rooted_across_allocating_value() {
 fn build(a: String, b: String) -> String {
     let m: Map<String, String> = Map::new();
     m.insert("k", a + b);
-    return m.toString();
+    return m.to_string();
 }
 fn main() { println(build("x", "y")); }
 "#,
@@ -302,7 +302,7 @@ fn lir_diff_c39_receiver_rooted_across_allocating_key() {
 fn build(a: String, b: String) -> String {
     let m: Map<String, i64> = Map::new();
     m.insert(a + b, 1);
-    return m.toString();
+    return m.to_string();
 }
 fn main() { println(build("x", "y")); }
 "#,
@@ -341,7 +341,7 @@ fn mixed() -> String {
     let xs: Array<i64> = [1, 2];
     let s = "n=";
     m.insert("count", xs.len());
-    return s + m.toString() + xs.toString();
+    return s + m.to_string() + xs.to_string();
 }
 fn main() { println(mixed()); }
 "#,
@@ -362,7 +362,7 @@ fn build(keys: FrozenArray<String>) -> String {
         m.insert(keys[i] + "!", i);
         i = i + 1;
     }
-    return m.toString();
+    return m.to_string();
 }
 fn main() {
     let keys: Array<String> = ["a", "b", "c"];
@@ -431,7 +431,7 @@ fn grow(m: Map<String, String>) -> Map<String, String> {
     m.insert("c", "gamma");
     return m;
 }
-fn main() { println(grow(make()).toString()); }
+fn main() { println(grow(make()).to_string()); }
 "#,
         ),
         "{a: \"alpha\", b: \"beta\", c: \"gamma\"}\n",

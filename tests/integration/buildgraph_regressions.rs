@@ -76,7 +76,7 @@ async fn main() {
     let inbox = new Inbox(Channel::with_capacity(1));
     inbox.messages.send("retained message");
     let mut i = 0;
-    while i < 100 { let garbage = "garbage-" + i.toString(); i = i + 1; }
+    while i < 100 { let garbage = "garbage-" + i.to_string(); i = i + 1; }
     let message = inbox.messages.recv();
     println(message);
     let empty = new Inbox(Channel::new());

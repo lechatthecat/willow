@@ -31,7 +31,7 @@ async fn exercise(extra_writer: bool) {
                     // Copy and display run under the same lock as the writers.
                     let snapshot = values.freeze();
                     if snapshot.get(i).unwrap() != i * 3 + 1 { println("bad copy"); }
-                    values.toString();
+                    values.to_string();
                 }
             }
             i = i + 1;

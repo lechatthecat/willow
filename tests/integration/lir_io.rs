@@ -343,7 +343,7 @@ fn write_many(path: String, times: i64) -> Result<String, IoError> {
     }
     let back = fs::read_to_string(path)?;
     fs::remove_file(path)?;
-    return Ok(back + i.toString());
+    return Ok(back + i.to_string());
 }
 
 fn main() {
@@ -659,7 +659,7 @@ async fn exchange(message: String) -> Result<String, IoError> {
     (await net::write_async(client, message))?;
     let server = (await accepting)?;
     let got = (await net::read_async(server, 4096))?;
-    return Ok(got + " " + noise[0].toString());
+    return Ok(got + " " + noise[0].to_string());
 }
 
 async fn main() {

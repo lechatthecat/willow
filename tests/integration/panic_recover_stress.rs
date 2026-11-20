@@ -159,7 +159,7 @@ async fn worker(tag: i64) -> i64 {
     if true {
         defer match recover() {
             Some(info) => {
-                if info.message == "boom-" + tag.toString() {
+                if info.message == "boom-" + tag.to_string() {
                     status = 100;
                 }
             },
@@ -387,7 +387,7 @@ fn psr_14_every_defer_runs_exactly_once_under_stress() {
 fn main() {
     let mut runs = 0;
     if true {
-        defer println("third " + runs.toString());
+        defer println("third " + runs.to_string());
         defer match recover() {
             Some(_) => println("second"),
             None => println("second-none")
@@ -589,7 +589,7 @@ fn main() {
 fn psr_20_allocation_heavy_recovery_keeps_root_depth_balanced() {
     let source = r#"
 fn build(n: i64) -> String {
-    let mut text = "row-" + n.toString();
+    let mut text = "row-" + n.to_string();
     if n % 4 == 3 {
         panic("bad row " + text);
     }
@@ -745,7 +745,7 @@ async fn request(id: i64) -> i64 {
     if true {
         defer match recover() {
             Some(info) => {
-                if info.message == "fault-" + id.toString() {
+                if info.message == "fault-" + id.to_string() {
                     handled = 1;
                 }
             },

@@ -213,7 +213,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_value_runtime_call(rt::willow_string_split, &[receiver, args[0]])
             }
             StringFind => {
-                self.emit_value_runtime_call(rt::willow_string_find, &[receiver, args[0]])
+                // The runtime answers a byte offset or `-1`; the language sees
+                // the inline `Option<i64>` pair (tag 0 `Some`, 1 `None` with a
+                // zero payload), so absence costs a compare and two selects.
+                let offset =
+                    self.emit_value_runtime_call(rt::willow_string_find, &[receiver, args[0]]);
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let absent = self.builder.ins().icmp(IntCC::SignedLessThan, offset, zero);
+                let tag = self.builder.ins().uextend(types::I64, absent);
+                let payload = self.builder.ins().select(absent, zero, offset);
+                self.emit_pair(tag, payload)
             }
             StringRepeat => {
                 self.emit_value_runtime_call(rt::willow_string_repeat, &[receiver, args[0]])

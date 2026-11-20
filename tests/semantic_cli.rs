@@ -5153,7 +5153,7 @@ fn sentinel_diagnostics_original_reproductions() {
             "E0201",
         ),
         (
-            "fn f(s: String) -> String { let i = s.find(\".\"); return match i { Some(k) => if k > 0 { s } else { s }, None => s }; } fn main() {}",
+            "fn f(s: String) -> String { let i = s.len(); return match i { Some(k) => if k > 0 { s } else { s }, None => s }; } fn main() {}",
             "E1205",
         ),
     ] {
@@ -5347,7 +5347,7 @@ fn sentinel_diagnostics_compound_uses() {
             "let x = [1][arr];",
             "let x = arr[0];",
             "let x = arr.nope();",
-            "let x = arr.toString();",
+            "let x = arr.to_string();",
             "let x = arr.field;",
             "let x = arr + 1;",
             "let x = -arr;",

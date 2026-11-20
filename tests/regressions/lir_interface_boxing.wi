@@ -40,7 +40,7 @@ class Tag implements Named {
     pub n: i64;
 
     pub fn name(self) -> String {
-        return "#" + self.n.toString();
+        return "#" + self.n.to_string();
     }
 }
 

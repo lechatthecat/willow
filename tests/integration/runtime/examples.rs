@@ -77,7 +77,14 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/return_annotation.wi", "1\n"),
         ("example/runtime_source_names.wi", "7\n9\n"),
         ("example/static_frozen_array.wi", "static frozen array ok\n"),
-        ("example/string_find.wi", "本\ntrue\ntrue\n0\n"),
+        (
+            "example/string_find.wi",
+            "本\ntrue\ntrue\n0\n語 at byte 6\n",
+        ),
+        (
+            "example/method_naming.wi",
+            "42 2.5 true\n[1, 2, 3]\n{ada: 36}\n(3, 4)\nkey / value\ntrue\n8\n",
+        ),
         ("example/string_metadata.wi", "0\n9\n2\n3\n4\n0\n18\n"),
         ("example/string_pattern_if_else.wi", "1\n2\n0\n"),
         ("tests/regressions/sync_poll_gates.wi", "1\n2\n4\n8\n"),
@@ -1263,12 +1270,12 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         (
             "tests/regressions/intrinsic_methods.wi",
             concat!(
-                // scalar toString: i64, f64, bool, String
+                // scalar to_string: i64, f64, bool, String
                 "42 1.5\n",
                 "true willow\n",
-                // Array: toString, pop, len, freeze; FrozenArray: len
+                // Array: to_string, pop, len, freeze; FrozenArray: len
                 "[1, 2, 3, 4]\n4\n3\n4\n3\n",
-                // Map: toString, contains, len, get, freeze
+                // Map: to_string, contains, len, get, freeze
                 "{ann: 87, ben: 92}\ntrue\n2\n92\n3\n",
                 // FrozenMap: len, contains, get
                 "2\nfalse\n87\n",
@@ -1901,6 +1908,54 @@ fn test_string_concat_fusion_example() {
 #[test]
 fn test_nested_patterns_example() {
     let path = "example/nested_patterns.wi";
+    let (_, expected) = runnable_example_cases()
+        .iter()
+        .find(|(entry, _)| *entry == path)
+        .expect("example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected, "{path} output mismatch");
+}
+
+#[test]
+fn test_method_naming_example() {
+    let path = "example/method_naming.wi";
+    let (_, expected) = runnable_example_cases()
+        .iter()
+        .find(|(entry, _)| *entry == path)
+        .expect("example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected, "{path} output mismatch");
+}
+
+#[test]
+fn test_string_find_example() {
+    let path = "example/string_find.wi";
+    let (_, expected) = runnable_example_cases()
+        .iter()
+        .find(|(entry, _)| *entry == path)
+        .expect("example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected, "{path} output mismatch");
+}
+
+#[test]
+fn test_string_methods_example() {
+    let path = "example/string_methods.wi";
+    let (_, expected) = runnable_example_cases()
+        .iter()
+        .find(|(entry, _)| *entry == path)
+        .expect("example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected, "{path} output mismatch");
+}
+
+#[test]
+fn test_builtin_method_surface_example() {
+    let path = "example/builtin_method_surface.wi";
     let (_, expected) = runnable_example_cases()
         .iter()
         .find(|(entry, _)| *entry == path)

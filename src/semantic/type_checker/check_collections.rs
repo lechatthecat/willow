@@ -421,7 +421,7 @@ impl TypeChecker {
         if (key_ty == Type::Void || val_ty == Type::Void)
             && matches!(
                 m.method.as_str(),
-                "get" | "contains" | "freeze" | "toString"
+                "get" | "contains" | "freeze" | "to_string"
             )
         {
             self.push(
@@ -483,20 +483,20 @@ impl TypeChecker {
             "len" => Some(Type::I64),
             // `.freeze()` -> an immutable `FrozenMap<K,V>` copy, Sync when K,V are
             // Sync, so it can be shared across tasks.
-            "toString" => {
+            "to_string" => {
                 if !matches!(val_ty, Type::I64 | Type::F64 | Type::Bool | Type::String) {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E1402,
                             format!(
-                                "cannot toString a map with `{}` values",
+                                "cannot to_string a map with `{}` values",
                                 self.diagnostic_type_name(&val_ty)
                             ),
                         )
                         .with_label(Label::primary(
                             m.span,
-                            "value types supported by toString are i64, f64, bool, and String",
+                            "value types supported by to_string are i64, f64, bool, and String",
                         )),
                     );
                 }
@@ -521,7 +521,7 @@ impl TypeChecker {
                     )
                     .with_label(Label::primary(m.span, "unknown map method"))
                     .with_help(
-                        "maps support `.insert(k, v)`, `.get(k)`, `.remove(k)`, `.keys()`, `.values()`, `.entries()`, `.contains(k)`, `.len()`, `.freeze()`, `.toString()`",
+                        "maps support `.insert(k, v)`, `.get(k)`, `.remove(k)`, `.keys()`, `.values()`, `.entries()`, `.contains(k)`, `.len()`, `.freeze()`, `.to_string()`",
                     );
                 self.label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
                 self.push(diagnostic);

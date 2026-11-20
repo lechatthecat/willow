@@ -47,10 +47,10 @@ fn serve(request: Request) -> String {
             Some(info) => println("  recovered: " + info.message),
             None => {}
         }
-        defer println("  finished request " + request.id.toString());
+        defer println("  finished request " + request.id.to_string());
 
         let body = handle(request);
-        status = "200 body=" + body.toString();
+        status = "200 body=" + body.to_string();
     }
     return status;
 }
@@ -69,7 +69,7 @@ async fn serve_async(request: Request) -> String {
         }
         await sleep(1);
         let body = handle(request);
-        status = "200 body=" + body.toString();
+        status = "200 body=" + body.to_string();
     }
     // The task resumes normally after a recovered scope: it can still suspend.
     await sleep(1);

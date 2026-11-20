@@ -118,7 +118,7 @@ pub class Array<T> {
         }
         return parts.__abi_concat();
     }
-    pub fn toString() -> String where T: i64 | f64 | bool | String {
+    pub fn to_string() -> String where T: i64 | f64 | bool | String {
         let parts = ["["];
         for index in 0..self.__abi_len() {
             if index > 0 { parts.push(", "); }

@@ -178,9 +178,9 @@ class Shelf {
 
 fn exercise(n: i64) -> String {
     let shelf = new Shelf(new TextBox("old"));
-    shelf.item = new TextBox("field-" + n.toString());
+    shelf.item = new TextBox("field-" + n.to_string());
     let items: Array<Container<String>> = [new TextBox("first")];
-    items[0] = new TextBox("array-" + n.toString());
+    items[0] = new TextBox("array-" + n.to_string());
     return shelf.read() + "/" + items[0].get();
 }
 fn main() {

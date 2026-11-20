@@ -1797,7 +1797,7 @@ fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
         ) {
             (B::Map, [k, v], _) => match method {
                 "insert" => Some(Type::Void),
-                "toString" => Some(Type::String),
+                "to_string" => Some(Type::String),
                 "get" => Some(B::Option.apply(vec![v.clone()])),
                 "contains" => Some(Type::Bool),
                 "len" => Some(Type::I64),

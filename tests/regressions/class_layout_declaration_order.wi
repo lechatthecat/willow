@@ -46,5 +46,5 @@ fn main() {
     // The same three levels declared root-first would produce these same
     // offsets, so both spellings agree on what `new` means.
     let other = new Leaf(2, 4, 8);
-    println(other.a.toString() + "," + other.b.toString() + "," + other.c.toString());
+    println(other.a.to_string() + "," + other.b.to_string() + "," + other.c.to_string());
 }

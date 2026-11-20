@@ -15,7 +15,7 @@ import std::parallel;
 fn square(value: i64) -> i64 { return value * value; }
 async fn main() {
     let values: Array<i64> = [5, 1, 4, 2, 3];
-    println((await parallel::map(values.freeze(), square)).toString());
+    println((await parallel::map(values.freeze(), square)).to_string());
 }
 "#,
     );
@@ -31,7 +31,7 @@ import std::collections::Array;
 import std::parallel as par;
 async fn main() {
     let values: Array<i64> = [1, 2, 3];
-    println((await par::map(values.freeze(), |value| value * 2)).toString());
+    println((await par::map(values.freeze(), |value| value * 2)).to_string());
 }
 "#,
     );
@@ -49,8 +49,8 @@ fn increment(value: i64) -> i64 { return value + 1; }
 async fn main() {
     let empty: Array<i64> = [];
     let one: Array<i64> = [41];
-    println((await parallel::map(empty.freeze(), increment)).toString());
-    println((await parallel::map(one.freeze(), increment)).toString());
+    println((await parallel::map(empty.freeze(), increment)).to_string());
+    println((await parallel::map(one.freeze(), increment)).to_string());
 }
 "#,
     );
@@ -77,8 +77,8 @@ async fn main() {
     let right: Array<i64> = [9, 8, 7];
     let first = nested_twice(left.freeze());
     let second = nested_plus_ten(right.freeze());
-    println((await second).toString());
-    println((await first).toString());
+    println((await second).to_string());
+    println((await first).to_string());
 }
 "#,
         &[("WILLOW_WORKERS", "5"), ("WILLOW_TASK_BUDGET", "1")],
@@ -175,7 +175,7 @@ fn parallel_map_08_wrong_mapper_signature_is_rejected() {
         r#"
 import std::collections::Array;
 import std::parallel;
-fn stringify(value: i64) -> String { return value.toString(); }
+fn stringify(value: i64) -> String { return value.to_string(); }
 async fn main() {
     let values: Array<i64> = [1, 2];
     let result = await parallel::map(values.freeze(), stringify);
@@ -201,7 +201,7 @@ import std::parallel;
 async fn main() {
     let offset = 10;
     let values: Array<i64> = [1, 2];
-    println((await parallel::map(values.freeze(), |value| value + offset)).toString());
+    println((await parallel::map(values.freeze(), |value| value + offset)).to_string());
 }
 "#,
     );
@@ -234,7 +234,7 @@ fn checked(value: i64) -> i64 {
 }
 async fn main() {
     let values: Array<i64> = [1, 2, 3];
-    println((await parallel::map(values.freeze(), checked)).toString());
+    println((await parallel::map(values.freeze(), checked)).to_string());
 }
 "#,
     );

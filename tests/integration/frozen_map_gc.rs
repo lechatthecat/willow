@@ -130,7 +130,7 @@ fn main() {
     let mut names: Map<i64, String> = Map::new();
     let mut i = 0;
     while i < 8 {
-        names.insert(i, "n" + i.toString());
+        names.insert(i, "n" + i.to_string());
         i = i + 1;
     }
     let texts = names.freeze();
@@ -434,7 +434,7 @@ fn freeze_names(seed: i64) -> i64 {
     let mut names: Map<i64, String> = Map::new();
     let mut i = 0;
     while i < 8 {
-        names.insert(i, "s" + (seed * 100 + i).toString());
+        names.insert(i, "s" + (seed * 100 + i).to_string());
         i = i + 1;
     }
     let frozen = names.freeze();
@@ -444,7 +444,7 @@ fn freeze_names(seed: i64) -> i64 {
     let mut hits = 0;
     let mut k = 0;
     while k < 8 {
-        if text_value(frozen, k) == "s" + (seed * 100 + k).toString() {
+        if text_value(frozen, k) == "s" + (seed * 100 + k).to_string() {
             hits = hits + 1;
         }
         k = k + 1;

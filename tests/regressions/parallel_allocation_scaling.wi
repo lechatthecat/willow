@@ -38,8 +38,8 @@ async fn main() {
         sum += await task;
     }
     if env::arg(1).is_some() {
-        println("tasks=" + count.toString() + " ns=" + (time::now_ns() - start).toString()
-            + " sum=" + sum.toString());
+        println("tasks=" + count.to_string() + " ns=" + (time::now_ns() - start).to_string()
+            + " sum=" + sum.to_string());
     }
     println(sum == count * allocate(iterations));
 }

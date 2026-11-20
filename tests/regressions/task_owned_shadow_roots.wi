@@ -5,7 +5,7 @@ class Token { pub value: i64; }
 
 fn rooted(depth: i64, total: &mut i64) {
     let token = new Token(depth);
-    let label = "root-" + depth.toString();
+    let label = "root-" + depth.to_string();
     if depth > 0 { rooted(depth - 1, &total); }
     let mut i = 0;
     while i < 4 {
@@ -14,7 +14,7 @@ fn rooted(depth: i64, total: &mut i64) {
         total = total + scratch.value;
         i = i + 1;
     }
-    if label != "root-" + depth.toString() { panic("lost string root"); }
+    if label != "root-" + depth.to_string() { panic("lost string root"); }
     total = total + token.value;
 }
 

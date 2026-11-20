@@ -12,12 +12,13 @@ fn string_methods_utf8_and_composition() {
         r#""".slice(0, 0) == """#,
         r#""😀é".slice(0, 4) == "😀""#,
         r#""abc".substring(0, 3) == "abc""#,
-        r#""日本語日本".find("本") == 3"#,
-        r#""abc".find("z") == -1"#,
-        r#""abc".find("") == 0"#,
-        r#""".find("") == 0"#,
-        r#""abc".find("abcd") == -1"#,
-        r#""ababa".find("aba") == 0"#,
+        r#""日本語日本".find("本").unwrap_or(-1) == 3"#,
+        r#""abc".find("z").is_none()"#,
+        r#""abc".find("").unwrap_or(-1) == 0"#,
+        r#""".find("").unwrap_or(-1) == 0"#,
+        r#""abc".find("abcd").is_none()"#,
+        r#""ababa".find("aba").unwrap_or(-1) == 0"#,
+        r#""abc".find("c").is_some()"#,
         r#""abc".contains("bc")"#,
         r#"!"abc".contains("bd")"#,
         r#""".contains("")"#,
@@ -46,7 +47,7 @@ fn string_methods_utf8_and_composition() {
         r#""abc".repeat(1) == "abc""#,
         r#""".repeat(9223372036854775807) == """#,
         r#"(" a" + "b ").trim().slice(0, 1).repeat(2) == "aa""#,
-        r#""abc".toString().split("b")[1].contains("c")"#,
+        r#""abc".to_string().split("b")[1].contains("c")"#,
     ];
     let body: String = cases
         .iter()
@@ -178,7 +179,7 @@ async fn main() {
         let input = " prefix," + "日本語,suffix ";
         let result = await process(input);
         gc_collect();
-        if result == "日本日本" && result.find("本") == 3 && result.contains("本日") && result.starts_with("日本") {
+        if result == "日本日本" && result.find("本").unwrap_or(-1) == 3 && result.contains("本日") && result.starts_with("日本") {
             total = total + 1;
         }
     }
@@ -308,7 +309,7 @@ fn array_join_generated_calls_scale_with_callsites() {
             );
             // Joining shares one linear string assembly operation, independent
             // of user callsite count or input bytes. Unused source methods such
-            // as `toString` are not instantiated, so they add no second one.
+            // as `to_string` are not instantiated, so they add no second one.
             assert_eq!(
                 symbols
                     .iter()
@@ -318,7 +319,7 @@ fn array_join_generated_calls_scale_with_callsites() {
                 "{symbols:?}"
             );
             assert!(
-                !symbols.iter().any(|s| s.ends_with(".toString")),
+                !symbols.iter().any(|s| s.ends_with(".to_string")),
                 "{symbols:?}"
             );
         }
@@ -326,7 +327,7 @@ fn array_join_generated_calls_scale_with_callsites() {
 }
 
 #[test]
-fn string_find_sentinel_example() {
+fn string_find_option_example() {
     for run in [
         compile_and_run,
         compile_and_run_release,
@@ -334,18 +335,33 @@ fn string_find_sentinel_example() {
     ] {
         let (out, ok) = run(include_str!("../../../example/string_find.wi"));
         assert!(ok, "{out}");
-        assert_eq!(out, "本\ntrue\ntrue\n0\n");
+        assert_eq!(out, "本\ntrue\ntrue\n0\n語 at byte 6\n");
     }
 }
 
 #[test]
-fn string_find_sentinel_diagnostic_is_rendered() {
-    let stderr =
-        compile_error_stderr(r#"fn main() { let index = "abc".find("b"); index.unwrap_or(0); }"#);
+fn string_find_sentinel_comparison_is_a_type_error() {
+    // Code written against the retired `-1` sentinel no longer type-checks.
+    for body in [
+        r#"let index = "abc".find("b"); if index >= 0 { }"#,
+        r#"let index = "abc".find("b"); println(index == -1);"#,
+        r#"let index: i64 = "abc".find("b");"#,
+        r#"println("abc".slice("abc".find("b"), 3));"#,
+    ] {
+        let stderr = compile_error_stderr(&format!("fn main() {{ {body} }}"));
+        assert!(stderr.contains("Option<"), "{body}: {stderr}");
+    }
+}
+
+#[test]
+fn renamed_method_diagnostic_is_rendered() {
+    let stderr = compile_error_stderr("fn main() { println(1.toString()); }");
     assert!(stderr.contains("E0201"), "{stderr}");
-    assert!(stderr.contains("String.find(needle)"), "{stderr}");
-    assert!(stderr.contains("-1 means not found"), "{stderr}");
-    assert!(stderr.contains("index >= 0"), "{stderr}");
+    assert!(
+        stderr.contains("no method `toString` on type `i64`; it was renamed to `to_string`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("write `.to_string(...)`"), "{stderr}");
 }
 
 #[test]

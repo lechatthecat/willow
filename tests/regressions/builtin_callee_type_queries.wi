@@ -22,7 +22,7 @@ fn main() {
     let contains = s.contains("a");
     let found = s.find("b");
     let starts = s.starts_with("a");
-    let shown = n.toString();
+    let shown = n.to_string();
     let sum = n.wrapping_add(1);
     let neg = n.wrapping_neg();
     let checked = n.checked_add(1);

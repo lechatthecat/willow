@@ -2,7 +2,7 @@ import sim;
 import fuzz;
 
 fn main() {
-    println(sim::run(0).toString());
-    println(fuzz::run(0).toString());
-    println(fuzz::ints(1).toString());
+    println(sim::run(0).to_string());
+    println(fuzz::run(0).to_string());
+    println(fuzz::ints(1).to_string());
 }

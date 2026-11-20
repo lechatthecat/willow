@@ -420,7 +420,7 @@ fn test_constructor_inference_match_reports_missing_error_type() {
     ] {
         assert!(stderr.contains(expected), "{stderr}");
     }
-    assert!(!stderr.contains("toString"), "{stderr}");
+    assert!(!stderr.contains("to_string"), "{stderr}");
     assert!(!stderr.contains("cannot concatenate"), "{stderr}");
 }
 
@@ -434,7 +434,7 @@ fn test_constructor_inference_void_concat_does_not_suggest_conversion() {
             stderr.contains("cannot concatenate `String` with `void`"),
             "{stderr}"
         );
-        assert!(!stderr.contains("toString"), "{stderr}");
+        assert!(!stderr.contains("to_string"), "{stderr}");
     }
 }
 

@@ -1,11 +1,15 @@
+// String.find returns Option<i64>: a byte offset, or None when absent.
 fn main() {
     let text = "日本語";
-    let index = text.find("本");
-    if index >= 0 {
+    if let Some(index) = text.find("本") {
         println(text.slice(index, index + 3));
     }
     let missing = text.find("x");
-    println(missing == -1);
+    println(missing.is_none());
     println(text.contains("本"));
-    println(text.find(""));
+    println(text.find("").unwrap_or(-1));
+    match text.find("語") {
+        Some(index) => println("語 at byte " + index.to_string()),
+        None => println("no 語"),
+    }
 }

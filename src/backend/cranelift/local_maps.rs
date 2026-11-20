@@ -89,7 +89,7 @@ pub(super) fn confined_scalar_maps(f: &LirFunction) -> bool {
                                             | "get"
                                             | "contains"
                                             | "len"
-                                            | "toString"
+                                            | "to_string"
                                             | "freeze"
                                             | "remove"
                                             | "keys"

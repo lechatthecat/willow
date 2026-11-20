@@ -282,7 +282,7 @@ import util;
 fn main() {
     let message = util::greet("Alice");
     let n = util::add(20, 22);
-    println(message + " " + n.toString());
+    println(message + " " + n.to_string());
 }
 "#,
         "hi Alice 42\n",

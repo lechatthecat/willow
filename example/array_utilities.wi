@@ -7,13 +7,13 @@ fn main() {
     values.insert(1, 2);
     println(values.remove(0));
     values.sort();
-    println(values.toString());
-    println(values.slice(1, 3).toString());
+    println(values.to_string());
+    println(values.slice(1, 3).to_string());
     println(values.contains(2));
     println(values.index_of(7).unwrap());
     values.fill(4);
     values.swap(0, 2);
-    println(values.toString());
+    println(values.to_string());
 
     let orders = [new Order(30, "third"), new Order(10, "first"), new Order(20, "second")];
     let ascending = true;

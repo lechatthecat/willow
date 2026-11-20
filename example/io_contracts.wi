@@ -1,7 +1,7 @@
 // Resource access belongs at the application boundary.
 @effects(no_io)
 fn render(value: i64) -> String {
-    return "value=" + value.toString();
+    return "value=" + value.to_string();
 }
 
 @effects(no_io)

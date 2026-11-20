@@ -258,7 +258,7 @@ fn integer_overflow_12_13_values_that_fit_never_panic() {
 fn integer_overflow_14_16_explicit_methods_ignore_build_mode() {
     let source = "fn show(value: Option<i64>) -> String {\n\
                       match value {\n\
-                          Some(n) => { return \"Some(\" + n.toString() + \")\"; }\n\
+                          Some(n) => { return \"Some(\" + n.to_string() + \")\"; }\n\
                           None => { return \"None\"; }\n\
                       }\n\
                   }\n\

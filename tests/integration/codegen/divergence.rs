@@ -123,7 +123,7 @@ fn lir_div_06_diverging_and_value_arms_in_one_match() {
 fn describe(n: i64) -> String {
     return match n {
         0 => "nothing",
-        _ => { println("saw " + n.toString()); return "something"; }
+        _ => { println("saw " + n.to_string()); return "something"; }
     };
 }
 fn main() { println(describe(0)); println(describe(4)); }
@@ -160,10 +160,10 @@ fn lir_div_08_scalar_to_string_and_format_match() {
     assert_program_output(
         r#"
 fn main() {
-    println((42).toString());
-    println((2.5).toString());
-    println(true.toString());
-    println("willow".toString());
+    println((42).to_string());
+    println((2.5).to_string());
+    println(true.to_string());
+    println("willow".to_string());
     println(format("{} items", 3));
     println(format("{} and {}", "left", "right"));
     println(format("{:.6f}", 3.14159265));
@@ -204,7 +204,7 @@ fn lir_div_10_a_panic_that_is_not_taken_exits_cleanly() {
     assert_program_output(
         r#"
 fn require_positive(n: i64) -> i64 {
-    if n <= 0 { panic("expected a positive value, got " + n.toString()); }
+    if n <= 0 { panic("expected a positive value, got " + n.to_string()); }
     return n;
 }
 fn main() { println(require_positive(5)); println(require_positive(1)); }

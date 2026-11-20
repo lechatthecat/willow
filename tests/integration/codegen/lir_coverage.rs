@@ -120,7 +120,7 @@ fn build() -> Map<f64, i64> {
 fn main() {
     let m = build();
     println(m.get(1.5).unwrap());
-    println(m.toString());
+    println(m.to_string());
 }
 "#,
         "10\n{1.5: 10, 2.5: 20}\n",

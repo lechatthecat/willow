@@ -9,8 +9,8 @@
 // That recognition lives in one table, `src/semantic/intrinsics.rs`. Before it
 // existed the same question was answered independently in four places by
 // comparing method-name strings, and the answers had already drifted: the
-// backend's type walk knew `Array::freeze` but not `Array::toString`, called
-// `Map::toString` void, and had never heard of `Task::result` or of any
+// backend's type walk knew `Array::freeze` but not `Array::to_string`, called
+// `Map::to_string` void, and had never heard of `Task::result` or of any
 // `CancellationToken`/`TaskScope` method. Every family the table owns is
 // exercised below, so a lowering that goes missing shows up as wrong output
 // rather than as silence.
@@ -18,21 +18,21 @@
 import std::collections::Array;
 import std::collections::Map;
 
-// i64, f64, bool and String each resolve `toString` to their own intrinsic.
+// i64, f64, bool and String each resolve `to_string` to their own intrinsic.
 fn scalars() {
     let count = 42;
     let ratio = 1.5;
     let ready = true;
     let name = "willow";
-    println(count.toString() + " " + ratio.toString());
-    println(ready.toString() + " " + name.toString());
+    println(count.to_string() + " " + ratio.to_string());
+    println(ready.to_string() + " " + name.to_string());
 }
 
-// Array<T>: len, push, pop, toString, freeze. FrozenArray<T>: len.
+// Array<T>: len, push, pop, to_string, freeze. FrozenArray<T>: len.
 fn arrays() {
     let xs: Array<i64> = [1, 2, 3];
     xs.push(4);
-    println(xs.toString());     // [1, 2, 3, 4]
+    println(xs.to_string());     // [1, 2, 3, 4]
     println(xs.pop());          // 4
     println(xs.len());          // 3
 
@@ -42,14 +42,14 @@ fn arrays() {
     println(snapshot.len());    // 3
 }
 
-// Map<K,V>: insert, get, contains, len, toString, freeze.
+// Map<K,V>: insert, get, contains, len, to_string, freeze.
 // FrozenMap<K,V>: get, contains, len — and no insert, because the checker
 // rejects it, so no lowering waits for one.
 fn maps() {
     let scores: Map<String, i64> = Map::new();
     scores.insert("ann", 87);
     scores.insert("ben", 92);
-    println(scores.toString());       // {ann: 87, ben: 92}
+    println(scores.to_string());       // {ann: 87, ben: 92}
     println(scores.contains("ann"));  // true
     println(scores.len());            // 2
 

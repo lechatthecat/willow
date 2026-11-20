@@ -60,7 +60,7 @@ async fn main() {
     let tasks: Array<Task<i64>> = [];
     for i in 0..8 { tasks.push(work(cfg, stats, tally, 100)); }
     for t in tasks { await t; }
-    println(cfg.labels[0] + " " + stats.hits.load().toString());
-    lock stats.total as t { println(cfg.labels[1] + " " + t.toString()); }
-    lock tally as tl { println(cfg.labels[2] + " " + tl.n.toString()); }
+    println(cfg.labels[0] + " " + stats.hits.load().to_string());
+    lock stats.total as t { println(cfg.labels[1] + " " + t.to_string()); }
+    lock tally as tl { println(cfg.labels[2] + " " + tl.n.to_string()); }
 }

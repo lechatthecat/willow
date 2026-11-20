@@ -62,7 +62,7 @@ async fn main() {
     let mut j = 0;
     while j < stages.len() {
         let stage = stages[j];
-        println(stage.name + " " + (stage.run)(42).toString());
+        println(stage.name + " " + (stage.run)(42).to_string());
         j = j + 1;
     }
 

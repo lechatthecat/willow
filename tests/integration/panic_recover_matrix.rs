@@ -408,7 +408,7 @@ if true {{
     defer match recover() {{
         Some(info) => {{
             let mut noise = "";
-            for i in 0..{allocations} {{ noise = noise + "x" + i.toString(); }}
+            for i in 0..{allocations} {{ noise = noise + "x" + i.to_string(); }}
             println(noise != "");
             println("prm-{id:03}:" + info.message);
         }},
@@ -584,7 +584,7 @@ async fn recover_worker(tag: i64) -> String {
             Some(info) => { result = info.message; },
             None => { result = "wrong-none"; }
         }
-        panic("task-" + tag.toString());
+        panic("task-" + tag.to_string());
     }
     await sleep(1);
     return result;
@@ -677,8 +677,8 @@ fn prm_matrix_161_170_cancellation_cleanup_observes_none() {
     let source = r#"
 async fn cancel_none(tag: i64) {
     defer match recover() {
-        Some(_) => println("prm-" + tag.toString() + ":some"),
-        None => println("prm-" + tag.toString() + ":none")
+        Some(_) => println("prm-" + tag.to_string() + ":some"),
+        None => println("prm-" + tag.to_string() + ":none")
     }
     await sleep(10000);
 }
@@ -737,10 +737,10 @@ fn prm_matrix_171_180_cancellation_cleanup_panic_recovery() {
     let source = r#"
 async fn cancel_panic(tag: i64, ready: Channel<i64>) {
     defer match recover() {
-        Some(info) => println("prm-" + tag.toString() + ":" + info.message),
-        None => println("prm-" + tag.toString() + ":none")
+        Some(info) => println("prm-" + tag.to_string() + ":" + info.message),
+        None => println("prm-" + tag.to_string() + ":none")
     }
-    defer panic("cleanup-" + tag.toString());
+    defer panic("cleanup-" + tag.to_string());
     ready.send(tag);
     await sleep(10000);
 }

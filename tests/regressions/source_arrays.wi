@@ -3,7 +3,7 @@ import std::collections::Array;
 class Display<T> {
     pub value: T;
     pub fn text() -> String where T: i64 | f64 | bool | String {
-        return self.value.toString();
+        return self.value.to_string();
     }
 }
 
@@ -15,6 +15,6 @@ fn main() {
     let snapshot = words.freeze();
     println(words.pop());
     println(snapshot.len());
-    println(words.toString());
+    println(words.to_string());
     println(new Display<i64>(42).text());
 }

@@ -37,14 +37,14 @@ fn buffered_strings(count: i64) -> String {
     let ch: Channel<String> = Channel::new();
     let mut i = 0;
     while i < count {
-        ch.send("value " + i.toString());
+        ch.send("value " + i.to_string());
         i = i + 1;
     }
 
     let mut padding = "";
     let mut j = 0;
     while j < 200 {
-        padding = "pad " + j.toString();
+        padding = "pad " + j.to_string();
         j = j + 1;
     }
 
@@ -63,14 +63,14 @@ fn buffered_notes(count: i64) -> String {
     let ch: Channel<Note> = Channel::new();
     let mut i = 0;
     while i < count {
-        ch.send(new Note("note " + i.toString(), i));
+        ch.send(new Note("note " + i.to_string(), i));
         i = i + 1;
     }
 
     let mut padding = "";
     let mut j = 0;
     while j < 200 {
-        padding = "pad " + j.toString();
+        padding = "pad " + j.to_string();
         j = j + 1;
     }
 
@@ -83,7 +83,7 @@ fn buffered_notes(count: i64) -> String {
         trail = trail + note.text + ";";
         k = k + 1;
     }
-    return total.toString() + " " + trail;
+    return total.to_string() + " " + trail;
 }
 
 // A scalar element takes the other path: the buffer holds plain words, so the
@@ -110,14 +110,14 @@ fn buffered_strings_explicit(count: i64) -> String {
     let ch = Channel<String>::new();
     let mut i = 0;
     while i < count {
-        ch.send("value " + i.toString());
+        ch.send("value " + i.to_string());
         i = i + 1;
     }
 
     let mut padding = "";
     let mut j = 0;
     while j < 200 {
-        padding = "pad " + j.toString();
+        padding = "pad " + j.to_string();
         j = j + 1;
     }
 
@@ -139,14 +139,14 @@ fn buffered_strings_bounded(count: i64) -> String {
     let ch: Channel<String> = Channel::with_capacity(64);
     let mut i = 0;
     while i < count {
-        ch.send("bounded " + i.toString());
+        ch.send("bounded " + i.to_string());
         i = i + 1;
     }
 
     let mut padding = "";
     let mut j = 0;
     while j < 200 {
-        padding = "pad " + j.toString();
+        padding = "pad " + j.to_string();
         j = j + 1;
     }
 
@@ -175,7 +175,7 @@ async fn consume(ch: Channel<String>, count: i64) -> String {
 async fn main() {
     println(buffered_strings(4));
     println(buffered_notes(4));
-    println((buffered_numbers(5)).toString());
+    println((buffered_numbers(5)).to_string());
     println(buffered_strings_explicit(4));
     println(buffered_strings_bounded(4));
 

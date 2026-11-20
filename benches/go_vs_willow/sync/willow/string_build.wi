@@ -5,7 +5,7 @@ fn main() {
     println("START");
     let mut i: i64 = 0;
     while i < 2000000 {
-        let s = "k" + i.toString() + ":" + (i * 7).toString();
+        let s = "k" + i.to_string() + ":" + (i * 7).to_string();
         total = total + s.len();
         i = i + 1;
     }

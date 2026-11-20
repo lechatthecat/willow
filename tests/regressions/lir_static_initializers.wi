@@ -34,7 +34,7 @@ class Point implements Named {
     pub x: i64;
 
     pub fn name(self) -> String {
-        return "p" + self.x.toString();
+        return "p" + self.x.to_string();
     }
 
     pub fn doubled(self) -> i64 {
@@ -66,7 +66,7 @@ class Config {
 
     // Strings: a concatenation and an intrinsic method call.
     pub static label: String = "wil" + "low";
-    pub static digits: String = 42.toString();
+    pub static digits: String = 42.to_string();
 
     // GC-managed values: the slot is registered as a permanent root, so the
     // store goes through the write barrier and survives a later collection.

@@ -6,7 +6,7 @@ fn invoke(f: fn(i64) -> String) -> String { return f(7); }
 fn identity(x: i64) -> i64 { return x; }
 fn prepare() -> Holder {
     let label = "value" + ":";
-    let f = |n: i64| label + n.toString();
+    let f = |n: i64| label + n.to_string();
     let h = new Holder(invoke(f), sleep(0));
     let words = [h.text, f(identity(8))];
     let scalar: Option<i64> = Some(9);
