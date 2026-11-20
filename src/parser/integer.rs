@@ -8,6 +8,15 @@ pub struct IntegerLayout {
 }
 
 impl IntegerLayout {
+    /// Decode the canonical 64-bit payload after source range checking.
+    pub fn value(self, bits: i64) -> i128 {
+        if !self.signed && self.bits == 64 {
+            i128::from(bits as u64)
+        } else {
+            i128::from(bits)
+        }
+    }
+
     pub fn min(self) -> i128 {
         if self.signed {
             -(1_i128 << (self.bits - 1))
@@ -32,17 +41,33 @@ impl IntegerLayout {
 }
 
 impl<N> Type<N> {
-    pub fn integer_layout(&self) -> Option<IntegerLayout> {
-        match self {
-            Self::I64 => Some(IntegerLayout {
-                bits: 64,
-                signed: true,
-            }),
-            Self::U8 => Some(IntegerLayout {
-                bits: 8,
+    /// Storage/conversion range. Unicode validation remains separate from integers.
+    pub fn scalar_layout(&self) -> Option<IntegerLayout> {
+        if matches!(self, Self::Char) {
+            Some(IntegerLayout {
+                bits: 32,
                 signed: false,
-            }),
-            _ => None,
+            })
+        } else {
+            self.integer_layout()
         }
+    }
+    pub fn scalar_width(&self) -> u32 {
+        self.scalar_layout().map_or(8, |layout| layout.bits / 8)
+    }
+
+    pub fn integer_layout(&self) -> Option<IntegerLayout> {
+        let (bits, signed) = match self {
+            Self::I8 => (8, true),
+            Self::I16 => (16, true),
+            Self::I32 => (32, true),
+            Self::I64 => (64, true),
+            Self::U8 => (8, false),
+            Self::U16 => (16, false),
+            Self::U32 => (32, false),
+            Self::U64 => (64, false),
+            _ => return None,
+        };
+        Some(IntegerLayout { bits, signed })
     }
 }

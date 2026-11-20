@@ -21,6 +21,7 @@ fn clif_abi_ty(ty: AbiTy, ptr_ty: Type) -> Type {
     match ty {
         AbiTy::Word | AbiTy::I64 => types::I64,
         AbiTy::I32 => types::I32,
+        AbiTy::I16 => types::I16,
         AbiTy::I8 => types::I8,
         AbiTy::F64 => types::F64,
         AbiTy::Ptr => ptr_ty,
@@ -33,6 +34,21 @@ fn clif_abi_ty(ty: AbiTy, ptr_ty: Type) -> Type {
 pub(crate) fn clif_abi_param(ty: AbiTy, ptr_ty: Type) -> AbiParam {
     let param = AbiParam::new(clif_abi_ty(ty, ptr_ty));
     if ty == AbiTy::I8 { param.uext() } else { param }
+}
+
+/// Native Rust scalar ABI extension is separate from runtime bool/u8 ABI.
+pub(crate) fn clif_scalar_param(
+    ty: &crate::rust_bridge_ir::Scalar,
+    ptr_ty: Type,
+) -> Option<AbiParam> {
+    use crate::rust_bridge_ir::Scalar;
+    let abi = ty.abi_type()?;
+    let param = AbiParam::new(clif_abi_ty(abi, ptr_ty));
+    Some(match ty {
+        Scalar::I8 | Scalar::I16 | Scalar::I32 => param.sext(),
+        Scalar::U8 | Scalar::U16 | Scalar::U32 | Scalar::Char | Scalar::Bool => param.uext(),
+        _ => param,
+    })
 }
 
 /// Push a runtime symbol's parameters and return onto a Cranelift signature.
@@ -513,6 +529,7 @@ mod alloc_effects_tests {
         rt::willow_contract_check,
         rt::willow_f64_to_string,
         rt::willow_i64_to_string,
+        rt::willow_scalar_to_string,
         rt::willow_bool_to_string,
         rt::willow_f64_parse,
         rt::willow_i64_parse,
@@ -655,6 +672,7 @@ mod alloc_effects_tests {
         for name in [
             rt::willow_f64_to_string,
             rt::willow_i64_to_string,
+            rt::willow_scalar_to_string,
             rt::willow_bool_to_string,
         ] {
             assert!(allocates(name), "{name} builds a WillowString");
@@ -791,6 +809,7 @@ mod alloc_effects_tests {
             rt::willow_map_new,
             rt::willow_map_new_local,
             rt::willow_i64_to_string,
+            rt::willow_scalar_to_string,
             rt::willow_runtime_args_array,
             rt::willow_channel_new,
             rt::willow_async_mutex_new,

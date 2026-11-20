@@ -99,8 +99,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         (receiver, receiver_ty): (cranelift_codegen::ir::Value, &Type),
         args: &[cranelift_codegen::ir::Value],
         arg_types: &[Type],
-        _result: &Type,
-        span: Span,
+        result: &Type,
+        _span: Span,
     ) -> cranelift_codegen::ir::Value {
         // A plain metadata read has no safepoint and needs no transient roots.
         if intrinsic == Intrinsic::StringLen {
@@ -114,10 +114,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if intrinsic == Intrinsic::ArrayResize
             && matches!(
                 array_element_type(receiver_ty),
-                Type::U8 | Type::I64 | Type::F64 | Type::Bool
+                Type::I8
+                    | Type::I16
+                    | Type::I32
+                    | Type::U16
+                    | Type::U32
+                    | Type::U64
+                    | Type::Char
+                    | Type::U8
+                    | Type::I64
+                    | Type::F64
+                    | Type::Bool
             )
         {
-            return self.emit_scalar_array_resize(receiver, args[0]);
+            return self.emit_scalar_array_resize(
+                receiver,
+                args[0],
+                array_element_type(receiver_ty).scalar_width(),
+            );
         }
         // Arguments have already been evaluated and rooted by LIR. Atomic
         // instructions cannot allocate, block, or safepoint, so they need no
@@ -158,7 +172,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             args,
             arg_types,
             &roots,
-            span,
+            result,
         );
         self.emit_pop_roots_n(self.roots.gc_root_count - roots_before);
         self.roots.gc_root_count = roots_before;
@@ -174,21 +188,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         args: &[cranelift_codegen::ir::Value],
         arg_types: &[Type],
         roots: &OperandRoots,
-        _span: Span,
+        result: &Type,
     ) -> cranelift_codegen::ir::Value {
         use Intrinsic::*;
         match intrinsic {
-            IntegerToI64 => self.builder.ins().uextend(types::I64, receiver),
-            IntegerWrappingToU8 => self.builder.ins().ireduce(types::I8, receiver),
-            IntegerCheckedToU8 => {
-                let overflow =
-                    self.builder
-                        .ins()
-                        .icmp_imm_u(IntCC::UnsignedGreaterThan, receiver, 255);
-                let tag = self.builder.ins().uextend(types::I64, overflow);
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                let payload = self.builder.ins().select(overflow, zero, receiver);
-                self.emit_pair(tag, payload)
+            IntegerConvert | IntegerWrappingConvert | IntegerCheckedConvert => {
+                let target = if intrinsic == IntegerCheckedConvert {
+                    builtin_types::unary_arg(result, builtin_types::BuiltinTypeId::Option).unwrap()
+                } else {
+                    result
+                };
+                self.emit_scalar_conversion(
+                    receiver,
+                    receiver_ty,
+                    target,
+                    intrinsic == IntegerCheckedConvert,
+                )
+            }
+            ScalarToString => self.emit_scalar_string(receiver, receiver_ty),
+            ScalarParse => {
+                let target =
+                    builtin_types::unary_arg(result, builtin_types::BuiltinTypeId::Option).unwrap();
+                self.emit_scalar_parse(receiver, target)
             }
             I64ToString => {
                 let receiver = self.widen_integer(receiver, receiver_ty);
@@ -624,7 +645,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         match ty {
             Type::String => value,
-            Type::U8 | Type::I64 => {
+            Type::Char | Type::U64 => self.emit_scalar_string(value, ty),
+            Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U8 | Type::I64 => {
                 let value = self.widen_integer(value, ty);
                 self.emit_value_runtime_call(rt::willow_i64_to_string, &[value])
             }

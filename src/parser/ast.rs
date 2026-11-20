@@ -189,6 +189,13 @@ impl PatternId {
 /// checker made of it.
 pub enum Type<Name = String> {
     I64,
+    I8,
+    I16,
+    I32,
+    U16,
+    U32,
+    U64,
+    Char,
     U8,
     F64,
     Bool,
@@ -586,7 +593,8 @@ pub struct FunctionDecl {
 /// The compile-time value of a module-level `const`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ConstValue {
-    Integer(i64),
+    Integer(i128),
+    Char(char),
     Float(f64),
     Bool(bool),
     String(String),
@@ -596,6 +604,7 @@ impl ConstValue {
     pub fn ty(&self) -> Type {
         match self {
             Self::Integer(_) => Type::I64,
+            Self::Char(_) => Type::Char,
             Self::Float(_) => Type::F64,
             Self::Bool(_) => Type::Bool,
             Self::String(_) => Type::String,
@@ -991,7 +1000,8 @@ pub struct ExprStmt {
 
 #[derive(Debug)]
 pub enum Expr {
-    Integer(i64, Span, ExprId),
+    Integer(i128, Span, ExprId),
+    Char(char, Span, ExprId),
     Float(f64, Span, ExprId),
     Bool(bool, Span, ExprId),
     String(String, Span, ExprId),
@@ -1101,7 +1111,8 @@ impl Expr {
 
     pub fn id(&self) -> ExprId {
         match self {
-            Self::Integer(_, _, id)
+            Self::Char(_, _, id)
+            | Self::Integer(_, _, id)
             | Self::Float(_, _, id)
             | Self::Bool(_, _, id)
             | Self::String(_, _, id)
@@ -1130,7 +1141,8 @@ impl Expr {
 
     pub fn span(&self) -> Span {
         match self {
-            Expr::Integer(_, s, _)
+            Expr::Char(_, s, _)
+            | Expr::Integer(_, s, _)
             | Expr::Float(_, s, _)
             | Expr::Bool(_, s, _)
             | Expr::String(_, s, _)
@@ -1308,7 +1320,8 @@ pub enum Pattern {
         id: PatternId,
     },
     LiteralBool(bool, Span, PatternId),
-    LiteralInt(i64, Span, PatternId),
+    LiteralInt(i128, Span, PatternId),
+    LiteralChar(char, Span, PatternId),
     /// `Color::Red` — fieldless enum variant
     EnumVariant {
         enum_name: String,
@@ -1345,6 +1358,7 @@ impl Pattern {
         match self {
             Self::Wildcard(_, id)
             | Self::LiteralBool(_, _, id)
+            | Self::LiteralChar(_, _, id)
             | Self::LiteralInt(_, _, id)
             | Self::Binding { id, .. }
             | Self::EnumVariant { id, .. }
@@ -1357,6 +1371,7 @@ impl Pattern {
         match self {
             Self::Wildcard(_, id)
             | Self::LiteralBool(_, _, id)
+            | Self::LiteralChar(_, _, id)
             | Self::LiteralInt(_, _, id)
             | Self::Binding { id, .. }
             | Self::EnumVariant { id, .. }
@@ -1370,7 +1385,7 @@ impl Pattern {
             Pattern::Wildcard(s, _) => *s,
             Pattern::Binding { span, .. } => *span,
             Pattern::LiteralBool(_, s, _) => *s,
-            Pattern::LiteralInt(_, s, _) => *s,
+            Pattern::LiteralChar(_, s, _) | Pattern::LiteralInt(_, s, _) => *s,
             Pattern::EnumVariant { span, .. } => *span,
             Pattern::EnumVariantTuple { span, .. } => *span,
             Pattern::ClassDowncast { span, .. } => *span,
@@ -1501,6 +1516,7 @@ impl std::fmt::Display for Pattern {
                 Self::Binding { name, .. } => f.write_str(name)?,
                 Self::LiteralBool(value, ..) => write!(f, "{value}")?,
                 Self::LiteralInt(value, ..) => write!(f, "{value}")?,
+                Self::LiteralChar(value, ..) => write!(f, "{value:?}")?,
                 Self::EnumVariant {
                     enum_name, variant, ..
                 } if enum_name.is_empty() => f.write_str(variant)?,
@@ -1546,6 +1562,10 @@ impl std::fmt::Display for Pattern {
 /// see the bindings of earlier steps, and a failing step falls through to the
 /// next arm exactly as a false guard does.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Inline guard syntax avoids another allocation; full-range integer literals increase alignment"
+)]
 pub enum Guard {
     If(Expr),
     Let(LetGuard),

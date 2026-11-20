@@ -21,14 +21,14 @@ use crate::semantic::ids::SemanticType as Type;
 
 #[derive(Clone, Copy)]
 enum Constant {
-    Int(i64),
+    Int(i128),
     Bool(bool),
 }
 
 impl Constant {
     fn kind(self) -> HirExprKind {
         match self {
-            Self::Int(value) => HirExprKind::Int(value),
+            Self::Int(value) => HirExprKind::Int(value as i64),
             Self::Bool(value) => HirExprKind::Bool(value),
         }
     }
@@ -55,7 +55,7 @@ fn binary(op: &BinOp, lhs: Constant, rhs: Constant) -> Option<Constant> {
                 // Bounded by the exponent's bit width, including i64::MAX. The
                 // backend's schedule: square only while bits remain, so an
                 // intermediate overflows exactly when the result does.
-                let (mut base, mut exponent, mut result) = (a, b as u64, 1i64);
+                let (mut base, mut exponent, mut result) = (a, b as u64, 1i128);
                 while exponent != 0 {
                     if exponent & 1 != 0 {
                         result = result.checked_mul(base)?;
@@ -95,7 +95,9 @@ pub(crate) fn fold_expr(expr: &mut HirExpr) {
     for node in expr.walk_postorder(true) {
         let get = |child: &HirExpr| constants.get(&std::ptr::from_ref(child)).copied();
         let value = match &node.kind {
-            HirExprKind::Int(n) if node.ty.integer_layout().is_some() => Some(Constant::Int(*n)),
+            HirExprKind::Int(n) if node.ty.integer_layout().is_some() => {
+                Some(Constant::Int(node.ty.integer_layout().unwrap().value(*n)))
+            }
             HirExprKind::Bool(b) => Some(Constant::Bool(*b)),
             HirExprKind::Unary { op, operand } => match (op, get(operand)) {
                 (UnaryOp::Neg, Some(Constant::Int(n))) => n.checked_neg().map(Constant::Int),
@@ -103,15 +105,17 @@ pub(crate) fn fold_expr(expr: &mut HirExpr) {
                 (UnaryOp::Not, Some(Constant::Int(n))) => Some(Constant::Int(
                     node.ty
                         .integer_layout()
-                        .map_or(!n, |layout| layout.wrap(i128::from(!n))),
+                        .map_or(!n, |layout| layout.value(layout.wrap(!n))),
                 )),
                 _ => None,
             },
             HirExprKind::Binary { op, lhs, rhs } => match (get(lhs), get(rhs)) {
                 (Some(a), Some(b)) => {
-                    if matches!(op, BinOp::Shl | BinOp::Shr)
-                        && matches!(b, Constant::Int(n) if lhs.ty.integer_layout().is_some_and(|l| n < 0 || n >= i64::from(l.bits)))
-                    {
+                    let division_fault = matches!(op, BinOp::Div | BinOp::Rem)
+                        && matches!((a,b), (Constant::Int(x),Constant::Int(-1)) if lhs.ty.integer_layout().is_some_and(|l| l.signed && x == l.min()));
+                    let shift_fault = matches!(op, BinOp::Shl | BinOp::Shr)
+                        && matches!(b, Constant::Int(n) if lhs.ty.integer_layout().is_some_and(|l| n < 0 || n >= i128::from(l.bits)));
+                    if division_fault || shift_fault {
                         None
                     } else {
                         binary(op, a, b)
@@ -127,7 +131,7 @@ pub(crate) fn fold_expr(expr: &mut HirExpr) {
             Constant::Int(n) => node
                 .ty
                 .integer_layout()
-                .is_none_or(|layout| layout.contains(i128::from(*n))),
+                .is_none_or(|layout| layout.contains(*n)),
             _ => true,
         });
         if let Some(value) = value {
@@ -149,15 +153,26 @@ pub(crate) fn fold_expr(expr: &mut HirExpr) {
 /// calls, closures, and scoped expressions are deliberately opaque.
 fn propagate_scalar(expr: &mut HirExpr, facts: &mut HashMap<String, Constant>) {
     let scalar = expr.walk_postorder(false).all(|node| {
-        matches!(node.ty, Type::U8 | Type::I64 | Type::Bool)
-            && matches!(
-                node.kind,
-                HirExprKind::Int(_)
-                    | HirExprKind::Bool(_)
-                    | HirExprKind::Var(_)
-                    | HirExprKind::Unary { .. }
-                    | HirExprKind::Binary { .. }
-            )
+        matches!(
+            node.ty,
+            Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::Char
+                | Type::U8
+                | Type::I64
+                | Type::Bool
+        ) && matches!(
+            node.kind,
+            HirExprKind::Int(_)
+                | HirExprKind::Bool(_)
+                | HirExprKind::Var(_)
+                | HirExprKind::Unary { .. }
+                | HirExprKind::Binary { .. }
+        )
     });
     if scalar {
         expr.visit_mut_preorder(false, |node| {
@@ -193,7 +208,7 @@ pub(crate) fn fold_blocks(blocks: &mut [SourceBlock]) {
                         facts.remove(name);
                         let constant = match value.kind {
                             HirExprKind::Int(n) if value.ty.integer_layout().is_some() => {
-                                Some(Constant::Int(n))
+                                Some(Constant::Int(value.ty.integer_layout().unwrap().value(n)))
                             }
                             HirExprKind::Bool(value) => Some(Constant::Bool(value)),
                             _ => None,
@@ -340,7 +355,7 @@ pub(crate) fn eliminate_dead_values(
         // Reading a scalar value just to discard it has no runtime effect.
         // A faulting producer remains an effectful instruction below.
         block.instrs.retain(|inst| !matches!(inst, SourceInst::Expr(expr)
-            if matches!(expr.ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool)
+            if matches!(expr.ty, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool)
                 && matches!(expr.kind, HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) | HirExprKind::Var(_))));
         for inst in &block.instrs {
             if matches!(inst, SourceInst::Compute { local, .. } if dependencies.contains_key(local))
@@ -389,7 +404,7 @@ pub(crate) fn simplify_cfg(blocks: &mut [SourceBlock]) {
 /// whole body so reusing a frame cannot retain references, roots or cleanup.
 pub(crate) fn eliminate_tail_recursion(function: &mut super::lowered::SourceFunction) {
     use super::lowered::{BlockId, LirLocal, LirLocalId, LirOperand, LirRvalue, LirStorageKind};
-    let scalar = |ty: &Type| matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool);
+    let scalar = |ty: &Type| ty.scalar_layout().is_some() || matches!(ty, Type::F64 | Type::Bool);
     if function.is_async
         || !function.captures.is_empty()
         || !scalar(&function.return_type)
@@ -581,7 +596,7 @@ pub(crate) fn unroll_scalar_loops(function: &mut super::lowered::SourceFunction)
     if function.params.iter().any(|param| param.by_reference) {
         return;
     }
-    let scalar = |ty: &Type| matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool);
+    let scalar = |ty: &Type| ty.scalar_layout().is_some() || matches!(ty, Type::F64 | Type::Bool);
     let operand = |value: &LirOperand| match value {
         LirOperand::Local(id) => function
             .locals
@@ -759,12 +774,34 @@ pub(crate) fn inline_scalar_leaves(
             || function.params.iter().any(|param| param.by_reference)
             || !matches!(
                 function.return_type,
-                Type::U8 | Type::I64 | Type::F64 | Type::Bool
+                Type::I8
+                    | Type::I16
+                    | Type::I32
+                    | Type::U16
+                    | Type::U32
+                    | Type::U64
+                    | Type::Char
+                    | Type::U8
+                    | Type::I64
+                    | Type::F64
+                    | Type::Bool
             )
-            || function
-                .locals
-                .iter()
-                .any(|local| !matches!(local.ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool))
+            || function.locals.iter().any(|local| {
+                !matches!(
+                    local.ty,
+                    Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::Char
+                        | Type::U8
+                        | Type::I64
+                        | Type::F64
+                        | Type::Bool
+                )
+            })
         {
             return None;
         }
@@ -923,7 +960,7 @@ pub(crate) fn scalar_replace_objects(
     if !block.recovery.is_empty() {
         return;
     }
-    let scalar = |ty: &Type| matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool);
+    let scalar = |ty: &Type| ty.scalar_layout().is_some() || matches!(ty, Type::F64 | Type::Bool);
     let atom = |expr: &HirExpr| {
         scalar(&expr.ty)
             && matches!(

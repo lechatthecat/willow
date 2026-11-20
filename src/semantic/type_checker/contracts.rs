@@ -55,6 +55,7 @@ impl TypeChecker {
                 AstEvent::Expr(expr) => {
                     let allowed = match expr {
                         Expr::Integer(..)
+                        | Expr::Char(..)
                         | Expr::Float(..)
                         | Expr::Bool(..)
                         | Expr::Binary(_)
@@ -170,5 +171,18 @@ impl TypeChecker {
 }
 
 fn scalar(ty: &Type) -> bool {
-    matches!(ty, Type::U8 | Type::I64 | Type::Bool | Type::F64)
+    matches!(
+        ty,
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
+            | Type::I64
+            | Type::Bool
+            | Type::F64
+    )
 }

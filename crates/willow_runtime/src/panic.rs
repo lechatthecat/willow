@@ -90,19 +90,37 @@ pub extern "C" fn willow_panic_at(message: *const u8, file: *const u8, line: i32
     std::process::abort();
 }
 
-/// Debug-build integer division guard failure. `kind`:
-/// 0 = division by zero, 1 = `i64::MIN / -1` overflow, 2 = remainder by zero,
-/// 3 = `i64::MIN % -1` overflow. `file` is a WillowString pointer.
+/// Integer division guard failure in either build mode. Low kind byte:
+/// 0 = division by zero, 1 = MIN / -1 overflow, 2 = remainder by zero,
+/// 3 = MIN % -1 overflow. Bits 8..15 carry a non-i64 signed width;
+/// legacy kinds 0..3 remain i64. `file` is a WillowString pointer.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_int_div_panic(kind: i64, file: *const u8, line: i32, col: i32) {
-    let what = match kind {
+    crate::panic_context::raise_language_message_at(
+        &int_div_message(kind),
+        file,
+        line.into(),
+        col.into(),
+    );
+}
+
+fn int_div_message(kind: i64) -> std::borrow::Cow<'static, str> {
+    let (operation, bits, _) = willow_abi::integer_overflow::decode(kind);
+    if kind >= 256 && matches!(operation, 1 | 3) {
+        return format!(
+            "integer overflow: `i{bits}::MIN {} -1`",
+            if operation == 1 { "/" } else { "%" },
+        )
+        .into();
+    }
+    match operation {
         0 => "division by zero",
         1 => "integer overflow: `i64::MIN / -1`",
         2 => "remainder by zero",
         _ => "integer overflow: `i64::MIN % -1`",
-    };
-    crate::panic_context::raise_language_message_at(what, file, line.into(), col.into());
+    }
+    .into()
 }
 
 /// Debug-build signed overflow check failure. `kind`:
@@ -163,6 +181,116 @@ pub extern "C" fn willow_abort(file: *const u8, line: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_width_division_messages_preserve_width_and_legacy_codes() {
+        for (bits, division, remainder) in [
+            (
+                8,
+                "integer overflow: `i8::MIN / -1`",
+                "integer overflow: `i8::MIN % -1`",
+            ),
+            (
+                16,
+                "integer overflow: `i16::MIN / -1`",
+                "integer overflow: `i16::MIN % -1`",
+            ),
+            (
+                32,
+                "integer overflow: `i32::MIN / -1`",
+                "integer overflow: `i32::MIN % -1`",
+            ),
+        ] {
+            assert_eq!(int_div_message(1 | (bits << 8)), division);
+            assert_eq!(int_div_message(3 | (bits << 8)), remainder);
+            assert_eq!(int_div_message(bits << 8), "division by zero");
+            assert_eq!(int_div_message(2 | (bits << 8)), "remainder by zero");
+        }
+        for (code, message) in [
+            "division by zero",
+            "integer overflow: `i64::MIN / -1`",
+            "remainder by zero",
+            "integer overflow: `i64::MIN % -1`",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(int_div_message(code as i64), message);
+        }
+    }
+
+    #[test]
+    fn scalar_width_contract_unsigned_high_bits() {
+        let call =
+            |op, a, b| contract_integer(willow_abi::integer_overflow::encode(op, 64, false), a, b);
+        assert_eq!(call(0, -1, 0), Some(-1));
+        assert_eq!(call(0, i64::MAX, 1), Some(i64::MIN));
+        assert_eq!(call(0, -1, 1), None);
+        assert_eq!(call(1, -1, i64::MIN), Some(i64::MAX));
+        assert_eq!(call(1, 0, -1), None);
+        assert_eq!(call(2, i64::MIN, 1), Some(i64::MIN));
+        assert_eq!(call(2, i64::MIN, 2), None);
+        assert_eq!(call(2, -1, -1), None);
+        assert_eq!(call(3, -1, 2), Some(i64::MAX));
+        assert_eq!(call(4, -1, 2), Some(1));
+        assert_eq!(call(3, -1, 0), None);
+        assert_eq!(call(4, -1, 0), None);
+        assert_eq!(call(5, -1, 0), Some(1));
+        assert_eq!(call(5, -1, 1), Some(-1));
+        assert_eq!(call(5, -1, 2), None);
+        assert_eq!(call(5, 1, -1), Some(1));
+        assert_eq!(call(5, 2, -1), None);
+        assert_eq!(call(6, -1, 0), None);
+        assert_eq!(call(6, i64::MIN, 0), None);
+        assert_eq!(call(6, 0, 0), Some(0));
+        assert_eq!(call(7, 1, 63), Some(i64::MIN));
+        assert_eq!(call(7, -1, 1), Some(-2));
+        assert_eq!(call(8, -1, 1), Some(i64::MAX));
+        assert_eq!(call(8, -1, 63), Some(1));
+        assert_eq!(call(7, 1, 64), None);
+        assert_eq!(call(8, 1, -1), None);
+    }
+
+    #[test]
+    fn scalar_width_contract_narrow_signed_boundaries() {
+        for bits in [8, 16, 32] {
+            let min = -(1_i64 << (bits - 1));
+            let max = -min - 1;
+            let call = |op, a, b| {
+                contract_integer(willow_abi::integer_overflow::encode(op, bits, true), a, b)
+            };
+            assert_eq!(call(0, max, 0), Some(max));
+            assert_eq!(call(0, max, 1), None);
+            assert_eq!(call(1, min, 1), None);
+            assert_eq!(call(2, min, -1), None);
+            assert_eq!(call(3, min, -1), None);
+            assert_eq!(call(4, min, -1), None);
+            assert_eq!(call(3, -3, 2), Some(-1));
+            assert_eq!(call(4, -3, 2), Some(-1));
+            assert_eq!(call(6, min, 0), None);
+            assert_eq!(call(6, max, 0), Some(-max));
+            assert_eq!(call(7, max, 1), Some(-2));
+            assert_eq!(call(8, min, i64::from(bits - 1)), Some(-1));
+            assert_eq!(call(7, 1, i64::from(bits)), None);
+            assert_eq!(call(8, 1, -1), None);
+        }
+        for bits in [8, 16, 32] {
+            let max = (1_i64 << bits) - 1;
+            let call = |op, a, b| {
+                contract_integer(willow_abi::integer_overflow::encode(op, bits, false), a, b)
+            };
+            assert_eq!(call(0, max, 1), None);
+            assert_eq!(call(1, 0, 1), None);
+            assert_eq!(call(3, max, 2), Some(max / 2));
+            assert_eq!(call(4, max, 2), Some(1));
+            assert_eq!(call(7, max, 1), Some(max - 1));
+            assert_eq!(call(8, max, i64::from(bits - 1)), Some(1));
+        }
+        assert_eq!(contract_integer(0, i64::MAX, 1), None);
+        assert_eq!(contract_integer(4, i64::MIN, -1), None);
+        assert_eq!(contract_integer(8, i64::MIN, 63), Some(-1));
+        assert_eq!(contract_integer(7, 1, 64), None);
+    }
 
     #[test]
     fn int_overflow_messages_name_the_operator() {
@@ -261,24 +389,68 @@ pub extern "C" fn willow_contract_i64(
 
 fn contract_integer(kind: i64, a: i64, b: i64) -> Option<i64> {
     let (op, bits, signed) = willow_abi::integer_overflow::decode(kind);
-    if matches!(op, 7 | 8) && !(0..i64::from(bits)).contains(&b) {
-        return None;
-    }
-    let value = contract_i64(op, a, b)?;
     if bits == 64 && signed {
-        return Some(value);
+        return contract_i64(op, a, b);
     }
+    let decode = |value| {
+        if !signed && bits == 64 {
+            i128::from(value as u64)
+        } else {
+            i128::from(value)
+        }
+    };
+    let (a, b) = (decode(a), decode(b));
     let min = if signed { -(1_i128 << (bits - 1)) } else { 0 };
     let max = (1_i128 << (bits - u32::from(signed))) - 1;
+    if !(min..=max).contains(&a) || !(min..=max).contains(&b) {
+        return None;
+    }
+    if matches!(op, 7 | 8) && !(0..i128::from(bits)).contains(&b) {
+        return None;
+    }
+    // Signed MIN / -1 and MIN % -1 both fault, including narrow integers.
+    if signed && matches!(op, 3 | 4) && a == min && b == -1 {
+        return None;
+    }
+    let value = contract_wide(op, a, b)?;
     if matches!(op, 7 | 8) {
         let shift = 128 - bits;
         return Some(if signed {
-            ((i128::from(value) << shift) >> shift) as i64
+            ((value << shift) >> shift) as i64
         } else {
-            (i128::from(value) & max) as i64
+            (value & max) as i64
         });
     }
-    (min..=max).contains(&i128::from(value)).then_some(value)
+    (min..=max).contains(&value).then_some(value as i64)
+}
+
+/// Common arithmetic for every non-i64 integer layout. i128 covers all valid
+/// operands; an intermediate i128 overflow necessarily exceeds the result type.
+fn contract_wide(op: i64, a: i128, b: i128) -> Option<i128> {
+    match op {
+        0 => a.checked_add(b),
+        1 => a.checked_sub(b),
+        2 => a.checked_mul(b),
+        3 => a.checked_div(b),
+        4 => a.checked_rem(b),
+        6 => a.checked_neg(),
+        7 => u32::try_from(b).ok().and_then(|b| a.checked_shl(b)),
+        8 => u32::try_from(b).ok().and_then(|b| a.checked_shr(b)),
+        5 => {
+            let (mut base, mut exponent, mut value) = (a, u64::try_from(b).ok()?, 1_i128);
+            while exponent != 0 {
+                if exponent & 1 != 0 {
+                    value = value.checked_mul(base)?;
+                }
+                exponent >>= 1;
+                if exponent != 0 {
+                    base = base.checked_mul(base)?;
+                }
+            }
+            Some(value)
+        }
+        _ => None,
+    }
 }
 
 fn contract_i64(op: i64, a: i64, b: i64) -> Option<i64> {

@@ -34,7 +34,15 @@ pub(super) fn frozen_element(ty: &Type) -> Option<&Type> {
 }
 pub(super) fn sort(ty: &Type) -> Result<String, String> {
     match ty {
-        Type::U8 | Type::I64 => Ok("Int".into()),
+        Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::Char
+        | Type::U8
+        | Type::I64 => Ok("Int".into()),
         Type::Bool => Ok("Bool".into()),
         Type::Named(_) => Ok(format!("D{}", type_key(ty))),
         _ if frozen_element(ty).is_some() => Ok(format!("D{}", type_key(ty))),
@@ -44,13 +52,24 @@ pub(super) fn sort(ty: &Type) -> Result<String, String> {
 pub(super) fn domain(ty: &Type, value: &str) -> String {
     match ty {
         ty if ty.integer_layout().is_some() => integer_bounds(value, ty.integer_layout().unwrap()),
+        Type::Char => format!(
+            "(or (and (<= 0 {value}) (<= {value} 55295)) (and (<= 57344 {value}) (<= {value} 1114111)))"
+        ),
         Type::Bool => "true".into(),
         _ => format!("(valid_{} {value})", type_key(ty)),
     }
 }
 pub(super) fn default_value(ty: &Type) -> String {
     match ty {
-        Type::U8 | Type::I64 => "0".into(),
+        Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::Char
+        | Type::U8
+        | Type::I64 => "0".into(),
         Type::Bool => "false".into(),
         _ => format!("default_{}", type_key(ty)),
     }
@@ -99,7 +118,19 @@ impl DataTypes {
         writes: &FieldWrites,
         depth: usize,
     ) -> Result<(), String> {
-        if matches!(ty, Type::U8 | Type::I64 | Type::Bool) {
+        if matches!(
+            ty,
+            Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::Char
+                | Type::U8
+                | Type::I64
+                | Type::Bool
+        ) {
             return Ok(());
         }
         if let Some(error) = self.errors.get(ty) {
@@ -236,7 +267,20 @@ impl DataTypes {
         result
     }
     pub fn check(&self, ty: &Type) -> Result<(), String> {
-        if matches!(ty, Type::U8 | Type::I64 | Type::Bool) || self.constructors.contains_key(ty) {
+        if matches!(
+            ty,
+            Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::Char
+                | Type::U8
+                | Type::I64
+                | Type::Bool
+        ) || self.constructors.contains_key(ty)
+        {
             Ok(())
         } else {
             Err(self

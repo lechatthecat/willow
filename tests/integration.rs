@@ -419,3 +419,6 @@ mod std_additions;
 
 #[path = "integration/u8_scalar.rs"]
 mod u8_scalar;
+
+#[path = "integration/scalar_widths.rs"]
+mod scalar_widths;

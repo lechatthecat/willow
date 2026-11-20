@@ -76,7 +76,14 @@ impl<N> Type<N> {
                     pending.extend(va.iter().zip(ta));
                 }
                 (Type::Named(v), Type::Named(t)) if v == t => {}
-                (Type::U8, Type::U8)
+                (Type::I8, Type::I8)
+                | (Type::I16, Type::I16)
+                | (Type::I32, Type::I32)
+                | (Type::U16, Type::U16)
+                | (Type::U32, Type::U32)
+                | (Type::U64, Type::U64)
+                | (Type::Char, Type::Char)
+                | (Type::U8, Type::U8)
                 | (Type::I64, Type::I64)
                 | (Type::F64, Type::F64)
                 | (Type::Bool, Type::Bool)
@@ -126,6 +133,13 @@ impl<N> Type<N> {
                 Work::Build(ty, count) => {
                     let mut children = values.split_off(values.len() - count);
                     let value = match ty {
+                        Type::I8 => Type::I8,
+                        Type::I16 => Type::I16,
+                        Type::I32 => Type::I32,
+                        Type::U16 => Type::U16,
+                        Type::U32 => Type::U32,
+                        Type::U64 => Type::U64,
+                        Type::Char => Type::Char,
                         Type::U8 => Type::U8,
                         Type::I64 => Type::I64,
                         Type::F64 => Type::F64,
@@ -186,6 +200,13 @@ impl<N> Type<N> {
                 Work::Build(ty, count) => {
                     let mut children = values.split_off(values.len() - count);
                     let value = match ty {
+                        Type::I8 => Type::I8,
+                        Type::I16 => Type::I16,
+                        Type::I32 => Type::I32,
+                        Type::U16 => Type::U16,
+                        Type::U32 => Type::U32,
+                        Type::U64 => Type::U64,
+                        Type::Char => Type::Char,
                         Type::U8 => Type::U8,
                         Type::I64 => Type::I64,
                         Type::F64 => Type::F64,
@@ -327,6 +348,13 @@ impl<N: Hash> Hash for Type<N> {
 #[derive(serde::Serialize, serde::Deserialize)]
 enum FlatType<N> {
     I64,
+    I8,
+    I16,
+    I32,
+    U16,
+    U32,
+    U64,
+    Char,
     U8,
     F64,
     Bool,
@@ -358,6 +386,13 @@ impl<N: serde::Serialize> serde::Serialize for Type<N> {
         let flat: Vec<_> = nodes
             .into_iter()
             .map(|ty| match ty {
+                Type::I8 => FlatType::I8,
+                Type::I16 => FlatType::I16,
+                Type::I32 => FlatType::I32,
+                Type::U16 => FlatType::U16,
+                Type::U32 => FlatType::U32,
+                Type::U64 => FlatType::U64,
+                Type::Char => FlatType::Char,
                 Type::U8 => FlatType::U8,
                 Type::I64 => FlatType::I64,
                 Type::F64 => FlatType::F64,
@@ -401,6 +436,13 @@ impl<'de, N: serde::Deserialize<'de>> serde::Deserialize<'de> for Type<N> {
                     .ok_or_else(|| D::Error::custom("invalid or repeated type edge"))
             };
             let value = match node {
+                FlatType::I8 => Self::I8,
+                FlatType::I16 => Self::I16,
+                FlatType::I32 => Self::I32,
+                FlatType::U16 => Self::U16,
+                FlatType::U32 => Self::U32,
+                FlatType::U64 => Self::U64,
+                FlatType::Char => Self::Char,
                 FlatType::U8 => Self::U8,
                 FlatType::I64 => Self::I64,
                 FlatType::F64 => Self::F64,
@@ -447,6 +489,13 @@ impl<N: std::fmt::Debug> std::fmt::Debug for Type<N> {
                 Work::Text(text) => f.write_str(text)?,
                 Work::Name(name) => std::fmt::Debug::fmt(name, f)?,
                 Work::Type(ty) => match ty {
+                    Type::I8 => f.write_str("I8")?,
+                    Type::I16 => f.write_str("I16")?,
+                    Type::I32 => f.write_str("I32")?,
+                    Type::U16 => f.write_str("U16")?,
+                    Type::U32 => f.write_str("U32")?,
+                    Type::U64 => f.write_str("U64")?,
+                    Type::Char => f.write_str("Char")?,
                     Type::U8 => f.write_str("U8")?,
                     Type::I64 => f.write_str("I64")?,
                     Type::F64 => f.write_str("F64")?,

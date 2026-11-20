@@ -139,8 +139,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.builder
                             .ins()
                             .bitcast(types::F64, MemFlagsData::new(), raw)
-                    } else if clif_ty == types::I8 {
-                        self.builder.ins().ireduce(types::I8, raw)
+                    } else if clif_ty.is_int() && clif_ty.bits() < 64 {
+                        self.builder.ins().ireduce(clif_ty, raw)
                     } else {
                         raw
                     };
@@ -539,10 +539,42 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             LirRvalue::Print { value, ty, newline } => {
                 let value = self.emit_lir_operand(function, value);
+                if matches!(ty, Type::Char | Type::U64) {
+                    let value = self.widen_integer(value, ty);
+                    let kind = self
+                        .builder
+                        .ins()
+                        .iconst(types::I64, if *ty == Type::Char { 0 } else { 64 });
+                    let newline = self.builder.ins().iconst(types::I8, i64::from(*newline));
+                    self.emit_void_runtime_call(rt::willow_print_scalar, &[value, kind, newline]);
+                    return self.builder.ins().iconst(types::I8, 0);
+                }
                 let value = self.widen_integer(value, ty);
                 let name = match (ty, newline) {
-                    (Type::U8 | Type::I64, false) => rt::willow_print_i64,
-                    (Type::U8 | Type::I64, true) => rt::willow_println_i64,
+                    (
+                        Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::Char
+                        | Type::U8
+                        | Type::I64,
+                        false,
+                    ) => rt::willow_print_i64,
+                    (
+                        Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::Char
+                        | Type::U8
+                        | Type::I64,
+                        true,
+                    ) => rt::willow_println_i64,
                     (Type::F64, false) => rt::willow_print_f64,
                     (Type::F64, true) => rt::willow_println_f64,
                     (Type::Bool, false) => rt::willow_print_bool,

@@ -7,13 +7,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
-pub(crate) const WRAPPER_SCHEMA: &str = "8";
+pub(crate) const WRAPPER_SCHEMA: &str = "9";
 
 pub type RustBridgeSymbols = Vec<((u32, String), RustBridgeSymbol)>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scalar {
     I64,
+    I8,
+    I16,
+    I32,
+    U16,
+    U32,
+    U64,
+    Char,
     U8,
     F64,
     Bool,
@@ -29,9 +36,11 @@ pub enum Scalar {
 impl Scalar {
     pub fn abi_type(&self) -> Option<willow_abi::AbiTy> {
         Some(match self {
-            Self::I64 => willow_abi::AbiTy::I64,
+            Self::I64 | Self::U64 => willow_abi::AbiTy::I64,
+            Self::I32 | Self::U32 | Self::Char => willow_abi::AbiTy::I32,
+            Self::I16 | Self::U16 => willow_abi::AbiTy::I16,
             Self::F64 => willow_abi::AbiTy::F64,
-            Self::U8 | Self::Bool => willow_abi::AbiTy::I8,
+            Self::I8 | Self::U8 | Self::Bool => willow_abi::AbiTy::I8,
             Self::Void => return None,
             _ => willow_abi::AbiTy::Ptr,
         })
@@ -54,6 +63,13 @@ impl Scalar {
         Some(match ty {
             Type::Named(name) if records.contains_key(name) => Self::Record(name.clone()),
             Type::Named(name) if names.contains(name) => Self::Opaque(name.clone()),
+            Type::I8 => Self::I8,
+            Type::I16 => Self::I16,
+            Type::I32 => Self::I32,
+            Type::U16 => Self::U16,
+            Type::U32 => Self::U32,
+            Type::U64 => Self::U64,
+            Type::Char => Self::Char,
             Type::U8 => Self::U8,
             Type::I64 => Self::I64,
             Type::F64 => Self::F64,
@@ -95,6 +111,13 @@ impl Scalar {
     }
     fn array(inner: &Type) -> Option<Self> {
         let element = match inner {
+            Type::I8 => Self::I8,
+            Type::I16 => Self::I16,
+            Type::I32 => Self::I32,
+            Type::U16 => Self::U16,
+            Type::U32 => Self::U32,
+            Type::U64 => Self::U64,
+            Type::Char => Self::Char,
             Type::U8 => Self::U8,
             Type::String => Self::String,
             Type::F64 => Self::F64,
@@ -105,6 +128,13 @@ impl Scalar {
     }
     fn rust(&self) -> &'static str {
         match self {
+            Self::I8 => "i8",
+            Self::I16 => "i16",
+            Self::I32 => "i32",
+            Self::U16 => "u16",
+            Self::U32 => "u32",
+            Self::U64 => "u64",
+            Self::Char => "char",
             Self::U8 => "u8",
             Self::I64 => "i64",
             Self::F64 => "f64",
@@ -112,6 +142,26 @@ impl Scalar {
             Self::Void => "()",
             _ => unreachable!("aggregate Rust type"),
         }
+    }
+
+    /// Rust `char` has a validity invariant and is not a C ABI type. Carry its
+    /// code point as u32, validating inside the wrapper's unwind boundary.
+    fn wire_rust(&self) -> &'static str {
+        if *self == Self::Char {
+            "u32"
+        } else {
+            self.rust()
+        }
+    }
+
+    fn array_storage_flags(&self) -> i64 {
+        let width = match self {
+            Self::I8 | Self::U8 => 1,
+            Self::I16 | Self::U16 => 2,
+            Self::I32 | Self::U32 | Self::Char => 4,
+            _ => 8,
+        };
+        willow_abi::array_layout::storage_flags(width, self.reference())
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,10 +358,10 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
         )
         .unwrap();
         for (i, ty) in symbol.input_types.iter().enumerate() {
-            write!(source, "a{i}: {},", ty.rust()).unwrap();
+            write!(source, "a{i}: {},", ty.wire_rust()).unwrap();
         }
         let guard = symbol.entry_guard();
-        write!(source, ") -> {} {{\nunsafe {{ {guard}({revision}); }}\nmatch std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\nlet adapter: fn(", symbol.output_type.rust()).unwrap();
+        write!(source, ") -> {} {{\nunsafe {{ {guard}({revision}); }}\nmatch std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\nlet adapter: fn(", symbol.output_type.wire_rust()).unwrap();
         for ty in &symbol.input_types {
             write!(source, "{},", ty.rust()).unwrap();
         }
@@ -321,11 +371,22 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
             symbol.output_type.rust()
         )
         .unwrap();
-        for i in 0..symbol.input_types.len() {
-            write!(source, "a{i},").unwrap();
+        for (i, ty) in symbol.input_types.iter().enumerate() {
+            if *ty == Scalar::Char {
+                write!(
+                    source,
+                    "char::from_u32(a{i}).expect(\"invalid Unicode scalar at Rust boundary\"),"
+                )
+                .unwrap();
+            } else {
+                write!(source, "a{i},").unwrap();
+            }
         }
-        source
-            .push_str(")\n})) { Ok(value) => value, Err(payload) => bridge_panic(payload) }\n}\n");
+        source.push(')');
+        if symbol.output_type == Scalar::Char {
+            source.push_str(" as u32");
+        }
+        source.push_str("\n})) { Ok(value) => value, Err(payload) => bridge_panic(payload) }\n}\n");
     }
     source
 }

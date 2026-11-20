@@ -17,7 +17,22 @@ pub(super) fn confined_scalar_maps(f: &LirFunction) -> bool {
     fn is_map(ty: &Type) -> Option<(&Type, &Type)> {
         builtin_types::binary_args(ty, BuiltinTypeId::Map)
     }
-    let scalar = |ty: &Type| matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool);
+    let scalar = |ty: &Type| {
+        matches!(
+            ty,
+            Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::Char
+                | Type::U8
+                | Type::I64
+                | Type::F64
+                | Type::Bool
+        )
+    };
     if f.is_async
         || !f.captures.is_empty()
         || is_map(&f.return_type).is_some()

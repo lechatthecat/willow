@@ -1681,7 +1681,18 @@ impl TypeChecker {
             && self.array_abi_files.contains(&span.file_id)
             && matches!(
                 obj_ty,
-                Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+                Type::I8
+                    | Type::I16
+                    | Type::I32
+                    | Type::U16
+                    | Type::U32
+                    | Type::U64
+                    | Type::Char
+                    | Type::U8
+                    | Type::I64
+                    | Type::F64
+                    | Type::Bool
+                    | Type::String
             )
         {
             self.check_call_argument_count(method_name, 0, args.len(), span);
@@ -1711,14 +1722,17 @@ impl TypeChecker {
         {
             return ty;
         }
-        if matches!(
-            (obj_ty, method_name),
-            (Type::U8, "to_i64") | (Type::I64, "wrapping_to_u8" | "checked_to_u8")
-        ) {
+        if let Some(resolved) = crate::semantic::intrinsics::resolve(obj_ty, method_name, 0)
+            && matches!(
+                resolved.intrinsic,
+                crate::semantic::intrinsics::Intrinsic::IntegerConvert
+                    | crate::semantic::intrinsics::Intrinsic::IntegerWrappingConvert
+                    | crate::semantic::intrinsics::Intrinsic::IntegerCheckedConvert
+                    | crate::semantic::intrinsics::Intrinsic::ScalarParse
+            )
+        {
             self.check_call_argument_count(method_name, 0, args.len(), span);
-            return crate::semantic::intrinsics::resolve(obj_ty, method_name, 0)
-                .unwrap()
-                .return_type(|_| None);
+            return resolved.return_type(|_| None);
         }
         // Built-in `to_string()` on primitives: `i64`/`f64`/`bool`/`String` ->
         // `String`. Class `to_string()` falls through to normal
@@ -1726,7 +1740,18 @@ impl TypeChecker {
         if method_name == "to_string"
             && matches!(
                 obj_ty,
-                Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+                Type::I8
+                    | Type::I16
+                    | Type::I32
+                    | Type::U16
+                    | Type::U32
+                    | Type::U64
+                    | Type::Char
+                    | Type::U8
+                    | Type::I64
+                    | Type::F64
+                    | Type::Bool
+                    | Type::String
             )
         {
             self.check_builtin_arity(

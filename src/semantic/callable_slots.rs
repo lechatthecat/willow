@@ -130,7 +130,18 @@ impl Binding {
 fn is_scalar(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
+            | Type::I64
+            | Type::F64
+            | Type::Bool
+            | Type::String
     )
 }
 
@@ -278,6 +289,7 @@ impl<'a> Collector<'a> {
                     work.push(&ternary.else_expr);
                 }
                 Expr::Integer(..)
+                | Expr::Char(..)
                 | Expr::Float(..)
                 | Expr::Bool(..)
                 | Expr::String(..)
@@ -368,7 +380,11 @@ impl<'a> Collector<'a> {
                         Some(ty) => is_scalar(ty),
                         None => matches!(
                             binding.init,
-                            Expr::Integer(..) | Expr::Float(..) | Expr::Bool(..) | Expr::String(..)
+                            Expr::Integer(..)
+                                | Expr::Char(..)
+                                | Expr::Float(..)
+                                | Expr::Bool(..)
+                                | Expr::String(..)
                         ),
                     };
                     self.lets.push(PendingLet {

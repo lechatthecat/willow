@@ -237,7 +237,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             self.emit_push_call_root(word);
                             (self.emit_reload_root(channel_root, channel), word)
                         } else {
-                            (channel, value)
+                            (channel, self.widen_integer(value, elem_ty))
                         };
                         let sent = self.emit_value_runtime_call(runtime, &[channel, value]);
                         self.emit_pop_roots_n(self.roots.gc_root_count - before);
@@ -448,6 +448,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         rt::willow_channel_try_send_ptr,
                     ],
                 );
+                let sent_value = self.widen_integer(sent_value, elem_ty);
                 let sent = self.emit_value_runtime_call(runtime, &[channel_value, sent_value]);
                 let done = self.builder.create_block();
                 let park = self.builder.create_block();

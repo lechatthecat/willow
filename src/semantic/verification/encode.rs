@@ -17,7 +17,8 @@ impl Value {
         }
     }
 }
-pub(super) fn integer(n: i64) -> String {
+pub(super) fn integer(n: impl Into<i128>) -> String {
+    let n = n.into();
     if n < 0 {
         format!("(- {})", n.unsigned_abs())
     } else {
@@ -30,8 +31,8 @@ pub(super) fn bounds(v: &str) -> String {
 pub(super) fn integer_bounds(v: &str, layout: crate::parser::ast::IntegerLayout) -> String {
     format!(
         "(and (<= {} {v}) (<= {v} {}))",
-        integer(layout.min() as i64),
-        integer(layout.max() as i64)
+        integer(layout.min()),
+        integer(layout.max())
     )
 }
 pub(super) fn has(f: &FunctionDecl, k: EffectContractKind) -> bool {
@@ -147,25 +148,28 @@ impl Encoder<'_> {
         expected: Option<&Type>,
     ) -> Result<Value, String> {
         let context = expected.filter(|ty| ty.integer_layout().is_some());
-        let (l, r) = if context.is_none()
-            && matches!(b.lhs, Expr::Integer(..))
-            && !matches!(b.rhs, Expr::Integer(..))
-        {
-            let r = self.expr(&b.rhs, state, gate)?;
-            let l = self.expr_expecting(&b.lhs, state, gate, Some(&r.ty))?;
-            (l, r)
-        } else {
-            let l = self.expr_expecting(&b.lhs, state, gate, context)?;
-            let rhs_gate = match b.op {
-                BinOp::And if l.boolean => self.and(gate, &l)?,
-                BinOp::Or if l.boolean => {
-                    self.node(format!("(and {} (not {}))", gate.text, l.text), true)?
-                }
-                _ => gate.clone(),
-            };
-            let r = self.expr_expecting(&b.rhs, state, &rhs_gate, Some(&l.ty))?;
-            (l, r)
+        let is_integer_literal = |expr: &Expr| {
+            matches!(expr, Expr::Integer(..))
+                || matches!(expr, Expr::Unary(unary) if unary.op == UnaryOp::Neg
+                    && matches!(unary.expr, Expr::Integer(..)))
         };
+        let (l, r) =
+            if context.is_none() && is_integer_literal(&b.lhs) && !is_integer_literal(&b.rhs) {
+                let r = self.expr(&b.rhs, state, gate)?;
+                let l = self.expr_expecting(&b.lhs, state, gate, Some(&r.ty))?;
+                (l, r)
+            } else {
+                let l = self.expr_expecting(&b.lhs, state, gate, context)?;
+                let rhs_gate = match b.op {
+                    BinOp::And if l.boolean => self.and(gate, &l)?,
+                    BinOp::Or if l.boolean => {
+                        self.node(format!("(and {} (not {}))", gate.text, l.text), true)?
+                    }
+                    _ => gate.clone(),
+                };
+                let r = self.expr_expecting(&b.rhs, state, &rhs_gate, Some(&l.ty))?;
+                (l, r)
+            };
         let (op, boolean) = match b.op {
             BinOp::Add => ("+", false),
             BinOp::Sub => ("-", false),
@@ -184,22 +188,44 @@ impl Encoder<'_> {
         };
         let valid = match b.op {
             BinOp::Eq | BinOp::Ne => {
-                l.ty == r.ty && matches!(l.ty, Type::U8 | Type::I64 | Type::Bool)
+                l.ty == r.ty
+                    && matches!(
+                        l.ty,
+                        Type::I8
+                            | Type::I16
+                            | Type::I32
+                            | Type::U16
+                            | Type::U32
+                            | Type::U64
+                            | Type::Char
+                            | Type::U8
+                            | Type::I64
+                            | Type::Bool
+                    )
             }
             BinOp::And | BinOp::Or => l.boolean && r.boolean,
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                l.ty.scalar_layout().is_some() && l.ty == r.ty
+            }
             _ => l.ty.integer_layout().is_some() && l.ty == r.ty,
         };
         if !valid {
             return Err("invalid operand types".into());
         }
         if matches!(b.op, BinOp::Div | BinOp::Rem) {
-            self.guard(
-                gate,
+            let layout = l.ty.integer_layout().unwrap();
+            let safe = if layout.signed {
                 format!(
-                    "(and (distinct {} 0) (not (and (= {} (- 9223372036854775808)) (= {} (- 1)))))",
-                    r.text, l.text, r.text
-                ),
-            )?;
+                    "(and (distinct {} 0) (not (and (= {} {}) (= {} (- 1)))))",
+                    r.text,
+                    l.text,
+                    integer(layout.min()),
+                    r.text
+                )
+            } else {
+                format!("(distinct {} 0)", r.text)
+            };
+            self.guard(gate, safe)?;
         }
         let result_ty = if boolean { Type::Bool } else { l.ty.clone() };
         let value = self.typed_node(format!("({op} {} {})", l.text, r.text), &result_ty)?;
@@ -223,6 +249,11 @@ impl Encoder<'_> {
                 }
                 Ok(value)
             }
+            Expr::Char(c, ..) => Ok(Value {
+                text: integer(u32::from(*c)),
+                boolean: false,
+                ty: Type::Char,
+            }),
             Expr::Bool(b, ..) => Ok(Value::literal(b.to_string(), true)),
             Expr::Var(n, ..) => {
                 if let Some(v) = state.env.get(n) {
@@ -238,6 +269,11 @@ impl Encoder<'_> {
                         value.ty = self.functions[self.names[n.as_str()]].return_type.clone();
                         Ok(value)
                     }
+                    Some(ConstValue::Char(c)) => Ok(Value {
+                        text: integer(u32::from(*c)),
+                        boolean: false,
+                        ty: Type::Char,
+                    }),
                     Some(ConstValue::Bool(b)) => Ok(Value::literal(b.to_string(), true)),
                     _ => Err(format!("unknown scalar binding `{n}`")),
                 }
@@ -545,6 +581,12 @@ impl Encoder<'_> {
             }
             Pattern::LiteralBool(b, ..) if value.ty == Type::Bool => {
                 return self.node(format!("(= {} {b})", value.text), true);
+            }
+            Pattern::LiteralChar(c, ..) if value.ty == Type::Char => {
+                return self.node(
+                    format!("(= {} {})", value.text, integer(u32::from(*c))),
+                    true,
+                );
             }
             Pattern::LiteralInt(n, ..) if value.ty.integer_layout().is_some() => {
                 return self.node(format!("(= {} {})", value.text, integer(*n)), true);

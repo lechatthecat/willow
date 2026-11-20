@@ -58,7 +58,19 @@ impl Parser {
                     || self.rust_records.contains_key(&record.name)
                     || matches!(
                         record.name.as_str(),
-                        "String" | "u8" | "i64" | "f64" | "bool" | "void"
+                        "String"
+                            | "i8"
+                            | "i16"
+                            | "i32"
+                            | "u16"
+                            | "u32"
+                            | "u64"
+                            | "char"
+                            | "u8"
+                            | "i64"
+                            | "f64"
+                            | "bool"
+                            | "void"
                     )
                     || crate::semantic::builtin_types::BuiltinTypeId::from_name(&record.name)
                         .is_some()
@@ -153,6 +165,13 @@ impl Parser {
                         | "Array"
                         | "Option"
                         | "Result"
+                        | "i8"
+                        | "i16"
+                        | "i32"
+                        | "u16"
+                        | "u32"
+                        | "u64"
+                        | "char"
                         | "u8"
                         | "i64"
                         | "f64"

@@ -64,7 +64,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             ],
         );
         let value = self.emit_value_runtime_call(runtime, &[channel]);
-        if self.is_inline_pair(elem_ty) || elem_ty.integer_layout().is_some_and(|l| l.bits < 64) {
+        if self.is_inline_pair(elem_ty) || elem_ty.scalar_layout().is_some_and(|l| l.bits < 64) {
             self.emit_from_storage_word(value, elem_ty)
         } else {
             value

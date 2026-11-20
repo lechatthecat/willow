@@ -102,8 +102,8 @@ impl BridgeFrame {
     fn array_get(&self, object: u64, index: usize) -> BridgeValue {
         BridgeValue { low: unsafe { willow_rust_bridge_array_get(object, index) }, high: 0 }
     }
-    fn array_new(&self, len: usize, reference: bool) -> BridgeValue {
-        BridgeValue { low: unsafe { willow_rust_bridge_array_new(self.raw, len, u32::from(reference)) }, high: 0 }
+    fn array_new(&self, len: usize, flags: i64) -> BridgeValue {
+        BridgeValue { low: unsafe { willow_rust_bridge_array_new(self.raw, len, flags as u32) }, high: 0 }
     }
     fn array_set(&self, object: BridgeValue, index: usize, value: BridgeValue) {
         unsafe { willow_rust_bridge_array_set(object.low, index, value.low) }

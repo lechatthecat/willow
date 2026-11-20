@@ -544,6 +544,7 @@ pub(crate) fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollec
             }
         }
         Expr::Integer(_, _, _)
+        | Expr::Char(..)
         | Expr::Float(_, _, _)
         | Expr::Bool(_, _, _)
         | Expr::String(_, _, _)
@@ -609,7 +610,14 @@ pub(crate) fn normalize_std_collection_type(ty: &mut Type, imports: &StdCollecti
             }
             normalize_std_collection_type(ret, imports);
         }
-        Type::U8
+        Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::Char
+        | Type::U8
         | Type::I64
         | Type::F64
         | Type::Bool

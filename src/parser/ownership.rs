@@ -114,6 +114,7 @@ fn expr_children<'a>(node: &'a Expr, visit: &mut impl FnMut(NodeRef<'a>)) {
             visit(NodeRef::Expr(b));
         }
         Expr::Integer(..)
+        | Expr::Char(..)
         | Expr::Float(..)
         | Expr::Bool(..)
         | Expr::String(..)
@@ -303,6 +304,7 @@ fn expr_children_mut<'a>(node: &'a mut Expr, visit: &mut impl FnMut(NodeMut<'a>)
             visit(NodeMut::Expr(b));
         }
         Expr::Integer(..)
+        | Expr::Char(..)
         | Expr::Float(..)
         | Expr::Bool(..)
         | Expr::String(..)
@@ -641,6 +643,7 @@ impl Expr {
             Self::Lambda(v) => Self::Lambda(v.clone_shell()),
             Self::Match(v) => Self::Match(v.clone_shell()),
             Self::Integer(v, s, id) => Self::Integer(*v, *s, *id),
+            Self::Char(v, s, id) => Self::Char(*v, *s, *id),
             Self::Float(v, s, id) => Self::Float(*v, *s, *id),
             Self::Bool(v, s, id) => Self::Bool(*v, *s, *id),
             Self::String(v, s, id) => Self::String(v.clone(), *s, *id),
@@ -737,6 +740,7 @@ fn drain_child(child: NodeMut<'_>, work: &mut Vec<NodeOwned>) {
     match child {
         NodeMut::Expr(
             Expr::Integer(..)
+            | Expr::Char(..)
             | Expr::Float(..)
             | Expr::Bool(..)
             | Expr::String(..)
@@ -781,6 +785,7 @@ mod tests {
     fn expr_kind(expr: &Expr) -> &'static str {
         match expr {
             Expr::Integer(..) => "Integer",
+            Expr::Char(..) => "Char",
             Expr::Float(..) => "Float",
             Expr::Bool(..) => "Bool",
             Expr::String(..) => "String",
@@ -831,6 +836,7 @@ mod tests {
             Pattern::Binding { .. } => "Binding",
             Pattern::LiteralBool(..) => "LiteralBool",
             Pattern::LiteralInt(..) => "LiteralInt",
+            Pattern::LiteralChar(..) => "LiteralChar",
             Pattern::EnumVariant { .. } => "EnumVariant",
             Pattern::EnumVariantTuple { .. } => "EnumVariantTuple",
             Pattern::ClassDowncast { .. } => "ClassDowncast",

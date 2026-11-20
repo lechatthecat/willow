@@ -97,6 +97,13 @@ impl TypeChecker {
                 .any(|r| r.role == "type")
             {
                 let ty = match canonical.as_str() {
+                    "i8" => Type::I8,
+                    "i16" => Type::I16,
+                    "i32" => Type::I32,
+                    "u16" => Type::U16,
+                    "u32" => Type::U32,
+                    "u64" => Type::U64,
+                    "char" => Type::Char,
                     "u8" => Type::U8,
                     "i64" => Type::I64,
                     "f64" => Type::F64,

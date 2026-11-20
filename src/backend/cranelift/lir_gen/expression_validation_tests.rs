@@ -449,7 +449,18 @@ pub(super) fn format_operands(args: &[HirExpr]) -> Option<&[HirExpr]> {
         crate::interpolate::Segment::F64(_) => a.ty == Type::F64,
         _ => matches!(
             a.ty,
-            Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+            Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::Char
+                | Type::U8
+                | Type::I64
+                | Type::F64
+                | Type::Bool
+                | Type::String
         ),
     });
     renderable.then_some(operands)
@@ -635,7 +646,16 @@ fn supported_match<'n>(
     // The scrutinee shapes the walker can test. A `String` or class scrutinee
     // needs a content comparison the pattern emitter below does not have.
     let scrutinee_ok = match &scrutinee.ty {
-        Type::U8 | Type::I64 | Type::Bool => true,
+        Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::Char
+        | Type::U8
+        | Type::I64
+        | Type::Bool => true,
         // An interface box, matched by class downcast patterns
         //. Checked before the enum test because an interface
         // is also spelled `Type::Named`; the two sets cannot overlap. A GENERIC
@@ -1209,7 +1229,16 @@ fn supported_expr_node<'n>(
             if matches!(op, BinOp::Pow)
                 && !matches!(
                     (&lhs.ty, &rhs.ty),
-                    (Type::U8, Type::U8) | (Type::I64, Type::I64) | (Type::F64, Type::F64)
+                    (Type::I8, Type::I8)
+                        | (Type::I16, Type::I16)
+                        | (Type::I32, Type::I32)
+                        | (Type::U16, Type::U16)
+                        | (Type::U32, Type::U32)
+                        | (Type::U64, Type::U64)
+                        | (Type::Char, Type::Char)
+                        | (Type::U8, Type::U8)
+                        | (Type::I64, Type::I64)
+                        | (Type::F64, Type::F64)
                 )
             {
                 return false;
@@ -1669,7 +1698,18 @@ fn supported_expr_node<'n>(
             // shared table rather than re-derived from the method name here,
             // so the walker cannot disagree with the checker about what the
             // call means or what it produces.
-            Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String => {
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
+            | Type::I64
+            | Type::F64
+            | Type::Bool
+            | Type::String => {
                 matches!(
                     scalar_to_string(&object.ty, method, args),
                     Some(ret) if ret == e.ty

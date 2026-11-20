@@ -111,7 +111,9 @@ struct Node {
 fn concat_parts(value: &LirRvalue, string_result: bool) -> Option<Vec<Part>> {
     let leaf = |op: &LirOperand, ty: &Type| match ty {
         Type::String => Some(Part::String(op.clone())),
-        ty if ty.integer_layout().is_some() => Some(Part::Integer(op.clone(), ty.clone())),
+        ty if ty.integer_layout().is_some() && *ty != Type::U64 => {
+            Some(Part::Integer(op.clone(), ty.clone()))
+        }
         _ => None,
     };
     let parts = match value {

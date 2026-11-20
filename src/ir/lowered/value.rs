@@ -122,10 +122,18 @@ impl LirOperand {
                 .get(id.0 as usize)
                 .filter(|local| !local.is_gc_owner())
                 .map(|local| local.ty.clone()),
-            Self::Integer { value, ty } => ty
-                .integer_layout()
-                .filter(|layout| layout.contains(i128::from(*value)))
-                .map(|_| ty.clone()),
+            Self::Integer { value, ty } => {
+                let valid = if *ty == Type::Char {
+                    u32::try_from(*value)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .is_some()
+                } else {
+                    ty.integer_layout()
+                        .is_some_and(|layout| layout.contains(layout.value(*value)))
+                };
+                valid.then(|| ty.clone())
+            }
             Self::Int(_) => Some(Type::I64),
             Self::Float(_) => Some(Type::F64),
             Self::Bool(_) => Some(Type::Bool),
@@ -367,9 +375,10 @@ pub fn is_overflow_checked_binary(op: &BinOp, rhs: &LirOperand, operand_ty: &Typ
 pub fn is_overflow_checked_unary(op: &UnaryOp, operand: &LirOperand, ty: &Type) -> bool {
     *op == UnaryOp::Neg
         && ty.integer_layout().is_some()
-        && !operand
-            .integer_value()
-            .is_some_and(|n| ty.integer_layout().unwrap().contains(-i128::from(n)))
+        && !operand.integer_value().is_some_and(|n| {
+            let layout = ty.integer_layout().unwrap();
+            layout.contains(-layout.value(n))
+        })
 }
 
 impl LirRvalue {
@@ -440,7 +449,7 @@ impl LirRvalue {
             Self::StaticCall { args, arg_types, result, .. } => destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| ty(arg).as_ref() == Some(expected)),
             Self::EnumAlloc { enum_ty, .. } => destination.ty == *enum_ty,
             Self::EnumPayloadStore { object, value, source, enum_ty, .. } => ty(object).as_ref() == Some(enum_ty) && ty(value).as_ref() == Some(source) && destination.ty == *enum_ty,
-            Self::FormatScalar { value, ty: expected, format } => ty(value).as_ref() == Some(expected) && destination.ty == Type::String && if format.is_some() { *expected == Type::F64 } else { matches!(expected, Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String) },
+            Self::FormatScalar { value, ty: expected, format } => ty(value).as_ref() == Some(expected) && destination.ty == Type::String && if format.is_some() { *expected == Type::F64 } else { matches!(expected, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String) },
             Self::Panic { message } => ty(message) == Some(Type::String) && destination.ty == Type::Never,
             Self::Recover => destination.ty == Type::Generic(TypeId::local(Builtin::Option.source_name()), vec![Type::Named(TypeId::local("PanicInfo"))]),
             Self::RebindResultError { value, source, target } | Self::IntoError { value, source, target } => ty(value).as_ref() == Some(source) && destination.ty == *target,
@@ -457,7 +466,7 @@ impl LirRvalue {
             Self::Closure { captures, ty: result, .. } => destination.ty == *result
                 && matches!(result, Type::Fn(..) | Type::Closure(..)) && captures.iter().all(|capture| ty(capture).is_some()),
             Self::Print { value, ty: expected, .. } => destination.ty == Type::Void
-                && ty(value).as_ref() == Some(expected) && matches!(expected, Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String),
+                && ty(value).as_ref() == Some(expected) && matches!(expected, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String),
             Self::DirectCall { args, params, result, .. } => destination.ty == *result
                 && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| ty(arg).as_ref() == Some(param)),
             Self::IndirectCall { callee, args, params, result, .. } => destination.ty == *result
@@ -471,8 +480,8 @@ impl LirRvalue {
                 ty(operand).as_ref() == Some(expected)
                     && destination.ty == *expected
                     && match op {
-                        UnaryOp::Neg => matches!(expected, Type::U8 | Type::I64 | Type::F64),
-                        UnaryOp::Not => matches!(expected, Type::Bool | Type::U8 | Type::I64),
+                        UnaryOp::Neg => expected.integer_layout().is_some() || *expected == Type::F64,
+                        UnaryOp::Not => expected.integer_layout().is_some() || *expected == Type::Bool,
                     }
             }
             Self::Binary {
@@ -495,7 +504,8 @@ impl LirRvalue {
                     && destination.ty == result
                     && !matches!(op, BinOp::And | BinOp::Or)
                     && match operand_ty {
-                        Type::U8 | Type::I64 => true,
+                        ty if ty.integer_layout().is_some() => true,
+                        Type::Char => comparison,
                         Type::F64 => !op.is_integer_only(),
                         Type::Bool => matches!(op, BinOp::Eq | BinOp::Ne),
                         Type::String => *op == BinOp::Add || comparison,
@@ -507,7 +517,7 @@ impl LirRvalue {
                 destination.ty == Type::String
                     && parts.len() == part_types.len()
                     && parts.iter().zip(part_types).all(|(part, expected)| {
-                        matches!(expected, Type::String | Type::U8 | Type::I64)
+                        matches!(expected, Type::String | Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64)
                             && ty(part).as_ref() == Some(expected)
                     })
             }
@@ -578,6 +588,103 @@ pub(super) use lower::{lower_blocks, lower_calls};
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scalar_width_char_artifacts_reject_arithmetic() {
+        let value = LirOperand::integer(i64::from(u32::from('λ')), &Type::Char);
+        let locals = [value_local(0, Type::Char), value_local(1, Type::Bool)];
+        for op in [UnaryOp::Neg, UnaryOp::Not] {
+            assert!(
+                !LirRvalue::Unary {
+                    op,
+                    operand: value.clone(),
+                    ty: Type::Char
+                }
+                .is_well_typed(&locals, LirLocalId(0))
+            );
+        }
+        for op in [
+            BinOp::Add,
+            BinOp::Sub,
+            BinOp::Mul,
+            BinOp::Div,
+            BinOp::Rem,
+            BinOp::Pow,
+            BinOp::BitAnd,
+            BinOp::BitOr,
+            BinOp::BitXor,
+            BinOp::Shl,
+            BinOp::Shr,
+        ] {
+            assert!(
+                !LirRvalue::Binary {
+                    op,
+                    lhs: value.clone(),
+                    rhs: value.clone(),
+                    operand_ty: Type::Char
+                }
+                .is_well_typed(&locals, LirLocalId(0))
+            );
+        }
+        for op in [
+            BinOp::Eq,
+            BinOp::Ne,
+            BinOp::Lt,
+            BinOp::Le,
+            BinOp::Gt,
+            BinOp::Ge,
+        ] {
+            assert!(
+                LirRvalue::Binary {
+                    op,
+                    lhs: value.clone(),
+                    rhs: value.clone(),
+                    operand_ty: Type::Char
+                }
+                .is_well_typed(&locals, LirLocalId(1))
+            );
+        }
+        for raw in [-1, 0xd800, 0xdfff, 0x110000] {
+            assert_eq!(LirOperand::integer(raw, &Type::Char).ty(&[]), None);
+        }
+    }
+
+    #[test]
+    fn scalar_width_constant_negation_retains_unsigned_overflow() {
+        use super::{LirOperand, Type, UnaryOp, is_overflow_checked_unary};
+        for (ty, nonzero, min) in [
+            (Type::U8, 255, 0),
+            (Type::U16, 65535, 0),
+            (Type::U32, i64::from(u32::MAX), 0),
+            (Type::U64, -1, 0),
+            (Type::I8, 127, -128),
+            (Type::I16, 32767, -32768),
+            (Type::I32, i64::from(i32::MAX), i64::from(i32::MIN)),
+            (Type::I64, i64::MAX, i64::MIN),
+        ] {
+            assert!(!is_overflow_checked_unary(
+                &UnaryOp::Neg,
+                &LirOperand::integer(0, &ty),
+                &ty
+            ));
+            assert_eq!(
+                is_overflow_checked_unary(&UnaryOp::Neg, &LirOperand::integer(nonzero, &ty), &ty),
+                min == 0
+            );
+            if min != 0 {
+                assert!(is_overflow_checked_unary(
+                    &UnaryOp::Neg,
+                    &LirOperand::integer(min, &ty),
+                    &ty
+                ));
+            }
+        }
+        assert!(is_overflow_checked_unary(
+            &UnaryOp::Neg,
+            &LirOperand::integer(i64::MIN, &Type::U64),
+            &Type::U64
+        ));
+    }
+
     #[test]
     fn typed_integer_operands_reject_invalid_artifacts() {
         use super::{LirOperand, Type};

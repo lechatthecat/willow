@@ -241,7 +241,20 @@ fn called_value(value: &LirRvalue) -> Option<LirLocalId> {
 }
 
 fn scalar(ty: &Type) -> bool {
-    matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool)
+    matches!(
+        ty,
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
+            | Type::I64
+            | Type::F64
+            | Type::Bool
+    )
 }
 
 /// The array an rvalue accesses only through the inline, nonallocating

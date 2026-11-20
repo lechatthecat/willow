@@ -414,10 +414,10 @@ fn scalar(
             || (!is_async && node.ty == Type::Void && matches!(&inner.kind, HirExprKind::Call { callee, args } if (callee.is_free_named("sleep") || callee.is_free_named("yield")) && builtin_call(callee, args, &inner.ty))),
         HirExprKind::Array { .. } => matches!(node.ty, Type::Array(_)),
         HirExprKind::Index { .. } | HirExprKind::FieldAccess { .. } | HirExprKind::Range { .. } => true,
-        HirExprKind::Unary { .. } => matches!(node.ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool),
+        HirExprKind::Unary { .. } => matches!(node.ty, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool),
         HirExprKind::Var(name) => names.contains_key(name),
         HirExprKind::Lambda { captures, .. } => captures.iter().all(|capture| names.contains_key(&capture.source)),
-        HirExprKind::Print { value, .. } => matches!(value.ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never),
+        HirExprKind::Print { value, .. } => matches!(value.ty, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never),
         HirExprKind::MethodCall { object, method, args, super_class } => crate::semantic::intrinsics::resolve(&object.ty, method, args.len()).is_some_and(|resolved|
             !(is_async && resolved.intrinsic.is_suspension_point()) && resolved.return_type(|i| args.get(i).map(|arg| arg.ty.clone())) == node.ty) || enum_method(&object.ty, method) || instance_method(super_class.map(Type::Named).as_ref().unwrap_or(&object.ty), method, args, callables),
         HirExprKind::Invoke { callee, args, .. } => matches!(&callee.ty, Type::Fn(params, result) | Type::Closure(params, result) if **result == node.ty && params.len() == args.len() && !args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) && params.iter().zip(args).all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution))),
@@ -427,7 +427,7 @@ fn scalar(
                 && params.len() == args.len() && params.iter().zip(args).all(|(param, arg)| argument_coercible(param, arg, &callables.resolution)))
                 || builtin_call(callee, args, &node.ty) },
         HirExprKind::Binary { op, lhs, rhs } => !matches!(op, BinOp::And | BinOp::Or)
-            && (matches!(lhs.ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String)
+            && (matches!(lhs.ty, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String)
                 || (matches!(op, BinOp::Eq | BinOp::Ne) && identity_operand_type(lhs, rhs, &callables.resolution).is_some())
                 || (matches!(op, BinOp::Eq | BinOp::Ne) && matches!(&lhs.ty, Type::Named(name) | Type::Generic(name, _) if callables.resolution.enums.get(name).is_some_and(|info| info.variants.iter().all(|variant| variant.payloads.is_empty()))))),
         _ => false,

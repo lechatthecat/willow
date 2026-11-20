@@ -161,6 +161,7 @@ fn push_stmt<'a>(pending: &mut Vec<AstEvent<'a>>, stmt: &'a Stmt) {
 fn push_expr<'a>(pending: &mut Vec<AstEvent<'a>>, node: &'a Expr) {
     match node {
         Expr::Integer(..)
+        | Expr::Char(..)
         | Expr::Float(..)
         | Expr::Bool(..)
         | Expr::String(..)
@@ -301,6 +302,7 @@ fn push_pattern<'a>(pending: &mut Vec<AstEvent<'a>>, pattern: &'a Pattern) {
         Pattern::Wildcard(..)
         | Pattern::LiteralBool(..)
         | Pattern::LiteralInt(..)
+        | Pattern::LiteralChar(..)
         | Pattern::EnumVariant { .. } => {}
         Pattern::Binding { name, .. } => pending.push(AstEvent::Bind(name)),
         Pattern::EnumVariantTuple { fields, .. } => {

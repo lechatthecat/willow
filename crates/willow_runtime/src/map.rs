@@ -902,6 +902,11 @@ pub extern "C" fn willow_map_snapshot(map: *mut u8, mode: i64, value_pair: i64) 
             (MapKey::Word(a), MapKey::Word(b)) if layout.key_kind == 1 => {
                 f64::from_bits(*a as u64).total_cmp(&f64::from_bits(*b as u64))
             }
+            (MapKey::Word(a), MapKey::Word(b))
+                if layout.key_kind == willow_abi::collection_element::U64 =>
+            {
+                (*a as u64).cmp(&(*b as u64))
+            }
             (MapKey::Word(a), MapKey::Word(b)) => a.cmp(b),
             _ => unreachable!(),
         }
@@ -911,7 +916,13 @@ pub extern "C" fn willow_map_snapshot(map: *mut u8, mode: i64, value_pair: i64) 
         1 => layout.value_is_ref,
         _ => true,
     };
-    let array = GcRootHandle::new(willow_array_new(entries.len() as i64, i64::from(is_ref)));
+    let element_kind = match mode {
+        0 => layout.key_kind,
+        1 => layout.value_kind,
+        _ => willow_abi::collection_element::OBJECT,
+    };
+    let flags = willow_abi::collection_element::storage_flags(element_kind, is_ref);
+    let array = GcRootHandle::new(willow_array_new(entries.len() as i64, flags));
     for (index, (key, value, root)) in entries.into_iter().enumerate() {
         let key = if mode == 1 {
             0
@@ -1085,7 +1096,7 @@ fn alloc_none() -> *mut u8 {
 
 /// Debug display of a whole map: `{a: 1, b: 2}` — entries sorted by rendered key
 /// for deterministic output (HashMap iteration order is not stable). Kinds follow
-/// `willow_array_to_string` (0=i64, 1=f64, 2=bool, 3=String); string KEYS are
+/// shared `collection_element` metadata; string KEYS are
 /// printed bare (they are identifiers-like), string VALUES are quoted. `key_kind` is what
 /// tells a word key apart from the `f64` and
 /// `bool` that share its representation, so `Map<f64, V>` prints `1.5` and not

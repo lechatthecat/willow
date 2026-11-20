@@ -486,7 +486,18 @@ impl TypeChecker {
             "to_string" => {
                 if !matches!(
                     val_ty,
-                    Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+                    Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::Char
+                        | Type::U8
+                        | Type::I64
+                        | Type::F64
+                        | Type::Bool
+                        | Type::String
                 ) {
                     self.push(
                         Diagnostic::new(

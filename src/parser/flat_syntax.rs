@@ -21,7 +21,8 @@ mod float_bits {
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "Expr")]
 enum ExprWire {
-    Integer(i64, Span, ExprId),
+    Integer(i128, Span, ExprId),
+    Char(char, Span, ExprId),
     Float(#[serde(with = "float_bits")] f64, Span, ExprId),
     Bool(bool, Span, ExprId),
     String(String, Span, ExprId),

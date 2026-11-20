@@ -1,0 +1,33 @@
+// Integer conversions are explicit. Checked conversions return Option;
+// wrapping conversions retain the destination's low bits. char is a Unicode
+// scalar, with checked construction and UTF-8 String conversion.
+import std::collections::Array;
+
+const MAX_COUNTER: u64 = 18446744073709551615;
+const TREE: char = '🌲';
+
+fn identity<T>(value: T) -> T { return value; }
+class Field<T> { pub value: T; }
+async fn transfer(value: u64) -> u64 { await sleep(1); return value; }
+
+async fn main() {
+    let signed: i8 = -128;
+    let small: i16 = -32768;
+    let number: i32 = -2147483648;
+    let port: u16 = 65535;
+    let mask: u32 = 4294967295;
+    println(signed); println(small); println(number);
+    println(port); println(mask); println(MAX_COUNTER);
+    println(signed.to_i32());
+    println(MAX_COUNTER.checked_to_i64().is_none());
+    println(MAX_COUNTER.wrapping_to_i32());
+    println("65535".parse_u16().unwrap());
+    let field = new Field<u64>(identity<u64>(MAX_COUNTER));
+    let values: Array<u64> = [0, field.value];
+    let captured = || values[1];
+    println(await transfer(captured()));
+    println(TREE); println(TREE.to_u32());
+    println("🌲".parse_char().unwrap() == TREE);
+    println(55296.checked_to_char().is_none());
+    println(match TREE { '🌲' => "tree", _ => "other" });
+}

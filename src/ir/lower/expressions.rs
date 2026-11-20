@@ -110,7 +110,12 @@ pub(super) fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Dia
 )]
 fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     match expr {
-        Expr::Integer(n, span, _) => Ok(lit(HirExprKind::Int(*n), Type::I64, *span)),
+        Expr::Integer(n, span, _) => Ok(lit(HirExprKind::Int(*n as i64), Type::I64, *span)),
+        Expr::Char(c, span, _) => Ok(lit(
+            HirExprKind::Int(i64::from(u32::from(*c))),
+            Type::Char,
+            *span,
+        )),
         Expr::Float(f, span, _) => Ok(lit(HirExprKind::Float(*f), Type::F64, *span)),
         Expr::Bool(b, span, _) => Ok(lit(HirExprKind::Bool(*b), Type::Bool, *span)),
         Expr::String(s, span, _) => Ok(lit(HirExprKind::Str(s.clone()), Type::String, *span)),
@@ -155,7 +160,8 @@ fn required_expr_type(id: ExprId, span: Span, ctx: &LowerCtx) -> Result<Option<T
 fn const_literal(value: &crate::parser::ast::ConstValue, span: Span) -> HirExpr {
     use crate::parser::ast::ConstValue;
     let kind = match value {
-        ConstValue::Integer(n) => HirExprKind::Int(*n),
+        ConstValue::Integer(n) => HirExprKind::Int(*n as i64),
+        ConstValue::Char(c) => HirExprKind::Int(i64::from(u32::from(*c))),
         ConstValue::Float(f) => HirExprKind::Float(*f),
         ConstValue::Bool(b) => HirExprKind::Bool(*b),
         ConstValue::String(s) => HirExprKind::Str(s.clone()),
@@ -278,6 +284,13 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
                 continue;
             }
             Step::Enter(Expr::Unary(unary)) => {
+                if unary.op == UnaryOp::Neg
+                    && let Expr::Integer(n, _, _) = &unary.expr
+                {
+                    let ty = required_expr_type(unary.id, unary.span, ctx)?.unwrap_or(Type::I64);
+                    values.push(lit(HirExprKind::Int((-*n) as i64), ty, unary.span));
+                    continue;
+                }
                 work.push(Step::Unary(unary));
                 work.push(Step::Enter(&unary.expr));
                 continue;
@@ -1861,7 +1874,8 @@ fn lower_flat_pattern<'p>(
     Ok(match pattern {
         Pattern::Wildcard(_, _) => HirPattern::Wildcard,
         Pattern::LiteralBool(b, _, _) => HirPattern::LiteralBool(*b),
-        Pattern::LiteralInt(n, _, _) => HirPattern::LiteralInt(*n),
+        Pattern::LiteralChar(c, _, _) => HirPattern::LiteralInt(i64::from(u32::from(*c))),
+        Pattern::LiteralInt(n, _, _) => HirPattern::LiteralInt(*n as i64),
         Pattern::Binding { name, .. } => {
             if infer_variant && infers_fieldless_variant(ctx, ty, name) {
                 let (Type::Named(enum_name) | Type::Generic(enum_name, _)) = ty else {

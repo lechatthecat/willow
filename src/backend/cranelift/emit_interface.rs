@@ -657,16 +657,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 }
 
-/// Element-kind tag for the collection debug-display runtime calls. Must match the runtime's
-/// `ELEM_KIND_*` constants.
+/// Shared collection metadata carries scalar width, ordering and display kind.
 pub(super) fn collection_elem_kind(ty: &Type) -> Option<i64> {
-    match ty {
-        Type::U8 | Type::I64 => Some(0),
-        Type::F64 => Some(1),
-        Type::Bool => Some(2),
-        Type::String => Some(3),
-        _ => None,
-    }
+    use willow_abi::collection_element as kind;
+    Some(match ty {
+        Type::I8 => kind::I8,
+        Type::I16 => kind::I16,
+        Type::I32 => kind::I32,
+        Type::I64 => kind::I64,
+        Type::U8 => kind::U8,
+        Type::U16 => kind::U16,
+        Type::U32 => kind::U32,
+        Type::U64 => kind::U64,
+        Type::Char => kind::CHAR,
+        Type::F64 => kind::F64,
+        Type::Bool => kind::BOOL,
+        Type::String => kind::STRING,
+        _ => return None,
+    })
 }
 
 /// Whether a receiver whose static class has `ancestor_id` can hold an object

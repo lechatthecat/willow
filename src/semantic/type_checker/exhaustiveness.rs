@@ -52,7 +52,8 @@ enum Shape {
 enum Ctor<'p> {
     Variant(usize),
     Bool(bool),
-    Int(i64),
+    Int(i128),
+    Char(char),
     /// A class downcast, or anything else no finite type lists.
     Other(&'p str),
 }
@@ -176,6 +177,7 @@ impl<'c> Usefulness<'c> {
         match pattern {
             Pattern::Wildcard(..) | Pattern::Binding { .. } => None,
             Pattern::LiteralBool(value, ..) => Some((Ctor::Bool(*value), &[])),
+            Pattern::LiteralChar(value, ..) => Some((Ctor::Char(*value), &[])),
             Pattern::LiteralInt(value, ..) => Some((Ctor::Int(*value), &[])),
             Pattern::EnumVariant { variant: name, .. } => Some((variant(name), &[])),
             Pattern::EnumVariantTuple {
@@ -200,6 +202,7 @@ impl<'c> Usefulness<'c> {
         let id = PatternId::fresh();
         match (self.shape(ty), ctor) {
             (_, Ctor::Bool(value)) => Pattern::LiteralBool(value, span, id),
+            (_, Ctor::Char(value)) => Pattern::LiteralChar(value, span, id),
             (_, Ctor::Int(value)) => Pattern::LiteralInt(value, span, id),
             (Shape::Enum { name, variants, .. }, Ctor::Variant(i)) if fields.is_empty() => {
                 Pattern::EnumVariant {
@@ -547,7 +550,15 @@ impl TypeChecker {
                 )
                 .with_help("add `true` and `false` patterns, or use a wildcard `_`"),
             ),
-            Type::U8 | Type::I64 => self.push_error(
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
+            | Type::I64 => self.push_error(
                 ErrorCode::E1206,
                 format!(
                     "non-exhaustive match on `{}`: add a wildcard arm `_ => ...`",

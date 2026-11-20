@@ -9,8 +9,9 @@
 //!   buffer payload:  [ traced_prefix(atomic i64), elem0, elem1, ... elem_{cap-1} ]
 //! ```
 //!
-//! Each element occupies one 64-bit word. Scalars are stored directly (`bool`
-//! zero-extended, `f64` bit-cast); reference elements store the GC pointer.
+//! Integer and character elements use their native 1/2/4/8-byte widths.
+//! Other scalars and reference elements keep the 64-bit word representation.
+//! The handle flags retain the scalar width independently of the GC trace bit.
 //! The handle traces `buffer` through `gc_ref_mask`; a reference buffer uses a
 //! dedicated `type_id` + trace function that scans its published prefix.
 //! Ordinary arrays trace their logical length and clear removed slots. Pair
@@ -35,7 +36,7 @@ use willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID;
 
 use willow_abi::array_layout::{
     BUFFER_HEADER_WORDS, H_BUF, H_CAP, H_IS_REF, H_LEN, HANDLE_MASK, HANDLE_WORDS,
-    PAIR_STORAGE_EXPOSED, WORD_BYTES,
+    PAIR_STORAGE_EXPOSED, WORD_BYTES, buffer_bytes, element_width, is_reference,
 };
 const WORD: i64 = WORD_BYTES as i64;
 
@@ -127,19 +128,15 @@ pub(crate) fn ensure_trace_registered() {
 }
 
 /// Allocate an empty, zero-initialized buffer of `cap` slots (`[len=0, e0..]`).
-fn alloc_buffer(cap: i64, is_ref: bool) -> *mut u8 {
-    // length word + one word per element, with overflow checked end-to-end.
-    let payload = match cap
-        .checked_add(BUFFER_HEADER_WORDS as i64)
-        .and_then(|words| words.checked_mul(WORD))
-    {
+fn alloc_buffer(cap: i64, flags: i64) -> *mut u8 {
+    let payload = match buffer_bytes(cap, flags) {
         Some(p) => p,
         None => {
             raise_with(&format!("array capacity too large: {cap}"));
             return std::ptr::null_mut();
         }
     };
-    let buf = if is_ref {
+    let buf = if is_reference(flags) {
         ensure_trace_registered();
         willow_alloc_with_layout(GcObjectKind::ArrayBuffer, ARRAY_REF_TYPE_ID, payload, 0)
     } else {
@@ -161,7 +158,29 @@ unsafe fn buf_slot(buffer: *mut u8, index: i64) -> *mut i64 {
     unsafe { (buffer as *mut i64).add(BUFFER_HEADER_WORDS + index as usize) }
 }
 
-unsafe fn store_buffer_slot(buffer: *mut u8, index: i64, value: i64, is_ref: bool) {
+/// Address within scalar or word storage; the caller proves the index valid.
+unsafe fn element_slot(buffer: *mut u8, index: i64, flags: i64) -> *mut u8 {
+    unsafe {
+        buffer
+            .add(BUFFER_HEADER_WORDS * WORD_BYTES as usize + index as usize * element_width(flags))
+    }
+}
+
+/// Preserve scalar bits; the compiler sign-extends signed narrow values.
+unsafe fn load_buffer_slot(buffer: *mut u8, index: i64, flags: i64) -> i64 {
+    let slot = unsafe { element_slot(buffer, index, flags) };
+    unsafe {
+        match element_width(flags) {
+            1 => i64::from(slot.read()),
+            2 => i64::from(slot.cast::<u16>().read()),
+            4 => i64::from(slot.cast::<u32>().read()),
+            _ => slot.cast::<i64>().read(),
+        }
+    }
+}
+
+unsafe fn store_buffer_slot(buffer: *mut u8, index: i64, value: i64, flags: i64) {
+    let is_ref = is_reference(flags);
     if is_ref {
         let slot = unsafe { buf_slot(buffer, index) }.cast::<u8>();
         write_barrier_array_slot(
@@ -174,7 +193,15 @@ unsafe fn store_buffer_slot(buffer: *mut u8, index: i64, value: i64, is_ref: boo
     if is_ref {
         unsafe { crate::gc::store_gc_reference(buf_slot(buffer, index).cast(), value as *mut u8) };
     } else {
-        unsafe { *buf_slot(buffer, index) = value };
+        let slot = unsafe { element_slot(buffer, index, flags) };
+        unsafe {
+            match element_width(flags) {
+                1 => slot.write(value as u8),
+                2 => slot.cast::<u16>().write(value as u16),
+                4 => slot.cast::<u32>().write(value as u32),
+                _ => slot.cast::<i64>().write(value),
+            }
+        }
     }
 }
 
@@ -201,8 +228,9 @@ pub(crate) unsafe fn scalar_slot_unchecked(arr: *mut u8, index: i64) -> *mut i64
     unsafe { buf_slot(handle_buffer(arr), index) }
 }
 
-/// Allocate an array of `len` elements (all zero). `elem_is_ref` marks
-/// GC-managed element types. Raises a language panic on a negative length.
+/// Allocate an array of `len` elements (all zero). `elem_is_ref` contains the
+/// shared storage flags; legacy 0/1 still select scalar/reference word storage.
+/// Raises a language panic on a negative length.
 ///
 /// A handle and a buffer that fit a TLAB are bump-allocated young together, with no lock,
 /// root registration or old-region work. Only a TLAB miss
@@ -223,7 +251,7 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_new_literal(len: i64, elem_is_ref: i64) -> *mut u8 {
-    if !(0..=i64::MAX / WORD - BUFFER_HEADER_WORDS as i64).contains(&len) {
+    if buffer_bytes(len, elem_is_ref).is_none() {
         crate::failure::fatal_invariant("invalid constant array literal length");
     }
     let array = allocate_array(len, elem_is_ref);
@@ -236,7 +264,7 @@ pub extern "C" fn willow_array_new_literal(len: i64, elem_is_ref: i64) -> *mut u
 // Shared allocation/GC/rooting path. Both callers validate non-negative length;
 // the literal entry also proves the old buffer payload cannot overflow.
 fn allocate_array(len: i64, elem_is_ref: i64) -> *mut u8 {
-    let Some(buffer_layout) = young_buffer_layout(len, elem_is_ref != 0) else {
+    let Some(buffer_layout) = young_buffer_layout(len, elem_is_ref) else {
         return new_old_array(len, elem_is_ref);
     };
     let handle_layout = crate::gc::array_handle_layout();
@@ -266,11 +294,9 @@ fn allocate_array(len: i64, elem_is_ref: i64) -> *mut u8 {
 
 /// TLAB layout of a buffer with `cap` slots, or `None` when it is too large
 /// for a TLAB object. Registers the reference-buffer trace hook first.
-fn young_buffer_layout(cap: i64, is_ref: bool) -> Option<crate::gc::YoungLayout> {
-    let payload = usize::try_from(cap)
-        .ok()?
-        .checked_add(BUFFER_HEADER_WORDS)?
-        .checked_mul(WORD_BYTES as usize)?;
+fn young_buffer_layout(cap: i64, flags: i64) -> Option<crate::gc::YoungLayout> {
+    let payload = usize::try_from(buffer_bytes(cap, flags)?).ok()?;
+    let is_ref = is_reference(flags);
     if is_ref {
         ensure_trace_registered();
     }
@@ -290,7 +316,6 @@ pub(crate) fn new_old_array(len: i64, elem_is_ref: i64) -> *mut u8 {
     if len < 0 {
         return raise_negative_length(len);
     }
-    let is_ref = elem_is_ref != 0;
     // Allocate the handle first (zero-filled, buffer slot null), root it, then
     // allocate the buffer — so a collection during the buffer allocation cannot
     // free the handle, and the still-null buffer slot traces safely.
@@ -304,7 +329,7 @@ pub(crate) fn new_old_array(len: i64, elem_is_ref: i64) -> *mut u8 {
         return std::ptr::null_mut();
     }
     let handle_root = crate::gc::GcRootHandle::new(handle);
-    let buffer = alloc_buffer(len, is_ref);
+    let buffer = alloc_buffer(len, elem_is_ref);
     if buffer.is_null() {
         return std::ptr::null_mut();
     }
@@ -322,7 +347,7 @@ unsafe fn init_array(handle: *mut u8, buffer: *mut u8, len: i64, elem_is_ref: i6
         set_buffer_len(buffer, len);
         set_handle_word(handle, H_LEN, len);
         set_handle_word(handle, H_CAP, len);
-        set_handle_word(handle, H_IS_REF, i64::from(elem_is_ref != 0));
+        set_handle_word(handle, H_IS_REF, elem_is_ref & !PAIR_STORAGE_EXPOSED);
         write_barrier_object_owner(
             handle,
             std::ptr::null_mut(),
@@ -468,8 +493,8 @@ pub extern "C" fn willow_array_len(arr: *mut u8) -> i64 {
     len
 }
 
-/// Read the raw 64-bit word at `index`. Callers interpret the bits according to
-/// the element type (`i64` directly, `bool`/`f64` via the generated cast).
+/// Read scalar bits at `index`, zero-extending narrow storage. Callers interpret
+/// the bits according to the element type, including signed narrow integers.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_get(arr: *mut u8, index: i64) -> i64 {
@@ -477,10 +502,10 @@ pub extern "C" fn willow_array_get(arr: *mut u8, index: i64) -> i64 {
         return 0;
     }
     unsafe { expose_pair_storage(arr) };
-    unsafe { *buf_slot(handle_buffer(arr), index) }
+    unsafe { load_buffer_slot(handle_buffer(arr), index, handle_word(arr, H_IS_REF)) }
 }
 
-/// Write the raw 64-bit `value` word at `index`.
+/// Write the low element-width bits of `value` at `index`.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_set(arr: *mut u8, index: i64, value: i64) {
@@ -488,12 +513,12 @@ pub extern "C" fn willow_array_set(arr: *mut u8, index: i64, value: i64) {
         return;
     }
     unsafe { expose_pair_storage(arr) };
-    let is_ref = unsafe { handle_word(arr, H_IS_REF) } != 0;
+    let flags = unsafe { handle_word(arr, H_IS_REF) };
     let buffer = unsafe { handle_buffer(arr) };
-    unsafe { store_buffer_slot(buffer, index, value, is_ref) };
+    unsafe { store_buffer_slot(buffer, index, value, flags) };
 }
 
-/// Return the address of the raw 64-bit element slot at `index`.
+/// Return the address of the element-width slot at `index`.
 ///
 /// Used by compiler-generated `&xs[i]` / `&mut xs[i]` reference calls. NOTE: the
 /// returned address points into the current buffer; a `push` that grows the
@@ -505,7 +530,7 @@ pub extern "C" fn willow_array_element_addr(arr: *mut u8, index: i64) -> *mut u8
         return std::ptr::null_mut();
     }
     unsafe { expose_pair_storage(arr) };
-    unsafe { buf_slot(handle_buffer(arr), index) as *mut u8 }
+    unsafe { element_slot(handle_buffer(arr), index, handle_word(arr, H_IS_REF)) }
 }
 
 /// Capture the allocation that currently owns an indexed reference. Unlike
@@ -526,7 +551,7 @@ pub extern "C" fn willow_array_reference_owner(arr: *mut u8, index: i64) -> *mut
 /// transferring pair boxes on the next growth. It does not affect scalar arrays.
 unsafe fn expose_pair_storage(arr: *mut u8) {
     let flags = unsafe { handle_word(arr, H_IS_REF) };
-    if flags != 0 {
+    if is_reference(flags) {
         unsafe { set_handle_word(arr, H_IS_REF, flags | PAIR_STORAGE_EXPOSED) };
     }
 }
@@ -611,7 +636,7 @@ fn grow_rooted(
     mut value: i64,
     len: i64,
     new_cap: i64,
-    is_ref: bool,
+    flags: i64,
     copy_pairs: bool,
 ) -> Option<(*mut u8, i64, *mut u8)> {
     // Root the handle and the (possibly reference) value across the buffer
@@ -621,8 +646,8 @@ fn grow_rooted(
     // make the collector treat it as an object pointer and crash. Use the
     // updated root slots after allocation in case the collector moves them.
     let arr_root = crate::gc::GcRootHandle::new(arr);
-    let value_root = is_ref.then(|| crate::gc::GcRootHandle::new(value as *mut u8));
-    let mut new_buf = alloc_buffer(new_cap, is_ref);
+    let value_root = is_reference(flags).then(|| crate::gc::GcRootHandle::new(value as *mut u8));
+    let mut new_buf = alloc_buffer(new_cap, flags);
     if new_buf.is_null() {
         return None;
     }
@@ -645,7 +670,7 @@ fn grow_rooted(
             arr = arr_root.load();
             new_buf = buffer_root.load();
             unsafe {
-                store_buffer_slot(new_buf, index, pair as i64, true);
+                store_buffer_slot(new_buf, index, pair as i64, 1);
                 // Keep each initialized pair visible to GC during the next
                 // allocation, while leaving the old buffer unchanged.
                 set_buffer_len(new_buf, index + 1);
@@ -665,7 +690,8 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
     }
     let len = unsafe { handle_word(arr, H_LEN) };
     let cap = unsafe { handle_word(arr, H_CAP) };
-    let is_ref = unsafe { handle_word(arr, H_IS_REF) } != 0;
+    let flags = unsafe { handle_word(arr, H_IS_REF) };
+    let is_ref = is_reference(flags);
 
     if len == cap {
         let clone_pairs =
@@ -675,14 +701,14 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
         // point, so `arr` and `value` stay valid and need no roots. Pair
         // arrays allocate per element and keep the rooted path.
         let young = (!clone_pairs)
-            .then(|| young_buffer_layout(new_cap, is_ref))
+            .then(|| young_buffer_layout(new_cap, flags))
             .flatten()
             .and_then(|layout| crate::gc::try_alloc_young([layout]));
         let new_buf = match young {
             Some([buffer]) => buffer,
             None => {
                 let Some((moved_arr, moved_value, buffer)) =
-                    grow_rooted(arr, value, len, new_cap, is_ref, clone_pairs)
+                    grow_rooted(arr, value, len, new_cap, flags, clone_pairs)
                 else {
                     return;
                 };
@@ -723,9 +749,9 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
                 // Separate live allocations; copy only initialized scalar slots.
                 // Empty arrays may have a null old buffer.
                 std::ptr::copy_nonoverlapping(
-                    buf_slot(old_buf, 0),
-                    buf_slot(new_buf, 0),
-                    len as usize,
+                    buf_slot(old_buf, 0).cast::<u8>(),
+                    buf_slot(new_buf, 0).cast::<u8>(),
+                    len as usize * element_width(flags),
                 );
             }
             set_buffer_len(new_buf, len);
@@ -739,7 +765,7 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
             set_handle_word(arr, H_CAP, new_cap);
             // The old captured buffer keeps its own cloned storage. No view
             // has observed the new buffer yet.
-            set_handle_word(arr, H_IS_REF, i64::from(is_ref));
+            set_handle_word(arr, H_IS_REF, flags & !PAIR_STORAGE_EXPOSED);
         }
     }
     unsafe {
@@ -765,7 +791,7 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
             );
             store_pair(target, source.read(), source.add(1).read(), mask);
         } else {
-            store_buffer_slot(buffer, len, value, is_ref);
+            store_buffer_slot(buffer, len, value, flags);
         }
         // The traced prefix is a high-water mark (see `willow_array_pop`).
         set_buffer_len(buffer, buffer_len(buffer).max(len + 1));
@@ -798,10 +824,9 @@ pub extern "C" fn willow_array_pop(arr: *mut u8) -> i64 {
     let last = len - 1;
     unsafe {
         let buffer = handle_buffer(arr);
-        let slot = buf_slot(buffer, last);
-        let value = *slot;
-        let is_ref = handle_word(arr, H_IS_REF) != 0;
-        store_buffer_slot(buffer, last, 0, is_ref); // allow the GC to reclaim it
+        let flags = handle_word(arr, H_IS_REF);
+        let value = load_buffer_slot(buffer, last, flags);
+        store_buffer_slot(buffer, last, 0, flags); // allow the GC to reclaim it
         set_handle_word(arr, H_LEN, last);
         value
     }
@@ -859,28 +884,33 @@ fn raise_with(message: &str) {
     crate::panic_context::raise_language_message(message);
 }
 
-/// Element-kind tags for `willow_array_to_string`. Must match
-/// the compiler's `collection_elem_kind`.
-const ELEM_KIND_I64: i64 = 0;
-const ELEM_KIND_F64: i64 = 1;
-const ELEM_KIND_BOOL: i64 = 2;
-const ELEM_KIND_STRING: i64 = 3;
-
 pub(crate) fn element_word_to_string(word: i64, kind: i64) -> String {
+    use willow_abi::collection_element as element;
     match kind {
-        ELEM_KIND_F64 => crate::math::format_f64_shortest(f64::from_bits(word as u64)),
-        ELEM_KIND_BOOL => if word != 0 { "true" } else { "false" }.to_string(),
-        ELEM_KIND_STRING => {
+        element::I8 => (word as i8).to_string(),
+        element::I16 => (word as i16).to_string(),
+        element::I32 => (word as i32).to_string(),
+        element::U8 => (word as u8).to_string(),
+        element::U16 => (word as u16).to_string(),
+        element::U32 => (word as u32).to_string(),
+        element::U64 => (word as u64).to_string(),
+        element::CHAR => u32::try_from(word)
+            .ok()
+            .and_then(char::from_u32)
+            .unwrap_or_else(|| crate::failure::fatal_invariant("invalid collection character"))
+            .to_string(),
+        element::F64 => crate::math::format_f64_shortest(f64::from_bits(word as u64)),
+        element::BOOL => if word != 0 { "true" } else { "false" }.to_string(),
+        element::STRING => {
             let s = unsafe { crate::string::willow_string_as_str(word as *const u8) };
             format!("{s:?}")
         }
         _ => word.to_string(),
     }
-    .clone()
 }
 
 /// Debug display of a whole array: `[1, 2, 3]` (strings quoted, f64 shortest
-/// round-trip). `elem_kind`: 0=i64, 1=f64, 2=bool, 3=String.
+/// round-trip). `elem_kind` uses the shared `collection_element` tags.
 /// Returns a newly allocated WillowString.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
@@ -909,6 +939,163 @@ mod tests {
         isolated_runtime, willow_gc_collect, willow_gc_init, willow_pop_roots, willow_push_root,
     };
     use crate::string::{willow_string_as_str, willow_string_from_str};
+
+    #[test]
+    fn array_width_collection_display_and_snapshot_layout() {
+        use willow_abi::collection_element as element;
+        let _guard = isolated_runtime();
+        willow_gc_init();
+        for (kind, value, width, expected) in [
+            (element::I8, 128, 1, "-128"),
+            (element::I16, 32768, 2, "-32768"),
+            (element::I32, 2147483648, 4, "-2147483648"),
+            (element::I64, i64::MIN, 8, "-9223372036854775808"),
+            (element::U8, -1, 1, "255"),
+            (element::U16, -1, 2, "65535"),
+            (element::U32, -1, 4, "4294967295"),
+            (element::U64, -1, 8, "18446744073709551615"),
+            (element::CHAR, '界' as i64, 4, "界"),
+            (element::CHAR, '🦀' as i64, 4, "🦀"),
+            (element::F64, 1.5_f64.to_bits() as i64, 8, "1.5"),
+            (element::BOOL, 1, 8, "true"),
+        ] {
+            let flags = element::storage_flags(kind, false);
+            assert_eq!(element_width(flags), width);
+            assert!(!is_reference(flags));
+            assert_eq!(element_word_to_string(value, kind), expected);
+            let array = willow_array_new(1, flags);
+            willow_array_set(array, 0, value);
+            let text = willow_array_to_string(array, kind);
+            assert_eq!(
+                unsafe { willow_string_as_str(text) },
+                format!("[{expected}]")
+            );
+        }
+        for kind in [element::STRING, element::OBJECT] {
+            let flags = element::storage_flags(kind, true);
+            assert_eq!(flags, 1);
+            assert_eq!(element_width(flags), 8);
+            assert!(is_reference(flags));
+        }
+        let text = willow_string_from_str("quoted");
+        assert_eq!(
+            element_word_to_string(text as i64, element::STRING),
+            "\"quoted\""
+        );
+    }
+
+    #[test]
+    fn array_width_storage_operations_and_captured_owner() {
+        let _guard = isolated_runtime();
+        willow_gc_init();
+        for width in [1, 2, 4, 8] {
+            let flags = willow_abi::array_layout::storage_flags(width, false);
+            let mask = if width == 8 {
+                -1
+            } else {
+                (1_i64 << (width * 8)) - 1
+            };
+            let mut array = willow_array_new(3, flags);
+            willow_push_root(&mut array);
+            for (index, value) in [-1, i64::MIN, 42].into_iter().enumerate() {
+                willow_array_set(array, index as i64, value);
+                assert_eq!(willow_array_get(array, index as i64), value & mask);
+            }
+            let first = willow_array_element_addr(array, 0);
+            let second = willow_array_element_addr(array, 1);
+            assert_eq!(unsafe { second.byte_offset_from(first) }, width as isize);
+            let mut owner = willow_array_reference_owner(array, 2);
+            willow_push_root(&mut owner);
+            willow_array_push(array, -1);
+            assert_ne!(unsafe { handle_buffer(array) }, owner);
+            assert_eq!(unsafe { load_buffer_slot(owner, 2, flags) }, 42);
+            assert_eq!(willow_array_pop(array), mask);
+            assert_eq!(willow_array_len(array), 3);
+            willow_array_resize(array, 33, -1);
+            assert_eq!(willow_array_get(array, 2), 42);
+            for index in 3..33 {
+                assert_eq!(willow_array_get(array, index), 0);
+            }
+            willow_array_set(array, 32, -1);
+            let mut copy = willow_array_copy(array);
+            willow_push_root(&mut copy);
+            willow_array_set(array, 32, 7);
+            willow_gc_collect();
+            assert_eq!(willow_array_get(copy, 32), mask);
+            assert_eq!(willow_array_get(array, 32), 7);
+            assert_eq!(unsafe { handle_word(copy, H_IS_REF) }, flags);
+            assert_eq!(unsafe { load_buffer_slot(owner, 2, flags) }, 42);
+            willow_array_resize(array, 0, -1);
+            willow_array_resize(array, 33, -1);
+            for index in 0..33 {
+                assert_eq!(willow_array_get(array, index), 0);
+            }
+            willow_pop_roots(3);
+        }
+    }
+
+    #[test]
+    fn array_width_allocation_bytes_and_alignment() {
+        let _guard = isolated_runtime();
+        willow_gc_init();
+        for width in [1, 2, 4, 8] {
+            let flags = willow_abi::array_layout::storage_flags(width, false);
+            for length in [0, 1, 3, 1000, 100_000] {
+                let logical = 8 + length * i64::from(width);
+                assert_eq!(buffer_bytes(length, flags), Some(logical));
+                let array = willow_array_new_literal(length, flags);
+                unsafe {
+                    let buffer = handle_buffer(array);
+                    let header = buffer
+                        .sub(crate::gc::GC_HEADER_SIZE)
+                        .cast::<crate::gc::GcHeader>();
+                    let descriptor =
+                        &*((*header).descriptor as *const willow_abi::GcLayoutDescriptor);
+                    let expected = (crate::gc::GC_HEADER_SIZE + logical as usize)
+                        .next_multiple_of(std::mem::align_of::<crate::gc::GcHeader>());
+                    assert_eq!(descriptor.size, expected as u64);
+                    assert_eq!(descriptor.type_id, 0);
+                    assert_eq!(descriptor.gc_ref_mask, 0);
+                    assert_eq!(buffer as usize % 8, 0);
+                    eprintln!(
+                        "array-width bytes width={width} n={length} logical={logical} allocated={expected}"
+                    );
+                }
+            }
+            assert_eq!(buffer_bytes(-1, flags), None);
+            assert_eq!(buffer_bytes(i64::MAX, flags), None);
+        }
+    }
+
+    #[test]
+    fn array_width_scalar_bytes_survive_collections_and_growth() {
+        let _guard = isolated_runtime();
+        willow_gc_init();
+        for width in [1, 2, 4] {
+            let flags = willow_abi::array_layout::storage_flags(width, false);
+            let pointer = willow_string_from_str("untraced scalar bits") as usize;
+            let mut array = willow_array_new(0, flags);
+            willow_push_root(&mut array);
+            let depth = crate::gc::willow_root_depth();
+            let mask = (1_u64 << (width * 8)) - 1;
+            let values: Vec<_> = (0..32)
+                .map(|index| ((pointer as u64).rotate_right(index * 8) & mask) as i64)
+                .collect();
+            crate::gc::set_gc_stress_for_test(Some("alloc"));
+            for &value in &values {
+                willow_array_push(array, value);
+            }
+            crate::gc::set_gc_stress_for_test(None);
+            crate::gc::willow_gc_minor_collect();
+            willow_gc_collect();
+            assert_eq!(crate::gc::willow_root_depth(), depth);
+            assert_eq!(unsafe { handle_word(array, H_IS_REF) }, flags);
+            for (index, &value) in values.iter().enumerate() {
+                assert_eq!(willow_array_get(array, index as i64), value);
+            }
+            willow_pop_roots(1);
+        }
+    }
 
     #[test]
     fn array_literal_invalid_lengths_and_exhaustion_never_return() {

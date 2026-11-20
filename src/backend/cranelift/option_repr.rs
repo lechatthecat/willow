@@ -59,6 +59,23 @@ mod tests {
         Type::Generic("Option".to_string().into(), vec![inner])
     }
 
+    fn scalar_types() -> [Type; 12] {
+        [
+            Type::I8,
+            Type::I16,
+            Type::I32,
+            Type::I64,
+            Type::U8,
+            Type::U16,
+            Type::U32,
+            Type::U64,
+            Type::Char,
+            Type::F64,
+            Type::Bool,
+            Type::Void,
+        ]
+    }
+
     #[test]
     fn gc_references_use_the_nullable_pointer_niche() {
         let enums = TypeMap::new();
@@ -79,7 +96,7 @@ mod tests {
     #[test]
     fn scalar_options_use_tagged_pairs() {
         let enums = TypeMap::new();
-        for scalar in [Type::U8, Type::I64, Type::F64, Type::Bool, Type::Void] {
+        for scalar in scalar_types() {
             assert_eq!(
                 option_repr(&option(scalar), &enums),
                 Some(OptionRepr::TaggedPair)
@@ -90,10 +107,12 @@ mod tests {
     #[test]
     fn nested_options_stay_boxed() {
         let enums = TypeMap::new();
-        assert_eq!(
-            option_repr(&option(option(Type::I64)), &enums),
-            Some(OptionRepr::BoxedTaggedEnum)
-        );
+        for scalar in scalar_types() {
+            assert_eq!(
+                option_repr(&option(option(scalar)), &enums),
+                Some(OptionRepr::BoxedTaggedEnum)
+            );
+        }
         assert_eq!(
             option_repr(&option(option(Type::String)), &enums),
             Some(OptionRepr::BoxedTaggedEnum)
@@ -102,13 +121,16 @@ mod tests {
 
     #[test]
     fn scalar_results_use_pairs_for_every_scalar_combination() {
-        for ok in [Type::U8, Type::I64, Type::F64, Type::Bool, Type::Void] {
-            for err in [Type::U8, Type::I64, Type::F64, Type::Bool, Type::Void] {
+        let mut combinations = 0;
+        for ok in scalar_types() {
+            for err in scalar_types() {
                 let result = Type::Generic("Result".into(), vec![ok.clone(), err]);
                 assert!(is_scalar_pair(&result));
                 assert_eq!(option_repr(&result, &TypeMap::new()), None);
+                combinations += 1;
             }
         }
+        assert_eq!(combinations, 144);
     }
 
     #[test]

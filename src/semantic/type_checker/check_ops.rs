@@ -14,7 +14,19 @@ impl TypeChecker {
     /// here rather than reaching lowering without an operand.
     fn supports_equality(&self, ty: &Type) -> bool {
         match ty {
-            Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never => true,
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
+            | Type::I64
+            | Type::F64
+            | Type::Bool
+            | Type::String
+            | Type::Never => true,
             Type::Named(name) => {
                 self.symbols.lookup_class(name).is_some()
                     || self.symbols.lookup_interface(name).is_some()
@@ -69,6 +81,11 @@ impl TypeChecker {
         expr: &Expr,
         expected: Option<&Type>,
     ) -> Type {
+        let is_integer_literal = |expr: &Expr| {
+            matches!(expr, Expr::Integer(..))
+                || matches!(expr, Expr::Unary(unary) if unary.op == UnaryOp::Neg
+                    && matches!(unary.expr, Expr::Integer(..)))
+        };
         enum Work<'a> {
             Enter(&'a Expr, Option<Type>),
             AfterRightForLiteral(&'a BinaryExpr),
@@ -83,8 +100,8 @@ impl TypeChecker {
             match next {
                 Work::Enter(Expr::Binary(binary), context) => {
                     if context.is_none()
-                        && matches!(binary.lhs, Expr::Integer(..))
-                        && !matches!(binary.rhs, Expr::Integer(..))
+                        && is_integer_literal(&binary.lhs)
+                        && !is_integer_literal(&binary.rhs)
                     {
                         work.push(Work::AfterRightForLiteral(binary));
                         work.push(Work::Enter(&binary.rhs, None));
@@ -103,6 +120,28 @@ impl TypeChecker {
                     }
                 }
                 Work::Enter(Expr::Unary(unary), context) => {
+                    if unary.op == UnaryOp::Neg
+                        && let Expr::Integer(n, _, _) = &unary.expr
+                    {
+                        let ty = context.unwrap_or(Type::I64);
+                        if let Some(layout) = ty.integer_layout() {
+                            if !layout.contains(-*n) {
+                                self.push_error(
+                                    ErrorCode::E0201,
+                                    "negative integer literal out of range",
+                                    unary.span,
+                                    "integer literal out of range",
+                                );
+                            }
+                            self.expr_types.insert(unary.expr.id(), ty.clone());
+                            self.expr_types.insert(unary.id, ty.clone());
+                            value = ty;
+                            continue;
+                        }
+                        work.push(Work::FinishUnary(unary));
+                        work.push(Work::Enter(&unary.expr, Some(ty)));
+                        continue;
+                    }
                     work.push(Work::FinishUnary(unary));
                     work.push(Work::Enter(&unary.expr, context));
                 }
@@ -326,7 +365,21 @@ impl TypeChecker {
                 }
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                if !matches!(lty, Type::U8 | Type::I64 | Type::F64 | Type::String) || lty != rty {
+                if !matches!(
+                    lty,
+                    Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::Char
+                        | Type::U8
+                        | Type::I64
+                        | Type::F64
+                        | Type::String
+                ) || lty != rty
+                {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -480,7 +533,7 @@ impl TypeChecker {
             UnaryOp::Neg => {
                 if let Some(layout) = ty.integer_layout()
                     && let Expr::Integer(value, _, _) = u.expr
-                    && !layout.contains(-i128::from(value))
+                    && !layout.contains(-value)
                 {
                     self.push_error(
                         ErrorCode::E0201,

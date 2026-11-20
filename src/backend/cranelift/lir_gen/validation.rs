@@ -805,7 +805,7 @@ pub(super) fn flat_rvalue_supported(
             if callee.is_free_named("gc_collect") || callee.is_free_named("gc_minor_collect") || callee.is_free_named("gc_task_frame_diagnostics") { *result == Type::Void }
             else { callee.is_free_named(callee.unqualified_name().as_deref().unwrap_or("")) && runtime_stat_builtin_runtime_name(callee.unqualified_name().as_deref().unwrap_or("")).is_some() && *result == Type::I64 }
         }
-        V::FormatScalar { ty, format, .. } => matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String) && (format.is_none() || *ty == Type::F64),
+        V::FormatScalar { ty, format, .. } => matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String) && (format.is_none() || *ty == Type::F64),
         V::Panic { message } => ty(message) == Some(Type::String),
         // A payload-free enum compares its tag; a class or interface value
         // compares its object word by reference identity.

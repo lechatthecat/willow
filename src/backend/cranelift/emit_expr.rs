@@ -20,7 +20,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value: cranelift_codegen::ir::Value,
         ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let Some(layout) = ty.integer_layout() else {
+        let Some(layout) = ty.scalar_layout() else {
             return value;
         };
         if layout.bits == 64 {
@@ -362,10 +362,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             self.builder.ins().iconst(types::I8, 0)
         };
-        let ovf_kind = self
-            .builder
-            .ins()
-            .iconst(types::I64, if is_rem { 3 } else { 1 });
+        let ovf_kind = self.builder.ins().iconst(
+            types::I64,
+            (if is_rem { 3 } else { 1 })
+                | if layout.bits == 64 {
+                    0
+                } else {
+                    i64::from(layout.bits) << 8
+                },
+        );
         self.builder
             .ins()
             .brif(overflows, panic_block, &[ovf_kind.into()], ok_block, &[]);

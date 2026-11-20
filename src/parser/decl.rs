@@ -1152,7 +1152,18 @@ fn const_value(
     };
     if !matches!(
         declared,
-        Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
+            | Type::I64
+            | Type::F64
+            | Type::Bool
+            | Type::String
     ) {
         let error = Diagnostic::new(
             Severity::Error,
@@ -1168,7 +1179,7 @@ fn const_value(
         });
     }
     if let (ConstValue::Integer(value), Some(layout)) = (&constant, declared.integer_layout()) {
-        if layout.contains(i128::from(*value)) {
+        if layout.contains(*value) {
             return Ok(constant);
         }
         return Err(Diagnostic::new(
@@ -1238,6 +1249,7 @@ fn frozen_array_static_help(declared: &Type) -> String {
 fn const_literal(expr: &Expr) -> Option<ConstValue> {
     match expr {
         Expr::Integer(value, ..) => Some(ConstValue::Integer(*value)),
+        Expr::Char(value, ..) => Some(ConstValue::Char(*value)),
         Expr::Float(value, ..) => Some(ConstValue::Float(*value)),
         Expr::Bool(value, ..) => Some(ConstValue::Bool(*value)),
         Expr::String(value, ..) => Some(ConstValue::String(value.clone())),

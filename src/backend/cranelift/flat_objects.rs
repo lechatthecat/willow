@@ -8,6 +8,16 @@ use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, types};
 use cranelift_module::Module;
 use willow_abi::runtime_symbols::names as rt;
 
+fn array_storage_type(width: u32) -> cranelift_codegen::ir::Type {
+    match width {
+        1 => types::I8,
+        2 => types::I16,
+        4 => types::I32,
+        8 => types::I64,
+        _ => unreachable!("validated scalar array storage width"),
+    }
+}
+
 impl<'a, 'b> FuncGen<'a, 'b> {
     fn flat_operand_type(function: &LirFunction, operand: &LirOperand) -> Type {
         operand
@@ -28,7 +38,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     pub(super) fn emit_flat_array_alloc(&mut self, len: usize, element_ty: &Type) -> Value {
         let is_ref = super::type_helpers::storage_is_gc_managed(element_ty, self.enum_infos);
-        self.emit_array_literal_alloc(len, is_ref)
+        self.emit_array_literal_alloc(len, is_ref, element_ty.scalar_width())
     }
 
     pub(super) fn emit_flat_array_store(
@@ -42,12 +52,30 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Primitive coercions and operand loads cannot allocate or suspend.
         // Load the owner from its current storage and never retain a raw buffer
         // across a call, safepoint, or suspension on the successful path.
-        if matches!(element_ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool) {
+        if matches!(
+            element_ty,
+            Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::Char
+                | Type::U8
+                | Type::I64
+                | Type::F64
+                | Type::Bool
+        ) {
             let array = self.emit_lir_operand(function, array);
             let index = self.emit_lir_operand(function, index);
             let value = self.emit_lir_operand(function, value);
             let word = self.emit_to_storage_word(value, element_ty);
-            return self.emit_array_access(array, Some(index), Some(word));
+            return self.emit_sized_array_access(
+                array,
+                Some(index),
+                Some(word),
+                element_ty.scalar_width(),
+            );
         }
         if self.is_inline_pair(element_ty) {
             let array = self.emit_lir_operand(function, array);
@@ -188,7 +216,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> Value {
         let array = self.emit_lir_operand(function, array);
         let index = self.emit_lir_operand(function, index);
-        let value = self.emit_array_access(array, Some(index), None);
+        let value =
+            self.emit_sized_array_access(array, Some(index), None, element_ty.scalar_width());
         self.emit_from_storage_word(value, element_ty)
     }
 
@@ -210,6 +239,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         array: Value,
         index: Option<Value>,
         word: Option<Value>,
+    ) -> Value {
+        self.emit_sized_array_access(array, index, word, 8)
+    }
+
+    /// The checked element type fixes the width at compile time. Generic
+    /// instantiations share this emitter; no width dispatch enters generated code.
+    pub(super) fn emit_sized_array_access(
+        &mut self,
+        array: Value,
+        index: Option<Value>,
+        word: Option<Value>,
+        width: u32,
     ) -> Value {
         use willow_abi::array_layout as layout;
         // A scalar store leaves the header alone, so reads and stores share
@@ -272,10 +313,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 ),
             };
             facts.buffer = Some(buffer);
-            let offset = self
-                .builder
-                .ins()
-                .imul_imm_s(index, i64::from(layout::WORD_BYTES));
+            let offset = self.builder.ins().imul_imm_s(index, i64::from(width));
             let offset = if ptr_ty == types::I64 {
                 offset
             } else {
@@ -284,14 +322,27 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let slot = self.builder.ins().iadd(buffer, offset);
             let header = layout::BUFFER_HEADER_WORDS as i32 * layout::WORD_BYTES;
             if let Some(word) = word {
+                let word = if width == 8 {
+                    word
+                } else {
+                    self.builder.ins().ireduce(array_storage_type(width), word)
+                };
                 self.builder
                     .ins()
                     .store(MemFlagsData::new(), word, slot, header);
                 self.builder.ins().iconst(types::I64, 0)
             } else {
-                self.builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::new(), slot, header)
+                let value = self.builder.ins().load(
+                    array_storage_type(width),
+                    MemFlagsData::new(),
+                    slot,
+                    header,
+                );
+                if width == 8 {
+                    value
+                } else {
+                    self.builder.ins().uextend(types::I64, value)
+                }
             }
         } else {
             facts.len
@@ -364,7 +415,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Scalar buffers have no concurrent GC tracer. Update their live length
     /// with ordinary stores; reference buffers retain runtime atomic publication
     /// and barriers. No raw buffer survives the allocating slow path.
-    pub(super) fn emit_scalar_array_resize(&mut self, array: Value, length: Value) -> Value {
+    pub(super) fn emit_scalar_array_resize(
+        &mut self,
+        array: Value,
+        length: Value,
+        width: u32,
+    ) -> Value {
         use willow_abi::array_layout as layout;
         let inspect = self.builder.create_block();
         let fast = self.builder.create_block();
@@ -401,17 +457,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             array,
             layout::handle_offset(layout::H_BUF),
         );
-        let offset = self
-            .builder
-            .ins()
-            .imul_imm_s(len, i64::from(layout::WORD_BYTES));
+        let offset = self.builder.ins().imul_imm_s(len, i64::from(width));
         let offset = if ptr_ty == types::I64 {
             offset
         } else {
             self.builder.ins().ireduce(ptr_ty, offset)
         };
         let slot = self.builder.ins().iadd(buffer, offset);
-        let zero = self.builder.ins().iconst(types::I64, 0);
+        let zero = self.builder.ins().iconst(array_storage_type(width), 0);
         self.builder.ins().store(
             MemFlagsData::new(),
             zero,

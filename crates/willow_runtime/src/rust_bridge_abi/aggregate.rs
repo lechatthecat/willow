@@ -355,7 +355,7 @@ pub extern "C" fn willow_rust_bridge_panic_message(bytes: *const u8, len: usize)
 pub extern "C" fn willow_rust_bridge_array_new(frame: *mut u8, len: usize, reference: u32) -> u64 {
     let length = i64::try_from(len)
         .unwrap_or_else(|_| crate::failure::fatal_invariant("rust_bridge_array_length"));
-    let object = array::new_old_array(length, i64::from(reference != 0)) as u64;
+    let object = array::new_old_array(length, i64::from(reference)) as u64;
     willow_rust_bridge_root(frame, object);
     object
 }

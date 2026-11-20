@@ -1111,6 +1111,14 @@ impl TypeChecker {
                 });
             }
             Pattern::LiteralBool(_, span, _) => self.check_bool_pattern(*span, ty),
+            Pattern::LiteralChar(_, span, _) => {
+                if *ty != Type::Char {
+                    self.push_pattern_type_mismatch(
+                        "char pattern requires char scrutinee".into(),
+                        *span,
+                    );
+                }
+            }
             Pattern::LiteralInt(value, span, _) => self.check_int_pattern(*value, *span, ty),
             Pattern::EnumVariant {
                 enum_name,
@@ -1341,9 +1349,9 @@ impl TypeChecker {
         }
     }
 
-    fn check_int_pattern(&mut self, value: i64, span: Span, scrutinee_ty: &Type) {
+    fn check_int_pattern(&mut self, value: i128, span: Span, scrutinee_ty: &Type) {
         if let Some(layout) = scrutinee_ty.integer_layout() {
-            if !layout.contains(i128::from(value)) {
+            if !layout.contains(value) {
                 self.push_pattern_type_mismatch("integer pattern out of range".to_string(), span);
             }
         } else {

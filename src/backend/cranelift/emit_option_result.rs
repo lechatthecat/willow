@@ -129,17 +129,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
         self.locals.terminated = false;
-        let clif_ty = self.clif_type(payload_ty);
         let raw = self.emit_enum_payload_bits(ptr, payload_ty);
-        if clif_ty == types::F64 {
-            self.builder
-                .ins()
-                .bitcast(types::F64, MemFlagsData::new(), raw)
-        } else if clif_ty == types::I8 {
-            self.builder.ins().ireduce(types::I8, raw)
-        } else {
-            raw
-        }
+        self.coerce_i64_to(raw, payload_ty)
     }
 
     /// Emit: if enum tag == success_tag, return payload at offset 8; else return default.
@@ -167,15 +158,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
         let raw = self.emit_enum_payload_bits(ptr, payload_ty);
-        let payload = if clif_ty == types::F64 {
-            self.builder
-                .ins()
-                .bitcast(types::F64, MemFlagsData::new(), raw)
-        } else if clif_ty == types::I8 {
-            self.builder.ins().ireduce(types::I8, raw)
-        } else {
-            raw
-        };
+        let payload = self.coerce_i64_to(raw, payload_ty);
         self.builder.def_var(result_var, payload);
         self.builder.ins().jump(merge, &[]);
 
@@ -517,7 +500,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder
                 .ins()
                 .bitcast(types::I64, MemFlagsData::new(), payload_val)
-        } else if payload_ty.integer_layout().is_some() {
+        } else if payload_ty.scalar_layout().is_some() {
             self.widen_integer(payload_val, payload_ty)
         } else if matches!(payload_ty, Type::Bool) {
             self.builder.ins().uextend(types::I64, payload_val)

@@ -650,7 +650,16 @@ impl TypeChecker {
         cache.insert(ty.clone(), false);
         use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
         let result = match ty {
-            Type::U8 | Type::I64 | Type::Bool => true,
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
+            | Type::I64
+            | Type::Bool => true,
             Type::Generic(name, args) if Builtin::from_name(name) == Some(Builtin::FrozenArray) => {
                 args.len() == 1 && self.verification_immutable_type_at(&args[0], cache, depth + 1)
             }
@@ -768,7 +777,14 @@ impl TypeChecker {
                                 && self.expr_types.get(&b.lhs.id()).is_some_and(|t| {
                                     !matches!(
                                         t,
-                                        Type::U8
+                                        Type::I8
+                                            | Type::I16
+                                            | Type::I32
+                                            | Type::U16
+                                            | Type::U32
+                                            | Type::U64
+                                            | Type::Char
+                                            | Type::U8
                                             | Type::I64
                                             | Type::F64
                                             | Type::Bool

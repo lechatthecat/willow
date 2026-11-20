@@ -538,6 +538,7 @@ impl<'a, 'f> Graph<'a, 'f> {
                         // A lambda's body runs later; it is checked here.
                         Expr::Lambda(_) => self.later_uses(AstEvent::Expr(expr), next),
                         Expr::Integer(..)
+                        | Expr::Char(..)
                         | Expr::Float(..)
                         | Expr::Bool(..)
                         | Expr::String(..)
@@ -793,7 +794,20 @@ impl Graph<'_, '_> {
             // object/interface display can run user `to_string` code.
             Expr::Print(value, ..) => !matches!(
                 self.types.get(&value.id()),
-                Some(Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String)
+                Some(
+                    Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::Char
+                        | Type::U8
+                        | Type::I64
+                        | Type::F64
+                        | Type::Bool
+                        | Type::String
+                )
             ),
             Expr::Index(..)
             | Expr::Binary(_)

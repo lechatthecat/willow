@@ -3144,7 +3144,8 @@ impl TypeChecker {
         }
 
         match expr {
-            Expr::Integer(_, _, _) => Type::I64,
+            Expr::Integer(_, _, _) => self.check_expr_expecting(expr, &Type::I64),
+            Expr::Char(_, _, _) => Type::Char,
             Expr::Float(_, _, _) => Type::F64,
             Expr::Bool(_, _, _) => Type::Bool,
             Expr::String(_, _, _) => Type::String,
@@ -3646,7 +3647,19 @@ impl TypeChecker {
         // and silently print NOTHING.
         if !matches!(
             &arg_ty,
-            Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never
+            Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::Char
+                | Type::U8
+                | Type::I64
+                | Type::F64
+                | Type::Bool
+                | Type::String
+                | Type::Never
         ) && !Self::contains_error_type(&arg_ty)
         {
             let fn_name = if *newline { "println" } else { "print" };

@@ -105,3 +105,20 @@ mod tests {
         assert_eq!(s, "hello");
     }
 }
+
+/// Unsigned words and Unicode scalars use the same I/O boundary as other scalars.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_print_scalar(value: i64, kind: i64, newline: u8) {
+    let mut text = if kind == 0 {
+        char::from_u32(value as u32)
+            .expect("validated Unicode scalar")
+            .to_string()
+    } else {
+        (value as u64).to_string()
+    };
+    if newline != 0 {
+        text.push('\n');
+    }
+    write_stdout(text);
+}

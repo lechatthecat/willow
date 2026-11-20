@@ -43,7 +43,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             super::type_helpers::future_await_runtime_name(result_ty),
             &[future],
         );
-        if result_ty.integer_layout().is_some_and(|l| l.bits < 64) {
+        if result_ty.scalar_layout().is_some_and(|l| l.bits < 64) {
             self.emit_from_storage_word(value, result_ty)
         } else {
             value

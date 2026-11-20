@@ -56,9 +56,11 @@ use willow_abi::runtime_symbols::names as rt;
 pub enum Intrinsic {
     /// `i64.to_string()` → `willow_i64_to_string`.
     I64ToString,
-    IntegerToI64,
-    IntegerWrappingToU8,
-    IntegerCheckedToU8,
+    IntegerConvert,
+    IntegerWrappingConvert,
+    IntegerCheckedConvert,
+    ScalarParse,
+    ScalarToString,
     /// `f64.to_string()` → `willow_f64_to_string`.
     F64ToString,
     /// `bool.to_string()` → `willow_bool_to_string`.
@@ -261,9 +263,11 @@ impl Intrinsic {
     /// added here fails `all_variants_are_listed`.
     pub const ALL: &'static [Intrinsic] = &[
         Intrinsic::I64ToString,
-        Intrinsic::IntegerToI64,
-        Intrinsic::IntegerWrappingToU8,
-        Intrinsic::IntegerCheckedToU8,
+        Intrinsic::IntegerConvert,
+        Intrinsic::IntegerWrappingConvert,
+        Intrinsic::IntegerCheckedConvert,
+        Intrinsic::ScalarParse,
+        Intrinsic::ScalarToString,
         Intrinsic::F64ToString,
         Intrinsic::BoolToString,
         Intrinsic::I64WrappingAdd,
@@ -348,9 +352,42 @@ impl Intrinsic {
             I64ToString | F64ToString | BoolToString | StringToString | MapToString => {
                 &["to_string"]
             }
-            IntegerToI64 => &["to_i64"],
-            IntegerWrappingToU8 => &["wrapping_to_u8"],
-            IntegerCheckedToU8 => &["checked_to_u8"],
+            ScalarParse => &[
+                "parse_i8",
+                "parse_i16",
+                "parse_i32",
+                "parse_i64",
+                "parse_u8",
+                "parse_u16",
+                "parse_u32",
+                "parse_u64",
+                "parse_char",
+            ],
+            ScalarToString => &["to_string"],
+            IntegerConvert => &[
+                "to_i8", "to_i16", "to_i32", "to_i64", "to_u8", "to_u16", "to_u32", "to_u64",
+            ],
+            IntegerWrappingConvert => &[
+                "wrapping_to_i8",
+                "wrapping_to_i16",
+                "wrapping_to_i32",
+                "wrapping_to_i64",
+                "wrapping_to_u8",
+                "wrapping_to_u16",
+                "wrapping_to_u32",
+                "wrapping_to_u64",
+            ],
+            IntegerCheckedConvert => &[
+                "checked_to_i8",
+                "checked_to_i16",
+                "checked_to_i32",
+                "checked_to_i64",
+                "checked_to_u8",
+                "checked_to_u16",
+                "checked_to_u32",
+                "checked_to_u64",
+                "checked_to_char",
+            ],
             I64WrappingAdd => &["wrapping_add"],
             I64WrappingSub => &["wrapping_sub"],
             I64WrappingMul => &["wrapping_mul"],
@@ -434,9 +471,14 @@ impl Intrinsic {
         use Intrinsic::*;
         match self {
             I64ToString => &[rt::willow_i64_to_string],
+            ScalarParse => &[rt::willow_scalar_parse],
+            ScalarToString => &[rt::willow_scalar_to_string],
             F64ToString => &[rt::willow_f64_to_string],
             BoolToString => &[rt::willow_bool_to_string],
-            IntegerToI64 | IntegerWrappingToU8 | IntegerCheckedToU8 | StringToString
+            IntegerConvert
+            | IntegerWrappingConvert
+            | IntegerCheckedConvert
+            | StringToString
             | TaskResult => &[],
             I64WrappingAdd | I64WrappingSub | I64WrappingMul | I64WrappingNeg | I64CheckedAdd
             | I64CheckedSub | I64CheckedMul | I64CheckedNeg => &[],
@@ -799,23 +841,65 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
         }
     }
     if arity == 0 {
-        let conversion = match (recv, method) {
-            (Type::U8, "to_i64") => Some((Intrinsic::IntegerToI64, Type::I64)),
-            (Type::I64, "wrapping_to_u8") => Some((Intrinsic::IntegerWrappingToU8, Type::U8)),
-            (Type::I64, "checked_to_u8") => Some((
-                Intrinsic::IntegerCheckedToU8,
-                B::Option.apply(vec![Type::U8]),
-            )),
-            _ => None,
-        };
-        if let Some((intrinsic, ty)) = conversion {
-            return Some(ResolvedMethod::fixed(intrinsic, ty));
+        if let Some(target) = scalar_conversion_target(method, "parse_")
+            && matches!(recv, Type::String)
+        {
+            return Some(ResolvedMethod::fixed(
+                Intrinsic::ScalarParse,
+                B::Option.apply(vec![target]),
+            ));
         }
+        if let Some(source) = recv.scalar_layout() {
+            if let Some(target) = scalar_conversion_target(method, "checked_to_") {
+                return Some(ResolvedMethod::fixed(
+                    Intrinsic::IntegerCheckedConvert,
+                    B::Option.apply(vec![target]),
+                ));
+            }
+            if let Some(target) = scalar_conversion_target(method, "wrapping_to_")
+                && target.integer_layout().is_some()
+                && recv.integer_layout().is_some()
+            {
+                return Some(ResolvedMethod::fixed(
+                    Intrinsic::IntegerWrappingConvert,
+                    target,
+                ));
+            }
+            if let Some(target) = scalar_conversion_target(method, "to_")
+                && let Some(layout) = target.integer_layout()
+                && layout.min() <= source.min()
+                && layout.max()
+                    >= if matches!(recv, Type::Char) {
+                        0x10ffff
+                    } else {
+                        source.max()
+                    }
+            {
+                return Some(ResolvedMethod::fixed(Intrinsic::IntegerConvert, target));
+            }
+        }
+    }
+    if matches!(method, "to_string" | "__abi_debug")
+        && arity == 0
+        && matches!(recv, Type::Char | Type::U64)
+    {
+        return Some(ResolvedMethod::fixed(
+            Intrinsic::ScalarToString,
+            Type::String,
+        ));
     }
     // Scalar `to_string` conversions.
     if method == "to_string" && arity == 0 {
         match recv {
-            Type::U8 | Type::I64 => {
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
+            | Type::I64 => {
                 return Some(ResolvedMethod::fixed(Intrinsic::I64ToString, Type::String));
             }
             Type::F64 => return Some(ResolvedMethod::fixed(Intrinsic::F64ToString, Type::String)),
@@ -835,9 +919,15 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
     if method == "__abi_debug" && arity == 0 {
         return match recv {
             Type::String => Some(ResolvedMethod::fixed(Intrinsic::StringDebug, Type::String)),
-            Type::U8 | Type::I64 => {
-                Some(ResolvedMethod::fixed(Intrinsic::I64ToString, Type::String))
-            }
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
+            | Type::I64 => Some(ResolvedMethod::fixed(Intrinsic::I64ToString, Type::String)),
             Type::F64 => Some(ResolvedMethod::fixed(Intrinsic::F64ToString, Type::String)),
             Type::Bool => Some(ResolvedMethod::fixed(Intrinsic::BoolToString, Type::String)),
             _ => None,
@@ -1634,6 +1724,8 @@ mod tests {
     #[test]
     fn every_intrinsic_is_reachable_from_resolve() {
         let receivers: Vec<Type> = vec![
+            Type::U64,
+            Type::Char,
             Type::U8,
             Type::I64,
             Type::F64,
@@ -1655,6 +1747,7 @@ mod tests {
             named("TaskScope"),
         ];
         let methods = [
+            "parse_i8",
             "to_i64",
             "wrapping_to_u8",
             "checked_to_u8",
@@ -1746,7 +1839,7 @@ mod tests {
         assert_eq!(unique.len(), Intrinsic::ALL.len(), "duplicate in ALL");
         assert_eq!(
             Intrinsic::ALL.len(),
-            75,
+            77,
             "Intrinsic::ALL must list every variant; update the count when adding one"
         );
     }
@@ -2290,6 +2383,10 @@ fn f() {
         let mut reached: std::collections::HashSet<Intrinsic> = std::collections::HashSet::new();
         for (src, expected) in [
             (SCALARS, 5),
+            (
+                "fn f(x: u64, c: char) { x.to_string(); c.to_string(); \"123\".parse_u16(); }",
+                3,
+            ),
             (INTEGERS, 8),
             (
                 "fn f(x: u8, y: i64) { x.to_i64(); y.wrapping_to_u8(); y.checked_to_u8(); }",
@@ -2572,5 +2669,21 @@ pub(crate) fn namespace_builtin(class: &str, method: &str) -> Option<NamespaceBu
             .collect::<Option<Vec<_>>>()?,
         ret: return_type.to_ast_type()?.into(),
         narrow_to_bool: matches!((class, method), ("fs", "exists") | ("path", "is_absolute")),
+    })
+}
+
+/// Parse one scalar target spelling; the table is independent of source type.
+fn scalar_conversion_target<N>(method: &str, prefix: &str) -> Option<Type<N>> {
+    Some(match method.strip_prefix(prefix)? {
+        "i8" => Type::I8,
+        "i16" => Type::I16,
+        "i32" => Type::I32,
+        "i64" => Type::I64,
+        "u8" => Type::U8,
+        "u16" => Type::U16,
+        "u32" => Type::U32,
+        "u64" => Type::U64,
+        "char" => Type::Char,
+        _ => return None,
     })
 }

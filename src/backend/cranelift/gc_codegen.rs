@@ -439,16 +439,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// Reserve both array objects atomically with respect to GC points. Neither
     /// object can be observed until both headers and the handle edge are ready.
-    pub(super) fn emit_array_literal_alloc(&mut self, len: usize, is_ref: bool) -> Value {
+    pub(super) fn emit_array_literal_alloc(
+        &mut self,
+        len: usize,
+        is_ref: bool,
+        width: u32,
+    ) -> Value {
         use willow_abi::array_layout as array;
         let ptr_ty = reference_type(self.module.target_config());
         let pointer_bytes = ptr_ty.bytes();
         let header_size = willow_abi::gc_header::size(pointer_bytes) as i64;
+        let alignment = willow_abi::storage_word_bytes(pointer_bytes) as i64;
         let length = self.builder.ins().iconst(types::I64, len as i64);
-        let refs = self.builder.ins().iconst(types::I64, i64::from(is_ref));
+        let flags = array::storage_flags(width, is_ref);
+        let refs = self.builder.ins().iconst(types::I64, flags);
         let buffer_size = len
-            .checked_add(array::BUFFER_HEADER_WORDS)
-            .and_then(|words| words.checked_mul(array::WORD_BYTES as usize))
+            .checked_mul(width as usize)
+            .and_then(|bytes| {
+                bytes.checked_add(array::BUFFER_HEADER_WORDS * array::WORD_BYTES as usize)
+            })
             .and_then(|bytes| i64::try_from(bytes).ok());
         let Some(buffer_size) =
             buffer_size.filter(|size| *size <= GC_TLAB_MAX_OBJECT_SIZE - header_size)
@@ -471,8 +480,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             },
             0,
         );
-        let handle_size = header_size + handle.payload_size;
-        let total = handle_size + header_size + buffer_size;
+        let handle_size = (header_size + handle.payload_size + alignment - 1) & !(alignment - 1);
+        // Packed payload lengths need not be word multiples. Both descriptor
+        // size and cursor advancement must include GC alignment padding.
+        let buffer_total = (header_size + buffer_size + alignment - 1) & !(alignment - 1);
+        let total = handle_size + buffer_total;
         let context = self.builder.ins().get_pinned_reg(ptr_ty);
         let tlab = self.builder.ins().load(
             ptr_ty,
@@ -515,7 +527,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .store(MemFlagsData::trusted(), next, tlab, 0);
         let buffer_header = self.builder.ins().iadd_imm_s(cursor, handle_size);
         self.emit_young_header(cursor, &handle, handle_size);
-        self.emit_young_header(buffer_header, &buffer, header_size + buffer_size);
+        self.emit_young_header(buffer_header, &buffer, buffer_total);
         let payload = self.builder.ins().iadd_imm_s(cursor, header_size);
         let buffer_payload = self.builder.ins().iadd_imm_s(buffer_header, header_size);
         for (field, value) in [

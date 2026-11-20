@@ -901,7 +901,18 @@ fn format_segments(args: &[HirExpr]) -> Option<Vec<crate::interpolate::Segment>>
             Segment::Display => {
                 if !matches!(
                     operands.next()?.ty,
-                    Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+                    Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::Char
+                        | Type::U8
+                        | Type::I64
+                        | Type::F64
+                        | Type::Bool
+                        | Type::String
                 ) {
                     return None;
                 }

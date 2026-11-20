@@ -87,7 +87,8 @@ pub mod string_layout {
     pub const TERMINATOR_BYTES: usize = 1;
 }
 
-/// Array payloads use fixed 64-bit slots, including on narrow-pointer targets.
+/// Array handles and buffer headers use fixed 64-bit words. Scalar elements
+/// may occupy 1, 2, 4 or 8 bytes; pointer and pair slots always occupy 8 bytes.
 /// Buffer word zero publishes the traced prefix: logical length for ordinary
 /// arrays, initialized high-water mark for stable scalar-pair slot storage.
 pub mod array_layout {
@@ -95,16 +96,77 @@ pub mod array_layout {
     pub const H_LEN: usize = 0;
     pub const H_CAP: usize = 1;
     pub const H_IS_REF: usize = 2;
-    /// H_IS_REF remains truthy for reference buffers. This additional bit
-    /// records exposed pair storage in the current buffer; scalar handles stay 0.
+    /// Bit zero marks reference buffers; bit one records exposed pair storage.
+    /// Upper bits encode narrow scalar widths. Legacy word storage stays 0/1/3.
     pub const PAIR_STORAGE_EXPOSED: i64 = 2;
     pub const H_BUF: usize = 3;
     pub const HANDLE_WORDS: i64 = 4;
     pub const HANDLE_MASK: u64 = 1 << H_BUF;
     pub const BUFFER_HEADER_WORDS: usize = 1;
 
+    pub const fn storage_flags(width: u32, is_ref: bool) -> i64 {
+        assert!(matches!(width, 1 | 2 | 4 | 8));
+        assert!(!is_ref || width == 8);
+        (if width == 8 { 0 } else { (width as i64) << 8 }) | is_ref as i64
+    }
+
+    pub const fn is_reference(flags: i64) -> bool {
+        flags & 1 != 0
+    }
+
+    pub const fn element_width(flags: i64) -> usize {
+        match flags >> 8 {
+            1 => 1,
+            2 => 2,
+            4 => 4,
+            _ => 8,
+        }
+    }
+
+    /// Logical payload bytes; allocators separately round to GC alignment.
+    pub const fn buffer_bytes(cap: i64, flags: i64) -> Option<i64> {
+        if cap < 0 {
+            return None;
+        }
+        match cap.checked_mul(element_width(flags) as i64) {
+            Some(bytes) => bytes.checked_add(BUFFER_HEADER_WORDS as i64 * WORD_BYTES as i64),
+            None => None,
+        }
+    }
+
     pub const fn handle_offset(word: usize) -> i32 {
         word as i32 * WORD_BYTES
+    }
+}
+
+/// Shared collection formatting tags and array snapshot storage.
+pub mod collection_element {
+    pub const I64: i64 = 0;
+    pub const F64: i64 = 1;
+    pub const BOOL: i64 = 2;
+    pub const STRING: i64 = 3;
+    pub const OBJECT: i64 = 4;
+    pub const I8: i64 = 5;
+    pub const I16: i64 = 6;
+    pub const I32: i64 = 7;
+    pub const U8: i64 = 8;
+    pub const U16: i64 = 9;
+    pub const U32: i64 = 10;
+    pub const U64: i64 = 11;
+    pub const CHAR: i64 = 12;
+
+    pub const fn storage_flags(kind: i64, is_ref: bool) -> i64 {
+        let width = if is_ref {
+            8
+        } else {
+            match kind {
+                I8 | U8 => 1,
+                I16 | U16 => 2,
+                I32 | U32 | CHAR => 4,
+                _ => 8,
+            }
+        };
+        super::array_layout::storage_flags(width, is_ref)
     }
 }
 
@@ -136,6 +198,7 @@ pub enum AbiTy {
     Word,
     I64,
     I32,
+    I16,
     I8,
     F64,
     Ptr,

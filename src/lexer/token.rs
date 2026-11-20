@@ -44,12 +44,20 @@ pub enum TokenKind {
 
     // Types
     I64,
+    I8,
+    I16,
+    I32,
+    U16,
+    U32,
+    U64,
+    Char,
     U8,
     Bool,
     F64,
 
     // Literals
-    Integer(i64),
+    Integer(i128),
+    CharLiteral(char),
     Float(f64),
     StringLiteral(String),
 
@@ -150,6 +158,13 @@ impl TokenKind {
             Self::Enum => Some("enum"),
             Self::Const => Some("const"),
             Self::I64 => Some("i64"),
+            Self::I8 => Some("i8"),
+            Self::I16 => Some("i16"),
+            Self::I32 => Some("i32"),
+            Self::U16 => Some("u16"),
+            Self::U32 => Some("u32"),
+            Self::U64 => Some("u64"),
+            Self::Char => Some("char"),
             Self::U8 => Some("u8"),
             Self::F64 => Some("f64"),
             Self::Bool => Some("bool"),

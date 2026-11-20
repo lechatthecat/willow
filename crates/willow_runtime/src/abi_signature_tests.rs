@@ -165,6 +165,18 @@ fn string_methods_abi_signatures() {
     }
 }
 
+#[test]
+fn scalar_width_conversion_abi_signatures() {
+    let _: extern "C" fn(i64, i64) -> *mut u8 = string::willow_scalar_to_string;
+    assert_schema("willow_scalar_to_string", &[I64, I64], Some(Ptr));
+    let _: extern "C" fn(*mut u8, i64, *mut u64) -> u8 = string::willow_scalar_parse;
+    assert_schema("willow_scalar_parse", &[Ptr, I64, Ptr], Some(I8));
+    assert_eq!(
+        runtime_symbol("willow_scalar_parse").unwrap().effects,
+        willow_abi::RuntimeEffects::NONE
+    );
+}
+
 // --- semantic kinds: generic payload `Word` vs fixed-width `I64` ---
 //
 // Every payload-carrying row is stated twice: the Rust `extern "C"` type,

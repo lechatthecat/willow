@@ -143,6 +143,7 @@ fn summarize(
                 if !matches!(
                     e,
                     Expr::Integer(..)
+                        | Expr::Char(..)
                         | Expr::Float(..)
                         | Expr::Bool(..)
                         | Expr::String(..)
@@ -247,7 +248,11 @@ fn summarize(
                             summary.ops.push(Op::Escape(*values.get(&value.id())?));
                         }
                     }
-                    Expr::Integer(..) | Expr::Float(..) | Expr::Bool(..) | Expr::String(..) => {}
+                    Expr::Integer(..)
+                    | Expr::Char(..)
+                    | Expr::Float(..)
+                    | Expr::Bool(..)
+                    | Expr::String(..) => {}
                     _ => return None,
                 }
                 if out == slot {

@@ -2113,7 +2113,8 @@ fn visit_item(
 }
 fn fresh_expr(e: &mut Expr, ids: &mut FreshIds) {
     let slot = match e {
-        Expr::Integer(_, _, id)
+        Expr::Char(_, _, id)
+        | Expr::Integer(_, _, id)
         | Expr::Float(_, _, id)
         | Expr::Bool(_, _, id)
         | Expr::String(_, _, id)
@@ -2146,6 +2147,7 @@ fn fresh_expr(e: &mut Expr, ids: &mut FreshIds) {
                 let id = match &mut a.pattern {
                     Pattern::Wildcard(_, id)
                     | Pattern::LiteralBool(_, _, id)
+                    | Pattern::LiteralChar(_, _, id)
                     | Pattern::LiteralInt(_, _, id)
                     | Pattern::Binding { id, .. }
                     | Pattern::EnumVariant { id, .. }

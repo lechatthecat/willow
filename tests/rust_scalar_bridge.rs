@@ -165,8 +165,8 @@ fn missing_symbols_and_rust_signature_mismatches_are_diagnostics() {
 #[test]
 fn unsupported_signatures_duplicate_and_malformed_declarations_fail() {
     for (name, declaration) in [
-        ("i32_parameter", "extern rust { fn bad(x: i32); }"),
-        ("u64_parameter", "extern rust { fn bad(x: u64); }"),
+        ("i128_parameter", "extern rust { fn bad(x: i128); }"),
+        ("usize_parameter", "extern rust { fn bad(x: usize); }"),
         ("f32_return", "extern rust { fn bad() -> f32; }"),
         (
             "raw_module_namespace",
@@ -2209,6 +2209,7 @@ extern rust {
  fn result(x: Result<u8, u8>) -> Result<u8, u8>;
  fn bytes(x: Array<u8>) -> Array<u8>;
 }
+
 fn main() {
  println(byte(255)); let indirect = byte; println(indirect(128));
  println(maybe(Some(255)).unwrap()); println(maybe(None).is_none());
@@ -2233,4 +2234,145 @@ pub fn bytes(x: Vec<u8>) -> Vec<u8> { x }
             "255\n128\n255\ntrue\n200\n255\n[0, 128, 255]\n"
         );
     }
+}
+
+#[test]
+fn scalar_widths_native_abi_and_aggregate_payloads() {
+    use std::fmt::Write;
+
+    let mut declarations = String::from("import std::collections::Array;\nextern rust {\n");
+    let mut body = String::from("fn main() {\n");
+    let mut rust = String::new();
+    let mut expected = String::new();
+    for (ty, boundary, other) in [
+        ("i8", "-128", "127"),
+        ("i16", "-32768", "32767"),
+        ("i32", "-2147483648", "2147483647"),
+        ("u16", "65535", "32768"),
+        ("u32", "4294967295", "2147483648"),
+        ("u64", "18446744073709551615", "9223372036854775808"),
+    ] {
+        writeln!(
+            declarations,
+            "fn scalar_{ty}(x: {ty}) -> {ty};
+             fn mixed_{ty}(x: {ty}, witness: Option<{ty}>) -> {ty};
+             fn maybe_{ty}(x: Option<{ty}>) -> Option<{ty}>;
+             fn result_{ty}(x: Result<{ty}, {ty}>) -> Result<{ty}, {ty}>;
+             fn array_{ty}(x: Array<{ty}>) -> Array<{ty}>;"
+        )
+        .unwrap();
+        writeln!(
+            rust,
+            "pub fn scalar_{ty}(x: {ty}) -> {ty} {{ assert_eq!(x, {boundary}); x }}
+             pub fn mixed_{ty}(x: {ty}, witness: Option<{ty}>) -> {ty} {{
+                 assert_eq!(x, {boundary}); assert_eq!(witness, Some({boundary})); x
+             }}
+             pub fn maybe_{ty}(x: Option<{ty}>) -> Option<{ty}> {{ x }}
+             pub fn result_{ty}(x: Result<{ty}, {ty}>) -> Result<{ty}, {ty}> {{ x }}
+             pub fn array_{ty}(x: Vec<{ty}>) -> Vec<{ty}> {{
+                 assert_eq!(x, vec![{boundary}, 0, {other}]); x
+             }}"
+        )
+        .unwrap();
+        writeln!(
+            body,
+            "println(\"{ty}\");
+             let value_{ty}: {ty} = {boundary};
+             println(scalar_{ty}(value_{ty}) == value_{ty});
+             let indirect_{ty} = scalar_{ty};
+             println(indirect_{ty}(value_{ty}) == value_{ty});
+             println(mixed_{ty}(value_{ty}, Some(value_{ty})) == value_{ty});
+             let indirect_mixed_{ty} = mixed_{ty};
+             println(indirect_mixed_{ty}(value_{ty}, Some(value_{ty})) == value_{ty});
+             println(maybe_{ty}(Some(value_{ty})).unwrap() == value_{ty});
+             println(maybe_{ty}(None).is_none());
+             let indirect_maybe_{ty} = maybe_{ty};
+             println(indirect_maybe_{ty}(Some(value_{ty})).unwrap() == value_{ty});
+             println(result_{ty}(Ok(value_{ty})).unwrap() == value_{ty});
+             println(result_{ty}(Err(value_{ty})).unwrap_err() == value_{ty});
+             let values_{ty}: Array<{ty}> = array_{ty}([value_{ty}, 0, {other}]);
+             println(values_{ty}.len() == 3 && values_{ty}[0] == value_{ty}
+                 && values_{ty}[1] == 0 && values_{ty}[2] == {other});
+             values_{ty}.push(value_{ty}); gc_collect();
+             println(values_{ty}[3] == value_{ty});"
+        )
+        .unwrap();
+        writeln!(expected, "{ty}").unwrap();
+        expected.push_str(&"true\n".repeat(11));
+    }
+    append_char_bridge_cases(&mut declarations, &mut body, &mut rust, &mut expected);
+    declarations.push_str("}\n");
+    body.push_str("}\n");
+    declarations.push_str(&body);
+    let f = Fixture::new();
+    f.sources(&declarations, &rust);
+    for args in [
+        vec!["run", "--offline"],
+        vec!["run", "--offline", "--release"],
+    ] {
+        let output = f.successful(&args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    }
+}
+
+fn append_char_bridge_cases(
+    declarations: &mut String,
+    body: &mut String,
+    rust: &mut String,
+    expected: &mut String,
+) {
+    use std::fmt::Write;
+
+    declarations.push_str(
+        "fn scalar_char(x: char) -> char;
+         fn mixed_char(x: char, witness: Option<char>) -> char;
+         fn maybe_char(x: Option<char>) -> Option<char>;
+         fn result_char(x: Result<char, char>) -> Result<char, char>;
+         fn array_char(x: Array<char>) -> Array<char>;\n",
+    );
+    rust.push_str(
+        r#"
+pub fn scalar_char(x: char) -> char { x }
+pub fn mixed_char(x: char, witness: Option<char>) -> char {
+    assert!(matches!(x, '\0' | '🌲' | '\u{10ffff}'));
+    assert_eq!(witness, Some(x)); x
+}
+pub fn maybe_char(x: Option<char>) -> Option<char> { x }
+pub fn result_char(x: Result<char, char>) -> Result<char, char> { x }
+pub fn array_char(x: Vec<char>) -> Vec<char> {
+    assert_eq!(x, vec!['\0', '🌲', '\u{10ffff}']); x
+}
+"#,
+    );
+    for (name, value) in [
+        ("nul", r"'\0'"),
+        ("supplementary", "'🌲'"),
+        ("max", r"'\u{10ffff}'"),
+    ] {
+        writeln!(
+            body,
+            "println(\"char_{name}\");
+             let char_{name}: char = {value};
+             println(scalar_char(char_{name}) == char_{name});
+             let indirect_char_{name} = scalar_char;
+             println(indirect_char_{name}(char_{name}) == char_{name});
+             println(mixed_char(char_{name}, Some(char_{name})) == char_{name});
+             let indirect_mixed_char_{name} = mixed_char;
+             println(indirect_mixed_char_{name}(char_{name}, Some(char_{name})) == char_{name});
+             println(maybe_char(Some(char_{name})).unwrap() == char_{name});
+             println(result_char(Ok(char_{name})).unwrap() == char_{name});
+             println(result_char(Err(char_{name})).unwrap_err() == char_{name});"
+        )
+        .unwrap();
+        writeln!(expected, "char_{name}").unwrap();
+        expected.push_str(&"true\n".repeat(7));
+    }
+    body.push_str(
+        r"println(maybe_char(None).is_none());
+          let chars: Array<char> = array_char(['\0', '🌲', '\u{10ffff}']);
+          println(chars.len() == 3 && chars[0] == '\0' && chars[1] == '🌲'
+              && chars[2] == '\u{10ffff}');
+          chars.push('🌲'); gc_collect(); println(chars[3] == '🌲');",
+    );
+    expected.push_str(&"true\n".repeat(3));
 }

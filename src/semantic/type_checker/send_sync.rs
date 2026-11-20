@@ -44,7 +44,19 @@ const ASYNC_CAPTURE_SHARING_NOTE: &str = "async calls share reference arguments 
 fn is_value_type(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
+            | Type::I64
+            | Type::F64
+            | Type::Bool
+            | Type::Void
+            | Type::Never
     )
 }
 
@@ -543,7 +555,14 @@ impl TypeChecker {
         let result = match ty {
             // Primitives + immutable String are Send + Sync; void/never carry
             // no shared mutable state.
-            Type::U8
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
             | Type::I64
             | Type::F64
             | Type::Bool

@@ -755,7 +755,14 @@ impl TypeChecker {
                     .collect(),
                 Box::new(self.normalize_type(ret.as_ref(), span)),
             ),
-            Type::U8
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
             | Type::I64
             | Type::F64
             | Type::Bool
@@ -1536,7 +1543,14 @@ impl TypeChecker {
                 }
                 self.validate_type(ret, span);
             }
-            Type::U8
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
             | Type::I64
             | Type::F64
             | Type::Bool
@@ -1902,7 +1916,14 @@ impl TypeChecker {
                     pending.push((std::slice::from_ref(ar), std::slice::from_ref(br)));
                     pending.push((aa, ba));
                 }
-                (Type::U8, Type::U8)
+                (Type::I8, Type::I8)
+                | (Type::I16, Type::I16)
+                | (Type::I32, Type::I32)
+                | (Type::U16, Type::U16)
+                | (Type::U32, Type::U32)
+                | (Type::U64, Type::U64)
+                | (Type::Char, Type::Char)
+                | (Type::U8, Type::U8)
                 | (Type::I64, Type::I64)
                 | (Type::F64, Type::F64)
                 | (Type::Bool, Type::Bool)

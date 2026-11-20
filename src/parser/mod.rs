@@ -380,7 +380,8 @@ impl Parser {
             _ => !matches!(
                 next,
                 Some(
-                    TokenKind::Integer(_)
+                    TokenKind::CharLiteral(_)
+                        | TokenKind::Integer(_)
                         | TokenKind::Float(_)
                         | TokenKind::True
                         | TokenKind::False
@@ -397,6 +398,13 @@ impl Parser {
                         | TokenKind::Select
                         | TokenKind::Print
                         | TokenKind::Println
+                        | TokenKind::I8
+                        | TokenKind::I16
+                        | TokenKind::I32
+                        | TokenKind::U16
+                        | TokenKind::U32
+                        | TokenKind::U64
+                        | TokenKind::Char
                         | TokenKind::U8
                         | TokenKind::I64
                         | TokenKind::F64
@@ -1833,7 +1841,7 @@ class ProtectedCtor { prot init(self) {} }
     fn classify_after_question(kind: &TokenKind) -> AfterQuestion {
         match kind {
             // Expression-starting tokens → ternary.
-            TokenKind::Integer(_)
+            TokenKind::CharLiteral(_) | TokenKind::Integer(_)
             | TokenKind::Float(_)
             | TokenKind::StringLiteral(_)
             | TokenKind::Ident(_)
@@ -1850,6 +1858,7 @@ class ProtectedCtor { prot init(self) {} }
             | TokenKind::Select
             | TokenKind::Print
             | TokenKind::Println
+            | TokenKind::I8 | TokenKind::I16 | TokenKind::I32 | TokenKind::U16 | TokenKind::U32 | TokenKind::U64 | TokenKind::Char
             | TokenKind::U8 | TokenKind::I64
             | TokenKind::F64 => AfterQuestion::Ternary,
 

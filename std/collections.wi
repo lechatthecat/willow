@@ -16,13 +16,13 @@ pub class Array<T> {
         for index in 0..self.__abi_len() { self[index] = value; }
     }
     // Scalar/string value equality; returns the first matching index, or None.
-    pub fn index_of(value: T) -> Option<i64> where T: u8 | i64 | f64 | bool | String {
+    pub fn index_of(value: T) -> Option<i64> where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | bool | String {
         for index in 0..self.__abi_len() {
             if self[index] == value { return Some(index); }
         }
         return None;
     }
-    pub fn contains(value: T) -> bool where T: u8 | i64 | f64 | bool | String {
+    pub fn contains(value: T) -> bool where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | bool | String {
         for index in 0..self.__abi_len() {
             if self[index] == value { return true; }
         }
@@ -64,7 +64,7 @@ pub class Array<T> {
         self[second] = value;
     }
     // Unstable ascending numeric sort; NaNs follow all numbers.
-    pub fn sort() where T: u8 | i64 | f64 {
+    pub fn sort() where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 {
         self.sort_by(|a: T, b: T| -> bool { return a < b || (a == a && b != b); });
     }
     // less(a, b) must define a strict weak ordering and must not mutate self.
@@ -118,7 +118,7 @@ pub class Array<T> {
         }
         return parts.__abi_concat();
     }
-    pub fn to_string() -> String where T: u8 | i64 | f64 | bool | String {
+    pub fn to_string() -> String where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | bool | String {
         let parts = ["["];
         for index in 0..self.__abi_len() {
             if index > 0 { parts.push(", "); }

@@ -227,7 +227,22 @@ fn lir_sync_poll_blocks(f: &LirFunction) -> Vec<bool> {
 /// Like a division guard, a debug overflow check has a panic path.
 fn lir_defer_entry_poll(f: &LirFunction, poll: &mut [bool], overflow_checks: bool) -> bool {
     use crate::ir::lowered::LirRvalue as V;
-    let scalar = |ty: &Type| matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool);
+    let scalar = |ty: &Type| {
+        matches!(
+            ty,
+            Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::Char
+                | Type::U8
+                | Type::I64
+                | Type::F64
+                | Type::Bool
+        )
+    };
     if f.is_async
         || f.params.iter().any(|p| p.by_reference)
         || f.locals.iter().any(|l| l.is_gc_owner() || !scalar(&l.ty))

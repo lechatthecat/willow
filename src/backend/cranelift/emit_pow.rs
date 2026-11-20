@@ -195,7 +195,11 @@ impl FuncGen<'_, '_> {
         self.builder.switch_to_block(negative_block);
         self.builder.seal_block(negative_block);
         let wide = if layout.bits < 64 {
-            self.builder.ins().uextend(types::I64, exponent)
+            if layout.signed {
+                self.builder.ins().sextend(types::I64, exponent)
+            } else {
+                self.builder.ins().uextend(types::I64, exponent)
+            }
         } else {
             exponent
         };

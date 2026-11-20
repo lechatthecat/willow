@@ -406,11 +406,200 @@ const JOIN_VISITS: crate::observation::Counter =
 const COPIED_BYTES: crate::observation::Counter =
     crate::observation::Counter(crate::observation::Event::CopiedBytes);
 
+/// Compiler-provided scalar kind: zero is char; integer kinds carry bit width
+/// in the low byte and signedness in bit 8.
+fn scalar_integer_layout(kind: i64) -> Option<(u32, bool)> {
+    let bits = (kind & 255) as u32;
+    (matches!(bits, 8 | 16 | 32 | 64) && kind & !511 == 0).then_some((bits, kind & 256 != 0))
+}
+
+/// Format a validated scalar without allocating an intermediate Rust String.
+/// Invalid raw ABI kinds or Unicode scalar values return null.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_scalar_to_string(value: i64, kind: i64) -> *mut u8 {
+    if kind == 0 {
+        let Some(value) = u32::try_from(value).ok().and_then(char::from_u32) else {
+            return std::ptr::null_mut();
+        };
+        let mut bytes = [0; 4];
+        return super::willow_string_from_str(value.encode_utf8(&mut bytes));
+    }
+    let Some((bits, signed)) = scalar_integer_layout(kind) else {
+        return std::ptr::null_mut();
+    };
+    if signed {
+        // Values arriving from native-width operands are sign-extended.
+        return super::i64_to_string(value);
+    }
+    let mut value = value as u64;
+    if bits < 64 {
+        value &= (1_u64 << bits) - 1;
+    }
+    let mut bytes = [0_u8; 20];
+    let mut start = bytes.len();
+    loop {
+        start -= 1;
+        bytes[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    // Only ASCII digits were written into this initialized suffix.
+    super::willow_string_from_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..]) })
+}
+
+fn parse_scalar_bits(value: &str, kind: i64) -> Option<u64> {
+    if kind == 0 {
+        let mut chars = value.chars();
+        let first = chars.next()?;
+        return chars.next().is_none().then_some(first as u64);
+    }
+    let (bits, signed) = scalar_integer_layout(kind)?;
+    if signed {
+        let parsed = value.parse::<i128>().ok()?;
+        let bound = 1_i128 << (bits - 1);
+        (-bound..bound).contains(&parsed).then_some(parsed as u64)
+    } else {
+        let parsed = value.parse::<u64>().ok()?;
+        (bits == 64 || parsed < (1_u64 << bits)).then_some(parsed)
+    }
+}
+
+/// Parse a complete decimal integer or exactly one Unicode scalar. Parsing
+/// borrows the String without allocating or reaching a GC point. Rust's decimal
+/// parser permits a leading plus but rejects whitespace and separators.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_scalar_parse(value: *mut u8, kind: i64, output: *mut u64) -> u8 {
+    if output.is_null() {
+        return 0;
+    }
+    let parsed = parse_scalar_bits(unsafe { text(value) }, kind);
+    unsafe { *output = parsed.unwrap_or(0) };
+    u8::from(parsed.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gc::{GcRootHandle, willow_pop_roots, willow_push_root};
     use crate::string::{willow_string_as_str, willow_string_from_str};
+
+    fn scalar_parse_case(source: &str, kind: i64, expected: Option<u64>) {
+        let string = willow_string_from_str(source);
+        let allocated = crate::gc::willow_gc_total_allocated_bytes();
+        let mut output = 123;
+        assert_eq!(
+            willow_scalar_parse(string, kind, &mut output),
+            u8::from(expected.is_some()),
+            "source={source:?} kind={kind}"
+        );
+        assert_eq!(
+            output,
+            expected.unwrap_or(0),
+            "source={source:?} kind={kind}"
+        );
+        assert_eq!(crate::gc::willow_gc_total_allocated_bytes(), allocated);
+    }
+
+    #[test]
+    fn scalar_string_integer_endpoints() {
+        let _guard = crate::gc::isolated_runtime();
+        crate::gc::willow_gc_init();
+        for bits in [8, 16, 32, 64] {
+            let signed_kind = bits | 256;
+            let signed_bound = 1_i128 << (bits - 1);
+            let unsigned_bound = 1_u128 << bits;
+            for value in [-signed_bound, -1, 0, signed_bound - 1] {
+                let expected = value.to_string();
+                scalar_parse_case(&expected, signed_kind, Some(value as u64));
+                let string = willow_scalar_to_string(value as i64, signed_kind);
+                assert_eq!(unsafe { willow_string_as_str(string) }, expected);
+            }
+            for value in [-signed_bound - 1, signed_bound] {
+                scalar_parse_case(&value.to_string(), signed_kind, None);
+            }
+            for value in [0, 1, unsigned_bound - 1] {
+                let expected = value.to_string();
+                scalar_parse_case(&expected, bits, Some(value as u64));
+                let string = willow_scalar_to_string(value as i64, bits);
+                assert_eq!(unsafe { willow_string_as_str(string) }, expected);
+            }
+            scalar_parse_case(&unsigned_bound.to_string(), bits, None);
+            scalar_parse_case("-1", bits, None);
+        }
+    }
+
+    #[test]
+    fn scalar_string_rejects_malformed_decimal_without_allocating() {
+        let _guard = crate::gc::isolated_runtime();
+        crate::gc::willow_gc_init();
+        for kind in [8, 16, 32, 64, 264, 272, 288, 320] {
+            for source in [
+                "",
+                " ",
+                " 1",
+                "1 ",
+                "1\n",
+                "1_0",
+                "1.0",
+                "0x10",
+                "--1",
+                "+",
+                "-",
+                "1\0",
+                "１",
+                "18446744073709551616000000000000000000000000000000000000",
+            ] {
+                scalar_parse_case(source, kind, None);
+            }
+            scalar_parse_case("+1", kind, Some(1));
+            scalar_parse_case("0001", kind, Some(1));
+        }
+        for kind in [-1, 1, 65, 128, 512, 520] {
+            scalar_parse_case("1", kind, None);
+            assert!(willow_scalar_to_string(1, kind).is_null());
+        }
+        let mut output = 99;
+        assert_eq!(
+            willow_scalar_parse(std::ptr::null_mut(), 64, &mut output),
+            0
+        );
+        assert_eq!(output, 0);
+        assert_eq!(
+            willow_scalar_parse(std::ptr::null_mut(), 64, std::ptr::null_mut()),
+            0
+        );
+    }
+
+    #[test]
+    fn scalar_string_unicode_roundtrip_and_validation() {
+        let _guard = crate::gc::isolated_runtime();
+        crate::gc::willow_gc_init();
+        for scalar in [
+            '\0',
+            'a',
+            'é',
+            '日',
+            '\u{D7FF}',
+            '\u{E000}',
+            '🌲',
+            '\u{10FFFF}',
+        ] {
+            let expected = scalar.to_string();
+            scalar_parse_case(&expected, 0, Some(scalar as u64));
+            let string = willow_scalar_to_string(scalar as i64, 0);
+            assert_eq!(unsafe { willow_string_as_str(string) }, expected);
+        }
+        for source in ["", "ab", "é日", "e\u{301}", "\0\0"] {
+            scalar_parse_case(source, 0, None);
+        }
+        for value in [-1, 0xD800, 0xDFFF, 0x110000, 0x1_0000_0000] {
+            assert!(willow_scalar_to_string(value, 0).is_null());
+        }
+    }
 
     #[test]
     fn string_transforms_copy_counts_and_aliases() {

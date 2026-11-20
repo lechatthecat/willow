@@ -115,7 +115,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } => {
                 let owner = self.load_lir_local(function, *owner);
                 let index = self.load_lir_local(function, *index);
-                let offset = self.builder.ins().imul_imm_s(index, 8);
+                let offset = self
+                    .builder
+                    .ins()
+                    .imul_imm_s(index, i64::from(element.scalar_width()));
                 let offset = self.builder.ins().iadd_imm_s(offset, 8);
                 if self.is_inline_pair(element) {
                     // Pop clears the pair's bits, not this pointer; no-growth

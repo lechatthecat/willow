@@ -118,6 +118,7 @@ runtime_abi_schema! {
     // Stdout locking, writing and flushing can block the current OS thread.
     // Native formatting allocations do not enter the Willow GC, and I/O
     // failures are fatal rather than recoverable Willow panics.
+    IO_BLOCK; willow_print_scalar => ([I64, I64, I8] -> None);
     IO_BLOCK; willow_print_i64 => ([I64] -> None);
     IO_BLOCK; willow_println_i64 => ([I64] -> None);
     IO_BLOCK; willow_print_bool => ([I8] -> None);
@@ -144,6 +145,8 @@ runtime_abi_schema! {
     PANIC_ALLOC; willow_pow_negative_exponent => ([I64, Ptr, I32, I32] -> None);
     ALLOC; willow_f64_to_string => ([F64] -> Some(Ptr));
     ALLOC; willow_i64_to_string => ([I64] -> Some(Ptr));
+    ALLOC; willow_scalar_to_string => ([I64, I64] -> Some(Ptr));
+    NONE; willow_scalar_parse => ([Ptr, I64, Ptr] -> Some(I8));
     ALLOC; willow_bool_to_string => ([I8] -> Some(Ptr));
     ALLOC; willow_i64_parse => ([Ptr] -> Some(Ptr));
     ALLOC; willow_f64_parse => ([Ptr] -> Some(Ptr));

@@ -9,7 +9,18 @@ impl Scalar {
     pub fn aggregate(&self) -> bool {
         !matches!(
             self,
-            Self::U8 | Self::I64 | Self::F64 | Self::Bool | Self::Void
+            Self::I8
+                | Self::I16
+                | Self::I32
+                | Self::I64
+                | Self::U8
+                | Self::U16
+                | Self::U32
+                | Self::U64
+                | Self::Char
+                | Self::F64
+                | Self::Bool
+                | Self::Void
         )
     }
     pub fn pair(&self) -> bool {
@@ -163,8 +174,9 @@ impl Scalar {
             Self::Bytes if owned => writeln!(source, "let {out} = frame.bytes({value}.low).to_vec();").unwrap(),
             Self::Record(name) if owned => writeln!(source, "let {out} = decode_owned_record_{name}(&frame, {value});").unwrap(),
             Self::Opaque(name) => writeln!(source, "let {out} = frame.handle::<bridge::r#{name}>(frame.payload({value}, false).low, std::any::TypeId::of::<opaque_tags::r#{name}>());").unwrap(),
-            Self::U8 => writeln!(source, "let {out} = {value}.low as u8;").unwrap(),
-            Self::I64 => writeln!(source, "let {out} = {value}.low as i64;").unwrap(),
+            Self::I8 | Self::I16 | Self::I32 | Self::I64
+                | Self::U8 | Self::U16 | Self::U32 | Self::U64 => writeln!(source, "let {out} = {value}.low as {};", self.rust()).unwrap(),
+            Self::Char => writeln!(source, "let {out} = u32::try_from({value}.low).ok().and_then(char::from_u32).expect(\"invalid Unicode scalar at Rust boundary\");").unwrap(),
             Self::F64 => writeln!(source, "let {out} = f64::from_bits({value}.low);").unwrap(),
             Self::Bool => writeln!(source, "let {out} = {value}.low != 0;").unwrap(),
             Self::Void => writeln!(source, "let {out} = ();").unwrap(),
@@ -229,7 +241,15 @@ impl Scalar {
         *serial += 1;
         let out = format!("r{n}");
         let bits = match self {
-            Self::U8 | Self::I64 => Some(format!("{value} as u64")),
+            Self::I8
+            | Self::I16
+            | Self::I32
+            | Self::I64
+            | Self::U8
+            | Self::U16
+            | Self::U32
+            | Self::U64
+            | Self::Char => Some(format!("{value} as u64")),
             Self::F64 => Some(format!("{value}.to_bits()")),
             Self::Bool => Some(format!("u64::from({value})")),
             Self::Void => Some("0".into()),
@@ -258,7 +278,7 @@ impl Scalar {
                     writeln!(source, "let {out} = encode_record_{name}(&frame, {value});").unwrap()
                 }
                 Self::Array(t) => {
-                    writeln!(source, "let {out} = frame.array_new({value}.len(), {});\nfor (i{n}, x{n}) in {value}.into_iter().enumerate() {{", t.reference()).unwrap();
+                    writeln!(source, "let {out} = frame.array_new({value}.len(), {});\nfor (i{n}, x{n}) in {value}.into_iter().enumerate() {{", t.array_storage_flags()).unwrap();
                     let child = t.encode(source, &format!("x{n}"), serial);
                     writeln!(source, "frame.array_set({out}, i{n}, {child}); }}").unwrap();
                 }

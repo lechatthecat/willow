@@ -3,7 +3,20 @@
 use super::*;
 
 pub(super) fn scalar(ty: &Type) -> bool {
-    matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool)
+    matches!(
+        ty,
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
+            | Type::I64
+            | Type::F64
+            | Type::Bool
+    )
 }
 
 /// The builtin collection generics the walker emits, split out so eligibility
@@ -141,7 +154,19 @@ pub(super) fn assignable_repr(target: &Type, value: &Type) -> bool {
             | Type::Array(_)
             | Type::Fn(_, _)
             | Type::Closure(_, _) => true,
-            Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never => false,
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
+            | Type::I64
+            | Type::F64
+            | Type::Bool
+            | Type::Void
+            | Type::Never => false,
             Type::Named(_) | Type::Generic(_, _) => {
                 unreachable!("nominal type reached assignable representation catch-all")
             }

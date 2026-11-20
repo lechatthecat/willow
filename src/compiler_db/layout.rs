@@ -108,7 +108,19 @@ pub(crate) fn is_gc_managed(ty: &Type, named: impl FnOnce(TypeId) -> bool) -> bo
         | Type::Fn(_, _)
         | Type::Closure(_, _) => true,
         Type::Generic(name, _) => Builtin::from_name(name.name().as_ref()) != Some(Builtin::Future),
-        Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never => false,
+        Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::Char
+        | Type::U8
+        | Type::I64
+        | Type::F64
+        | Type::Bool
+        | Type::Void
+        | Type::Never => false,
     }
 }
 

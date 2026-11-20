@@ -1609,10 +1609,10 @@ impl UnitCodegenContext<'_> {
             }
         } else if let Some(bridge) = &f.rust_bridge {
             for ty in &bridge.input_types {
-                sig.params.push(crate::backend::abi::clif_abi_param(
-                    ty.abi_type().context("void Rust bridge parameter")?,
-                    ptr_ty,
-                ));
+                sig.params.push(
+                    crate::backend::abi::clif_scalar_param(ty, ptr_ty)
+                        .context("void Rust bridge parameter")?,
+                );
             }
         } else if symbol_name != USER_MAIN_SYMBOL {
             for param in &f.params {
@@ -1626,11 +1626,11 @@ impl UnitCodegenContext<'_> {
         // sync with compile_function_named.
         let force_void_main = symbol_name == USER_MAIN_SYMBOL && main_result_err_type(f).is_some();
         if let Some(bridge) = &f.rust_bridge {
-            if !bridge.aggregate()
-                && let Some(ty) = bridge.output_type.abi_type()
-            {
-                sig.returns
-                    .push(crate::backend::abi::clif_abi_param(ty, ptr_ty));
+            if !bridge.aggregate() && bridge.output_type.abi_type().is_some() {
+                sig.returns.push(
+                    crate::backend::abi::clif_scalar_param(&bridge.output_type, ptr_ty)
+                        .expect("nonvoid output"),
+                );
             }
         } else if call_return_type != Type::Void && !force_void_main {
             sig.returns
@@ -1668,22 +1668,23 @@ impl UnitCodegenContext<'_> {
             .output
             .module
             .declare_function(symbol_name, linkage, &sig)?;
-        // Willow function values use the internal scalar ABI (no bool
-        // extension attributes). A single per-declaration shim preserves that
-        // ABI while the Rust boundary uses C zero extension, including indirect
-        // calls. Non-bool signatures already agree and need no shim.
+        // Willow function values omit C integer-extension attributes. Adapt
+        // each affected declaration once, so direct and indirect calls both
+        // extend narrow scalars before entering optimized Rust code. Full-width
+        // signatures already agree and need no shim.
         let id = if f
             .rust_bridge
             .as_ref()
             .is_some_and(|bridge| bridge.aggregate())
         {
             self.declare_aggregate_bridge_shim(f, symbol_name, id)?
-        } else if f.rust_bridge.as_ref().is_some_and(|bridge| {
-            bridge
-                .input_types
-                .contains(&crate::rust_bridge_ir::Scalar::Bool)
-                || bridge.output_type == crate::rust_bridge_ir::Scalar::Bool
-        }) {
+        } else if f.rust_bridge.is_some()
+            && sig
+                .params
+                .iter()
+                .chain(&sig.returns)
+                .any(|param| param.extension != cranelift_codegen::ir::ArgumentExtension::None)
+        {
             let mut internal = sig.clone();
             for param in internal.params.iter_mut().chain(&mut internal.returns) {
                 *param = AbiParam::new(param.value_type);
@@ -1691,7 +1692,7 @@ impl UnitCodegenContext<'_> {
             let shim_name = format!("{symbol_name}_willow");
             self.claim_bridge_symbol(
                 &shim_name,
-                format!("Rust bool ABI shim `{}`", f.name),
+                format!("Rust scalar ABI shim `{}`", f.name),
                 f.span,
             )?;
             let shim =
@@ -1852,8 +1853,16 @@ impl UnitCodegenContext<'_> {
                 } else {
                     let low = if ty == types::F64 {
                         b.ins().bitcast(types::I64, MemFlagsData::new(), value)
-                    } else if ty == types::I8 {
-                        b.ins().uextend(types::I64, value)
+                    } else if ty.is_int() && ty.bits() < 64 {
+                        if f.params[i]
+                            .ty
+                            .scalar_layout()
+                            .is_some_and(|layout| layout.signed)
+                        {
+                            b.ins().sextend(types::I64, value)
+                        } else {
+                            b.ins().uextend(types::I64, value)
+                        }
                     } else {
                         value
                     };
@@ -1891,8 +1900,8 @@ impl UnitCodegenContext<'_> {
                     b.ins().iconcat(low, high)
                 } else if ty == types::F64 {
                     b.ins().bitcast(types::F64, MemFlagsData::new(), low)
-                } else if ty == types::I8 {
-                    b.ins().ireduce(types::I8, low)
+                } else if ty.is_int() && ty.bits() < 64 {
+                    b.ins().ireduce(ty, low)
                 } else {
                     low
                 };

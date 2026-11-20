@@ -89,6 +89,7 @@ mod nonnegative;
 mod option_repr;
 mod panic_effect;
 mod root_effect;
+mod scalar_codegen;
 mod stack_slots;
 mod std_collection;
 mod symbols;
@@ -2187,7 +2188,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .builder
                 .ins()
                 .bitcast(types::F64, MemFlagsData::new(), raw),
-            ty if ty.integer_layout().is_some_and(|l| l.bits < 64) => {
+            ty if ty.scalar_layout().is_some_and(|l| l.bits < 64) => {
                 let target = self.clif_type(ty);
                 self.builder.ins().ireduce(target, raw)
             }
@@ -2209,7 +2210,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .builder
                 .ins()
                 .bitcast(types::I64, MemFlagsData::new(), val),
-            ty if ty.integer_layout().is_some() => self.widen_integer(val, ty),
+            ty if ty.scalar_layout().is_some() => self.widen_integer(val, ty),
             Type::Bool => self.builder.ins().uextend(types::I64, val),
             _ => val,
         }
@@ -2391,7 +2392,15 @@ fn reference_index_name(expr: &Expr) -> String {
 
 fn channel_runtime_symbol(ty: &Type, symbols: [&'static str; 4]) -> &'static str {
     symbols[match ty {
-        Type::U8 | Type::I64 => 0,
+        Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::Char
+        | Type::U8
+        | Type::I64 => 0,
         Type::Bool => 1,
         Type::F64 => 2,
         _ => 3,

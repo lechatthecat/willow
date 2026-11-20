@@ -626,6 +626,11 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Integer(n, span, ExprId::fresh()))
             }
+            TokenKind::CharLiteral(n) => {
+                let span = self.current_span();
+                self.advance();
+                Ok(Expr::Char(n, span, ExprId::fresh()))
+            }
             TokenKind::Float(f) => {
                 let span = self.current_span();
                 self.advance();
@@ -702,14 +707,17 @@ impl Parser {
             TokenKind::Select => self.parse_select(),
             TokenKind::If => self.parse_if_expr(),
             TokenKind::Match => self.parse_match_expr(),
-            TokenKind::U8 | TokenKind::F64 | TokenKind::I64 => {
-                let name = if matches!(self.peek_kind(), TokenKind::U8) {
-                    "u8"
-                } else if matches!(self.peek_kind(), TokenKind::I64) {
-                    "i64"
-                } else {
-                    "f64"
-                };
+            TokenKind::I8
+            | TokenKind::I16
+            | TokenKind::I32
+            | TokenKind::I64
+            | TokenKind::U8
+            | TokenKind::U16
+            | TokenKind::U32
+            | TokenKind::U64
+            | TokenKind::Char
+            | TokenKind::F64 => {
+                let name = self.peek_kind().keyword_name().unwrap();
                 let span = self.current_span();
                 self.advance();
                 if self.eat(TokenKind::ColonColon) {

@@ -48,7 +48,22 @@ impl Leaf {
         target: FuncId,
         owner: LeafOwner,
     ) -> Option<Self> {
-        let scalar = |ty: &Type| matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool);
+        let scalar = |ty: &Type| {
+            matches!(
+                ty,
+                Type::I8
+                    | Type::I16
+                    | Type::I32
+                    | Type::U16
+                    | Type::U32
+                    | Type::U64
+                    | Type::Char
+                    | Type::U8
+                    | Type::I64
+                    | Type::F64
+                    | Type::Bool
+            )
+        };
         if function.is_async
             || !function.captures.is_empty()
             || function.blocks.len() != 1
@@ -152,10 +167,36 @@ impl FuncGen<'_, '_> {
         if self.reuse.indirect_leaf_promoted
             || self.indirect_leaves.0.is_empty()
             || params.len() > 8
-            || !matches!(result, Type::U8 | Type::I64 | Type::F64 | Type::Bool)
-            || params
-                .iter()
-                .any(|ty| !matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool))
+            || !matches!(
+                result,
+                Type::I8
+                    | Type::I16
+                    | Type::I32
+                    | Type::U16
+                    | Type::U32
+                    | Type::U64
+                    | Type::Char
+                    | Type::U8
+                    | Type::I64
+                    | Type::F64
+                    | Type::Bool
+            )
+            || params.iter().any(|ty| {
+                !matches!(
+                    ty,
+                    Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::Char
+                        | Type::U8
+                        | Type::I64
+                        | Type::F64
+                        | Type::Bool
+                )
+            })
         {
             return self.emit_lir_indirect_call(signature, word, args, name, span);
         }

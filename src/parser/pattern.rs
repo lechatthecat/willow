@@ -55,6 +55,10 @@ impl Parser {
                 self.advance();
                 Ok(Pattern::LiteralInt(n, span, PatternId::fresh()))
             }
+            TokenKind::CharLiteral(n) => {
+                self.advance();
+                Ok(Pattern::LiteralChar(n, span, PatternId::fresh()))
+            }
             TokenKind::StringLiteral(_) => Err(self
                 .err(
                     ErrorCode::E0102,

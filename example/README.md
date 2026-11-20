@@ -431,3 +431,34 @@ leading/trailing whitespace), separators, radix prefixes, non-ASCII digits and
 overflow return `ParseIntError::Invalid(String)`. Trim input explicitly if desired.
 The error string describes the failure; callers should match the variant rather
 than depend on its exact wording.
+
+## Integer widths and Unicode scalars
+
+[scalar_widths.wi](scalar_widths.wi) uses `i8`, `i16`, `i32`, `u16`, `u32`,
+`u64`, and `char`, alongside `u8`, `i64`, and `f64`. This extension retains
+`f64` as the floating-point type; it does not introduce `f32`.
+
+Integer literals use their expected type, otherwise `i64`. Decimal and radix
+literals support the complete `u64` range when that type is expected. Types
+never widen implicitly. `value.to_i32()` (and other integer destinations)
+is available when every source value fits; `checked_to_i32()` returns an
+`Option`, and `wrapping_to_i32()` keeps the low destination bits. These
+conversions share one implementation across widths. Ordinary arithmetic
+panics on overflow in debug and wraps in release; `wrapping_*` and `checked_*`
+methods retain their behavior in both modes. Division by zero and signed
+minimum divided or reduced modulo `-1` panic in both modes.
+
+Character literals contain one Unicode scalar, for example `'猫'`, `'🌲'`,
+`'\n'`, or `'\u{10ffff}'`. Surrogates are invalid. Characters support
+comparison and display; arithmetic requires an explicit integer conversion.
+`number.checked_to_char()` validates a code point and `character.to_u32()`
+returns it. `text.parse_char()` accepts exactly one scalar. For integers,
+`text.parse_u16()` and the corresponding width methods return `Option`;
+parsing consumes the whole decimal string and rejects whitespace and overflow.
+`to_string()` emits decimal integers or UTF-8 characters.
+
+Arrays, including fixed arrays and generic instantiations, store integer and
+character elements at their native widths (char uses four bytes). Array
+operations share the same implementation for every width. Other element types
+retain their storage representation. Rust bridges preserve each scalar type,
+with checked Unicode conversion through a `u32` wire representation for char.

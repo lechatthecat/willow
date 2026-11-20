@@ -278,7 +278,7 @@ impl TypeChecker {
     fn check_expr_expecting_inner(&mut self, expr: &Expr, expected: &Type) -> Type {
         if let Some(layout) = expected.integer_layout() {
             if let Expr::Integer(value, span, _) = expr {
-                if !layout.contains(i128::from(*value)) {
+                if !layout.contains(*value) {
                     self.push_error(
                         ErrorCode::E0201,
                         format!(
@@ -1279,7 +1279,18 @@ impl TypeChecker {
                 _ => {
                     if !matches!(
                         ty,
-                        Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+                        Type::I8
+                            | Type::I16
+                            | Type::I32
+                            | Type::U16
+                            | Type::U32
+                            | Type::U64
+                            | Type::Char
+                            | Type::U8
+                            | Type::I64
+                            | Type::F64
+                            | Type::Bool
+                            | Type::String
                     ) {
                         self.push(
                             Diagnostic::new(

@@ -196,6 +196,7 @@ impl<'a> Lexer<'a> {
                 }
             }
             b'"' => return self.lex_string().map(Some),
+            b'\'' => return self.lex_char().map(Some),
             b'@' => {
                 self.advance();
                 TokenKind::At
@@ -299,7 +300,42 @@ impl<'a> Lexer<'a> {
         .with_label(Label::primary(span, "string starts here but never ends"))
     }
 
-    /// Byte literals use the existing i64 representation (0..=255).
+    /// Scan once without allocating, including malformed long literals.
+    fn lex_char(&mut self) -> Result<TokenKind, Diagnostic> {
+        let start = self.pos;
+        let line = self.line;
+        let col = self.col;
+        self.advance();
+        let body_start = self.pos;
+        while let Some(byte) = self.peek() {
+            if matches!(byte, b'\n' | b'\r') {
+                break;
+            }
+            if byte == b'\'' {
+                let end = self.pos;
+                self.advance();
+                if let Some(value) = char_literal_value(&self.src[body_start..end]) {
+                    return Ok(TokenKind::CharLiteral(value));
+                }
+                break;
+            }
+            self.advance_char();
+            if byte == b'\\' && !matches!(self.peek(), None | Some(b'\n' | b'\r')) {
+                self.advance_char();
+            }
+        }
+        Err(Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0050,
+            "invalid character literal",
+        )
+        .with_label(Label::primary(
+            self.span_at(start, self.pos, line, col),
+            "expected exactly one Unicode scalar value or a valid escape",
+        )))
+    }
+
+    /// Byte literals remain contextually typed integers (0..=255).
     /// Scan once, retaining only offsets even for malformed long literals.
     fn lex_byte(&mut self) -> Result<TokenKind, Diagnostic> {
         let start = self.pos;
@@ -331,7 +367,7 @@ impl<'a> Lexer<'a> {
                     _ => None,
                 };
                 return value
-                    .map(|b| TokenKind::Integer(i64::from(b)))
+                    .map(|b| TokenKind::Integer(i128::from(b)))
                     .ok_or_else(|| self.err_byte_literal(start, line, col));
             }
             self.advance_char();
@@ -405,8 +441,8 @@ impl<'a> Lexer<'a> {
     ///   directly after a radix prefix (`0x_FF`); a leading, trailing or
     ///   doubled `_` is rejected. Decimal integers and both halves of a float
     ///   accept separators too.
-    /// - An integer literal must fit `i64` whatever its radix, so
-    ///   `0xFFFF_FFFF_FFFF_FFFF` is out of range rather than `-1` (as in Rust).
+    /// - An integer magnitude must fit `u64`; checking later applies the
+    ///   contextual type or the default `i64` range without discarding bits.
     /// - A decimal literal with a fraction or an exponent (`1e3`, `2.5E-4`) is
     ///   an `f64`. Its value is the runtime `f64::parse` of
     ///   the text without separators; a value that rounds to infinity is E0055.
@@ -486,8 +522,8 @@ impl<'a> Lexer<'a> {
             return Ok(TokenKind::Float(f));
         }
         let s = &self.src[start..self.pos];
-        // A digit sequence that overflows `i64` was previously silently parsed
-        // as 0, miscompiling the program. Report it as a source-aware error.
+        // Preserve the full unsigned magnitude until contextual type checking.
+        // Values beyond every supported integer type remain lexical errors.
         match scan_digits(s.as_bytes(), 10) {
             Ok(n) => Ok(TokenKind::Integer(n)),
             Err(err) => Err(self.err_numeric_literal(err, s, 10, start, line, col)),
@@ -598,27 +634,16 @@ impl<'a> Lexer<'a> {
             _ => ("decimal", "", "`0`-`9`"),
         };
         match err {
-            NumberError::OutOfRange => {
-                let diag = Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0052,
-                    format!("integer literal `{lit}` out of range for `i64`"),
-                )
-                .with_label(Label::primary(span, "value does not fit in `i64`"))
-                .with_help(format!(
-                    "`i64` values range from {} to {}",
-                    i64::MIN,
-                    i64::MAX
-                ));
-                if radix == 10 {
-                    diag
-                } else {
-                    diag.with_help(
-                        "a literal cannot set the sign bit; write all bits set as `!0` \
-                         and the sign bit as `1 << 63`",
-                    )
-                }
-            }
+            NumberError::OutOfRange => Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0052,
+                format!("integer literal `{lit}` out of range for `u64`"),
+            )
+            .with_label(Label::primary(span, "value does not fit in `u64`"))
+            .with_help(format!(
+                "integer literal magnitudes range from 0 to {}",
+                u64::MAX
+            )),
             NumberError::InvalidDigit(offset) => {
                 let digit = lit.as_bytes()[offset] as char;
                 let span = self.span_at(start + offset, start + offset + 1, line, col + offset);
@@ -744,6 +769,13 @@ impl<'a> Lexer<'a> {
             "enum" => TokenKind::Enum,
             "const" => TokenKind::Const,
             "i64" => TokenKind::I64,
+            "i8" => TokenKind::I8,
+            "i16" => TokenKind::I16,
+            "i32" => TokenKind::I32,
+            "u16" => TokenKind::U16,
+            "u32" => TokenKind::U32,
+            "u64" => TokenKind::U64,
+            "char" => TokenKind::Char,
             "u8" => TokenKind::U8,
             "f64" => TokenKind::F64,
             "bool" => TokenKind::Bool,
@@ -865,6 +897,44 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// Decode only after the scanner has found the matching quote. No input-sized
+/// buffer or recursive escape parser is needed.
+fn char_literal_value(body: &str) -> Option<char> {
+    if let Some(escape) = body.strip_prefix('\\') {
+        return match escape {
+            "n" => Some('\n'),
+            "r" => Some('\r'),
+            "t" => Some('\t'),
+            "e" => Some('\u{1b}'),
+            "0" => Some('\0'),
+            "\\" => Some('\\'),
+            "'" => Some('\''),
+            "\"" => Some('"'),
+            _ => {
+                let digits = if let Some(hex) = escape.strip_prefix('x') {
+                    if hex.len() != 2 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return None;
+                    }
+                    let value = u32::from_str_radix(hex, 16).ok()?;
+                    return char::from_u32(value).filter(|_| value <= 0x7f);
+                } else {
+                    escape.strip_prefix("u{")?.strip_suffix('}')?
+                };
+                if digits.is_empty()
+                    || digits.len() > 6
+                    || !digits.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    return None;
+                }
+                char::from_u32(u32::from_str_radix(digits, 16).ok()?)
+            }
+        };
+    }
+    let mut chars = body.chars();
+    let value = chars.next()?;
+    (chars.next().is_none() && !value.is_control()).then_some(value)
+}
+
 /// Why a float literal is malformed beyond its digit runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FloatError {
@@ -876,7 +946,7 @@ enum FloatError {
     OutOfRange,
 }
 
-/// Why a digit sequence is not a valid `i64` literal.
+/// Why a digit sequence is not a valid integer magnitude.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NumberError {
     /// Byte offset of the first byte that is not a digit of the radix.
@@ -891,8 +961,8 @@ enum NumberError {
 /// returns their value in one pass. Errors are reported in priority order:
 /// the first invalid digit, then an empty body, then a misplaced separator,
 /// then overflow, so the diagnostic names the most specific problem.
-fn scan_digits(digits: &[u8], radix: u32) -> Result<i64, NumberError> {
-    let mut value: i64 = 0;
+fn scan_digits(digits: &[u8], radix: u32) -> Result<i128, NumberError> {
+    let mut value: u64 = 0;
     let mut overflow = false;
     let mut count = 0usize;
     let mut misplaced = false;
@@ -910,8 +980,8 @@ fn scan_digits(digits: &[u8], radix: u32) -> Result<i64, NumberError> {
         };
         count += 1;
         match value
-            .checked_mul(radix as i64)
-            .and_then(|v| v.checked_add(d as i64))
+            .checked_mul(u64::from(radix))
+            .and_then(|v| v.checked_add(u64::from(d)))
         {
             Some(v) => value = v,
             None => overflow = true,
@@ -924,7 +994,7 @@ fn scan_digits(digits: &[u8], radix: u32) -> Result<i64, NumberError> {
     } else if overflow {
         Err(NumberError::OutOfRange)
     } else {
-        Ok(value)
+        Ok(i128::from(value))
     }
 }
 
@@ -1113,7 +1183,7 @@ mod tests {
     fn integer_i64_max_ok() {
         assert_eq!(
             kinds("9223372036854775807").unwrap(),
-            vec![TokenKind::Integer(i64::MAX)]
+            vec![TokenKind::Integer(i128::from(i64::MAX))]
         );
     }
 
@@ -1159,10 +1229,10 @@ mod tests {
         assert!(d.message.contains("out of range"));
     }
 
-    // Perspective 19: `i64::MAX + 1` is rejected (boundary).
+    // Perspective 19: `u64::MAX + 1` is rejected (boundary).
     #[test]
     fn integer_one_past_max_is_error() {
-        let d = first_error("9223372036854775808");
+        let d = first_error("18446744073709551616");
         assert_eq!(d.code, ErrorCode::E0052);
     }
 
@@ -1173,7 +1243,7 @@ mod tests {
         assert_eq!(d.code, ErrorCode::E0052);
     }
 
-    // Perspective 21: the overflow error help mentions the i64 range.
+    // Perspective 21: the overflow error help mentions the integer magnitude range.
     #[test]
     fn integer_overflow_help_mentions_range() {
         let d = first_error("99999999999999999999");
@@ -1208,7 +1278,7 @@ mod tests {
     fn block_comment_then_max_integer() {
         assert_eq!(
             kinds("/* c */ 9223372036854775807").unwrap(),
-            vec![TokenKind::Integer(i64::MAX)]
+            vec![TokenKind::Integer(i128::from(i64::MAX))]
         );
     }
 
@@ -1436,7 +1506,7 @@ mod tests {
 
     // ── Radix prefixes and digit separators ─────────────────
 
-    fn ints(src: &str) -> Vec<i64> {
+    fn ints(src: &str) -> Vec<i128> {
         kinds(src)
             .unwrap()
             .into_iter()
@@ -1463,30 +1533,25 @@ mod tests {
     #[test]
     fn radix_03_i64_max_in_every_radix() {
         let max = format!("0b{:b} 0o{:o} 0x7FFF_FFFF_FFFF_FFFF", i64::MAX, i64::MAX);
-        assert_eq!(ints(&max), vec![i64::MAX; 3]);
+        assert_eq!(ints(&max), vec![i128::from(i64::MAX); 3]);
     }
 
-    // Radix 4: one past `i64::MAX` is E0052 in every radix; the sign-bit help
-    // explains how to spell such masks.
+    // Radix 4: the signed high bit remains a positive source magnitude.
     #[test]
-    fn radix_04_sign_bit_is_out_of_range() {
+    fn radix_04_sign_bit_preserves_magnitude() {
         for src in [
             "0x8000_0000_0000_0000",
             "0o1000000000000000000000",
             "0b1000000000000000000000000000000000000000000000000000000000000000",
         ] {
-            let d = first_error(src);
-            assert_eq!(d.code, ErrorCode::E0052, "{src}");
-            assert!(d.helps.iter().any(|h| h.contains("!0")), "{src}");
+            assert_eq!(ints(src), vec![1_i128 << 63], "{src}");
         }
     }
 
-    // Radix 5: all bits set is rejected rather than wrapping to -1 (as Rust).
+    // Radix 5: all bits set is the u64 maximum, never a signed -1.
     #[test]
-    fn radix_05_all_bits_set_is_rejected() {
-        let d = first_error("0xFFFF_FFFF_FFFF_FFFF");
-        assert_eq!(d.code, ErrorCode::E0052);
-        assert!(d.message.contains("0xFFFF_FFFF_FFFF_FFFF"));
+    fn radix_05_all_bits_set_preserves_magnitude() {
+        assert_eq!(ints("0xFFFF_FFFF_FFFF_FFFF"), vec![i128::from(u64::MAX)]);
     }
 
     // Radix 6: very long hex bodies are rejected without panicking.
@@ -1608,7 +1673,10 @@ mod tests {
     fn separator_19_decimal_overflow_with_separators() {
         let d = first_error("9_223_372_036_854_775_808");
         assert_eq!(d.code, ErrorCode::E0052);
-        assert_eq!(ints("9_223_372_036_854_775_807"), vec![i64::MAX]);
+        assert_eq!(
+            ints("9_223_372_036_854_775_807"),
+            vec![i128::from(i64::MAX)]
+        );
     }
 
     // Radix 20: a prefixed literal stops at `.`, operators and delimiters, and
@@ -1641,7 +1709,7 @@ mod tests {
     // errors too.
     #[test]
     fn radix_21_recovers_after_error() {
-        let errs = Lexer::new("0b2 + 0xFFFF_FFFF_FFFF_FFFF + 0x")
+        let errs = Lexer::new("0b2 + 0x1_0000_0000_0000_0000 + 0x")
             .tokenize()
             .unwrap_err();
         let codes: Vec<_> = errs.iter().map(|d| d.code).collect();
@@ -1877,6 +1945,120 @@ mod tests {
             floats("0e0 0.0e-5 0e99999999999999999999"),
             vec![0.0, 0.0, 0.0]
         );
+    }
+}
+
+#[cfg(test)]
+mod scalar_literal_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_integer_full_unsigned_range() {
+        for source in [
+            "18446744073709551615".to_owned(),
+            "18_446_744_073_709_551_615".to_owned(),
+            format!("0x{:x}", u64::MAX),
+            format!("0o{:o}", u64::MAX),
+            format!("0b{:b}", u64::MAX),
+        ] {
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            assert_eq!(tokens[0].kind, TokenKind::Integer(i128::from(u64::MAX)));
+        }
+        let tokens = Lexer::new("-9223372036854775808").tokenize().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Minus);
+        assert_eq!(tokens[1].kind, TokenKind::Integer(1_i128 << 63));
+    }
+
+    #[test]
+    fn scalar_integer_overflow_and_error_priority() {
+        for source in [
+            "18446744073709551616".to_owned(),
+            format!("0x{:x}", 1_u128 << 64),
+            format!("0o{:o}", 1_u128 << 64),
+            format!("0b{:b}", 1_u128 << 64),
+            "9".repeat(10000),
+        ] {
+            let errors = Lexer::new(&source).tokenize().unwrap_err();
+            assert_eq!(errors.diagnostics[0].code, ErrorCode::E0052);
+        }
+        for source in ["0x10000000000000000G", "18446744073709551616_", "0b222"] {
+            let errors = Lexer::new(source).tokenize().unwrap_err();
+            assert_eq!(errors.diagnostics[0].code, ErrorCode::E0054);
+        }
+    }
+
+    #[test]
+    fn scalar_character_unicode_and_escapes() {
+        for (source, value) in [
+            ("'a'", 'a'),
+            ("'é'", 'é'),
+            ("'🌲'", '🌲'),
+            ("' '", ' '),
+            (r"'\0'", '\0'),
+            (r"'\n'", '\n'),
+            (r"'\r'", '\r'),
+            (r"'\t'", '\t'),
+            (r"'\e'", '\u{1b}'),
+            (r"'\\'", '\\'),
+            (r"'\''", '\''),
+            (r#"'\"'"#, '"'),
+            (r"'\x7f'", '\u{7f}'),
+            (r"'\u{0}'", '\0'),
+            (r"'\u{d7ff}'", '\u{d7ff}'),
+            (r"'\u{e000}'", '\u{e000}'),
+            (r"'\u{10ffff}'", '\u{10ffff}'),
+        ] {
+            let tokens = Lexer::new(source).tokenize().unwrap();
+            assert_eq!(tokens[0].kind, TokenKind::CharLiteral(value), "{source}");
+            assert_eq!(tokens[0].span.start, 0);
+            assert_eq!(tokens[0].span.end, source.len());
+        }
+    }
+
+    #[test]
+    fn scalar_character_rejects_invalid_scalars_and_escapes() {
+        for source in [
+            "''",
+            "'ab'",
+            "'é'",
+            "'",
+            "'a",
+            "'\n'",
+            "'\r'",
+            "'\t'",
+            r"'\q'",
+            r"'\x'",
+            r"'\x1'",
+            r"'\x80'",
+            r"'\xff'",
+            r"'\xgg'",
+            r"'\u{}'",
+            r"'\u{d800}'",
+            r"'\u{dfff}'",
+            r"'\u{110000}'",
+            r"'\u{0000000}'",
+            r"'\u{1_2}'",
+            r"'\u{gg}'",
+            r"'\u{12'",
+        ] {
+            let errors = Lexer::new(source).tokenize().unwrap_err();
+            assert_eq!(errors.diagnostics[0].code, ErrorCode::E0050, "{source}");
+        }
+        let source = format!("'{}'", "a".repeat(10000));
+        assert!(Lexer::new(&source).tokenize().is_err());
+    }
+
+    #[test]
+    fn scalar_character_recovers_and_preserves_byte_literals() {
+        let mut lexer = Lexer::new("'bad\n42");
+        assert!(lexer.next_token().is_err());
+        lexer.skip_whitespace_and_comments().unwrap();
+        assert_eq!(lexer.next_token().unwrap(), Some(TokenKind::Integer(42)));
+        let tokens = Lexer::new("'é' b'a' char").tokenize().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::CharLiteral('é'));
+        assert_eq!(tokens[1].kind, TokenKind::Integer(97));
+        assert_eq!(tokens[2].kind, TokenKind::Char);
+        assert_eq!(tokens[1].span.col, 5);
     }
 }
 

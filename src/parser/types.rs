@@ -36,10 +36,26 @@ impl Parser {
         let mut frames = Vec::new();
         loop {
             let type_start = self.current_span();
-            if let TokenKind::U8 | TokenKind::I64 | TokenKind::F64 | TokenKind::Bool =
-                self.peek_kind()
+            if let TokenKind::I8
+            | TokenKind::I16
+            | TokenKind::I32
+            | TokenKind::U16
+            | TokenKind::U32
+            | TokenKind::U64
+            | TokenKind::Char
+            | TokenKind::U8
+            | TokenKind::I64
+            | TokenKind::F64
+            | TokenKind::Bool = self.peek_kind()
             {
                 let name = match self.peek_kind() {
+                    TokenKind::I8 => "i8",
+                    TokenKind::I16 => "i16",
+                    TokenKind::I32 => "i32",
+                    TokenKind::U16 => "u16",
+                    TokenKind::U32 => "u32",
+                    TokenKind::U64 => "u64",
+                    TokenKind::Char => "char",
                     TokenKind::U8 => "u8",
                     TokenKind::I64 => "i64",
                     TokenKind::F64 => "f64",
@@ -55,6 +71,34 @@ impl Parser {
                     self.advance();
                     frames.push(Frame::FixedArray);
                     continue;
+                }
+                TokenKind::I8 => {
+                    self.advance();
+                    Type::I8
+                }
+                TokenKind::I16 => {
+                    self.advance();
+                    Type::I16
+                }
+                TokenKind::I32 => {
+                    self.advance();
+                    Type::I32
+                }
+                TokenKind::U16 => {
+                    self.advance();
+                    Type::U16
+                }
+                TokenKind::U32 => {
+                    self.advance();
+                    Type::U32
+                }
+                TokenKind::U64 => {
+                    self.advance();
+                    Type::U64
+                }
+                TokenKind::Char => {
+                    self.advance();
+                    Type::Char
                 }
                 TokenKind::U8 => {
                     self.advance();

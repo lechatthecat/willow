@@ -13,7 +13,7 @@ pub class HashSet<T> {
         self.slots = Map::new();
     }
 
-    pub static fn from_array(values: Array<T>) -> HashSet<T> where T: u8 | i64 | f64 | bool | String {
+    pub static fn from_array(values: Array<T>) -> HashSet<T> where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | bool | String {
         let set: HashSet<T> = new HashSet();
         for index in 0..values.len() { set.insert(values[index]); }
         return set;
@@ -24,7 +24,7 @@ pub class HashSet<T> {
 
     // Returns true when value was not already present. Panics on NaN, which
     // equals no value.
-    pub fn insert(value: T) -> bool where T: u8 | i64 | f64 | bool | String {
+    pub fn insert(value: T) -> bool where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | bool | String {
         if value != value { panic("HashSet element must not be NaN"); }
         if self.slots.contains(value) { return false; }
         self.slots.insert(value, self.elements.len());
@@ -33,13 +33,13 @@ pub class HashSet<T> {
     }
 
     // NaN is never an element (insert rejects it), so it is never found.
-    pub fn contains(value: T) -> bool where T: u8 | i64 | f64 | bool | String {
+    pub fn contains(value: T) -> bool where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | bool | String {
         if value != value { return false; }
         return self.slots.contains(value);
     }
 
     // Returns true when value was present; false for NaN.
-    pub fn remove(value: T) -> bool where T: u8 | i64 | f64 | bool | String {
+    pub fn remove(value: T) -> bool where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | bool | String {
         if value != value { return false; }
         if let Some(slot) = self.slots.remove(value) {
             let last = self.elements.pop();
@@ -64,13 +64,13 @@ pub class HashSet<T> {
     }
 
     // Set algebra is O(len(self) + len(other)) expected.
-    pub fn union(other: HashSet<T>) -> HashSet<T> where T: u8 | i64 | f64 | bool | String {
+    pub fn union(other: HashSet<T>) -> HashSet<T> where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | bool | String {
         let result = self.copy();
         for index in 0..other.elements.len() { result.insert(other.elements[index]); }
         return result;
     }
 
-    pub fn intersection(other: HashSet<T>) -> HashSet<T> where T: u8 | i64 | f64 | bool | String {
+    pub fn intersection(other: HashSet<T>) -> HashSet<T> where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | bool | String {
         let result: HashSet<T> = new HashSet();
         for index in 0..self.elements.len() {
             let value = self.elements[index];
@@ -79,7 +79,7 @@ pub class HashSet<T> {
         return result;
     }
 
-    pub fn difference(other: HashSet<T>) -> HashSet<T> where T: u8 | i64 | f64 | bool | String {
+    pub fn difference(other: HashSet<T>) -> HashSet<T> where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | bool | String {
         let result: HashSet<T> = new HashSet();
         for index in 0..self.elements.len() {
             let value = self.elements[index];
@@ -88,7 +88,7 @@ pub class HashSet<T> {
         return result;
     }
 
-    pub fn is_subset(other: HashSet<T>) -> bool where T: u8 | i64 | f64 | bool | String {
+    pub fn is_subset(other: HashSet<T>) -> bool where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | bool | String {
         if self.elements.len() > other.elements.len() { return false; }
         for index in 0..self.elements.len() {
             if !other.slots.contains(self.elements[index]) { return false; }
@@ -96,14 +96,14 @@ pub class HashSet<T> {
         return true;
     }
 
-    pub fn copy() -> HashSet<T> where T: u8 | i64 | f64 | bool | String {
+    pub fn copy() -> HashSet<T> where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | bool | String {
         let result: HashSet<T> = new HashSet();
         for index in 0..self.elements.len() { result.insert(self.elements[index]); }
         return result;
     }
 
     // Ascending elements, formatted like Map::to_string: {1, 2, 3}. O(n log n).
-    pub fn to_string() -> String where T: u8 | i64 | f64 | bool | String {
+    pub fn to_string() -> String where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | bool | String {
         let values = self.slots.keys();
         let parts = ["{"];
         for index in 0..values.len() {

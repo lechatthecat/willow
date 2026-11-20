@@ -4,8 +4,8 @@ import std::collections::Array;
 // node"). insert is amortized O(log n) because the arrays grow; get, contains,
 // remove, first/last and floor/ceiling are O(log n) key comparisons.
 // keys(), values() and entries() are O(n) in ascending key order;
-// range_keys(from, to) is O(log n + m) for m returned keys. Keys are u8, i64, f64
-// or String; a NaN key panics because it has no place in the order.
+// range_keys(from, to) is O(log n + m) for m returned keys. Keys are integers,
+// char, f64 or String; a NaN key panics because it has no place in the order.
 pub class SortedMap<K, V> {
     node_keys: Array<K>;
     node_values: Array<V>;
@@ -38,23 +38,23 @@ pub class SortedMap<K, V> {
     }
 
     // Adds key or replaces its value, like Map::insert.
-    pub fn insert(key: K, value: V) where K: u8 | i64 | f64 | String {
+    pub fn insert(key: K, value: V) where K: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | String {
         if key != key { panic("SortedMap key must not be NaN"); }
         self.root = self.insert_at(self.root, key, value);
     }
 
-    pub fn get(key: K) -> Option<V> where K: u8 | i64 | f64 | String {
+    pub fn get(key: K) -> Option<V> where K: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | String {
         let node = self.find(key);
         if node < 0 { return None; }
         return Some(self.node_values[node]);
     }
 
-    pub fn contains(key: K) -> bool where K: u8 | i64 | f64 | String {
+    pub fn contains(key: K) -> bool where K: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | String {
         return self.find(key) >= 0;
     }
 
     // Removes key and returns its value, like Map::remove.
-    pub fn remove(key: K) -> Option<V> where K: u8 | i64 | f64 | String {
+    pub fn remove(key: K) -> Option<V> where K: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | String {
         let node = self.find(key);
         if node < 0 { return None; }
         let value = self.node_values[node];
@@ -78,7 +78,7 @@ pub class SortedMap<K, V> {
     }
 
     // Greatest key <= key; None for a NaN key.
-    pub fn floor_key(key: K) -> Option<K> where K: u8 | i64 | f64 | String {
+    pub fn floor_key(key: K) -> Option<K> where K: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | String {
         if key != key { return None; }
         let mut node = self.root;
         let mut best = -1;
@@ -95,7 +95,7 @@ pub class SortedMap<K, V> {
     }
 
     // Least key >= key; None for a NaN key.
-    pub fn ceiling_key(key: K) -> Option<K> where K: u8 | i64 | f64 | String {
+    pub fn ceiling_key(key: K) -> Option<K> where K: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | String {
         if key != key { return None; }
         let mut node = self.root;
         let mut best = -1;
@@ -137,7 +137,7 @@ pub class SortedMap<K, V> {
 
     // Ascending keys in the half-open range [from, to); empty when either
     // bound is NaN.
-    pub fn range_keys(from: K, to: K) -> Array<K> where K: u8 | i64 | f64 | String {
+    pub fn range_keys(from: K, to: K) -> Array<K> where K: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | String {
         let result: Array<K> = Array::new();
         if from != from || to != to { return result; }
         let stack: Array<i64> = Array::new();
@@ -168,7 +168,7 @@ pub class SortedMap<K, V> {
     }
 
     // NaN equals no stored key (insert rejects it), so it is never found.
-    fn find(key: K) -> i64 where K: u8 | i64 | f64 | String {
+    fn find(key: K) -> i64 where K: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | String {
         if key != key { return -1; }
         let mut node = self.root;
         while node >= 0 {
@@ -201,7 +201,7 @@ pub class SortedMap<K, V> {
         return result;
     }
 
-    fn insert_at(node: i64, key: K, value: V) -> i64 where K: u8 | i64 | f64 | String {
+    fn insert_at(node: i64, key: K, value: V) -> i64 where K: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | String {
         if node < 0 {
             let slot = self.node_keys.len();
             self.node_keys.push(key);
@@ -227,7 +227,7 @@ pub class SortedMap<K, V> {
 
     // Unlinks key (known to be present) and records the vacated slot in
     // self.freed; returns the new subtree root.
-    fn remove_at(node: i64, key: K) -> i64 where K: u8 | i64 | f64 | String {
+    fn remove_at(node: i64, key: K) -> i64 where K: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | String {
         let current = self.node_keys[node];
         if key < current {
             let child = self.remove_at(self.left[node], key);
@@ -256,7 +256,7 @@ pub class SortedMap<K, V> {
 
     // Keeps storage dense: the last slot moves into the vacated one and its
     // parent link (found by one key search) is redirected. O(log n).
-    fn compact(vacated: i64) where K: u8 | i64 | f64 | String {
+    fn compact(vacated: i64) where K: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | String {
         let last = self.node_keys.len() - 1;
         if vacated != last {
             let key = self.node_keys[last];

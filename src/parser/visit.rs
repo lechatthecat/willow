@@ -179,6 +179,7 @@ pub fn walk_stmt<V: AstVisitor + ?Sized>(visitor: &mut V, stmt: &Stmt) {
 pub fn walk_expr<V: AstVisitor + ?Sized>(visitor: &mut V, expr: &Expr) {
     match expr {
         Expr::Integer(..)
+        | Expr::Char(..)
         | Expr::Float(..)
         | Expr::Bool(..)
         | Expr::String(..)
@@ -306,7 +307,10 @@ pub fn walk_lambda<V: AstVisitor + ?Sized>(visitor: &mut V, lambda: &LambdaExpr)
 /// Bind every name a pattern introduces. `_` is a hole, not a name.
 pub fn walk_pattern<V: AstVisitor + ?Sized>(visitor: &mut V, pattern: &Pattern) {
     match pattern {
-        Pattern::Wildcard(_, _) | Pattern::LiteralBool(..) | Pattern::LiteralInt(..) => {}
+        Pattern::Wildcard(_, _)
+        | Pattern::LiteralBool(..)
+        | Pattern::LiteralInt(..)
+        | Pattern::LiteralChar(..) => {}
         Pattern::Binding { name, .. } => visitor.bind(name),
         Pattern::EnumVariant { .. } => {}
         Pattern::EnumVariantTuple { .. } | Pattern::ClassDowncast { .. } => {

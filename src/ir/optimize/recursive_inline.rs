@@ -17,7 +17,22 @@ pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_ch
     const MAX_DEPTH: u32 = 3;
     const MAX_INSTRUCTIONS: usize = 256;
     const MAX_BLOCKS: usize = 64;
-    let scalar = |ty: &Type| matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool);
+    let scalar = |ty: &Type| {
+        matches!(
+            ty,
+            Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::Char
+                | Type::U8
+                | Type::I64
+                | Type::F64
+                | Type::Bool
+        )
+    };
     if function.is_async
         || !function.captures.is_empty()
         || !scalar(&function.return_type)
