@@ -11,6 +11,8 @@ Willow is statically typed and compiles to native code using [Cranelift](https:/
 
 Its premise is simple: **when a person or an AI agent changes a program, the compiler should do more than check syntax and types. It should reject certain unsafe behaviors and explain the program's semantics in a form the agent can use.**
 
+**Keep declared properties intact as code changes.** Effect analysis also lets developers express requirements as compiler-checked contracts. With [`@effects(...)`](#effect-contracts-declare-the-property-on-any-function), an AI agent can change an implementation while the compiler checks that it still satisfies the declared restrictions, such as no I/O or no managed allocation. These checks include effects introduced through calls to other functions.
+
 **Built for concurrent network services.** Willow is aimed at API servers and backends often written in Go or on the JVM. It combines lightweight tasks and familiar syntax with compile-time checks for specific concurrency hazards, such as unsafe task captures and waiting while holding a Willow lock.
 
 **Readable first, proven where it matters.** Willow code is meant to be read, by people and by AI agents alike. Its syntax is deliberately familiar, so anyone who knows Rust or Kotlin can follow it and agents can apply what they already know. Concurrency checks run in the compiler without adding concepts to everyday code, and proof is opt-in: mark the functions that matter with [`@verified`](#verified-prove-a-contract-with-z3) and leave the rest as ordinary code.
@@ -466,6 +468,17 @@ See the [shared effect fixpoint](tests/regressions/shared_effect_fixpoint.wi),
 [indirect calls](example/lock_function_values.wi) examples.
 
 ### Effect contracts: declare the property on any function
+
+**Why this matters for AI-assisted changes.** A contract records a property that
+must survive edits. For example, adding `println` to a `@effects(no_io)` function,
+or to a helper it calls, makes the program fail compilation. The compiler checks
+the edited program against the same contract each time; it does not need to trust
+the agent's claim that the change preserves that property.
+
+This guarantee depends on keeping the contract in place: deleting or weakening
+the annotation must itself be reviewed. Effect contracts do not prove that the
+old and new implementations return the same results or satisfy every business
+requirement, and foreign declarations retain the trust boundaries described below.
 
 **Guarantee.** `@effects(...)` applies the solved effects to a declaration. A
 function with a contract contains no proven source of the forbidden effect
