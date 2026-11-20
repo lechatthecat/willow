@@ -192,25 +192,40 @@ impl RustCommand {
         });
         let graph = &mut snapshot.semantic.interop;
         let mut review = None;
+        let mut legacy_review = None;
         let has_legacy = self
             .options
             .symbols
             .iter()
             .any(|symbol| symbol.native.is_none());
-        if enabled && (!has_native_sources || has_legacy) {
+        let has_claim = self
+            .options
+            .symbols
+            .iter()
+            .any(|s| s.native.is_some() && s.nonblocking.is_some());
+        let recorded = willow_compiler::toolchain::rust_bridge_build::review::recorded(root)?;
+        if enabled && (!has_native_sources || has_legacy || has_claim || recorded.is_some()) {
             let build =
                 inspect_bridge(project, root, &self.options)?.context("Rust bridge missing")?;
             graph.resolved_crates(&build.direct_dependencies)?;
+            legacy_review = Some(build.legacy_review_fingerprint);
             review = Some(build.review_fingerprint);
         }
         let mut value = graph.query(self.selector.as_deref());
         value["review_fingerprint"] = serde_json::json!(review);
+        if has_legacy && (has_claim || recorded.is_some()) {
+            value["legacy_review_fingerprint"] = serde_json::json!(legacy_review);
+        }
         for bridge in value["bridges"].as_array_mut().unwrap() {
-            bridge["review_current"] = serde_json::json!(
+            bridge["review_current"] = serde_json::json!(if bridge["assume_no_block"] == true {
                 review
                     .as_ref()
+                    .is_some_and(|r| recorded.as_ref() == Some(r))
+            } else {
+                legacy_review
+                    .as_ref()
                     .is_some_and(|r| bridge["nonblocking"].as_str() == Some(r))
-            );
+            });
         }
         super::write_machine_output(&value)?;
         Ok(())

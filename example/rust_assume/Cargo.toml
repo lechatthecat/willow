@@ -1,0 +1,9 @@
+[package]
+name = "rust_assume_example"
+version = "0.1.0"
+edition = "2024"
+[lib]
+path = "src/native.rs"
+[dependencies]
+willow = { package = "willow_assume", path = "../../crates/willow_assume" }
+[workspace]

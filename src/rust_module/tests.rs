@@ -342,3 +342,92 @@ fn nested_conversion_output_scales_linearly_and_scalar_arrays_are_moves() {
     let array = NativeType::Array(Box::new(NativeType::Value(Scalar::I64)));
     assert_eq!(array.convert("input", "native", true), "input");
 }
+
+#[test]
+fn assume_no_block_attribute_validation_perspectives() {
+    // 1-9: valid free function, method, opaque close, independent claims,
+    // retained allocation/panic/foreign effects, async rejection, no pure claim.
+    let program = interface("#[willow::assume(no_block)] pub fn f() {} pub fn g() {}");
+    assert!(function(&program, "f").nonblocking.is_some());
+    assert!(function(&program, "g").nonblocking.is_none());
+    // 10-22: malformed effect/path/list, duplicates, unsupported placements,
+    // async assertions, mutable/by-value/typed receivers and name collisions.
+    for source in [
+        "#[willow::assume] pub fn f() {}",
+        "#[willow::assume()] pub fn f() {}",
+        "#[willow::assume(no_io)] pub fn f() {}",
+        "#[willow::assume(no_block, no_io)] pub fn f() {}",
+        "#[willow::assume(\"no_block\")] pub fn f() {}",
+        "#[willow::assume(no_block)] #[willow::assume(no_block)] pub fn f() {}",
+        "#[willow::assume(no_block)] pub struct Record { pub x: i64 }",
+        "pub fn f(#[willow::assume(no_block)] x: i64) {}",
+        "#[willow::assume(no_block)] pub async fn f() {}",
+        "pub struct Handle(i64); impl Handle { pub fn f(&mut self) {} }",
+        "pub struct Handle(i64); impl Handle { pub fn f(self) {} }",
+        "pub struct Handle(i64); impl Handle { pub fn f(self: &Self) {} }",
+        "pub struct Handle(i64); impl Handle { pub fn close(&self) {} }",
+    ] {
+        let (_, errors) = parse(Path::new("src/native.rs"), source, FileId(7));
+        assert!(!errors.is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn assume_no_block_generated_work_is_linear() {
+    for count in [1, 16, 128, 512] {
+        let source: String = (0..count)
+            .map(|i| {
+                format!("#[willow::assume(no_block)] pub fn operation_{i}() -> i64 {{ {i} }}\n")
+            })
+            .collect();
+        let program = interface(&source);
+        let symbols: Vec<_> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Function(f) => f.rust_bridge.as_deref().cloned(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(symbols.len(), count);
+        assert_eq!(
+            symbols
+                .iter()
+                .filter(|s| s.native.as_ref().unwrap().source.is_some())
+                .count(),
+            1
+        );
+        let wrappers = crate::rust_bridge_ir::wrappers(&symbols, Path::new("abi.rs"), 1);
+        assert_eq!(
+            wrappers
+                .matches("willow_rust_bridge_enter_nonblocking(1)")
+                .count(),
+            count
+        );
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|s| s
+                    .native
+                    .as_ref()
+                    .unwrap()
+                    .adapter
+                    .matches("let result = ")
+                    .count())
+                .sum::<usize>(),
+            count
+        );
+    }
+}
+
+#[test]
+fn assume_no_block_methods_preserve_private_helpers_and_raw_owners() {
+    let program = interface(
+        "struct Hidden; impl Hidden { pub fn generic<T>(&self, v: T) -> T { v } } #[willow::assume(no_block)] pub fn answer() -> i64 { 42 }",
+    );
+    assert_eq!(program.items.len(), 1);
+    let program = interface(
+        "#[willow::assume(no_block)] pub struct r#struct(i64); impl r#struct { #[willow::assume(no_block)] pub fn read(&self) -> i64 { self.0 } }",
+    );
+    assert!(function(&program, "struct_read").nonblocking.is_some());
+}

@@ -966,6 +966,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "willow_assume"
+version = "0.1.0"
+
+[[package]]
 name = "willow_continuations"
 version = "0.1.11"
 dependencies = [

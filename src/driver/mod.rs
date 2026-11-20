@@ -238,8 +238,14 @@ impl<'a> CompilerSession<'a> {
             .any(|file| file.path.extension().is_some_and(|ext| ext == "rs"));
         let has_legacy_symbols = bound.iter().any(|(_, symbol)| symbol.native.is_none());
         // Derived interfaces are checked entirely by the frontend. Cargo is
-        // reserved for an explicit native build or legacy adapter validation.
-        if !build && has_native_sources && !has_legacy_symbols {
+        // reserved for an explicit native build, review or legacy adapter validation.
+        if !build
+            && has_native_sources
+            && !has_legacy_symbols
+            && !self.project_root.as_ref().is_some_and(|root| {
+                toolchain::rust_bridge_build::review::required(root, bound.iter().map(|(_, s)| s))
+            })
+        {
             return Ok(());
         }
         let rust_bridge = if let Some(project_root) = &self.project_root {

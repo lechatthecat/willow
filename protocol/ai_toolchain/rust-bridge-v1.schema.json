@@ -40,6 +40,12 @@
         "string",
         "null"
       ]
+    },
+    "legacy_review_fingerprint": {
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "$defs": {
@@ -169,8 +175,12 @@
         "coverage": {
           "type": "string"
         },
-        "async": { "type": "boolean" },
-        "no_io": { "type": "boolean" },
+        "async": {
+          "type": "boolean"
+        },
+        "no_io": {
+          "type": "boolean"
+        },
         "effects": {
           "type": "integer",
           "minimum": 0,
@@ -200,6 +210,9 @@
           "items": {
             "$ref": "#/$defs/record"
           }
+        },
+        "assume_no_block": {
+          "type": "boolean"
         }
       }
     },

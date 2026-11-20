@@ -14,6 +14,7 @@ use crate::BuildMode;
 use crate::project::{ProjectManifest, RustDependencySource, RustGitSelector};
 
 pub mod commands;
+pub mod review;
 
 const BRIDGE_NAME: &str = "willow_generated_bridge";
 
@@ -176,6 +177,7 @@ pub struct BridgeBuild {
     pub directory: PathBuf,
     pub cache_key: String,
     pub review_fingerprint: String,
+    pub legacy_review_fingerprint: String,
     pub target: String,
     pub staticlib: Option<PathBuf>,
     pub messages: CargoMessages,
@@ -604,7 +606,12 @@ fn prepare_bridge(
         crate::workspace_transaction::sync_directory(&root)?;
     }
     fs::create_dir_all(directory.join("src"))?;
-    let manifest = generated_manifest(project, &root)?;
+    let manifest = prepare_manifest(
+        project,
+        &root,
+        &directory,
+        has_native_modules && review::required(&root, &options.symbols),
+    )?;
     let manifest_path = directory.join("Cargo.toml");
     let lib_path = directory.join("src/lib.rs");
     write_changed(
@@ -655,35 +662,14 @@ fn prepare_bridge(
     {
         bail!("rust_lockfile_stale: Cargo resolution or direct version summary changed");
     }
-    // Compute once for all declarations. Source and manifest changes require
-    // review even when Cargo's resolved package versions have not changed.
-    // Line endings carry no Rust meaning and differ between checkouts (CRLF on
-    // Windows), so a reviewed fingerprint stays portable across platforms.
-    let legacy_hash = bridge.as_deref().map(hash_source_file).transpose()?;
-    // Nonblocking reviews retain the explicit legacy adapter's source boundary.
-    // Native exports cannot claim nonblocking; their source still participates in
-    // the build key below. Project-wide inspection may discover unused modules
-    // that an executable does not import, without changing a legacy review.
-    let bridge_hash = legacy_hash
-        .or(native_hash)
-        .context("rust_bridge_missing: bridge source is required")?;
-    let review = hash(&serde_json::to_vec(&(
-        &lock_hash,
-        &bridge_hash,
-        &rust_lock.bridge_input_hash,
-    ))?);
-    for symbol in &options.symbols {
-        if let Some(declared) = &symbol.nonblocking
-            && declared.fingerprint != review
-            && !matches!(action, BridgeAction::Metadata | BridgeAction::Edit { .. })
-        {
-            bail!(
-                "rust_nonblocking_review_required: {}: review current bridge and dependencies, then use nonblocking(\"{}\")",
-                symbol.willow_function,
-                review
-            );
-        }
-    }
+    let (bridge_hash, review, legacy_review) = bridge_reviews(
+        &root,
+        options,
+        action,
+        bridge.as_deref(),
+        native_hash,
+        &rust_lock,
+    )?;
     let source_hash = hash(&serde_json::to_vec(&(&bridge_hash, &options.symbols))?);
     let manifest_hash = hash(manifest.as_bytes());
     let cache_key = BridgeCacheKey {
@@ -707,6 +693,7 @@ fn prepare_bridge(
             directory,
             cache_key,
             review_fingerprint: review,
+            legacy_review_fingerprint: legacy_review,
             target: target.to_owned(),
             staticlib: None,
             messages: CargoMessages::default(),
@@ -730,6 +717,7 @@ fn prepare_bridge(
         directory,
         cache_key,
         review_fingerprint: review,
+        legacy_review_fingerprint: legacy_review,
         target: target.to_owned(),
         staticlib,
         messages,
@@ -740,6 +728,97 @@ fn prepare_bridge(
         _project_lease: project_lease,
         resolution: rust_lock,
     }))
+}
+
+fn prepare_manifest(
+    project: &ProjectManifest,
+    root: &Path,
+    directory: &Path,
+    inject_assume: bool,
+) -> Result<String> {
+    let mut manifest = generated_manifest(project, root)?;
+    if inject_assume {
+        anyhow::ensure!(
+            !project.rust_dependencies.contains_key("willow"),
+            "Rust dependency alias `willow` is reserved for the assertion macro"
+        );
+        let macro_dir = directory.join("willow-assume");
+        fs::create_dir_all(macro_dir.join("src"))?;
+        write_changed(
+            &macro_dir.join("Cargo.toml"),
+            include_bytes!("../../crates/willow_assume/Cargo.toml"),
+        )?;
+        write_changed(
+            &macro_dir.join("src/lib.rs"),
+            include_bytes!("../../crates/willow_assume/src/lib.rs"),
+        )?;
+        manifest.push_str(
+            "\n[dependencies.willow]\npackage = \"willow_assume\"\npath = \"willow-assume\"\n",
+        );
+    }
+    Ok(manifest)
+}
+
+fn bridge_reviews(
+    root: &Path,
+    options: &BridgeOptions,
+    action: BridgeAction<'_>,
+    bridge: Option<&Path>,
+    native_hash: Option<String>,
+    rust_lock: &crate::package::lock::RustLock,
+) -> Result<(String, String, String)> {
+    let has_native_modules = options.symbols.iter().any(|symbol| symbol.native.is_some());
+    // Compute once for all declarations. Source and manifest changes require
+    // review even when Cargo's resolved package versions have not changed.
+    // Line endings carry no Rust meaning and differ between checkouts (CRLF on
+    // Windows), so a reviewed fingerprint stays portable across platforms.
+    let native_review = has_native_modules && review::required(root, &options.symbols);
+    let legacy_hash = bridge
+        .map(|path| {
+            if native_review {
+                review::reviewed_file_hash(path)
+            } else {
+                hash_source_file(path)
+            }
+        })
+        .transpose()?;
+    // Preserve legacy review semantics while native reviews bind every module.
+    let bridge_hash = legacy_hash
+        .clone()
+        .or(native_hash)
+        .context("rust_bridge_missing: bridge source is required")?;
+    let legacy_review = hash(&serde_json::to_vec(&(
+        &rust_lock.cargo_lock_hash,
+        &bridge_hash,
+        &rust_lock.bridge_input_hash,
+    ))?);
+    let review = if native_review {
+        review::fingerprint(
+            root,
+            &options.symbols,
+            &rust_lock.cargo_lock_hash,
+            &rust_lock.bridge_input_hash,
+            legacy_hash.as_deref(),
+        )?
+    } else {
+        legacy_review.clone()
+    };
+    if !matches!(action, BridgeAction::Metadata | BridgeAction::Edit { .. }) {
+        review::validate(root, &options.symbols, &review)?;
+        for symbol in &options.symbols {
+            if symbol.native.is_none()
+                && let Some(declared) = &symbol.nonblocking
+                && declared.fingerprint != legacy_review
+            {
+                bail!(
+                    "rust_nonblocking_review_required: {}: review current bridge and dependencies, then use nonblocking(\"{}\")",
+                    symbol.willow_function,
+                    legacy_review
+                );
+            }
+        }
+    }
+    Ok((bridge_hash, review, legacy_review))
 }
 
 fn generated_bridge_source(

@@ -242,7 +242,26 @@ impl Deriver<'_> {
         Ok(name)
     }
     fn attributes(&self, attrs: &[syn::Attribute]) -> Result<(), Diagnostic> {
+        self.assumptions(attrs, false).map(|_| ())
+    }
+    fn assumptions(&self, attrs: &[syn::Attribute], supported: bool) -> Result<bool, Diagnostic> {
+        let mut assumed = false;
         for attr in attrs {
+            if attr.path().segments.len() == 2
+                && attr.path().segments[0].ident == "willow"
+                && attr.path().segments[1].ident == "assume"
+            {
+                if !supported
+                    || assumed
+                    || !attr
+                        .parse_args::<syn::Ident>()
+                        .is_ok_and(|name| name == "no_block")
+                {
+                    return Err(self.error(attr.span(), "expected one #[willow::assume(no_block)] on a function, method or opaque type"));
+                }
+                assumed = true;
+                continue;
+            }
             if !attr.path().is_ident("doc")
                 && !attr.path().is_ident("allow")
                 && !attr.path().is_ident("warn")
@@ -260,7 +279,7 @@ impl Deriver<'_> {
                 ));
             }
         }
-        Ok(())
+        Ok(assumed)
     }
     fn ty(&self, ty: &syn::Type, input: bool) -> Result<NativeType, Diagnostic> {
         let fail = || self.error(ty.span(), "unsupported Rust bridge type or type arguments");
@@ -405,7 +424,7 @@ impl Deriver<'_> {
     }
     fn function(&self, f: &syn::ItemFn, path: &Path) -> Result<FunctionDecl, Diagnostic> {
         self.generics(&f.sig.generics)?;
-        self.attributes(&f.attrs)?;
+        let assumed = self.assumptions(&f.attrs, true)?;
         if matches!(f.sig.safety, syn::Safety::Unsafe(_))
             || f.sig.abi.is_some()
             || f.sig.variadic.is_some()
@@ -446,6 +465,13 @@ impl Deriver<'_> {
             types.iter().map(|t| t.scalar(&self.module)).collect(),
             output.scalar(&self.module),
         );
+        if assumed {
+            if f.sig.asyncness.is_some() {
+                return Err(self.error(f.sig.span(), "async Rust bridge cannot declare no_block"));
+            }
+            // Native claims are bound to the single project review at validation.
+            symbol.declare_nonblocking(String::new());
+        }
         symbol.is_async = f.sig.asyncness.is_some();
         if symbol.is_async {
             symbol.effects |= willow_abi::RuntimeEffects::MAY_SUSPEND.bits();
@@ -482,6 +508,56 @@ impl Deriver<'_> {
             span,
             constant: None,
         })
+    }
+    fn method(
+        &self,
+        owner: &syn::Ident,
+        method: &syn::ImplItemFn,
+        path: &Path,
+    ) -> Result<FunctionDecl, Diagnostic> {
+        let owner_name = ident(owner);
+        let mut signature = method.sig.clone();
+        syn::visit_mut::VisitMut::visit_signature_mut(&mut MethodSelf(owner), &mut signature);
+        let method_name = self.export_name(&signature.ident)?;
+        signature.ident = syn::Ident::new(
+            &format!("{owner_name}_{method_name}"),
+            signature.ident.span(),
+        );
+        for arg in &mut signature.inputs {
+            if let syn::FnArg::Receiver(receiver) = arg {
+                self.attributes(&receiver.attrs)?;
+                if !matches!(receiver.kind, syn::ReceiverKind::Reference(_, None, None))
+                    || receiver.mutability.is_some()
+                    || !self.opaque.contains(&owner_name)
+                {
+                    return Err(
+                        self.error(receiver.span(), "methods require an opaque &self receiver")
+                    );
+                }
+                *arg = syn::parse_str(&format!("receiver: &{owner}")).unwrap();
+            }
+        }
+        let function = syn::ItemFn {
+            modifiers: method.modifiers.clone(),
+            attrs: method.attrs.clone(),
+            vis: method.vis.clone(),
+            sig: signature,
+            block: Box::new(syn::parse_str("{}").unwrap()),
+        };
+        let mut derived = self.function(&function, path)?;
+        let native = derived
+            .rust_bridge
+            .as_mut()
+            .unwrap()
+            .native
+            .as_mut()
+            .unwrap();
+        native.adapter = native.adapter.replace(
+            &format!("crate::{}::r#{}(", self.module, derived.name),
+            &format!("crate::{}::r#{owner_name}::r#{method_name}(", self.module),
+        );
+        derived.span = self.span(method.sig.span());
+        Ok(derived)
     }
     fn function_adapter(
         &self,
@@ -716,6 +792,17 @@ fn canonical_import_root(path: &[String], original: &str, name: &str) -> Option<
     (standard_type_name(&[origin, module, original]) == Some(name)).then(|| origin.clone())
 }
 
+struct MethodSelf<'a>(&'a syn::Ident);
+impl syn::visit_mut::VisitMut for MethodSelf<'_> {
+    fn visit_type_path_mut(&mut self, path: &mut syn::TypePath) {
+        if path.qself.is_none() && path.path.is_ident("Self") {
+            path.path.segments[0].ident = self.0.clone();
+        } else {
+            syn::visit_mut::visit_type_path_mut(self, path);
+        }
+    }
+}
+
 struct HandleUses<'a>(&'a mut HashSet<String>);
 impl<'ast> Visit<'ast> for HandleUses<'_> {
     fn visit_type_reference(&mut self, r: &'ast syn::TypeReference) {
@@ -790,6 +877,26 @@ pub(crate) fn parse(path: &Path, source: &str, file: FileId) -> (Program, Vec<Di
             HandleUses(&mut d.opaque).visit_signature(&f.sig);
         }
     }
+    for item in &syntax.items {
+        if let syn::Item::Impl(i) = item
+            && let syn::Type::Path(p) = &*i.self_ty
+            && let Some(owner) = p.path.get_ident()
+        {
+            for item in &i.items {
+                if let syn::ImplItem::Fn(m) = item
+                    && matches!(m.vis, syn::Visibility::Public(_))
+                {
+                    if m.sig.receiver().is_some() {
+                        d.opaque.insert(ident(owner));
+                    }
+                    HandleUses(&mut d.opaque).visit_signature(&m.sig);
+                    if d.opaque.remove("Self") {
+                        d.opaque.insert(ident(owner));
+                    }
+                }
+            }
+        }
+    }
     d.opaque.retain(|n| d.structs.contains_key(n));
     let result = derive_items(&d, &syntax, path, &mut program);
     match result {
@@ -820,6 +927,35 @@ fn derive_items(
             program.items.push(Item::Function(d.function(f, path)?));
         }
     }
+    for item in &syntax.items {
+        if let syn::Item::Impl(implementation) = item
+            && implementation.items.iter().any(|member| matches!(member, syn::ImplItem::Fn(m) if matches!(m.vis, syn::Visibility::Public(_))))
+        {
+            let syn::Type::Path(owner) = &*implementation.self_ty else { continue; };
+            let Some(owner) = owner.path.get_ident().filter(|name| d.structs.contains_key(&ident(name))) else { continue; };
+            d.attributes(&implementation.attrs)?;
+            d.generics(&implementation.generics)?;
+            if implementation.trait_.is_some() {
+                return Err(d.error(implementation.span(), "only inherent public methods are supported"));
+            }
+            for member in &implementation.items {
+                if let syn::ImplItem::Fn(method) = member && matches!(method.vis, syn::Visibility::Public(_)) {
+                    program.items.push(Item::Function(d.method(owner, method, path)?));
+                }
+            }
+        }
+    }
+    let mut names = HashSet::new();
+    for item in &program.items {
+        if let Item::Function(f) = item
+            && !names.insert(&f.name)
+        {
+            return Err(d.error(
+                syntax.span(),
+                format!("duplicate exported function `{}`", f.name),
+            ));
+        }
+    }
     records.finish(d, program)
 }
 
@@ -839,8 +975,8 @@ impl RecordInterfaces {
         program: &mut Program,
     ) -> Result<(), Diagnostic> {
         d.generics(&s.generics)?;
-        d.attributes(&s.attrs)?;
         let name = ident(&s.ident);
+        let assumed = d.assumptions(&s.attrs, d.opaque.contains(&name))?;
         if matches!(
             name.as_str(),
             "String"
@@ -872,7 +1008,7 @@ impl RecordInterfaces {
         d.export_name(&s.ident)?;
         let span = d.span(s.span());
         if d.opaque.contains(&name) {
-            self.add_opaque(d, name, span, path, program);
+            self.add_opaque(d, name, span, path, program, assumed);
             Ok(())
         } else {
             self.add_record(d, s, name, span, program)
@@ -886,6 +1022,7 @@ impl RecordInterfaces {
         span: Span,
         path: &Path,
         program: &mut Program,
+        assumed: bool,
     ) {
         program.items.push(Item::Enum(EnumDecl {
             name: name.clone(),
@@ -910,6 +1047,9 @@ impl RecordInterfaces {
             Scalar::Void,
         );
         symbol.close_handle = true;
+        if assumed {
+            symbol.declare_nonblocking(String::new());
+        }
         symbol.native = Some(NativeBridge {
             module: d.module.clone(),
             source_path: path.to_owned(),

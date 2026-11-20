@@ -9,7 +9,7 @@ autobenches = false
 autobins = false
 
 [workspace]
-members = [".", "crates/willow_abi", "crates/willow_runtime", "crates/willow_continuations", "crates/willow_runtime_macros"]
+members = [".", "crates/willow_abi", "crates/willow_runtime", "crates/willow_continuations", "crates/willow_runtime_macros", "crates/willow_assume"]
 default-members = [".", "crates/willow_abi", "crates/willow_runtime", "crates/willow_continuations"]
 resolver = "3"
 
@@ -47,7 +47,7 @@ serde_json = { version = "1.0.152", features = ["raw_value"] }
 willow_abi = { path = "crates/willow_abi" }
 willow_continuations = { path = "crates/willow_continuations" }
 toml_edit = "0.25.17"
-syn = { version = "3.0.7", features = ["full", "visit"] }
+syn = { version = "3.0.7", features = ["full", "visit", "visit-mut"] }
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 im = { version = "15.1.0", features = ["serde"] }
 

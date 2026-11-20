@@ -225,6 +225,8 @@ pub struct RustBridgeSymbol {
     #[serde(default)]
     pub close_handle: bool,
     /// Developer assertion, bound to the resolved lock and bridge source.
+    /// Native declarations use an empty marker; their shared fingerprint lives
+    /// exclusively in rust-review.toml and is checked before execution.
     #[serde(default)]
     pub nonblocking: Option<Box<NonblockingReview>>,
 }
