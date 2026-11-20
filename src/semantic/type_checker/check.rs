@@ -249,6 +249,23 @@ impl TypeChecker {
             }
             match item {
                 Item::Function(f) if !f.type_params.is_empty() => {
+                    if let Some(attribute) = f
+                        .effect_contracts
+                        .iter()
+                        .find(|a| a.kind == EffectContractKind::Verified)
+                    {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E2631,
+                                "UNKNOWN: @verified requires a concrete top-level function",
+                            )
+                            .with_label(Label::primary(
+                                attribute.span,
+                                "generic verification is unsupported",
+                            )),
+                        );
+                    }
                     self.generics.functions.insert(
                         f.name.clone(),
                         self.generics.registry.borrow_mut().intern_function(f),
@@ -436,16 +453,6 @@ impl TypeChecker {
                 &self.static_call_classes,
             );
             for diagnostic in result.diagnostics {
-                self.push(diagnostic);
-            }
-        }
-        if self.effect_graph_only.is_none() && !self.defer_static_verification {
-            let diagnostics = crate::semantic::verification::check(
-                program,
-                &self.errors,
-                self.field_writes.as_deref().expect("field write analysis"),
-            );
-            for diagnostic in diagnostics {
                 self.push(diagnostic);
             }
         }
@@ -1293,6 +1300,12 @@ impl TypeChecker {
             );
         }
         self.report_effect_contracts(program, &graph, &effects.facts, false);
+        if let Some((queries, unit)) = &self.effect_queries
+            && let Some(captured) = queries.analysis.borrow_mut().as_mut()
+            && let Some(capture) = captured.get_mut(unit)
+        {
+            crate::ai::capture_panic_evidence(capture, self.panic_evidence.clone());
+        }
         self.report_transitive_lock_effects(&effects.facts);
         self.report_indirect_lock_effects(&graph, &effects.facts);
     }

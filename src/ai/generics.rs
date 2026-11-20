@@ -609,6 +609,22 @@ pub(super) fn aggregate(
         *effects.entry(id).or_default() |= bits;
     }
     semantic.compiler_effects = effects;
+    let mut panic_evidence = BTreeMap::new();
+    for (mut id, evidence) in std::mem::take(&mut semantic.panic_evidence) {
+        remap(&mut id);
+        // A source declaration is proven only if every specialization is.
+        panic_evidence
+            .entry(id)
+            .and_modify(|old: &mut serde_json::Value| {
+                if evidence["status"] != "PROVEN"
+                    || (old["status"] == "PROVEN" && evidence["basis"] == "solver-proof")
+                {
+                    *old = evidence.clone();
+                }
+            })
+            .or_insert(evidence);
+    }
+    semantic.panic_evidence = panic_evidence;
     // Every instantiation reports the same source call sites; key them by the
     // merged source function and keep one entry per site.
     let mut unresolved = BTreeMap::<String, Vec<semantic::UnresolvedCall>>::new();

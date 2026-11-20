@@ -177,3 +177,103 @@ fn contract_policy_lock_symlink_cannot_overwrite_external_file() {
     assert!(verify(&o, &p).is_err());
     assert_eq!(fs::read_to_string(keep).unwrap(), "keep");
 }
+
+#[test]
+fn proof_no_panic_verify_edit_and_lock_evidence() {
+    let (dir, o, mut policy) = fixture();
+    let source = "@pure @verified @effects(no_panic) fn f(x:i64)->i64 requires x>=0 && x<100 {return x+1;} @effects(no_panic) fn plain(x:i64)->i64 {return x;} fn main() {}";
+    fs::write(dir.0.join("main.wi"), source).unwrap();
+    git(&dir.0, &["add", "main.wi"]);
+    git(&dir.0, &["commit", "-qm", "Proven arithmetic"]);
+    let mut o = o;
+    o.base = resolve_base(&dir.0, "HEAD").unwrap();
+    policy.protected_base = Some(git(&dir.0, &["rev-parse", "HEAD"]));
+    fs::write(
+        dir.0.join("main.wi"),
+        source
+            .replace("return x+1;", "return 1+x;")
+            .replace("{return x;}", "{return 0;}"),
+    )
+    .unwrap();
+    let legacy = super::super::verify(&o).unwrap();
+    assert_eq!(legacy.exit_code(), 0, "{legacy:?}");
+    assert!(
+        legacy.summary["no_panic"]
+            .to_string()
+            .contains("solver-proof"),
+        "{legacy:?}"
+    );
+    assert!(legacy.human(false).contains("solver-proof"));
+    policy.write_lock = true;
+    let report = verify(&o, &policy).unwrap();
+    assert_eq!(report.exit_code(), 0, "{report:?}");
+    let lock: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.0.join("contracts.lock")).unwrap()).unwrap();
+    assert_eq!(lock["functions"]["f"]["no_panic"]["basis"], "solver-proof");
+    assert_eq!(
+        lock["functions"]["plain"]["no_panic"]["basis"],
+        "effect-analysis"
+    );
+    fs::write(dir.0.join("main.wi"), source.replace("x<100", "x>=0")).unwrap();
+    let report = super::super::verify(&o).unwrap();
+    assert_ne!(report.exit_code(), 0, "{report:?}");
+    assert!(
+        report.summary["diagnostics"].to_string().contains("E2610"),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn proof_no_panic_verify_edit_dependency_and_output_bounds() {
+    for n in [0, 32, 128] {
+        let (dir, mut options, _) = fixture();
+        let mut source = "@effects(no_panic) fn f(x:i64)->i64 {return x;} fn main() {}".to_owned();
+        for i in 0..n {
+            source += &format!("fn unrelated{i}(x:i64)->i64 {{return x;}}");
+        }
+        fs::write(dir.0.join("main.wi"), &source).unwrap();
+        git(&dir.0, &["add", "main.wi"]);
+        git(&dir.0, &["commit", "-qm", "Evidence inventory"]);
+        options.base = resolve_base(&dir.0, "HEAD").unwrap();
+        fs::write(
+            dir.0.join("main.wi"),
+            source.replacen("return x;", "return 0;", 1),
+        )
+        .unwrap();
+        let report = super::super::verify(&options).unwrap();
+        assert_eq!(report.exit_code(), 0, "{report:?}");
+        for side in ["base", "target"] {
+            assert_eq!(
+                report.summary["no_panic"][side].as_object().unwrap().len(),
+                1
+            );
+        }
+        println!(
+            "proof-output unrelated={n} evidence_entries=2 bytes={}",
+            report.summary["no_panic"].to_string().len()
+        );
+    }
+    let (dir, mut options, _) = fixture();
+    let source = "@pure @verified fn helper(x:i64)->i64 requires x>=0 && x<100 {return x+1;} @pure @verified @effects(no_panic) fn f(x:i64)->i64 requires x>=0 && x<100 {return helper(x);} fn main() {}";
+    fs::write(dir.0.join("main.wi"), source).unwrap();
+    git(&dir.0, &["add", "main.wi"]);
+    git(&dir.0, &["commit", "-qm", "Proven caller"]);
+    options.base = resolve_base(&dir.0, "HEAD").unwrap();
+    fs::write(dir.0.join("main.wi"), source.replacen("x<100", "x<50", 1)).unwrap();
+    let report = super::super::verify(&options).unwrap();
+    assert_ne!(report.exit_code(), 0, "{report:?}");
+    assert!(
+        report.summary["diagnostics"]["target"]
+            .to_string()
+            .contains("E2610"),
+        "{report:?}"
+    );
+    assert!(
+        report.summary["no_panic"]["target"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|e| e["status"] == "UNPROVEN"),
+        "{report:?}"
+    );
+}

@@ -2,6 +2,13 @@
 //! Mathematical integers model values; every finite-width operation has a
 //! separate safety obligation. Summaries share helper bodies across call sites.
 mod cache;
+#[cfg(test)]
+mod panic_effect_tests;
+#[cfg(test)]
+thread_local! {
+    static PROOF_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SOLVER_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 pub mod comparison;
 mod data;
 mod encode;
@@ -79,6 +86,7 @@ pub struct Report {
     pub vc_nodes: usize,
     pub inferred_loop_annotations: Vec<InferredLoopAnnotations>,
 }
+#[derive(Clone)]
 pub struct Options {
     pub solver: PathBuf,
     pub timeout_ms: u64,
@@ -110,6 +118,7 @@ fn budget(name: &str, default: u64) -> u64 {
         .map(|v| v.parse().unwrap_or(0))
         .unwrap_or(default)
 }
+#[derive(Default)]
 pub struct Verification {
     pub reports: Vec<Report>,
     pub smt: String,
@@ -159,7 +168,9 @@ pub(crate) fn check(
     program: &Program,
     previous: &[Diagnostic],
     writes: &crate::semantic::field_writes::FieldWrites,
-) -> Vec<Diagnostic> {
+    options: &Options,
+    cache: &mut ProofCache,
+) -> (Vec<Diagnostic>, Verification) {
     let mut diagnostics = Vec::new();
     // Methods are outside V1, including interface declarations without bodies.
     for item in &program.items {
@@ -184,14 +195,14 @@ pub(crate) fn check(
         .iter()
         .any(|i| matches!(i, Item::Function(f) if has(f,EffectContractKind::Verified)))
     {
-        return diagnostics;
+        return (diagnostics, Verification::default());
     }
     let prior_error = previous.iter().any(|d| d.severity == Severity::Error);
     let verification = verify_with_data(
         program,
-        &Options::default(),
+        options,
         prior_error,
-        &mut ProofCache::default(),
+        cache,
         &DataTypes::new(program, writes),
     );
     for r in &verification.reports {
@@ -222,7 +233,7 @@ pub(crate) fn check(
             ));
         }
     }
-    if let Some(error) = verification.artifact_error {
+    if let Some(error) = &verification.artifact_error {
         diagnostics.push(diagnostic(
             ErrorCode::E2632,
             program
@@ -239,7 +250,7 @@ pub(crate) fn check(
             &format!("UNKNOWN: cannot save verification artifacts: {error}"),
         ));
     }
-    diagnostics
+    (diagnostics, verification)
 }
 fn diagnostic(code: ErrorCode, span: Span, message: &str) -> Diagnostic {
     Diagnostic::new(Severity::Error, code, message).with_label(Label::primary(span,"static verification failed")).with_help("check the failed obligation and candidate inputs; UNKNOWN is not a proof; replay saved SMT with the pinned Z3 version")
@@ -339,6 +350,8 @@ fn verify_with_data(
     } else if roots.is_empty() || prior_error {
         Err("type or purity checking failed".into())
     } else {
+        #[cfg(test)]
+        SOLVER_STARTS.with(|n| n.set(n.get() + 1));
         solver::Solver::new(&options.solver, options.timeout_ms)
     };
     if let Ok(s) = &mut engine
@@ -401,6 +414,8 @@ fn verify_with_data(
             if !verified {
                 return Ok(());
             }
+            #[cfg(test)]
+            PROOF_RUNS.with(|n| n.set(n.get() + 1));
             let cache_key = cache::identity(&summary, &r.dependency_digests, f, options);
             r.inferred_loop_annotations = summary.inferred_loop_annotations;
             let cached = cache.get(&cache_key);

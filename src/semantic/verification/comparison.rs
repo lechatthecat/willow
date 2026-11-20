@@ -60,6 +60,8 @@ pub struct Lock {
 pub struct Digests {
     pub contract: String,
     pub semantics: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_panic: Option<Json>,
 }
 impl Lock {
     pub fn digest(&self) -> String {
@@ -98,7 +100,8 @@ fn with_data_identity(identity: String, data: Option<&str>) -> String {
 }
 
 fn relevant(f: &FunctionDecl) -> bool {
-    !f.requires.is_empty()
+    has(f, EffectContractKind::NoPanic)
+        || !f.requires.is_empty()
         || !f.ensures.is_empty()
         || has(f, EffectContractKind::Pure)
         || has(f, EffectContractKind::Verified)
@@ -118,7 +121,8 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
     let symbols = crate::semantic::ids::SymbolInterner::new();
     let _symbols = symbols.enter();
     let mut checker = crate::semantic::TypeChecker::new();
-    checker.defer_static_verification = true;
+    checker.verification_options = Some(options.clone());
+    checker.verification_cache = std::mem::take(cache);
     checker.check_module_program(&program);
     let purity_spans: BTreeSet<_> = checker
         .errors
@@ -166,7 +170,21 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
             "comparison requires top-level functions and data declarations without imports".into(),
         );
     }
-    let verification = verify_cached(&program, options, prior_error || !errors.is_empty(), cache);
+    let verification = if program
+        .items
+        .iter()
+        .any(|i| matches!(i, Item::Function(f) if has(f, EffectContractKind::Verified)))
+    {
+        std::mem::take(&mut checker.verification)
+    } else {
+        verify_cached(
+            &program,
+            options,
+            prior_error || !errors.is_empty(),
+            &mut checker.verification_cache,
+        )
+    };
+    *cache = std::mem::take(&mut checker.verification_cache);
     let fs: Vec<_> = program
         .items
         .iter()
@@ -264,6 +282,13 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
                 Digests {
                     contract: contracts[i].clone(),
                     semantics: dependency_digests[i].clone(),
+                    no_panic: has(f, EffectContractKind::NoPanic).then(|| {
+                        checker
+                            .panic_evidence
+                            .get(&crate::semantic::ids::FunctionId::free(&f.name))
+                            .cloned()
+                            .unwrap_or(Json::Null)
+                    }),
                 },
             )
         })

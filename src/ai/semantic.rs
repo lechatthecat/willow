@@ -24,6 +24,8 @@ pub struct SemanticFacts {
     pub flows: Vec<Flow>,
     pub witnesses: BTreeMap<String, Vec<Value>>,
     pub compiler_effects: BTreeMap<String, u8>,
+    #[serde(default)]
+    pub panic_evidence: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub effect_calls: BTreeMap<String, Vec<EffectCall>>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -96,6 +98,7 @@ pub(super) struct Captured {
     pub builtin_calls: Vec<(FunctionId, Span, FunctionId)>,
     pub witnesses: HashMap<FunctionId, Vec<Value>>,
     pub compiler_effects: HashMap<FunctionId, u8>,
+    pub panic_evidence: HashMap<FunctionId, Value>,
     // Keep operation sites separate so capability replacement scans stay bounded.
     suspension_sites: HashMap<FunctionId, Vec<Value>>,
     builtin_sites: HashMap<FunctionId, Vec<Value>>,
@@ -396,6 +399,13 @@ pub(super) fn finish(
                         operation: operation.clone(),
                         location: location(*span)?,
                     });
+            }
+        }
+        for (&id, evidence) in &captures[&unit].semantic.panic_evidence {
+            if let Some(function) = functions.get(&resolve(unit, id)) {
+                result
+                    .panic_evidence
+                    .insert(function.id.clone(), evidence.clone());
             }
         }
         for (&id, &effects) in &captures[&unit].semantic.compiler_effects {
@@ -1308,7 +1318,7 @@ impl QuerySession {
         let compiler_witnesses = self.local_compiler_witnesses(f);
         json!({"schema":effect_states::SCHEMA,"effects":states,
             "status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
-            "reason":f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }), "unknown_causes":unknown_causes, "bounds":{"runtime":f.runtime_effects,"compiler":self.snapshot.semantic.compiler_effects.get(&f.id)},"effect_evidence":evidence,
+            "reason":f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }), "unknown_causes":unknown_causes, "bounds":{"runtime":f.runtime_effects,"compiler":self.snapshot.semantic.compiler_effects.get(&f.id)},"effect_evidence":evidence, "no_panic":self.snapshot.semantic.panic_evidence.get(&f.id),
             "witness":witness, "compiler_witnesses":compiler_witnesses,
             "meaning":"compiler facts and conservative runtime capability bounds; indirect-call bounds cover checked function values in this workspace, not arbitrary values supplied by future callers; external business effects and predicate feasibility are not implied"})
     }

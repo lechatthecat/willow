@@ -74,6 +74,19 @@ impl SemanticDiff {
         if let Some(digest) = self.target["digest"].as_str() {
             text.push_str(&format!("Target digest: {digest}\n"));
         }
+        for side in ["base", "target"] {
+            if let Some(evidence) = self.summary["no_panic"][side].as_object() {
+                for (name, proof) in evidence {
+                    if proof["status"] == "PROVEN" {
+                        text.push_str(&format!(
+                            "no_panic {side} {}: {}\n",
+                            matching::human_name(name),
+                            proof["basis"].as_str().unwrap_or("unproven")
+                        ));
+                    }
+                }
+            }
+        }
         for change in &self.changes {
             text.push_str(&format!(
                 "{}: {}\n",
@@ -174,6 +187,7 @@ pub(crate) struct Capture {
     causes: CausePaths,
     ambiguous: im::OrdSet<String>,
     contract_index: Option<Node>,
+    panic_evidence: im::OrdMap<String, Value>,
     violations: im::OrdSet<String>,
 }
 #[derive(Clone, Default)]
@@ -252,13 +266,23 @@ impl Capture {
                 let waiting = RuntimeEffects::MAY_BLOCK
                     .union(RuntimeEffects::MAY_SUSPEND)
                     .bits();
-                let bits = snapshot
+                let mut bits = snapshot
                     .semantic
                     .compiler_effects
                     .get(&f.id)
                     .map_or(f.runtime_effects, |checked| {
                         (f.runtime_effects & !waiting) | (checked & waiting)
                     });
+                if snapshot
+                    .semantic
+                    .panic_evidence
+                    .get(&f.id)
+                    .is_some_and(|e| e["status"] == "PROVEN")
+                {
+                    bits &= !RuntimeEffects::MAY_PANIC
+                        .union(RuntimeEffects::MAY_CHECKED_PANIC)
+                        .bits();
+                }
                 let effects = Some(EffectState {
                     may: bits,
                     unknown: if f.unknown {
@@ -273,6 +297,12 @@ impl Capture {
                 }
             }
         }
+        let panic_evidence = snapshot
+            .semantic
+            .panic_evidence
+            .iter()
+            .filter_map(|(id, e)| ids.get(id).map(|key| (key.clone(), e.clone())))
+            .collect();
         let mut causes = CausePaths::default();
         let mut retained = state::ReportState::new(snapshot, ids, type_names);
         retained.replace_leaves(snapshot, &mut causes);
@@ -311,6 +341,7 @@ impl Capture {
             coordinate_updates: 0,
             retained,
             contract_index,
+            panic_evidence,
             violations,
             baseline,
             contracts,
@@ -502,6 +533,8 @@ fn compare_keys(
     let renamed_targets: BTreeSet<_> = renames.values().collect();
     let empty = BTreeSet::new();
     let mut changes = Vec::new();
+    let mut old_panic = BTreeMap::new();
+    let mut new_panic = BTreeMap::new();
     let mut growth = 0;
     let mut emitted_hops = 0usize;
     let mut uncertainty = Vec::new();
@@ -535,6 +568,18 @@ fn compare_keys(
         }
     }
     for (base_key, new_key) in comparisons {
+        // Emit evidence only for the compared slice, never the untouched
+        // inventory. Persistent maps above keep lookup proportional to output.
+        if let Some(key) = base_key
+            && let Some(evidence) = before.panic_evidence.get(key)
+        {
+            old_panic.insert(key, evidence);
+        }
+        if let Some(key) = new_key
+            && let Some(evidence) = after.panic_evidence.get(key)
+        {
+            new_panic.insert(key, evidence);
+        }
         let key = base_key.or(new_key).expect("comparison identity");
         let target_key = new_key.unwrap_or(key);
         let a = base_key.and_then(|key| old.facts.get(key));
@@ -678,6 +723,7 @@ fn compare_keys(
         changes,
         summary: json!({"contract_violations":violations,"policy_violations":if fail_on_growth {growth} else {0},
             "effect_growth":growth,"impacted_callers":impacted_count,"uncertainty":uncertainty,
+            "no_panic":{"base":old_panic,"target":new_panic},
             "diagnostics":{"base":old.diagnostics,"target":new.diagnostics}}),
     })
 }

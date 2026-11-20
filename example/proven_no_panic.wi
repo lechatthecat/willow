@@ -1,0 +1,34 @@
+// Runtime guards remain; these failure paths are excluded by static proof.
+@effects(no_panic)
+@pure
+@verified
+fn inc(x: i64) -> i64
+    requires x >= 0 && x < 100
+    ensures result == x + 1
+{
+    return x + 1;
+}
+
+@effects(no_panic)
+@pure
+@verified
+fn at(xs: FrozenArray<i64>, i: i64) -> i64
+    requires i >= 0 && i < xs.len()
+{
+    return xs[i];
+}
+
+@effects(no_panic)
+@pure
+@verified
+fn next(x: i64) -> i64
+    requires x >= 0 && x < 100
+{
+    return inc(x);
+}
+
+fn main() {
+    println(inc(41));
+    println(at([7, 9].freeze(), 1));
+    println(next(98));
+}

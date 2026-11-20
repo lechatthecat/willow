@@ -709,6 +709,12 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
     let target = result["selected"]["selector"]
         .as_str()
         .unwrap_or("selected function");
+    if let Some(basis) = result["no_panic"]["basis"].as_str() {
+        lines.push(format!(
+            "no_panic: {} ({basis}; runtime checks retained)",
+            result["no_panic"]["status"].as_str().unwrap_or("UNPROVEN")
+        ));
+    }
     let paths: Vec<_> = result["effect_evidence"]
         .as_array()
         .into_iter()

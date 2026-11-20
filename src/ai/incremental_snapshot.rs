@@ -1195,6 +1195,7 @@ fn merge_semantic(target: &mut SemanticFacts, mut source: SemanticFacts) {
     target.flows.extend(source.flows);
     target.witnesses.extend(source.witnesses);
     target.compiler_effects.extend(source.compiler_effects);
+    target.panic_evidence.extend(source.panic_evidence);
     target.effect_calls.extend(source.effect_calls);
     target.async_functions.extend(source.async_functions);
     target.unresolved_calls.extend(source.unresolved_calls);
@@ -1355,6 +1356,9 @@ fn split(snapshot: &Snapshot) -> (Snapshot, HashMap<String, Projection>) {
     for (id, record) in &mut records {
         if let Some(value) = metadata.semantic.witnesses.remove(id) {
             record.semantic.witnesses.insert(id.clone(), value);
+        }
+        if let Some(value) = metadata.semantic.panic_evidence.remove(id) {
+            record.semantic.panic_evidence.insert(id.clone(), value);
         }
         if let Some(value) = metadata.semantic.compiler_effects.remove(id) {
             record.semantic.compiler_effects.insert(id.clone(), value);

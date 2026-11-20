@@ -538,10 +538,26 @@ as `may-io`.
 | --- | --- | --- |
 | A function-value parameter | Its target is unknown, so a `no_wait` caller fails with E2612 | `effect_contract_polymorphic_perspectives` in [`effect_contracts.rs`](src/semantic/type_checker/effect_contracts.rs) |
 | Foreign declarations | Unknown for every contract; `@effects(no_io)` on the declaration is trusted, not verified | `io_contract_permission_matrix` and `panic_allocation_contract_matrix` in [`effect_contracts.rs`](src/semantic/type_checker/effect_contracts.rs) |
-| `no_panic` is an effect proof, not a value-range proof | A potential guard is rejected even when an application invariant prevents it. Checked integer faults count even in profiles that wrap integer arithmetic. | `panic_allocation_checked_profiles` in [`tests/effect_contracts.rs`](tests/effect_contracts.rs) |
+| `no_panic` can use a value proof inside `@pure @verified` | Proven checked arithmetic, division, immutable array bounds and contract evaluation do not violate the declaration. Without a successful proof, potential guards still count, including in profiles that wrap integer arithmetic. | [`proven_no_panic.wi`](example/proven_no_panic.wi) |
 | `no_panic` does not cover the process | It does not promise termination and does not exclude hardware faults, out-of-memory aborts, stack exhaustion or failures inside runtime housekeeping | The effect bits in `RuntimeEffects`, [`willow_abi`](crates/willow_abi/src/lib.rs) |
 | `no_alloc` covers managed allocation by language operations only | Allocation used only to report a compiler-generated fault (such as a failed bounds check or `unwrap()` of an empty value), GC and scheduler bookkeeping are excluded. It does not promise zero native allocator calls or no GC safepoints. `requires`/`ensures` guards count; loop invariants and variants are verifier-only and do not. | `no_alloc_fault_reporting_and_proof_only_clauses` in [`tests/effect_contracts.rs`](tests/effect_contracts.rs) |
 | `no_io` is not an operating-system sandbox | Runtime housekeeping (GC, scheduling, clocks and fault reporting) is outside its scope | `io_contract_std_resource_catalog_is_complete` in [`effect_contracts.rs`](src/semantic/type_checker/effect_contracts.rs) |
+
+`no_panic` uses two kinds of evidence: `effect-analysis` when effect analysis alone
+suffices, and `solver-proof` when a successful `@verified` proof is needed. The
+`effects` query, `verify-edit` report and `contracts.lock` expose this distinction.
+UNKNOWN, timeout and failed obligations never discharge a potential panic.
+Proofs are checked once per verified function in a checking pass and shared with
+the effect checker; ordinary programs do not start the solver.
+
+Runtime checks are **retained**. A solver-backed `no_panic` guarantee means that
+failure paths are unreachable under the function's `requires`. A verified caller
+must prove its callees' preconditions at each call. Ordinary callers still count
+the runtime guards as possible panic sources, even when the callee is verified.
+Explicit `panic`, `unwrap`, mutable `Array` indexing and unsupported operations
+remain rejected. Other effect contracts, including `no_alloc`, retain their
+existing meaning. Changes to contracts, bodies or immutable data declarations
+cause proof rechecking; saved artifacts never grant proof authority.
 
 What `no_alloc` counts in detail: string literals count, because first use
 initializes their cached managed object. Materialized ranges and the implicit

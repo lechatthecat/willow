@@ -1118,6 +1118,22 @@ impl TypeChecker {
     ) {
         let mut declarations = self.contract_obligations(program, templates);
         self.report_purity(program, graph, &declarations, templates);
+        if !templates && !self.template_precheck {
+            let options = self.verification_options.clone().unwrap_or_default();
+            let writes = self.field_writes.clone().expect("field write analysis");
+            let (diagnostics, verification) = crate::semantic::verification::check(
+                program,
+                &self.errors,
+                &writes,
+                &options,
+                &mut self.verification_cache,
+            );
+            self.verification = verification;
+            for diagnostic in diagnostics {
+                self.push(diagnostic);
+            }
+        }
+
         declarations.retain(|(_, c)| {
             !matches!(
                 c.kind,
@@ -1130,6 +1146,29 @@ impl TypeChecker {
             facts,
             declarations.iter().map(|(id, _)| *id),
         );
+        // Runtime guards remain in generated code. A whole-function proof is
+        // conditional on this entry's requires; callers without their own proof
+        // must still account for those guards. Keep the exported lattice raw.
+        let proven: HashMap<_, _> = self
+            .verification
+            .reports
+            .iter()
+            .filter(|r| r.status == crate::semantic::verification::Status::Proven)
+            .map(|r| (FunctionId::free(&r.function), r))
+            .collect();
+        let panic = RuntimeEffects::MAY_PANIC.union(RuntimeEffects::MAY_CHECKED_PANIC);
+        self.panic_evidence = contract_facts.iter().map(|(&id, summary)| {
+            let report = proven.get(&id);
+            let effect_only = !summary.intersects(panic);
+            (id, serde_json::json!({
+                "status": if effect_only || report.is_some() { "PROVEN" } else { "UNPROVEN" },
+                "basis": if effect_only { "effect-analysis" } else if report.is_some() { "solver-proof" } else { "unproven" },
+                "runtime_checks": "retained",
+                "contract_digest": report.map(|r| &r.contract_digest),
+                "dependency_digests": report.map(|r| &r.dependency_digests),
+            }))
+        }).collect();
+        let proven: HashSet<_> = proven.into_keys().collect();
         let contract_facts = std::sync::Arc::new(contract_facts);
         let facts = &contract_facts;
         let graph = &graph;
@@ -1168,6 +1207,9 @@ impl TypeChecker {
             let matching = |bit: &RuntimeEffects| {
                 contract.kind.forbidden().intersects(*bit) && summary.intersects(*bit)
             };
+            if contract.kind == EffectContractKind::NoPanic && proven.contains(&id) {
+                continue;
+            }
             let Some(index) = bits
                 .iter()
                 .position(|bit| {
@@ -1254,10 +1296,20 @@ impl TypeChecker {
                     "conservative-bound"
                 }
             };
+            if let Some(evidence) = self.panic_evidence.get(&id) {
+                diagnostic = diagnostic.with_note(format!(
+                    "no_panic evidence: {} ({})",
+                    evidence["status"].as_str().unwrap_or("UNPROVEN"),
+                    evidence["basis"].as_str().unwrap_or("unproven")
+                ));
+            }
             diagnostic = diagnostic.with_note(format!(
                 "certainty: {certainty}; call chain: {}",
                 chain.join(" -> ")
             ));
+            if contract.kind == EffectContractKind::NoPanic {
+                diagnostic = diagnostic.with_help("checked arithmetic, FrozenArray indexing and contract guards can be discharged by @pure @verified with sufficient requires; explicit panic and unsupported operations remain violations");
+            }
             self.push(diagnostic);
         }
     }

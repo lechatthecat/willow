@@ -1601,3 +1601,97 @@ fn no_alloc_fault_reporting_and_proof_only_clauses() {
         }
     }
 }
+
+#[test]
+fn proof_no_panic_driver_example_and_retained_guard() {
+    let fixture = Fixture::new(include_str!("../example/proven_no_panic.wi"));
+    for command in ["check", "run", "check"] {
+        let out = fixture.command(command);
+        assert!(
+            out.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if command == "run" {
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "42\n9\n99");
+        }
+    }
+    let source = include_str!("../example/proven_no_panic.wi").replace("inc(41)", "inc(100)");
+    fs::write(fixture.0.join("main.wi"), source).unwrap();
+    let check = fixture.command("check");
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let run = fixture.command("run");
+    assert!(!run.status.success(), "requires guard must remain");
+}
+
+#[test]
+fn proof_no_panic_driver_queries_and_invalidation() {
+    let source = "@pure @verified @effects(no_panic) fn f(x:i64)->i64 requires x>=0 && x<100 {return x+1;} @effects(no_panic) fn plain(x:i64)->i64 {return x;} fn main() {}";
+    let fixture = Fixture::new(source);
+    for _ in 0..2 {
+        for (name, basis) in [("f", "solver-proof"), ("plain", "effect-analysis")] {
+            let out = Command::new(env!("CARGO_BIN_EXE_willow"))
+                .current_dir(&fixture.0)
+                .args([
+                    "effects",
+                    &format!("main::{name}"),
+                    "--source",
+                    "main.wi",
+                    "--format=json",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert!(value.to_string().contains(basis), "{value}");
+        }
+    }
+    fs::write(fixture.0.join("main.wi"), source.replace("x<100", "x>=0")).unwrap();
+    for _ in 0..2 {
+        let out = fixture.command("check");
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && text.contains("E2610"), "{text}");
+        assert!(
+            text.contains("@verified") && text.contains("requires"),
+            "{text}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn proof_no_panic_driver_unknown_and_timeout_fail_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new(
+        "@pure @verified @effects(no_panic) fn f(x:i64)->i64 requires x>=0 && x<100 {return x+1;} fn main() {}",
+    );
+    assert!(fixture.command("check").status.success());
+    let solver = fixture.0.join("solver.py");
+    for (action, message) in [
+        ("print('unknown', flush=True)", "UNKNOWN"),
+        ("time.sleep(30)", "timeout"),
+    ] {
+        fs::write(&solver, format!("#!/usr/bin/env python3\nimport sys,time\nfor line in sys.stdin:\n if 'get-info' in line: print('(:version \"4.15.4\")', flush=True)\n elif 'check-sat' in line: {action}\n elif 'echo' in line: print('willow-end', flush=True)\n")).unwrap();
+        fs::set_permissions(&solver, fs::Permissions::from_mode(0o700)).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .current_dir(&fixture.0)
+            .args(["check", "main.wi"])
+            .env("WILLOW_Z3", &solver)
+            .env("WILLOW_VERIFICATION_TIMEOUT_MS", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && text.contains("E2610") && text.contains(message),
+            "{text}"
+        );
+    }
+}

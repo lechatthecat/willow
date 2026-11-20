@@ -163,6 +163,13 @@ pub(crate) fn hash_serialized(value: &impl Serialize) -> Result<String> {
     Ok(format!("{:x}", crate::hex::Hex(&writer.0.finalize())))
 }
 
+pub(crate) fn capture_panic_evidence(
+    unit: &mut CapturedUnit,
+    evidence: HashMap<FunctionId, serde_json::Value>,
+) {
+    unit.semantic.panic_evidence = evidence;
+}
+
 pub(crate) struct CapturedUnit {
     graph: CallGraph,
     indirect: indirect::Inputs,

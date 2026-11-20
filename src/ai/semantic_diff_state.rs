@@ -409,6 +409,7 @@ impl Capture {
         for id in removed_symbols.iter().chain(removed_functions) {
             if let Some(key) = self.retained.ids.get(id) {
                 self.shapes.remove(key);
+                self.panic_evidence.remove(key);
                 if matching::is_lambda(key)
                     && let Some(owner) = matching::scope(key)
                     && let Some(lambdas) = self.lambda_owners.get_mut(&owner)
@@ -640,13 +641,22 @@ impl Capture {
             let waiting = RuntimeEffects::MAY_BLOCK
                 .union(RuntimeEffects::MAY_SUSPEND)
                 .bits();
-            let bits = patch
+            let mut bits = patch
                 .semantic
                 .compiler_effects
                 .get(&f.id)
                 .map_or(f.runtime_effects, |checked| {
                     (f.runtime_effects & !waiting) | (checked & waiting)
                 });
+            self.panic_evidence.remove(key);
+            if let Some(evidence) = patch.semantic.panic_evidence.get(&f.id) {
+                if evidence["status"] == "PROVEN" {
+                    bits &= !RuntimeEffects::MAY_PANIC
+                        .union(RuntimeEffects::MAY_CHECKED_PANIC)
+                        .bits();
+                }
+                self.panic_evidence.insert(key.clone(), evidence.clone());
+            }
             fact.effects = Some(EffectState {
                 may: bits,
                 unknown: if f.unknown {
