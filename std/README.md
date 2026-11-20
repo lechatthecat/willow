@@ -101,6 +101,21 @@ scalar value and panics on a surrogate or a value above `0x10FFFF`.
 Growable, indexable sequence. `arr[i]` reads and `arr[i] = v` writes in O(1)
 and panic when `i` is out of bounds.
 
+`Array<u8>` and fixed arrays `[u8; N]` store one byte per element, plus
+the array handle, buffer header, alignment and spare capacity. GC traces the
+buffer owner but never interprets its bytes as pointers. Generic `Array<T>`
+code specialized with `T = u8` retains this packed representation: passing,
+returning, capturing or storing an array does not widen or copy its elements.
+The compiler selects byte loads/stores statically; runtime allocation, growth
+and copying share the width-aware array implementation. Other element layouts
+and the array handle ABI are unchanged.
+
+Use `concat` for an independent shallow concatenation and `content_equals`
+for ordered scalar/string element equality (including empty arrays). These
+methods also work in generic code; array `+`, `==` and `!=` operators remain
+undefined. Floating element equality follows scalar equality, including NaN.
+See [packed byte arrays](../example/packed_byte_arrays.wi).
+
 | Method | Result | Cost |
 | --- | --- | --- |
 | `Array::new()`, `[a, b, c]` | `Array<T>` | O(1) / O(n) |
@@ -112,9 +127,11 @@ and panic when `i` is out of bounds.
 | `swap(i, j)` | | O(1) |
 | `fill(v)` | | O(n) |
 | `slice(start, end)` | `Array<T>` (copy) | O(end - start) |
+| `concat(other)` | `Array<T>` (copy) | O(n + m) |
+| `content_equals(other)` | `bool` | O(n) worst case, O(1) for different lengths; scalar and `String` elements |
 | `index_of(v)` | `Option<i64>` | O(n); scalar and `String` elements |
 | `contains(v)` | `bool` | O(n); scalar and `String` elements |
-| `sort()` | | O(n log n); `i64` and `f64` elements |
+| `sort()` | | O(n log n); integer and `f64` elements |
 | `sort_by(less)` | | O(n log n) comparisons |
 | `join(separator)` | `String` | O(total bytes); `String` elements |
 | `to_string()` | `String` | O(total); `[1, 2]`, strings quoted |

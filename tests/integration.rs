@@ -6,6 +6,9 @@
 #[path = "integration/support.rs"]
 mod support;
 
+#[path = "integration/packed_byte_arrays.rs"]
+mod packed_byte_arrays;
+
 #[path = "integration/cleanup_cfg.rs"]
 mod cleanup_cfg;
 

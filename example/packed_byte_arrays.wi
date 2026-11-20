@@ -1,0 +1,36 @@
+// Generic Array<T> calls retain packed byte storage when T = u8.
+import std::collections::Array;
+
+fn append<T>(values: Array<T>, value: T) -> Array<T> {
+    values.push(value);
+    return values;
+}
+class Packet<T> { pub payload: Array<T>; }
+async fn create() -> Array<u8> {
+    await sleep(1);
+    let values: Array<u8> = [0];
+    gc_collect();
+    return values;
+}
+async fn main() {
+    let bytes = await create();
+    append<u8>(bytes, 128);
+    bytes.push(255);
+    bytes[0] = 7;
+    let header: [u8; 2] = [1, 2];
+    let packet = new Packet<u8>(header.slice(0, 2).concat(bytes));
+    let capture = || packet.payload[4];
+    println(capture());
+    let received = packet.payload;
+    let expected: Array<u8> = [1, 2, 7, 128, 255];
+    println(received.content_equals(expected));
+    let frozen = received.freeze();
+    received[0] = 99;
+    gc_collect();
+    let mut sum: i64 = 0;
+    for byte in frozen { sum += byte.to_i64(); }
+    println(sum);
+    println(received.slice(2, 5).to_string());
+    println(received.pop());
+    println(received.len());
+}

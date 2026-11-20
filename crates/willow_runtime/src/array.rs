@@ -577,6 +577,13 @@ pub extern "C" fn willow_array_resize(arr: *mut u8, length: i64, pair_mask: i64)
 /// again after every call that can reach a GC point.
 fn resize_rooted(root: &*mut u8, length: i64, pair_mask: i64) {
     let arr = || unsafe { std::ptr::read_volatile(root) };
+    // Reject impossible requests before incremental growth can allocate or
+    // mutate the array. Generated scalar in-capacity resizes stay inline;
+    // this check belongs only to their runtime fallback.
+    if buffer_bytes(length, unsafe { handle_word(arr(), H_IS_REF) }).is_none() {
+        raise_with(&format!("array capacity too large: {length}"));
+        return;
+    }
     while willow_array_len(arr()) < length {
         let value = if pair_mask < 0 {
             0
@@ -931,6 +938,10 @@ pub extern "C" fn willow_array_to_string(arr: *mut u8, elem_kind: i64) -> *mut u
     out.push(']');
     crate::string::willow_string_from_str(&out)
 }
+
+#[cfg(test)]
+#[path = "array/packed_tests.rs"]
+mod packed_tests;
 
 #[cfg(test)]
 mod tests {

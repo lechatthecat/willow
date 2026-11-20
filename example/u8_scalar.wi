@@ -1,6 +1,6 @@
 // u8 stores 0..=255. Integer literals take their annotated context.
 // Conversion is explicit: widening is lossless; wrapping truncates to 8 bits;
-// checked conversion returns None outside the range. Arrays still use slots.
+// checked conversion returns None outside the range. Arrays pack one byte per element.
 import std::collections::Array;
 
 const MAX_BYTE: u8 = 255;

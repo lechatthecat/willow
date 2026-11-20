@@ -38,6 +38,22 @@ pub class Array<T> {
         for index in start..end { result[index - start] = self[index]; }
         return result;
     }
+    // Independent shallow concatenation, including when other aliases self.
+    pub fn concat(other: Array<T>) -> Array<T> {
+        let result: Array<T> = [];
+        for value in self { result.push(value); }
+        for value in other { result.push(value); }
+        return result;
+    }
+    // Ordered scalar/string value comparison; does not compare array identity.
+    pub fn content_equals(other: Array<T>) -> bool where T: i8 | i16 | i32 | u16 | u32 | u64 | char | u8 | i64 | f64 | bool | String {
+        let length = self.__abi_len();
+        if length != other.len() { return false; }
+        for index in 0..length {
+            if self[index] != other[index] { return false; }
+        }
+        return true;
+    }
     pub fn insert(index: i64, value: T) {
         let length = self.__abi_len();
         if index < 0 || index > length { panic("array insert out of bounds"); }
