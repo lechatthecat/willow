@@ -796,7 +796,7 @@ pub(super) fn flat_rvalue_supported(
         V::Range { start, end } => ty(start) == Some(Type::I64) && ty(end) == Some(Type::I64),
         V::EnumMethod { receiver_ty, method, arg_types, result, .. } => ctx.supported_enum_type(receiver_ty) && ctx.supported_type(result) && arg_types.iter().all(|ty| ctx.supported_type(ty)) && option_result_method(receiver_ty, method, arg_types).is_some_and(|ret| ctx.same_repr(&ret, result)),
         V::BuiltinCall { callee, params, result, .. } => {
-            if callee.is_free_named("$contract_i64") { return params == &[Type::I64, Type::I64, Type::I64] && *result == Type::I64; }
+            if callee.is_free_named("$contract_i64") { return matches!(params.as_slice(), [op, lhs, rhs] if *op == Type::I64 && lhs.integer_layout().is_some() && lhs == rhs && lhs == result); }
             if callee.is_free_named("$contract_check") { return params == &[Type::Bool, Type::I64] && *result == Type::Void; }
             let void_future = *result == Type::Void || builtin_types::unary_arg(result, B::Future) == Some(&Type::Void);
             if callee.is_free_named("sleep") { return params == &[Type::I64] && void_future; }
@@ -805,7 +805,7 @@ pub(super) fn flat_rvalue_supported(
             if callee.is_free_named("gc_collect") || callee.is_free_named("gc_minor_collect") || callee.is_free_named("gc_task_frame_diagnostics") { *result == Type::Void }
             else { callee.is_free_named(callee.unqualified_name().as_deref().unwrap_or("")) && runtime_stat_builtin_runtime_name(callee.unqualified_name().as_deref().unwrap_or("")).is_some() && *result == Type::I64 }
         }
-        V::FormatScalar { ty, format, .. } => matches!(ty, Type::I64 | Type::F64 | Type::Bool | Type::String) && (format.is_none() || *ty == Type::F64),
+        V::FormatScalar { ty, format, .. } => matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String) && (format.is_none() || *ty == Type::F64),
         V::Panic { message } => ty(message) == Some(Type::String),
         // A payload-free enum compares its tag; a class or interface value
         // compares its object word by reference identity.

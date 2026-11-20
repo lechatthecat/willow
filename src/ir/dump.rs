@@ -482,6 +482,7 @@ fn type_str<N: std::fmt::Display>(ty: &Type<N>) -> String {
             }
         };
         match ty {
+            Type::U8 => out.push_str("u8"),
             Type::I64 => out.push_str("i64"),
             Type::F64 => out.push_str("f64"),
             Type::Bool => out.push_str("bool"),

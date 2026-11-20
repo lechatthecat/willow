@@ -56,6 +56,9 @@ use willow_abi::runtime_symbols::names as rt;
 pub enum Intrinsic {
     /// `i64.to_string()` → `willow_i64_to_string`.
     I64ToString,
+    IntegerToI64,
+    IntegerWrappingToU8,
+    IntegerCheckedToU8,
     /// `f64.to_string()` → `willow_f64_to_string`.
     F64ToString,
     /// `bool.to_string()` → `willow_bool_to_string`.
@@ -258,6 +261,9 @@ impl Intrinsic {
     /// added here fails `all_variants_are_listed`.
     pub const ALL: &'static [Intrinsic] = &[
         Intrinsic::I64ToString,
+        Intrinsic::IntegerToI64,
+        Intrinsic::IntegerWrappingToU8,
+        Intrinsic::IntegerCheckedToU8,
         Intrinsic::F64ToString,
         Intrinsic::BoolToString,
         Intrinsic::I64WrappingAdd,
@@ -342,6 +348,9 @@ impl Intrinsic {
             I64ToString | F64ToString | BoolToString | StringToString | MapToString => {
                 &["to_string"]
             }
+            IntegerToI64 => &["to_i64"],
+            IntegerWrappingToU8 => &["wrapping_to_u8"],
+            IntegerCheckedToU8 => &["checked_to_u8"],
             I64WrappingAdd => &["wrapping_add"],
             I64WrappingSub => &["wrapping_sub"],
             I64WrappingMul => &["wrapping_mul"],
@@ -427,7 +436,8 @@ impl Intrinsic {
             I64ToString => &[rt::willow_i64_to_string],
             F64ToString => &[rt::willow_f64_to_string],
             BoolToString => &[rt::willow_bool_to_string],
-            StringToString | TaskResult => &[],
+            IntegerToI64 | IntegerWrappingToU8 | IntegerCheckedToU8 | StringToString
+            | TaskResult => &[],
             I64WrappingAdd | I64WrappingSub | I64WrappingMul | I64WrappingNeg | I64CheckedAdd
             | I64CheckedSub | I64CheckedMul | I64CheckedNeg => &[],
             StringLen => &[],
@@ -771,13 +781,13 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
     }
     // Explicit overflow behavior, independent of the build mode.
     //
-    if matches!(recv, Type::I64) {
-        let option = || B::Option.apply(vec![Type::I64]);
+    if recv.integer_layout().is_some() {
+        let option = || B::Option.apply(vec![recv.clone()]);
         let entry = match (method, arity) {
-            ("wrapping_add", 1) => Some((Intrinsic::I64WrappingAdd, Type::I64)),
-            ("wrapping_sub", 1) => Some((Intrinsic::I64WrappingSub, Type::I64)),
-            ("wrapping_mul", 1) => Some((Intrinsic::I64WrappingMul, Type::I64)),
-            ("wrapping_neg", 0) => Some((Intrinsic::I64WrappingNeg, Type::I64)),
+            ("wrapping_add", 1) => Some((Intrinsic::I64WrappingAdd, recv.clone())),
+            ("wrapping_sub", 1) => Some((Intrinsic::I64WrappingSub, recv.clone())),
+            ("wrapping_mul", 1) => Some((Intrinsic::I64WrappingMul, recv.clone())),
+            ("wrapping_neg", 0) => Some((Intrinsic::I64WrappingNeg, recv.clone())),
             ("checked_add", 1) => Some((Intrinsic::I64CheckedAdd, option())),
             ("checked_sub", 1) => Some((Intrinsic::I64CheckedSub, option())),
             ("checked_mul", 1) => Some((Intrinsic::I64CheckedMul, option())),
@@ -788,10 +798,26 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
             return Some(ResolvedMethod::fixed(intrinsic, ty));
         }
     }
+    if arity == 0 {
+        let conversion = match (recv, method) {
+            (Type::U8, "to_i64") => Some((Intrinsic::IntegerToI64, Type::I64)),
+            (Type::I64, "wrapping_to_u8") => Some((Intrinsic::IntegerWrappingToU8, Type::U8)),
+            (Type::I64, "checked_to_u8") => Some((
+                Intrinsic::IntegerCheckedToU8,
+                B::Option.apply(vec![Type::U8]),
+            )),
+            _ => None,
+        };
+        if let Some((intrinsic, ty)) = conversion {
+            return Some(ResolvedMethod::fixed(intrinsic, ty));
+        }
+    }
     // Scalar `to_string` conversions.
     if method == "to_string" && arity == 0 {
         match recv {
-            Type::I64 => return Some(ResolvedMethod::fixed(Intrinsic::I64ToString, Type::String)),
+            Type::U8 | Type::I64 => {
+                return Some(ResolvedMethod::fixed(Intrinsic::I64ToString, Type::String));
+            }
             Type::F64 => return Some(ResolvedMethod::fixed(Intrinsic::F64ToString, Type::String)),
             Type::Bool => {
                 return Some(ResolvedMethod::fixed(Intrinsic::BoolToString, Type::String));
@@ -809,7 +835,9 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
     if method == "__abi_debug" && arity == 0 {
         return match recv {
             Type::String => Some(ResolvedMethod::fixed(Intrinsic::StringDebug, Type::String)),
-            Type::I64 => Some(ResolvedMethod::fixed(Intrinsic::I64ToString, Type::String)),
+            Type::U8 | Type::I64 => {
+                Some(ResolvedMethod::fixed(Intrinsic::I64ToString, Type::String))
+            }
             Type::F64 => Some(ResolvedMethod::fixed(Intrinsic::F64ToString, Type::String)),
             Type::Bool => Some(ResolvedMethod::fixed(Intrinsic::BoolToString, Type::String)),
             _ => None,
@@ -1606,6 +1634,7 @@ mod tests {
     #[test]
     fn every_intrinsic_is_reachable_from_resolve() {
         let receivers: Vec<Type> = vec![
+            Type::U8,
             Type::I64,
             Type::F64,
             Type::Bool,
@@ -1626,6 +1655,9 @@ mod tests {
             named("TaskScope"),
         ];
         let methods = [
+            "to_i64",
+            "wrapping_to_u8",
+            "checked_to_u8",
             "__abi_len",
             "__abi_resize",
             "__abi_copy",
@@ -1714,7 +1746,7 @@ mod tests {
         assert_eq!(unique.len(), Intrinsic::ALL.len(), "duplicate in ALL");
         assert_eq!(
             Intrinsic::ALL.len(),
-            72,
+            75,
             "Intrinsic::ALL must list every variant; update the count when adding one"
         );
     }
@@ -2259,6 +2291,10 @@ fn f() {
         for (src, expected) in [
             (SCALARS, 5),
             (INTEGERS, 8),
+            (
+                "fn f(x: u8, y: i64) { x.to_i64(); y.wrapping_to_u8(); y.checked_to_u8(); }",
+                3,
+            ),
             (STRINGS, 14),
             (ARRAYS, 7),
             (MAPS, 13),

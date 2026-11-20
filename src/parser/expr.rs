@@ -702,8 +702,10 @@ impl Parser {
             TokenKind::Select => self.parse_select(),
             TokenKind::If => self.parse_if_expr(),
             TokenKind::Match => self.parse_match_expr(),
-            TokenKind::F64 | TokenKind::I64 => {
-                let name = if matches!(self.peek_kind(), TokenKind::I64) {
+            TokenKind::U8 | TokenKind::F64 | TokenKind::I64 => {
+                let name = if matches!(self.peek_kind(), TokenKind::U8) {
+                    "u8"
+                } else if matches!(self.peek_kind(), TokenKind::I64) {
                     "i64"
                 } else {
                     "f64"

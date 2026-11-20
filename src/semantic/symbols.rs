@@ -501,6 +501,7 @@ impl SymbolTable {
 
     fn type_key_into(&self, ty: &Type, key: &mut String) -> Option<()> {
         match ty {
+            Type::U8 => key.push_str("u8"),
             Type::I64 => key.push('i'),
             Type::F64 => key.push('f'),
             Type::Bool => key.push('b'),

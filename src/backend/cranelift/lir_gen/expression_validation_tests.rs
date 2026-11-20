@@ -347,7 +347,9 @@ fn supported_pattern<'n>(
             true
         }
         HirPattern::LiteralBool(_) => *scrutinee_ty == Type::Bool,
-        HirPattern::LiteralInt(_) => *scrutinee_ty == Type::I64,
+        HirPattern::LiteralInt(value) => scrutinee_ty
+            .integer_layout()
+            .is_some_and(|layout| layout.contains(i128::from(*value))),
         HirPattern::EnumVariant { enum_name, variant } => {
             variant_of(&enum_name.to_string(), variant).is_some_and(|v| v.payloads.is_empty())
         }
@@ -445,7 +447,10 @@ pub(super) fn format_operands(args: &[HirExpr]) -> Option<&[HirExpr]> {
         // A precision placeholder passes its operand straight to an f64
         // formatting symbol, so nothing else may reach it.
         crate::interpolate::Segment::F64(_) => a.ty == Type::F64,
-        _ => matches!(a.ty, Type::I64 | Type::F64 | Type::Bool | Type::String),
+        _ => matches!(
+            a.ty,
+            Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+        ),
     });
     renderable.then_some(operands)
 }
@@ -630,7 +635,7 @@ fn supported_match<'n>(
     // The scrutinee shapes the walker can test. A `String` or class scrutinee
     // needs a content comparison the pattern emitter below does not have.
     let scrutinee_ok = match &scrutinee.ty {
-        Type::I64 | Type::Bool => true,
+        Type::U8 | Type::I64 | Type::Bool => true,
         // An interface box, matched by class downcast patterns
         //. Checked before the enum test because an interface
         // is also spelled `Type::Named`; the two sets cannot overlap. A GENERIC
@@ -1204,7 +1209,7 @@ fn supported_expr_node<'n>(
             if matches!(op, BinOp::Pow)
                 && !matches!(
                     (&lhs.ty, &rhs.ty),
-                    (Type::I64, Type::I64) | (Type::F64, Type::F64)
+                    (Type::U8, Type::U8) | (Type::I64, Type::I64) | (Type::F64, Type::F64)
                 )
             {
                 return false;
@@ -1664,7 +1669,7 @@ fn supported_expr_node<'n>(
             // shared table rather than re-derived from the method name here,
             // so the walker cannot disagree with the checker about what the
             // call means or what it produces.
-            Type::I64 | Type::F64 | Type::Bool | Type::String => {
+            Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String => {
                 matches!(
                     scalar_to_string(&object.ty, method, args),
                     Some(ret) if ret == e.ty

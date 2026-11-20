@@ -294,7 +294,7 @@ impl<'e> ScalarLowering<'_, 'e> {
         let HirExprKind::Int(value) = &node.kind else {
             unreachable!()
         };
-        LirOperand::Int(*value)
+        LirOperand::integer(*value, &node.ty)
     }
 
     fn finish_float(&mut self, node: &HirExpr) -> LirOperand {

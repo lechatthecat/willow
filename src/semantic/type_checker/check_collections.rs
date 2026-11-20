@@ -445,7 +445,7 @@ impl TypeChecker {
             )
         {
             if key {
-                let got = self.check_expr(&m.args[0].expr);
+                let got = self.check_expr_expecting(&m.args[0].expr, &key_ty);
                 self.check_builtin_argument(
                     BuiltinArgument::MapKey,
                     B::Map.source_name(),
@@ -484,7 +484,10 @@ impl TypeChecker {
             // `.freeze()` -> an immutable `FrozenMap<K,V>` copy, Sync when K,V are
             // Sync, so it can be shared across tasks.
             "to_string" => {
-                if !matches!(val_ty, Type::I64 | Type::F64 | Type::Bool | Type::String) {
+                if !matches!(
+                    val_ty,
+                    Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+                ) {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -542,7 +545,7 @@ impl TypeChecker {
         let key_ty = key_ty.clone();
         let val_ty = val_ty.clone();
         if let Some(arg) = m.args.first() {
-            let k = self.check_expr(&arg.expr);
+            let k = self.check_expr_expecting(&arg.expr, &key_ty);
             if matches!(m.method.as_str(), "get" | "contains")
                 && key_ty != Type::Void
                 && !self.types_compatible(&key_ty, &k)

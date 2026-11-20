@@ -547,9 +547,12 @@ impl TypeChecker {
                 )
                 .with_help("add `true` and `false` patterns, or use a wildcard `_`"),
             ),
-            Type::I64 => self.push_error(
+            Type::U8 | Type::I64 => self.push_error(
                 ErrorCode::E1206,
-                "non-exhaustive match on `i64`: add a wildcard arm `_ => ...`",
+                format!(
+                    "non-exhaustive match on `{}`: add a wildcard arm `_ => ...`",
+                    self.diagnostic_type_name(scrutinee_ty)
+                ),
                 m.span,
                 "match is not exhaustive",
             ),

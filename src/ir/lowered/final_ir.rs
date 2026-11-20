@@ -340,7 +340,7 @@ fn operand(
     use crate::ir::typed_ast::HirExprKind as E;
     let value = match &expression.kind {
         E::Var(name) => names.get(name).copied().map(LirOperand::Local),
-        E::Int(value) => Some(LirOperand::Int(*value)),
+        E::Int(value) => Some(LirOperand::integer(*value, &expression.ty)),
         E::Float(value) => Some(LirOperand::Float(*value)),
         E::Bool(value) => Some(LirOperand::Bool(*value)),
         _ => None,

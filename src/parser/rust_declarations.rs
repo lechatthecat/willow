@@ -58,7 +58,7 @@ impl Parser {
                     || self.rust_records.contains_key(&record.name)
                     || matches!(
                         record.name.as_str(),
-                        "String" | "i64" | "f64" | "bool" | "void"
+                        "String" | "u8" | "i64" | "f64" | "bool" | "void"
                     )
                     || crate::semantic::builtin_types::BuiltinTypeId::from_name(&record.name)
                         .is_some()
@@ -149,7 +149,15 @@ impl Parser {
                 self.expect(TokenKind::Semicolon)?;
                 if matches!(
                     name.as_str(),
-                    "String" | "Array" | "Option" | "Result" | "i64" | "f64" | "bool" | "void"
+                    "String"
+                        | "Array"
+                        | "Option"
+                        | "Result"
+                        | "u8"
+                        | "i64"
+                        | "f64"
+                        | "bool"
+                        | "void"
                 ) {
                     return Err(self.err(
                         ErrorCode::E0102,

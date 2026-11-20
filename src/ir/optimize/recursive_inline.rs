@@ -17,7 +17,7 @@ pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_ch
     const MAX_DEPTH: u32 = 3;
     const MAX_INSTRUCTIONS: usize = 256;
     const MAX_BLOCKS: usize = 64;
-    let scalar = |ty: &Type| matches!(ty, Type::I64 | Type::F64 | Type::Bool);
+    let scalar = |ty: &Type| matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool);
     if function.is_async
         || !function.captures.is_empty()
         || !scalar(&function.return_type)
@@ -272,7 +272,7 @@ pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_ch
                             HirExprKind::Var(name) => {
                                 LirOperand::Local(remap_id(names[name.as_str()]))
                             }
-                            HirExprKind::Int(n) => LirOperand::Int(*n),
+                            HirExprKind::Int(n) => LirOperand::integer(*n, &value.ty),
                             HirExprKind::Float(n) => LirOperand::Float(*n),
                             HirExprKind::Bool(b) => LirOperand::Bool(*b),
                             _ => unreachable!(),

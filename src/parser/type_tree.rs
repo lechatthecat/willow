@@ -76,7 +76,8 @@ impl<N> Type<N> {
                     pending.extend(va.iter().zip(ta));
                 }
                 (Type::Named(v), Type::Named(t)) if v == t => {}
-                (Type::I64, Type::I64)
+                (Type::U8, Type::U8)
+                | (Type::I64, Type::I64)
                 | (Type::F64, Type::F64)
                 | (Type::Bool, Type::Bool)
                 | (Type::String, Type::String)
@@ -125,6 +126,7 @@ impl<N> Type<N> {
                 Work::Build(ty, count) => {
                     let mut children = values.split_off(values.len() - count);
                     let value = match ty {
+                        Type::U8 => Type::U8,
                         Type::I64 => Type::I64,
                         Type::F64 => Type::F64,
                         Type::Bool => Type::Bool,
@@ -184,6 +186,7 @@ impl<N> Type<N> {
                 Work::Build(ty, count) => {
                     let mut children = values.split_off(values.len() - count);
                     let value = match ty {
+                        Type::U8 => Type::U8,
                         Type::I64 => Type::I64,
                         Type::F64 => Type::F64,
                         Type::Bool => Type::Bool,
@@ -324,6 +327,7 @@ impl<N: Hash> Hash for Type<N> {
 #[derive(serde::Serialize, serde::Deserialize)]
 enum FlatType<N> {
     I64,
+    U8,
     F64,
     Bool,
     String,
@@ -354,6 +358,7 @@ impl<N: serde::Serialize> serde::Serialize for Type<N> {
         let flat: Vec<_> = nodes
             .into_iter()
             .map(|ty| match ty {
+                Type::U8 => FlatType::U8,
                 Type::I64 => FlatType::I64,
                 Type::F64 => FlatType::F64,
                 Type::Bool => FlatType::Bool,
@@ -396,6 +401,7 @@ impl<'de, N: serde::Deserialize<'de>> serde::Deserialize<'de> for Type<N> {
                     .ok_or_else(|| D::Error::custom("invalid or repeated type edge"))
             };
             let value = match node {
+                FlatType::U8 => Self::U8,
                 FlatType::I64 => Self::I64,
                 FlatType::F64 => Self::F64,
                 FlatType::Bool => Self::Bool,
@@ -441,6 +447,7 @@ impl<N: std::fmt::Debug> std::fmt::Debug for Type<N> {
                 Work::Text(text) => f.write_str(text)?,
                 Work::Name(name) => std::fmt::Debug::fmt(name, f)?,
                 Work::Type(ty) => match ty {
+                    Type::U8 => f.write_str("U8")?,
                     Type::I64 => f.write_str("I64")?,
                     Type::F64 => f.write_str("F64")?,
                     Type::Bool => f.write_str("Bool")?,

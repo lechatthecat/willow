@@ -36,8 +36,11 @@ impl Parser {
         let mut frames = Vec::new();
         loop {
             let type_start = self.current_span();
-            if let TokenKind::I64 | TokenKind::F64 | TokenKind::Bool = self.peek_kind() {
+            if let TokenKind::U8 | TokenKind::I64 | TokenKind::F64 | TokenKind::Bool =
+                self.peek_kind()
+            {
                 let name = match self.peek_kind() {
+                    TokenKind::U8 => "u8",
                     TokenKind::I64 => "i64",
                     TokenKind::F64 => "f64",
                     _ => "bool",
@@ -52,6 +55,10 @@ impl Parser {
                     self.advance();
                     frames.push(Frame::FixedArray);
                     continue;
+                }
+                TokenKind::U8 => {
+                    self.advance();
+                    Type::U8
                 }
                 TokenKind::I64 => {
                     self.advance();

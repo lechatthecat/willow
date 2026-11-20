@@ -1881,8 +1881,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let value_ty = &slots.value_ty;
         let [handle_offset, token_offset, phase_offset, value_offset] = offsets;
         // I64/F64 output can go straight to the existing 64-bit frame slot:
-        // it needs no GC barrier and remains inactive until phase=Held. Bool
-        // keeps its byte-width conversion (also correct on big-endian targets).
+        // it needs no GC barrier and remains inactive until phase=Held. Narrow
+        // scalars keep byte-width conversion (also correct on big-endian targets).
         // Reuse avoids O(number of lock sites) additional native stack slots.
         let fused_scalar = mode == LockMode::Mutex && matches!(value_ty, Type::I64 | Type::F64);
         let (acquire_fn, poll_fn, load_fn, recursive_fn, invalid_fn) = match mode {

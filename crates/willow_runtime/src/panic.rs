@@ -113,15 +113,32 @@ pub extern "C" fn willow_int_div_panic(kind: i64, file: *const u8, line: i32, co
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_int_overflow_panic(kind: i64, file: *const u8, line: i32, col: i32) {
     crate::panic_context::raise_language_message_at(
-        int_overflow_message(kind),
+        &int_overflow_message(kind),
         file,
         line.into(),
         col.into(),
     );
 }
 
-fn int_overflow_message(kind: i64) -> &'static str {
-    match kind {
+fn int_overflow_message(kind: i64) -> std::borrow::Cow<'static, str> {
+    let (operation, bits, signed) = willow_abi::integer_overflow::decode(kind);
+    if kind >= 256 {
+        if operation == 3 {
+            return format!(
+                "integer overflow: negation of {}{bits}",
+                if signed { "i" } else { "u" }
+            )
+            .into();
+        }
+        if matches!(operation, 5 | 6) {
+            return format!(
+                "integer overflow: `{}` shift amount outside 0..{bits}",
+                if operation == 5 { "<<" } else { ">>" }
+            )
+            .into();
+        }
+    }
+    match operation {
         0 => "integer overflow: `+`",
         1 => "integer overflow: `-`",
         2 => "integer overflow: `*`",
@@ -130,6 +147,7 @@ fn int_overflow_message(kind: i64) -> &'static str {
         5 => "integer overflow: `<<` shift amount outside 0..64",
         _ => "integer overflow: `>>` shift amount outside 0..64",
     }
+    .into()
 }
 
 #[unsafe(no_mangle)]
@@ -160,6 +178,26 @@ mod tests {
                 "integer overflow: `<<` shift amount outside 0..64",
                 "integer overflow: `>>` shift amount outside 0..64",
             ]
+        );
+    }
+    #[test]
+    fn int_overflow_messages_preserve_unsigned_width() {
+        use willow_abi::integer_overflow::{decode, encode};
+        for operation in 0..7 {
+            assert_eq!(decode(encode(operation, 8, false)), (operation, 8, false));
+            assert_eq!(decode(encode(operation, 64, true)), (operation, 64, true));
+        }
+        assert_eq!(
+            int_overflow_message(encode(3, 8, false)),
+            "integer overflow: negation of u8"
+        );
+        assert_eq!(
+            int_overflow_message(encode(5, 8, false)),
+            "integer overflow: `<<` shift amount outside 0..8"
+        );
+        assert_eq!(
+            int_overflow_message(encode(6, 8, false)),
+            "integer overflow: `>>` shift amount outside 0..8"
         );
     }
     use crate::gc::{isolated_runtime, willow_gc_init};
@@ -208,17 +246,39 @@ pub extern "C" fn willow_contract_i64(
     line: i32,
     col: i32,
 ) -> i64 {
-    let value = contract_i64(op, a, b);
+    let value = contract_integer(op, a, b);
     if let Some(value) = value {
         return value;
     }
-    crate::panic_context::raise_language_message_at(
-        "contract evaluation error: invalid or overflowing i64 arithmetic",
-        file,
-        line.into(),
-        col.into(),
+    let (_, bits, signed) = willow_abi::integer_overflow::decode(op);
+    let message = format!(
+        "contract evaluation error: invalid or overflowing {}{bits} arithmetic",
+        if signed { "i" } else { "u" }
     );
+    crate::panic_context::raise_language_message_at(&message, file, line.into(), col.into());
     0
+}
+
+fn contract_integer(kind: i64, a: i64, b: i64) -> Option<i64> {
+    let (op, bits, signed) = willow_abi::integer_overflow::decode(kind);
+    if matches!(op, 7 | 8) && !(0..i64::from(bits)).contains(&b) {
+        return None;
+    }
+    let value = contract_i64(op, a, b)?;
+    if bits == 64 && signed {
+        return Some(value);
+    }
+    let min = if signed { -(1_i128 << (bits - 1)) } else { 0 };
+    let max = (1_i128 << (bits - u32::from(signed))) - 1;
+    if matches!(op, 7 | 8) {
+        let shift = 128 - bits;
+        return Some(if signed {
+            ((i128::from(value) << shift) >> shift) as i64
+        } else {
+            (i128::from(value) & max) as i64
+        });
+    }
+    (min..=max).contains(&i128::from(value)).then_some(value)
 }
 
 fn contract_i64(op: i64, a: i64, b: i64) -> Option<i64> {

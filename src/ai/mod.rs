@@ -624,7 +624,7 @@ impl CaptureExpressionContext<'_> {
             Expr::Await(_) | Expr::Select(_) | Expr::Print(..) => RuntimeEffects::ALL.bits(),
             Expr::Binary(b)
                 if b.op == BinOp::Add
-                    && !matches!(types.get(&b.id), Some(Type::I64 | Type::F64)) =>
+                    && !matches!(types.get(&b.id), Some(Type::U8 | Type::I64 | Type::F64)) =>
             {
                 RuntimeEffects::ALL.bits()
             }

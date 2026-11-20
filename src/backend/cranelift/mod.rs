@@ -2187,6 +2187,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .builder
                 .ins()
                 .bitcast(types::F64, MemFlagsData::new(), raw),
+            ty if ty.integer_layout().is_some_and(|l| l.bits < 64) => {
+                let target = self.clif_type(ty);
+                self.builder.ins().ireduce(target, raw)
+            }
             Type::Bool => self.builder.ins().ireduce(types::I8, raw),
             _ => raw,
         }
@@ -2205,6 +2209,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .builder
                 .ins()
                 .bitcast(types::I64, MemFlagsData::new(), val),
+            ty if ty.integer_layout().is_some() => self.widen_integer(val, ty),
             Type::Bool => self.builder.ins().uextend(types::I64, val),
             _ => val,
         }
@@ -2386,7 +2391,7 @@ fn reference_index_name(expr: &Expr) -> String {
 
 fn channel_runtime_symbol(ty: &Type, symbols: [&'static str; 4]) -> &'static str {
     symbols[match ty {
-        Type::I64 => 0,
+        Type::U8 | Type::I64 => 0,
         Type::Bool => 1,
         Type::F64 => 2,
         _ => 3,

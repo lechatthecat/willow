@@ -114,7 +114,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if intrinsic == Intrinsic::ArrayResize
             && matches!(
                 array_element_type(receiver_ty),
-                Type::I64 | Type::F64 | Type::Bool
+                Type::U8 | Type::I64 | Type::F64 | Type::Bool
             )
         {
             return self.emit_scalar_array_resize(receiver, args[0]);
@@ -178,6 +178,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         use Intrinsic::*;
         match intrinsic {
+            IntegerToI64 => self.builder.ins().uextend(types::I64, receiver),
+            IntegerWrappingToU8 => self.builder.ins().ireduce(types::I8, receiver),
+            IntegerCheckedToU8 => {
+                let overflow =
+                    self.builder
+                        .ins()
+                        .icmp_imm_u(IntCC::UnsignedGreaterThan, receiver, 255);
+                let tag = self.builder.ins().uextend(types::I64, overflow);
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let payload = self.builder.ins().select(overflow, zero, receiver);
+                self.emit_pair(tag, payload)
+            }
+            I64ToString => {
+                let receiver = self.widen_integer(receiver, receiver_ty);
+                self.emit_value_runtime_call(rt::willow_i64_to_string, &[receiver])
+            }
             StringToString | TaskResult => receiver,
             // Explicit overflow behavior ignores the build mode.
             I64WrappingAdd => self.builder.ins().iadd(receiver, args[0]),
@@ -186,13 +202,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             I64WrappingNeg => self.builder.ins().ineg(receiver),
             I64CheckedAdd | I64CheckedSub | I64CheckedMul | I64CheckedNeg => {
                 let (value, overflowed) = match intrinsic {
-                    I64CheckedAdd => self.emit_overflowing_binop(&BinOp::Add, receiver, args[0]),
-                    I64CheckedSub => self.emit_overflowing_binop(&BinOp::Sub, receiver, args[0]),
-                    I64CheckedMul => self.emit_overflowing_binop(&BinOp::Mul, receiver, args[0]),
-                    _ => self.emit_overflowing_neg(receiver),
+                    I64CheckedAdd => self.emit_overflowing_binop(
+                        &BinOp::Add,
+                        receiver,
+                        args[0],
+                        receiver_ty.integer_layout().unwrap(),
+                    ),
+                    I64CheckedSub => self.emit_overflowing_binop(
+                        &BinOp::Sub,
+                        receiver,
+                        args[0],
+                        receiver_ty.integer_layout().unwrap(),
+                    ),
+                    I64CheckedMul => self.emit_overflowing_binop(
+                        &BinOp::Mul,
+                        receiver,
+                        args[0],
+                        receiver_ty.integer_layout().unwrap(),
+                    ),
+                    _ => self.emit_overflowing_neg(receiver, receiver_ty.integer_layout().unwrap()),
                 };
                 // `Option<i64>` is a scalar pair: tag 0 `Some`, 1 `None` with
                 // a zero payload, as `emit_alloc_option_none` builds it.
+                let value = self.widen_integer(value, receiver_ty);
                 let tag = self.builder.ins().uextend(types::I64, overflowed);
                 let zero = self.builder.ins().iconst(types::I64, 0);
                 let payload = self.builder.ins().select(overflowed, zero, value);
@@ -248,7 +280,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().ireduce(types::I8, value)
             }
 
-            I64ToString => self.emit_value_runtime_call(rt::willow_i64_to_string, &[receiver]),
             F64ToString => self.emit_value_runtime_call(rt::willow_f64_to_string, &[receiver]),
             BoolToString => self.emit_value_runtime_call(rt::willow_bool_to_string, &[receiver]),
             TaskCancel => {
@@ -356,6 +387,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     } else {
                         value
                     };
+                    let value = self.widen_integer(value, element);
                     values.push(value);
                 }
                 self.emit_runtime_call_with_cleanup(symbol, &values, |_| {});
@@ -592,7 +624,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         match ty {
             Type::String => value,
-            Type::I64 => self.emit_value_runtime_call(rt::willow_i64_to_string, &[value]),
+            Type::U8 | Type::I64 => {
+                let value = self.widen_integer(value, ty);
+                self.emit_value_runtime_call(rt::willow_i64_to_string, &[value])
+            }
             Type::F64 => self.emit_value_runtime_call(rt::willow_f64_to_string, &[value]),
             Type::Bool => self.emit_value_runtime_call(rt::willow_bool_to_string, &[value]),
             _ => unreachable!("validated display format operand"),

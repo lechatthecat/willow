@@ -24,6 +24,10 @@ mod float_bits {
 pub enum LirOperand {
     Local(LirLocalId),
     Int(i64),
+    Integer {
+        value: i64,
+        ty: Type,
+    },
     Float(#[serde(with = "float_bits")] f64),
     Bool(bool),
     Reference {
@@ -89,6 +93,22 @@ impl LirPlace {
 }
 
 impl LirOperand {
+    pub(crate) fn integer_value(&self) -> Option<i64> {
+        match self {
+            Self::Int(n) | Self::Integer { value: n, .. } => Some(*n),
+            _ => None,
+        }
+    }
+    pub(crate) fn integer(value: i64, ty: &Type) -> Self {
+        if *ty == Type::I64 {
+            Self::Int(value)
+        } else {
+            Self::Integer {
+                value,
+                ty: ty.clone(),
+            }
+        }
+    }
     pub fn locals(&self) -> Vec<LirLocalId> {
         match self {
             Self::Local(local) => vec![*local],
@@ -102,6 +122,10 @@ impl LirOperand {
                 .get(id.0 as usize)
                 .filter(|local| !local.is_gc_owner())
                 .map(|local| local.ty.clone()),
+            Self::Integer { value, ty } => ty
+                .integer_layout()
+                .filter(|layout| layout.contains(i128::from(*value)))
+                .map(|_| ty.clone()),
             Self::Int(_) => Some(Type::I64),
             Self::Float(_) => Some(Type::F64),
             Self::Bool(_) => Some(Type::Bool),
@@ -328,12 +352,12 @@ pub enum LirRvalue {
 /// `0..64`, so a literal amount in range needs no check;
 /// release builds mask the amount to its low six bits.
 pub fn is_overflow_checked_binary(op: &BinOp, rhs: &LirOperand, operand_ty: &Type) -> bool {
-    *operand_ty == Type::I64
+    operand_ty.integer_layout().is_some()
         && match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Pow => true,
-            BinOp::Shl | BinOp::Shr => {
-                !matches!(rhs, LirOperand::Int(amount) if (0..64).contains(amount))
-            }
+            BinOp::Shl | BinOp::Shr => !rhs.integer_value().is_some_and(|n| {
+                (0..i64::from(operand_ty.integer_layout().unwrap().bits)).contains(&n)
+            }),
             _ => false,
         }
 }
@@ -342,8 +366,10 @@ pub fn is_overflow_checked_binary(op: &BinOp, rhs: &LirOperand, operand_ty: &Typ
 /// needs no check. A folded `i64::MIN` constant operand keeps the check.
 pub fn is_overflow_checked_unary(op: &UnaryOp, operand: &LirOperand, ty: &Type) -> bool {
     *op == UnaryOp::Neg
-        && *ty == Type::I64
-        && !matches!(operand, LirOperand::Int(value) if *value != i64::MIN)
+        && ty.integer_layout().is_some()
+        && !operand
+            .integer_value()
+            .is_some_and(|n| ty.integer_layout().unwrap().contains(-i128::from(n)))
 }
 
 impl LirRvalue {
@@ -414,7 +440,7 @@ impl LirRvalue {
             Self::StaticCall { args, arg_types, result, .. } => destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| ty(arg).as_ref() == Some(expected)),
             Self::EnumAlloc { enum_ty, .. } => destination.ty == *enum_ty,
             Self::EnumPayloadStore { object, value, source, enum_ty, .. } => ty(object).as_ref() == Some(enum_ty) && ty(value).as_ref() == Some(source) && destination.ty == *enum_ty,
-            Self::FormatScalar { value, ty: expected, format } => ty(value).as_ref() == Some(expected) && destination.ty == Type::String && if format.is_some() { *expected == Type::F64 } else { matches!(expected, Type::I64 | Type::F64 | Type::Bool | Type::String) },
+            Self::FormatScalar { value, ty: expected, format } => ty(value).as_ref() == Some(expected) && destination.ty == Type::String && if format.is_some() { *expected == Type::F64 } else { matches!(expected, Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String) },
             Self::Panic { message } => ty(message) == Some(Type::String) && destination.ty == Type::Never,
             Self::Recover => destination.ty == Type::Generic(TypeId::local(Builtin::Option.source_name()), vec![Type::Named(TypeId::local("PanicInfo"))]),
             Self::RebindResultError { value, source, target } | Self::IntoError { value, source, target } => ty(value).as_ref() == Some(source) && destination.ty == *target,
@@ -431,7 +457,7 @@ impl LirRvalue {
             Self::Closure { captures, ty: result, .. } => destination.ty == *result
                 && matches!(result, Type::Fn(..) | Type::Closure(..)) && captures.iter().all(|capture| ty(capture).is_some()),
             Self::Print { value, ty: expected, .. } => destination.ty == Type::Void
-                && ty(value).as_ref() == Some(expected) && matches!(expected, Type::I64 | Type::F64 | Type::Bool | Type::String),
+                && ty(value).as_ref() == Some(expected) && matches!(expected, Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String),
             Self::DirectCall { args, params, result, .. } => destination.ty == *result
                 && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| ty(arg).as_ref() == Some(param)),
             Self::IndirectCall { callee, args, params, result, .. } => destination.ty == *result
@@ -445,8 +471,8 @@ impl LirRvalue {
                 ty(operand).as_ref() == Some(expected)
                     && destination.ty == *expected
                     && match op {
-                        UnaryOp::Neg => matches!(expected, Type::I64 | Type::F64),
-                        UnaryOp::Not => matches!(expected, Type::Bool | Type::I64),
+                        UnaryOp::Neg => matches!(expected, Type::U8 | Type::I64 | Type::F64),
+                        UnaryOp::Not => matches!(expected, Type::Bool | Type::U8 | Type::I64),
                     }
             }
             Self::Binary {
@@ -469,7 +495,7 @@ impl LirRvalue {
                     && destination.ty == result
                     && !matches!(op, BinOp::And | BinOp::Or)
                     && match operand_ty {
-                        Type::I64 => true,
+                        Type::U8 | Type::I64 => true,
                         Type::F64 => !op.is_integer_only(),
                         Type::Bool => matches!(op, BinOp::Eq | BinOp::Ne),
                         Type::String => *op == BinOp::Add || comparison,
@@ -481,7 +507,7 @@ impl LirRvalue {
                 destination.ty == Type::String
                     && parts.len() == part_types.len()
                     && parts.iter().zip(part_types).all(|(part, expected)| {
-                        matches!(expected, Type::String | Type::I64)
+                        matches!(expected, Type::String | Type::U8 | Type::I64)
                             && ty(part).as_ref() == Some(expected)
                     })
             }
@@ -552,6 +578,20 @@ pub(super) use lower::{lower_blocks, lower_calls};
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_integer_operands_reject_invalid_artifacts() {
+        use super::{LirOperand, Type};
+        for value in [0, 128, 255] {
+            assert_eq!(
+                LirOperand::integer(value, &Type::U8).ty(&[]),
+                Some(Type::U8)
+            );
+        }
+        for (value, ty) in [(-1, Type::U8), (256, Type::U8), (1, Type::Bool)] {
+            assert_eq!(LirOperand::Integer { value, ty }.ty(&[]), None);
+        }
+    }
+
     #[test]
     fn float_operand_artifacts_preserve_every_payload_bit() {
         for bits in [

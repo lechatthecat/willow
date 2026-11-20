@@ -3561,7 +3561,8 @@ impl<N> HazardVisitor<'_, N> {
                 // Reuse checked expression types; unknown additions remain
                 // conservative for direct backend users without artifacts.
                 let ty = self.expr_types.get(&expr.id);
-                let concat = expr.op == BinOp::Add && !matches!(ty, Some(Type::I64 | Type::F64));
+                let concat =
+                    expr.op == BinOp::Add && !matches!(ty, Some(Type::U8 | Type::I64 | Type::F64));
                 // Only integer division keeps a zero/overflow guard, and a
                 // literal divisor other than 0 and -1 can trip neither.
                 let guarded_division = matches!(expr.op, BinOp::Div | BinOp::Rem)
@@ -3576,16 +3577,22 @@ impl<N> HazardVisitor<'_, N> {
                     Expr::Integer(exponent, ..) if exponent >= 0 => Some(exponent),
                     _ => None,
                 };
-                let guarded_pow = expr.op == BinOp::Pow && !float_pow && pow_literal.is_none();
+                let integer = ty.and_then(Type::integer_layout);
+                let guarded_pow = expr.op == BinOp::Pow
+                    && !float_pow
+                    && integer.is_none_or(|layout| layout.signed)
+                    && pow_literal.is_none();
                 // Debug builds check integer `+ - *` for overflow and a shift
                 // amount outside `0..64` unless it is an in-range literal.
                 let checked = matches!(expr.op, BinOp::Add | BinOp::Sub | BinOp::Mul)
                     && !matches!(ty, Some(Type::F64))
                     || matches!(expr.op, BinOp::Shl | BinOp::Shr)
-                        && !matches!(expr.rhs, Expr::Integer(amount, ..) if (0..64).contains(&amount))
+                        && !matches!(expr.rhs, Expr::Integer(amount, ..) if (0..i64::from(integer.map_or(64, |layout| layout.bits))).contains(&amount))
                     || expr.op == BinOp::Pow
                         && !float_pow
-                        && pow_literal.is_some_and(|exponent| exponent >= 2);
+                        && (pow_literal.is_some_and(|exponent| exponent >= 2)
+                            || integer.is_some_and(|layout| !layout.signed)
+                                && pow_literal.is_none());
                 if concat || guarded_division || guarded_pow {
                     self.mark_direct(expression.span());
                 } else if checked {

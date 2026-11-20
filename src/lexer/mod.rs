@@ -744,6 +744,7 @@ impl<'a> Lexer<'a> {
             "enum" => TokenKind::Enum,
             "const" => TokenKind::Const,
             "i64" => TokenKind::I64,
+            "u8" => TokenKind::U8,
             "f64" => TokenKind::F64,
             "bool" => TokenKind::Bool,
             _ => TokenKind::Ident(word.to_string()),

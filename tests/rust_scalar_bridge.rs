@@ -2196,3 +2196,41 @@ fn nonblocking_opaque_close_requires_its_own_review() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("rust_nonblocking_review_required"));
 }
+
+#[test]
+fn u8_scalar_native_abi_and_aggregate_payloads() {
+    let f = Fixture::new();
+    f.sources(
+        r#"
+import std::collections::Array;
+extern rust {
+ fn byte(x: u8) -> u8;
+ fn maybe(x: Option<u8>) -> Option<u8>;
+ fn result(x: Result<u8, u8>) -> Result<u8, u8>;
+ fn bytes(x: Array<u8>) -> Array<u8>;
+}
+fn main() {
+ println(byte(255)); let indirect = byte; println(indirect(128));
+ println(maybe(Some(255)).unwrap()); println(maybe(None).is_none());
+ println(result(Ok(200)).unwrap()); println(result(Err(255)).unwrap_err());
+ println(bytes([0, 128, 255]).to_string());
+}
+"#,
+        r#"
+pub fn byte(x: u8) -> u8 { x }
+pub fn maybe(x: Option<u8>) -> Option<u8> { x }
+pub fn result(x: Result<u8, u8>) -> Result<u8, u8> { x }
+pub fn bytes(x: Vec<u8>) -> Vec<u8> { x }
+"#,
+    );
+    for args in [
+        vec!["run", "--offline"],
+        vec!["run", "--offline", "--release"],
+    ] {
+        let output = f.successful(&args);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "255\n128\n255\ntrue\n200\n255\n[0, 128, 255]\n"
+        );
+    }
+}

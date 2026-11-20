@@ -276,6 +276,27 @@ impl TypeChecker {
     }
 
     fn check_expr_expecting_inner(&mut self, expr: &Expr, expected: &Type) -> Type {
+        if let Some(layout) = expected.integer_layout() {
+            if let Expr::Integer(value, span, _) = expr {
+                if !layout.contains(i128::from(*value)) {
+                    self.push_error(
+                        ErrorCode::E0201,
+                        format!(
+                            "integer literal `{value}` is outside {}..={} for `{}`",
+                            layout.min(),
+                            layout.max(),
+                            self.diagnostic_type_name(expected)
+                        ),
+                        *span,
+                        "integer literal out of range",
+                    );
+                }
+                return expected.clone();
+            }
+            if matches!(expr, Expr::Binary(_) | Expr::Unary(_)) {
+                return self.check_operator_tree_expecting(expr, Some(expected));
+            }
+        }
         if crate::semantic::generic_inference::has_enum_hole(expected) {
             return self.check_generic_enum_argument(
                 expr,
@@ -1256,7 +1277,10 @@ impl TypeChecker {
                     }
                 }
                 _ => {
-                    if !matches!(ty, Type::I64 | Type::F64 | Type::Bool | Type::String) {
+                    if !matches!(
+                        ty,
+                        Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+                    ) {
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,

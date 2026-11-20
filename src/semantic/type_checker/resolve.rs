@@ -1591,19 +1591,20 @@ impl TypeChecker {
     #[inline(never)]
     fn resolve_i64_overflow_method(
         &mut self,
+        receiver: &Type,
         method_name: &str,
         args: &[CallArg],
         span: Span,
     ) -> Option<Type> {
         let params: &[Type] = match method_name {
             "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "checked_add" | "checked_sub"
-            | "checked_mul" => &[Type::I64],
+            | "checked_mul" => std::slice::from_ref(receiver),
             "wrapping_neg" | "checked_neg" => &[],
             _ => return None,
         };
         self.check_call_argument_count(method_name, params.len(), args.len(), span);
         self.check_value_call_args(params, args);
-        crate::semantic::intrinsics::resolve(&Type::I64, method_name, params.len())
+        crate::semantic::intrinsics::resolve(receiver, method_name, params.len())
             .map(|resolution| resolution.return_type(|_| None))
     }
 
@@ -1678,7 +1679,10 @@ impl TypeChecker {
         let receiver = &call.object;
         if method_name == "__abi_debug"
             && self.array_abi_files.contains(&span.file_id)
-            && matches!(obj_ty, Type::I64 | Type::F64 | Type::Bool | Type::String)
+            && matches!(
+                obj_ty,
+                Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+            )
         {
             self.check_call_argument_count(method_name, 0, args.len(), span);
             return Type::String;
@@ -1702,16 +1706,28 @@ impl TypeChecker {
                     .return_type(|_| None);
             }
         }
-        if *obj_ty == Type::I64
-            && let Some(ty) = self.resolve_i64_overflow_method(method_name, args, span)
+        if obj_ty.integer_layout().is_some()
+            && let Some(ty) = self.resolve_i64_overflow_method(obj_ty, method_name, args, span)
         {
             return ty;
+        }
+        if matches!(
+            (obj_ty, method_name),
+            (Type::U8, "to_i64") | (Type::I64, "wrapping_to_u8" | "checked_to_u8")
+        ) {
+            self.check_call_argument_count(method_name, 0, args.len(), span);
+            return crate::semantic::intrinsics::resolve(obj_ty, method_name, 0)
+                .unwrap()
+                .return_type(|_| None);
         }
         // Built-in `to_string()` on primitives: `i64`/`f64`/`bool`/`String` ->
         // `String`. Class `to_string()` falls through to normal
         // instance-method resolution.
         if method_name == "to_string"
-            && matches!(obj_ty, Type::I64 | Type::F64 | Type::Bool | Type::String)
+            && matches!(
+                obj_ty,
+                Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+            )
         {
             self.check_builtin_arity(
                 method_arity("primitive", method_name),
@@ -1819,7 +1835,10 @@ impl TypeChecker {
                         "len, byte_at, trim, substring, slice, repeat, split, contains, find, starts_with, ends_with, replace, trim_start, trim_end, to_lower, to_upper, to_string"
                     }
                     Type::I64 => {
-                        "wrapping_add, wrapping_sub, wrapping_mul, wrapping_neg, checked_add, checked_sub, checked_mul, checked_neg, to_string"
+                        "wrapping_add, wrapping_sub, wrapping_mul, wrapping_neg, checked_add, checked_sub, checked_mul, checked_neg, wrapping_to_u8, checked_to_u8, to_string"
+                    }
+                    Type::U8 => {
+                        "wrapping_add, wrapping_sub, wrapping_mul, wrapping_neg, checked_add, checked_sub, checked_mul, checked_neg, to_i64, to_string"
                     }
                     Type::F64 | Type::Bool => "to_string",
                     _ => "",

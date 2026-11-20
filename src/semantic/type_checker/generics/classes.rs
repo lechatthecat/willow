@@ -641,7 +641,7 @@ impl TypeChecker {
         for alternative in &bound.alternatives {
             if !matches!(
                 alternative,
-                Type::I64 | Type::F64 | Type::Bool | Type::String
+                Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
             ) {
                 self.generic_error(
                     method.span,

@@ -189,6 +189,7 @@ impl PatternId {
 /// checker made of it.
 pub enum Type<Name = String> {
     I64,
+    U8,
     F64,
     Bool,
     String,
@@ -234,6 +235,10 @@ pub const SEND_ONLY_BUILTINS: &[&str] = &[
     "Future",
     "TaskResult",
 ];
+
+#[path = "integer.rs"]
+mod integer;
+pub use integer::IntegerLayout;
 
 #[path = "type_tree.rs"]
 mod type_tree;

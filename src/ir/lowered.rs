@@ -901,7 +901,7 @@ fn format_segments(args: &[HirExpr]) -> Option<Vec<crate::interpolate::Segment>>
             Segment::Display => {
                 if !matches!(
                     operands.next()?.ty,
-                    Type::I64 | Type::F64 | Type::Bool | Type::String
+                    Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
                 ) {
                     return None;
                 }
@@ -2551,7 +2551,7 @@ impl Builder {
 
     fn flat_operand(&mut self, value: &HirExpr) -> LirOperand {
         match &value.kind {
-            HirExprKind::Int(value) => LirOperand::Int(*value),
+            HirExprKind::Int(n) => LirOperand::integer(*n, &value.ty),
             HirExprKind::Float(value) => LirOperand::Float(*value),
             HirExprKind::Bool(value) => LirOperand::Bool(*value),
             HirExprKind::Var(name) if self.local_by_name.contains_key(name) => {

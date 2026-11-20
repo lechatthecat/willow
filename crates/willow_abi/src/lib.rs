@@ -13,6 +13,29 @@ pub mod unwind_reason {
     pub const CANCEL: i32 = 2;
 }
 
+/// Operation and integer width for recoverable overflow diagnostics. The legacy
+/// signed-64 operation numbers remain unchanged.
+pub mod integer_overflow {
+    pub const fn encode(operation: i64, bits: u32, signed: bool) -> i64 {
+        if bits == 64 && signed {
+            operation
+        } else {
+            operation | ((bits as i64) << 8) | ((signed as i64) << 16)
+        }
+    }
+    pub const fn decode(kind: i64) -> (i64, u32, bool) {
+        if kind < 256 {
+            (kind, 64, true)
+        } else {
+            (
+                kind & 255,
+                ((kind >> 8) & 255) as u32,
+                kind & (1 << 16) != 0,
+            )
+        }
+    }
+}
+
 pub mod ffi;
 pub mod fingerprint;
 pub mod native;

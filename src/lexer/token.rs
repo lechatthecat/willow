@@ -44,6 +44,7 @@ pub enum TokenKind {
 
     // Types
     I64,
+    U8,
     Bool,
     F64,
 
@@ -149,6 +150,7 @@ impl TokenKind {
             Self::Enum => Some("enum"),
             Self::Const => Some("const"),
             Self::I64 => Some("i64"),
+            Self::U8 => Some("u8"),
             Self::F64 => Some("f64"),
             Self::Bool => Some("bool"),
             _ => None,

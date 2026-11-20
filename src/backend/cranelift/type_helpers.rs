@@ -31,7 +31,14 @@ pub(crate) fn clif_type<N: builtin_types::TypeName>(
         return types::I128;
     }
     match ty {
-        crate::parser::ast::Type::I64 => types::I64,
+        crate::parser::ast::Type::U8 | crate::parser::ast::Type::I64 => {
+            let abi = match ty.integer_layout().unwrap().bits {
+                8 => willow_abi::AbiTy::I8,
+                64 => willow_abi::AbiTy::I64,
+                _ => unreachable!("supported integer ABI width"),
+            };
+            crate::backend::abi::clif_abi_param(abi, reference_type).value_type
+        }
         crate::parser::ast::Type::F64 => types::F64,
         crate::parser::ast::Type::Bool | crate::parser::ast::Type::Void => types::I8,
         // Never uses the reference representation for unreachable values.
@@ -48,6 +55,7 @@ pub(crate) fn clif_type<N: builtin_types::TypeName>(
 
 pub(crate) fn debug_type_name<N: std::fmt::Display>(ty: &crate::parser::ast::Type<N>) -> String {
     match ty {
+        crate::parser::ast::Type::U8 => "u8".to_string(),
         crate::parser::ast::Type::I64 => "i64".to_string(),
         crate::parser::ast::Type::F64 => "f64".to_string(),
         crate::parser::ast::Type::Bool => "bool".to_string(),
@@ -82,7 +90,7 @@ pub(crate) fn debug_type_name<N: std::fmt::Display>(ty: &crate::parser::ast::Typ
 pub(crate) fn future_await_runtime_name(ty: &Type) -> &'static str {
     match ty {
         Type::Void => rt::willow_timer_value_await,
-        Type::I64 => rt::willow_future_await_i64,
+        Type::U8 | Type::I64 => rt::willow_future_await_i64,
         Type::Bool => rt::willow_future_await_bool,
         Type::F64 => rt::willow_future_await_f64,
         _ => rt::willow_future_await_ptr,

@@ -1111,7 +1111,7 @@ impl TypeChecker {
                 });
             }
             Pattern::LiteralBool(_, span, _) => self.check_bool_pattern(*span, ty),
-            Pattern::LiteralInt(_, span, _) => self.check_int_pattern(*span, ty),
+            Pattern::LiteralInt(value, span, _) => self.check_int_pattern(*value, *span, ty),
             Pattern::EnumVariant {
                 enum_name,
                 variant,
@@ -1341,8 +1341,12 @@ impl TypeChecker {
         }
     }
 
-    fn check_int_pattern(&mut self, span: Span, scrutinee_ty: &Type) {
-        if *scrutinee_ty != Type::I64 {
+    fn check_int_pattern(&mut self, value: i64, span: Span, scrutinee_ty: &Type) {
+        if let Some(layout) = scrutinee_ty.integer_layout() {
+            if !layout.contains(i128::from(value)) {
+                self.push_pattern_type_mismatch("integer pattern out of range".to_string(), span);
+            }
+        } else {
             self.push_pattern_type_mismatch(
                 format!(
                     "integer pattern cannot match scrutinee of type `{}`",

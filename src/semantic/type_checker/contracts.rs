@@ -170,5 +170,5 @@ impl TypeChecker {
 }
 
 fn scalar(ty: &Type) -> bool {
-    matches!(ty, Type::I64 | Type::Bool | Type::F64)
+    matches!(ty, Type::U8 | Type::I64 | Type::Bool | Type::F64)
 }

@@ -697,6 +697,7 @@ fn param_mode_name(mode: &ParamMode) -> &'static str {
 
 fn type_name(ty: &Type) -> String {
     match ty {
+        Type::U8 => "u8".to_string(),
         Type::I64 => "i64".to_string(),
         Type::F64 => "f64".to_string(),
         Type::Bool => "bool".to_string(),

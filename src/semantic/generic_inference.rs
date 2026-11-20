@@ -66,6 +66,7 @@ pub(crate) fn merge_enum_holes(left: &Type, right: &Type) -> Option<Type> {
 enum Shape<'a> {
     Param(usize),
     I64,
+    U8,
     F64,
     Bool,
     String,
@@ -86,6 +87,7 @@ struct Signature<'a> {
 
 fn shape(ty: &Type) -> Shape<'_> {
     match ty {
+        Type::U8 => Shape::U8,
         Type::I64 => Shape::I64,
         Type::F64 => Shape::F64,
         Type::Bool => Shape::Bool,

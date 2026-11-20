@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn scalar_options_use_tagged_pairs() {
         let enums = TypeMap::new();
-        for scalar in [Type::I64, Type::F64, Type::Bool, Type::Void] {
+        for scalar in [Type::U8, Type::I64, Type::F64, Type::Bool, Type::Void] {
             assert_eq!(
                 option_repr(&option(scalar), &enums),
                 Some(OptionRepr::TaggedPair)
@@ -102,8 +102,8 @@ mod tests {
 
     #[test]
     fn scalar_results_use_pairs_for_every_scalar_combination() {
-        for ok in [Type::I64, Type::F64, Type::Bool, Type::Void] {
-            for err in [Type::I64, Type::F64, Type::Bool, Type::Void] {
+        for ok in [Type::U8, Type::I64, Type::F64, Type::Bool, Type::Void] {
+            for err in [Type::U8, Type::I64, Type::F64, Type::Bool, Type::Void] {
                 let result = Type::Generic("Result".into(), vec![ok.clone(), err]);
                 assert!(is_scalar_pair(&result));
                 assert_eq!(option_repr(&result, &TypeMap::new()), None);

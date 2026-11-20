@@ -265,7 +265,8 @@ fn reusable_scalar(local: &LirLocal) -> bool {
     !local.is_gc_owner()
         && matches!(
             local.ty,
-            crate::parser::ast::Type::I64
+            crate::parser::ast::Type::U8
+                | crate::parser::ast::Type::I64
                 | crate::parser::ast::Type::F64
                 | crate::parser::ast::Type::Bool
         )

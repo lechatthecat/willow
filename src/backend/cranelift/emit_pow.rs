@@ -32,6 +32,7 @@ use willow_abi::runtime_symbols::names as rt;
 
 use super::FuncGen;
 use crate::diagnostics::Span;
+use crate::parser::ast::IntegerLayout;
 
 /// One step of the unrolled multiplication schedule for a literal exponent.
 ///
@@ -100,19 +101,33 @@ impl FuncGen<'_, '_> {
     /// Lower `base ** exponent` for `i64` operands. Both operands are already
     /// evaluated, which is what keeps evaluation left-to-right and exactly
     /// once: `x ** 0` still runs (and can still panic inside) `x`.
-    pub(super) fn emit_pow_i64(&mut self, base: Value, exponent: Value, span: Span) -> Value {
+    pub(super) fn emit_pow_i64(
+        &mut self,
+        base: Value,
+        exponent: Value,
+        layout: IntegerLayout,
+        span: Span,
+    ) -> Value {
         match const_i64_operand(self.builder, exponent) {
             // A negative constant cannot produce an integer, and the checker
             // already rejected the literal form (E0204). A negative that still
             // reaches here takes the dynamic path and raises at runtime.
-            Some(constant) if constant >= 0 => self.emit_pow_i64_const(base, constant as u64, span),
-            _ => self.emit_pow_i64_dynamic(base, exponent, span),
+            Some(constant) if constant >= 0 => {
+                self.emit_pow_i64_const(base, constant as u64, layout, span)
+            }
+            _ => self.emit_pow_i64_dynamic(base, exponent, layout, span),
         }
     }
 
     /// Literal exponent: no branch, no loop, no runtime call — just the `imul`
     /// chain from [`pow_unroll_steps`].
-    fn emit_pow_i64_const(&mut self, base: Value, exponent: u64, span: Span) -> Value {
+    fn emit_pow_i64_const(
+        &mut self,
+        base: Value,
+        exponent: u64,
+        layout: IntegerLayout,
+        span: Span,
+    ) -> Value {
         let steps = pow_unroll_steps(exponent);
         let mut accumulator = base;
         let mut result: Option<Value> = None;
@@ -121,39 +136,54 @@ impl FuncGen<'_, '_> {
                 PowStep::Mul => {
                     result = Some(match result {
                         None => accumulator,
-                        Some(current) => self.emit_pow_mul(current, accumulator, None, span),
+                        Some(current) => {
+                            self.emit_pow_mul(current, accumulator, None, layout, span)
+                        }
                     });
                 }
                 PowStep::Square => {
-                    accumulator = self.emit_pow_mul(accumulator, accumulator, None, span);
+                    accumulator = self.emit_pow_mul(accumulator, accumulator, None, layout, span);
                 }
             }
         }
         // `x ** 0` is 1 for every base, including 0.
-        result.unwrap_or_else(|| self.builder.ins().iconst(types::I64, 1))
+        result.unwrap_or_else(|| {
+            let ty = self.builder.func.dfg.value_type(base);
+            self.builder.ins().iconst(ty, 1)
+        })
     }
 
     /// Dynamic exponent: guard the sign, then exponentiate by squaring. The
     /// loop shifts the exponent right once per iteration, so it runs at most
     /// 63 times regardless of the value.
-    fn emit_pow_i64_dynamic(&mut self, base: Value, exponent: Value, span: Span) -> Value {
+    fn emit_pow_i64_dynamic(
+        &mut self,
+        base: Value,
+        exponent: Value,
+        layout: IntegerLayout,
+        span: Span,
+    ) -> Value {
+        let ty = self.builder.func.dfg.value_type(base);
         let negative_block = self.builder.create_block();
         let header_block = self.builder.create_block();
         let body_block = self.builder.create_block();
         let advance_block = self.builder.create_block();
         let exit_block = self.builder.create_block();
         for block in [header_block, body_block] {
-            self.builder.append_block_param(block, types::I64); // squaring accumulator
-            self.builder.append_block_param(block, types::I64); // remaining exponent
-            self.builder.append_block_param(block, types::I64); // result so far
+            self.builder.append_block_param(block, ty); // squaring accumulator
+            self.builder.append_block_param(block, ty); // remaining exponent
+            self.builder.append_block_param(block, ty); // result so far
         }
-        self.builder.append_block_param(exit_block, types::I64);
+        self.builder.append_block_param(exit_block, ty);
 
-        let one = self.builder.ins().iconst(types::I64, 1);
-        let is_negative = self
-            .builder
-            .ins()
-            .icmp_imm_s(IntCC::SignedLessThan, exponent, 0);
+        let one = self.builder.ins().iconst(ty, 1);
+        let is_negative = if layout.signed {
+            self.builder
+                .ins()
+                .icmp_imm_s(IntCC::SignedLessThan, exponent, 0)
+        } else {
+            self.builder.ins().iconst(types::I8, 0)
+        };
         self.builder.ins().brif(
             is_negative,
             negative_block,
@@ -164,7 +194,12 @@ impl FuncGen<'_, '_> {
 
         self.builder.switch_to_block(negative_block);
         self.builder.seal_block(negative_block);
-        self.emit_pow_negative_exponent_panic(exponent, span);
+        let wide = if layout.bits < 64 {
+            self.builder.ins().uextend(types::I64, exponent)
+        } else {
+            exponent
+        };
+        self.emit_pow_negative_exponent_panic(wide, span);
 
         self.builder.switch_to_block(header_block);
         let carried = self.builder.block_params(header_block).to_vec();
@@ -183,7 +218,7 @@ impl FuncGen<'_, '_> {
         let (accumulator, remaining, result) = (live[0], live[1], live[2]);
         let low_bit = self.builder.ins().band_imm_u(remaining, 1);
         let is_odd = self.builder.ins().icmp_imm_s(IntCC::Equal, low_bit, 1);
-        let multiplied = self.emit_pow_mul(result, accumulator, Some(is_odd), span);
+        let multiplied = self.emit_pow_mul(result, accumulator, Some(is_odd), layout, span);
         let next_result = self.builder.ins().select(is_odd, multiplied, result);
         let next_remaining = self.builder.ins().ushr_imm_u(remaining, 1);
         let finished = self
@@ -200,7 +235,7 @@ impl FuncGen<'_, '_> {
 
         self.builder.switch_to_block(advance_block);
         self.builder.seal_block(advance_block);
-        let next_accumulator = self.emit_pow_mul(accumulator, accumulator, None, span);
+        let next_accumulator = self.emit_pow_mul(accumulator, accumulator, None, layout, span);
         self.builder.ins().jump(
             header_block,
             &[
@@ -219,17 +254,32 @@ impl FuncGen<'_, '_> {
 
     /// One schedule multiplication. Debug builds guard its overflow flag,
     /// masked by `used` when the product may be discarded.
-    fn emit_pow_mul(&mut self, lhs: Value, rhs: Value, used: Option<Value>, span: Span) -> Value {
+    fn emit_pow_mul(
+        &mut self,
+        lhs: Value,
+        rhs: Value,
+        used: Option<Value>,
+        layout: IntegerLayout,
+        span: Span,
+    ) -> Value {
         if !self.overflow_checks() {
             return self.builder.ins().imul(lhs, rhs);
         }
         let (product, overflowed) =
-            self.emit_overflowing_binop(&crate::parser::ast::BinOp::Mul, lhs, rhs);
+            self.emit_overflowing_binop(&crate::parser::ast::BinOp::Mul, lhs, rhs, layout);
         let overflowed = match used {
             Some(used) => self.builder.ins().band(overflowed, used),
             None => overflowed,
         };
-        self.emit_int_overflow_guard(overflowed, super::emit_expr::INT_OVERFLOW_POW, span);
+        self.emit_int_overflow_guard(
+            overflowed,
+            willow_abi::integer_overflow::encode(
+                super::emit_expr::INT_OVERFLOW_POW,
+                layout.bits,
+                layout.signed,
+            ),
+            span,
+        );
         product
     }
 

@@ -53,6 +53,7 @@ fn representation_matrix_all_types_and_builtins() {
         );
     }
     let mut cases = vec![
+        (Type::U8, types::I8, SlotKind::Word),
         (Type::I64, types::I64, SlotKind::Word),
         (Type::F64, types::F64, SlotKind::Word),
         (Type::Bool, types::I8, SlotKind::Word),
@@ -123,7 +124,7 @@ fn representation_matrix_all_types_and_builtins() {
     ] {
         cases.push((B::Option.apply(vec![inner]), types::I64, SlotKind::GcRef));
     }
-    assert_eq!(cases.len(), 39);
+    assert_eq!(cases.len(), 40);
     for (ty, clif, slot) in &cases {
         assert_eq!(clif_type(types::I64, ty), *clif, "{ty:?}");
         assert_eq!(value_slot_kind(ty, &enums), *slot, "{ty:?}");

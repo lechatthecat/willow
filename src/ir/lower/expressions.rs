@@ -315,7 +315,7 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
                     .unwrap_or_else(|| match unary.op {
                         UnaryOp::Neg => operand.ty.clone(),
                         // `!` is bitwise on `i64` and logical on `bool`.
-                        UnaryOp::Not if operand.ty == Type::I64 => Type::I64,
+                        UnaryOp::Not if operand.ty.integer_layout().is_some() => operand.ty.clone(),
                         UnaryOp::Not => Type::Bool,
                     });
                 HirExpr {

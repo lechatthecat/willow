@@ -397,6 +397,7 @@ impl Parser {
                         | TokenKind::Select
                         | TokenKind::Print
                         | TokenKind::Println
+                        | TokenKind::U8
                         | TokenKind::I64
                         | TokenKind::F64
                 )
@@ -1849,7 +1850,7 @@ class ProtectedCtor { prot init(self) {} }
             | TokenKind::Select
             | TokenKind::Print
             | TokenKind::Println
-            | TokenKind::I64
+            | TokenKind::U8 | TokenKind::I64
             | TokenKind::F64 => AfterQuestion::Ternary,
 
             // `r? - 1` (binary minus on the try result) vs `c ? -1 : 2`

@@ -190,7 +190,7 @@ pub fn panic_info_fields() -> [(&'static str, Type); 4] {
 pub(crate) fn is_scalar_pair<N: TypeName>(ty: &crate::parser::ast::Type<N>) -> bool {
     use crate::parser::ast::Type as T;
     fn scalar<N>(ty: &T<N>) -> bool {
-        matches!(ty, T::I64 | T::F64 | T::Bool | T::Void)
+        matches!(ty, T::U8 | T::I64 | T::F64 | T::Bool | T::Void)
     }
     if let Some(inner) = unary_arg(ty, BuiltinTypeId::Option) {
         return scalar(inner);

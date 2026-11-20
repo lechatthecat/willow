@@ -1,0 +1,34 @@
+// u8 stores 0..=255. Integer literals take their annotated context.
+// Conversion is explicit: widening is lossless; wrapping truncates to 8 bits;
+// checked conversion returns None outside the range. Arrays still use slots.
+import std::collections::Array;
+
+const MAX_BYTE: u8 = 255;
+fn identity<T>(value: T) -> T { return value; }
+class ByteBox<T> {
+    pub value: T;
+    pub fn get(self) -> T { return self.value; }
+}
+fn optional(value: u8) -> Option<u8> { return Some(value); }
+fn success(value: u8) -> Result<u8, String> { return Ok(value); }
+async fn transfer(value: u8) -> u8 {
+    await sleep(1);
+    return value;
+}
+async fn main() {
+    let byte: u8 = MAX_BYTE;
+    let boxed = new ByteBox<u8>(byte);
+    let values: Array<u8> = [0, 128, boxed.get()];
+    let captured = || byte;
+    println(identity<u8>(values[2]));
+    println(optional(captured()).unwrap());
+    println(success(await transfer(byte)).unwrap());
+    println(byte.to_i64());
+    println(256.wrapping_to_u8());
+    println(256.checked_to_u8().is_none());
+    println(byte.wrapping_add(1));
+    println(byte.checked_add(1).is_none());
+    println(byte > 128);
+    println(byte >> 1);
+    println(match byte { 255 => "max", _ => "other" });
+}

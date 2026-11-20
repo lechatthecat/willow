@@ -1968,6 +1968,15 @@ fn may_allocate_distinguishes_string_comparison_from_concatenation() {
 
 // 1. a scalar arithmetic function is eligible
 #[test]
+fn u8_scalar_hir_eligibility_oracle() {
+    assert!(eligible_checked(
+        "fn byte(x: u8) -> u8 { println(x); println(format(\"{}\", x)); return match x { 255 => 128, _ => x ** 1 }; }",
+        "byte",
+        &["byte"],
+    ));
+}
+
+#[test]
 fn e01_scalar_fn_eligible() {
     assert!(eligible(
         "fn add(a: i64, b: i64) -> i64 { return a + b; }",

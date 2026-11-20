@@ -31,7 +31,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().icmp(IntCC::Equal, scrutinee, expected)
             }
             crate::ir::lowered::LirPattern::LiteralInt(n) => {
-                let expected = self.builder.ins().iconst(types::I64, *n);
+                let ty = self.clif_type(scrutinee_ty);
+                let expected = self.builder.ins().iconst(ty, *n);
                 self.builder.ins().icmp(IntCC::Equal, scrutinee, expected)
             }
             crate::ir::lowered::LirPattern::EnumVariant { enum_name, variant }
@@ -174,6 +175,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         use crate::ir::lowered::LirOperand;
         match operand {
             LirOperand::Local(local) => self.load_lir_local(function, *local),
+            LirOperand::Integer { value, ty } => {
+                let ty = self.clif_type(ty);
+                self.builder.ins().iconst(ty, *value)
+            }
             LirOperand::Int(value) => self.builder.ins().iconst(types::I64, *value),
             LirOperand::Float(value) => self.builder.ins().f64const(*value),
             LirOperand::Bool(value) => self.builder.ins().iconst(types::I8, i64::from(*value)),
@@ -206,7 +211,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             rt::willow_string_concat_n,
             |this| {
                 for (index, (part, ty)) in parts.iter().zip(part_types).enumerate() {
-                    let kind = if *ty == Type::I64 {
+                    let kind = if ty.integer_layout().is_some() {
                         PART_I64
                     } else {
                         PART_STRING
@@ -215,6 +220,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let kind = this.builder.ins().iconst(types::I64, kind as i64);
                     this.builder.ins().stack_store(ptr_ty, kind, slot, offset);
                     let value = this.emit_lir_operand(function, part);
+                    let value = this.widen_integer(value, ty);
                     this.builder
                         .ins()
                         .stack_store(ptr_ty, value, slot, offset + 8);
@@ -470,7 +476,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .collect();
                 self.emit_flat_enum_method(receiver, receiver_ty, method, &args, arg_types, span)
             }
-            LirRvalue::BuiltinCall { callee, args, .. } => {
+            LirRvalue::BuiltinCall {
+                callee,
+                args,
+                result,
+                params,
+            } => {
                 let args: Vec<_> = args
                     .iter()
                     .map(|arg| self.emit_lir_operand(function, arg))
@@ -483,15 +494,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         rt::willow_contract_check
                     };
                     let mut args = args;
-                    if callee.is_free_named("$contract_check") {
-                        args[0] = self.builder.ins().uextend(types::I64, args[0]);
+                    for (arg, ty) in args.iter_mut().zip(params) {
+                        *arg = self.coerce_to_i64(*arg, ty);
                     }
                     let file = self.emit_string_literal(self.diagnostics.source_file);
                     let line = self.builder.ins().iconst(types::I32, span.line as i64);
                     let col = self.builder.ins().iconst(types::I32, span.col as i64);
                     args.extend([file, line, col]);
-                    self.emit_runtime_call_with_cleanup(runtime, &args, |_| {})
-                        .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
+                    let value = self
+                        .emit_runtime_call_with_cleanup(runtime, &args, |_| {})
+                        .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
+                    self.coerce_i64_to(value, result)
                 } else {
                     self.emit_flat_builtin_call(callee, &args)
                 }
@@ -526,9 +539,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             LirRvalue::Print { value, ty, newline } => {
                 let value = self.emit_lir_operand(function, value);
+                let value = self.widen_integer(value, ty);
                 let name = match (ty, newline) {
-                    (Type::I64, false) => rt::willow_print_i64,
-                    (Type::I64, true) => rt::willow_println_i64,
+                    (Type::U8 | Type::I64, false) => rt::willow_print_i64,
+                    (Type::U8 | Type::I64, true) => rt::willow_println_i64,
                     (Type::F64, false) => rt::willow_print_f64,
                     (Type::F64, true) => rt::willow_println_f64,
                     (Type::Bool, false) => rt::willow_print_bool,
@@ -785,16 +799,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 match op {
                     UnaryOp::Neg if *ty == Type::F64 => self.builder.ins().fneg(operand),
                     UnaryOp::Neg if checked => {
-                        let (negated, overflowed) = self.emit_overflowing_neg(operand);
+                        let (negated, overflowed) =
+                            self.emit_overflowing_neg(operand, ty.integer_layout().unwrap());
                         self.emit_int_overflow_guard(
                             overflowed,
-                            crate::backend::cranelift::emit_expr::INT_OVERFLOW_NEG,
+                            willow_abi::integer_overflow::encode(
+                                crate::backend::cranelift::emit_expr::INT_OVERFLOW_NEG,
+                                ty.integer_layout().unwrap().bits,
+                                ty.integer_layout().unwrap().signed,
+                            ),
                             span,
                         );
                         negated
                     }
                     UnaryOp::Neg => self.builder.ins().ineg(operand),
-                    UnaryOp::Not if *ty == Type::I64 => self.builder.ins().bnot(operand),
+                    UnaryOp::Not if ty.integer_layout().is_some() => {
+                        self.builder.ins().bnot(operand)
+                    }
                     UnaryOp::Not => {
                         let one = self.builder.ins().iconst(types::I8, 1);
                         self.builder.ins().bxor(operand, one)
@@ -809,7 +830,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } => {
                 // A literal divisor other than 0 and -1 can trip neither the
                 // zero nor the overflow guard.
-                let unguarded_divisor = matches!(rhs, crate::ir::lowered::LirOperand::Int(divisor) if *divisor != 0 && *divisor != -1);
+                let unguarded_divisor = rhs
+                    .integer_value()
+                    .is_some_and(|divisor| divisor != 0 && divisor != -1);
                 let nonnegative_lhs =
                     *operand_ty == Type::I64 && self.reuse.lir_nonnegative.contains(lhs);
                 let unsigned_rem = if nonnegative_lhs && matches!(op, BinOp::Rem) {
@@ -878,7 +901,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 };
                 let float = *operand_ty == Type::F64;
                 if !float && !unguarded_divisor && matches!(op, BinOp::Div | BinOp::Rem) {
-                    self.emit_int_div_guard(lhs, rhs, matches!(op, BinOp::Rem), span);
+                    self.emit_int_div_guard(
+                        lhs,
+                        rhs,
+                        matches!(op, BinOp::Rem),
+                        operand_ty.integer_layout().unwrap(),
+                        span,
+                    );
                 }
                 if let Some(divisor) = unsigned_rem {
                     if divisor.is_power_of_two() {
@@ -902,17 +931,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     if float {
                         self.emit_pow_f64(lhs, rhs)
                     } else {
-                        self.emit_pow_i64(lhs, rhs, span)
+                        self.emit_pow_i64(lhs, rhs, operand_ty.integer_layout().unwrap(), span)
                     }
                 } else if !float
                     && self.overflow_checks()
                     && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
                 {
-                    self.emit_checked_int_binop(op, lhs, rhs, span)
+                    self.emit_checked_int_binop(
+                        op,
+                        lhs,
+                        rhs,
+                        operand_ty.integer_layout().unwrap(),
+                        span,
+                    )
                 } else if checked_shift {
-                    self.emit_checked_shift(op, lhs, rhs, span)
+                    self.emit_checked_shift(
+                        op,
+                        lhs,
+                        rhs,
+                        operand_ty.integer_layout().unwrap(),
+                        span,
+                    )
                 } else {
-                    self.emit_lir_binop(op, lhs, rhs, float)
+                    self.emit_lir_binop(op, lhs, rhs, operand_ty)
                 }
             }
             LirRvalue::StringConcat { parts, part_types } => {
@@ -1018,10 +1059,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         op: &BinOp,
         l: cranelift_codegen::ir::Value,
         r: cranelift_codegen::ir::Value,
-        float: bool,
+        ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let ins = self.builder.ins();
-        if float {
+        if *ty == Type::F64 {
             return match op {
                 BinOp::Add => ins.fadd(l, r),
                 BinOp::Sub => ins.fsub(l, r),
@@ -1041,7 +1082,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             };
         }
+        let unsigned = ty.integer_layout().is_some_and(|layout| !layout.signed);
         match op {
+            BinOp::Div if unsigned => ins.udiv(l, r),
+            BinOp::Rem if unsigned => ins.urem(l, r),
+            BinOp::Shr if unsigned => ins.ushr(l, r),
+            BinOp::Lt if unsigned => ins.icmp(IntCC::UnsignedLessThan, l, r),
+            BinOp::Le if unsigned => ins.icmp(IntCC::UnsignedLessThanOrEqual, l, r),
+            BinOp::Gt if unsigned => ins.icmp(IntCC::UnsignedGreaterThan, l, r),
+            BinOp::Ge if unsigned => ins.icmp(IntCC::UnsignedGreaterThanOrEqual, l, r),
             BinOp::Add => ins.iadd(l, r),
             BinOp::Sub => ins.isub(l, r),
             BinOp::Mul => ins.imul(l, r),

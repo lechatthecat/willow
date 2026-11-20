@@ -416,3 +416,6 @@ mod json;
 
 #[path = "integration/std_additions.rs"]
 mod std_additions;
+
+#[path = "integration/u8_scalar.rs"]
+mod u8_scalar;

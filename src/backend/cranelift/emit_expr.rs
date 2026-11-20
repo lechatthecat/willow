@@ -3,6 +3,7 @@ use cranelift_module::Module;
 use willow_abi::runtime_symbols::names as rt;
 
 use super::*;
+use crate::parser::ast::IntegerLayout;
 
 /// `willow_int_overflow_panic` operator kinds.
 pub(super) const INT_OVERFLOW_ADD: i64 = 0;
@@ -14,6 +15,23 @@ pub(super) const INT_OVERFLOW_SHL: i64 = 5;
 pub(super) const INT_OVERFLOW_SHR: i64 = 6;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    pub(super) fn widen_integer(
+        &mut self,
+        value: cranelift_codegen::ir::Value,
+        ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let Some(layout) = ty.integer_layout() else {
+            return value;
+        };
+        if layout.bits == 64 {
+            value
+        } else if layout.signed {
+            self.builder.ins().sextend(types::I64, value)
+        } else {
+            self.builder.ins().uextend(types::I64, value)
+        }
+    }
+
     pub(super) fn emit_string_length(
         &mut self,
         receiver: cranelift_codegen::ir::Value,
@@ -311,6 +329,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         lhs: cranelift_codegen::ir::Value,
         rhs: cranelift_codegen::ir::Value,
         is_rem: bool,
+        layout: IntegerLayout,
         span: crate::diagnostics::Span,
     ) {
         let panic_block = self.builder.create_block();
@@ -333,9 +352,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(overflow_check);
         self.builder.seal_block(overflow_check);
-        let is_min = self.builder.ins().icmp_imm_s(IntCC::Equal, lhs, i64::MIN);
+        let is_min = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, lhs, layout.min() as i64);
         let is_neg1 = self.builder.ins().icmp_imm_s(IntCC::Equal, rhs, -1);
-        let overflows = self.builder.ins().band(is_min, is_neg1);
+        let overflows = if layout.signed {
+            self.builder.ins().band(is_min, is_neg1)
+        } else {
+            self.builder.ins().iconst(types::I8, 0)
+        };
         let ovf_kind = self
             .builder
             .ins()
@@ -377,8 +403,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         op: &BinOp,
         lhs: cranelift_codegen::ir::Value,
         rhs: cranelift_codegen::ir::Value,
+        layout: IntegerLayout,
     ) -> (cranelift_codegen::ir::Value, cranelift_codegen::ir::Value) {
         let ins = self.builder.ins();
+        if !layout.signed {
+            return match op {
+                BinOp::Add => ins.uadd_overflow(lhs, rhs),
+                BinOp::Sub => ins.usub_overflow(lhs, rhs),
+                BinOp::Mul => ins.umul_overflow(lhs, rhs),
+                _ => unreachable!("only arithmetic overflow operations"),
+            };
+        }
         match op {
             BinOp::Add => ins.sadd_overflow(lhs, rhs),
             BinOp::Sub => ins.ssub_overflow(lhs, rhs),
@@ -391,12 +426,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_overflowing_neg(
         &mut self,
         operand: cranelift_codegen::ir::Value,
+        layout: IntegerLayout,
     ) -> (cranelift_codegen::ir::Value, cranelift_codegen::ir::Value) {
         let negated = self.builder.ins().ineg(operand);
-        let overflowed = self
-            .builder
-            .ins()
-            .icmp_imm_s(IntCC::Equal, operand, i64::MIN);
+        let overflowed = self.builder.ins().icmp_imm_s(
+            if layout.signed {
+                IntCC::Equal
+            } else {
+                IntCC::NotEqual
+            },
+            operand,
+            layout.min() as i64,
+        );
         (negated, overflowed)
     }
 
@@ -406,15 +447,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         op: &BinOp,
         lhs: cranelift_codegen::ir::Value,
         rhs: cranelift_codegen::ir::Value,
+        layout: IntegerLayout,
         span: crate::diagnostics::Span,
     ) -> cranelift_codegen::ir::Value {
-        let (value, overflowed) = self.emit_overflowing_binop(op, lhs, rhs);
+        let (value, overflowed) = self.emit_overflowing_binop(op, lhs, rhs, layout);
         let kind = match op {
             BinOp::Add => INT_OVERFLOW_ADD,
             BinOp::Sub => INT_OVERFLOW_SUB,
             _ => INT_OVERFLOW_MUL,
         };
-        self.emit_int_overflow_guard(overflowed, kind, span);
+        self.emit_int_overflow_guard(
+            overflowed,
+            willow_abi::integer_overflow::encode(kind, layout.bits, layout.signed),
+            span,
+        );
         value
     }
 
@@ -426,22 +472,30 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         op: &BinOp,
         lhs: cranelift_codegen::ir::Value,
         rhs: cranelift_codegen::ir::Value,
+        layout: IntegerLayout,
         span: crate::diagnostics::Span,
     ) -> cranelift_codegen::ir::Value {
-        let out_of_range =
-            self.builder
-                .ins()
-                .icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, rhs, 64);
+        let out_of_range = self.builder.ins().icmp_imm_u(
+            IntCC::UnsignedGreaterThanOrEqual,
+            rhs,
+            i64::from(layout.bits),
+        );
         let kind = if *op == BinOp::Shl {
             INT_OVERFLOW_SHL
         } else {
             INT_OVERFLOW_SHR
         };
-        self.emit_int_overflow_guard(out_of_range, kind, span);
+        self.emit_int_overflow_guard(
+            out_of_range,
+            willow_abi::integer_overflow::encode(kind, layout.bits, layout.signed),
+            span,
+        );
         if *op == BinOp::Shl {
             self.builder.ins().ishl(lhs, rhs)
-        } else {
+        } else if layout.signed {
             self.builder.ins().sshr(lhs, rhs)
+        } else {
+            self.builder.ins().ushr(lhs, rhs)
         }
     }
 

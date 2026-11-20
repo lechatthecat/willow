@@ -128,7 +128,10 @@ impl Binding {
 }
 
 fn is_scalar(ty: &Type) -> bool {
-    matches!(ty, Type::I64 | Type::F64 | Type::Bool | Type::String)
+    matches!(
+        ty,
+        Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+    )
 }
 
 fn is_callable(ty: &Type) -> bool {

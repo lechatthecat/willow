@@ -92,7 +92,7 @@ impl Accesses {
 /// One operand of a fused chain: a leaf value, or a whole absorbed node.
 enum Part {
     String(LirOperand),
-    I64(LirOperand),
+    Integer(LirOperand, Type),
     Node(usize),
 }
 
@@ -111,7 +111,7 @@ struct Node {
 fn concat_parts(value: &LirRvalue, string_result: bool) -> Option<Vec<Part>> {
     let leaf = |op: &LirOperand, ty: &Type| match ty {
         Type::String => Some(Part::String(op.clone())),
-        Type::I64 => Some(Part::I64(op.clone())),
+        ty if ty.integer_layout().is_some() => Some(Part::Integer(op.clone(), ty.clone())),
         _ => None,
     };
     let parts = match value {
@@ -134,14 +134,15 @@ fn concat_parts(value: &LirRvalue, string_result: bool) -> Option<Vec<Part>> {
         LirRvalue::IntrinsicCall {
             intrinsic: Intrinsic::I64ToString,
             receiver,
+            receiver_ty,
             ..
-        } => vec![Part::I64(receiver.clone())],
+        } => vec![Part::Integer(receiver.clone(), receiver_ty.clone())],
         LirRvalue::Use(op) if string_result => vec![Part::String(op.clone())],
         _ => return None,
     };
     // Deferring a heap read past intervening instructions is unsound.
     let deferrable = parts.iter().all(|part| match part {
-        Part::String(op) | Part::I64(op) => !matches!(op, LirOperand::Reference { .. }),
+        Part::String(op) | Part::Integer(op, _) => !matches!(op, LirOperand::Reference { .. }),
         Part::Node(_) => true,
     });
     deferrable.then_some(parts)
@@ -246,7 +247,7 @@ fn fuse_block(block: &mut SourceBlock, accesses: &Accesses, locals: &[LirLocal])
                     nodes[*child].parent = Some(id);
                     absorbed_any = true;
                 }
-                Part::String(op) | Part::I64(op) => {
+                Part::String(op) | Part::Integer(op, _) => {
                     for leaf in op.locals() {
                         leaf_readers.entry(leaf).or_default().push(id);
                     }
@@ -291,9 +292,9 @@ fn fuse_block(block: &mut SourceBlock, accesses: &Accesses, locals: &[LirLocal])
                     parts.push(op);
                     part_types.push(Type::String);
                 }
-                Part::I64(op) => {
+                Part::Integer(op, ty) => {
                     parts.push(op);
-                    part_types.push(Type::I64);
+                    part_types.push(ty);
                 }
             }
         }

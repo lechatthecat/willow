@@ -609,7 +609,8 @@ pub(crate) fn normalize_std_collection_type(ty: &mut Type, imports: &StdCollecti
             }
             normalize_std_collection_type(ret, imports);
         }
-        Type::I64
+        Type::U8
+        | Type::I64
         | Type::F64
         | Type::Bool
         | Type::String

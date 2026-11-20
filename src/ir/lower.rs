@@ -1898,25 +1898,21 @@ fn contract_expression(mut expression: HirExpr) -> HirExpr {
     expression.visit_mut_preorder(false, |node| {
         use crate::parser::ast::{BinOp, UnaryOp};
         let op = match &node.kind {
-            HirExprKind::Binary { op, lhs, .. }
-                if lhs.ty == crate::semantic::ids::SemanticType::I64 =>
-            {
-                match op {
-                    BinOp::Add => Some(0),
-                    BinOp::Sub => Some(1),
-                    BinOp::Mul => Some(2),
-                    BinOp::Div => Some(3),
-                    BinOp::Rem => Some(4),
-                    BinOp::Pow => Some(5),
-                    BinOp::Shl => Some(7),
-                    BinOp::Shr => Some(8),
-                    _ => None,
-                }
-            }
+            HirExprKind::Binary { op, lhs, .. } if lhs.ty.integer_layout().is_some() => match op {
+                BinOp::Add => Some(0),
+                BinOp::Sub => Some(1),
+                BinOp::Mul => Some(2),
+                BinOp::Div => Some(3),
+                BinOp::Rem => Some(4),
+                BinOp::Pow => Some(5),
+                BinOp::Shl => Some(7),
+                BinOp::Shr => Some(8),
+                _ => None,
+            },
             HirExprKind::Unary {
                 op: UnaryOp::Neg,
                 operand,
-            } if operand.ty == crate::semantic::ids::SemanticType::I64 => Some(6),
+            } if operand.ty.integer_layout().is_some() => Some(6),
             _ => None,
         };
         if let Some(op) = op {
@@ -1928,9 +1924,18 @@ fn contract_expression(mut expression: HirExpr) -> HirExpr {
             let old = std::mem::replace(&mut node.kind, HirExprKind::Int(0));
             let (lhs, rhs) = match old {
                 HirExprKind::Binary { lhs, rhs, .. } => (*lhs, *rhs),
-                HirExprKind::Unary { operand, .. } => (*operand, int(0)),
+                HirExprKind::Unary { operand, .. } => {
+                    let mut zero = int(0);
+                    zero.ty = operand.ty.clone();
+                    (*operand, zero)
+                }
                 _ => unreachable!(),
             };
+            let layout = lhs
+                .ty
+                .integer_layout()
+                .expect("integer contract expression");
+            let op = willow_abi::integer_overflow::encode(op, layout.bits, layout.signed);
             node.kind = HirExprKind::Call {
                 callee: "$contract_i64".into(),
                 args: vec![int(op), lhs, rhs],

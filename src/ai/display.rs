@@ -151,6 +151,7 @@ impl TypeNames {
             #[cfg(test)]
             TYPE_VISITS.with(|count| count.set(count.get() + 1));
             match ty {
+                Type::U8 => out.push_str("u8"),
                 Type::I64 => out.push_str("i64"),
                 Type::F64 => out.push_str("f64"),
                 Type::Bool => out.push_str("bool"),

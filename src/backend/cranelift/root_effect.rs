@@ -9,7 +9,7 @@ use crate::semantic::ids::SemanticType as Type;
 fn immediate(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never
+        Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never
     )
 }
 

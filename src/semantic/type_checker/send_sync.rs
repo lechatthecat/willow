@@ -44,7 +44,7 @@ const ASYNC_CAPTURE_SHARING_NOTE: &str = "async calls share reference arguments 
 fn is_value_type(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never
+        Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never
     )
 }
 
@@ -543,7 +543,13 @@ impl TypeChecker {
         let result = match ty {
             // Primitives + immutable String are Send + Sync; void/never carry
             // no shared mutable state.
-            Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Void | Type::Never => true,
+            Type::U8
+            | Type::I64
+            | Type::F64
+            | Type::Bool
+            | Type::String
+            | Type::Void
+            | Type::Never => true,
 
             // A mutable array/map may be sent if its contents are Send, but it is
             // NOT Sync (concurrent push/set/insert races).

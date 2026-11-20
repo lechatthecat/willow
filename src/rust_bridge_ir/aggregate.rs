@@ -7,7 +7,10 @@ thread_local! { static TYPE_NODE_VISITS: std::cell::Cell<usize> = const { std::c
 
 impl Scalar {
     pub fn aggregate(&self) -> bool {
-        !matches!(self, Self::I64 | Self::F64 | Self::Bool | Self::Void)
+        !matches!(
+            self,
+            Self::U8 | Self::I64 | Self::F64 | Self::Bool | Self::Void
+        )
     }
     pub fn pair(&self) -> bool {
         match self {
@@ -160,6 +163,7 @@ impl Scalar {
             Self::Bytes if owned => writeln!(source, "let {out} = frame.bytes({value}.low).to_vec();").unwrap(),
             Self::Record(name) if owned => writeln!(source, "let {out} = decode_owned_record_{name}(&frame, {value});").unwrap(),
             Self::Opaque(name) => writeln!(source, "let {out} = frame.handle::<bridge::r#{name}>(frame.payload({value}, false).low, std::any::TypeId::of::<opaque_tags::r#{name}>());").unwrap(),
+            Self::U8 => writeln!(source, "let {out} = {value}.low as u8;").unwrap(),
             Self::I64 => writeln!(source, "let {out} = {value}.low as i64;").unwrap(),
             Self::F64 => writeln!(source, "let {out} = f64::from_bits({value}.low);").unwrap(),
             Self::Bool => writeln!(source, "let {out} = {value}.low != 0;").unwrap(),
@@ -225,7 +229,7 @@ impl Scalar {
         *serial += 1;
         let out = format!("r{n}");
         let bits = match self {
-            Self::I64 => Some(format!("{value} as u64")),
+            Self::U8 | Self::I64 => Some(format!("{value} as u64")),
             Self::F64 => Some(format!("{value}.to_bits()")),
             Self::Bool => Some(format!("u64::from({value})")),
             Self::Void => Some("0".into()),

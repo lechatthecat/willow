@@ -48,7 +48,7 @@ impl Leaf {
         target: FuncId,
         owner: LeafOwner,
     ) -> Option<Self> {
-        let scalar = |ty: &Type| matches!(ty, Type::I64 | Type::F64 | Type::Bool);
+        let scalar = |ty: &Type| matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool);
         if function.is_async
             || !function.captures.is_empty()
             || function.blocks.len() != 1
@@ -123,6 +123,10 @@ impl FuncGen<'_, '_> {
     fn scalar_leaf_operand(&mut self, operand: &LirOperand, locals: &[Option<Value>]) -> Value {
         match operand {
             LirOperand::Local(id) => locals[id.0 as usize].expect("validated scalar leaf local"),
+            LirOperand::Integer { value, ty } => {
+                let ty = self.clif_type(ty);
+                self.builder.ins().iconst(ty, *value)
+            }
             LirOperand::Int(n) => self.builder.ins().iconst(types::I64, *n),
             LirOperand::Float(n) => self.builder.ins().f64const(*n),
             LirOperand::Bool(b) => self.builder.ins().iconst(types::I8, i64::from(*b)),
@@ -148,10 +152,10 @@ impl FuncGen<'_, '_> {
         if self.reuse.indirect_leaf_promoted
             || self.indirect_leaves.0.is_empty()
             || params.len() > 8
-            || !matches!(result, Type::I64 | Type::F64 | Type::Bool)
+            || !matches!(result, Type::U8 | Type::I64 | Type::F64 | Type::Bool)
             || params
                 .iter()
-                .any(|ty| !matches!(ty, Type::I64 | Type::F64 | Type::Bool))
+                .any(|ty| !matches!(ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool))
         {
             return self.emit_lir_indirect_call(signature, word, args, name, span);
         }
@@ -226,7 +230,7 @@ impl FuncGen<'_, '_> {
                     match op {
                         UnaryOp::Neg if *ty == Type::F64 => self.builder.ins().fneg(v),
                         UnaryOp::Neg => self.builder.ins().ineg(v),
-                        UnaryOp::Not if *ty == Type::I64 => self.builder.ins().bnot(v),
+                        UnaryOp::Not if ty.integer_layout().is_some() => self.builder.ins().bnot(v),
                         UnaryOp::Not => self.builder.ins().bxor_imm_s(v, 1),
                     }
                 }
@@ -238,7 +242,7 @@ impl FuncGen<'_, '_> {
                 } => {
                     let l = self.scalar_leaf_operand(lhs, &locals);
                     let r = self.scalar_leaf_operand(rhs, &locals);
-                    self.emit_lir_binop(op, l, r, *operand_ty == Type::F64)
+                    self.emit_lir_binop(op, l, r, operand_ty)
                 }
                 _ => unreachable!("validated scalar leaf operation"),
             };

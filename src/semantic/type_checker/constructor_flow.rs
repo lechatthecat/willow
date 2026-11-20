@@ -793,7 +793,7 @@ impl Graph<'_, '_> {
             // object/interface display can run user `to_string` code.
             Expr::Print(value, ..) => !matches!(
                 self.types.get(&value.id()),
-                Some(Type::I64 | Type::F64 | Type::Bool | Type::String)
+                Some(Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String)
             ),
             Expr::Index(..)
             | Expr::Binary(_)

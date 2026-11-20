@@ -3646,7 +3646,7 @@ impl TypeChecker {
         // and silently print NOTHING.
         if !matches!(
             &arg_ty,
-            Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never
+            Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never
         ) && !Self::contains_error_type(&arg_ty)
         {
             let fn_name = if *newline { "println" } else { "print" };

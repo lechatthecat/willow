@@ -661,7 +661,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 /// `ELEM_KIND_*` constants.
 pub(super) fn collection_elem_kind(ty: &Type) -> Option<i64> {
     match ty {
-        Type::I64 => Some(0),
+        Type::U8 | Type::I64 => Some(0),
         Type::F64 => Some(1),
         Type::Bool => Some(2),
         Type::String => Some(3),

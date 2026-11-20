@@ -39,10 +39,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_flat_await_future(&mut self, future: Value, result_ty: &Type) -> Value {
         // Future<void> is an allocation-free deadline word. Other output
         // types retain the native handle ABI; neither is a GC heap pointer.
-        self.emit_value_runtime_call(
+        let value = self.emit_value_runtime_call(
             super::type_helpers::future_await_runtime_name(result_ty),
             &[future],
-        )
+        );
+        if result_ty.integer_layout().is_some_and(|l| l.bits < 64) {
+            self.emit_from_storage_word(value, result_ty)
+        } else {
+            value
+        }
     }
 
     /// One idle iteration. Selection, retries and case bodies live in LIR.

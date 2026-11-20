@@ -42,7 +42,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Primitive coercions and operand loads cannot allocate or suspend.
         // Load the owner from its current storage and never retain a raw buffer
         // across a call, safepoint, or suspension on the successful path.
-        if matches!(element_ty, Type::I64 | Type::F64 | Type::Bool) {
+        if matches!(element_ty, Type::U8 | Type::I64 | Type::F64 | Type::Bool) {
             let array = self.emit_lir_operand(function, array);
             let index = self.emit_lir_operand(function, index);
             let value = self.emit_lir_operand(function, value);

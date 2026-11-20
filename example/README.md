@@ -223,6 +223,27 @@ sorts entries by rendered key text for deterministic output.
 
 ## Integer arithmetic
 
+[`u8_scalar.wi`](u8_scalar.wi) uses unsigned eight-bit integers in functions,
+classes, arrays, generics, Option/Result, closures and tasks. `u8` ranges from
+0 through 255. Literals receive their expected integer type; out-of-range
+literals and implicit mixing with `i64` are errors. Unannotated integer literals
+remain `i64`.
+
+- `byte.to_i64()` widens without losing information.
+- `integer.wrapping_to_u8()` keeps the low eight bits (`-1` becomes 255).
+- `integer.checked_to_u8()` returns `Option<u8>`; values below 0 or above 255
+  produce `None` in either build mode.
+- `+`, `-`, `*`, `**`, and unary `-` panic recoverably on overflow in debug,
+  and wrap modulo 256 in release. Division/remainder by zero panic in both.
+- Comparisons and `>>` are unsigned. Shift amounts have type `u8`: debug
+  requires 0 through 7; release masks to the low three bits. Left shifts
+  discard high bits in both modes. `&`, `|`, `^`, and `!` operate on eight bits.
+- `wrapping_add/sub/mul/neg` return `u8`; `checked_add/sub/mul/neg` return
+  `Option<u8>`. Their behavior is independent of the build mode.
+
+`u8` follows the same effect-contract rules as `i64`. Array elements retain
+the existing storage-slot representation.
+
 [Integer overflow](integer_overflow.wi) shows the `i64` overflow policy:
 
 - Debug builds (the default `willow build`) check `+`, `-`, `*`, `**` and

@@ -14,7 +14,7 @@ impl TypeChecker {
     /// here rather than reaching lowering without an operand.
     fn supports_equality(&self, ty: &Type) -> bool {
         match ty {
-            Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never => true,
+            Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never => true,
             Type::Named(name) => {
                 self.symbols.lookup_class(name).is_some()
                     || self.symbols.lookup_interface(name).is_some()
@@ -61,35 +61,64 @@ impl TypeChecker {
     /// Traverse contiguous unary/binary trees on the heap. Non-operator leaves
     /// still use normal checking so contextual and callable state is preserved.
     pub(super) fn check_operator_tree(&mut self, expr: &Expr) -> Type {
+        self.check_operator_tree_expecting(expr, None)
+    }
+
+    pub(super) fn check_operator_tree_expecting(
+        &mut self,
+        expr: &Expr,
+        expected: Option<&Type>,
+    ) -> Type {
         enum Work<'a> {
-            Enter(&'a Expr),
+            Enter(&'a Expr, Option<Type>),
+            AfterRightForLiteral(&'a BinaryExpr),
             AfterLeft(&'a BinaryExpr),
             FinishBinary(&'a BinaryExpr, Type),
             AfterRightForBareNoneLhs(&'a BinaryExpr),
             FinishUnary(&'a UnaryExpr),
         }
-        let mut work = vec![Work::Enter(expr)];
+        let mut work = vec![Work::Enter(expr, expected.cloned())];
         let mut value = Type::Void;
         while let Some(next) = work.pop() {
             match next {
-                Work::Enter(Expr::Binary(binary)) => {
+                Work::Enter(Expr::Binary(binary), context) => {
+                    if context.is_none()
+                        && matches!(binary.lhs, Expr::Integer(..))
+                        && !matches!(binary.rhs, Expr::Integer(..))
+                    {
+                        work.push(Work::AfterRightForLiteral(binary));
+                        work.push(Work::Enter(&binary.rhs, None));
+                        continue;
+                    }
                     if matches!(binary.op, BinOp::Eq | BinOp::Ne)
                         && is_option_none_expr(self, &binary.lhs)
                     {
                         // A bare None on the left derives its Option context
                         // from the right, retaining the original evaluation order.
                         work.push(Work::AfterRightForBareNoneLhs(binary));
-                        work.push(Work::Enter(&binary.rhs));
+                        work.push(Work::Enter(&binary.rhs, None));
                     } else {
                         work.push(Work::AfterLeft(binary));
-                        work.push(Work::Enter(&binary.lhs));
+                        work.push(Work::Enter(&binary.lhs, context));
                     }
                 }
-                Work::Enter(Expr::Unary(unary)) => {
+                Work::Enter(Expr::Unary(unary), context) => {
                     work.push(Work::FinishUnary(unary));
-                    work.push(Work::Enter(&unary.expr));
+                    work.push(Work::Enter(&unary.expr, context));
                 }
-                Work::Enter(leaf) => value = self.check_expr(leaf),
+                Work::Enter(leaf, context) => {
+                    value = if let Some(expected) = context {
+                        self.check_expr_expecting(leaf, &expected)
+                    } else {
+                        self.check_expr(leaf)
+                    }
+                }
+                Work::AfterRightForLiteral(binary) => {
+                    let right = value;
+                    let left = self.check_expr_expecting(&binary.lhs, &right);
+                    value = self.finish_binary(binary, left, right);
+                    self.expr_types.insert(binary.id, value.clone());
+                }
                 Work::AfterLeft(binary) => {
                     let left = value;
                     if matches!(binary.op, BinOp::Eq | BinOp::Ne)
@@ -100,8 +129,9 @@ impl TypeChecker {
                         value = self.finish_binary(binary, left, right);
                         self.expr_types.insert(binary.id, value.clone());
                     } else {
+                        let context = left.integer_layout().map(|_| left.clone());
                         work.push(Work::FinishBinary(binary, left));
-                        work.push(Work::Enter(&binary.rhs));
+                        work.push(Work::Enter(&binary.rhs, context));
                         value = Type::Void;
                     }
                 }
@@ -140,14 +170,14 @@ impl TypeChecker {
             // error rather than an implicit widening, and `String ** String` gets
             // an exponent-specific message instead of the concatenation help text.
             BinOp::Pow => {
-                if lty == Type::I64 && rty == Type::I64 {
+                if lty.integer_layout().is_some() && lty == rty {
                     // `i64 ** i64` is lowered natively. A
                     // literal negative exponent has no integer result, so it is
                     // a compile error rather than a guaranteed runtime panic.
                     if let Some(span) = negative_exponent_literal_span(&b.rhs) {
                         self.push(negative_exponent_literal(span));
                     }
-                    return Type::I64;
+                    return lty;
                 }
                 if lty == Type::F64 && rty == Type::F64 {
                     return Type::F64;
@@ -225,7 +255,7 @@ impl TypeChecker {
                     return Type::String;
                 }
 
-                if (lty != Type::I64 && lty != Type::F64) || lty != rty {
+                if (lty.integer_layout().is_none() && lty != Type::F64) || lty != rty {
                     let mut diagnostic = Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0202,
@@ -260,7 +290,7 @@ impl TypeChecker {
             // Bitwise and shift operators are integer-only:
             // `bool` uses `&&`/`||`, and there is no `f64` bit pattern access.
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
-                if lty != Type::I64 || rty != Type::I64 {
+                if lty.integer_layout().is_none() || lty != rty {
                     let mut diagnostic = Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0202,
@@ -289,10 +319,14 @@ impl TypeChecker {
                     }
                     self.push(diagnostic);
                 }
-                Type::I64
+                if lty.integer_layout().is_some() {
+                    lty
+                } else {
+                    Type::I64
+                }
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                if !matches!(lty, Type::I64 | Type::F64 | Type::String) || lty != rty {
+                if !matches!(lty, Type::U8 | Type::I64 | Type::F64 | Type::String) || lty != rty {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -444,7 +478,18 @@ impl TypeChecker {
         }
         match &u.op {
             UnaryOp::Neg => {
-                if ty != Type::I64 && ty != Type::F64 {
+                if let Some(layout) = ty.integer_layout()
+                    && let Expr::Integer(value, _, _) = u.expr
+                    && !layout.contains(-i128::from(value))
+                {
+                    self.push_error(
+                        ErrorCode::E0201,
+                        "negative integer literal out of range",
+                        u.span,
+                        "integer literal out of range",
+                    );
+                }
+                if ty.integer_layout().is_none() && ty != Type::F64 {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -466,7 +511,7 @@ impl TypeChecker {
                 ty
             }
             // Bitwise complement on `i64`.
-            UnaryOp::Not if ty == Type::I64 => Type::I64,
+            UnaryOp::Not if ty.integer_layout().is_some() => ty,
             UnaryOp::Not => {
                 if ty != Type::Bool {
                     self.push(

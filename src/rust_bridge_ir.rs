@@ -14,6 +14,7 @@ pub type RustBridgeSymbols = Vec<((u32, String), RustBridgeSymbol)>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scalar {
     I64,
+    U8,
     F64,
     Bool,
     Void,
@@ -30,7 +31,7 @@ impl Scalar {
         Some(match self {
             Self::I64 => willow_abi::AbiTy::I64,
             Self::F64 => willow_abi::AbiTy::F64,
-            Self::Bool => willow_abi::AbiTy::I8,
+            Self::U8 | Self::Bool => willow_abi::AbiTy::I8,
             Self::Void => return None,
             _ => willow_abi::AbiTy::Ptr,
         })
@@ -53,6 +54,7 @@ impl Scalar {
         Some(match ty {
             Type::Named(name) if records.contains_key(name) => Self::Record(name.clone()),
             Type::Named(name) if names.contains(name) => Self::Opaque(name.clone()),
+            Type::U8 => Self::U8,
             Type::I64 => Self::I64,
             Type::F64 => Self::F64,
             Type::Bool => Self::Bool,
@@ -93,6 +95,7 @@ impl Scalar {
     }
     fn array(inner: &Type) -> Option<Self> {
         let element = match inner {
+            Type::U8 => Self::U8,
             Type::String => Self::String,
             Type::F64 => Self::F64,
             Type::Bool => Self::Bool,
@@ -102,6 +105,7 @@ impl Scalar {
     }
     fn rust(&self) -> &'static str {
         match self {
+            Self::U8 => "u8",
             Self::I64 => "i64",
             Self::F64 => "f64",
             Self::Bool => "bool",

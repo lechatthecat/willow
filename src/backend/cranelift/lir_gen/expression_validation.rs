@@ -47,7 +47,9 @@ pub(super) fn supported_lir_pattern<'n>(
             true
         }
         crate::ir::lowered::LirPattern::LiteralBool(_) => *scrutinee_ty == Type::Bool,
-        crate::ir::lowered::LirPattern::LiteralInt(_) => *scrutinee_ty == Type::I64,
+        crate::ir::lowered::LirPattern::LiteralInt(n) => scrutinee_ty
+            .integer_layout()
+            .is_some_and(|layout| layout.contains(i128::from(*n))),
         crate::ir::lowered::LirPattern::EnumVariant { enum_name, variant } => {
             variant_of(&enum_name.to_string(), variant).is_some_and(|v| v.payloads.is_empty())
         }

@@ -98,6 +98,7 @@ pub(super) fn type_name_with<'a, N: std::fmt::Display>(
                 }
             }
             Part::Type(ty) => match ty {
+                Type::U8 => output.push_str("u8"),
                 Type::I64 => output.push_str("i64"),
                 Type::F64 => output.push_str("f64"),
                 Type::Bool => output.push_str("bool"),

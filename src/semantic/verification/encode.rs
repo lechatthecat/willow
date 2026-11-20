@@ -25,7 +25,14 @@ pub(super) fn integer(n: i64) -> String {
     }
 }
 pub(super) fn bounds(v: &str) -> String {
-    format!("(and (<= (- 9223372036854775808) {v}) (<= {v} 9223372036854775807))")
+    integer_bounds(v, Type::<String>::I64.integer_layout().unwrap())
+}
+pub(super) fn integer_bounds(v: &str, layout: crate::parser::ast::IntegerLayout) -> String {
+    format!(
+        "(and (<= {} {v}) (<= {v} {}))",
+        integer(layout.min() as i64),
+        integer(layout.max() as i64)
+    )
 }
 pub(super) fn has(f: &FunctionDecl, k: EffectContractKind) -> bool {
     f.effect_contracts.iter().any(|c| c.kind == k)
@@ -72,6 +79,7 @@ struct Encoder<'a> {
     assumptions: Vec<String>,
     dependencies: BTreeSet<usize>,
     depth: usize,
+    expected: Option<Type>,
     function_id: usize,
     havoc: Vec<Value>,
     loop_symbols: std::collections::BTreeMap<String, String>,
@@ -113,13 +121,108 @@ impl Encoder<'_> {
         if self.depth > 256 {
             return Err("expression depth budget exceeded".into());
         }
-        let result = self.expr_inner(expr, state, gate);
+        let expected = self.expected.take();
+        let result = self.expr_inner(expr, state, gate, expected.as_ref());
         self.depth -= 1;
         result
     }
-    fn expr_inner(&mut self, expr: &Expr, state: &State, gate: &Value) -> Result<Value, String> {
+    fn expr_expecting(
+        &mut self,
+        expr: &Expr,
+        state: &State,
+        gate: &Value,
+        expected: Option<&Type>,
+    ) -> Result<Value, String> {
+        let previous = self.expected.take();
+        self.expected = expected.cloned();
+        let result = self.expr(expr, state, gate);
+        self.expected = previous;
+        result
+    }
+    fn binary_expr(
+        &mut self,
+        b: &BinaryExpr,
+        state: &State,
+        gate: &Value,
+        expected: Option<&Type>,
+    ) -> Result<Value, String> {
+        let context = expected.filter(|ty| ty.integer_layout().is_some());
+        let (l, r) = if context.is_none()
+            && matches!(b.lhs, Expr::Integer(..))
+            && !matches!(b.rhs, Expr::Integer(..))
+        {
+            let r = self.expr(&b.rhs, state, gate)?;
+            let l = self.expr_expecting(&b.lhs, state, gate, Some(&r.ty))?;
+            (l, r)
+        } else {
+            let l = self.expr_expecting(&b.lhs, state, gate, context)?;
+            let rhs_gate = match b.op {
+                BinOp::And if l.boolean => self.and(gate, &l)?,
+                BinOp::Or if l.boolean => {
+                    self.node(format!("(and {} (not {}))", gate.text, l.text), true)?
+                }
+                _ => gate.clone(),
+            };
+            let r = self.expr_expecting(&b.rhs, state, &rhs_gate, Some(&l.ty))?;
+            (l, r)
+        };
+        let (op, boolean) = match b.op {
+            BinOp::Add => ("+", false),
+            BinOp::Sub => ("-", false),
+            BinOp::Mul => ("*", false),
+            BinOp::Div => ("wdiv", false),
+            BinOp::Rem => ("wrem", false),
+            BinOp::Eq => ("=", true),
+            BinOp::Ne => ("distinct", true),
+            BinOp::Lt => ("<", true),
+            BinOp::Le => ("<=", true),
+            BinOp::Gt => (">", true),
+            BinOp::Ge => (">=", true),
+            BinOp::And => ("and", true),
+            BinOp::Or => ("or", true),
+            _ => return Err("unsupported binary operation".into()),
+        };
+        let valid = match b.op {
+            BinOp::Eq | BinOp::Ne => {
+                l.ty == r.ty && matches!(l.ty, Type::U8 | Type::I64 | Type::Bool)
+            }
+            BinOp::And | BinOp::Or => l.boolean && r.boolean,
+            _ => l.ty.integer_layout().is_some() && l.ty == r.ty,
+        };
+        if !valid {
+            return Err("invalid operand types".into());
+        }
+        if matches!(b.op, BinOp::Div | BinOp::Rem) {
+            self.guard(
+                gate,
+                format!(
+                    "(and (distinct {} 0) (not (and (= {} (- 9223372036854775808)) (= {} (- 1)))))",
+                    r.text, l.text, r.text
+                ),
+            )?;
+        }
+        let result_ty = if boolean { Type::Bool } else { l.ty.clone() };
+        let value = self.typed_node(format!("({op} {} {})", l.text, r.text), &result_ty)?;
+        if !boolean {
+            self.guard(gate, data::domain(&value.ty, &value.text))?;
+        }
+        Ok(value)
+    }
+    fn expr_inner(
+        &mut self,
+        expr: &Expr,
+        state: &State,
+        gate: &Value,
+        expected: Option<&Type>,
+    ) -> Result<Value, String> {
         match expr {
-            Expr::Integer(n, ..) => Ok(Value::literal(integer(*n), false)),
+            Expr::Integer(n, ..) => {
+                let mut value = Value::literal(integer(*n), false);
+                if let Some(ty) = expected.filter(|ty| ty.integer_layout().is_some()) {
+                    value.ty = ty.clone();
+                }
+                Ok(value)
+            }
             Expr::Bool(b, ..) => Ok(Value::literal(b.to_string(), true)),
             Expr::Var(n, ..) => {
                 if let Some(v) = state.env.get(n) {
@@ -130,7 +233,11 @@ impl Encoder<'_> {
                     .get(n.as_str())
                     .and_then(|i| self.functions[*i].constant.as_ref())
                 {
-                    Some(ConstValue::Integer(n)) => Ok(Value::literal(integer(*n), false)),
+                    Some(ConstValue::Integer(number)) => {
+                        let mut value = Value::literal(integer(*number), false);
+                        value.ty = self.functions[self.names[n.as_str()]].return_type.clone();
+                        Ok(value)
+                    }
                     Some(ConstValue::Bool(b)) => Ok(Value::literal(b.to_string(), true)),
                     _ => Err(format!("unknown scalar binding `{n}`")),
                 }
@@ -180,65 +287,23 @@ impl Encoder<'_> {
                     false,
                 )
             }
-            Expr::Match(m) => self.match_expr(m, state, gate),
+            Expr::Match(m) => self.match_expr(m, state, gate, expected),
             Expr::Call(c) if matches!(c.callee.as_str(), "forall" | "exists") => {
                 self.quantifier(c, state, gate)
             }
             Expr::Unary(u) => {
-                let v = self.expr(&u.expr, state, gate)?;
+                let v = self.expr_expecting(&u.expr, state, gate, expected)?;
                 match u.op {
-                    UnaryOp::Neg if v.ty == Type::I64 => {
-                        let r = self.node(format!("(- {})", v.text), false)?;
-                        self.guard(gate, bounds(&r.text))?;
+                    UnaryOp::Neg if v.ty.integer_layout().is_some() => {
+                        let r = self.typed_node(format!("(- {})", v.text), &v.ty)?;
+                        self.guard(gate, data::domain(&r.ty, &r.text))?;
                         Ok(r)
                     }
                     UnaryOp::Not if v.boolean => self.node(format!("(not {})", v.text), true),
                     _ => Err("unsupported unary operation".into()),
                 }
             }
-            Expr::Binary(b) => {
-                let l = self.expr(&b.lhs, state, gate)?;
-                let rhs_gate = match b.op {
-                    BinOp::And if l.boolean => self.and(gate, &l)?,
-                    BinOp::Or if l.boolean => {
-                        self.node(format!("(and {} (not {}))", gate.text, l.text), true)?
-                    }
-                    _ => gate.clone(),
-                };
-                let r = self.expr(&b.rhs, state, &rhs_gate)?;
-                let (op, boolean) = match b.op {
-                    BinOp::Add => ("+", false),
-                    BinOp::Sub => ("-", false),
-                    BinOp::Mul => ("*", false),
-                    BinOp::Div => ("wdiv", false),
-                    BinOp::Rem => ("wrem", false),
-                    BinOp::Eq => ("=", true),
-                    BinOp::Ne => ("distinct", true),
-                    BinOp::Lt => ("<", true),
-                    BinOp::Le => ("<=", true),
-                    BinOp::Gt => (">", true),
-                    BinOp::Ge => (">=", true),
-                    BinOp::And => ("and", true),
-                    BinOp::Or => ("or", true),
-                    _ => return Err("unsupported binary operation".into()),
-                };
-                let valid = match b.op {
-                    BinOp::Eq | BinOp::Ne => l.ty == r.ty && matches!(l.ty, Type::I64 | Type::Bool),
-                    BinOp::And | BinOp::Or => l.boolean && r.boolean,
-                    _ => l.ty == Type::I64 && r.ty == Type::I64,
-                };
-                if !valid {
-                    return Err("invalid operand types".into());
-                }
-                if matches!(b.op, BinOp::Div | BinOp::Rem) {
-                    self.guard(gate, format!("(and (distinct {} 0) (not (and (= {} (- 9223372036854775808)) (= {} (- 1)))))", r.text, l.text, r.text))?;
-                }
-                let value = self.node(format!("({op} {} {})", l.text, r.text), boolean)?;
-                if !boolean {
-                    self.guard(gate, bounds(&value.text))?;
-                }
-                Ok(value)
-            }
+            Expr::Binary(b) => self.binary_expr(b, state, gate, expected),
             Expr::Ternary(t) => {
                 let c = self.expr(&t.condition, state, gate)?;
                 if !c.boolean {
@@ -246,8 +311,8 @@ impl Encoder<'_> {
                 }
                 let yes = self.and(gate, &c)?;
                 let no = self.node(format!("(and {} (not {}))", gate.text, c.text), true)?;
-                let a = self.expr(&t.then_expr, state, &yes)?;
-                let b = self.expr(&t.else_expr, state, &no)?;
+                let a = self.expr_expecting(&t.then_expr, state, &yes, expected)?;
+                let b = self.expr_expecting(&t.else_expr, state, &no, Some(&a.ty))?;
                 if a.ty != b.ty {
                     return Err("branch type mismatch".into());
                 }
@@ -273,7 +338,7 @@ impl Encoder<'_> {
                     if a.mode != CallArgMode::Value {
                         return Err("reference argument".into());
                     }
-                    let v = self.expr(a, state, gate)?;
+                    let v = self.expr_expecting(a, state, gate, Some(&p.ty))?;
                     if v.ty != p.ty {
                         return Err("argument type mismatch".into());
                     }
@@ -378,7 +443,13 @@ impl Encoder<'_> {
         let formula = self.fragment(format!("({} (({symbol} Int)) {formula})", c.callee), first);
         self.node(formula, true)
     }
-    fn match_expr(&mut self, m: &MatchExpr, state: &State, gate: &Value) -> Result<Value, String> {
+    fn match_expr(
+        &mut self,
+        m: &MatchExpr,
+        state: &State,
+        gate: &Value,
+        expected: Option<&Type>,
+    ) -> Result<Value, String> {
         let value = self.expr(&m.scrutinee, state, gate)?;
         let mut remaining = gate.clone();
         let mut result: Option<Value> = None;
@@ -405,7 +476,7 @@ impl Encoder<'_> {
             let MatchBody::Expr(expression) = &arm.body else {
                 return Err("proof match requires expression arms".into());
             };
-            let branch_value = self.expr(expression, &branch, &selected)?;
+            let branch_value = self.expr_expecting(expression, &branch, &selected, expected)?;
             result = Some(if let Some(previous) = result {
                 if previous.ty != branch_value.ty {
                     return Err("match result type mismatch".into());
@@ -475,7 +546,7 @@ impl Encoder<'_> {
             Pattern::LiteralBool(b, ..) if value.ty == Type::Bool => {
                 return self.node(format!("(= {} {b})", value.text), true);
             }
-            Pattern::LiteralInt(n, ..) if value.ty == Type::I64 => {
+            Pattern::LiteralInt(n, ..) if value.ty.integer_layout().is_some() => {
                 return self.node(format!("(= {} {})", value.text, integer(*n)), true);
             }
             Pattern::EnumVariant {
@@ -552,7 +623,8 @@ impl Encoder<'_> {
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Let(s) => {
-                    let v = self.expr(&s.init, state, &state.alive.clone())?;
+                    let v =
+                        self.expr_expecting(&s.init, state, &state.alive.clone(), s.ty.as_ref())?;
                     if let Some(t) = &s.ty
                         && v.ty != *t
                     {
@@ -565,7 +637,8 @@ impl Encoder<'_> {
                 }
                 Stmt::Assign(s) => {
                     let old = state.env.get(&s.name).ok_or("unknown assignment")?.clone();
-                    let v = self.expr(&s.value, state, &state.alive.clone())?;
+                    let v =
+                        self.expr_expecting(&s.value, state, &state.alive.clone(), Some(&old.ty))?;
                     if old.ty != v.ty {
                         return Err("assignment type mismatch".into());
                     }
@@ -624,10 +697,11 @@ impl Encoder<'_> {
                     state.alive = Value::literal("false", true);
                 }
                 Stmt::Return(s) => {
-                    let v = self.expr(
+                    let v = self.expr_expecting(
                         s.value.as_ref().ok_or("void return outside V1")?,
                         state,
                         &state.alive.clone(),
+                        Some(&state.result.ty),
                     )?;
                     if v.ty != state.result.ty {
                         return Err("return type mismatch".into());
@@ -1138,6 +1212,7 @@ pub(super) fn encode(
         assumptions: Vec::new(),
         dependencies: BTreeSet::new(),
         depth: 0,
+        expected: None,
         function_id: id,
         havoc: Vec::new(),
         loop_symbols: std::collections::BTreeMap::new(),
@@ -1223,6 +1298,7 @@ pub(super) fn encode(
         assumptions: Vec::new(),
         dependencies: BTreeSet::new(),
         depth: 0,
+        expected: None,
         function_id: id,
         havoc: Vec::new(),
         loop_symbols: std::collections::BTreeMap::new(),
@@ -1398,6 +1474,7 @@ pub(super) fn contract_predicates(
         assumptions: Vec::new(),
         dependencies: BTreeSet::new(),
         depth: 0,
+        expected: None,
         function_id: id,
         havoc: Vec::new(),
         loop_symbols: std::collections::BTreeMap::new(),

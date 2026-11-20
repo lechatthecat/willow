@@ -1150,7 +1150,10 @@ fn const_value(
             error.with_help("for computed values, use a function that returns the value instead")
         });
     };
-    if !matches!(declared, Type::I64 | Type::F64 | Type::Bool | Type::String) {
+    if !matches!(
+        declared,
+        Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String
+    ) {
         let error = Diagnostic::new(
             Severity::Error,
             ErrorCode::E0110,
@@ -1163,6 +1166,22 @@ fn const_value(
         } else {
             error
         });
+    }
+    if let (ConstValue::Integer(value), Some(layout)) = (&constant, declared.integer_layout()) {
+        if layout.contains(i128::from(*value)) {
+            return Ok(constant);
+        }
+        return Err(Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0110,
+            format!(
+                "integer literal is outside {}..={} for `{}`",
+                layout.min(),
+                layout.max(),
+                type_name(declared)
+            ),
+        )
+        .with_label(Label::primary(type_span, "constant out of range")));
     }
     if constant.ty() != *declared {
         let declared = type_name(declared);

@@ -517,6 +517,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder
                 .ins()
                 .bitcast(types::I64, MemFlagsData::new(), payload_val)
+        } else if payload_ty.integer_layout().is_some() {
+            self.widen_integer(payload_val, payload_ty)
         } else if matches!(payload_ty, Type::Bool) {
             self.builder.ins().uextend(types::I64, payload_val)
         } else {
