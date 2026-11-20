@@ -221,7 +221,7 @@ fn lower_var_expr(
             .tables
             .symbols
             .is_some_and(|symbols| symbols.lookup_func(name).is_some()))
-        && let Some(ty @ Type::Fn(..)) = ctx.expr_type(&expr.id())
+        && let Some(ty @ (Type::Fn(..) | Type::Closure(..))) = ctx.expr_type(&expr.id())
     {
         return Ok(HirExpr {
             kind: HirExprKind::FnRef(name.into()),
@@ -1547,9 +1547,8 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
     ctx.pop_scope();
     ctx.binds_seen = outer_binds;
     ctx.namespace_scope_base = outer_namespace_scope_base;
-    // A capture-free lambda that a `closure(...)` slot expects is a
-    // closure too: the slot decides the calling convention, so the
-    // lifted body still takes the (empty) environment.
+    // The checker's kind (shareable or task-local) only constrains where
+    // the value may flow; every function value has the same representation.
     let ty = if is_closure {
         Type::Closure(param_tys, Box::new(ret))
     } else {

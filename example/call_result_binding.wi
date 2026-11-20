@@ -1,5 +1,5 @@
 // A call result must be bound before it can be called again.
-fn pick(offset: i64) -> closure(i64) -> i64 {
+fn pick(offset: i64) -> fn(i64) -> i64 {
     return |value: i64| value + offset;
 }
 

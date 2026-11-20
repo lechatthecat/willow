@@ -5,7 +5,7 @@ class A { pub n: i64; }
 fn apply(f: fn(Wrap<A>) -> i64) -> i64 {
     return f(new Wrap<A>(new A(3)));
 }
-fn apply_captured(f: closure(Wrap<Wrap<A>>) -> i64) -> i64 {
+fn apply_captured(f: fn(Wrap<Wrap<A>>) -> i64) -> i64 {
     return f(new Wrap<Wrap<A>>(new Wrap<A>(new A(4))));
 }
 fn main() {

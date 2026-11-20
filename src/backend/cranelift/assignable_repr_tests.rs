@@ -67,7 +67,7 @@ fn representation_matrix_all_types_and_builtins() {
         (
             Type::Fn(vec![], Box::new(Type::Void)),
             types::I64,
-            SlotKind::Word,
+            SlotKind::GcRef,
         ),
         (
             Type::Closure(vec![], Box::new(Type::Void)),
@@ -154,6 +154,8 @@ fn representation_matrix_all_types_and_builtins() {
 
 #[test]
 fn callable_and_heap_representations_are_not_interchangeable() {
+    // Every function value has one representation, whichever kind the
+    // checker gave it, so only the signature decides.
     let function = Type::Fn(vec![Type::I64], Box::new(Type::String));
     let closure = Type::Closure(vec![Type::I64], Box::new(Type::String));
     for callable in [&function, &closure] {
@@ -167,8 +169,8 @@ fn callable_and_heap_representations_are_not_interchangeable() {
             assert!(!assignable_repr(&other, callable));
         }
     }
-    assert!(!assignable_repr(&function, &closure));
-    assert!(!assignable_repr(&closure, &function));
+    assert!(assignable_repr(&function, &closure));
+    assert!(assignable_repr(&closure, &function));
     assert!(!assignable_repr(
         &function,
         &Type::Fn(vec![Type::Bool], Box::new(Type::String))

@@ -8,10 +8,91 @@ impl<N> Type<N> {
     where
         N: Clone,
     {
-        self.map_tree(Clone::clone, true, Type::Generic)
+        self.map_tree(Clone::clone, true, None, Type::Generic)
     }
     pub fn map_names<M>(&self, map: impl FnMut(&N) -> M) -> Type<M> {
-        self.map_tree(map, false, Type::Generic)
+        self.map_tree(map, false, None, Type::Generic)
+    }
+    /// Rewrite every function-value type in the tree to one internal kind:
+    /// `sync == true` gives the shareable kind ([`Type::Fn`]), `false` the
+    /// task-local one ([`Type::Closure`]). Both share one runtime
+    /// representation and one source spelling, `fn(...) -> R`; the kind is
+    /// only the checker's Send/Sync knowledge about the captured environment.
+    pub fn with_callable_kind(&self, sync: bool) -> Self
+    where
+        N: Clone,
+    {
+        self.map_tree(Clone::clone, false, Some(sync), Type::Generic)
+    }
+    /// The callable kinds a freshly parsed written type has: task-local
+    /// everywhere except inside [`super::SEND_ONLY_BUILTINS`] arguments.
+    /// Re-applying declaration kind decisions starts from this, so the result
+    /// does not depend on an earlier decision.
+    pub(crate) fn with_parsed_callable_kinds(&self) -> Self
+    where
+        N: Clone + AsRef<str>,
+    {
+        self.map_tree(Clone::clone, false, Some(false), |name, args| {
+            if super::SEND_ONLY_BUILTINS.contains(&name.as_ref()) {
+                let args = args
+                    .iter()
+                    .map(|arg| arg.with_callable_kind(true))
+                    .collect();
+                Type::Generic(name, args)
+            } else {
+                Type::Generic(name, args)
+            }
+        })
+    }
+    /// Whether `self` has exactly the shape of `other` and, at every callable
+    /// position, the same kind or the shareable one where `other` is
+    /// task-local. Such a value carries at least the guarantees `other`
+    /// promises, at every depth.
+    pub fn callable_kinds_refine(&self, other: &Self) -> bool
+    where
+        N: PartialEq,
+    {
+        // Parameter positions are contravariant; keeping them exact is the
+        // conservative choice and all a binding's kind adoption needs.
+        let mut pending = vec![(self, other)];
+        while let Some((value, target)) = pending.pop() {
+            match (value, target) {
+                (
+                    Type::Fn(vp, vr) | Type::Closure(vp, vr),
+                    Type::Fn(tp, tr) | Type::Closure(tp, tr),
+                ) => {
+                    if matches!((value, target), (Type::Closure(..), Type::Fn(..))) || vp != tp {
+                        return false;
+                    }
+                    pending.push((vr, tr));
+                }
+                (Type::Array(v), Type::Array(t)) => pending.push((v, t)),
+                (Type::FixedArray(v, vn), Type::FixedArray(t, tn)) if vn == tn => {
+                    pending.push((v, t))
+                }
+                (Type::Generic(vn, va), Type::Generic(tn, ta))
+                    if vn == tn && va.len() == ta.len() =>
+                {
+                    pending.extend(va.iter().zip(ta));
+                }
+                (Type::Named(v), Type::Named(t)) if v == t => {}
+                (Type::I64, Type::I64)
+                | (Type::F64, Type::F64)
+                | (Type::Bool, Type::Bool)
+                | (Type::String, Type::String)
+                | (Type::Void, Type::Void)
+                | (Type::Never, Type::Never) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+    /// Whether two types are equal once callable kinds are ignored.
+    pub fn same_modulo_callable_kind(&self, other: &Self) -> bool
+    where
+        N: Clone + PartialEq,
+    {
+        self.with_callable_kind(false) == other.with_callable_kind(false)
     }
     /// Rebuild every generic application bottom-up; `rewrite` receives the
     /// already rewritten arguments.
@@ -19,12 +100,13 @@ impl<N> Type<N> {
     where
         N: Clone,
     {
-        self.map_tree(Clone::clone, false, rewrite)
+        self.map_tree(Clone::clone, false, None, rewrite)
     }
     fn map_tree<M>(
         &self,
         mut map: impl FnMut(&N) -> M,
         erase_array_length: bool,
+        callable_kind: Option<bool>,
         mut generic: impl FnMut(M, Vec<Type<M>>) -> Type<M>,
     ) -> Type<M> {
         enum Work<'a, N> {
@@ -60,13 +142,14 @@ impl<N> Type<N> {
                             }
                         }
                         Type::Generic(name, _) => generic(map(name), children),
-                        Type::Fn(..) => {
-                            let result = children.pop().unwrap();
-                            Type::Fn(children, Box::new(result))
-                        }
-                        Type::Closure(..) => {
-                            let result = children.pop().unwrap();
-                            Type::Closure(children, Box::new(result))
+                        Type::Fn(..) | Type::Closure(..) => {
+                            let result = Box::new(children.pop().unwrap());
+                            let sync = callable_kind.unwrap_or(matches!(ty, Type::Fn(..)));
+                            if sync {
+                                Type::Fn(children, result)
+                            } else {
+                                Type::Closure(children, result)
+                            }
                         }
                     };
                     values.push(value);
@@ -169,7 +252,8 @@ impl<N> Drop for Type<N> {
 }
 impl<N: PartialEq> Type<N> {
     /// Runtime array slots have the same representation regardless of their
-    /// checked length constraint. Nominal identities and all other shapes stay exact.
+    /// checked length constraint, and function values regardless of their
+    /// callable kind. Nominal identities and all other shapes stay exact.
     pub(crate) fn same_array_storage_type(&self, other: &Self) -> bool {
         self.equal_tree(other, true)
     }
@@ -185,7 +269,14 @@ impl<N: PartialEq> Type<N> {
                 pending.push((a, b));
                 continue;
             }
-            if std::mem::discriminant(left) != std::mem::discriminant(right) {
+            // Both function-value kinds share one representation; only the
+            // checker distinguishes them.
+            let same_callable_storage = erase_array_length
+                && matches!(left, Self::Fn(..) | Self::Closure(..))
+                && matches!(right, Self::Fn(..) | Self::Closure(..));
+            if !same_callable_storage
+                && std::mem::discriminant(left) != std::mem::discriminant(right)
+            {
                 return false;
             }
             match (left, right) {

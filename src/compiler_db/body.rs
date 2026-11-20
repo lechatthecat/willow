@@ -1819,7 +1819,7 @@ mod tests {
     fn normalized_body_queries_preserve_nested_lambda_await_ids_and_checked_types() {
         let (program, queries, checker) = prepare(
             r#"
-            fn apply(f: closure(i64) -> i64, n: i64) -> i64 { return f(n); }
+            fn apply(f: fn(i64) -> i64, n: i64) -> i64 { return f(n); }
             async fn fetch() -> i64 { return 2; }
             async fn main() {
                 let extra = 40;

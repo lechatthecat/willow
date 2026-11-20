@@ -339,7 +339,7 @@ import bx::Bx as Box2;
 pub enum Two { P(Bx, Box2), Z }
 pub fn lam(n: Two) -> i64 {
     return match n {
-        Two::P(a, c) => { let f: closure(i64) -> i64 = |k| a.get() + c.hi + k; return f(100); },
+        Two::P(a, c) => { let f: fn(i64) -> i64 = |k| a.get() + c.hi + k; return f(100); },
         Two::Z => 0,
     };
 }

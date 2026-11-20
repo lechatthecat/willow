@@ -1388,8 +1388,8 @@ fn ione(x: i64) -> i64 { return x ** 1; }
 fn izero(x: i64) -> i64 { return x ** 0; }
 fn gf<T>(t: T, x: f64) -> f64 { return x ** 2.0; }
 fn gi<T>(t: T, x: i64, e: i64) -> i64 { return x ** e; }
-fn cf(x: f64) -> closure(f64) -> f64 { return |y: f64| -> f64 { return y ** x; }; }
-fn ci(x: i64) -> closure(i64) -> i64 { return |y: i64| -> i64 { return y ** x; }; }
+fn cf(x: f64) -> fn(f64) -> f64 { return |y: f64| -> f64 { return y ** x; }; }
+fn ci(x: i64) -> fn(i64) -> i64 { return |y: i64| -> i64 { return y ** x; }; }
 fn main() {
     println(fbig()); println(fvar(-4.0, 0.5)); println(ivar(2, 3)); println(ilit(2));
     println(ione(2)); println(izero(2)); println(gf(1, 3.0)); println(gi("a", 2, 3));

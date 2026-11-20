@@ -1,7 +1,7 @@
 // Query declarations with: willow symbol generic_signature_queries::iterate --source tests/regressions/generic_signature_queries.wi
 fn identity<T>(value: T) -> T { return value; }
 fn choose<A, B>(first: A, second: B) -> A { return first; }
-fn iterate<T>(start: T, n: i64, step: closure(T) -> T) -> T {
+fn iterate<T>(start: T, n: i64, step: fn(T) -> T) -> T {
     let mut value = start;
     let mut i = 0;
     while i < n { value = step(value); i = i + 1; }

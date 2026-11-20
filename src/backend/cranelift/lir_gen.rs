@@ -704,7 +704,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let sync_poll = (coop.is_none() && !deferred_poll && !unpolled)
             .then(|| self.emit_sync_poll_gates(poll_spare));
         let unrooted = if coop.is_none() {
-            super::transient_roots::unrooted_array_temps(f)
+            super::transient_roots::unrooted_transient_temps(f)
         } else {
             HashSet::new()
         };
@@ -856,8 +856,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.seal_block(cleanup.entry);
         }
         // The enclosing function compiler may append shared panic-return CFG
-        // after the LIR body. It seals all blocks once that ABI edge exists
-        //.
+        // after the LIR body. It seals all blocks once that ABI edge exists.
         self.locals.terminated = true;
         self.suspension.lir_confined_maps = outer_confined_maps;
         self.reuse.lir_nonnegative = outer_nonnegative;
@@ -1223,11 +1222,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 }
 
-/// Tag bit in a closure's code word: the lifted body cannot raise, so a call
-/// through it skips the panic-depth protocol. Function code
-/// is at least 64-byte aligned (`log2_min_function_alignment`), so the bit is
-/// never part of the address; callers mask it off before the call.
-const CLOSURE_CODE_NO_PANIC: i64 = 1;
+/// Tag bit in a function value's code word: the body may raise, so a call
+/// through it runs the panic-depth protocol and masks the bit off first.
+/// Function code is at least 64-byte aligned (`log2_min_function_alignment`),
+/// so the bit is never part of the address, and an untagged word is the code
+/// address itself.
+pub(super) const FUNCTION_CODE_MAY_PANIC: i64 = willow_abi::FUNCTION_CODE_MAY_PANIC as i64;
 
 /// User calls can run synchronous safepoints. Builtin scalar/collection
 /// operations and task creation remain on the ordinary poll stack.

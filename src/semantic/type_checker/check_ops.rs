@@ -565,21 +565,7 @@ impl TypeChecker {
             }
         }
         if info.ty != Type::Void && !self.types_compatible(&info.ty, &val_ty) {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    self.type_mismatch_error_code(&info.ty, &val_ty),
-                    format!(
-                        "mismatched types: expected `{}`, found `{}`",
-                        self.diagnostic_type_name(&info.ty),
-                        self.diagnostic_type_name(&val_ty)
-                    ),
-                )
-                .with_label(Label::primary(
-                    s.span,
-                    format!("expected `{}`", self.diagnostic_type_name(&info.ty)),
-                )),
-            );
+            self.push_type_mismatch(&info.ty, &val_ty, s.span);
         }
     }
 

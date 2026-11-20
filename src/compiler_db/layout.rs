@@ -101,9 +101,14 @@ pub(crate) fn is_gc_managed(ty: &Type, named: impl FnOnce(TypeId) -> bool) -> bo
     }
     match ty {
         Type::Named(name) => named(*name),
-        Type::FixedArray(_, _) | Type::Array(_) | Type::String | Type::Closure(_, _) => true,
+        // Every function value is a managed object (code word, then captures).
+        Type::FixedArray(_, _)
+        | Type::Array(_)
+        | Type::String
+        | Type::Fn(_, _)
+        | Type::Closure(_, _) => true,
         Type::Generic(name, _) => Builtin::from_name(name.name().as_ref()) != Some(Builtin::Future),
-        Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never | Type::Fn(_, _) => false,
+        Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never => false,
     }
 }
 

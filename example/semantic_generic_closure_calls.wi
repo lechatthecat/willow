@@ -2,10 +2,10 @@
 // willow effects semantic_generic_closure_calls::apply --source example/semantic_generic_closure_calls.wi
 // willow effects semantic_generic_closure_calls::Box::twice --source example/semantic_generic_closure_calls.wi
 // Generic bodies that call closure values keep every semantic query available.
-fn apply<T>(x: T, f: closure(T) -> T) -> T { return f(x); }
+fn apply<T>(x: T, f: fn(T) -> T) -> T { return f(x); }
 class Box<T> {
     pub value: T;
-    pub fn twice(self, f: closure(T) -> T) -> T { let g = f; return g(g(self.value)); }
+    pub fn twice(self, f: fn(T) -> T) -> T { let g = f; return g(g(self.value)); }
 }
 fn main() {
     let k = 1;

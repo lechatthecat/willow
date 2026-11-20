@@ -86,12 +86,12 @@ fn callers(snapshot: &Snapshot, seed: &str) -> (BTreeSet<String>, bool) {
 
 const PQ: &str = "module pq;
 pub class Heap<T> {
-    less: closure(T, T) -> bool;
-    pub init(self, less: closure(T, T) -> bool) { self.less = less; }
+    less: fn(T, T) -> bool;
+    pub init(self, less: fn(T, T) -> bool) { self.less = less; }
     pub fn push(self, x: T) -> bool { return self.check(x); }
     fn check(self, x: T) -> bool { let less = self.less; return less(x, x); }
 }
-pub fn merge_sort<T>(x: T, less: closure(T, T) -> bool) -> bool { return less(x, x); }
+pub fn merge_sort<T>(x: T, less: fn(T, T) -> bool) -> bool { return less(x, x); }
 ";
 const DATA: &str = "module data;
 pub class Patient { pub id: i64; }
@@ -315,7 +315,7 @@ fn closure_impact_fn_and_closure_types_share_a_key() {
     let snapshot = single(
         "fn inc(x: i64) -> i64 { return x + 1; }
 fn apply_fn(f: fn(i64) -> i64) -> i64 { return f(1); }
-fn apply_closure(f: closure(i64) -> i64) -> i64 { return f(1); }
+fn apply_closure(f: fn(i64) -> i64) -> i64 { return f(1); }
 fn main() { let k = 1; apply_fn(inc); apply_closure(|x: i64| x + k); }",
     );
     let (names, _) = callers(&snapshot, "main::inc");
@@ -328,8 +328,8 @@ fn closure_impact_same_key_values_stay_conservative() {
     // P16 two lambdas of one type: a call cannot tell them apart.
     let snapshot = single(
         "fn target(x: i64) -> bool { return x > 0; }
-fn first(f: closure(i64) -> bool) -> bool { return f(1); }
-fn second(f: closure(i64) -> bool) -> bool { return f(2); }
+fn first(f: fn(i64) -> bool) -> bool { return f(1); }
+fn second(f: fn(i64) -> bool) -> bool { return f(2); }
 fn main() { let k = 1; first(|x: i64| target(x + k)); second(|x: i64| x < k); }",
     );
     let (names, _) = callers(&snapshot, "main::target");
@@ -358,7 +358,7 @@ fn closure_impact_unkeyed_value_reaches_every_typed_call() {
 fn target() -> i64 { return 1; }
 fn count(m: Map<String, i64>) -> i64 { return target() + m.len(); }
 fn apply_map(f: fn(Map<String, i64>) -> i64) -> i64 { return f(Map::new()); }
-fn apply_int(f: closure(i64) -> i64) -> i64 { return f(1); }
+fn apply_int(f: fn(i64) -> i64) -> i64 { return f(1); }
 fn main() { let k = 1; apply_map(count); apply_int(|x: i64| x + k); }",
     );
     let (names, _) = callers(&snapshot, "main::target");
@@ -394,8 +394,8 @@ fn main() { apply_a(target); apply_b(on_b); apply_arr(on_arr); }",
 const QUEUE: &str = "module queue;
 pub interface Queue<T> { fn push(self, x: T) -> bool; }
 pub class Fast<T> implements Queue<T> {
-    less: closure(T, T) -> bool;
-    pub init(self, less: closure(T, T) -> bool) { self.less = less; }
+    less: fn(T, T) -> bool;
+    pub init(self, less: fn(T, T) -> bool) { self.less = less; }
     pub fn push(self, x: T) -> bool { let less = self.less; return less(x, x); }
 }
 pub fn feed<T>(q: Queue<T>, x: T) -> bool { return q.push(x); }
@@ -470,7 +470,7 @@ fn closure_impact_uninstantiated_template_does_not_mark_coverage_unknown() {
     // P25 a never-instantiated generic template cannot run: no global note.
     let snapshot = single(
         "fn target() -> i64 { return 1; }
-fn unused<T>(x: T, f: closure(T) -> i64) -> i64 { return f(x); }
+fn unused<T>(x: T, f: fn(T) -> i64) -> i64 { return f(x); }
 fn main() { target(); }",
     );
     let (names, unknown) = callers(&snapshot, "main::target");
@@ -487,8 +487,8 @@ fn closure_impact_instance_graph_scales_linearly() {
     for n in [4, 16, 64] {
         let mut main = String::from(
             "class Heap<T> {
-    less: closure(T, T) -> bool;
-    pub init(self, less: closure(T, T) -> bool) { self.less = less; }
+    less: fn(T, T) -> bool;
+    pub init(self, less: fn(T, T) -> bool) { self.less = less; }
     pub fn push(self, x: T) -> bool { let less = self.less; return less(x, x); }
 }
 ",

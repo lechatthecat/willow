@@ -247,7 +247,9 @@ impl TypeChecker {
                 };
                 let f_ty = self.check_fn_arg_with_param_context(&call.args[0].expr, params, false);
                 match f_ty {
-                    Type::Fn(ref parameters, ref ret) if parameters.len() == params.len() => {
+                    Type::Fn(ref parameters, ref ret) | Type::Closure(ref parameters, ref ret)
+                        if parameters.len() == params.len() =>
+                    {
                         if !no_input {
                             self.check_builtin_argument(
                                 BuiltinArgument::Closure,

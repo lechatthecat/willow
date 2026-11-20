@@ -145,11 +145,8 @@ pub(super) fn type_name_with<'a, N: std::fmt::Display>(
                             work.push(Part::Text(", "));
                         }
                     }
-                    work.push(Part::Text(if matches!(ty, Type::Fn(..)) {
-                        "fn("
-                    } else {
-                        "closure("
-                    }));
+                    // One spelling for both callable kinds (see `Type::Fn`).
+                    work.push(Part::Text("fn("));
                 }
             },
         }

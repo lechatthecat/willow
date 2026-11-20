@@ -19,22 +19,22 @@ class Point {
 }
 
 // Leaf: two field loads, a multiply-add (wrapping in release builds).
-fn dot(p: Point) -> closure(i64, i64) -> i64 {
+fn dot(p: Point) -> fn(i64, i64) -> i64 {
     return |a, b| p.x * a + p.y * b;
 }
 
 // Not a leaf: the divisor is a parameter, so `x / d` can panic on zero.
-fn divider(n: i64) -> closure(i64) -> i64 {
+fn divider(n: i64) -> fn(i64) -> i64 {
     return |d| n / d;
 }
 
 // Not a leaf: it allocates a string.
-fn labeller(prefix: String) -> closure(i64) -> String {
+fn labeller(prefix: String) -> fn(i64) -> String {
     return |v: i64| { return prefix + v.toString(); };
 }
 
 fn main() {
-    let mut fs: Array<closure(i64, i64) -> i64> = [];
+    let mut fs: Array<fn(i64, i64) -> i64> = [];
     let mut i = 1;
     while i <= 10 {
         fs.push(dot(new Point(i, i * i)));

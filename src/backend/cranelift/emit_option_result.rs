@@ -189,39 +189,54 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.use_var(result_var)
     }
 
-    /// Emit an indirect call through a function value.
+    /// Emit an indirect call through a function value. The value is a managed
+    /// object whose first word is the (tagged) code address; the call passes
+    /// the value itself as the trailing environment argument.
     pub(super) fn emit_indirect_call(
         &mut self,
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
         args: &[cranelift_codegen::ir::Value],
     ) -> cranelift_codegen::ir::Value {
-        if let Type::Fn(param_types, ret_type) = f_ty {
-            let mut sig = self.module.make_signature();
-            for pt in param_types {
-                sig.params.push(AbiParam::new(self.clif_type(pt)));
-            }
-            let has_return = **ret_type != Type::Void;
-            if has_return {
-                sig.returns.push(AbiParam::new(self.clif_type(ret_type)));
-            }
-            let sig_ref = self.builder.import_signature(sig);
-            let panic_depth = self.emit_pre_willow_call_panic_depth();
-            let call = self.builder.ins().call_indirect(sig_ref, f_val, args);
-            let results = self.builder.inst_results(call);
-            let result = if results.is_empty() {
-                self.builder.ins().iconst(types::I64, 0)
-            } else {
-                results[0]
-            };
-            self.emit_post_willow_call_panic_check(panic_depth);
-            result
-        } else {
+        let (Type::Fn(param_types, ret_type) | Type::Closure(param_types, ret_type)) = f_ty else {
             panic!(
                 "compiler invariant violated: indirect call target typed `{}` instead of a function",
                 debug_type_name(f_ty)
             )
+        };
+        let mut sig = self.module.make_signature();
+        for pt in param_types {
+            sig.params.push(AbiParam::new(self.clif_type(pt)));
         }
+        sig.params
+            .push(AbiParam::new(reference_type(self.module.target_config())));
+        let has_return = **ret_type != Type::Void;
+        if has_return {
+            sig.returns.push(AbiParam::new(self.clif_type(ret_type)));
+        }
+        let sig_ref = self.builder.import_signature(sig);
+        let word = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::trusted(),
+            f_val,
+            0,
+        );
+        let code = self
+            .builder
+            .ins()
+            .band_imm_s(word, !(willow_abi::FUNCTION_CODE_MAY_PANIC as i64));
+        let mut values = args.to_vec();
+        values.push(f_val);
+        let panic_depth = self.emit_pre_willow_call_panic_depth();
+        let call = self.builder.ins().call_indirect(sig_ref, code, &values);
+        let results = self.builder.inst_results(call);
+        let result = if results.is_empty() {
+            self.builder.ins().iconst(types::I64, 0)
+        } else {
+            results[0]
+        };
+        self.emit_post_willow_call_panic_check(panic_depth);
+        result
     }
 
     // The combinators below read `ptr` and `f_val` only before their first GC
@@ -276,13 +291,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let output_ty = match f_ty {
-            Type::Fn(_, ret) => (**ret).clone(),
+            Type::Fn(_, ret) | Type::Closure(_, ret) => (**ret).clone(),
             _ => unreachable!("combinator callback must be a function"),
         };
         let result_var = self.builder.declare_var(self.clif_type(&output_ty));
         let is_some = self.emit_option_is_some(ptr, inner_ty);
         let output_inner = match f_ty {
-            Type::Fn(_, ret) => option_inner(ret).cloned().unwrap_or(Type::Void),
+            Type::Fn(_, ret) | Type::Closure(_, ret) => {
+                option_inner(ret).cloned().unwrap_or(Type::Void)
+            }
             _ => Type::Void,
         };
 
@@ -570,7 +587,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 /// The return type of a combinator's callback.
 fn callback_return_type(f_ty: &Type) -> Type {
     match f_ty {
-        Type::Fn(_, ret) => (**ret).clone(),
+        Type::Fn(_, ret) | Type::Closure(_, ret) => (**ret).clone(),
         _ => unreachable!("combinator callback must be a function"),
     }
 }

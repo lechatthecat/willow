@@ -183,11 +183,7 @@ impl TypeNames {
                     list(&mut work, args);
                 }
                 Type::Fn(args, result) | Type::Closure(args, result) => {
-                    out.push_str(if matches!(ty, Type::Fn(..)) {
-                        "fn("
-                    } else {
-                        "closure("
-                    });
+                    out.push_str("fn(");
                     work.extend([Work::Type(result), Work::Text(") -> ")]);
                     list(&mut work, args);
                 }
@@ -342,7 +338,7 @@ mod tests {
             ),
             (
                 Type::Closure(vec![pair.clone()], Box::new(pair)),
-                "closure((i64, bool)) -> (i64, bool)",
+                "fn((i64, bool)) -> (i64, bool)",
             ),
             (
                 Type::Generic("$TupleLike".into(), vec![Type::I64]),

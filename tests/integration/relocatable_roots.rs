@@ -244,7 +244,7 @@ class Square implements Shape {
 }
 class Node { pub value: i64; }
 enum Slot { Empty, Full(Node) }
-fn apply(f: closure(i64) -> i64, v: i64) -> i64 { return f(v); }
+fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }
 fn main() {
     let shape: Shape = new Square(4);
     let slot = Slot::Full(new Node(9));

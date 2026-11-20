@@ -14,7 +14,7 @@ fn main() {
     println(is_success(Ok(4)));
     println(nested_or(Some(None), 11));
     println(nested_or(Some(Some(13)), 0));
-    let increment: closure(i64) -> Option<i64> = |n: i64| Some(n + 1);
+    let increment: fn(i64) -> Option<i64> = |n: i64| Some(n + 1);
     println(value_or(increment(14), 0));
     println(value_or(true ? Some(16) : None, 0));
     println(value_or(match false { true => Some(17), false => None }, 18));

@@ -3,7 +3,7 @@
 // parameters, even where those reuse the callee's names (`T` below).
 import std::collections::Array;
 
-pub fn fold<T, A>(xs: Array<T>, init: A, f: closure(A, T) -> A) -> A {
+pub fn fold<T, A>(xs: Array<T>, init: A, f: fn(A, T) -> A) -> A {
     let mut acc = init;
     for x in xs {
         acc = f(acc, x);
@@ -11,7 +11,7 @@ pub fn fold<T, A>(xs: Array<T>, init: A, f: closure(A, T) -> A) -> A {
     return acc;
 }
 
-pub fn map<T, U>(xs: Array<T>, f: closure(T) -> U) -> Array<U> {
+pub fn map<T, U>(xs: Array<T>, f: fn(T) -> U) -> Array<U> {
     let out: Array<U> = [];
     for x in xs {
         out.push(f(x));
@@ -19,18 +19,18 @@ pub fn map<T, U>(xs: Array<T>, f: closure(T) -> U) -> Array<U> {
     return out;
 }
 
-pub fn count_where<T>(xs: Array<T>, pred: closure(T) -> bool) -> i64 {
+pub fn count_where<T>(xs: Array<T>, pred: fn(T) -> bool) -> i64 {
     return fold(xs, 0, |n, x| if pred(x) { n + 1 } else { n });
 }
 
 // Crossed names: the callee's `T` is this function's `U` and vice versa.
-pub fn remap<U, T>(xs: Array<U>, f: closure(U) -> T) -> Array<T> {
+pub fn remap<U, T>(xs: Array<U>, f: fn(U) -> T) -> Array<T> {
     return map(xs, |x| f(x));
 }
 
 class Bag<T> {
     pub items: Array<T>;
-    pub fn total(self, weight: closure(T) -> i64) -> i64 {
+    pub fn total(self, weight: fn(T) -> i64) -> i64 {
         return fold(self.items, 0, |sum, x| sum + weight(x));
     }
 }

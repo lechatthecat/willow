@@ -295,7 +295,7 @@ perspective!(
 fn pair_49_closure_physical_word_boundaries() {
     for count in [30, 31, 32, 63, 64, 128] {
         for prefix_ref in [false, true] {
-            let mut source = String::from("fn make() -> closure() -> i64 { ");
+            let mut source = String::from("fn make() -> fn() -> i64 { ");
             if prefix_ref {
                 source.push_str("let atext = \"early\" + \"!\"; ");
             }

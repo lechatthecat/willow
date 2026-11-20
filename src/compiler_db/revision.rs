@@ -1473,11 +1473,11 @@ mod tests {
         f.write("data.wi", "pub class Patient { pub id: i64; }");
         f.write(
             "pq.wi",
-            "import data::Patient; pub fn check(less: closure(Patient, Patient) -> bool) -> bool { let p = new Patient(1); return less(p, p); }",
+            "import data::Patient; pub fn check(less: fn(Patient, Patient) -> bool) -> bool { let p = new Patient(1); return less(p, p); }",
         );
         let sim = |bias: i64| {
             format!(
-                "import pq; import data::Patient; fn target(p: Patient) -> bool {{ return p.id > 0; }} fn make(b: i64) -> closure(Patient, Patient) -> bool {{ return |a: Patient, c: Patient| target(a) && b >= {bias}; }} pub fn run(b: i64) -> bool {{ return pq::check(make(b)); }}"
+                "import pq; import data::Patient; fn target(p: Patient) -> bool {{ return p.id > 0; }} fn make(b: i64) -> fn(Patient, Patient) -> bool {{ return |a: Patient, c: Patient| target(a) && b >= {bias}; }} pub fn run(b: i64) -> bool {{ return pq::check(make(b)); }}"
             )
         };
         f.write("sim.wi", &sim(0));
@@ -2304,7 +2304,7 @@ mod tests {
         f.write("data.wi", "pub class Patient { pub id: i64; }");
         f.write(
             "pq.wi",
-            "pub class Heap<T> { less: closure(T, T) -> bool; pub init(self, less: closure(T, T) -> bool) { self.less = less; } pub fn check(self, x: T) -> bool { let less = self.less; return less(x, x); } }",
+            "pub class Heap<T> { less: fn(T, T) -> bool; pub init(self, less: fn(T, T) -> bool) { self.less = less; } pub fn check(self, x: T) -> bool { let less = self.less; return less(x, x); } }",
         );
         let sim = |bias: i64| {
             format!(
@@ -2381,7 +2381,7 @@ mod tests {
         f.write("main.wi", "import lib; fn main() { println(lib::run()); }");
         let lib = |template: &str, user: &str| {
             format!(
-                "interface Show<T> {{ fn get(self) -> T; fn show(self) -> T {{ return self.get(); }} }} class Num implements Show<i64> {{ pub fn get(self) -> i64 {{ return 1; }} }} class Counter {{ pub static base: i64 = 7; }} class Box<T> {{ pub static made: i64 = 3; pub v: T; pub fn get(self) -> T {{ {template} }} pub fn made(self) -> i64 {{ return Box::made; }} }} fn twice<T>(x: T, f: closure(T) -> T) -> T {{ return f(f(x)); }} pub fn run() -> i64 {{ let b = new Box<i64>(Counter::base); return twice(b.get(), |x: i64| x + {user}) + new Num().show() + b.made(); }}"
+                "interface Show<T> {{ fn get(self) -> T; fn show(self) -> T {{ return self.get(); }} }} class Num implements Show<i64> {{ pub fn get(self) -> i64 {{ return 1; }} }} class Counter {{ pub static base: i64 = 7; }} class Box<T> {{ pub static made: i64 = 3; pub v: T; pub fn get(self) -> T {{ {template} }} pub fn made(self) -> i64 {{ return Box::made; }} }} fn twice<T>(x: T, f: fn(T) -> T) -> T {{ return f(f(x)); }} pub fn run() -> i64 {{ let b = new Box<i64>(Counter::base); return twice(b.get(), |x: i64| x + {user}) + new Num().show() + b.made(); }}"
             )
         };
         f.write("lib.wi", &lib("return self.v;", "1"));

@@ -37,7 +37,7 @@ fn effects(snapshot: Snapshot, name: &str) -> serde_json::Value {
 
 #[test]
 fn closure_effects_comparator_and_route_are_known() {
-    let source = "fn before(f: closure(i64, i64) -> bool) -> bool { return f(1, 2); }\nclass Dijkstra { pub fn route(self) -> bool { let offset = 1; return before(|a: i64, b: i64| a + offset < b); } }\nfn main() { let d = new Dijkstra(); println(d.route()); }";
+    let source = "fn before(f: fn(i64, i64) -> bool) -> bool { return f(1, 2); }\nclass Dijkstra { pub fn route(self) -> bool { let offset = 1; return before(|a: i64, b: i64| a + offset < b); } }\nfn main() { let d = new Dijkstra(); println(d.route()); }";
     let snapshot = snapshot(source, "comparator");
     for name in ["before", "Dijkstra::route"] {
         let result = effects(snapshot.clone(), name);
@@ -99,7 +99,7 @@ fn closure_effects_body_inference_perspectives() {
         (
             "closure_parameter",
             "let k = 2; apply(|x: i64| x + k);",
-            "fn apply(f: closure(i64) -> i64) { f(1); }",
+            "fn apply(f: fn(i64) -> i64) { f(1); }",
             false,
         ),
         (
@@ -117,19 +117,19 @@ fn closure_effects_body_inference_perspectives() {
         (
             "generic",
             "apply(1, |x: i64| x + 1);",
-            "fn apply<T>(x: T, f: closure(T) -> T) -> T { return f(x); }",
+            "fn apply<T>(x: T, f: fn(T) -> T) -> T { return f(x); }",
             false,
         ),
         (
             "return_value",
             "let f = factory(); f(1);",
-            "fn factory() -> closure(i64) -> i64 { let k = 2; return |x: i64| x + k; }",
+            "fn factory() -> fn(i64) -> i64 { let k = 2; return |x: i64| x + k; }",
             false,
         ),
         (
             "field",
             "let k = 2; let h = new Holder(|x: i64| x + k); h.run();",
-            "class Holder { pub f: closure(i64) -> i64; pub init(self, f: closure(i64) -> i64) { self.f = f; } pub fn run(self) -> i64 { let callback = self.f; return callback(1); } }",
+            "class Holder { pub f: fn(i64) -> i64; pub init(self, f: fn(i64) -> i64) { self.f = f; } pub fn run(self) -> i64 { let callback = self.f; return callback(1); } }",
             false,
         ),
         (
@@ -166,12 +166,12 @@ fn closure_effects_body_inference_perspectives() {
         (
             "blocking_parameter",
             "let cell = BlockingCell::new(false); apply(|| cell.get());",
-            "fn apply(f: closure() -> bool) -> bool { return f(); }",
+            "fn apply(f: fn() -> bool) -> bool { return f(); }",
             true,
         ),
         (
             "reassignment",
-            "let cell = BlockingCell::new(false); let mut f: closure() -> bool = || false; f = || cell.get(); f();",
+            "let cell = BlockingCell::new(false); let mut f: fn() -> bool = || false; f = || cell.get(); f();",
             "",
             true,
         ),
@@ -196,7 +196,7 @@ fn closure_effects_body_inference_perspectives() {
 fn closure_effects_missing_candidates_remain_unknown() {
     let result = effects(
         snapshot(
-            "fn apply(f: closure() -> bool) -> bool { return f(); } fn main() {}",
+            "fn apply(f: fn() -> bool) -> bool { return f(); } fn main() {}",
             "missing",
         ),
         "apply",
@@ -216,7 +216,7 @@ fn closure_effects_imported_heap_and_dijkstra_route() {
         "import net::Dijkstra; fn main() { let d = new Dijkstra(); println(d.route()); }",
     )
     .unwrap();
-    std::fs::write(directory.join("heap.wi"), "module heap; pub class Heap<T> { pub compare: closure(T, T) -> bool; pub init(self, compare: closure(T, T) -> bool) { self.compare = compare; } pub fn before(self, a: T, b: T) -> bool { let f = self.compare; return f(a, b); } }").unwrap();
+    std::fs::write(directory.join("heap.wi"), "module heap; pub class Heap<T> { pub compare: fn(T, T) -> bool; pub init(self, compare: fn(T, T) -> bool) { self.compare = compare; } pub fn before(self, a: T, b: T) -> bool { let f = self.compare; return f(a, b); } }").unwrap();
     std::fs::write(directory.join("net.wi"), "module net; import heap::Heap; pub class Dijkstra { pub fn route(self) -> bool { let offset = 1; let h = new Heap<i64>(|a: i64, b: i64| a + offset < b); return h.before(1, 3); } }").unwrap();
     let snapshot =
         CompilerSession::new(main.to_str().unwrap(), "", &CompilerOptions::debug(), None)
@@ -309,7 +309,7 @@ fn closure_effects_chains_cycles_and_serialization() {
 
 #[test]
 fn closure_effects_distinct_arities_do_not_share_blocking_bounds() {
-    let source = "fn compare(f: closure(i64, i64) -> bool) -> bool { return f(1, 2); } fn main() { let c = BlockingCell::new(false); let read = || c.get(); let k = 1; compare(|a: i64, b: i64| a + k < b); read(); }";
+    let source = "fn compare(f: fn(i64, i64) -> bool) -> bool { return f(1, 2); } fn main() { let c = BlockingCell::new(false); let read = || c.get(); let k = 1; compare(|a: i64, b: i64| a + k < b); read(); }";
     let snapshot = snapshot(source, "separate");
     let compare = effects(snapshot.clone(), "compare");
     assert_eq!(compare["status"], "ok", "{compare}");
@@ -361,7 +361,7 @@ fn closure_effects_repeated_values_do_not_duplicate_edges() {
 
 #[test]
 fn closure_effects_known_method_and_indirect_call_compose() {
-    let source = "class Heap { pub fn count(self) -> i64 { return 2; } pub fn before(self, compare: closure(i64, i64) -> bool) -> bool { return compare(1, self.count()); } } fn main() { let heap = new Heap(); let k = 0; heap.before(|a: i64, b: i64| a + k < b); }";
+    let source = "class Heap { pub fn count(self) -> i64 { return 2; } pub fn before(self, compare: fn(i64, i64) -> bool) -> bool { return compare(1, self.count()); } } fn main() { let heap = new Heap(); let k = 0; heap.before(|a: i64, b: i64| a + k < b); }";
     let result = effects(snapshot(source, "method-and-indirect"), "Heap::before");
     assert_eq!(result["status"], "ok", "{result}");
     assert_eq!(
@@ -373,7 +373,7 @@ fn closure_effects_known_method_and_indirect_call_compose() {
 
 #[test]
 fn closure_effects_unresolved_virtual_call_is_not_hidden_by_known_lambda() {
-    let source = "interface Run { fn run(self) -> i64; } fn apply(f: closure() -> i64, r: Run) -> i64 { return f() + r.run(); } fn main() { let k = 1; let f = || k; f(); }";
+    let source = "interface Run { fn run(self) -> i64; } fn apply(f: fn() -> i64, r: Run) -> i64 { return f() + r.run(); } fn main() { let k = 1; let f = || k; f(); }";
     let result = effects(snapshot(source, "unresolved-virtual"), "apply");
     assert_eq!(result["status"], "unknown", "{result}");
     assert_eq!(result["bounds"]["runtime"], 127);
@@ -395,7 +395,7 @@ fn evidence_operation(result: &serde_json::Value, effect: u64) -> String {
 fn closure_effects_cite_indirect_site_not_caller_lambda_body() {
     // caller-supplied lambda bodies keep their bounds but
     // are cited at the reaching indirect call; the lambda owner cites the body.
-    let source = "fn apply<T>(x: T, f: closure(T) -> T) -> T { return f(x); }\nfn relay(f: closure(i64) -> i64) -> i64 { return apply(1, f); }\nfn main() { let c = BlockingCell::new(false); relay(|x: i64| { c.get(); return x; }); }";
+    let source = "fn apply<T>(x: T, f: fn(T) -> T) -> T { return f(x); }\nfn relay(f: fn(i64) -> i64) -> i64 { return apply(1, f); }\nfn main() { let c = BlockingCell::new(false); relay(|x: i64| { c.get(); return x; }); }";
     let snapshot = snapshot(source, "caller-lambda");
     for name in ["apply", "relay"] {
         let result = effects(snapshot.clone(), name);
@@ -423,7 +423,7 @@ fn closure_effects_cite_indirect_site_not_caller_lambda_body() {
             .unwrap();
         assert_eq!(blocking["status"], "conservative-bound", "{result}");
         assert_eq!(
-            blocking["witness"]["cause"]["location"]["start"], 52,
+            blocking["witness"]["cause"]["location"]["start"], 47,
             "{result}"
         );
     }
@@ -433,7 +433,7 @@ fn closure_effects_cite_indirect_site_not_caller_lambda_body() {
 
 #[test]
 fn closure_effects_direct_callee_keeps_evidence_beside_foreign_lambda() {
-    let source = "fn read(c: BlockingCell<bool>) -> bool { return c.get(); }\nfn apply(f: closure() -> bool, c: BlockingCell<bool>) -> bool { f(); return read(c); }\nfn own<T>(x: T, f: closure(T) -> T) -> T { let g = |y: T| f(y); return g(x); }\nfn main() { let cell = BlockingCell::new(false); apply(|| read(cell), cell); own(1, |x: i64| { cell.get(); return x; }); }";
+    let source = "fn read(c: BlockingCell<bool>) -> bool { return c.get(); }\nfn apply(f: fn() -> bool, c: BlockingCell<bool>) -> bool { f(); return read(c); }\nfn own<T>(x: T, f: fn(T) -> T) -> T { let g = |y: T| f(y); return g(x); }\nfn main() { let cell = BlockingCell::new(false); apply(|| read(cell), cell); own(1, |x: i64| { cell.get(); return x; }); }";
     let snapshot = snapshot(source, "direct-and-foreign");
     let apply = effects(snapshot.clone(), "apply");
     assert_eq!(evidence_operation(&apply, 2), "BlockingCell.get", "{apply}");
@@ -457,7 +457,7 @@ fn closure_effects_foreign_candidates_visit_each_edge_once() {
     // Each foreign candidate is queued once per incoming edge and expanded
     // once; the indirect call site is looked up once per reaching function.
     for n in [8, 32, 128] {
-        let mut source = "fn apply<T>(x: T, f: closure(T) -> T) -> T { return f(x); }\n".to_owned();
+        let mut source = "fn apply<T>(x: T, f: fn(T) -> T) -> T { return f(x); }\n".to_owned();
         for i in 0..n {
             source.push_str(&format!(
                 "fn caller_{i}() -> String {{ return apply(\"{i}\", |x: String| x + \"!\"); }}\n"

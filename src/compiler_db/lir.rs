@@ -494,7 +494,7 @@ mod tests {
             compare(
                 r#"
             fn twice(n: i64) -> i64 { return n * 2; }
-            fn apply(f: closure(i64) -> i64) -> i64 { return f(2); }
+            fn apply(f: fn(i64) -> i64) -> i64 { return f(2); }
             fn main() {
                 let extra = 38;
                 println(apply(|x: i64| { let nested = |y: i64| twice(y) + extra; return nested(x); }));

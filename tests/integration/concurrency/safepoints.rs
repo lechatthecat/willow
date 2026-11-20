@@ -4,7 +4,7 @@ use super::*;
 // The task-aware design closed as: (1) coop loops (ALL while/for in async
 // fns, await or not) carry backedge safepoints; (2) long sync helpers called
 // from task context are REJECTED (E0810) rather than safepoint-cloned;
-// (3) environment-free fn values can enter tasks; native sync-stack
+// (3) shareable function values can enter tasks; native sync-stack
 // safepoints keep their callees preemptible; (4) statement
 // call-bearing statement boundaries carry safepoints; (5) runtime calls
 // (string/array/map ops) are

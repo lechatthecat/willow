@@ -53,6 +53,8 @@ mod defer_panic_termination;
 mod enum_identity_aliases;
 #[path = "integration/frozen_map_gc.rs"]
 mod frozen_map_gc;
+#[path = "integration/function_value_unification.rs"]
+mod function_value_unification;
 #[path = "integration/gc_enum_payload_roots.rs"]
 mod gc_enum_payload_roots;
 #[path = "integration/gc_mutator_registration.rs"]

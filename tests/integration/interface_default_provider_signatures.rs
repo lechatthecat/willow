@@ -263,7 +263,7 @@ fn provider_signature_function_closure_array_and_reference_types() {
         pub class Payload { pub value: i64; }
         pub interface Get {
             fn function(self, f: fn(Payload) -> Payload, p: Payload) -> Payload { return f(p); }
-            fn closure(self, f: closure(Payload) -> Payload, p: Payload) -> Payload { return f(p); }
+            fn closure(self, f: fn(Payload) -> Payload, p: Payload) -> Payload { return f(p); }
             fn array(self, ps: Array<Payload>) -> Array<Payload> { return ps; }
             fn reference(self, p: &Payload) -> i64 { return p.value; }
         }"#,

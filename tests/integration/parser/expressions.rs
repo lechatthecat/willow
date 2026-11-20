@@ -229,19 +229,19 @@ fn test_closure_field_binding_example() {
 fn test_parenthesized_callable_field_perspectives() {
     let source = r#"
 class Holder {
-    pub f: closure(i64) -> i64;
+    pub f: fn(i64) -> i64;
     pub fn run(self, x: i64) -> i64 { return (self.f)(x); }
     pub fn method(self, x: i64) -> i64 { return x + 100; }
 }
 class Box<T> {
-    pub f: closure(T) -> T;
+    pub f: fn(T) -> T;
     pub fn run(self, x: T) -> T { return ((self.f))(x); }
 }
 class Outer { pub inner: Holder; }
-class Zero { pub f: closure() -> i64; }
-class Two { pub f: closure(i64, i64) -> i64; }
-class Flag { pub f: closure(bool) -> bool; }
-class Text { pub f: closure(String) -> String; }
+class Zero { pub f: fn() -> i64; }
+class Two { pub f: fn(i64, i64) -> i64; }
+class Flag { pub f: fn(bool) -> bool; }
+class Text { pub f: fn(String) -> String; }
 fn make() -> Holder { println(90); return new Holder(|x: i64| x + 1); }
 fn argument() -> i64 { println(91); return 2; }
 fn main() {
@@ -291,9 +291,9 @@ fn main() {
 #[test]
 fn test_parenthesized_callable_field_snapshot_and_fn() {
     let source = r#"
-class Holder { pub f: closure(i64) -> i64; }
+class Holder { pub f: fn(i64) -> i64; }
 class Function { pub f: fn(i64) -> i64; }
-class Sink { pub f: closure(i64) -> void; }
+class Sink { pub f: fn(i64) -> void; }
 fn increment(x: i64) -> i64 { return x + 1; }
 fn replace(h: Holder) -> i64 {
     h.f = |x: i64| x + 100;

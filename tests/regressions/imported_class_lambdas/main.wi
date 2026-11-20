@@ -8,6 +8,6 @@ fn main() {
     println(read(copy(ops::shifted(40))));
 
     let origin = new Point(7);
-    let saved: closure() -> Point = || origin;
+    let saved: fn() -> Point = || origin;
     println(read(saved()));
 }

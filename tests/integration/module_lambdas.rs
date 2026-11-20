@@ -20,9 +20,8 @@
 //! `compile_module_bodies` compiled free functions and class methods and no
 //! lambda bodies at all.
 //!
-//! This is capture-FREE lambdas only, which is all the checker admits today; a
-//! capture is still rejected in a module body exactly as in the entry file, and
-//! real closures wait on closure support.
+//! A capturing lambda in a module body is lifted the same way, with its
+//! captures in the function value's environment.
 //!
 //! The lifted symbols carry the module prefix (`calc.$lambda.0`).
 //! `collect_lambdas_in_program` restarts its numbering for every unit it walks,
@@ -72,11 +71,11 @@ fn imported_class_lambda_signature_matrix() {
         ),
         (
             "capturing_parameter",
-            "let n = 1; let f: closure(T) -> i64 = |q| q.x + n; println(f(new T(2)));",
+            "let n = 1; let f: fn(T) -> i64 = |q| q.x + n; println(f(new T(2)));",
         ),
         (
             "capturing_result",
-            "let q = new T(3); let f: closure() -> T = || q; println(f().x);",
+            "let q = new T(3); let f: fn() -> T = || q; println(f().x);",
         ),
         (
             "explicit_block_result",
@@ -624,10 +623,10 @@ fn main() {
     assert_project_output(files, "main.wi", "42\n2\n");
 }
 
-// 16. A capture in a module body is still refused, and by the CHECKER — the
-//     lifting pass must not turn a rejected form into a silent miscompile.
+// 16. A capturing lambda in a module body is a function value like in the
+//     entry file: lifted with its captures and called through the value.
 #[test]
-fn a_capturing_lambda_in_a_module_is_still_rejected() {
+fn a_capturing_lambda_in_a_module_runs() {
     let files = &[
         (
             "grab.wi",
@@ -652,11 +651,9 @@ fn main() {
 "#,
         ),
     ];
-    let stderr = compile_temp_project_error_stderr(files, "main.wi");
-    assert!(
-        stderr.contains("factor"),
-        "a capture in a module body must be reported, naming the variable: {stderr}"
-    );
+    let (out, ok) = compile_temp_project_and_run(files, "main.wi");
+    assert!(ok, "{out}");
+    assert_eq!(out, "12\n");
 }
 
 // 17. A lifted module lambda's allocation survives allocation stress.

@@ -1,5 +1,5 @@
 // status: future
-// feature: auto-capture lambdas and closure(...) function types
+// feature: auto-capture lambdas and fn(...) function types
 // Non-capturing fn lambdas with contextual parameter inference are covered by
 // ../lambda_context.wi.
 
@@ -7,7 +7,7 @@ fn apply(x: i64, f: fn(i64) -> i64) -> i64 {
     return f(x);
 }
 
-fn apply_closure(x: i64, f: closure(i64) -> i64) -> i64 {
+fn apply_closure(x: i64, f: fn(i64) -> i64) -> i64 {
     return f(x);
 }
 

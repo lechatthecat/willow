@@ -144,7 +144,7 @@ fn purity_driver_string_and_enum_allocations() {
 fn purity_driver_closure_allocation() {
     for (body, accepted) in [
         ("let g = || x;", false),
-        ("let g: closure() -> i64 = || 1;", false),
+        ("let g: fn() -> i64 = || 1;", false),
         ("let g = || 1;", true),
         ("let g: fn() -> i64 = || { println(1); return 1; };", true),
     ] {

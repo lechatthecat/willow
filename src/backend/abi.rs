@@ -403,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_mapper_abi_is_a_native_function_pointer() {
+    fn parallel_mapper_abi_is_a_function_value_pointer() {
         let symbol = runtime_symbol(rt::willow_parallel_map_i64).expect("parallel ABI");
         assert_eq!(symbol.params, &[AbiTy::Ptr, AbiTy::Ptr]);
         assert_eq!(symbol.ret, Some(AbiTy::Ptr));
@@ -525,6 +525,7 @@ mod alloc_effects_tests {
         rt::willow_string_debug,
         rt::willow_string_alloc,
         rt::willow_string_literal_slot,
+        rt::willow_function_value_slot,
         rt::willow_array_join,
         rt::willow_string_repeat,
         rt::willow_string_from_scalar,

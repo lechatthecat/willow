@@ -284,6 +284,7 @@ impl TypeChecker {
             return true;
         }
         let found = self.diagnostic_type_name(got);
+        let expected_type = expected;
         let expected = if matches!(rule, Message | Task | Capacity) {
             String::new()
         } else {
@@ -348,9 +349,9 @@ impl TypeChecker {
                 format!("expected `{expected}`, found `{found}`"),
             ),
         };
-        self.push(
-            Diagnostic::new(Severity::Error, code, message).with_label(Label::primary(span, label)),
-        );
+        let diagnostic =
+            Diagnostic::new(Severity::Error, code, message).with_label(Label::primary(span, label));
+        self.push(self.with_callable_kind_help(diagnostic, expected_type, got));
         false
     }
 }

@@ -1033,7 +1033,7 @@ mod tests {
             ),
             (
                 "captured alias",
-                "let a = [1]; let f: closure() -> i64 = || a[0]; await take(a);",
+                "let a = [1]; let f: fn() -> i64 = || a[0]; await take(a);",
                 true,
             ),
             (
@@ -1064,7 +1064,7 @@ mod tests {
             "let c = BlockingCell::new(a);",
             "opaque(a);",
             "let h = new Holder(a); opaque(h.a);",
-            "let f: closure() -> i64 = || a[0];",
+            "let f: fn() -> i64 = || a[0];",
             "return a;",
         ] {
             let extra = format!(
@@ -1181,7 +1181,7 @@ mod tests {
             "let m = Mutex::new(b.a);",
             "opaque(b);",
             "let c: Channel<Buffer> = Channel::new(); c.send(b);",
-            "let f: closure() -> i64 = || b.a[0];",
+            "let f: fn() -> i64 = || b.a[0];",
         ] {
             let errors = check(
                 "",
@@ -1471,13 +1471,13 @@ mod tests {
             ),
             (
                 "lock closure",
-                "let m = Mutex::new(new Box(0)); lock m as b { let f: closure() -> i64 = || b.n; }",
+                "let m = Mutex::new(new Box(0)); lock m as b { let f: fn() -> i64 = || b.n; }",
                 "",
                 true,
             ),
             (
                 "captured source",
-                "let b = new Box(0); let f: closure() -> i64 = || b.n; let m = Mutex::new(b);",
+                "let b = new Box(0); let f: fn() -> i64 = || b.n; let m = Mutex::new(b);",
                 "",
                 true,
             ),

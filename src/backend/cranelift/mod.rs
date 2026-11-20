@@ -172,6 +172,9 @@ struct EmissionState {
     module: ObjectModule,
     string_literals: HashMap<String, StringLiteralData>,
     string_counter: usize,
+    /// One static slot per capture-free function value this object refers
+    /// to: the shared, permanently rooted object for that code word.
+    function_value_slots: HashMap<FuncId, DataId>,
     runtime_declared: bool,
     interface_slot_summaries: std::cell::RefCell<emit_interface::InterfaceAnalysis>,
     unit_static_inits: HashMap<InitUnitId, UnitStaticInit>,
@@ -432,6 +435,7 @@ impl Codegen {
                 module,
                 string_literals: HashMap::new(),
                 string_counter: 0,
+                function_value_slots: HashMap::new(),
                 runtime_declared: false,
                 interface_slot_summaries: Default::default(),
                 unit_static_inits: HashMap::new(),
@@ -1433,6 +1437,7 @@ struct FuncGen<'a, 'b> {
     leaf_lambdas: &'a HashSet<ExprId>,
     indirect_leaves: &'a indirect_leaf::Candidates,
     string_literals: &'a HashMap<String, StringLiteralData>,
+    function_value_slots: &'a mut HashMap<FuncId, DataId>,
     /// This unit's alias-resolving view of the frozen class layouts, base
     /// edges, runtime type ids, virtual slot orders and interface
     /// compositions. The runtime id is not stored
@@ -1539,6 +1544,10 @@ struct LirReuseState {
     /// Frame slot the array fault paths share for their operands; see
     /// `emit_array_access`.
     array_fault_spill: Option<cranelift_codegen::ir::StackSlot>,
+    /// Frame slot every indirect call site shares for its panic-depth
+    /// snapshot; the value lives only from one call's snapshot to its
+    /// check, so one slot per function suffices. See `emit_lir_indirect_call`.
+    indirect_depth_spill: Option<cranelift_codegen::ir::StackSlot>,
     indirect_leaf_promoted: bool,
 }
 
@@ -1762,6 +1771,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             leaf_lambdas: &unit.leaf_lambdas,
             indirect_leaves: &unit.indirect_leaves,
             string_literals: &unit.output.string_literals,
+            function_value_slots: &mut unit.output.function_value_slots,
             classes: ClassView::new(&unit.type_scope, &unit.layout_queries),
             static_storage: &unit.static_storage,
             enum_infos: &unit.enum_infos,

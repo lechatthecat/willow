@@ -30,21 +30,21 @@ import std::collections::Array;
 
 // ── The shape of the type ───────────────────────────────────────────────────
 
-// A `closure(...) -> ...` parameter. The call is indirect and passes the
+// A `fn(...) -> ...` parameter. The call is indirect and passes the
 // environment: the callee address comes out of the object's first word.
-fn apply(f: closure(i64) -> i64, v: i64) -> i64 {
+fn apply(f: fn(i64) -> i64, v: i64) -> i64 {
     return f(v);
 }
 
 // A closure outlives the frame it captured from — the environment is a heap
 // object, so `n` is still readable after `adder` returns.
-fn adder(n: i64) -> closure(i64) -> i64 {
+fn adder(n: i64) -> fn(i64) -> i64 {
     return |x: i64| x + n;
 }
 
 // A capture-free lambda is still accepted where a closure is expected: it
 // simply carries an environment with no slots in it.
-fn twice(f: closure(i64) -> i64, v: i64) -> i64 {
+fn twice(f: fn(i64) -> i64, v: i64) -> i64 {
     return f(f(v));
 }
 
@@ -55,7 +55,7 @@ fn apply_fn(f: fn(i64) -> i64, v: i64) -> i64 {
 
 // ── What a capture can be ───────────────────────────────────────────────────
 
-fn describe(label: String, factor: i64) -> closure(i64) -> String {
+fn describe(label: String, factor: i64) -> fn(i64) -> String {
     // Two captures of different types, and the environment lays its slots out
     // in first-mention order.
     return |x: i64| label + "=" + (x * factor).toString();
@@ -109,7 +109,7 @@ fn share() -> i64 {
 
 // ── Closures that close over closures ───────────────────────────────────────
 
-fn compose(f: closure(i64) -> i64, g: closure(i64) -> i64) -> closure(i64) -> i64 {
+fn compose(f: fn(i64) -> i64, g: fn(i64) -> i64) -> fn(i64) -> i64 {
     // `f` and `g` are themselves closure values, so this environment holds two
     // GC references and the body's calls are indirect through both.
     return |x: i64| f(g(x));

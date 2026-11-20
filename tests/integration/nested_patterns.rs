@@ -347,7 +347,7 @@ fn pick(o: Option<(i64, Option<i64>)>) -> i64 {
 
 fn main() {
     let items: Array<Option<Result<i64, String>>> = [Some(Ok(1)), Some(Ok(2)), None, Some(Ok(4))];
-    let fs: Array<closure() -> i64> = [];
+    let fs: Array<fn() -> i64> = [];
     for o in items {
         if let Some(Ok(v)) = o && v % 2 == 0 {
             fs.push(|| v * 100);

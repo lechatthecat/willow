@@ -212,6 +212,13 @@ fn source_span_index(program: &Program) -> HashMap<(u32, usize, usize), Span> {
 }
 
 impl TypeChecker {
+    /// Whether evaluating the lambda builds a fresh function-value object.
+    pub(super) fn lambda_allocates_environment(&self, lambda: ExprId) -> bool {
+        self.lambda_captures
+            .get(&lambda)
+            .is_some_and(|captures| !captures.is_empty())
+    }
+
     /// Match the inline representations boxed by emit_to_storage_word. The
     /// destination type matters: a concrete object may be coerced to an interface.
     fn contract_storage_type_allocates(&self, ty: &Type) -> bool {
@@ -534,7 +541,9 @@ impl TypeChecker {
                                 },
                             ));
                         }
-                        matches!(self.expr_types.get(&expr.id()), Some(Type::Closure(..)))
+                        // Only a captured environment allocates per evaluation;
+                        // a captureless value is one shared, permanent object.
+                        self.lambda_allocates_environment(lambda.id)
                     }
                     _ => false,
                 };
@@ -1669,7 +1678,7 @@ mod tests {
             ),
             (
                 "closure creation",
-                "@effects(no_alloc) fn f(x:i64) { let g:closure()->i64 = || x; }",
+                "@effects(no_alloc) fn f(x:i64) { let g:fn()->i64 = || x; }",
                 Some(ErrorCode::E2610),
             ),
             (
@@ -2235,11 +2244,6 @@ mod tests {
             (
                 "unknown function parameter",
                 "@effects(no_wait) fn guard(f: fn()) { f(); }",
-                Some(ErrorCode::E2612),
-            ),
-            (
-                "unknown closure parameter",
-                "@effects(no_wait) fn guard(f: closure()) { f(); }",
                 Some(ErrorCode::E2612),
             ),
             (

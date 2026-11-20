@@ -427,7 +427,7 @@ impl LirRvalue {
                         resolved.intrinsic == *intrinsic && resolved.return_type(|i| arg_types.get(i).cloned()) == *result)
             }
             Self::StringLiteral(_) => destination.ty == Type::String,
-            Self::FunctionRef { ty, .. } => destination.ty == *ty && matches!(ty, Type::Fn(..)),
+            Self::FunctionRef { ty, .. } => destination.ty == *ty && matches!(ty, Type::Fn(..) | Type::Closure(..)),
             Self::Closure { captures, ty: result, .. } => destination.ty == *result
                 && matches!(result, Type::Fn(..) | Type::Closure(..)) && captures.iter().all(|capture| ty(capture).is_some()),
             Self::Print { value, ty: expected, .. } => destination.ty == Type::Void

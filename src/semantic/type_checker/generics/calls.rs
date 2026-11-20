@@ -859,12 +859,7 @@ impl TypeChecker {
                     Diagnostic::new(Severity::Error, ErrorCode::E0201, message).with_label(
                         Label::primary(call_args[i].expr.span(), "argument type mismatch"),
                     );
-                self.push(self.with_fn_closure_help(
-                    diagnostic,
-                    &params[i],
-                    &actual[i],
-                    &call_args[i].expr,
-                ));
+                self.push(self.with_callable_kind_help(diagnostic, &params[i], &actual[i]));
             } else {
                 self.generic_error(span, message);
             }

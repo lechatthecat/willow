@@ -1253,10 +1253,12 @@ fn may_allocate_preserves_twenty_wrapper_perspectives() {
         HirExprKind::Float(1.0),
         HirExprKind::Bool(true),
         HirExprKind::Var("x".into()),
-        HirExprKind::FnRef("f".into()),
     ] {
         assert!(!may_allocate(&node(kind)));
     }
+    // A named function's value is a shared managed object that may be
+    // materialized on first use.
+    assert!(may_allocate(&node(HirExprKind::FnRef("f".into()))));
     // Even an allocation-free child does not make an unlisted wrapper safe.
     assert!(may_allocate(&node(HirExprKind::TryPropagate {
         inner: scalar()
@@ -1280,7 +1282,8 @@ fn may_allocate_preserves_twenty_wrapper_perspectives() {
         } else {
             Type::Fn(vec![], Box::new(Type::I64))
         };
-        assert_eq!(may_allocate(&lambda), closure);
+        // Either kind is a managed function object.
+        assert!(may_allocate(&lambda));
     }
 }
 
@@ -7531,7 +7534,7 @@ fn unrooted_count(src: &str) -> (usize, usize) {
         .filter(|local| local.synthetic && !local.parameter)
         .filter(|local| super::super::transient_roots::is_array(&local.ty))
         .count();
-    let unrooted = super::super::transient_roots::unrooted_array_temps(&f);
+    let unrooted = super::super::transient_roots::unrooted_transient_temps(&f);
     for id in &unrooted {
         let local = &f.locals[id.0 as usize];
         assert!(local.synthetic && !local.parameter, "{local:?}");

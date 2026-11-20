@@ -34,7 +34,8 @@ fn assert_build(project: &TestProject, release: bool, expected: &str) {
 
 #[test]
 fn imported_generic_callable_caller_nominals() {
-    for callable in ["fn", "closure"] {
+    {
+        let callable = "fn";
         for nominal in ["B", "N"] {
             for shape in ["entry", "module", "alias", "qualified", "shadow", "release"] {
                 let util = format!(
@@ -76,7 +77,7 @@ fn imported_generic_callable_captures_and_controls() {
         &[
             (
                 "util.wi",
-                "pub fn call<T>(x: T, f: closure(T) -> bool) -> bool { return f(x); }",
+                "pub fn call<T>(x: T, f: fn(T) -> bool) -> bool { return f(x); }",
             ),
             (
                 "main.wi",

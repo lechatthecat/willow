@@ -1,13 +1,13 @@
 // Parentheses read a callable field before invoking it.
 // Direct receiver.f(args) retains method dispatch.
 class Plain {
-    pub f: closure(i64) -> i64;
+    pub f: fn(i64) -> i64;
     pub fn run(self, x: i64) -> i64 {
         return (self.f)(x);
     }
 }
 class Box<T> {
-    pub f: closure(T) -> T;
+    pub f: fn(T) -> T;
     pub fn run(self, x: T) -> T {
         return ((self.f))(x);
     }

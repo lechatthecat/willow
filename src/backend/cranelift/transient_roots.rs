@@ -1,7 +1,8 @@
-//! Array temporaries that need no shadow-stack root.
+//! Array and function-value temporaries that need no shadow-stack root.
 //!
 //! Lowering copies a method receiver into a synthetic temporary, so
-//! `while i < values.len()` evaluates `t = values; t.len()` on every trip.
+//! `while i < values.len()` evaluates `t = values; t.len()` on every trip,
+//! and copies a called function value, so `f(x)` evaluates `t = f; t(x)`.
 //! A GC-managed temporary normally gets a rooted stack slot that is stored,
 //! reloaded and nulled again, and those stores also keep Cranelift from
 //! forwarding the owner and length loads to the loop body.
@@ -9,15 +10,20 @@
 //! A root is only needed while a collection can move the referent, that is,
 //! across a GC point. A temporary qualifies for a plain SSA value when:
 //!
-//! * it is synthetic, typed `Array<T>`/`FrozenArray<T>`, and written by exactly
-//!   one `Compute`;
+//! * it is synthetic, typed `Array<T>`/`FrozenArray<T>` or a function type,
+//!   and written by exactly one `Compute`;
 //! * every read is a later instruction of the same block that only inspects
-//!   the array (`len`, a scalar-element index, or a scalar-element store);
-//! * every instruction from the write up to its last read is GC-free on all
-//!   paths that continue: scalar arithmetic, copies, scalar array reads,
-//!   scalar array stores and lengths, and root clears. Faults in them
+//!   the array (`len`, a scalar-element index, or a scalar-element store) or
+//!   calls the function value (as the callee only, not also as an argument);
+//! * every instruction after the write and before its last read is GC-free
+//!   on all paths that continue: scalar arithmetic, copies, scalar array
+//!   reads, scalar array stores and lengths, and root clears. Faults in them
 //!   (bounds, null, overflow, zero divisor) raise and never rejoin, so a
 //!   recovered panic resumes in another block, where the temporary is dead.
+//!   An array inspection is itself GC-free. An indirect call reads its callee
+//!   before transferring control, and the called body roots the function
+//!   value it receives as its trailing environment argument (a named
+//!   function never reads it), so the call needs no caller-side root.
 //!
 //! The block-entry safepoint precedes every instruction of the block. Only
 //! synchronous bodies use this: a cooperative body may suspend at a task
@@ -87,12 +93,16 @@ enum State {
     Rejected,
 }
 
-pub(super) fn unrooted_array_temps(f: &LirFunction) -> HashSet<LirLocalId> {
+pub(super) fn unrooted_transient_temps(f: &LirFunction) -> HashSet<LirLocalId> {
     let mut states: Vec<State> = f
         .locals
         .iter()
         .map(|local| {
-            if local.synthetic && !local.parameter && !local.is_gc_owner() && is_array(&local.ty) {
+            if local.synthetic
+                && !local.parameter
+                && !local.is_gc_owner()
+                && (is_array(&local.ty) || is_function(&local.ty))
+            {
                 State::Unseen
             } else {
                 State::Rejected
@@ -114,7 +124,7 @@ pub(super) fn unrooted_array_temps(f: &LirFunction) -> HashSet<LirLocalId> {
             count += u32::from(!gc_free(f, inst));
             prefix.push(count);
             if let LirInst::Compute { local, value, .. } = inst {
-                let inspected = inspected_array(value);
+                let inspected = inspected_array(value).or_else(|| called_value(value));
                 for operand in value.operands() {
                     for id in operand.locals() {
                         let direct = matches!(operand, LirOperand::Local(_));
@@ -159,7 +169,7 @@ pub(super) fn unrooted_array_temps(f: &LirFunction) -> HashSet<LirLocalId> {
                 block,
                 at,
                 last_read,
-            } if gc_points[block][last_read + 1] == gc_points[block][at + 1] => {
+            } if gc_points[block][last_read.max(at + 1)] == gc_points[block][at + 1] => {
                 Some(f.locals[index].id)
             }
             _ => None,
@@ -212,6 +222,22 @@ pub(super) fn sole_predecessors(f: &LirFunction) -> Vec<Option<usize>> {
 
 pub(super) fn is_array(ty: &Type) -> bool {
     matches!(ty, Type::Array(_)) || builtin_types::unary_arg(ty, B::FrozenArray).is_some()
+}
+
+pub(super) fn is_function(ty: &Type) -> bool {
+    matches!(ty, Type::Fn(..) | Type::Closure(..))
+}
+
+/// The function value an indirect call reads only as its callee.
+fn called_value(value: &LirRvalue) -> Option<LirLocalId> {
+    match value {
+        LirRvalue::IndirectCall {
+            callee: LirOperand::Local(callee),
+            args,
+            ..
+        } if !args.iter().any(|arg| arg.locals().contains(callee)) => Some(*callee),
+        _ => None,
+    }
 }
 
 fn scalar(ty: &Type) -> bool {

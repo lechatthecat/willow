@@ -175,7 +175,8 @@ fn main() {
 // the callable signature and body constructor must agree.
 #[test]
 fn test_lambda_result_expression_context_matrix() {
-    for callable in ["fn", "closure"] {
+    {
+        let callable = "fn";
         for params in ["a: i64", "a"] {
             for constructor in [
                 "Ok(a + 1)",
@@ -218,24 +219,24 @@ fn main() {{
 fn test_lambda_result_expression_context_variations() {
     let cases = [
         (
-            "let offset = 1; let g: closure(i64) -> Result<i64, String> = |a| Ok(a + offset);",
+            "let offset = 1; let g: fn(i64) -> Result<i64, String> = |a| Ok(a + offset);",
             "2\n",
         ),
         ("let g = |a: i64| -> Result<i64, String> Ok(a + 1);", "2\n"),
         (
-            "let g: closure(i64) -> Result<i64, String> = |a| a > 0 ? Ok(a + 1) : Err(\"failed\");",
+            "let g: fn(i64) -> Result<i64, String> = |a| a > 0 ? Ok(a + 1) : Err(\"failed\");",
             "2\n",
         ),
         (
-            "let g: closure(i64) -> Result<i64, String> = |a| match a { 1 => Ok(2), _ => Err(\"failed\") };",
+            "let g: fn(i64) -> Result<i64, String> = |a| match a { 1 => Ok(2), _ => Err(\"failed\") };",
             "2\n",
         ),
         (
-            "let mut g: closure(i64) -> Result<i64, String> = |a| Ok(a); g = |a| Err(\"failed\");",
+            "let mut g: fn(i64) -> Result<i64, String> = |a| Ok(a); g = |a| Err(\"failed\");",
             "failed\n",
         ),
         (
-            "let g: closure(i64) -> Result<i64, String> = |a| { return Ok(a + 1); };",
+            "let g: fn(i64) -> Result<i64, String> = |a| { return Ok(a + 1); };",
             "2\n",
         ),
     ];
@@ -264,9 +265,8 @@ fn test_lambda_result_expression_rejects_wrong_payload() {
         "Result::Ok(\"wrong\")",
         "Result::Err(1)",
     ] {
-        let source = format!(
-            "fn main() {{ let g: closure(i64) -> Result<i64, String> = |a| {constructor}; }}"
-        );
+        let source =
+            format!("fn main() {{ let g: fn(i64) -> Result<i64, String> = |a| {constructor}; }}");
         let project = TestProject::new("lambda_result_bad_payload", &[("main.wi", &source)]);
         for result in [project.check("main.wi"), project.compile("main.wi")] {
             let stderr = String::from_utf8_lossy(&result.stderr);

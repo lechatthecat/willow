@@ -25,7 +25,7 @@ fn shadow(n: i64) -> i64 {
     if n > 0 { let x = n + 1; return x; }
     return x;
 }
-fn fold<T>(xs: Array<T>, init: T, f: closure(T, T) -> T) -> T {
+fn fold<T>(xs: Array<T>, init: T, f: fn(T, T) -> T) -> T {
     let mut acc = init;
     for x in xs { acc = f(acc, x); }
     return acc;

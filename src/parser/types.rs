@@ -20,7 +20,13 @@ impl Parser {
                 Type::Fn(params, Box::new(ret))
             }
         }
-        fn generic(name: String, args: Vec<Type>) -> Type {
+        fn generic(name: String, mut args: Vec<Type>) -> Type {
+            if crate::parser::ast::SEND_ONLY_BUILTINS.contains(&name.as_str()) {
+                args = args
+                    .iter()
+                    .map(|arg| arg.with_callable_kind(true))
+                    .collect();
+            }
             if name == "JoinHandle" && args.len() == 1 {
                 Type::Generic("Task".into(), args)
             } else {
@@ -69,23 +75,11 @@ impl Parser {
                     frames.push(Frame::Tuple(Vec::new()));
                     continue;
                 }
+                // `fn(...) -> R` is the one function-value type. Written
+                // annotations start as the task-local kind; the positions
+                // that require Send (async signatures, Send-only builtin
+                // arguments) re-kind it to the shareable one.
                 TokenKind::Fn => {
-                    self.advance();
-                    self.expect(TokenKind::LParen)?;
-                    if !self.check(TokenKind::RParen) && !self.at_eof() {
-                        frames.push(Frame::Params(false, Vec::new()));
-                        continue;
-                    }
-                    self.expect(TokenKind::RParen)?;
-                    if self.eat(TokenKind::Arrow) {
-                        frames.push(Frame::Return(false, Vec::new()));
-                        continue;
-                    }
-                    callable(false, Vec::new(), Type::Void)
-                }
-                TokenKind::Ident(name)
-                    if name == "closure" && self.peek_kind_at(1) == &TokenKind::LParen =>
-                {
                     self.advance();
                     self.expect(TokenKind::LParen)?;
                     if !self.check(TokenKind::RParen) && !self.at_eof() {
@@ -98,6 +92,18 @@ impl Parser {
                         continue;
                     }
                     callable(true, Vec::new(), Type::Void)
+                }
+                TokenKind::Ident(name)
+                    if name == "closure" && self.peek_kind_at(1) == &TokenKind::LParen =>
+                {
+                    return Err(self
+                        .err(
+                            ErrorCode::E0107,
+                            "`closure(...)` is no longer a type; write `fn(...)`",
+                        )
+                        .with_help(
+                            "`fn(T) -> R` accepts both named functions and capturing lambdas",
+                        ));
                 }
                 TokenKind::Ident(name) => {
                     self.advance();
@@ -127,7 +133,7 @@ impl Parser {
                 }
                 _ => return Err(self.err(
                     ErrorCode::E0107,
-                    "expected type (`i64`, `f64`, `bool`, `void` / `()`, `fn(...)`, `closure(...)`, or type name)",
+                    "expected type (`i64`, `f64`, `bool`, `void` / `()`, `fn(...)`, or type name)",
                 )),
             };
             loop {
@@ -261,7 +267,7 @@ mod tests {
             "fn consume(ts: Array<Task<()>>) {} fn main() {}",
             "fn consume(ts: Array<Array<Task<()>>>) {} fn main() {}",
             "fn work() {} fn main() { let f: fn() -> () = work; f(); }",
-            "fn consume(f: closure() -> ()) {} fn main() {}",
+            "fn consume(f: fn() -> ()) {} fn main() {}",
             "fn consume(f: fn(Task<()>) -> ()) {} fn main() {}",
             "fn consume(t: Task< ( /* empty */ ) >) {} fn main() {}",
             "fn consume(t: Task<(),>) {} fn main() {}",
@@ -391,7 +397,7 @@ mod tests {
             ("Task<()>", "Task<void>"),
             ("Array<Task<()>>", "Array<Task<void>>"),
             ("fn() -> ()", "fn() -> void"),
-            ("closure(Task<()>) -> ()", "closure(Task<void>) -> void"),
+            ("fn(Task<()>) -> ()", "fn(Task<void>) -> void"),
             ("()?", "void?"),
         ] {
             let parse = |text| {

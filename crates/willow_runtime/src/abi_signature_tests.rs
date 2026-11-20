@@ -62,13 +62,12 @@ fn scheduler_callbacks_and_frame_handles_are_native_pointers() {
 }
 
 #[test]
-fn parallel_mapper_is_a_nullable_native_function_pointer() {
-    fn mapper_alias(callback: parallel::I64Mapper) -> unsafe extern "C" fn(i64) -> i64 {
+fn parallel_mapper_is_a_managed_function_value() {
+    fn mapper_alias(callback: parallel::I64Mapper) -> unsafe extern "C" fn(i64, *mut u8) -> i64 {
         callback
     }
-    let _: fn(unsafe extern "C" fn(i64) -> i64) -> parallel::I64Mapper = mapper_alias;
-    let _: extern "C" fn(*mut u8, Option<parallel::I64Mapper>) -> *mut c_void =
-        parallel::willow_parallel_map_i64;
+    let _: fn(unsafe extern "C" fn(i64, *mut u8) -> i64) -> parallel::I64Mapper = mapper_alias;
+    let _: extern "C" fn(*mut u8, *mut u8) -> *mut c_void = parallel::willow_parallel_map_i64;
 }
 
 #[test]
@@ -96,6 +95,9 @@ fn collection_handles_are_pointers_and_payload_words_remain_i64() {
     let _: extern "C" fn(*const std::sync::atomic::AtomicPtr<u8>, *const u8, i64) -> *mut u8 =
         string::willow_string_literal_slot;
     assert_schema("willow_string_literal_slot", &[Ptr, Ptr, I64], Some(Ptr));
+    let _: extern "C" fn(*const std::sync::atomic::AtomicPtr<u8>, *const u8) -> *mut u8 =
+        crate::function_value::willow_function_value_slot;
+    assert_schema("willow_function_value_slot", &[Ptr, Ptr], Some(Ptr));
     let _: extern "C" fn(*const u8, i64) -> *mut u8 = string::willow_string_alloc;
     let _: extern "C" fn(*const u8, *const u8) -> *mut u8 = string::willow_string_concat;
     let _: extern "C" fn(*mut u64, i64) -> *mut u8 = string::willow_string_concat_n;

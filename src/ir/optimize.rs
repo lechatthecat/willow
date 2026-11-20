@@ -5,8 +5,10 @@
 //! overflowing `+ - * **` or negation is such a fault in debug builds and
 //! wraps in release builds; folding is build-mode
 //! independent, so it leaves both for the backend.
+mod devirtualize;
 mod recursive_inline;
 mod string_concat;
+pub(crate) use devirtualize::devirtualize_function_values;
 pub(crate) use recursive_inline::inline_scalar_recursion;
 pub(crate) use string_concat::fuse_string_concats;
 

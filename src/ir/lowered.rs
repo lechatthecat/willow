@@ -718,6 +718,19 @@ pub(crate) fn lower_source_program_with(
         }
     }
     value::lower_calls(&mut functions, &mut lambdas, &program.resolution);
+    // Calls through a value that can only be one named function become
+    // direct calls before leaf inlining selects its call sites.
+    let direct: std::collections::HashSet<_> = functions
+        .iter()
+        .filter(|function| !function.is_async)
+        .map(|function| function.name)
+        .collect();
+    for function in functions
+        .iter_mut()
+        .chain(lambdas.iter_mut().map(|lambda| &mut lambda.function))
+    {
+        super::optimize::devirtualize_function_values(function, &direct);
+    }
     super::optimize::inline_scalar_leaves(&mut functions, overflow_checks);
     // The lifted graph is the sole owner of each executable lambda body.
     // Enclosing expressions retain only closure construction metadata.

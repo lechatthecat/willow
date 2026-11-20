@@ -70,7 +70,7 @@ fn raw_lambda_delta(body: &str, symbol: &str) -> [usize; 2] {
             let makers: String = (0..count)
                 .map(|i| {
                     format!(
-                        "fn make{i}(p: P) -> closure(i64) -> i64 {{ return |x: i64| {body}; }}\n"
+                        "fn make{i}(p: P) -> fn(i64) -> i64 {{ return |x: i64| {body}; }}\n"
                     )
                 })
                 .collect();
@@ -124,7 +124,7 @@ fn arithmetic_leaf_lambda_is_a_leaf_in_release_only() {
 
 #[test]
 fn debug_overflow_in_expression_lambda_still_panics() {
-    let source = "fn make(n: i64) -> closure(i64) -> i64 { return |x| x + n; }\n\
+    let source = "fn make(n: i64) -> fn(i64) -> i64 { return |x| x + n; }\n\
          fn main() { let f = make(1); println(f(41)); println(f(9223372036854775807)); println(\"after\"); }";
     let (out, ok) = compile_and_run(source);
     assert!(!ok, "{out}");
@@ -137,7 +137,7 @@ fn debug_overflow_in_expression_lambda_still_panics() {
 
 #[test]
 fn closure_call_site_pushes_no_root() {
-    let closure = call_site_delta("closure(i64) -> i64", "|x| x + n", ROOT);
+    let closure = call_site_delta("fn(i64) -> i64", "|x| x + n", ROOT);
     assert_eq!(closure, [0, 0]);
     let function = call_site_delta("fn(i64) -> i64", "double", ROOT);
     assert_eq!(function, [0, 0]);
@@ -148,7 +148,7 @@ fn function_value_call_keeps_panic_bracket() {
     // Every unknown function target retains a checked fallback. Capturing
     // closures independently use their existing code-word no-panic tag.
     let function = call_site_delta("fn(i64) -> i64", "double", PANIC_DEPTH);
-    let closure = call_site_delta("closure(i64) -> i64", "|x| x + n", PANIC_DEPTH);
+    let closure = call_site_delta("fn(i64) -> i64", "|x| x + n", PANIC_DEPTH);
     assert!(function.iter().all(|&d| d >= 4), "{function:?}");
     assert!(closure.iter().all(|&d| d >= 8), "{closure:?}");
 }
@@ -171,7 +171,7 @@ fn calling_lambda_keeps_root_and_poll() {
         let makers: String = (0..count)
             .map(|i| {
                 format!(
-                    "fn make{i}(n: i64) -> closure(i64) -> i64 {{ return |x: i64| helper(x, n); }}\n"
+                    "fn make{i}(n: i64) -> fn(i64) -> i64 {{ return |x: i64| helper(x, n); }}\n"
                 )
             })
             .collect();
@@ -190,7 +190,7 @@ fn calling_lambda_keeps_root_and_poll() {
 
 #[test]
 fn panicking_block_lambda_unwinds_through_call() {
-    let source = "fn make(n: i64) -> closure(i64) -> i64 { return |x: i64| { if x > n { panic(\"too big\"); } return x; }; }\n\
+    let source = "fn make(n: i64) -> fn(i64) -> i64 { return |x: i64| { if x > n { panic(\"too big\"); } return x; }; }\n\
          fn main() { let f = make(5); println(f(3)); println(f(9)); println(\"after\"); }";
     for (out, ok) in both(source) {
         assert!(!ok, "{out}");
@@ -201,7 +201,7 @@ fn panicking_block_lambda_unwinds_through_call() {
 
 #[test]
 fn parameter_divisor_lambda_panics_on_zero() {
-    let source = "fn make(n: i64) -> closure(i64) -> i64 { return |x| n / x; }\n\
+    let source = "fn make(n: i64) -> fn(i64) -> i64 { return |x| n / x; }\n\
          fn main() { let f = make(12); println(f(4)); println(f(0)); println(\"after\"); }";
     for (out, ok) in both(source) {
         assert!(!ok, "{out}");
@@ -213,7 +213,7 @@ fn parameter_divisor_lambda_panics_on_zero() {
 #[test]
 fn no_panic_allocating_lambda_survives_gc_stress() {
     let source = r#"
-fn make(prefix: String) -> closure(i64) -> String {
+fn make(prefix: String) -> fn(i64) -> String {
     return |x: i64| { let s = prefix + x.toString(); return s + "!"; };
 }
 fn main() {
@@ -232,9 +232,9 @@ fn captured_references_survive_moving_gc_between_leaf_calls() {
     let source = r#"
 import std::collections::Array;
 class P { pub x: i64; pub name: String; }
-fn reader(p: P, k: i64) -> closure(i64) -> i64 { return |y| p.x * k + y; }
+fn reader(p: P, k: i64) -> fn(i64) -> i64 { return |y| p.x * k + y; }
 fn main() {
-    let mut fs: Array<closure(i64) -> i64> = [];
+    let mut fs: Array<fn(i64) -> i64> = [];
     let mut i = 0;
     while i < 40 { fs.push(reader(new P(i, "p" + i.toString()), 3)); i = i + 1; }
     let mut total = 0;
@@ -266,7 +266,7 @@ fn main() {
 fn captures_survive_collection_inside_non_leaf_body() {
     let source = r##"
 class P { pub x: i64; pub name: String; }
-fn make(p: P, tag: String) -> closure(i64) -> String {
+fn make(p: P, tag: String) -> fn(i64) -> String {
     return |y: i64| {
         gc_minor_collect();
         let junk = tag + y.toString();
@@ -293,7 +293,7 @@ fn main() {
 #[test]
 fn reference_arguments_survive_collection_in_callee() {
     let source = r#"
-fn make(sep: String) -> closure(String, String) -> String {
+fn make(sep: String) -> fn(String, String) -> String {
     return |a: String, b: String| { gc_minor_collect(); let t = a + sep; gc_collect(); return t + b; };
 }
 fn main() {
@@ -309,7 +309,7 @@ fn main() {
 
 #[test]
 fn void_leaf_closure() {
-    let source = "fn make(n: i64) -> closure(i64) -> void { return |x: i64| { let y = x > n; }; }\n\
+    let source = "fn make(n: i64) -> fn(i64) -> void { return |x: i64| { let y = x > n; }; }\n\
          fn main() { let f = make(2); f(1); f(3); println(\"done\"); }";
     for (out, ok) in both(source) {
         assert!(ok, "{out}");
@@ -319,7 +319,7 @@ fn void_leaf_closure() {
 
 #[test]
 fn float_leaf_closure() {
-    let source = "fn make(k: f64) -> closure(f64) -> f64 { return |x| x * k + 0.25; }\n\
+    let source = "fn make(k: f64) -> fn(f64) -> f64 { return |x| x * k + 0.25; }\n\
          fn main() { let f = make(1.5); println(f(2.0)); println(f(-1.0)); }";
     for (out, ok) in both(source) {
         assert!(ok, "{out}");
@@ -330,7 +330,7 @@ fn float_leaf_closure() {
 #[test]
 fn leaf_returning_captured_reference_under_gc_stress() {
     let source = r#"
-fn make(a: String, b: String) -> closure(bool) -> String { return |first| first ? a : b; }
+fn make(a: String, b: String) -> fn(bool) -> String { return |first| first ? a : b; }
 fn main() {
     let f = make("left" + 1.toString(), "right" + 2.toString());
     let mut i = 0;
@@ -367,12 +367,12 @@ fn main() {
 
 #[test]
 fn disabled_panic_effects_keep_closures_checked() {
-    let ok_source = "fn make(n: i64) -> closure(i64) -> i64 { return |x| x > n ? x : n; }\n\
+    let ok_source = "fn make(n: i64) -> fn(i64) -> i64 { return |x| x > n ? x : n; }\n\
          fn main() { let f = make(3); println(f(1) + f(9)); }";
     let (out, ok) = compile_and_run_with_env(ok_source, &NO_EFFECTS);
     assert!(ok, "{out}");
     assert_eq!(out, "12\n");
-    let panic_source = "fn make(n: i64) -> closure(i64) -> i64 { return |x| n / x; }\n\
+    let panic_source = "fn make(n: i64) -> fn(i64) -> i64 { return |x| n / x; }\n\
          fn main() { let f = make(3); println(f(1)); println(f(0)); println(\"after\"); }";
     let (out, ok) = compile_and_run_with_env(panic_source, &NO_EFFECTS);
     assert!(!ok, "{out}");
@@ -383,9 +383,9 @@ fn disabled_panic_effects_keep_closures_checked() {
 fn closures_called_round_robin_through_an_array() {
     let source = r#"
 import std::collections::Array;
-fn adder(n: i64) -> closure(i64) -> i64 { return |x| x + n; }
+fn adder(n: i64) -> fn(i64) -> i64 { return |x| x + n; }
 fn main() {
-    let fs: Array<closure(i64) -> i64> = [];
+    let fs: Array<fn(i64) -> i64> = [];
     let mut i = 0;
     while i < 64 { fs.push(adder(i % 7 + 1)); i = i + 1; }
     let mut sum = 0;
@@ -405,7 +405,7 @@ fn main() {
 fn leaf_closures_inside_async_function() {
     let source = r#"
 class Box { pub n: i64; }
-fn make(b: Box) -> closure(i64) -> bool { return |n| b.n > n; }
+fn make(b: Box) -> fn(i64) -> bool { return |n| b.n > n; }
 fn hit(b: Box, i: i64) -> bool { let f = make(b); gc_minor_collect(); return f(i); }
 async fn work(s: String) -> i64 {
     let mut hits = 0;
@@ -431,7 +431,7 @@ fn panic_protocol_references_scale_linearly_with_call_sites() {
         let source = |sites: usize| {
             let body = "total = total + f(total);".repeat(sites);
             format!(
-                "fn run(f: closure(i64) -> i64) -> i64 {{ let mut total = 1; {body} return total; }}\n\
+                "fn run(f: fn(i64) -> i64) -> i64 {{ let mut total = 1; {body} return total; }}\n\
                  fn main() {{ let n = 1; println(run(|x| x + n)); }}"
             )
         };
@@ -450,7 +450,7 @@ fn chained_call_site_code_grows_linearly() {
     let source = |sites: usize| {
         let body = "total = total + f(total);".repeat(sites);
         format!(
-            "fn run(f: closure(i64) -> i64) -> i64 {{ let mut total = 1; {body} return total; }}\n\
+            "fn run(f: fn(i64) -> i64) -> i64 {{ let mut total = 1; {body} return total; }}\n\
              fn main() {{ let n = 1; println(run(|x| x + n)); }}"
         )
     };
@@ -468,8 +468,8 @@ fn chained_call_site_code_grows_linearly() {
 #[test]
 fn closure_panic_is_recoverable() {
     let source = r#"
-fn make(n: i64) -> closure(i64) -> i64 { return |x| n / x; }
-fn guarded(f: closure(i64) -> i64, x: i64) -> i64 {
+fn make(n: i64) -> fn(i64) -> i64 { return |x| n / x; }
+fn guarded(f: fn(i64) -> i64, x: i64) -> i64 {
     let mut result = -1;
     if true {
         defer match recover() { Some(info) => println("recovered"), None => {} }

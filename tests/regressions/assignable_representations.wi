@@ -2,7 +2,7 @@
 enum Tag { First, Second }
 enum Payload { Text(String), Empty }
 class Holder { pub text: String; pub future: Future<void>; }
-fn invoke(f: closure(i64) -> String) -> String { return f(7); }
+fn invoke(f: fn(i64) -> String) -> String { return f(7); }
 fn identity(x: i64) -> i64 { return x; }
 fn prepare() -> Holder {
     let label = "value" + ":";

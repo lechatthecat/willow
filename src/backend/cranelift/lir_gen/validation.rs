@@ -15,16 +15,13 @@ pub(super) fn may_allocate(e: &HirExpr) -> bool {
             HirExprKind::Int(_)
             | HirExprKind::Float(_)
             | HirExprKind::Bool(_)
-            | HirExprKind::Var(_)
-            | HirExprKind::FnRef(_) => {}
+            | HirExprKind::Var(_) => {}
             HirExprKind::ReferenceArg { place } => pending.push(place),
-            // Only constructing a captured environment allocates. Never inspect
-            // a lambda body: it executes later as a separate callable.
-            HirExprKind::Lambda { .. } => {
-                if matches!(expr.ty, Type::Closure(..)) {
-                    return true;
-                }
-            }
+            // Every function value is a managed object: a captured
+            // environment allocates, and a captureless value may materialize
+            // its shared object on first use. Never inspect a lambda body: it
+            // executes later as a separate callable.
+            HirExprKind::FnRef(_) | HirExprKind::Lambda { .. } => return true,
             HirExprKind::Unary { operand, .. } => pending.push(operand),
             HirExprKind::Binary { op, lhs, rhs } => {
                 if lhs.ty == Type::String && matches!(op, BinOp::Add) {

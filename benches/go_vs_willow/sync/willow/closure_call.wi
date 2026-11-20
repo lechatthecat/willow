@@ -2,12 +2,12 @@
 // so the target is only known at run time. 20,000 rounds (20,480,000 calls).
 import std::collections::Array;
 
-fn adder(n: i64) -> closure(i64) -> i64 {
+fn adder(n: i64) -> fn(i64) -> i64 {
     return |x| x + n;
 }
 
 fn main() {
-    let fs: Array<closure(i64) -> i64> = [];
+    let fs: Array<fn(i64) -> i64> = [];
     let mut i: i64 = 0;
     while i < 1024 {
         fs.push(adder(i % 7 + 1));

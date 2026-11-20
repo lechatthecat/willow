@@ -122,7 +122,7 @@ pub(super) fn supported_lir_pattern<'n>(
 /// every combinator operand is one, so a non-function here is a compiler bug.
 pub(super) fn fn_return_type(f_ty: &Type) -> Type {
     match f_ty {
-        Type::Fn(_, ret) => (**ret).clone(),
+        Type::Fn(_, ret) | Type::Closure(_, ret) => (**ret).clone(),
         _ => unreachable!("combinator operand vetted by eligibility is a function"),
     }
 }

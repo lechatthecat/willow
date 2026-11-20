@@ -622,9 +622,7 @@ fn generic_lambda_annotations_accept_twenty_contexts() {
                     format!("println(apply(|x: {ty}| {access}));"),
                 ),
                 _ => (
-                    format!(
-                        "fn apply(f: closure({ty}) -> {ret}) -> {ret} {{ return f({value}); }}"
-                    ),
+                    format!("fn apply(f: fn({ty}) -> {ret}) -> {ret} {{ return f({value}); }}"),
                     format!(
                         "let captured = true; println(apply(|x: {ty}| {{ if captured {{ return {access}; }} return {access}; }}));"
                     ),

@@ -136,8 +136,12 @@ pub(super) fn assignable_repr(target: &Type, value: &Type) -> bool {
     // below must handle them before reaching this exhaustive fallback.
     fn gc_managed_for_assignable_catchall(ty: &Type) -> bool {
         match ty {
-            Type::String | Type::FixedArray(_, _) | Type::Array(_) | Type::Closure(_, _) => true,
-            Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never | Type::Fn(_, _) => false,
+            Type::String
+            | Type::FixedArray(_, _)
+            | Type::Array(_)
+            | Type::Fn(_, _)
+            | Type::Closure(_, _) => true,
+            Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never => false,
             Type::Named(_) | Type::Generic(_, _) => {
                 unreachable!("nominal type reached assignable representation catch-all")
             }
@@ -161,8 +165,9 @@ pub(super) fn assignable_repr(target: &Type, value: &Type) -> bool {
         // `FrozenArray<i64>` interchangeable.
         (Type::Generic(..), Type::Generic(..)) => target.same_array_storage_type(value),
         (Type::Generic(..), _) | (_, Type::Generic(..)) => false,
-        // Both the calling convention and signature belong to the representation.
-        (Type::Fn(..), Type::Fn(..)) | (Type::Closure(..), Type::Closure(..)) => {
+        // Both callable kinds are one managed object called with a trailing
+        // environment; the signature belongs to the representation.
+        (Type::Fn(..) | Type::Closure(..), Type::Fn(..) | Type::Closure(..)) => {
             target.same_array_storage_type(value)
         }
         (Type::Fn(..) | Type::Closure(..), _) | (_, Type::Fn(..) | Type::Closure(..)) => false,
@@ -885,8 +890,10 @@ impl LirTypeCtx<'_> {
     /// lowered body names the declaration itself.
     pub(super) fn same_callable(&self, known: &Type, ty: &Type) -> bool {
         match (known, ty) {
-            (Type::Fn(a, a_out), Type::Fn(b, b_out))
-            | (Type::Closure(a, a_out), Type::Closure(b, b_out)) => {
+            (
+                Type::Fn(a, a_out) | Type::Closure(a, a_out),
+                Type::Fn(b, b_out) | Type::Closure(b, b_out),
+            ) => {
                 a.len() == b.len()
                     && a.iter().zip(b).all(|(a, b)| self.same_repr(a, b))
                     && self.same_repr(a_out, b_out)
@@ -939,8 +946,10 @@ impl LirTypeCtx<'_> {
             }
             // A signature can name one class under two spellings, like any
             // other position.
-            (Type::Fn(pa, ra), Type::Fn(pb, rb))
-            | (Type::Closure(pa, ra), Type::Closure(pb, rb)) => {
+            (
+                Type::Fn(pa, ra) | Type::Closure(pa, ra),
+                Type::Fn(pb, rb) | Type::Closure(pb, rb),
+            ) => {
                 pa.len() == pb.len()
                     && pa
                         .iter()
@@ -1106,7 +1115,7 @@ impl LirTypeCtx<'_> {
     }
 
     /// The declared callable type of a symbol that is about to be used as a
-    /// VALUE — `fn(...) ->...`, or `closure(...) ->...` for a lifted
+    /// VALUE — `fn(...) ->...`, or `fn(...) ->...` for a lifted
     /// capturing lambda — or `None` when it
     /// cannot be. The closure's hidden environment parameter is NOT part of
     /// this type: it is the value itself, not something a call site passes.

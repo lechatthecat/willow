@@ -245,20 +245,29 @@ fn test_fn_pointer_send_sync_async_example() {
 
 #[test]
 fn test_closure_async_e2402_help() {
-    for source in [
-        "async fn apply(f: closure(i64) -> i64) -> i64 { await sleep(1); return f(1); } fn main() {}",
-        "async fn apply(f: closure(i64) -> i64) -> i64 { return f(1); } fn main() { let n = 2; let f: closure(i64) -> i64 = |x| x + n; let t = apply(f); }",
-        "async fn main() { let f: closure(i64) -> i64 = |x| x + 1; await sleep(1); println(f(1)); }",
+    // Only a function value that is actually task-local is rejected: one that
+    // mutates a captured binding, or a field the program also stores such a
+    // value into.
+    for (source, help) in [
+        (
+            "async fn apply(f: fn(i64) -> i64) -> i64 { return f(1); } fn main() { let mut n = 2; let f = |x: i64| { n = n + x; return n; }; let t = apply(f); }",
+            "may capture task-local state",
+        ),
+        (
+            "async fn main() { let mut n = 0; let f = || { n = n + 1; return n; }; await sleep(1); println(f()); }",
+            "may capture task-local state",
+        ),
+        (
+            "class Callback { pub f: fn(i64) -> i64; } fn twice(x: i64) -> i64 { return x * 2; } async fn apply(c: Callback) -> i64 { let f = c.f; return f(1); } fn keep() { let mut n = 0; let c = new Callback(|x: i64| { n = n + x; return n; }); } async fn main() { println(await apply(new Callback(twice))); }",
+            "every value the program stores",
+        ),
     ] {
         let (ok, stderr) = compile_with_data_race_check(source);
         assert!(!ok, "{stderr}");
         assert!(stderr.contains("E2402"), "{stderr}");
-        assert!(
-            stderr.contains("closure values have unknown captures"),
-            "{stderr}"
-        );
-        assert!(stderr.contains("environment-free fn pointer"), "{stderr}");
-        assert!(!stderr.contains("function and closure values"), "{stderr}");
+        assert!(stderr.contains(help), "{stderr}");
+        assert!(!stderr.contains("environment-free"), "{stderr}");
+        assert!(!stderr.contains("closure"), "{stderr}");
     }
 }
 

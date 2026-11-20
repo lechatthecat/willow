@@ -349,8 +349,7 @@ mod tests {
     fn purity_closure_allocation_uses_resolved_type() {
         for (body, rejected) in [
             ("let g = || x;", true),
-            ("let g: closure() -> i64 = || 1;", true),
-            ("let g: closure() -> i64 = || x;", true),
+            ("let g: fn() -> i64 = || x;", true),
             ("let g = || 1;", false),
             ("let g: fn() -> i64 = || 1;", false),
             ("let g = || { println(1); };", false),
@@ -772,12 +771,12 @@ impl TypeChecker {
                         {
                             Some(PuritySummary::NONDETERMINISTIC)
                         }
-                        Expr::Lambda(_) => {
-                            // Closure-typed values allocate an environment even
-                            // without captures. Plain function values do not.
-                            // Neither form executes its body at creation time.
+                        Expr::Lambda(lambda) => {
+                            // Only a captured environment allocates per
+                            // evaluation; a captureless value is one shared,
+                            // permanent object. Creation never runs the body.
                             walk.skip_children();
-                            matches!(self.expr_types.get(&expr.id()), Some(Type::Closure(..)))
+                            self.lambda_allocates_environment(lambda.id)
                                 .then_some(PuritySummary::UNKNOWN)
                         }
                         _ => None,

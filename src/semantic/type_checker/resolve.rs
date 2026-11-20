@@ -2105,21 +2105,25 @@ impl TypeChecker {
                 && !self.types_compatible(param_ty, &arg_ty)
             {
                 self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        self.type_mismatch_error_code(param_ty, &arg_ty),
-                        format!(
-                            "argument {} of `{}` expects `{}`, found `{}`",
-                            idx + 1,
-                            method_name,
-                            self.diagnostic_type_name(param_ty),
-                            self.diagnostic_type_name(&arg_ty)
-                        ),
-                    )
-                    .with_label(Label::primary(
-                        arg.expr.span(),
-                        format!("expected `{}`", self.diagnostic_type_name(param_ty)),
-                    )),
+                    self.with_callable_kind_help(
+                        Diagnostic::new(
+                            Severity::Error,
+                            self.type_mismatch_error_code(param_ty, &arg_ty),
+                            format!(
+                                "argument {} of `{}` expects `{}`, found `{}`",
+                                idx + 1,
+                                method_name,
+                                self.diagnostic_type_name(param_ty),
+                                self.diagnostic_type_name(&arg_ty)
+                            ),
+                        )
+                        .with_label(Label::primary(
+                            arg.expr.span(),
+                            format!("expected `{}`", self.diagnostic_type_name(param_ty)),
+                        )),
+                        param_ty,
+                        &arg_ty,
+                    ),
                 );
             }
         }

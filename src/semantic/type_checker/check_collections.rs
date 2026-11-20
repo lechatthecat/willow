@@ -37,16 +37,20 @@ impl TypeChecker {
                 let ty = self.check_expr_expecting(el, expected);
                 if !self.types_compatible(expected, &ty) {
                     self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            self.type_mismatch_error_code(expected, &ty),
-                            format!(
-                                "array element expects `{}`, found `{}`",
-                                self.diagnostic_type_name(expected),
-                                self.diagnostic_type_name(&ty)
-                            ),
-                        )
-                        .with_label(Label::primary(el.span(), "mismatched element type")),
+                        self.with_callable_kind_help(
+                            Diagnostic::new(
+                                Severity::Error,
+                                self.type_mismatch_error_code(expected, &ty),
+                                format!(
+                                    "array element expects `{}`, found `{}`",
+                                    self.diagnostic_type_name(expected),
+                                    self.diagnostic_type_name(&ty)
+                                ),
+                            )
+                            .with_label(Label::primary(el.span(), "mismatched element type")),
+                            expected,
+                            &ty,
+                        ),
                     );
                 }
             }
@@ -56,7 +60,19 @@ impl TypeChecker {
         if elements.is_empty() {
             return Type::Array(Box::new(Type::Void));
         }
-        let first_ty = self.check_expr(&elements[0]);
+        // An array is mutable storage, so its element type is the one any
+        // later store must fit: a function value element takes the type a
+        // written `Array<fn(...)>` names, which holds every function value.
+        // The shareable kind would make the array invariant at a type no
+        // annotation spells, so neither a capturing lambda pushed later nor
+        // a `fn(...)` parameter could accept it.
+        let mut first_ty = self.check_expr(&elements[0]);
+        if let Type::Fn(params, result) = &mut first_ty {
+            first_ty = Type::Closure(
+                std::mem::take(params),
+                std::mem::replace(result, Box::new(Type::Void)),
+            );
+        }
         for el in elements.iter().skip(1) {
             let ty = self.check_expr(el);
             if !self.types_compatible(&first_ty, &ty) {

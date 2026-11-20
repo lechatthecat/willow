@@ -134,6 +134,20 @@ pub extern "C" fn willow_string_literal_slot(
 ) -> *mut u8 {
     // SAFETY: compiler-generated writable static slot obeys the contract above.
     let slot: &'static AtomicPtr<u8> = unsafe { &*slot };
+    initialize_rooted_slot(slot, || willow_string_alloc(bytes, len))
+}
+
+/// The shared once-per-runtime initialization of a compiler-owned static slot
+/// holding a permanently rooted, never-moving object: string literals and
+/// function values both use it, so they share one reset registry.
+///
+/// `allocate` must return an old (never-moving) object or null; null leaves the
+/// slot empty so a later call retries.
+pub(crate) fn initialize_rooted_slot(
+    slot: &'static AtomicPtr<u8>,
+    allocate: impl FnOnce() -> *mut u8,
+) -> *mut u8 {
+    let mut allocate = Some(allocate);
     loop {
         let value = slot.load(Ordering::Acquire);
         if value != INITIALIZING && !value.is_null() {
@@ -144,7 +158,10 @@ pub extern "C" fn willow_string_literal_slot(
                 .compare_exchange(value, INITIALIZING, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
         {
-            let ptr = willow_string_alloc(bytes, len);
+            let allocate = allocate
+                .take()
+                .expect("a slot initializes at most once per call");
+            let ptr = allocate();
             if !ptr.is_null() {
                 willow_gc_add_runtime_root(ptr);
                 // No GC allocation/safepoint while holding the reset registry
@@ -152,7 +169,7 @@ pub extern "C" fn willow_string_literal_slot(
                 let _no_preempt = crate::preempt::NoPreemptGuard::enter();
                 initialized_literal_slots().push(slot);
             }
-            // Root and fully initialized bytes become visible together. A
+            // Root and fully initialized contents become visible together. A
             // failed allocation restores empty storage so a later call retries.
             slot.store(ptr, Ordering::Release);
             return ptr;

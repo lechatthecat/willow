@@ -1137,7 +1137,7 @@ mod tests {
             let body = format!("{}return;{}", prefix.repeat(5_000), suffix.repeat(5_000));
             parse_on_one_mib(prefix, format!("fn main() {{{body}}}"));
         }
-        for (prefix, suffix) in [("Array<", ">"), ("fn() -> ", ""), ("closure(", ")")] {
+        for (prefix, suffix) in [("Array<", ">"), ("fn() -> ", ""), ("fn(", ") -> i64")] {
             let ty = format!("{}i64{}", prefix.repeat(10_000), suffix.repeat(10_000));
             parse_on_one_mib(prefix, format!("fn f(x: {ty}) {{}}"));
         }

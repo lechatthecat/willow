@@ -13,29 +13,31 @@ use willow_abi::runtime_symbols::names as rt;
 use super::*;
 use anyhow::Context;
 
-/// The name of a lifted closure's hidden leading parameter — the environment
-/// object it was called through.
+/// The name of a lifted lambda's hidden trailing parameter — the function
+/// value it was called through.
 ///
 /// `$` cannot appear in a source identifier, so this can never collide with a
 /// parameter, a capture, or a local the program wrote.
 pub(super) const CLOSURE_ENV_PARAM: &str = "$closure_env";
 
-/// The hidden environment parameter a `closure`-typed lambda's lifted body
-/// takes, or `None` for a `fn`-typed one, which is called through a bare code
-/// address and has no environment at all.
+/// The hidden environment parameter every lambda's lifted body takes LAST.
 ///
-/// Its declared type is the closure type itself: that is what the value IS, so
-/// the parameter is rooted and traced like any other GC reference.
-fn closure_env_param(lambda_type: Option<&Type>, span: Span) -> Option<Param> {
-    match lambda_type {
-        Some(ty @ Type::Closure(..)) => Some(Param {
-            name: CLOSURE_ENV_PARAM.to_string(),
-            ty: (ty.clone()).to_source(),
-            mode: ParamMode::Value,
-            span,
-            type_span: span,
-        }),
-        _ => None,
+/// Every function value is called with itself as one extra trailing argument.
+/// A named function simply ignores it: the default calling conventions of all
+/// supported targets are caller-cleanup and pass the leading arguments in the
+/// same places either way, so a named function needs no forwarding thunk to
+/// be a function value. A lambda with captures reads them through this
+/// parameter; one without leaves it unbound.
+///
+/// Its declared type is the lambda's callable type itself: that is what the
+/// value IS, so the parameter is rooted and traced like any other GC reference.
+fn closure_env_param(lambda_type: &Type, span: Span) -> Param {
+    Param {
+        name: CLOSURE_ENV_PARAM.to_string(),
+        ty: lambda_type.clone().to_source(),
+        mode: ParamMode::Value,
+        span,
+        type_span: span,
     }
 }
 
@@ -892,7 +894,15 @@ impl UnitCodegenContext<'_> {
             } else {
                 continue;
             };
-            if let Some(leaf) = super::indirect_leaf::Leaf::analyze(function, self.func_ids[name]) {
+            let owner = match &target.target {
+                BodyTarget::Lambda { lambda, .. } => {
+                    super::indirect_leaf::LeafOwner::Lambda(lambda.id, id)
+                }
+                _ => super::indirect_leaf::LeafOwner::Function(id),
+            };
+            if let Some(leaf) =
+                super::indirect_leaf::Leaf::analyze(function, self.func_ids[name], owner)
+            {
                 self.indirect_leaves.insert(leaf);
             }
         }
@@ -1331,20 +1341,17 @@ impl UnitCodegenContext<'_> {
                 l.span
             ),
         };
-        // A closure's lifted body takes its environment object as a hidden
-        // LEADING argument. It is declared here, in the
+        // A lambda's lifted body takes the function value it was called
+        // through as a hidden TRAILING argument. It is declared here, in the
         // signature and in every per-parameter table, so the index a caller
         // counts from and the index the body binds from stay the same one.
-        let env_param = closure_env_param(lambda_type.as_ref(), l.span);
         let mut sig = self.output.module.make_signature();
-        if env_param.is_some() {
-            sig.params.push(AbiParam::new(reference_type(
-                self.output.module.target_config(),
-            )));
-        }
         for ty in &param_types {
             sig.params.push(AbiParam::new(self.clif_type(ty)));
         }
+        sig.params.push(AbiParam::new(reference_type(
+            self.output.module.target_config(),
+        )));
         sig.returns.push(AbiParam::new(self.clif_type(&ast_ret)));
         let id = self
             .output
@@ -1354,24 +1361,26 @@ impl UnitCodegenContext<'_> {
         self.func_return_types.insert(name, ast_ret.clone());
         self.func_param_modes.insert(
             name,
-            env_param
+            l.params
                 .iter()
                 .map(|_| ParamMode::Value)
-                .chain(l.params.iter().map(|_| ParamMode::Value))
+                .chain(std::iter::once(ParamMode::Value))
                 .collect(),
         );
+        let env_ty = lambda_type.clone().expect("lambda type checked above");
         self.func_param_debug.insert(
             name,
-            env_param
+            l.params
                 .iter()
+                .zip(param_types.iter())
                 .map(|p| ParamDebug {
-                    name: p.name.clone(),
-                    ty: p.ty.clone().into(),
-                    mode: ParamMode::Value,
-                })
-                .chain(l.params.iter().zip(param_types.iter()).map(|p| ParamDebug {
                     name: p.0.name.clone(),
                     ty: p.1.clone(),
+                    mode: ParamMode::Value,
+                })
+                .chain(std::iter::once(ParamDebug {
+                    name: CLOSURE_ENV_PARAM.to_string(),
+                    ty: env_ty,
                     mode: ParamMode::Value,
                 }))
                 .collect(),
@@ -1417,23 +1426,25 @@ impl UnitCodegenContext<'_> {
                 l.span
             ),
         };
-        // Same leading environment parameter `declare_lambda` put in the
+        // Same trailing environment parameter `declare_lambda` put in the
         // signature; the two are built from the same
         // checker type, so they cannot disagree.
-        let params: Vec<Param> = closure_env_param(lambda_type.as_ref(), l.span)
-            .into_iter()
-            .chain(
-                l.params
-                    .iter()
-                    .zip(param_types.iter())
-                    .map(|(p, ty)| Param {
-                        name: p.name.clone(),
-                        ty: (ty.clone()).to_source(),
-                        mode: ParamMode::Value,
-                        span: p.span,
-                        type_span: p.span,
-                    }),
-            )
+        let env_param = closure_env_param(
+            lambda_type.as_ref().expect("lambda type checked above"),
+            l.span,
+        );
+        let params: Vec<Param> = l
+            .params
+            .iter()
+            .zip(param_types.iter())
+            .map(|(p, ty)| Param {
+                name: p.name.clone(),
+                ty: (ty.clone()).to_source(),
+                mode: ParamMode::Value,
+                span: p.span,
+                type_span: p.span,
+            })
+            .chain(std::iter::once(env_param))
             .collect();
         let body = match &l.body {
             LambdaBody::Block(b) => b.clone(),
@@ -2037,6 +2048,11 @@ impl UnitCodegenContext<'_> {
             }
         } else {
             for (i, param) in f.params.iter().enumerate() {
+                // A lambda without captures never reads the function value it
+                // was called through: leave it unbound and unrooted.
+                if lir_fn.captures.is_empty() && param.name == CLOSURE_ENV_PARAM {
+                    continue;
+                }
                 let val = fg.builder.block_params(entry_block)[i];
                 // Frame-back a GC-managed value param (its name is in the map).
                 let framed = matches!(param.mode, ParamMode::Value)

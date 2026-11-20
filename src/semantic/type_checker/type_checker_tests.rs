@@ -17,7 +17,7 @@ fn constructor_closure_diagnostic_formatting_scales() {
         });
         assert_eq!(visits, width);
         assert_eq!(rendered.matches("Item").count(), width);
-        assert_eq!(rendered.len(), 15 + 6 * width);
+        assert_eq!(rendered.len(), 10 + 6 * width);
         println!(
             "closure_parameters={width} name_lookups={visits} output_bytes={}",
             rendered.len()
@@ -36,15 +36,17 @@ fn constructor_closure_diagnostic_nominal_arguments() {
     ] {
         for explicit in [false, true] {
             for result in [false, true] {
+                // A function value of another shape, so the argument is
+                // rejected and its diagnostic names the instantiated type.
                 let signature = if result {
-                    format!("() -> {argument}")
+                    "() -> void".to_string()
                 } else {
-                    format!("({argument}, {argument}) -> bool")
+                    format!("({argument}, {argument}) -> i64")
                 };
                 let field = if result {
-                    "closure() -> T"
+                    "fn() -> T"
                 } else {
-                    "closure(T, T) -> bool"
+                    "fn(T, T) -> bool"
                 };
                 let constructor = if explicit {
                     format!("pub init(self, f: {field}) {{ self.f = f; }}")
@@ -65,9 +67,9 @@ fn constructor_closure_diagnostic_nominal_arguments() {
                     .find(|d| d.message.contains("constructor argument 1"))
                     .unwrap_or_else(|| panic!("{source}: {:?}", checker.errors));
                 let expected = if result {
-                    format!("closure() -> {expected}")
+                    format!("fn() -> {expected}")
                 } else {
-                    format!("closure({expected}, {expected}) -> bool")
+                    format!("fn({expected}, {expected}) -> bool")
                 };
                 assert!(
                     diagnostic
@@ -104,7 +106,7 @@ fn async_local_occurrences_survive_shared_spans() {
             let scalars = (0..scalar_count)
                 .map(|i| format!("let value_{i}: i64 = {i};"))
                 .collect::<String>();
-            let bad = "let op: closure(i64) -> i64 = |x| x;";
+            let bad = "let op: fn(i64) -> i64 = |x| x;";
             let body = if bad_first {
                 format!("{bad}{scalars}")
             } else {
@@ -150,7 +152,7 @@ fn synchronous_lambda_send_does_not_add_outer_async_locals() {
     let source = r#"
 async fn run() {
     (|| {
-        let ch = Channel<closure(i64) -> i64>::new();
+        let ch = Channel<fn(i64) -> i64>::new();
         ch.send(|x| x);
     });
 }

@@ -465,14 +465,14 @@ fn self_inside_generic_argument_is_rejected() {
         ("return head([self]).n();", "Array<Self>", "head"),
         (
             "let s = self; return apply(|| s).n();",
-            "closure() -> Self",
+            "fn() -> Self",
             "apply",
         ),
     ] {
         let stderr = fails(&[(
             "main.wi",
             &format!(
-                "import std::collections::Array; interface Get {{ fn n(self) -> i64; fn t(self) -> i64 {{ {body} }} }} fn first<T>(o: Option<T>) -> T {{ match o {{ Option::Some(v) => {{ return v; }} Option::None => {{ panic(\"none\"); }} }} }} fn head<T>(xs: Array<T>) -> T {{ return xs[0]; }} fn apply<T>(f: closure() -> T) -> T {{ return f(); }} class Box implements Get {{ pub value: i64; pub fn n(self) -> i64 {{ return self.value; }} }} fn main() {{ println(new Box(5).t()); }}"
+                "import std::collections::Array; interface Get {{ fn n(self) -> i64; fn t(self) -> i64 {{ {body} }} }} fn first<T>(o: Option<T>) -> T {{ match o {{ Option::Some(v) => {{ return v; }} Option::None => {{ panic(\"none\"); }} }} }} fn head<T>(xs: Array<T>) -> T {{ return xs[0]; }} fn apply<T>(f: fn() -> T) -> T {{ return f(); }} class Box implements Get {{ pub value: i64; pub fn n(self) -> i64 {{ return self.value; }} }} fn main() {{ println(new Box(5).t()); }}"
             ),
         )]);
         assert!(

@@ -83,7 +83,7 @@ fn clo_06_a_closure_outlives_the_frame_it_captured_from() {
     // `adder` has returned.
     assert_program_output(
         r#"
-fn adder(n: i64) -> closure(i64) -> i64 { return |x: i64| x + n; }
+fn adder(n: i64) -> fn(i64) -> i64 { return |x: i64| x + n; }
 fn main() { let a = adder(10); println(a(1)); println(a(2)); }
 "#,
         "11\n12\n",
@@ -94,7 +94,7 @@ fn main() { let a = adder(10); println(a(1)); println(a(2)); }
 fn clo_07_each_closure_value_gets_its_own_environment() {
     assert_program_output(
         r#"
-fn adder(n: i64) -> closure(i64) -> i64 { return |x: i64| x + n; }
+fn adder(n: i64) -> fn(i64) -> i64 { return |x: i64| x + n; }
 fn main() { let a = adder(10); let b = adder(100); println(a(1)); println(b(1)); println(a(2)); }
 "#,
         "11\n101\n12\n",
@@ -123,7 +123,7 @@ fn main() {
 fn clo_09_repeat_calls_see_one_unchanging_copy() {
     assert_program_output(
         r#"
-fn twice(f: closure(i64) -> i64, v: i64) -> i64 { return f(f(v)); }
+fn twice(f: fn(i64) -> i64, v: i64) -> i64 { return f(f(v)); }
 fn main() { let k = 3; println(twice(|x: i64| x * k, 2)); }
 "#,
         "18\n",
@@ -171,7 +171,7 @@ fn clo_12_a_closure_parameter_is_called_with_its_environment() {
     // a call into the wrong code or a body reading an empty environment.
     assert_program_output(
         r#"
-fn twice(f: closure(i64) -> i64, v: i64) -> i64 { return f(f(v)); }
+fn twice(f: fn(i64) -> i64, v: i64) -> i64 { return f(f(v)); }
 fn main() { let k = 3; println(twice(|x: i64| x * k, 2)); println(twice(|x: i64| x + 1, 2)); }
 "#,
         "18\n4\n",
@@ -182,7 +182,7 @@ fn main() { let k = 3; println(twice(|x: i64| x * k, 2)); println(twice(|x: i64|
 fn clo_13_a_closure_can_capture_and_call_other_closures() {
     assert_program_output(
         r#"
-fn compose(f: closure(i64) -> i64, g: closure(i64) -> i64) -> closure(i64) -> i64 {
+fn compose(f: fn(i64) -> i64, g: fn(i64) -> i64) -> fn(i64) -> i64 {
     return |x: i64| f(g(x));
 }
 fn main() {
@@ -340,7 +340,7 @@ fn clo_22_a_closure_can_return_a_closure() {
     // lifted body rather than in a named function.
     assert_program_output(
         r#"
-fn curry(a: i64) -> closure(i64) -> closure(i64) -> i64 {
+fn curry(a: i64) -> fn(i64) -> fn(i64) -> i64 {
     return |b: i64| |c: i64| a + b + c;
 }
 fn main() { let add1 = curry(1); let add12 = add1(2); println(add12(3)); }
@@ -355,7 +355,7 @@ fn clo_23_a_capture_free_lambda_still_answers_to_a_closure_parameter() {
     // of lambda can be mixed in one call site.
     assert_program_output(
         r#"
-fn twice(f: closure(i64) -> i64, v: i64) -> i64 { return f(f(v)); }
+fn twice(f: fn(i64) -> i64, v: i64) -> i64 { return f(f(v)); }
 fn main() { println(twice(|x: i64| x + 1, 2)); }
 "#,
         "4\n",
@@ -378,16 +378,12 @@ fn main() {
 }
 
 #[test]
-fn clo_25_a_capturing_lambda_is_refused_where_a_fn_value_is_wanted() {
-    let (ok, stderr) = compile_with_compiler_env(
+fn clo_25_a_capturing_lambda_is_a_fn_value() {
+    // One function type: a capturing lambda passes wherever a named function does.
+    assert_program_output(
         "fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }\n\
-         fn main() { let n = 1; println(apply(|x: i64| x + n, 2)); }",
-        &PLAIN,
-    );
-    assert!(!ok, "a capturing lambda must not pass as a `fn` value");
-    assert!(
-        stderr.contains("E1011") && stderr.contains("captures `n`"),
-        "the refusal must name the capture: {stderr}"
+         fn main() { let n = 1; println(apply(|x: i64| x + n, 2)); let mut m = 0; println(apply(|x: i64| { m = m + x; return m; }, 5)); println(m); }",
+        "3\n5\n5\n",
     );
 }
 
@@ -456,7 +452,7 @@ fn mutable_capture_reader_after_writer() {
 #[test]
 fn mutable_capture_escaped() {
     assert_program_output(
-        r#"fn make() -> closure() -> i64 { let mut n = 0; return || { n = n + 1; return n; }; } fn main() { let f = make(); println(f()); println(f()); }"#,
+        r#"fn make() -> fn() -> i64 { let mut n = 0; return || { n = n + 1; return n; }; } fn main() { let f = make(); println(f()); println(f()); }"#,
         "1\n2\n",
     );
 }
@@ -464,7 +460,7 @@ fn mutable_capture_escaped() {
 #[test]
 fn mutable_capture_independent() {
     assert_program_output(
-        r#"fn make() -> closure() -> i64 { let mut n = 0; return || { n = n + 1; return n; }; } fn main() { let f = make(); let g = make(); println(f()); println(f()); println(g()); }"#,
+        r#"fn make() -> fn() -> i64 { let mut n = 0; return || { n = n + 1; return n; }; } fn main() { let f = make(); let g = make(); println(f()); println(f()); println(g()); }"#,
         "1\n2\n1\n",
     );
 }
@@ -552,7 +548,7 @@ fn mutable_capture_fn_value() {
 #[test]
 fn mutable_capture_closure_value() {
     assert_program_output(
-        r#"fn main() { let x = 1; let y = 2; let mut v: closure() -> i64 = || x; let f = || { v = || y; }; f(); println(v()); }"#,
+        r#"fn main() { let x = 1; let y = 2; let mut v: fn() -> i64 = || x; let f = || { v = || y; }; f(); println(v()); }"#,
         "2\n",
     );
 }
@@ -593,7 +589,7 @@ fn mutable_capture_readonly_snapshot() {
 fn mutable_capture_gc_string_cell_and_environment() {
     assert_program_output(
         r#"
-fn make() -> closure() -> String {
+fn make() -> fn() -> String {
     let mut value = "first";
     return || { gc_collect(); value = value + "!"; gc_minor_collect(); return value; };
 }
@@ -634,7 +630,7 @@ fn mutable_capture_immutable_rejected() {
 #[test]
 fn mutable_capture_async_transfer_rejected() {
     let (ok, stderr) = compile_with_compiler_env(
-        "async fn consume(f: closure() -> i64) -> i64 { return f(); } async fn main() { let mut n = 0; let f = || { n = n + 1; return n; }; println(await consume(f)); }",
+        "async fn consume(f: fn() -> i64) -> i64 { return f(); } async fn main() { let mut n = 0; let f = || { n = n + 1; return n; }; println(await consume(f)); }",
         &PLAIN,
     );
     assert!(!ok);
@@ -689,7 +685,7 @@ fn main() {
 #[test]
 fn mutable_capture_release_gc() {
     let (out, ok) = compile_and_run_release(
-        "fn make() -> closure() -> String { let mut s = \"a\"; return || { s = s + \"b\"; gc_collect(); return s; }; } fn main() { let f = make(); println(f()); println(f()); }",
+        "fn make() -> fn() -> String { let mut s = \"a\"; return || { s = s + \"b\"; gc_collect(); return s; }; } fn main() { let f = make(); println(f()); println(f()); }",
     );
     assert!(ok);
     assert_eq!(out, "ab\nabb\n");
@@ -700,7 +696,7 @@ fn mutable_capture_interface_pair_gc() {
     assert_output_under_gc_stress(
         &dispatch_source(
             r#"
-fn make() -> closure() -> i64 {
+fn make() -> fn() -> i64 {
     let mut shape: Shape = new Square(3);
     return || { shape = new Rect(2, 5); gc_collect(); return shape.area(); };
 }
@@ -717,7 +713,7 @@ fn mutable_capture_method_local_and_branch() {
         r#"
 class C {
     pub initial: i64;
-    pub fn counter(self) -> closure(bool) -> i64 {
+    pub fn counter(self) -> fn(bool) -> i64 {
         let mut n = self.initial;
         return |up: bool| { if up { n = n + 1; } else { n = n - 1; } return n; };
     }
@@ -774,7 +770,7 @@ fn mutable_capture_defer_invoke_roots_replaced_closure() {
 fn main() {
     let label = "old" + " value";
     let other = "new" + " value";
-    let mut f: closure(String) -> void = |s: String| { println(label + s); };
+    let mut f: fn(String) -> void = |s: String| { println(label + s); };
     let replace = || { f = |s: String| { println(other + s); }; };
     defer f("!");
     replace();
@@ -812,7 +808,7 @@ open class A {
 }
 class B extends A {
     pub override fn value(self) -> i64 { return self.n + 100; }
-    pub fn make(self) -> closure() -> i64 {
+    pub fn make(self) -> fn() -> i64 {
         return || super.value() + self.value();
     }
 }
@@ -823,18 +819,15 @@ fn main() { let f = new B(3).make(); gc_collect(); println(f()); }
 }
 
 #[test]
-fn receiver_capture_fn_help_for_direct_and_alias() {
+fn receiver_capture_fn_for_direct_and_alias() {
+    // A lambda capturing the receiver, directly or through an alias, is a
+    // `fn` value like any other.
     for receiver in ["self", "me"] {
-        let (ok, stderr) = compile_with_compiler_env(
+        assert_program_output(
             &format!(
-                "class C {{ pub v: i64; pub fn m(self) {{ let me = self; let f: fn() -> i64 = || {receiver}.v; }} }} fn main() {{}}"
+                "class C {{ pub v: i64; pub fn m(self) -> i64 {{ let me = self; let f: fn() -> i64 = || {receiver}.v; return f(); }} }} fn main() {{ println(new C(7).m()); }}"
             ),
-            &PLAIN,
-        );
-        assert!(!ok);
-        assert!(
-            stderr.contains("E1011") && stderr.contains("closure() -> i64"),
-            "{stderr}"
+            "7\n",
         );
     }
 }

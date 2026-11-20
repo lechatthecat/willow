@@ -185,7 +185,7 @@ async fn main() {
 #[test]
 fn concat_fusion_inside_defer_and_lambda_bodies() {
     let src = r#"
-fn describe(label: String, factor: i64) -> closure(i64) -> String {
+fn describe(label: String, factor: i64) -> fn(i64) -> String {
     return |x: i64| label + "=" + (x * factor).toString() + ";" + label;
 }
 fn main() {

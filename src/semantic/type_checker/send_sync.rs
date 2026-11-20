@@ -640,7 +640,7 @@ impl TypeChecker {
                     })
                 }
                 Type::Closure(_, _) => Some(
-                    "closure values have unknown captures; pass Send/Sync data or an environment-free fn pointer instead of retaining a closure across a task boundary",
+                    "this function value may capture task-local state; a value written `fn(...)` is shareable in an async signature, and a field, constructor parameter or enum payload of type `fn(...)` is shareable when every value the program stores into it is shareable (a named function, an awaited async result, or a lambda capturing only immutable Send + Sync bindings), or when its class promises Send/Sync",
                 ),
                 _ => None,
             };
@@ -888,8 +888,8 @@ mod tests {
     #[test]
     fn task_frame_fallback_labels_only_signatures() {
         for source in [
-            "async fn bad() -> closure(i64) -> i64 { let n = 1; return |x: i64| x + n; } fn main() {}",
-            "class Bad { f: closure(i64) -> i64; pub async fn run(self) { println(1); } } fn main() {}",
+            "class Bad { f: fn(i64) -> i64; } async fn bad(b: Bad) -> i64 { return 1; } fn keep() { let mut n = 0; let b = new Bad(|x: i64| { n = n + x; return n; }); } fn main() {}",
+            "class Bad { f: fn(i64) -> i64; pub async fn run(self) { println(1); } } fn keep() { let mut n = 0; let b = new Bad(|x: i64| { n = n + x; return n; }); } fn main() {}",
         ] {
             let (program, errors) = Parser::new(Lexer::new(source).tokenize().unwrap()).parse();
             assert!(errors.is_empty(), "{errors:?}");
@@ -931,7 +931,7 @@ mod tests {
     #[test]
     fn failure_notes_follow_nested_fields_and_wrapper_marker_rules() {
         let c = checker(
-            "class Inner { pub inboxes: Array<Channel<i64>>; } class Outer { pub nested: Inner; } class Callback { pub action: closure() -> void; } fn main() {}",
+            "class Inner { pub inboxes: Array<Channel<i64>>; } class Outer { pub nested: Inner; } class Callback { pub action: fn() -> void; } fn keep() { let mut n = 0; let c = new Callback(|| { n = n + 1; }); } fn main() {}",
         );
         let note = c.marker_failure_note(&named("Outer"), Marker::Sync);
         assert!(

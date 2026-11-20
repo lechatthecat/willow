@@ -2,7 +2,7 @@ class Item {
     pub k: i64;
 }
 class Box<T> {
-    pub f: closure(T, T) -> bool;
+    pub f: fn(T, T) -> bool;
 }
 fn less(a: Item, b: Item) -> bool {
     return a.k < b.k;

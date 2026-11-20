@@ -677,26 +677,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .func_ids
                     .get_id(function)
                     .expect("registered function reference");
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                self.builder
-                    .ins()
-                    .func_addr(reference_type(self.module.target_config()), fref)
+                let may_panic = self.user_function_may_panic_id(function);
+                self.emit_function_value_slot(fid, may_panic)
             }
-            LirRvalue::Closure { id, captures, ty } => {
+            LirRvalue::Closure { id, captures, .. } => {
                 let name = self.lambda_names[id];
                 let fid = *self.func_ids.get_id(&name).expect("registered lambda");
+                let may_panic = self.lambda_may_panic(id, &name);
+                // Nothing captured: every evaluation can share one value.
+                if captures.is_empty() {
+                    return self.emit_function_value_slot(fid, may_panic);
+                }
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 let code = self
                     .builder
                     .ins()
                     .func_addr(reference_type(self.module.target_config()), fref);
-                if !matches!(ty, Type::Closure(..)) {
-                    return code;
-                }
-                let code = if self.lambda_may_panic(id, &name) {
-                    code
+                let code = if may_panic {
+                    self.builder.ins().bor_imm_s(code, FUNCTION_CODE_MAY_PANIC)
                 } else {
-                    self.builder.ins().bor_imm_s(code, CLOSURE_CODE_NO_PANIC)
+                    code
                 };
                 let slots: Vec<_> = captures
                     .iter()
@@ -941,31 +941,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 params,
                 result,
             } => {
-                let closure = matches!(callee.ty(&function.locals), Some(Type::Closure(..)));
-                // Every addressable target is a compiled synchronous Willow
-                // body, which roots its own GC parameters (the closure
-                // environment included) before its first safepoint, or a
-                // scalar builtin. Operands evaluate without reaching a GC
-                // point, so the call site keeps no roots of its own
-                //, as interface dispatch does for targets
-                // that root their receiver.
+                // A local that always holds one named function's value was
+                // already rewritten to a direct call
+                // (`devirtualize_function_values`). Every addressable target
+                // is a compiled synchronous Willow body, which roots its own
+                // GC parameters (the function value included) before its
+                // first safepoint, or a scalar builtin. Operands evaluate
+                // without reaching a GC point, so the call site keeps no roots
+                // of its own, as interface dispatch does for targets that
+                // root their receiver.
+                let pointer = reference_type(self.module.target_config());
+                let mut values: Vec<_> = args
+                    .iter()
+                    .map(|argument| self.emit_lir_operand(function, argument))
+                    .collect();
                 let target = self.emit_lir_operand(function, callee);
-                let mut values = Vec::with_capacity(args.len() + usize::from(closure));
-                if closure {
-                    values.push(target);
-                }
-                for argument in args {
-                    values.push(self.emit_lir_operand(function, argument));
-                }
+                let word = self
+                    .builder
+                    .ins()
+                    .load(pointer, MemFlagsData::trusted(), target, 0);
+                // The function value itself is the trailing argument: a lambda
+                // reads its captures through it, a named function ignores it.
+                values.push(target);
                 let mut signature = self.module.make_signature();
-                if closure {
-                    signature
-                        .params
-                        .push(AbiParam::new(reference_type(self.module.target_config())));
-                }
                 signature
                     .params
                     .extend(params.iter().map(|ty| AbiParam::new(self.clif_type(ty))));
+                signature.params.push(AbiParam::new(pointer));
                 if *result != Type::Void {
                     signature
                         .returns
@@ -973,28 +975,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 let signature = self.builder.import_signature(signature);
                 let name = name.to_string();
-                if !closure {
-                    return self.emit_promoted_fn_call(
-                        signature,
-                        target,
-                        &values,
-                        (params, result),
-                        &name,
-                        span,
-                    );
-                }
-                // A closure whose body cannot raise tags its code word
-                // (see `LirRvalue::Closure`); only an untagged one needs the
+                // A body that may raise tags its code word (see
+                // `LirRvalue::Closure`); only a tagged one needs the
                 // panic-depth protocol around the call.
-                let word = self.builder.ins().load(
-                    reference_type(self.module.target_config()),
-                    MemFlagsData::trusted(),
-                    target,
-                    0,
-                );
-                let code = self.builder.ins().band_imm_s(word, !CLOSURE_CODE_NO_PANIC);
-                let unchecked = self.builder.ins().band_imm_s(word, CLOSURE_CODE_NO_PANIC);
-                self.emit_lir_indirect_call(signature, code, &values, &name, span, Some(unchecked))
+                self.emit_promoted_fn_call(signature, word, &values, (params, result), &name, span)
             }
             _ => unreachable!("rvalue dispatched by responsibility"),
         }
@@ -1083,49 +1067,86 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    /// One indirect call with its call-stack frame and the panic-depth
-    /// protocol. With `unchecked`, a nonzero flag skips the protocol at run
-    /// time: only the depth snapshot and the depth comparison are branched
-    /// around, so the call and its operands stay in one block. Duplicating the
-    /// call per path would let the optimizer rematerialize pure operand
-    /// computations on both paths, and a chain of such sites would then grow
-    /// quadratically. Returns the result, or an `i8` zero
-    /// for `void`.
+    /// One call through a function value's code `word`, with its call-stack
+    /// frame. A word tagged `FUNCTION_CODE_MAY_PANIC` runs the panic-depth
+    /// protocol around the call; the code address is the word with the tag
+    /// cleared. There is exactly one call instruction: its operands are used
+    /// in a single block that dominates the rest of the caller, so the
+    /// optimizer materializes each pure operand once (a call per tag path let
+    /// it rematerialize an operand computation on both paths, and a chain of
+    /// such sites grew quadratically). The protocol's snapshot and check are
+    /// cold side blocks, and the snapshot passes through a stack slot rather
+    /// than a block parameter, so the panic-free path is the tag test, the
+    /// mask, the call and one more tag test, with no join moves or jumps.
+    /// Returns the result, or an `i8` zero for `void`.
     pub(in crate::backend::cranelift) fn emit_lir_indirect_call(
+        &mut self,
+        signature: cranelift_codegen::ir::SigRef,
+        word: cranelift_codegen::ir::Value,
+        values: &[cranelift_codegen::ir::Value],
+        name: &str,
+        span: Span,
+    ) -> cranelift_codegen::ir::Value {
+        let tag = willow_abi::FUNCTION_CODE_MAY_PANIC as i64;
+        let depth_ty = {
+            let depth = crate::backend::abi::runtime_symbol(rt::willow_panic_depth)
+                .and_then(|symbol| symbol.ret)
+                .expect("willow_panic_depth returns the depth");
+            let pointer = reference_type(self.module.target_config());
+            crate::backend::abi::clif_abi_param(depth, pointer).value_type
+        };
+        // One slot per function: a snapshot is stored after the site's
+        // arguments are evaluated and read right after its call returns, so
+        // no two sites' snapshots are ever live at once and the frame size
+        // does not grow with the number of indirect call sites.
+        let depth_slot = *self.reuse.indirect_depth_spill.get_or_insert_with(|| {
+            self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            ))
+        });
+        let snapshot = self.builder.create_block();
+        let call_block = self.builder.create_block();
+        self.builder.set_cold_block(snapshot);
+        let may_panic = self.builder.ins().band_imm_s(word, tag);
+        self.builder
+            .ins()
+            .brif(may_panic, snapshot, &[], call_block, &[]);
+        self.builder.switch_to_block(snapshot);
+        self.builder.seal_block(snapshot);
+        let before = self
+            .emit_pre_willow_call_panic_depth()
+            .expect("Willow call panic-depth snapshot");
+        self.stack_store(before, depth_slot);
+        self.builder.ins().jump(call_block, &[]);
+        self.builder.switch_to_block(call_block);
+        self.builder.seal_block(call_block);
+        let code = self.builder.ins().band_imm_s(word, !tag);
+        let result = self.emit_lir_indirect_call_instruction(signature, code, values, name, span);
+        self.emit_post_willow_call_panic_check(None);
+        let checked = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.set_cold_block(checked);
+        self.builder.ins().brif(may_panic, checked, &[], done, &[]);
+        self.builder.switch_to_block(checked);
+        self.builder.seal_block(checked);
+        let before = self.stack_load(depth_ty, depth_slot);
+        self.emit_panic_depth_check(before);
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
+        result
+    }
+
+    fn emit_lir_indirect_call_instruction(
         &mut self,
         signature: cranelift_codegen::ir::SigRef,
         code: cranelift_codegen::ir::Value,
         values: &[cranelift_codegen::ir::Value],
         name: &str,
         span: Span,
-        unchecked: Option<cranelift_codegen::ir::Value>,
     ) -> cranelift_codegen::ir::Value {
-        let panic_depth = match unchecked {
-            None => self.emit_pre_willow_call_panic_depth(),
-            Some(unchecked) => {
-                let depth = crate::backend::abi::runtime_symbol(rt::willow_panic_depth)
-                    .and_then(|symbol| symbol.ret)
-                    .expect("willow_panic_depth returns the depth");
-                let pointer = reference_type(self.module.target_config());
-                let depth_ty = crate::backend::abi::clif_abi_param(depth, pointer).value_type;
-                let call_block = self.builder.create_block();
-                let depth = self.builder.append_block_param(call_block, depth_ty);
-                let checked = self.builder.create_block();
-                let skipped = self.builder.ins().iconst(depth_ty, 0);
-                self.builder
-                    .ins()
-                    .brif(unchecked, call_block, &[skipped.into()], checked, &[]);
-                self.builder.switch_to_block(checked);
-                self.builder.seal_block(checked);
-                let before = self
-                    .emit_pre_willow_call_panic_depth()
-                    .expect("Willow call panic-depth snapshot");
-                self.builder.ins().jump(call_block, &[before.into()]);
-                self.builder.switch_to_block(call_block);
-                self.builder.seal_block(call_block);
-                Some(depth)
-            }
-        };
         let pushed = self.emit_callstack_push(name, span);
         let call = self.builder.ins().call_indirect(signature, code, values);
         let result = self
@@ -1137,22 +1158,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if pushed {
             self.emit_callstack_pop();
         }
-        let Some(unchecked) = unchecked else {
-            self.emit_post_willow_call_panic_check(panic_depth);
-            return result;
-        };
-        // The unchecked closure continuation skips the shared post-call path.
-        self.emit_stack_helper();
-        self.emit_sync_cancel_check();
-        let checked = self.builder.create_block();
-        let done = self.builder.create_block();
-        self.builder.ins().brif(unchecked, done, &[], checked, &[]);
-        self.builder.switch_to_block(checked);
-        self.builder.seal_block(checked);
-        self.emit_panic_depth_check(panic_depth.expect("checked closure call depth"));
-        self.builder.ins().jump(done, &[]);
-        self.builder.switch_to_block(done);
-        self.builder.seal_block(done);
         result
     }
 

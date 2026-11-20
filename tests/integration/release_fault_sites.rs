@@ -115,7 +115,7 @@ class Box implements Reader {
     pub values: Array<i64>;
     pub fn read(self, i: i64) -> i64 { return self.values[i]; }
 }
-fn adder(n: i64) -> closure(i64) -> i64 { return |x| x + n; }
+fn adder(n: i64) -> fn(i64) -> i64 { return |x| x + n; }
 fn get(values: Array<i64>, i: i64) -> i64 { return values[i]; }
 fn main() {
     let values: Array<i64> = [3, 4];

@@ -493,7 +493,7 @@ mod template_registry_tests {
                 expression = format!("apply({input}, |x{level}| {expression})");
             }
             let source = format!(
-                "fn apply<T, U>(x: T, f: closure(T) -> U) -> U {{ return f(x); }} fn main() {{ let n: i64 = {expression}; println(n); }}"
+                "fn apply<T, U>(x: T, f: fn(T) -> U) -> U {{ return f(x); }} fn main() {{ let n: i64 = {expression}; println(n); }}"
             );
             let mut checker = TypeChecker::new();
             GENERIC_CALL_CHECKS.with(|count| count.set(0));
@@ -512,7 +512,7 @@ mod template_registry_tests {
         // Every link is a generic function that calls `fold` and the previous
         // link with unannotated lambdas typed from its own `T`.
         for depth in [1, 4, 16, 64] {
-            let mut source = "import std::collections::Array; fn fold<T, A>(xs: Array<T>, init: A, f: closure(A, T) -> A) -> A { let mut acc = init; for x in xs { acc = f(acc, x); } return acc; }".to_string();
+            let mut source = "import std::collections::Array; fn fold<T, A>(xs: Array<T>, init: A, f: fn(A, T) -> A) -> A { let mut acc = init; for x in xs { acc = f(acc, x); } return acc; }".to_string();
             for link in 0..depth {
                 let previous = if link == 0 {
                     "0".to_string()
@@ -520,7 +520,7 @@ mod template_registry_tests {
                     format!("c{}(xs, |y| p(y))", link - 1)
                 };
                 source.push_str(&format!(
-                    " fn c{link}<T>(xs: Array<T>, p: closure(T) -> bool) -> i64 {{ return fold(xs, 0, |n, x| if p(x) {{ n + 1 }} else {{ n }}) + {previous}; }}"
+                    " fn c{link}<T>(xs: Array<T>, p: fn(T) -> bool) -> i64 {{ return fold(xs, 0, |n, x| if p(x) {{ n + 1 }} else {{ n }}) + {previous}; }}"
                 ));
             }
             source.push_str(&format!(

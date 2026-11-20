@@ -141,7 +141,11 @@ fn validate_argument(name: &str, ty: &Type) -> Result<(), String> {
 /// Infer all declared parameters from positional argument types. A nonempty
 /// explicit list fixes every parameter and must have exactly the declared arity.
 /// Repeated occurrences impose equality, including occurrences nested in type
-/// constructors or callable signatures. Concrete nodes must match exactly.
+/// constructors or callable signatures. Concrete nodes must match exactly,
+/// except callable kinds, which follow subtyping at each node's variance: a
+/// shareable `fn` value serves where a task-local one is expected, and a
+/// parameter seen only at covariant (contravariant) positions binds the
+/// join (meet) of the callable kinds it sees.
 ///
 /// With S signature nodes, A visited actual nodes and B total stored binding
 /// size, work is O(S + A + B), plus equality checks for repeated bindings (each
@@ -211,6 +215,146 @@ pub(crate) struct Inference<'a> {
     type_params: &'a [String],
     parameters: HashMap<&'a str, usize>,
     bindings: Vec<Option<Type>>,
+    /// The variance every use of a bound parameter shared so far. Only a
+    /// parameter used solely at covariant (or solely at contravariant)
+    /// positions may move to a wider (narrower) callable kind; an explicit
+    /// or mixed one is fixed.
+    uses: Vec<Variance>,
+}
+
+/// Where a node sits relative to the value passed: callable parameters flip
+/// it, containers and generic arguments fix it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Variance {
+    Co,
+    Contra,
+    Inv,
+}
+
+impl Variance {
+    fn flip(self) -> Self {
+        match self {
+            Self::Co => Self::Contra,
+            Self::Contra => Self::Co,
+            Self::Inv => Self::Inv,
+        }
+    }
+
+    fn join(self, other: Self) -> Self {
+        if self == other { self } else { Self::Inv }
+    }
+
+    /// Whether a value of callable kind `actual` serves where `formal` is
+    /// written: the shareable kind is a subtype of the task-local one.
+    fn kind_fits(self, formal_closure: bool, actual_closure: bool) -> bool {
+        match self {
+            Self::Co => formal_closure || !actual_closure,
+            Self::Contra => !formal_closure || actual_closure,
+            Self::Inv => formal_closure == actual_closure,
+        }
+    }
+
+    /// The kind that both `left` and `right` fit at this position.
+    fn bound_kind(self, left_closure: bool, right_closure: bool) -> Option<bool> {
+        match self {
+            Self::Co => Some(left_closure || right_closure),
+            Self::Contra => Some(left_closure && right_closure),
+            Self::Inv => (left_closure == right_closure).then_some(left_closure),
+        }
+    }
+}
+
+/// Children of `ty` with their variance, in the order `push_children` uses.
+fn push_children_with<'a>(
+    ty: &'a Type,
+    variance: Variance,
+    pending: &mut Vec<(&'a Type, Variance)>,
+) {
+    match ty {
+        Type::Array(element) | Type::FixedArray(element, _) => {
+            pending.push((element, Variance::Inv))
+        }
+        Type::Generic(_, args) => pending.extend(args.iter().rev().map(|arg| (arg, Variance::Inv))),
+        Type::Fn(args, result) | Type::Closure(args, result) => {
+            pending.push((result, variance));
+            pending.extend(args.iter().rev().map(|arg| (arg, variance.flip())));
+        }
+        _ => {}
+    }
+}
+
+/// The callable kind of a shape, when it is one, with its arity.
+fn callable_shape(shape: &Shape<'_>) -> Option<(usize, bool)> {
+    match shape {
+        Shape::Function(n) => Some((*n, false)),
+        Shape::Closure(n) => Some((*n, true)),
+        _ => None,
+    }
+}
+
+/// Reconcile a parameter's binding with another occurrence's type that may
+/// differ only in callable kinds. With `widen`, each kind becomes the one both
+/// sides fit at its position (the join at a covariant use, the meet at a
+/// contravariant one); otherwise `actual` must fit the binding unchanged.
+/// Visits each node pair once.
+fn reconcile_callable_kinds(
+    binding: &Type,
+    actual: &Type,
+    variance: Variance,
+    widen: bool,
+) -> Option<Type> {
+    let mut result = binding.clone();
+    let mut pending = vec![(&mut result, actual, variance)];
+    while let Some((left, right, variance)) = pending.pop() {
+        let (left_shape, right_shape) = (shape(left), shape(right));
+        if let (Some((ln, lc)), Some((rn, rc))) =
+            (callable_shape(&left_shape), callable_shape(&right_shape))
+        {
+            if ln != rn {
+                return None;
+            }
+            let kind = if widen {
+                variance.bound_kind(lc, rc)?
+            } else if variance.kind_fits(lc, rc) {
+                lc
+            } else {
+                return None;
+            };
+            if kind != lc {
+                let (Type::Fn(args, result) | Type::Closure(args, result)) = left else {
+                    unreachable!("callable shape")
+                };
+                let (args, result) = (
+                    std::mem::take(args),
+                    std::mem::replace(result, Box::new(Type::Void)),
+                );
+                *left = if kind {
+                    Type::Closure(args, result)
+                } else {
+                    Type::Fn(args, result)
+                };
+            }
+        } else if left_shape != right_shape {
+            return None;
+        }
+        match (left, right) {
+            (Type::Generic(_, aa), Type::Generic(_, bb)) => {
+                pending.extend(aa.iter_mut().zip(bb).map(|(a, b)| (a, b, Variance::Inv)));
+            }
+            (Type::Array(a), Type::Array(b)) | (Type::FixedArray(a, _), Type::FixedArray(b, _)) => {
+                pending.push((a, b, Variance::Inv))
+            }
+            (
+                Type::Fn(aa, ar) | Type::Closure(aa, ar),
+                Type::Fn(ba, br) | Type::Closure(ba, br),
+            ) => {
+                pending.push((ar, br, variance));
+                pending.extend(aa.iter_mut().zip(ba).map(|(a, b)| (a, b, variance.flip())));
+            }
+            _ => {}
+        }
+    }
+    Some(result)
 }
 
 impl<'a> Inference<'a> {
@@ -240,6 +384,7 @@ impl<'a> Inference<'a> {
             type_params,
             parameters,
             bindings,
+            uses: vec![Variance::Inv; type_params.len()],
         })
     }
 
@@ -268,10 +413,10 @@ impl<'a> Inference<'a> {
         partial: bool,
     ) -> Result<(), String> {
         let signature = Signature::new(std::slice::from_ref(formal), &self.parameters);
-        let mut pending = vec![actual];
+        let mut pending = vec![(actual, Variance::Co)];
         let mut nodes = signature.nodes.into_iter();
         while let Some(node) = nodes.next() {
-            let ty = pending
+            let (ty, variance) = pending
                 .pop()
                 .expect("matching shapes preserve child counts");
             let hole = partial && is_enum_hole(ty);
@@ -291,10 +436,17 @@ impl<'a> Inference<'a> {
             if let Shape::Param(index) = node {
                 validate_argument(&self.type_params[index], ty)?;
                 if let Some(previous) = &self.bindings[index] {
+                    let uses = self.uses[index];
+                    self.uses[index] = uses.join(variance);
                     if previous == ty {
                         continue;
                     }
+                    let widen = uses == variance && variance != Variance::Inv;
                     if partial && let Some(merged) = merge_enum_holes(previous, ty) {
+                        self.bindings[index] = Some(merged);
+                    } else if let Some(merged) =
+                        reconcile_callable_kinds(previous, ty, variance, widen)
+                    {
                         self.bindings[index] = Some(merged);
                     } else {
                         return Err(format!(
@@ -304,13 +456,20 @@ impl<'a> Inference<'a> {
                     }
                 } else {
                     self.bindings[index] = Some(ty.clone());
+                    self.uses[index] = variance;
                 }
             } else {
                 let found = shape(ty);
-                if node != found {
-                    return Err(mismatch_message(&node, &found));
+                let fits = match (callable_shape(&node), callable_shape(&found)) {
+                    (Some((formal, formal_closure)), Some((actual, actual_closure))) => {
+                        formal == actual && variance.kind_fits(formal_closure, actual_closure)
+                    }
+                    _ => node == found,
+                };
+                if !fits {
+                    return Err(mismatch_message(&node, &found, variance));
                 }
-                push_children(ty, &mut pending);
+                push_children_with(ty, variance, &mut pending);
             }
         }
         debug_assert!(pending.is_empty());
@@ -337,11 +496,18 @@ impl<'a> Inference<'a> {
 
 /// A callable mismatch names what differs; anything else keeps the generic
 /// wording, because the concrete shapes alone do not say which side is wrong.
-fn mismatch_message(expected: &Shape<'_>, found: &Shape<'_>) -> String {
+fn mismatch_message(expected: &Shape<'_>, found: &Shape<'_>, variance: Variance) -> String {
     match (expected, found) {
-        (Shape::Function(_), Shape::Closure(_)) => "a capturing closure cannot be passed where \
-             a plain `fn` value is expected; declare the parameter `closure(...)` instead"
-            .into(),
+        (Shape::Function(n), Shape::Closure(m)) if n == m && variance != Variance::Contra => {
+            "a function value capturing task-local state \
+             cannot be passed where a shareable `fn` value is expected"
+                .into()
+        }
+        (Shape::Closure(n), Shape::Function(m)) if n == m && variance == Variance::Contra => {
+            "a callable that only accepts shareable `fn` values cannot receive the \
+             task-local function values this parameter passes it"
+                .into()
+        }
         (
             Shape::Function(expected) | Shape::Closure(expected),
             Shape::Function(found) | Shape::Closure(found),
@@ -380,6 +546,107 @@ mod tests {
             actual,
             explicit,
         )
+    }
+
+    fn shareable(params: Vec<Type>, result: Type) -> Type {
+        Type::Fn(params, Box::new(result))
+    }
+    fn local(params: Vec<Type>, result: Type) -> Type {
+        Type::Closure(params, Box::new(result))
+    }
+
+    #[test]
+    fn callable_kinds_follow_subtyping_per_position() {
+        let t = named("T");
+        let i = Type::I64;
+        // Covariant: a task-local formal takes either kind; a shareable one
+        // rejects a task-local value.
+        for actual in [
+            shareable(vec![i.clone()], i.clone()),
+            local(vec![i.clone()], i.clone()),
+        ] {
+            run(
+                &["T"],
+                &[local(vec![t.clone()], t.clone())],
+                std::slice::from_ref(&actual),
+                &[],
+            )
+            .unwrap();
+        }
+        let error = run(
+            &["T"],
+            &[shareable(vec![t.clone()], t.clone())],
+            &[local(vec![i.clone()], i.clone())],
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("task-local"), "{error}");
+        // Contravariant: a parameter of the callable flips the direction.
+        let takes_local = local(vec![local(vec![i.clone()], i.clone())], i.clone());
+        let takes_shared = local(vec![shareable(vec![i.clone()], i.clone())], i.clone());
+        let formal = local(vec![local(vec![t.clone()], t.clone())], t.clone());
+        run(&["T"], std::slice::from_ref(&formal), &[takes_local], &[]).unwrap();
+        let error = run(&["T"], &[formal], &[takes_shared], &[]).unwrap_err();
+        assert!(error.contains("only accepts shareable"), "{error}");
+    }
+
+    #[test]
+    fn repeated_bindings_join_covariantly_and_meet_contravariantly() {
+        let i = Type::I64;
+        let named_fn = shareable(vec![i.clone()], i.clone());
+        let lambda = local(vec![i.clone()], i.clone());
+        // `either<T>(a: T, b: T)`: both uses covariant, so T is the join.
+        for order in [
+            [named_fn.clone(), lambda.clone()],
+            [lambda.clone(), named_fn.clone()],
+        ] {
+            let bound = run(&["T"], &[named("T"), named("T")], &order, &[]).unwrap();
+            assert_eq!(bound["T"], lambda);
+        }
+        // `both<T>(f: fn(T) -> i64, g: fn(T) -> i64)`: T is only read by the
+        // callables, so it is the meet of what they accept.
+        let formal = local(vec![named("T")], i.clone());
+        let bound = run(
+            &["T"],
+            &[formal.clone(), formal],
+            &[
+                local(vec![lambda.clone()], i.clone()),
+                local(vec![named_fn.clone()], i.clone()),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(bound["T"], named_fn);
+        // Mixed uses fix the binding. A later use that fits it is accepted
+        // (a callable accepting any value may take shareable ones) ...
+        let bound = run(
+            &["T"],
+            &[named("T"), local(vec![named("T")], i.clone())],
+            &[named_fn.clone(), local(vec![lambda.clone()], i.clone())],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(bound["T"], named_fn);
+        // ... and one that would need it widened is not.
+        run(
+            &["T"],
+            &[local(vec![named("T")], i.clone()), named("T")],
+            &[local(vec![lambda.clone()], i.clone()), named_fn.clone()],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            run(
+                &["T"],
+                &[local(vec![named("T")], i.clone()), named("T")],
+                &[local(vec![named_fn.clone()], i.clone()), lambda.clone()],
+                &[],
+            )
+            .is_err()
+        );
+        // An explicit argument is never widened by a use.
+        let error = run(&["T"], &[named("T")], &[lambda], &[named_fn]).unwrap_err();
+        assert!(error.contains("conflicting"), "{error}");
     }
 
     #[test]

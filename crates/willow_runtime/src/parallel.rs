@@ -1,7 +1,9 @@
 //! Bounded parallel collection mapping on the M:N scheduler.
 //!
 //! `parallel::map` accepts the runtime representation of a
-//! `FrozenArray<i64>` and a non-capturing `fn(i64) -> i64`. It creates at most
+//! `FrozenArray<i64>` and a shareable `fn(i64) -> i64` function value (a
+//! managed object: code word, then captures that are all Send + Sync and
+//! immutable). It creates at most
 //! one chunk Task per active scheduler worker, never one OS thread or Task per
 //! element. Chunks write disjoint output indices, which preserves input order
 //! independently of execution order. Each poll processes a bounded quantum so
@@ -16,6 +18,7 @@ const CHUNK_TASK_ID_SLOT: usize = 1;
 const CHUNK_INPUT_SLOT: usize = 2;
 const CHUNK_OUTPUT_SLOT: usize = 3;
 const CHUNK_STATE_SLOT: usize = 4;
+const CHUNK_MAPPER_SLOT: usize = 5;
 const COORD_RESULT_SLOT: usize = 0;
 const COORD_TASK_ID_SLOT: usize = 1;
 const COORD_INPUT_SLOT: usize = 2;
@@ -31,6 +34,7 @@ impl NativeFrameSpec for ChunkFrame {
         willow_abi::SlotKind::GcRef,
         willow_abi::SlotKind::GcRef,
         willow_abi::SlotKind::NativePtr,
+        willow_abi::SlotKind::GcRef,
     ]);
     const NAME: &'static str = "parallel map chunk";
 }
@@ -64,10 +68,20 @@ const ELEMENTS_PER_SAFEPOINT: i64 = 64;
 // Keep the native batch bound independent of production time-based scheduling.
 const MAX_ELEMENTS_PER_POLL: i64 = 65_536;
 
-pub type I64Mapper = unsafe extern "C" fn(i64) -> i64;
+/// The code word of an `fn(i64) -> i64` value: its argument, then the value
+/// itself as the trailing environment.
+pub type I64Mapper = unsafe extern "C" fn(i64, *mut u8) -> i64;
+
+/// The callable code of the function value `mapper`.
+///
+/// # Safety
+/// `mapper` must be a live Willow function value.
+unsafe fn mapper_code(mapper: *mut u8) -> *const () {
+    let word = unsafe { (mapper as *const usize).read() };
+    std::ptr::without_provenance(word & !willow_abi::FUNCTION_CODE_MAY_PANIC)
+}
 
 struct ChunkState {
-    mapper: I64Mapper,
     next: i64,
     end: i64,
 }
@@ -112,7 +126,6 @@ unsafe extern "C" fn poll_chunk(frame: *mut c_void) -> i32 {
         .saturating_add(MAX_ELEMENTS_PER_POLL)
         .min(state.end);
     let bridge = crate::generated_context::ScalarBridge::enter();
-    let mapper = state.mapper;
     let end = state.end;
     let mut next = state.next;
     let mut until_check = ELEMENTS_PER_SAFEPOINT;
@@ -122,9 +135,13 @@ unsafe extern "C" fn poll_chunk(frame: *mut c_void) -> i32 {
         let input_value = unsafe {
             crate::array::scalar_slot_unchecked(frame_view.load_gc(CHUNK_INPUT_SLOT), next).read()
         };
+        // The mapper value is rooted by this frame and may move whenever the
+        // previous call collected, so its address is reloaded per element.
         // This native frame can repurpose the pinned register even when its
         // scheduler entry installed one. Re-establish it at the mapper boundary.
-        let mapped = unsafe { bridge.call(mapper, input_value) };
+        let mapper = frame_view.load_gc(CHUNK_MAPPER_SLOT);
+        let mapped =
+            unsafe { bridge.call_function_value(mapper_code(mapper), input_value, mapper) };
         // A mapper panic follows the ordinary Task policy. Stop immediately so
         // neutral ABI return values are never committed as successful output.
         if bridge.panicked() {
@@ -170,19 +187,23 @@ unsafe extern "C" fn cancel_chunk(frame: *mut c_void) {
     unsafe { drop_chunk_state(frame) };
 }
 
-fn spawn_chunk(input: *mut u8, output: *mut u8, mapper: I64Mapper, start: i64, end: i64) -> u64 {
+fn spawn_chunk(
+    input: &crate::gc::GcRootHandle,
+    output: &crate::gc::GcRootHandle,
+    mapper: &crate::gc::GcRootHandle,
+    start: i64,
+    end: i64,
+) -> u64 {
     let Some(frame) = NativeTaskFrame::<ChunkFrame>::allocate() else {
         return 0;
     };
-    frame.store_gc(CHUNK_INPUT_SLOT, input);
-    frame.store_gc(CHUNK_OUTPUT_SLOT, output);
+    // Reload after the frame allocation, which may have moved them.
+    frame.store_gc(CHUNK_INPUT_SLOT, input.load());
+    frame.store_gc(CHUNK_OUTPUT_SLOT, output.load());
+    frame.store_gc(CHUNK_MAPPER_SLOT, mapper.load());
     frame.store_native(
         CHUNK_STATE_SLOT,
-        Box::into_raw(Box::new(ChunkState {
-            mapper,
-            next: start,
-            end,
-        })),
+        Box::into_raw(Box::new(ChunkState { next: start, end })),
     );
     let raw = frame.as_raw();
     crate::scheduler::spawn_global_task_initialized(
@@ -248,21 +269,12 @@ unsafe extern "C" fn cancel_coordinator(frame: *mut c_void) {
 /// `parallel::map(values, mapper) -> Task<Array<i64>>`.
 ///
 /// The input must be a `FrozenArray<i64>` at the language boundary. The mapper
-/// is a plain non-capturing function pointer; captured lambdas are rejected by
-/// the compiler before this ABI is reached.
+/// is a function value whose captures the compiler proved Send + Sync and
+/// immutable, so every chunk Task may call the one shared value.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_parallel_map_i64(
-    input: *mut u8,
-    mapper: Option<I64Mapper>,
-) -> *mut c_void {
-    let Some(mapper) = mapper else {
-        crate::panic_context::raise_language_message(
-            "parallel::map requires a FrozenArray<i64> and a valid mapper",
-        );
-        return std::ptr::null_mut();
-    };
-    if input.is_null() {
+pub extern "C" fn willow_parallel_map_i64(input: *mut u8, mapper: *mut u8) -> *mut c_void {
+    if mapper.is_null() || input.is_null() {
         crate::panic_context::raise_language_message(
             "parallel::map requires a FrozenArray<i64> and a valid mapper",
         );
@@ -273,6 +285,7 @@ pub extern "C" fn willow_parallel_map_i64(
         return std::ptr::null_mut();
     }
     let input = crate::gc::GcRootHandle::new(input);
+    let mapper = crate::gc::GcRootHandle::new(mapper);
     let output = crate::array::new_old_array(len, 0);
     if output.is_null() {
         return std::ptr::null_mut();
@@ -295,7 +308,7 @@ pub extern "C" fn willow_parallel_map_i64(
     let ranges = chunk_ranges(len, worker_count);
     let mut children = Vec::with_capacity(ranges.len());
     for (start, end) in ranges {
-        let child = spawn_chunk(input.load(), rooted_output.load(), mapper, start, end);
+        let child = spawn_chunk(&input, &rooted_output, &mapper, start, end);
         if child == 0 {
             for spawned in children {
                 crate::scheduler::willow_sched_cancel(spawned);
@@ -371,9 +384,17 @@ mod tests {
         static MAPPED_ELEMENTS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     }
 
-    unsafe extern "C" fn increment(value: i64) -> i64 {
+    unsafe extern "C" fn increment(value: i64, _environment: *mut u8) -> i64 {
         MAPPED_ELEMENTS.set(MAPPED_ELEMENTS.get() + 1);
         value.wrapping_add(1)
+    }
+
+    /// A capture-free function value whose code is `increment`, kept alive by
+    /// the returned handle.
+    fn increment_value() -> crate::gc::GcRootHandle {
+        let value = crate::gc::willow_alloc_with_layout(crate::gc::GcObjectKind::Closure, 0, 8, 0);
+        unsafe { (value as *mut usize).write(increment as I64Mapper as usize) };
+        crate::gc::GcRootHandle::new(value)
     }
 
     #[test]
@@ -396,13 +417,11 @@ mod tests {
                 let frame = NativeTaskFrame::<ChunkFrame>::allocate().unwrap();
                 frame.store_gc(CHUNK_INPUT_SLOT, input);
                 frame.store_gc(CHUNK_OUTPUT_SLOT, output);
+                let mapper = increment_value();
+                frame.store_gc(CHUNK_MAPPER_SLOT, mapper.load());
                 frame.store_native(
                     CHUNK_STATE_SLOT,
-                    Box::into_raw(Box::new(ChunkState {
-                        mapper: increment,
-                        next: 0,
-                        end: len,
-                    })),
+                    Box::into_raw(Box::new(ChunkState { next: 0, end: len })),
                 );
                 let mut processed = 0;
                 let mut polls = 0;
@@ -453,13 +472,11 @@ mod tests {
         let frame = NativeTaskFrame::<ChunkFrame>::allocate().unwrap();
         frame.store_gc(CHUNK_INPUT_SLOT, input);
         frame.store_gc(CHUNK_OUTPUT_SLOT, output);
+        let mapper = increment_value();
+        frame.store_gc(CHUNK_MAPPER_SLOT, mapper.load());
         frame.store_native(
             CHUNK_STATE_SLOT,
-            Box::into_raw(Box::new(ChunkState {
-                mapper: increment,
-                next: 0,
-                end: 1024,
-            })),
+            Box::into_raw(Box::new(ChunkState { next: 0, end: 1024 })),
         );
         let flag = std::sync::atomic::AtomicBool::new(true);
         crate::preempt::begin_quantum(

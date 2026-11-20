@@ -1,8 +1,11 @@
-// Function items require an explicit lambda when a closure is expected.
+// A named function and a lambda share one function type: either can be
+// passed where `fn(...) -> R` is expected, with or without a wrapper.
 fn lt(a: i64, b: i64) -> bool { return a < b; }
-fn apply(f: closure(i64, i64) -> bool) -> bool { return f(1, 2); }
-fn gapply<T>(f: closure(T, T) -> bool, x: T, y: T) -> bool { return f(x, y); }
+fn apply(f: fn(i64, i64) -> bool) -> bool { return f(1, 2); }
+fn gapply<T>(f: fn(T, T) -> bool, x: T, y: T) -> bool { return f(x, y); }
 fn main() {
     println(apply(|a: i64, b: i64| lt(a, b)));
     println(gapply(|a: i64, b: i64| lt(a, b), 1, 2));
+    println(apply(lt));
+    println(gapply(lt, 1, 2));
 }

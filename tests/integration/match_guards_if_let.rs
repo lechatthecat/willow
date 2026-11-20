@@ -74,7 +74,7 @@ fn flag(b: bool, c: bool) -> i64 {
         false => 3,
     };
 }
-fn apply(f: closure(i64) -> i64, v: i64) -> i64 { return f(v); }
+fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }
 fn capture(n: i64) -> i64 {
     match n {
         x if x > 0 => { return apply(|y: i64| x + y, 100); }

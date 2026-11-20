@@ -67,21 +67,14 @@ pub(crate) fn debug_type_name<N: std::fmt::Display>(ty: &crate::parser::ast::Typ
                 .join(",");
             format!("{name}<{args}>")
         }
-        crate::parser::ast::Type::Fn(params, ret) => {
+        crate::parser::ast::Type::Fn(params, ret)
+        | crate::parser::ast::Type::Closure(params, ret) => {
             let param_str = params
                 .iter()
                 .map(debug_type_name)
                 .collect::<Vec<_>>()
                 .join(",");
             format!("fn({}) -> {}", param_str, debug_type_name(ret))
-        }
-        crate::parser::ast::Type::Closure(params, ret) => {
-            let param_str = params
-                .iter()
-                .map(debug_type_name)
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("closure({}) -> {}", param_str, debug_type_name(ret))
         }
     }
 }

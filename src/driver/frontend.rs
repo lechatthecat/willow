@@ -221,6 +221,7 @@ pub(crate) fn run_frontend_revision_cached(
         &diagnostic_modules,
         emitter,
     )?;
+    apply_callable_slots(&mut program, &mut graph, &desugar_dependencies);
     let expanded = expand_templates(
         program,
         &mut graph,
@@ -366,6 +367,40 @@ fn parse_entry(
         outcome: parse,
     })
 }
+/// Decide the callable kind of every function-typed declaration slot from
+/// the stores of the whole build (see `semantic::callable_slots`). Runs once
+/// all imports are resolved and desugared, before templates are expanded or
+/// any declaration is checked, so every later phase sees one decision.
+fn apply_callable_slots(
+    program: &mut parser::ast::Program,
+    graph: &mut module::ModuleGraph,
+    dependencies: &ModuleDependencies,
+) {
+    let stores = match &graph.artifacts {
+        Some(artifacts) => artifacts.callable_stores(
+            std::iter::once(&*program).chain(graph.files.iter().map(|module| &module.program)),
+        ),
+        None => std::iter::once(&*program)
+            .chain(graph.files.iter().map(|module| &module.program))
+            .flat_map(semantic::callable_slots::program_stores)
+            .collect(),
+    };
+    let namespaces: Vec<String> = graph
+        .files
+        .iter()
+        .map(|module| module.identity_path().to_owned())
+        .collect();
+    let mut programs: Vec<(&str, &mut parser::ast::Program)> = std::iter::once(("", program))
+        .chain(
+            namespaces
+                .iter()
+                .map(String::as_str)
+                .zip(graph.files.iter_mut().map(|module| &mut module.program)),
+        )
+        .collect();
+    semantic::callable_slots::apply_build(&mut programs, Some(dependencies), &stores);
+}
+
 #[allow(clippy::too_many_lines, reason = "split pending")]
 fn expand_templates(
     mut program: parser::ast::Program,

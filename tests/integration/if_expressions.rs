@@ -50,7 +50,7 @@ fn main() {
     let f: fn(i64) -> i64 = if false { |x| x + 1 } else { |x| x + 2 };
     println(f(10));
     let captured = 20;
-    let g: closure(i64) -> i64 = |x: i64| if x > 0 { captured + x } else { captured };
+    let g: fn(i64) -> i64 = |x: i64| if x > 0 { captured + x } else { captured };
     println(g(3));
     // 22: condition once; 23: unselected branch not evaluated.
     println(if mark(1) { value(31) } else { value(32) });

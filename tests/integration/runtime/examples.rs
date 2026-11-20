@@ -52,7 +52,14 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/constructor_type_annotations.wi",
             "7\ntrue\nfail missing\n",
         ),
-        ("example/function_closure_wrappers.wi", "true\ntrue\n"),
+        (
+            "example/function_closure_wrappers.wi",
+            "true\ntrue\ntrue\ntrue\n",
+        ),
+        (
+            "example/function_values.wi",
+            "11449\n20\n205\nhi!!\n20\n17\ndouble 84\nshift -58\n2\n200\n42\n",
+        ),
         ("tests/regressions/gc_inline_satb.wi", "8128\n"),
         ("tests/regressions/gc_mark_worker_count.wi", "120000\n"),
         (

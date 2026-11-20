@@ -30,15 +30,15 @@ fn callee_tokens_report_their_own_types() {
         let revision = snapshot.revision.clone();
         let mut session = QuerySession::new(snapshot).unwrap();
         for (needle, expected) in [
-            ("callback(value)", "closure(i64) -> f64"),
+            ("callback(value)", "fn(i64) -> f64"),
             ("function(value)", "fn(i64) -> i64"),
             ("increment(3)", "fn(i64) -> i64"),
             ("local(4)", "fn(i64) -> i64"),
-            ("captured(5)", "closure(i64) -> i64"),
+            ("captured(5)", "fn(i64) -> i64"),
             ("mutable(6)", "fn(i64) -> i64"),
             ("increment(increment(7))", "fn(i64) -> i64"),
             ("increment(7)", "fn(i64) -> i64"),
-            ("apply_closure(|", "fn(closure(i64) -> f64, i64) -> f64"),
+            ("apply_closure(|", "fn(fn(i64) -> f64, i64) -> f64"),
             ("apply_function(local", "fn(fn(i64) -> i64, i64) -> i64"),
         ] {
             let start = source.find(needle).unwrap();

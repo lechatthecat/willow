@@ -1019,7 +1019,7 @@ mod tests {
     fn typed_body_mutable_capture_metadata_survives_splicing() {
         let (checker, _, _) = compare(
             r#"
-            fn make() -> closure() -> i64 {
+            fn make() -> fn() -> i64 {
                 let mut n = 0;
                 let read = || n;
                 let change = || { let inner = || { n = n + 1; }; inner(); };
@@ -1482,7 +1482,7 @@ mod tests {
                         "return Result::Ok(x);"
                     };
                     let declaration = format!(
-                        "let f{level}: closure(i64) -> Result<i64, String> = |x| {{ {inner} }};"
+                        "let f{level}: fn(i64) -> Result<i64, String> = |x| {{ {inner} }};"
                     );
                     body = if nested {
                         format!("{declaration} return Result::Ok(f{level}(x)?);")
@@ -1579,7 +1579,7 @@ mod tests {
                 for x in xs { out.push(f(x)); }
                 return out;
             }
-            fn apply<T, U>(x: T, f: closure(T) -> U) -> U { return f(x); }
+            fn apply<T, U>(x: T, f: fn(T) -> U) -> U { return f(x); }
             fn main() {
                 let k = 3;
                 let ys = map([1, 2], |x| x * 2);

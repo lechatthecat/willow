@@ -93,6 +93,13 @@ impl HirResolution {
         if source == target {
             return true;
         }
+        // The two callable kinds share one representation, at any depth (a
+        // function value, or an `Option`/`FrozenArray`/... of them); the
+        // checker already enforced which direction and which variance is
+        // allowed, so lowering only needs the shapes to agree.
+        if source.same_modulo_callable_kind(target) {
+            return true;
+        }
         let mut pending = vec![source.clone()];
         let mut seen = std::collections::HashSet::new();
         while let Some(current) = pending.pop() {
@@ -637,14 +644,15 @@ pub enum HirExprKind {
     TryPropagate {
         inner: Box<HirExpr>,
     },
-    /// `|params| body` lambda; `ty` is `fn(params) -> ret` when it captures
-    /// nothing and `closure(params) -> ret` when it does. An expression body is
-    /// represented as a single `Return` statement.
+    /// `|params| body` lambda; `ty` is the function type `fn(params) -> ret`,
+    /// of the shareable kind (`Type::Fn`) when every capture is immutable and
+    /// shareable and of the task-local kind (`Type::Closure`) otherwise. An
+    /// expression body is represented as a single `Return` statement.
     Lambda {
         id: ExprId,
         params: Vec<HirParam>,
         /// What the body reads from the enclosing function, in environment-slot
-        /// order. Empty for a `fn`-typed lambda.
+        /// order. Empty for a lambda that captures nothing.
         captures: Vec<HirCapture>,
         body: Vec<HirStmt>,
     },

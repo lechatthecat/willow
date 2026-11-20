@@ -1469,11 +1469,16 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         Stmt::Let(l) => {
             let mut value = lower_expr(&l.init, ctx)?;
             // A `let x: T = ..` annotation pins the binding type; otherwise the
-            // type flows from the value expression.
-            let binding_ty =
-                l.ty.as_ref()
-                    .map(|ty| ctx.normalize(ty))
-                    .unwrap_or_else(|| (value.ty.clone()).to_source());
+            // type flows from the value expression. As in the checker, an
+            // immutable binding keeps an initializer whose function values
+            // are only more shareable than the written `fn(...)` says.
+            let inferred = value.ty.clone().to_source();
+            let binding_ty = match l.ty.as_ref().map(|ty| ctx.normalize(ty)) {
+                Some(annotation) if l.mutable || !inferred.callable_kinds_refine(&annotation) => {
+                    annotation
+                }
+                _ => inferred,
+            };
             // An annotated array literal takes the ANNOTATION's element type,
             // exactly as `check_array_literal_expecting` typed it. Without this
             // the literal keeps the type of its first element, so

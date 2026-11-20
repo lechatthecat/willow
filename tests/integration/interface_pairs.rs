@@ -90,7 +90,7 @@ perspective!(
 
 perspective!(
     iface_pair_11_closure_capture,
-    r#"fn make() -> closure() -> i64 { let v: Value = new Number(47); let text = "kept" + "!"; return || -> i64 { gc_collect(); println(text); return v.get(); }; } fn main() { let f = make(); gc_collect(); println(f()); }"#,
+    r#"fn make() -> fn() -> i64 { let v: Value = new Number(47); let text = "kept" + "!"; return || -> i64 { gc_collect(); println(text); return v.get(); }; } fn main() { let f = make(); gc_collect(); println(f()); }"#,
     "kept!\n47\n"
 );
 
@@ -289,7 +289,7 @@ fn iface_pair_32_wide_closure_bitmap_boundary() {
             .join(" + ");
         check(
             &format!(
-                r#"fn make() -> closure() -> i64 {{
+                r#"fn make() -> fn() -> i64 {{
             {bindings} let ztext = "kept" + "!";
             return || -> i64 {{ gc_collect(); gc_minor_collect(); println(ztext); return {sum}; }};
         }} fn main() {{ let f = make(); gc_collect(); println(f()); }}"#

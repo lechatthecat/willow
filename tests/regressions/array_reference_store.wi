@@ -89,7 +89,7 @@ fn main() {
 
     // Closures, and one value shared by every slot.
     let factor = 3;
-    let fs: Array<closure(i64) -> i64> = [|x: i64| x];
+    let fs: Array<fn(i64) -> i64> = [|x: i64| x];
     fs[0] = |x: i64| x * factor;
     gc_minor_collect();
     let triple = fs[0];

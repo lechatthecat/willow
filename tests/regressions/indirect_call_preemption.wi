@@ -2,7 +2,7 @@
 fn call_fn(op: fn(AtomicBool, AtomicBool) -> void, done: AtomicBool, started: AtomicBool) {
     op(done, started);
 }
-fn call_closure(op: closure() -> String) -> String {
+fn call_closure(op: fn() -> String) -> String {
     return op();
 }
 async fn fn_worker(done: AtomicBool, started: AtomicBool) {

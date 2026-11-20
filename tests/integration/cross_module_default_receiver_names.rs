@@ -212,7 +212,7 @@ fn provider_generic_closure_argument_named_like_provider_class() {
         &[
             (
                 "util.wi",
-                "module util; class Me { pub fn n(self) -> i64 { return 1; } } pub fn call<T>(x: T, f: closure(T) -> i64) -> i64 { let g = |y: T| f(y); return g(x); }",
+                "module util; class Me { pub fn n(self) -> i64 { return 1; } } pub fn call<T>(x: T, f: fn(T) -> i64) -> i64 { let g = |y: T| f(y); return g(x); }",
             ),
             (
                 "main.wi",

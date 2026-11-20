@@ -872,6 +872,10 @@ impl Parser {
         };
         let body = self.parse_block()?;
         let span = start.to(body.span);
+        let mut return_type = return_type;
+        if is_async {
+            sync_callable_signature(&mut params, &mut return_type);
+        }
 
         Ok(MethodDecl {
             effect_contracts: Vec::new(),
@@ -1010,6 +1014,10 @@ impl Parser {
         }
         let body = self.parse_block()?;
         let span = start.to(body.span);
+        let mut return_type = return_type;
+        if is_async {
+            sync_callable_signature(&mut params, &mut return_type);
+        }
         Ok(FunctionDecl {
             requires,
             ensures,
@@ -1619,4 +1627,14 @@ mod effect_contract_diagnostic_tests {
             EDIT_CELLS.with(|n| assert_eq!(n.get(), 46 * length));
         }
     }
+}
+
+/// An async body runs as a task that may resume on another worker, so the
+/// function values its signature carries must be shareable: every written
+/// `fn(...)` there is the Send + Sync callable kind.
+pub(super) fn sync_callable_signature(params: &mut [Param], return_type: &mut Type) {
+    for param in params {
+        param.ty = param.ty.with_callable_kind(true);
+    }
+    *return_type = return_type.with_callable_kind(true);
 }

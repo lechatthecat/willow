@@ -27,7 +27,7 @@ pub fn nested(n: i64) -> i64 {
     return f(1);
 }
 pub class Calc { pub fn call(self) -> i64 { let f = |x: i64| x + 2; return f(40); } }
-pub fn returned(n: i64) -> closure(i64) -> i64 { return |x: i64| x + n; }
+pub fn returned(n: i64) -> fn(i64) -> i64 { return |x: i64| x + n; }
 "#,
         );
         for i in 0..count {

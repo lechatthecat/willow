@@ -198,19 +198,42 @@ pub enum Type<Name = String> {
     /// Statically sized, non-resizable array.
     FixedArray(Box<Type<Name>>, u64),
     Generic(Name, Vec<Type<Name>>),
-    /// `fn(T1, T2) -> R` — plain function pointer type (non-capturing)
+    /// `fn(T1, T2) -> R`, shareable kind: a function value whose captured
+    /// environment is empty or entirely immutable and Send + Sync, so the
+    /// value may cross task boundaries. Named functions are this kind.
+    ///
+    /// Both callable kinds print as `fn(...) -> R` and share ONE runtime
+    /// representation: a GC object whose word 0 is the code pointer (bit 0
+    /// tags a no-panic target) and whose remaining words are the captures.
+    /// The code takes the object as a hidden TRAILING argument, which a named
+    /// function simply never reads, so a named function needs no wrapper.
+    /// The kinds differ only in what the checker knows about the environment:
+    /// a `Fn` is usable wherever a [`Type::Closure`] is expected (top-level
+    /// subsumption, no conversion code); the reverse is rejected.
     Fn(Vec<Type<Name>>, Box<Type<Name>>),
-    /// `closure(T1, T2) -> R` — a GC-managed closure object: word 0 is the
-    /// code pointer and the words after it are the captured environment. Kept apart from
-    /// [`Type::Fn`] because the two are
-    /// CALLED differently: a `fn` value is the code address itself, while a
-    /// closure value is the object and its code pointer takes that object as a
-    /// hidden leading argument, so neither is assignable to the other: a bare
-    /// `fn` would need a wrapper object to become a closure value.
+    /// `fn(T1, T2) -> R`, task-local kind: the captured environment may hold
+    /// mutable or non-Send state, so the value is neither Send nor Sync.
+    /// Written `fn(...)` annotations default to this kind outside the
+    /// Send-required positions (async signatures, [`SEND_ONLY_BUILTINS`]
+    /// arguments).
     Closure(Vec<Type<Name>>, Box<Type<Name>>),
     /// Bottom type — coerces to any type (used for panic/return arms in match)
     Never,
 }
+
+/// Builtins whose type arguments must be Send (or Send + Sync): a written
+/// `fn(...)` argument of one of these is the shareable callable kind.
+pub const SEND_ONLY_BUILTINS: &[&str] = &[
+    "Channel",
+    "Mutex",
+    "RwLock",
+    "BlockingCell",
+    "BlockingRwCell",
+    "Task",
+    "JoinHandle",
+    "Future",
+    "TaskResult",
+];
 
 #[path = "type_tree.rs"]
 mod type_tree;

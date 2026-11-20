@@ -72,6 +72,7 @@ pub(crate) mod failure;
 pub mod frame_lifetime;
 pub(crate) mod frame_reclaim;
 pub mod fs;
+pub mod function_value;
 pub mod future;
 pub mod gc;
 pub mod gc_mark_queue;

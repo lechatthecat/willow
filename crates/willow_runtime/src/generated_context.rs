@@ -486,6 +486,19 @@ impl ScalarBridge {
         unsafe { call_word(entry as *const (), value as usize, self.context) as i64 }
     }
 
+    /// Call a Willow function value's code word with one scalar argument and
+    /// the value itself as the trailing environment argument. The code must
+    /// obey the scalar generated C ABI and never unwind.
+    #[inline]
+    pub(crate) unsafe fn call_function_value(
+        &self,
+        code: *const (),
+        value: i64,
+        environment: *mut u8,
+    ) -> i64 {
+        unsafe { call_word2(code, value as usize, environment as usize, self.context) as i64 }
+    }
+
     #[inline]
     pub(crate) fn panicked(&self) -> bool {
         let depth = unsafe { &*self.context }
@@ -527,6 +540,39 @@ unsafe fn call_word(entry: *const (), argument: usize, context: *const Context) 
     unsafe {
         std::arch::asm!("blr x9",
             in("x9") entry, inlateout("x0") argument => result,
+            in("x21") context, clobber_abi("C"));
+    }
+    result
+}
+
+/// [`call_word`] with a second ABI word in the second integer argument
+/// register.
+#[inline]
+unsafe fn call_word2(
+    entry: *const (),
+    first: usize,
+    second: usize,
+    context: *const Context,
+) -> usize {
+    let result: usize;
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    unsafe {
+        std::arch::asm!("call rax",
+            inlateout("rax") entry => result,
+            in("rdi") first, in("rsi") second, in("r15") context,
+            clobber_abi("C"));
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    unsafe {
+        std::arch::asm!("sub rsp, 32", "call rax", "add rsp, 32",
+            inlateout("rax") entry => result,
+            in("rcx") first, in("rdx") second, in("r15") context,
+            clobber_abi("C"));
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("blr x9",
+            in("x9") entry, inlateout("x0") first => result, in("x1") second,
             in("x21") context, clobber_abi("C"));
     }
     result

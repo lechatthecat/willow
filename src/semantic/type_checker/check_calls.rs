@@ -216,46 +216,41 @@ impl TypeChecker {
                 arg.expr.span(),
                 format!("expected `{}`", self.diagnostic_type_name(param_ty)),
             ));
-            self.push(self.with_fn_closure_help(diagnostic, param_ty, &arg_ty, &arg.expr));
+            self.push(self.with_callable_kind_help(diagnostic, param_ty, &arg_ty));
         }
     }
 
-    /// Advice only: a named function still requires an explicit closure wrapper.
-    pub(super) fn with_fn_closure_help(
+    /// Both callable kinds print as `fn(...)`, so a mismatch between them
+    /// would read "expected `fn(i64) -> i64`, found `fn(i64) -> i64`". Say
+    /// what actually differs: either the value's environment is task-local,
+    /// or a mutable container of shareable function values is used where
+    /// one that may hold any function value is expected.
+    pub(super) fn with_callable_kind_help(
         &self,
         diagnostic: Diagnostic,
         expected: &Type,
         actual: &Type,
-        expr: &Expr,
     ) -> Diagnostic {
-        let (Type::Closure(_, _), Type::Fn(params, _)) = (expected, actual) else {
+        if expected == actual || !expected.same_modulo_callable_kind(actual) {
             return diagnostic;
-        };
-        let Expr::Var(name, _, _) = expr else {
-            return diagnostic.with_help(
-                "wrap the function value in a typed lambda before passing it as a closure",
-            );
-        };
-        let names: Vec<_> = (0..params.len())
-            .map(|i| {
-                let candidate = format!("arg{i}");
-                if candidate == *name {
-                    format!("_{candidate}")
-                } else {
-                    candidate
-                }
-            })
-            .collect();
-        let declarations = names
-            .iter()
-            .zip(params)
-            .map(|(name, ty)| format!("{name}: {}", self.diagnostic_type_name(ty)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        diagnostic.with_help(format!(
-            "wrap the function in a lambda: `|{declarations}| {name}({})`",
-            names.join(", ")
-        ))
+        }
+        if actual.callable_kinds_refine(expected) {
+            return diagnostic.with_help(format!(
+                "this value holds only function values that can be shared across tasks, and a mutable container cannot widen in place (a store through `{}` could add a task-local one); build it with that type, or pass an immutable snapshot such as a `FrozenArray`",
+                self.diagnostic_type_name(expected)
+            ));
+        }
+        // The shapes agree, so the only problem is crossing a task boundary:
+        // report it as one, with a message that names the actual difference.
+        let mut diagnostic = diagnostic.with_help(
+            "this function value may capture task-local state (a mutable binding or a value that is not Send + Sync), but this position requires one that can be shared across tasks; a `fn(...)` written outside an async signature accepts any function value, and a declared field, constructor parameter or enum payload becomes task-local once the program stores a task-local value into it, so pass the shareable value itself (a named function, or a lambda capturing only immutable Send + Sync bindings)",
+        );
+        diagnostic.code = ErrorCode::E2402;
+        diagnostic.message = format!(
+            "cannot share a task-local function value: `{}` here must be shareable across tasks",
+            self.diagnostic_type_name(expected)
+        );
+        diagnostic
     }
 
     pub(super) fn check_fn_arg_with_param_context(
@@ -657,18 +652,17 @@ impl TypeChecker {
         for (param_ty, arg) in payload_types.iter().zip(c.args.iter()) {
             let arg_ty = self.check_expr_expecting(&arg.expr, param_ty);
             if !self.types_compatible(param_ty, &arg_ty) {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "mismatched types: expected `{}`, found `{}`",
-                            self.diagnostic_type_name(param_ty),
-                            self.diagnostic_type_name(&arg_ty)
-                        ),
-                    )
-                    .with_label(Label::primary(arg.expr.span(), "wrong argument type")),
-                );
+                let diagnostic = Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "mismatched types: expected `{}`, found `{}`",
+                        self.diagnostic_type_name(param_ty),
+                        self.diagnostic_type_name(&arg_ty)
+                    ),
+                )
+                .with_label(Label::primary(arg.expr.span(), "wrong argument type"));
+                self.push(self.with_callable_kind_help(diagnostic, param_ty, &arg_ty));
             }
         }
         self.record_variant_use(enum_name, &c.callee, c.span);
@@ -813,18 +807,17 @@ impl TypeChecker {
                     &result,
                     &arg_ty,
                 );
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "mismatched types: expected `{}`, found `{}`",
-                            self.diagnostic_type_name(&result),
-                            self.diagnostic_type_name(&actual_result)
-                        ),
-                    )
-                    .with_label(Label::primary(arg.expr.span(), "wrong argument type")),
-                );
+                let diagnostic = Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "mismatched types: expected `{}`, found `{}`",
+                        self.diagnostic_type_name(&result),
+                        self.diagnostic_type_name(&actual_result)
+                    ),
+                )
+                .with_label(Label::primary(arg.expr.span(), "wrong argument type"));
+                self.push(self.with_callable_kind_help(diagnostic, &result, &actual_result));
             }
         }
         result

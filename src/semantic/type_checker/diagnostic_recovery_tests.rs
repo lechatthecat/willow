@@ -239,7 +239,8 @@ fn annotation_span_preserves_file_identity() {
 #[test]
 fn closure_field_call_help_perspectives() {
     for (class, ty) in [("Plain", "i64"), ("Box<T>", "T")] {
-        for callable in ["closure", "fn"] {
+        {
+            let callable = "fn";
             let call = "self.f(x)";
             let source = format!(
                 "class {class} {{ f: {callable}({ty}) -> {ty}; pub fn run(self, x: {ty}) -> {ty} {{ return {call}; }} }} fn main() {{}}"
@@ -280,7 +281,7 @@ fn closure_field_help_does_not_replace_missing_method_diagnostic() {
 
 #[test]
 fn closure_field_help_inherited_declaration() {
-    let source = "open class Base { pub f: closure(i64) -> i64; } class Child extends Base { pub fn run(self) { self.f(1); } } fn main() {}";
+    let source = "open class Base { pub f: fn(i64) -> i64; } class Child extends Base { pub fn run(self) { self.f(1); } } fn main() {}";
     let errors = check_source(source);
     let error = errors.iter().find(|d| d.code == ErrorCode::E0502).unwrap();
     let label = error
@@ -587,7 +588,8 @@ fn sentinel_diagnostics_lock_target_work() {
 #[test]
 fn parenthesized_callable_field_type_checks() {
     for (class, ty) in [("Plain", "i64"), ("Box<T>", "T")] {
-        for callable in ["closure", "fn"] {
+        {
+            let callable = "fn";
             for call in ["(self.f)(x)", "((self.f))(x)"] {
                 let source = format!(
                     "class {class} {{ f: {callable}({ty}) -> {ty}; pub fn run(self, x: {ty}) -> {ty} {{ return {call}; }} }} fn main() {{}}"
@@ -597,15 +599,15 @@ fn parenthesized_callable_field_type_checks() {
             }
         }
     }
-    let inherited = "open class Base { pub f: closure(i64) -> i64; } class Child extends Base { pub fn run(self) -> i64 { return (self.f)(1); } } fn main() {}";
+    let inherited = "open class Base { pub f: fn(i64) -> i64; } class Child extends Base { pub fn run(self) -> i64 { return (self.f)(1); } } fn main() {}";
     assert!(check_source(inherited).is_empty());
     for source in [
         "class H { pub f: i64; } fn main() { let h = new H(1); (h.f)(2); }",
-        "class H { pub f: closure(i64) -> i64; } fn main() { let h = new H(|x: i64| x); (h.f)(); }",
-        "class H { pub f: closure(i64) -> i64; } fn main() { let h = new H(|x: i64| x); (h.f)(1, 2); }",
-        "class H { pub f: closure(i64) -> i64; } fn main() { let h = new H(|x: i64| x); (h.f)(true); }",
-        "class H { f: closure(i64) -> i64; } fn read(h: H) { (h.f)(1); } fn main() {}",
-        "class H { pub f: closure(i64) -> i64; } fn read(h: H) { (h.absent)(1); } fn main() {}",
+        "class H { pub f: fn(i64) -> i64; } fn main() { let h = new H(|x: i64| x); (h.f)(); }",
+        "class H { pub f: fn(i64) -> i64; } fn main() { let h = new H(|x: i64| x); (h.f)(1, 2); }",
+        "class H { pub f: fn(i64) -> i64; } fn main() { let h = new H(|x: i64| x); (h.f)(true); }",
+        "class H { f: fn(i64) -> i64; } fn read(h: H) { (h.f)(1); } fn main() {}",
+        "class H { pub f: fn(i64) -> i64; } fn read(h: H) { (h.absent)(1); } fn main() {}",
     ] {
         assert!(
             !check_source(source).is_empty(),

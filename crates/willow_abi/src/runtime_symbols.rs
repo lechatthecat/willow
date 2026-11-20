@@ -177,6 +177,7 @@ runtime_abi_schema! {
     NONE; willow_string_eq => ([Ptr, Ptr] -> Some(I64));
     ALLOC; willow_string_alloc => ([Ptr, I64] -> Some(Ptr));
     ALLOC; willow_string_literal_slot => ([Ptr, Ptr, I64] -> Some(Ptr));
+    ALLOC; willow_function_value_slot => ([Ptr, Ptr] -> Some(Ptr));
     // --- args ---
     IO; willow_time_now_ns => ([] -> Some(I64));
     IO; willow_runtime_args_len => ([] -> Some(I64));
@@ -486,9 +487,8 @@ runtime_abi_schema! {
     NONE; willow_task_scope_is_cancelled => ([Ptr] -> Some(I64));
     ALLOC; willow_task_scope_finish => ([Ptr] -> Some(Ptr));
     // --- bounded parallel collection mapping ---
-    // The mapper is a native function pointer. Generated Willow function
-    // values are 64-bit on every accepted target, but the ABI classification
-    // still distinguishes an address the runtime calls from an integer.
+    // The mapper is a Willow function value: a managed object whose word 0
+    // is the code the runtime calls with the value as trailing environment.
     PANIC_ALLOC; willow_parallel_map_i64 => ([Ptr, Ptr] -> Some(Ptr));
     NONE; willow_blocking_active_jobs => ([] -> Some(I64));
     NONE; willow_blocking_completed_jobs => ([] -> Some(I64));

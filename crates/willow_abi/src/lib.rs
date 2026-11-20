@@ -28,6 +28,14 @@ pub use runtime_type_ids::GC_BITMAP_TYPE_ID;
 /// must acquire-load the slot and call the runtime for zero or this value.
 pub const STRING_LITERAL_INITIALIZING: usize = 1;
 
+/// Tag bit in word 0 of a function value (its code word): the body may raise,
+/// so a call through it runs the panic-depth protocol. Generated function code
+/// is aligned well beyond two bytes, so the bit is never part of the address:
+/// an untagged word is the code address itself, and a caller masks the bit
+/// off a tagged one. Tagging the raising kind keeps the panic-free call path
+/// free of the mask.
+pub const FUNCTION_CODE_MAY_PANIC: usize = 1;
+
 /// Maximum number of payload words represented by the inline GC reference mask.
 pub const GC_REF_MASK_BITS: usize = u64::BITS as usize;
 

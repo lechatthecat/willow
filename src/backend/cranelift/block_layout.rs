@@ -281,6 +281,46 @@ mod tests {
         (modules, entry)
     }
 
+    /// Every indirect call site of a function shares one panic-depth
+    /// snapshot slot, so the frame does not grow with the number of sites.
+    #[test]
+    fn indirect_call_sites_share_one_frame_slot() {
+        let frame = |sites: usize| {
+            let source = format!(
+                "fn probe(f: fn(i64) -> i64) -> i64 {{ let mut n = 1; {} return n; }}
+                fn inc(x: i64) -> i64 {{ return x + 1; }}
+                fn main() {{ println(probe(inc)); println(probe(|x: i64| x * 2)); }}",
+                "n = n + f(n);".repeat(sites)
+            );
+            let functions = compiled_functions(&source);
+            let probe = functions
+                .iter()
+                .max_by_key(|f| {
+                    f.layout
+                        .blocks()
+                        .flat_map(|b| f.layout.block_insts(b))
+                        .filter(|&i| f.dfg.insts[i].opcode() == Opcode::CallIndirect)
+                        .count()
+                })
+                .expect("compiled probe");
+            let indirect = probe
+                .layout
+                .blocks()
+                .flat_map(|b| probe.layout.block_insts(b))
+                .filter(|&i| probe.dfg.insts[i].opcode() == Opcode::CallIndirect)
+                .count();
+            assert_eq!(indirect, sites);
+            probe
+                .sized_stack_slots
+                .values()
+                .map(|slot| slot.size)
+                .sum::<u32>()
+        };
+        let one = frame(1);
+        assert_eq!(frame(8), one);
+        assert_eq!(frame(32), one);
+    }
+
     #[test]
     fn closed_world_interface_ir_and_analysis_scale() {
         use super::super::emit_interface::INTERFACE_WORK;

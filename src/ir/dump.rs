@@ -527,11 +527,9 @@ fn type_str<N: std::fmt::Display>(ty: &Type<N>) -> String {
                 }
             }
             Type::Fn(params, ret) | Type::Closure(params, ret) => {
-                out.push_str(if matches!(ty, Type::Fn(..)) {
-                    "fn("
-                } else {
-                    "closure("
-                });
+                // One user-facing function type: the shareable/task-local
+                // kind is a checker fact, not part of the spelling.
+                out.push_str("fn(");
                 pending.push(Part::Ty(ret));
                 pending.push(Part::Text(") -> "));
                 for (index, param) in params.iter().enumerate().rev() {

@@ -108,13 +108,13 @@ fn generic_bodies_report_template_types_without_aliases() {
         let mut session = QuerySession::new(snapshot).unwrap();
         for (needle, occurrence, token, expected) in [
             // Heap has three instantiations; template locals keep `T`.
-            ("let less", 0, "less", "closure(T, T) -> bool"),
-            ("let less", 1, "less", "closure(T, T) -> bool"),
+            ("let less", 0, "less", "fn(T, T) -> bool"),
+            ("let less", 1, "less", "fn(T, T) -> bool"),
             ("let current", 0, "current", "Option<T>"),
             ("let current", 1, "current", "Option<T>"),
             ("let held", 0, "held", "Option<T>"),
-            ("less(old", 0, "less", "closure(T, T) -> bool"),
-            ("self.less", 0, "less", "closure(T, T) -> bool"),
+            ("less(old", 0, "less", "fn(T, T) -> bool"),
+            ("self.less", 0, "less", "fn(T, T) -> bool"),
             // Default interface method and generic function bodies.
             ("let found", 0, "found", "Option<T>"),
             ("let next", 0, "next", "Option<T>"),
@@ -125,7 +125,7 @@ fn generic_bodies_report_template_types_without_aliases() {
                 "pop",
                 "fn<T>() -> Option<T>",
             ),
-            ("less: closure", 0, "less", "closure(T, T) -> bool"),
+            ("less: closure", 0, "less", "fn(T, T) -> bool"),
             // Concrete locals in the caller.
             ("let first", 0, "first", "Patient"),
             ("let direct", 0, "direct", "Option<Patient>"),
@@ -203,8 +203,8 @@ fn absent_callee_type_is_omitted_and_older_snapshots_load() {
 #[test]
 fn imported_generic_receivers_render_in_the_caller_module() {
     let queue = "pub interface PQueue<T> {\n    fn pop(self) -> Option<T>;\n}\n\
-        pub class Heap<T> implements PQueue<T> {\n    item: T;\n    less: closure(T, T) -> bool;\n\
-        pub init(self, item: T, less: closure(T, T) -> bool) {\n        self.item = item;\n        self.less = less;\n    }\n\
+        pub class Heap<T> implements PQueue<T> {\n    item: T;\n    less: fn(T, T) -> bool;\n\
+        pub init(self, item: T, less: fn(T, T) -> bool) {\n        self.item = item;\n        self.less = less;\n    }\n\
         pub fn pop(self) -> Option<T> {\n        let less = self.less;\n        if less(self.item, self.item) {\n            return None;\n        }\n        return Some(self.item);\n    }\n}\n";
     let patient = "pub class Patient {\n    pub id: i64;\n}\n";
     let main = "import queue::{PQueue, Heap};\nimport patient;\n\nfn main() {\n\
@@ -251,10 +251,7 @@ fn imported_generic_receivers_render_in_the_caller_module() {
         "queue.wi",
         byte(queue, "let less", 0, "less"),
     );
-    assert_eq!(
-        less["result"]["type_display"], "closure(T, T) -> bool",
-        "{less}"
-    );
+    assert_eq!(less["result"]["type_display"], "fn(T, T) -> bool", "{less}");
 }
 
 #[test]

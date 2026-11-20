@@ -1,6 +1,7 @@
 pub mod async_borrows;
 pub mod builtin_types;
 pub mod call_graph;
+pub(crate) mod callable_slots;
 pub mod concurrency;
 pub mod effects;
 pub mod field_writes;

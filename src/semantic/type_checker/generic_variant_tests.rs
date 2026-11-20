@@ -63,7 +63,7 @@ positive! {
     p14_nested_some: "let x: i64 = nested(Some(Some(4)), 3);",
     p15_nested_none: "let x: i64 = nested(Some(None), 3);",
     p16_outer_none: "let x: i64 = nested(None, 3);",
-    p17_lambda_return: "let g: closure(i64) -> Option<i64> = |a: i64| Some(a+1);",
+    p17_lambda_return: "let g: fn(i64) -> Option<i64> = |a: i64| Some(a+1);",
     p18_qualified_without_context: "let x = Option::Some(4);",
     p19_concrete_context: "let x: Option<i64> = Some(4);",
 }

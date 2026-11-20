@@ -16,8 +16,8 @@ interface PQueue<T> {
 
 class Heap<T> implements PQueue<T> {
     item: Option<T>;
-    less: closure(T, T) -> bool;
-    pub init(self, less: closure(T, T) -> bool) {
+    less: fn(T, T) -> bool;
+    pub init(self, less: fn(T, T) -> bool) {
         self.item = None;
         self.less = less;
     }

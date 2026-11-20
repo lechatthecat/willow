@@ -173,13 +173,11 @@ impl TypeChecker {
     ) -> (Type, bool) {
         let (actual, captured) =
             self.check_lambda_in_context(l, params, ret, matches!(signature, Type::Closure(..)));
-        // A `fn` value is a bare code address with no room for an environment,
-        // so a capturing lambda cannot be one. Reporting it
-        // here keeps the message about the capture rather than about a type
-        // mismatch the user cannot act on.
-        let (Type::Fn(signature_params, signature_ret), Type::Closure(actual_params, actual_ret)) =
-            (signature, &actual)
-        else {
+        // A shareable `fn` slot (an async signature, a Send-only builtin's
+        // argument) cannot hold a lambda whose environment is task-local.
+        // Reporting it here keeps the message about the offending captures
+        // rather than about a type mismatch between two `fn(...)` spellings.
+        let (Type::Fn(..), Type::Closure(actual_params, actual_ret)) = (signature, &actual) else {
             return (actual, false);
         };
         let captured = captured
@@ -191,18 +189,12 @@ impl TypeChecker {
             Diagnostic::new(
                 Severity::Error,
                 ErrorCode::E1011,
-                "capturing lambda cannot be used as a plain function pointer".to_string(),
+                "lambda capturing task-local state cannot be shared across tasks".to_string(),
             )
             .with_label(Label::primary(l.span, format!("captures {captured}")))
-            .with_help(format!(
-                "a `fn` value carries no environment: take what it reads as a parameter, or, where the signature can be changed, declare it `closure({}) -> {}`",
-                signature_params
-                    .iter()
-                    .map(|ty| self.diagnostic_type_name(ty))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                self.diagnostic_type_name(signature_ret)
-            )),
+            .with_help(
+                "this `fn` value may run on another task, so every capture must be an immutable binding of a Send + Sync type: pass that state as a parameter, or share it through a `Mutex` or `Channel`",
+            ),
         );
         (Type::Fn(actual_params.clone(), actual_ret.clone()), true)
     }
@@ -560,16 +552,20 @@ impl TypeChecker {
             Some(ann) => {
                 if !self.types_compatible(ann, &body_ty) {
                     self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            self.type_mismatch_error_code(ann, &body_ty),
-                            format!(
-                                "lambda return type mismatch: expected `{}`, found `{}`",
-                                self.diagnostic_type_name(ann),
-                                self.diagnostic_type_name(&body_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(l.span, "return type mismatch")),
+                        self.with_callable_kind_help(
+                            Diagnostic::new(
+                                Severity::Error,
+                                self.type_mismatch_error_code(ann, &body_ty),
+                                format!(
+                                    "lambda return type mismatch: expected `{}`, found `{}`",
+                                    self.diagnostic_type_name(ann),
+                                    self.diagnostic_type_name(&body_ty)
+                                ),
+                            )
+                            .with_label(Label::primary(l.span, "return type mismatch")),
+                            ann,
+                            &body_ty,
+                        ),
                     );
                 }
                 ann.clone()
@@ -578,16 +574,20 @@ impl TypeChecker {
                 if let Some(expected) = expected_return {
                     if !self.types_compatible(expected, &body_ty) {
                         self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                self.type_mismatch_error_code(expected, &body_ty),
-                                format!(
-                                    "lambda return type mismatch: expected `{}`, found `{}`",
-                                    self.diagnostic_type_name(expected),
-                                    self.diagnostic_type_name(&body_ty)
-                                ),
-                            )
-                            .with_label(Label::primary(l.span, "return type mismatch")),
+                            self.with_callable_kind_help(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    self.type_mismatch_error_code(expected, &body_ty),
+                                    format!(
+                                        "lambda return type mismatch: expected `{}`, found `{}`",
+                                        self.diagnostic_type_name(expected),
+                                        self.diagnostic_type_name(&body_ty)
+                                    ),
+                                )
+                                .with_label(Label::primary(l.span, "return type mismatch")),
+                                expected,
+                                &body_ty,
+                            ),
                         );
                     }
                     expected.clone()
@@ -597,18 +597,27 @@ impl TypeChecker {
             }
         };
 
-        // A lambda that takes nothing is a plain code address; one that
-        // captures is a GC environment object and is CALLED differently, so the
-        // two carry different types. A non-capturing lambda
-        // still becomes a closure when the context asks for one, so that
-        // `closure(i64) -> i64` accepts `|x| x * 2` — the environment is then
-        // just the code pointer.
-        let fn_ty = if captures.is_empty() && !expected_closure {
+        // Every function value is one representation (code word plus the
+        // captured environment), so the kind only records what the checker
+        // knows about that environment. A lambda whose captures are all
+        // immutable and Send + Sync is the shareable kind and may cross task
+        // boundaries; one that captures a mutable binding (shared with the
+        // enclosing frame) or task-local state is the task-local kind. The
+        // context's expected kind does not change this: a shareable value
+        // serves a task-local slot by subsumption.
+        let _ = expected_closure;
+        let mut task_local = Vec::new();
+        for capture in &captures {
+            if capture.mutable || !(self.is_send(&capture.ty) && self.is_sync(&capture.ty)) {
+                task_local.push(capture.name.clone());
+            }
+        }
+        let fn_ty = if task_local.is_empty() {
             Type::Fn(param_types, Box::new(ret_ty))
         } else {
             Type::Closure(param_types, Box::new(ret_ty))
         };
-        let captured = captures.iter().map(|c| c.name.clone()).collect();
+        let captured = task_local;
         self.lambda_captures.insert(l.id, captures);
         // Record the lambda's type here rather than leaving it to `check_expr`:
         // a lambda passed as a call argument is checked through
@@ -2489,7 +2498,7 @@ mod lambda_capture_tests {
                 "let me = self; let f = || { let me = me.v; return me; };",
                 vec![vec!["me"]],
             ),
-            ("let f: closure() -> i64 = || self.v;", vec![vec!["self"]]),
+            ("let f: fn() -> i64 = || self.v;", vec![vec!["self"]]),
             (
                 "let f = || { if true { return self.v; } return 0; };",
                 vec![vec!["self"]],
@@ -2512,8 +2521,14 @@ mod lambda_capture_tests {
     #[test]
     fn receiver_capture_fn_diagnostic_explains_supported_pattern() {
         for receiver in ["self", "me"] {
-            let diagnostics = check(&format!(
+            // Any function value may capture the receiver ...
+            ok(&format!(
                 "class C {{ pub v: i64; pub fn m(self) {{ let me = self; let f: fn() -> i64 = || {receiver}.v; }} }} fn main() {{}}"
+            ));
+            // ... but one that may run on another task may not capture a
+            // receiver that is not Sync.
+            let diagnostics = check(&format!(
+                "import std::collections::Array; async fn run(f: fn() -> i64) -> i64 {{ return f(); }} class C {{ pub v: i64; pub items: Array<i64>; pub fn m(self) {{ let me = self; let t = run(|| {receiver}.v); }} }} fn main() {{}}"
             ));
             assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
             assert_eq!(diagnostics[0].code, crate::diagnostics::ErrorCode::E1011);
@@ -2522,7 +2537,7 @@ mod lambda_capture_tests {
                 rendered.contains(&format!("captures `{receiver}`")),
                 "{rendered}"
             );
-            assert!(rendered.contains("closure() -> i64"), "{rendered}");
+            assert!(rendered.contains("Send + Sync"), "{rendered}");
         }
         err(
             "class C { pub v: i64; pub fn m(self) { let f = || { self = new C(2); }; } } fn main() {}",
@@ -2602,22 +2617,23 @@ mod lambda_capture_tests {
         );
     }
 
-    /// A `fn` value is a bare code address with no room for an environment.
+    /// A function value that may run on another task cannot carry a
+    /// mutable capture.
     #[test]
-    fn c33_a_capturing_lambda_is_not_a_fn_value() {
+    fn c33_a_task_local_lambda_is_not_a_shareable_value() {
         err(
-            "fn apply(g: fn(i64) -> i64, v: i64) -> i64 { return g(v); } \
-             fn main() { let y = 1; println(apply(|x: i64| x + y, 2)); }",
+            "async fn apply(g: fn(i64) -> i64, v: i64) -> i64 { return g(v); } \
+             fn main() { let mut y = 1; let t = apply(|x: i64| { y = y + x; return y; }, 2); }",
             "E1011",
         );
     }
 
-    /// The same lambda against a `closure` parameter is exactly what the
-    /// environment is for.
+    /// The same parameter type on a synchronous function takes a capturing
+    /// lambda: carrying the captures is what the environment is for.
     #[test]
     fn c34_a_capturing_lambda_is_a_closure_value() {
         captures_one(
-            "fn apply(g: closure(i64) -> i64, v: i64) -> i64 { return g(v); } \
+            "fn apply(g: fn(i64) -> i64, v: i64) -> i64 { return g(v); } \
              fn main() { let y = 1; println(apply(|x: i64| x + y, 2)); }",
             &["y"],
         );

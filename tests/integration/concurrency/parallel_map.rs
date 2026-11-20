@@ -191,22 +191,34 @@ async fn main() {
 /// has to name the capture, since the fix is to stop capturing rather than to
 /// change the mapper.
 #[test]
-fn parallel_map_09_captured_mapper_is_rejected() {
-    assert_compile_error_contains(
+fn parallel_map_09_only_a_shareable_mapper_is_accepted() {
+    // An immutable scalar capture is shared by value, so the mapper may run
+    // on other workers.
+    let (out, ok) = compile_and_run(
         r#"
 import std::collections::Array;
 import std::parallel;
 async fn main() {
     let offset = 10;
     let values: Array<i64> = [1, 2];
-    let result = await parallel::map(values.freeze(), |value| value + offset);
+    println((await parallel::map(values.freeze(), |value| value + offset)).toString());
 }
 "#,
-        &[
-            "error[E1011]",
-            "capturing lambda cannot be used as a plain function pointer",
-            "captures `offset`",
-        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "[11, 12]\n");
+    // A mapper that mutates a capture is task-local and stays in its task.
+    assert_compile_error_contains(
+        r#"
+import std::collections::Array;
+import std::parallel;
+async fn main() {
+    let mut seen = 0;
+    let values: Array<i64> = [1, 2];
+    let result = await parallel::map(values.freeze(), |value| { seen = seen + 1; return value; });
+}
+"#,
+        &["error[E1011]", "task-local", "seen"],
     );
 }
 

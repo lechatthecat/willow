@@ -1786,10 +1786,18 @@ impl TypeChecker {
             self.record_element_write(&s.init, reference_start, true);
         }
         let ty = if let Some(ann) = &annotation {
-            if !self.types_compatible(ann, &inferred) {
-                self.push_let_annotation_mismatch(s, ann, &inferred);
+            if !s.mutable && inferred.callable_kinds_refine(ann) {
+                // A written `fn(...)` names both callable kinds. An immutable
+                // binding keeps what the initializer knows (a shareable
+                // function value stays shareable), so the annotation does
+                // not, for instance, stop it from being held across an await.
+                inferred
+            } else {
+                if !self.types_compatible(ann, &inferred) {
+                    self.push_let_annotation_mismatch(s, ann, &inferred);
+                }
+                ann.clone()
             }
-            ann.clone()
         } else {
             // Builtin constructor holes are finalized by check_expr,
             // including recovery from malformed payloads. Keep the
@@ -1939,15 +1947,19 @@ impl TypeChecker {
                 let val_ty = self.check_expr_expecting(&s.value, elem);
                 if !self.types_compatible(elem, &val_ty) {
                     let element = self.diagnostic_type_name(elem);
-                    self.push_error(
-                        self.type_mismatch_error_code(elem, &val_ty),
-                        format!(
-                            "cannot assign `{}` to an element of `Array<{element}>`",
-                            self.diagnostic_type_name(&val_ty),
+                    self.push(self.with_callable_kind_help(
+                        Self::error_at(
+                            self.type_mismatch_error_code(elem, &val_ty),
+                            format!(
+                                "cannot assign `{}` to an element of `Array<{element}>`",
+                                self.diagnostic_type_name(&val_ty),
+                            ),
+                            s.span,
+                            format!("expected `{element}`"),
                         ),
-                        s.span,
-                        format!("expected `{element}`"),
-                    );
+                        elem,
+                        &val_ty,
+                    ));
                 }
             }
             // A known array still provides element context even if a
@@ -2442,14 +2454,8 @@ impl TypeChecker {
             return; // don't validate against outer current_return_type
         }
         if !self.types_compatible(&self.local.current_return_type, &ret_ty) {
-            let expected = self.diagnostic_type_name(&self.local.current_return_type);
-            let found = self.diagnostic_type_name(&ret_ty);
-            self.push_error(
-                self.type_mismatch_error_code(&self.local.current_return_type, &ret_ty),
-                format!("mismatched types: expected `{expected}`, found `{found}`"),
-                s.span,
-                format!("expected `{expected}`"),
-            );
+            let expected = self.local.current_return_type.clone();
+            self.push_type_mismatch(&expected, &ret_ty, s.span);
         }
     }
 

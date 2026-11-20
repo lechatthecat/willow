@@ -1210,7 +1210,7 @@ mod tests {
 
     #[test]
     fn async_retention_control_flow_perspectives() {
-        let decl = "let mut op: closure(i64) -> i64 = |x| x;";
+        let decl = "let mut op: fn(i64) -> i64 = |x| x;";
         let cases = [
             ("no wait", "println(op(1));", false),
             ("unused before wait", "await sleep(0);", false),
@@ -1298,7 +1298,7 @@ mod tests {
             ),
             (
                 "late declaration",
-                "println(op(1)); await sleep(0); let later: closure(i64) -> i64 = |x| x; println(later(1));",
+                "println(op(1)); await sleep(0); let later: fn(i64) -> i64 = |x| x; println(later(1));",
                 false,
             ),
             (
@@ -1387,53 +1387,53 @@ mod tests {
         let cases = [
             (
                 "for before wait",
-                "let ops: Array<closure(i64) -> i64> = [|x| x]; for op in ops { println(op(1)); } await sleep(0);",
+                "let ops: Array<fn(i64) -> i64> = [|x| x]; for op in ops { println(op(1)); } await sleep(0);",
                 false,
             ),
             (
                 "for item dead",
-                "let ops: Array<closure(i64) -> i64> = [|x| x]; for op in ops { println(op(1)); await sleep(0); break; }",
+                "let ops: Array<fn(i64) -> i64> = [|x| x]; for op in ops { println(op(1)); await sleep(0); break; }",
                 false,
             ),
             (
                 "for iterator live",
-                "let ops: Array<closure(i64) -> i64> = [|x| x]; for op in ops { println(op(1)); await sleep(0); }",
+                "let ops: Array<fn(i64) -> i64> = [|x| x]; for op in ops { println(op(1)); await sleep(0); }",
                 true,
             ),
             (
                 "for item live",
-                "let ops: Array<closure(i64) -> i64> = [|x| x]; for op in ops { await sleep(0); println(op(1)); break; }",
+                "let ops: Array<fn(i64) -> i64> = [|x| x]; for op in ops { await sleep(0); println(op(1)); break; }",
                 true,
             ),
             (
                 "deferred operand scope ended",
-                "if true { let op: closure(i64) -> i64 = |x| x; defer consume(op); } await sleep(0);",
+                "if true { let op: fn(i64) -> i64 = |x| x; defer consume(op); } await sleep(0);",
                 false,
             ),
             (
                 "deferred operand live",
-                "let op: closure(i64) -> i64 = |x| x; defer consume(op); await sleep(0);",
+                "let op: fn(i64) -> i64 = |x| x; defer consume(op); await sleep(0);",
                 true,
             ),
             (
                 "deferred operand no wait",
-                "let op: closure(i64) -> i64 = |x| x; defer consume(op);",
+                "let op: fn(i64) -> i64 = |x| x; defer consume(op);",
                 false,
             ),
             (
                 "channel implicit wait",
-                "let op: closure(i64) -> i64 = |x| x; let ch = Channel<i64>::new(); ch.send(1); println(op(1));",
+                "let op: fn(i64) -> i64 = |x| x; let ch = Channel<i64>::new(); ch.send(1); println(op(1));",
                 true,
             ),
             (
                 "channel wait after last use",
-                "let op: closure(i64) -> i64 = |x| x; println(op(1)); let ch = Channel<i64>::new(); ch.send(1);",
+                "let op: fn(i64) -> i64 = |x| x; println(op(1)); let ch = Channel<i64>::new(); ch.send(1);",
                 false,
             ),
         ];
         for (name, body, bad) in cases {
             let source = format!(
-                "import std::collections::Array; fn consume(op: closure(i64) -> i64) {{ println(op(1)); }} async fn check() {{ {body} }}"
+                "import std::collections::Array; fn consume(op: fn(i64) -> i64) {{ println(op(1)); }} async fn check() {{ {body} }}"
             );
             let program = parse(&source);
             let mut checker = TypeChecker::new();
@@ -1476,7 +1476,7 @@ mod tests {
             ),
             (
                 "index",
-                "let ops: Array<closure(i64) -> i64> = [op]; consume(ops[0], await number());",
+                "let ops: Array<fn(i64) -> i64> = [op]; consume(ops[0], await number());",
                 true,
             ),
             ("literal closure", "consume(|x| x, await number());", true),
@@ -1508,7 +1508,7 @@ mod tests {
             ),
             (
                 "index consumed",
-                "let ops: Array<closure(i64) -> i64> = [op]; consume(ops[0], 1); await sleep(0);",
+                "let ops: Array<fn(i64) -> i64> = [op]; consume(ops[0], 1); await sleep(0);",
                 false,
             ),
         ];
@@ -1516,13 +1516,13 @@ mod tests {
             let source = format!(
                 r#"
 import std::collections::Array;
-class Holder {{ pub value: closure(i64) -> i64; }}
-fn identity(op: closure(i64) -> i64) -> closure(i64) -> i64 {{ return op; }}
-fn evaluate(op: closure(i64) -> i64) -> i64 {{ return op(1); }}
-fn consume(op: closure(i64) -> i64, n: i64) {{ println(op(n)); }}
+class Holder {{ pub value: fn(i64) -> i64; }}
+fn identity(op: fn(i64) -> i64) -> fn(i64) -> i64 {{ return op; }}
+fn evaluate(op: fn(i64) -> i64) -> i64 {{ return op(1); }}
+fn consume(op: fn(i64) -> i64, n: i64) {{ println(op(n)); }}
 fn consume_number(a: i64, b: i64) {{ println(a + b); }}
 async fn number() -> i64 {{ return 1; }}
-async fn check(flag: bool) {{ let op: closure(i64) -> i64 = |x| x; {body} }}
+async fn check(flag: bool) {{ let op: fn(i64) -> i64 = |x| x; {body} }}
 "#
             );
             let program = parse(&source);
@@ -1685,14 +1685,14 @@ async fn check(flag: bool) {{ let op: closure(i64) -> i64 = |x| x; {body} }}
         for (name, body, bad) in cases {
             let program = parse(&format!(
                 r#"
-enum Boxed {{ One(closure(i64) -> i64), Empty }}
+enum Boxed {{ One(fn(i64) -> i64), Empty }}
 enum Color {{ Red, Green }}
 enum Tint {{ Paint(Color), Blank }}
 interface Value {{}}
-class Holder implements Value {{ pub value: closure(i64) -> i64; }}
+class Holder implements Value {{ pub value: fn(i64) -> i64; }}
 fn plain(x: i64) {{ println(x); }}
 async fn choose() -> bool {{ return false; }}
-async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}
+async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}
 "#
             ));
             let mut checker = TypeChecker::new();
@@ -1729,12 +1729,12 @@ async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}
         for n in [16, 32, 64, 128] {
             for deferred in [false, true] {
                 let body = if deferred {
-                    "if true { let op: closure(i64) -> i64 = |x| x; defer op(1); await sleep(0); }"
+                    "if true { let op: fn(i64) -> i64 = |x| x; defer op(1); await sleep(0); }"
                         .repeat(n)
                 } else {
                     let arms = "f if await choose() => {},".repeat(n);
                     format!(
-                        "let op: closure(i64) -> i64 = |x| x; match op {{ {arms} g => {{ println(g(1)); }} }}"
+                        "let op: fn(i64) -> i64 = |x| x; match op {{ {arms} g => {{ println(g(1)); }} }}"
                     )
                 };
                 let program = parse(&format!(
@@ -1818,7 +1818,7 @@ async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}
             ),
             (
                 "shadow local",
-                "defer { let op: closure(i64) -> i64 = |x| x + 1; println(op(1)); }",
+                "defer { let op: fn(i64) -> i64 = |x| x + 1; println(op(1)); }",
                 true,
                 false,
             ),
@@ -1887,7 +1887,7 @@ async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}
         for (name, body, wait, bad) in cases {
             let wait = if wait { "await sleep(0);" } else { "" };
             let program = parse(&format!(
-                "fn identity(op: closure(i64) -> i64) -> closure(i64) -> i64 {{ return op; }} async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} {wait} }}"
+                "fn identity(op: fn(i64) -> i64) -> fn(i64) -> i64 {{ return op; }} async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} {wait} }}"
             ));
             let mut checker = TypeChecker::new();
             checker.set_enforce_send_sync(true);
@@ -1915,7 +1915,7 @@ async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}
             let cleanup = "defer { op = |x| x + 1; println(op(1)); }".repeat(n);
             let exits = "if flag { return; }".repeat(n);
             let program = parse(&format!(
-                "async fn work(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {cleanup} await sleep(0); {exits} }}"
+                "async fn work(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {cleanup} await sleep(0); {exits} }}"
             ));
             let mut checker = TypeChecker::new();
             checker.set_enforce_send_sync(true);
@@ -2065,7 +2065,7 @@ async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}
         ];
         for (name, body, bad) in cases {
             let program = parse(&format!(
-                "async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}"
+                "async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}"
             ));
             let mut checker = TypeChecker::new();
             checker.set_enforce_send_sync(true);
@@ -2149,7 +2149,7 @@ async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}
                     format!("await sleep(0); {matched} println(op(1));")
                 };
                 let program = parse(&format!(
-                    "enum Tag {{ A, B }} async fn check(flag: bool, tag: Tag) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}"
+                    "enum Tag {{ A, B }} async fn check(flag: bool, tag: Tag) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}"
                 ));
                 let mut checker = TypeChecker::new();
                 checker.set_enforce_send_sync(true);
@@ -2193,7 +2193,7 @@ async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}
                         format!("await sleep(0); {matched}")
                     };
                     let program = parse(&format!(
-                        "enum Tag {{ {variants} }} async fn check(tag: Tag) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}"
+                        "enum Tag {{ {variants} }} async fn check(tag: Tag) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}"
                     ));
                     let mut checker = TypeChecker::new();
                     checker.set_enforce_send_sync(true);
@@ -2261,7 +2261,7 @@ async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}
         ];
         for (expr, bad) in cases {
             let program = parse(&format!(
-                "async fn choose() -> bool {{ return true; }} async fn check(flag: bool) {{ let op: closure(i64) -> i64 = |x| x; let b = {expr}; println(op(1)); }}"
+                "async fn choose() -> bool {{ return true; }} async fn check(flag: bool) {{ let op: fn(i64) -> i64 = |x| x; let b = {expr}; println(op(1)); }}"
             ));
             let mut checker = TypeChecker::new();
             checker.set_enforce_send_sync(true);
@@ -2347,7 +2347,7 @@ async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}
             );
             assert_variant_retention(
                 &format!(
-                    "let A: closure(i64) -> i64 = |x| x; match tag {{ {a} => {{ await sleep(0); println(A(1)); }}, {b} => {{}} }}"
+                    "let A: fn(i64) -> i64 = |x| x; match tag {{ {a} => {{ await sleep(0); println(A(1)); }}, {b} => {{}} }}"
                 ),
                 true,
                 "variant must not shadow local",
@@ -2357,7 +2357,7 @@ async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}
 
     fn assert_variant_retention(body: &str, bad: bool, name: &str) {
         let program = parse(&format!(
-            "enum Tag {{ A, B }} async fn check(tag: Tag, flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}"
+            "enum Tag {{ A, B }} async fn check(tag: Tag, flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}"
         ));
         let mut checker = TypeChecker::new();
         checker.set_enforce_send_sync(true);
@@ -2416,7 +2416,7 @@ async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}
 
     fn assert_guard_retention(body: &str, bad: bool) {
         let program = parse(&format!(
-            "async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}"
+            "async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}"
         ));
         let mut checker = TypeChecker::new();
         checker.set_enforce_send_sync(true);
@@ -2443,10 +2443,10 @@ async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}
             let body = "consume(identity(op), await number());".repeat(n);
             let program = parse(&format!(
                 r#"
-fn identity(op: closure(i64) -> i64) -> closure(i64) -> i64 {{ return op; }}
-fn consume(op: closure(i64) -> i64, n: i64) {{ println(op(n)); }}
+fn identity(op: fn(i64) -> i64) -> fn(i64) -> i64 {{ return op; }}
+fn consume(op: fn(i64) -> i64, n: i64) {{ println(op(n)); }}
 async fn number() -> i64 {{ return 1; }}
-async fn work() {{ let op: closure(i64) -> i64 = |x| x; {body} }}
+async fn work() {{ let op: fn(i64) -> i64 = |x| x; {body} }}
 "#
             ));
             let mut checker = TypeChecker::new();
@@ -2679,7 +2679,7 @@ async fn work() {{ let op: closure(i64) -> i64 = |x| x; {body} }}
         ];
         for (name, body, bad) in cases {
             let program = parse(&format!(
-                "async fn choose() -> bool {{ return true; }} async fn check(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}"
+                "async fn choose() -> bool {{ return true; }} async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}"
             ));
             let mut checker = TypeChecker::new();
             checker.set_enforce_send_sync(true);
@@ -2709,7 +2709,7 @@ async fn work() {{ let op: closure(i64) -> i64 = |x| x; {body} }}
                     .repeat(n);
             let exits = "if flag { return; }".repeat(n);
             let program = parse(&format!(
-                "async fn work(flag: bool) {{ let mut op: closure(i64) -> i64 = |x| x; defer {{ println(op(1)); }} {cleanup} await sleep(0); {exits} }}"
+                "async fn work(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; defer {{ println(op(1)); }} {cleanup} await sleep(0); {exits} }}"
             ));
             let mut checker = TypeChecker::new();
             checker.set_enforce_send_sync(true);
@@ -2820,7 +2820,7 @@ async fn work() {{ let op: closure(i64) -> i64 = |x| x; {body} }}
                     _ => format!("defer {{ println(op(1)); }} defer {{ {operation} {overwrite} }}"),
                 };
                 let program = parse(&format!(
-                    "fn fail() {{ panic(\"stop\"); }} async fn check(zero: i64) {{ let mut values = [1]; let mut op: closure(i64) -> i64 = |x| x; {body} }}"
+                    "fn fail() {{ panic(\"stop\"); }} async fn check(zero: i64) {{ let mut values = [1]; let mut op: fn(i64) -> i64 = |x| x; {body} }}"
                 ));
                 let mut checker = TypeChecker::new();
                 checker.set_enforce_send_sync(true);
@@ -2864,7 +2864,7 @@ async fn work() {{ let op: closure(i64) -> i64 = |x| x; {body} }}
                         ""
                     };
                     let source = format!(
-                        "async fn slow() -> i64 {{ await sleep(1000); return 1; }} async fn check() {{ let t = slow(); t.cancel(); let mut op: closure(i64) -> i64 = |x| x; await sleep(0); if true {{ defer {{ recover(); }} {before} select {{ {arm} => {{ op = |x| x + 1; }} {default} }} }} println(op(1)); }}"
+                        "async fn slow() -> i64 {{ await sleep(1000); return 1; }} async fn check() {{ let t = slow(); t.cancel(); let mut op: fn(i64) -> i64 = |x| x; await sleep(0); if true {{ defer {{ recover(); }} {before} select {{ {arm} => {{ op = |x| x + 1; }} {default} }} }} println(op(1)); }}"
                     );
                     let program = parse(&source);
                     let mut checker = TypeChecker::new();

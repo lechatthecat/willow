@@ -105,28 +105,16 @@ impl FieldWrites {
     ) -> Self {
         let programs: Vec<_> = programs.into_iter().collect();
         let mut resolver = Resolver::new(programs.iter().flat_map(|(_, p)| classes(p)));
-        resolver.dependencies = dependencies;
+        resolver.names.dependencies = dependencies;
         for (namespace, program) in programs {
             for class in classes(program) {
-                let id = resolver.local[&class.span.file_id][class.name.as_str()];
-                let qualified = if namespace.is_empty() {
-                    class.name.clone()
-                } else {
-                    QualifiedName::join(namespace, &class.name)
-                };
-                resolver.qualified.insert(qualified, id);
+                let id = resolver
+                    .names
+                    .local(class.span.file_id, &class.name)
+                    .expect("indexed class");
+                resolver.names.qualify(namespace, &class.name, id);
             }
-            for import in &program.imports {
-                let alias = import
-                    .alias
-                    .as_deref()
-                    .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment());
-                resolver
-                    .imports
-                    .entry(import.span.file_id)
-                    .or_default()
-                    .insert(alias.to_owned(), import.path.clone());
-            }
+            resolver.names.add_imports(program);
         }
         resolver.resolve(writes).0
     }
@@ -148,14 +136,98 @@ impl FieldWrites {
     }
 }
 
+/// Build-wide lookup of one kind of named declaration (classes,
+/// interfaces, functions, ...). A declaration's identity is its index in the
+/// caller's inventory, never a bare name. A name resolves in its own file,
+/// then through the file's import aliases, then as a qualified path (including
+/// package dependencies).
+pub(crate) struct DeclNames<'a> {
+    pub(crate) dependencies: Option<&'a crate::compiler_db::dependencies::ModuleDependencies>,
+    local: HashMap<FileId, HashMap<&'a str, usize>>,
+    qualified: HashMap<String, usize>,
+    imports: HashMap<FileId, HashMap<String, String>>,
+}
+
+impl<'a> DeclNames<'a> {
+    /// Index `decls` (declaring file, name) by their position.
+    pub(crate) fn new(decls: impl IntoIterator<Item = (FileId, &'a str)>) -> Self {
+        let mut local: HashMap<FileId, HashMap<&str, usize>> = HashMap::new();
+        for (id, (file, name)) in decls.into_iter().enumerate() {
+            local.entry(file).or_default().insert(name, id);
+        }
+        Self {
+            dependencies: None,
+            local,
+            qualified: HashMap::new(),
+            imports: HashMap::new(),
+        }
+    }
+
+    /// The declaration named `name` in `file` itself.
+    pub(crate) fn local(&self, file: FileId, name: &str) -> Option<usize> {
+        self.local.get(&file)?.get(name).copied()
+    }
+
+    /// Make declaration `id` reachable as `namespace::name`.
+    pub(crate) fn qualify(&mut self, namespace: &str, name: &str, id: usize) {
+        let qualified = if namespace.is_empty() {
+            name.to_owned()
+        } else {
+            QualifiedName::join(namespace, name)
+        };
+        self.qualified.insert(qualified, id);
+    }
+
+    /// Record the import aliases of `program`.
+    pub(crate) fn add_imports(&mut self, program: &Program) {
+        for import in &program.imports {
+            let alias = import
+                .alias
+                .as_deref()
+                .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment());
+            self.imports
+                .entry(import.span.file_id)
+                .or_default()
+                .insert(alias.to_owned(), import.path.clone());
+        }
+    }
+
+    pub(crate) fn lookup(&self, file: FileId, name: &str) -> Option<usize> {
+        if let Some(id) = self.local(file, name) {
+            return Some(id);
+        }
+        let (head, tail) = QualifiedName::new(name)
+            .split_first()
+            .map_or((name, None), |(h, t)| (h, Some(t)));
+        if let Some(path) = self
+            .imports
+            .get(&file)
+            .and_then(|imports| imports.get(head))
+        {
+            let qualified =
+                tail.map_or_else(|| path.clone(), |tail| QualifiedName::join(path, tail));
+            return self.qualified(file, &qualified);
+        }
+        self.qualified(file, name)
+    }
+
+    fn qualified(&self, file: FileId, name: &str) -> Option<usize> {
+        if let Some(id) = self.qualified.get(name) {
+            return Some(*id);
+        }
+        let (module, decl) = QualifiedName::new(&name).split_last()?;
+        let unit = self
+            .dependencies?
+            .unit_for_path(crate::module::ModuleId(file.0), module)?;
+        self.local(FileId(unit.0), decl)
+    }
+}
+
 /// Declaration identity is an index into the input class inventory, never a
 /// bare class or field name. Fields and lexical scopes both have indexed lookup.
 struct Resolver<'a> {
     classes: Vec<&'a ClassDecl>,
-    dependencies: Option<&'a crate::compiler_db::dependencies::ModuleDependencies>,
-    local: HashMap<FileId, HashMap<&'a str, usize>>,
-    qualified: HashMap<String, usize>,
-    imports: HashMap<FileId, HashMap<String, String>>,
+    names: DeclNames<'a>,
     fields: Vec<HashMap<&'a str, Span>>,
     bases: Vec<Option<Result<usize, ()>>>,
     escaping: HashSet<usize>,
@@ -165,13 +237,7 @@ struct Resolver<'a> {
 impl<'a> Resolver<'a> {
     fn new(classes: impl IntoIterator<Item = &'a ClassDecl>) -> Self {
         let classes: Vec<_> = classes.into_iter().collect();
-        let mut local: HashMap<FileId, HashMap<&str, usize>> = HashMap::new();
-        for (id, class) in classes.iter().enumerate() {
-            local
-                .entry(class.span.file_id)
-                .or_default()
-                .insert(&class.name, id);
-        }
+        let names = DeclNames::new(classes.iter().map(|c| (c.span.file_id, c.name.as_str())));
         let fields = classes
             .iter()
             .map(|c| {
@@ -184,10 +250,7 @@ impl<'a> Resolver<'a> {
             .collect();
         Self {
             classes,
-            dependencies: None,
-            local,
-            qualified: HashMap::new(),
-            imports: HashMap::new(),
+            names,
             fields,
             bases: Vec::new(),
             escaping: HashSet::new(),
@@ -196,33 +259,7 @@ impl<'a> Resolver<'a> {
     }
 
     fn class(&self, file: FileId, name: &str) -> Option<usize> {
-        if let Some(id) = self.local.get(&file).and_then(|classes| classes.get(name)) {
-            return Some(*id);
-        }
-        let (head, tail) = QualifiedName::new(name)
-            .split_first()
-            .map_or((name, None), |(h, t)| (h, Some(t)));
-        if let Some(path) = self
-            .imports
-            .get(&file)
-            .and_then(|imports| imports.get(head))
-        {
-            let qualified =
-                tail.map_or_else(|| path.clone(), |tail| QualifiedName::join(path, tail));
-            return self.qualified_class(file, &qualified);
-        }
-        self.qualified_class(file, name)
-    }
-
-    fn qualified_class(&self, file: FileId, name: &str) -> Option<usize> {
-        if let Some(id) = self.qualified.get(name) {
-            return Some(*id);
-        }
-        let (module, class) = QualifiedName::new(&name).split_last()?;
-        let unit = self
-            .dependencies?
-            .unit_for_path(crate::module::ModuleId(file.0), module)?;
-        self.local.get(&FileId(unit.0))?.get(class).copied()
+        self.names.lookup(file, name)
     }
 
     fn resolve<'w>(

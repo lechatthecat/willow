@@ -15,6 +15,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::diagnostics::FileId;
 use crate::parser::ast::{Block, BodyId, Expr, Item, Program};
+use crate::semantic::callable_slots::RawStore;
 use crate::semantic::field_writes::{BodyRef, FieldWrites, RawFieldWrite, WriteContext};
 
 #[cfg(test)]
@@ -78,6 +79,9 @@ pub(crate) struct UnitArtifacts {
     /// Field writes of each offloaded body or initializer, recorded while its
     /// syntax is still resident.
     field_writes: HashMap<BodyId, HashSet<RawFieldWrite>>,
+    /// Function-value stores of each offloaded body or initializer, recorded
+    /// with its field writes.
+    callable_stores: HashMap<BodyId, HashSet<RawStore>>,
     sources: HashMap<FileId, usize>,
     pub(crate) bodies: Rc<crate::compiler_db::ids::BodyIndex>,
     pub(crate) revision_enabled: bool,
@@ -365,6 +369,7 @@ impl UnitArtifacts {
                         blocks: HashMap::new(),
                         initializers: HashMap::new(),
                         field_writes: HashMap::new(),
+                        callable_stores: HashMap::new(),
                         sources: HashMap::new(),
                         bodies: Default::default(),
                         revision_enabled: false,
@@ -599,6 +604,23 @@ impl UnitArtifacts {
     pub(crate) fn offload(&mut self, program: &mut Program) -> Result<()> {
         let _live = self.live(UnitKind::Ast);
         self.body_index_mut().register_program(program);
+        // Record stores of every body still resident, while its syntax is.
+        crate::semantic::callable_slots::for_each_body(
+            program,
+            |body, context, params, type_params| {
+                let key = match &body {
+                    BodyRef::Block(block) if !self.blocks.contains_key(&block.id) => block.id,
+                    BodyRef::Initializer(expr) if !self.initializers.contains_key(&expr.id()) => {
+                        self.bodies
+                            .initializer_body(expr.id())
+                            .expect("indexed initializer")
+                    }
+                    _ => return,
+                };
+                self.callable_stores
+                    .insert(key, body.collect_stores(context, params, type_params));
+            },
+        );
         for item in &mut program.items {
             match item {
                 Item::Function(function) => self.offload_block(
@@ -699,6 +721,31 @@ impl UnitArtifacts {
             Some(dependencies),
             writes.into_iter().chain(&resident),
         )
+    }
+
+    /// Every function-value store of the live unit shells: recorded facts of
+    /// offloaded bodies, and a direct walk of bodies that are still resident.
+    pub(crate) fn callable_stores<'a>(
+        &self,
+        programs: impl IntoIterator<Item = &'a Program>,
+    ) -> Vec<RawStore> {
+        let mut stores = Vec::new();
+        for program in programs {
+            crate::semantic::callable_slots::for_each_body(
+                program,
+                |body, context, params, type_params| {
+                    let key = match &body {
+                        BodyRef::Block(block) => Some(self.bodies.source_body(block.id)),
+                        BodyRef::Initializer(expr) => self.bodies.initializer_body(expr.id()),
+                    };
+                    match key.and_then(|key| self.callable_stores.get(&key)) {
+                        Some(recorded) => stores.extend(recorded.iter().cloned()),
+                        None => stores.extend(body.collect_stores(context, params, type_params)),
+                    }
+                },
+            );
+        }
+        stores
     }
 
     pub(crate) fn hydrate(&self, summary: &Program, file: FileId) -> Result<LiveUnit<Program>> {

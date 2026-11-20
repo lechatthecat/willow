@@ -1,8 +1,8 @@
 // Body-based semantic effects: synchronous comparators are non-blocking,
 // while a synchronous closure calling BlockingCell::get retains MAY_BLOCK.
 class Heap {
-    pub compare: closure(i64, i64) -> bool;
-    pub init(self, compare: closure(i64, i64) -> bool) {
+    pub compare: fn(i64, i64) -> bool;
+    pub init(self, compare: fn(i64, i64) -> bool) {
         self.compare = compare;
     }
     pub fn before(self, a: i64, b: i64) -> bool {
@@ -17,11 +17,11 @@ class Dijkstra {
         return heap.before(1, 3);
     }
 }
-fn apply(f: closure() -> bool) -> bool { return f(); }
+fn apply(f: fn() -> bool) -> bool { return f(); }
 fn main() {
     let route = new Dijkstra();
     println(route.route());
     let cell = BlockingCell::new(false);
-    let f: closure() -> bool = || cell.get();
+    let f: fn() -> bool = || cell.get();
     println(apply(f));
 }

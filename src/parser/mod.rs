@@ -272,16 +272,15 @@ impl Parser {
         let mut arities: Vec<_> = self.tuple_arities.iter().copied().collect();
         arities.sort_unstable();
         items.extend(arities.into_iter().map(tuples::declaration));
-        (
-            Program {
-                instantiation_types: Vec::new(),
-                type_uses: std::mem::take(&mut self.type_uses),
-                module,
-                imports,
-                items,
-            },
-            errors,
-        )
+        let mut program = Program {
+            instantiation_types: Vec::new(),
+            type_uses: std::mem::take(&mut self.type_uses),
+            module,
+            imports,
+            items,
+        };
+        crate::semantic::callable_slots::apply_program(&mut program);
+        (program, errors)
     }
 
     fn peek_kind(&self) -> &TokenKind {

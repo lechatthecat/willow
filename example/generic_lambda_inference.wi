@@ -8,7 +8,7 @@ fn map<T, U>(xs: Array<T>, f: fn(T) -> U) -> Array<U> {
     return out;
 }
 
-fn map_with<T, U>(xs: Array<T>, f: closure(T) -> U) -> Array<U> {
+fn map_with<T, U>(xs: Array<T>, f: fn(T) -> U) -> Array<U> {
     let out: Array<U> = [];
     for x in xs { out.push(f(x)); }
     return out;

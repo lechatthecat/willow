@@ -1031,7 +1031,7 @@ impl TypeChecker {
                     (ParamMode::Value, CallArgMode::Value) => {
                         if !self.types_compatible(&param.ty, aty) {
                             let expected = self.diagnostic_type_name(&param.ty);
-                            self.push(
+                            self.push(self.with_callable_kind_help(
                                 Diagnostic::new(
                                     Severity::Error,
                                     self.type_mismatch_error_code(&param.ty, aty),
@@ -1046,8 +1046,7 @@ impl TypeChecker {
                                 .with_label(Label::primary(
                                     arg.expr.span(),
                                     format!("expected `{expected}`"),
-                                )),
-                            );
+                                )), &param.ty, aty));
                         }
                     }
                     (ParamMode::Value, CallArgMode::Reference { .. }) => {

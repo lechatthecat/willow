@@ -1,0 +1,78 @@
+// function_values.wi — one function type for named functions and lambdas.
+//
+// `fn(T) -> R` is the only function type users write. A named function, a
+// lambda that captures nothing and a lambda that captures locals are all
+// values of it, so they mix freely in generics, arrays, class fields, return
+// values and task arguments. Whether a call goes through an environment is
+// decided by the compiler, and a call written through a local that always
+// holds one named function compiles to a direct call.
+
+import std::collections::Array;
+
+fn double(x: i64) -> i64 { return x * 2; }
+fn inc(x: i64) -> i64 { return x + 1; }
+
+// Generic code receives either kind.
+fn apply_twice<T>(f: fn(T) -> T, value: T) -> T { return f(f(value)); }
+
+// Return values: a named function or a capturing lambda, same type.
+fn pick(capture: bool, offset: i64) -> fn(i64) -> i64 {
+    if capture {
+        return |x: i64| x + offset;
+    }
+    return double;
+}
+
+// Class fields store either kind.
+class Stage {
+    pub name: String;
+    pub run: fn(i64) -> i64;
+}
+
+async fn run_in_task(f: fn(i64) -> i64, x: i64) -> i64 {
+    await sleep(1);
+    return f(x);
+}
+
+async fn main() {
+    let base = 100;
+    let add_base = |x: i64| x + base;
+
+    // Arrays hold named functions and lambdas side by side.
+    let steps: Array<fn(i64) -> i64> = [double, add_base, inc, |x: i64| x * x];
+    let mut value = 3;
+    let mut i = 0;
+    while i < steps.len() {
+        let step = steps[i];
+        value = step(value);
+        i = i + 1;
+    }
+    println(value);                         // ((3*2)+100+1)^2 = 11449
+
+    println(apply_twice(double, 5));        // 20
+    println(apply_twice(add_base, 5));      // 205
+    println(apply_twice(|s: String| s + "!", "hi")); // hi!!
+
+    let named = pick(false, 7);
+    let captured = pick(true, 7);
+    println(named(10));                     // 20
+    println(captured(10));                  // 17
+
+    let stages: Array<Stage> = [new Stage("double", double), new Stage("shift", |x: i64| x - base)];
+    let mut j = 0;
+    while j < stages.len() {
+        let stage = stages[j];
+        println(stage.name + " " + (stage.run)(42).toString());
+        j = j + 1;
+    }
+
+    // Tasks accept named functions and lambdas that capture immutable values.
+    let a = run_in_task(inc, 1);
+    let b = run_in_task(|x: i64| x * base, 2);
+    println(await a);                       // 2
+    println(await b);                       // 200
+
+    // A local bound once to a named function is called directly.
+    let f = double;
+    println(f(21));                         // 42
+}

@@ -582,7 +582,7 @@ fn binding_declarations_report_declared_types_and_gaps_have_no_expression() {
     let f = Fixture::new();
     fs::write(
         f.0.join("src/main.wi"),
-        "fn apply(f: closure(i64) -> f64, x: i64) -> f64 { return f(x); }\n\
+        "fn apply(f: fn(i64) -> f64, x: i64) -> f64 { return f(x); }\n\
          fn pick(o: Option<f64>) -> i64 {\n\
          \x20   return match o {\n\
          \x20       Some(h) => 1,\n\
@@ -591,25 +591,25 @@ fn binding_declarations_report_declared_types_and_gaps_have_no_expression() {
          }\n\
          fn main() {\n\
          \x20   let total = apply(|i: i64| -> f64 { return 1.5; }, 3);\n\
-         \x20   let g: closure(i64) -> i64 = |n| n * 2; let twice = [g(1), 2];\n\
+         \x20   let g: fn(i64) -> i64 = |n| n * 2; let twice = [g(1), 2];\n\
          \x20   for item in twice { println( item /* note */ ); }\n\
          \x20   println(pick(Some(total)) + ( 1 ));\n\
          }\n",
     )
     .unwrap();
     for (selector, expected) in [
-        ("src/main.wi:9:24", "i64"),                 // annotated lambda parameter
-        ("src/main.wi:10:35", "i64"),                // inferred lambda parameter
-        ("src/main.wi:4:14", "f64"),                 // pattern binding in an i64 match
-        ("src/main.wi:9:9", "f64"),                  // let binding
-        ("src/main.wi:11:9", "i64"),                 // for binding
-        ("src/main.wi:1:10", "closure(i64) -> f64"), // function parameter
-        ("src/main.wi:2:9", "Option<f64>"),          // function parameter
-        ("src/main.wi:1:60", "i64"),                 // parameter use
-        ("src/main.wi:3:18", "Option<f64>"),         // scrutinee use
+        ("src/main.wi:9:24", "i64"),            // annotated lambda parameter
+        ("src/main.wi:10:35", "i64"),           // inferred lambda parameter
+        ("src/main.wi:4:14", "f64"),            // pattern binding in an i64 match
+        ("src/main.wi:9:9", "f64"),             // let binding
+        ("src/main.wi:11:9", "i64"),            // for binding
+        ("src/main.wi:1:10", "fn(i64) -> f64"), // function parameter
+        ("src/main.wi:2:9", "Option<f64>"),     // function parameter
+        ("src/main.wi:1:60", "i64"),            // parameter use
+        ("src/main.wi:3:18", "Option<f64>"),    // scrutinee use
         ("src/main.wi:12:13", "fn(Option<f64>) -> i64"), // callee token
-        ("src/main.wi:12:35", "i64"),                // literal inside parentheses
-        ("src/main.wi:11:34", "i64"),                // for binding use
+        ("src/main.wi:12:35", "i64"),           // literal inside parentheses
+        ("src/main.wi:11:34", "i64"),           // for binding use
     ] {
         let value = f.json(&["type", selector], 0);
         assert_eq!(
@@ -953,7 +953,7 @@ fn impact_groups_definitions_direct_and_indirect_callers() {
     let f = Fixture::new();
     fs::write(
         f.0.join("src/main.wi"),
-        "interface Ev { fn score(self, n: i64) -> i64; }\nclass A implements Ev { pub fn score(self, n: i64) -> i64 { return n; } }\nclass B implements Ev { pub fn score(self, n: i64) -> i64 { return new A().score(n) + 1; } }\nclass C implements Ev { pub fn score(self, n: i64) -> i64 { return 3; } }\nclass Other { pub fn score(self, n: i64) -> i64 { return 9; } }\nfn dispatch(e: Ev) -> i64 { return e.score(1); }\nfn concrete() -> i64 { return new C().score(2); }\nfn both(e: Ev) -> i64 { return e.score(3) + dispatch(e); }\nfn via<T>(x: T, e: Ev) -> i64 { return e.score(4); }\nfn recurse(e: Ev, k: i64) -> i64 { if k == 0 { return e.score(5); } return recurse(e, k - 1); }\nfn apply(f: closure(i64) -> i64) -> i64 { return f(6); }\nfn hop1(e: Ev) -> i64 { return dispatch(e) + concrete(); }\nfn hop2(e: Ev) -> i64 { return hop1(e); }\nfn unrelated() -> i64 { return new Other().score(7); }\nfn main() {\n    let e: Ev = new B();\n    println(hop2(e));\n    println(both(e));\n    println(via(1, e));\n    println(via(true, e));\n    println(recurse(e, 2));\n    println(apply(|n: i64| -> i64 { return e.score(n); }));\n    println(unrelated());\n}\n",
+        "interface Ev { fn score(self, n: i64) -> i64; }\nclass A implements Ev { pub fn score(self, n: i64) -> i64 { return n; } }\nclass B implements Ev { pub fn score(self, n: i64) -> i64 { return new A().score(n) + 1; } }\nclass C implements Ev { pub fn score(self, n: i64) -> i64 { return 3; } }\nclass Other { pub fn score(self, n: i64) -> i64 { return 9; } }\nfn dispatch(e: Ev) -> i64 { return e.score(1); }\nfn concrete() -> i64 { return new C().score(2); }\nfn both(e: Ev) -> i64 { return e.score(3) + dispatch(e); }\nfn via<T>(x: T, e: Ev) -> i64 { return e.score(4); }\nfn recurse(e: Ev, k: i64) -> i64 { if k == 0 { return e.score(5); } return recurse(e, k - 1); }\nfn apply(f: fn(i64) -> i64) -> i64 { return f(6); }\nfn hop1(e: Ev) -> i64 { return dispatch(e) + concrete(); }\nfn hop2(e: Ev) -> i64 { return hop1(e); }\nfn unrelated() -> i64 { return new Other().score(7); }\nfn main() {\n    let e: Ev = new B();\n    println(hop2(e));\n    println(both(e));\n    println(via(1, e));\n    println(via(true, e));\n    println(recurse(e, 2));\n    println(apply(|n: i64| -> i64 { return e.score(n); }));\n    println(unrelated());\n}\n",
     )
     .unwrap();
     let listing = |args: &[&str]| {
@@ -2439,11 +2439,11 @@ fn callee_type_cli_reports_callable_types() {
     let source = include_str!("../tests/regressions/callee_type_queries.wi");
     fs::write(f.0.join("src/main.wi"), source).unwrap();
     for (needle, expected) in [
-        ("callback(value)", "closure(i64) -> f64"),
+        ("callback(value)", "fn(i64) -> f64"),
         ("function(value)", "fn(i64) -> i64"),
         ("increment(3)", "fn(i64) -> i64"),
         ("local(4)", "fn(i64) -> i64"),
-        ("captured(5)", "closure(i64) -> i64"),
+        ("captured(5)", "fn(i64) -> i64"),
     ] {
         let byte = source.find(needle).unwrap();
         let line = source[..byte].bytes().filter(|&b| b == b'\n').count() + 1;
@@ -3349,16 +3349,16 @@ fn generic_closure_value_calls_keep_queries_available() {
     fs::write(
         f.0.join("src/coll.wi"),
         "module coll;\n\
-         pub fn apply<T>(x: T, f: closure(T) -> T) -> T { return f(x); }\n\
-         pub fn relay<T>(x: T, f: closure(T) -> T) -> T { return apply(x, f); }\n\
-         pub fn nested<T>(x: T, f: closure(T) -> T) -> T { let h = |y: T| f(y); return h(x); }\n\
-         pub class Box<T> {\n    pub value: T;\n    pub fn map(self, f: closure(T) -> T) -> T { return f(self.value); }\n    pub fn twice(self, f: closure(T) -> T) -> T { let g = f; return g(g(self.value)); }\n}\n",
+         pub fn apply<T>(x: T, f: fn(T) -> T) -> T { return f(x); }\n\
+         pub fn relay<T>(x: T, f: fn(T) -> T) -> T { return apply(x, f); }\n\
+         pub fn nested<T>(x: T, f: fn(T) -> T) -> T { let h = |y: T| f(y); return h(x); }\n\
+         pub class Box<T> {\n    pub value: T;\n    pub fn map(self, f: fn(T) -> T) -> T { return f(self.value); }\n    pub fn twice(self, f: fn(T) -> T) -> T { let g = f; return g(g(self.value)); }\n}\n",
     )
     .unwrap();
     fs::write(
         f.0.join("src/main.wi"),
         "import coll;\nimport coll::Box;\n\
-         fn local<T>(x: T, f: closure(T) -> T) -> T { return f(x); }\n\
+         fn local<T>(x: T, f: fn(T) -> T) -> T { return f(x); }\n\
          fn unrelated() -> i64 { return 7; }\n\
          fn main() {\n    let k = 1;\n    println(local(3, |x: i64| x + k));\n    println(local(\"a\", |s: String| s + \"b\"));\n    println(coll::apply(3, |x: i64| x + k));\n    println(coll::apply(\"c\", |s: String| s + \"d\"));\n    println(coll::relay(4, |x: i64| x * 2));\n    println(coll::nested(5, |x: i64| x - k));\n    let b = new Box<i64>(10);\n    println(b.map(|x: i64| x + k));\n    println(b.twice(|x: i64| x + 1));\n    let c = new Box<String>(\"q\");\n    println(c.map(|s: String| s + \"!\"));\n    println(c.twice(|s: String| s + \"?\"));\n    println(unrelated());\n}\n",
     )
@@ -6170,7 +6170,7 @@ fn generic_declaration_signatures() {
     for (name, expected) in [
         ("identity", "fn<T>(T) -> T"),
         ("choose", "fn<A, B>(A, B) -> A"),
-        ("iterate", "fn<T>(T, i64, closure(T) -> T) -> T"),
+        ("iterate", "fn<T>(T, i64, fn(T) -> T) -> T"),
         ("Box", "main::Box<T>"),
         ("Pair", "main::Pair<A, B>"),
         ("Box::get", "fn<T>() -> T"),

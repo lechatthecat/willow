@@ -57,14 +57,14 @@ fn async_retention_intermediate_rejections() {
         let source = format!(
             r#"
 import std::collections::Array;
-class Holder {{ pub value: closure(i64) -> i64; }}
-fn identity(op: closure(i64) -> i64) -> closure(i64) -> i64 {{ return op; }}
-fn consume(op: closure(i64) -> i64, n: i64) {{ println(op(n)); }}
+class Holder {{ pub value: fn(i64) -> i64; }}
+fn identity(op: fn(i64) -> i64) -> fn(i64) -> i64 {{ return op; }}
+fn consume(op: fn(i64) -> i64, n: i64) {{ println(op(n)); }}
 async fn number() -> i64 {{ return 1; }}
 async fn main() {{
-    let op: closure(i64) -> i64 = |x| x;
+    let op: fn(i64) -> i64 = |x| x;
     let holder = new Holder(op);
-    let ops: Array<closure(i64) -> i64> = [op];
+    let ops: Array<fn(i64) -> i64> = [op];
     consume({operand}, await number());
 }}
 "#
@@ -98,7 +98,7 @@ fn async_retention_patterns_and_saved_callee_rejected() {
         ),
     ] {
         let source = format!(
-            "async fn choose() -> bool {{ return false; }} async fn main() {{ let mut op: closure(i64) -> i64 = |x| x; {body} }}"
+            "async fn choose() -> bool {{ return false; }} async fn main() {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}"
         );
         let (ok, errors) = compile_with_data_race_check(&source);
         assert!(
@@ -113,7 +113,7 @@ fn async_retention_ordered_cleanup_run_and_reject() {
     let (output, ok) = compile_and_run_with_runtime_env(
         r#"
 async fn work(flag: bool) {
-    let mut op: closure(i64) -> i64 = |x| x + 90;
+    let mut op: fn(i64) -> i64 = |x| x + 90;
     defer { if flag { op = |x| x + 1; } else { op = |x| x + 2; } println(op(1)); }
     await sleep(0);
 }
@@ -131,7 +131,7 @@ async fn main() { await work(true); await work(false); }
     let (ok, errors) = compile_with_data_race_check(
         r#"
 async fn work(flag: bool) {
-    let mut op: closure(i64) -> i64 = |x| x;
+    let mut op: fn(i64) -> i64 = |x| x;
     defer { if flag { op = |x| x + 1; } println(op(1)); }
     await sleep(0);
 }
@@ -148,7 +148,7 @@ async fn main() { await work(false); }
 fn async_retention_cleanup_continuations_run() {
     let source = r#"
 async fn main() {
-    let mut op: closure(i64) -> i64 = |x| x;
+    let mut op: fn(i64) -> i64 = |x| x;
     await sleep(0);
     if true { defer { op = |x| x + 1; } }
     println(op(1));
@@ -185,7 +185,7 @@ fn async_retention_exhaustive_match_overwrites_run() {
     let source = r#"
 enum Tag { A, B }
 async fn work(flag: bool, tag: Tag) {
-    let mut op: closure(i64) -> i64 = |x| x;
+    let mut op: fn(i64) -> i64 = |x| x;
     await sleep(0);
     match flag { true => { op = |x| x + 1; }, false => { op = |x| x + 2; } }
     println(op(1));
@@ -222,7 +222,7 @@ fn async_retention_literal_expression_branches_run() {
     let source = r#"
 async fn choose() -> bool { println(99); return true; }
 async fn main() {
-    let op: closure(i64) -> i64 = |x| x;
+    let op: fn(i64) -> i64 = |x| x;
     let a = false && await choose();
     let b = true || await choose();
     let c = true ? false : await choose();
@@ -250,7 +250,7 @@ async fn main() {
         "false ? false : await choose()",
     ] {
         let source = format!(
-            "async fn choose() -> bool {{ return true; }} async fn main() {{ let op: closure(i64) -> i64 = |x| x; let b = {expr}; println(op(1)); }}"
+            "async fn choose() -> bool {{ return true; }} async fn main() {{ let op: fn(i64) -> i64 = |x| x; let b = {expr}; println(op(1)); }}"
         );
         let (ok, errors) = compile_with_data_race_check(&source);
         assert!(!ok && errors.contains("E2402"), "{expr}: {errors}");
@@ -269,7 +269,7 @@ fn async_retention_bare_variant_rejections() {
                 format!("match tag {{ {a} => {{}}, {b} => {{ await sleep(0); println(op(1)); }} }}")
             };
             let source = format!(
-                "enum Tag {{ A, B }} async fn work(tag: Tag) {{ let op: closure(i64) -> i64 = |x| x; {body} }} async fn main() {{ await work(Tag::B); }}"
+                "enum Tag {{ A, B }} async fn work(tag: Tag) {{ let op: fn(i64) -> i64 = |x| x; {body} }} async fn main() {{ await work(Tag::B); }}"
             );
             let (ok, errors) = compile_with_data_race_check(&source);
             assert!(
@@ -284,7 +284,7 @@ fn async_retention_bare_variant_rejections() {
 fn async_retention_literal_match_guards_run() {
     let source = r#"
 async fn main() {
-    let mut op: closure(i64) -> i64 = |x| x;
+    let mut op: fn(i64) -> i64 = |x| x;
     match true { _ if false => { await sleep(0); println(op(99)); }, _ => {} }
     match true { _ if true => {}, _ => { await sleep(0); println(op(99)); } }
     println(op(1));
@@ -330,7 +330,7 @@ fn async_retention_never_cli_diagnostics() {
             true,
         ),
     ] {
-        let source = format!("async fn main() {{ let op: closure(i64) -> i64 = |x| x; {body} }}");
+        let source = format!("async fn main() {{ let op: fn(i64) -> i64 = |x| x; {body} }}");
         let (ok, errors) = compile_with_data_race_check(&source);
         assert_eq!(ok, !bad, "{body}: {errors}");
         assert_eq!(errors.contains("E2402"), bad, "{body}: {errors}");
@@ -341,7 +341,7 @@ fn async_retention_never_cli_diagnostics() {
 fn async_retention_never_cleanup_recovery_run() {
     let source = r#"
 async fn unreachable() {
-    let op: closure(i64) -> i64 = |x| x;
+    let op: fn(i64) -> i64 = |x| x;
     if true {
         defer { recover(); }
         panic("recovered");
@@ -351,7 +351,7 @@ async fn unreachable() {
 }
 async fn main() {
     await unreachable();
-    let mut op: closure(i64) -> i64 = |x| x;
+    let mut op: fn(i64) -> i64 = |x| x;
     await sleep(0);
     if true {
         defer { recover(); }
@@ -390,7 +390,7 @@ fn async_retention_exceptional_cleanup_cli() {
                 format!("{operation} op = |x| x + 1;")
             };
             let source = format!(
-                "fn fail() {{ panic(\"stop\"); }} async fn main() {{ let zero = 0; let mut values = [1]; let mut op: closure(i64) -> i64 = |x| x; defer {{ println(op(1)); }} defer {{ {cleanup} }} await sleep(0); }}"
+                "fn fail() {{ panic(\"stop\"); }} async fn main() {{ let zero = 0; let mut values = [1]; let mut op: fn(i64) -> i64 = |x| x; defer {{ println(op(1)); }} defer {{ {cleanup} }} await sleep(0); }}"
             );
             let (ok, errors) = compile_with_data_race_check(&source);
             assert_eq!(ok, overwrite_first, "{operation}: {errors}");
@@ -408,7 +408,7 @@ fn async_retention_exceptional_cleanup_overwrite_run() {
     let source = r#"
 fn fail() { panic("cleanup"); }
 async fn main() {
-    let mut op: closure(i64) -> i64 = |x| x;
+    let mut op: fn(i64) -> i64 = |x| x;
     defer { recover(); }
     defer { println(op(1)); }
     defer { op = |x| x + 1; fail(); }
@@ -443,7 +443,7 @@ async fn main() {
         defer { recover(); }
         await t;
     }
-    let mut op: closure(i64) -> i64 = |x| x;
+    let mut op: fn(i64) -> i64 = |x| x;
     await sleep(0);
     if true {
         defer { recover(); }

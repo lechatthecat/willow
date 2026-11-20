@@ -55,7 +55,9 @@ async fn main() { await forward([1, 2, 3]); }
 // Send/Sync checks make task migration sound regardless of worker count.
 const NONSEND_ASYNC_FRAME_SRC: &str = r#"
 async fn run() -> i64 {
-    let op: closure(i64) -> i64 = |x| x + 1;
+    // Mutating a capture makes the function value task-local.
+    let mut n = 1;
+    let op = |x: i64| { n = n + x; return n; };
     await sleep(1);
     return op(41);
 }

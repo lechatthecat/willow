@@ -1985,8 +1985,67 @@ impl TypeChecker {
             // interface its declaration extends: `extends` names no type
             // arguments (E0427), so `Get<i64>` <: `Base`.
             (Type::Generic(child, _), Type::Named(parent)) => self.interface_extends(child, parent),
+            (Type::Fn(..) | Type::Closure(..), Type::Fn(..) | Type::Closure(..)) => {
+                self.callable_subtype(actual, expected)
+            }
+            (Type::Generic(..), Type::Generic(..)) => self.callable_kinds_widen(actual, expected),
             _ => false,
         }
+    }
+
+    /// Whether `actual` converts to `expected` by widening callable kinds
+    /// only: identical types, a callable subtype, or the same immutable
+    /// builtin (`Option`, `Result`, `FrozenArray`, `FrozenMap`, `Task`)
+    /// whose arguments widen. Those builtins never store a new value into
+    /// an existing instance, so a shareable function value read through
+    /// them is still one that fits the task-local kind; mutable containers
+    /// stay invariant because a store through the wider view would put a
+    /// task-local value where the narrower one promises a shareable one.
+    fn callable_kinds_widen(&self, actual: &Type, expected: &Type) -> bool {
+        if self.same_type_identity(expected, actual) {
+            return true;
+        }
+        match (actual, expected) {
+            (Type::Fn(..) | Type::Closure(..), Type::Fn(..) | Type::Closure(..)) => {
+                self.callable_subtype(actual, expected)
+            }
+            (
+                Type::Generic(actual_name, actual_args),
+                Type::Generic(expected_name, expected_args),
+            ) => {
+                actual_name == expected_name
+                    && actual_args.len() == expected_args.len()
+                    && matches!(
+                        B::from_name(actual_name),
+                        Some(B::Option | B::Result | B::FrozenArray | B::FrozenMap | B::Task)
+                    )
+                    && actual_args
+                        .iter()
+                        .zip(expected_args)
+                        .all(|(actual, expected)| self.callable_kinds_widen(actual, expected))
+            }
+            _ => false,
+        }
+    }
+
+    /// Function values share one representation, so only the checker's
+    /// knowledge of the captured environment separates the two callable
+    /// kinds: a shareable `Fn` serves where a task-local `Closure` is
+    /// expected, never the reverse. Signatures follow ordinary variance over
+    /// that kind (parameters contravariant, result covariant); every other
+    /// component stays exact, because a conversion there would change the
+    /// value's representation (interface boxing) or its mutability contract.
+    fn callable_subtype(&self, actual: &Type, expected: &Type) -> bool {
+        let (Type::Fn(ap, ar) | Type::Closure(ap, ar), Type::Fn(ep, er) | Type::Closure(ep, er)) =
+            (actual, expected)
+        else {
+            return false;
+        };
+        if matches!((actual, expected), (Type::Closure(..), Type::Fn(..))) || ap.len() != ep.len() {
+            return false;
+        }
+        let component = |a: &Type, e: &Type| self.callable_kinds_widen(a, e);
+        ap.iter().zip(ep).all(|(a, e)| component(e, a)) && component(ar, er)
     }
 
     /// True when error type `e1` can be converted to `e2` for `?` automatic
@@ -2121,14 +2180,15 @@ impl TypeChecker {
         found: &Type,
         span: Span,
     ) {
-        let expected = self.diagnostic_type_name(expected);
-        let found = self.diagnostic_type_name(found);
-        self.push_error(
+        let expected_name = self.diagnostic_type_name(expected);
+        let found_name = self.diagnostic_type_name(found);
+        let diagnostic = Self::error_at(
             code,
-            format!("mismatched types: expected `{expected}`, found `{found}`"),
+            format!("mismatched types: expected `{expected_name}`, found `{found_name}`"),
             span,
-            format!("expected `{expected}`"),
+            format!("expected `{expected_name}`"),
         );
+        self.push(self.with_callable_kind_help(diagnostic, expected, found));
     }
 
     /// [`Self::push_type_mismatch_with_code`] with the code chosen by
@@ -2662,7 +2722,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-mod fn_closure_diagnostic_tests;
+mod function_value_unification_tests;
 
 /// A signature registered from another module keeps its source spelling, so a
 /// bundled storage class (`Array<T>`) must become its storage type there, as
