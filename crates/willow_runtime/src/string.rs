@@ -17,6 +17,7 @@ pub(crate) const ALLOCATION_COPY_BYTES: crate::observation::Counter =
 mod methods;
 pub use methods::*;
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::gc::{GcObjectKind, willow_alloc_with_layout, willow_gc_add_runtime_root};
@@ -35,15 +36,37 @@ fn string_payload_size(len: usize) -> Option<i64> {
     i64::try_from(size).ok()
 }
 
+// Every string producer, including generated TLAB allocation, returns a GC
+// word-aligned payload. The ABI reserves its first word for the byte length.
+const _: () = assert!(LEN_OFFSET == 0 && size_of::<i64>() == DATA_OFFSET);
+
+#[inline]
+unsafe fn payload_length(string: *const u8) -> i64 {
+    // SAFETY: the caller supplies a live string with its length word initialized.
+    unsafe { string.cast::<i64>().read() }
+}
+
+/// Initialize a fresh string whose checked allocation includes the header,
+/// `length` data bytes and a terminator.
+#[inline]
+pub(crate) unsafe fn initialize_length(string: *mut u8, length: usize) {
+    // SAFETY: the caller owns a fresh word-aligned payload sized for this length.
+    unsafe { string.cast::<i64>().write(length as i64) }
+}
+
 /// UTF-8 byte length excluding the NUL terminator. No allocation or safepoint.
+///
+/// # Safety
+/// A non-null value must point to the aligned, initialized length word of a live
+/// WillowString and remain readable through the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_string_len(value: *const u8) -> i64 {
+pub unsafe extern "C" fn willow_string_len(value: *const u8) -> i64 {
     if value.is_null() {
         return 0;
     }
     // SAFETY: a non-null argument is a live WillowString payload.
-    unsafe { *(value.add(LEN_OFFSET as usize) as *const i64) }
+    unsafe { payload_length(value) }
 }
 
 /// Allocate a new WillowString from a raw UTF-8 byte slice.
@@ -51,9 +74,16 @@ pub extern "C" fn willow_string_len(value: *const u8) -> i64 {
 /// Returns a pointer to the payload (the `len` field at offset 0).
 /// Negative/unrepresentable lengths and a null byte pointer with positive
 /// length are rejected with null. Managed storage exhaustion terminates.
+///
+/// # Safety
+/// For a positive, representable length and a non-null pointer, `bytes` must
+/// address that many initialized, readable bytes in one allocation. Native
+/// storage must remain live through the copy. The bytes must not be mutated
+/// during validation or copying. Managed input
+/// must be current on entry so the runtime can pin it before allocating.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_string_alloc(bytes: *const u8, len: i64) -> *mut u8 {
+pub unsafe extern "C" fn willow_string_alloc(bytes: *const u8, len: i64) -> *mut u8 {
     if len < 0 {
         return std::ptr::null_mut();
     }
@@ -65,9 +95,12 @@ pub extern "C" fn willow_string_alloc(bytes: *const u8, len: i64) -> *mut u8 {
         return std::ptr::null_mut();
     };
     if len_usize > 0 {
+        // SAFETY: For positive lengths the caller supplies that many readable bytes. The checked
+        // payload size includes the header and terminator.
         let input = unsafe { std::slice::from_raw_parts(bytes, len_usize) };
         require_utf8(input);
     }
+    // SAFETY: The input passed UTF-8 validation and payload_size includes its header and NUL.
     unsafe { alloc_validated_bytes(bytes, len_usize, payload_size) }
 }
 
@@ -78,12 +111,16 @@ unsafe fn alloc_validated_bytes(bytes: *const u8, len_usize: usize, payload_size
     let _loan = (len_usize != 0)
         .then(|| crate::gc::PinLease::<crate::gc::InteriorPointer>::for_address(bytes))
         .flatten();
-    let ptr = willow_alloc_with_layout(GcObjectKind::String, 0, payload_size, 0);
+    // SAFETY: The requested layout describes the initialized words of this object and its
+    // type’s tracing or finalization contract.
+    let ptr = unsafe { willow_alloc_with_layout(GcObjectKind::String, 0, payload_size, 0) };
     if ptr.is_null() {
         return ptr;
     }
+    // SAFETY: The fresh word-aligned string has room for the checked byte count, its header and
+    // the terminating NUL.
     unsafe {
-        *(ptr.add(LEN_OFFSET as usize) as *mut i64) = len_usize as i64;
+        initialize_length(ptr, len_usize);
         if len_usize > 0 {
             std::ptr::copy_nonoverlapping(bytes, ptr.add(DATA_OFFSET), len_usize);
             crate::observation::record(crate::observation::Event::AllocationCopyBytes, len_usize);
@@ -121,29 +158,46 @@ pub(crate) fn clear_string_literal_slots() {
 
 /// Retrieve a permanently rooted literal using compiler-owned static storage.
 ///
-/// `slot` must point to a pointer-aligned, initially zero atomic pointer with
-/// process lifetime. Every use of a slot must supply the same valid static UTF-8
-/// bytes and length. Different literals (including prefixes) need distinct slots.
-/// Heap reset must be quiescent; it clears every initialized slot before reuse.
+/// # Safety
+/// The slot must be non-null, aligned for AtomicPtr, writable atomically for its entire process lifetime,
+/// initially null, and dedicated to this literal and its runtime until quiescent
+/// reset. Only the initializer and reset may publish values. Successful uses
+/// must specify the same static byte range. For a non-null pointer and accepted
+/// positive length, that range must contain `len` initialized, readable bytes.
+///
+/// ```compile_fail,E0133
+/// use std::sync::atomic::AtomicPtr;
+/// use willow_runtime::string::willow_string_literal_slot;
+/// static SLOT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+/// willow_string_literal_slot(&SLOT, b"x".as_ptr(), 1);
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_string_literal_slot(
+pub unsafe extern "C" fn willow_string_literal_slot(
     slot: *const AtomicPtr<u8>,
     bytes: *const u8,
     len: i64,
 ) -> *mut u8 {
     // SAFETY: compiler-generated writable static slot obeys the contract above.
     let slot: &'static AtomicPtr<u8> = unsafe { &*slot };
-    initialize_rooted_slot(slot, || willow_string_alloc(bytes, len))
+    let allocate = || {
+        // SAFETY: This literal owns its static byte range across initialization.
+        unsafe { willow_string_alloc(bytes, len) }
+    };
+    // SAFETY: The dedicated slot outlives reset. The byte constructor returns
+    // fresh old-space storage, and initialization publishes it before returning.
+    unsafe { initialize_rooted_slot(slot, allocate) }
 }
 
 /// The shared once-per-runtime initialization of a compiler-owned static slot
 /// holding a permanently rooted, never-moving object: string literals and
 /// function values both use it, so they share one reset registry.
 ///
-/// `allocate` must return an old (never-moving) object or null; null leaves the
-/// slot empty so a later call retries.
-pub(crate) fn initialize_rooted_slot(
+/// # Safety
+/// Use a dedicated slot in the current runtime until quiescent reset.
+/// The initializer must return a fresh old-space object of the slot's type
+/// or null. No other writer may publish a value in this slot.
+pub(crate) unsafe fn initialize_rooted_slot(
     slot: &'static AtomicPtr<u8>,
     allocate: impl FnOnce() -> *mut u8,
 ) -> *mut u8 {
@@ -163,7 +217,9 @@ pub(crate) fn initialize_rooted_slot(
                 .expect("a slot initializes at most once per call");
             let ptr = allocate();
             if !ptr.is_null() {
-                willow_gc_add_runtime_root(ptr);
+                // SAFETY: The runtime keeps this nonmoving payload at its registered address
+                // through removal.
+                unsafe { willow_gc_add_runtime_root(ptr) };
                 // No GC allocation/safepoint while holding the reset registry
                 // lock, and no scheduler preemption can strand its owner.
                 let _no_preempt = crate::preempt::NoPreemptGuard::enter();
@@ -193,23 +249,32 @@ unsafe fn ws_as_bytes(s: *const u8) -> (*const u8, usize) {
     if s.is_null() {
         return (std::ptr::null(), 0);
     }
-    let len = unsafe { *(s.add(LEN_OFFSET as usize) as *const i64) } as usize;
+    // SAFETY: The GC word-aligns the live string and the length is its first initialized i64.
+    let len = unsafe { payload_length(s) } as usize;
+    // SAFETY: The live string contains the recorded number of bytes immediately after its length
+    // word.
     (unsafe { s.add(DATA_OFFSET) }, len)
 }
 
 /// Content equality of two strings: `==` on `String` must
 /// compare bytes, not pointers. Null-safe: two nils are equal, nil never
 /// equals a real string (this also gives `s == nil` the right meaning).
+///
+/// # Safety
+/// Each non-null string operand must be a current, live WillowString in this
+/// runtime, with its aligned length word and immutable UTF-8 payload intact.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_string_eq(lhs: *const u8, rhs: *const u8) -> i64 {
+pub unsafe extern "C" fn willow_string_eq(lhs: *const u8, rhs: *const u8) -> i64 {
     if lhs == rhs {
         return 1;
     }
     if lhs.is_null() || rhs.is_null() {
         return 0;
     }
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let l = unsafe { willow_string_as_str(lhs) };
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let r = unsafe { willow_string_as_str(rhs) };
     i64::from(l == r)
 }
@@ -218,9 +283,13 @@ pub extern "C" fn willow_string_eq(lhs: *const u8, rhs: *const u8) -> i64 {
 /// Prefixes sort before extensions; no normalization or locale collation.
 /// Inputs are live string payloads. Null is ordered before any real string.
 /// No allocation, safepoint, decoding, or full-string validation is needed.
+///
+/// # Safety
+/// Each non-null string operand must be a current, live WillowString in this
+/// runtime, with its aligned length word and immutable UTF-8 payload intact.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_string_cmp(lhs: *const u8, rhs: *const u8) -> i64 {
+pub unsafe extern "C" fn willow_string_cmp(lhs: *const u8, rhs: *const u8) -> i64 {
     if lhs == rhs {
         return 0;
     }
@@ -230,7 +299,9 @@ pub extern "C" fn willow_string_cmp(lhs: *const u8, rhs: *const u8) -> i64 {
     if rhs.is_null() {
         return 1;
     }
+    // SAFETY: The operand is null or a live string, and no safepoint intervenes in this borrow.
     let (l, ln) = unsafe { ws_as_bytes(lhs) };
+    // SAFETY: The operand is null or a live string, and no safepoint intervenes in this borrow.
     let (r, rn) = unsafe { ws_as_bytes(rhs) };
     // SAFETY: live string payloads contain their declared number of bytes.
     let ordering =
@@ -243,11 +314,16 @@ pub extern "C" fn willow_string_cmp(lhs: *const u8, rhs: *const u8) -> i64 {
 }
 
 /// Concatenate two WillowStrings and return a new GC-managed WillowString.
+///
+/// # Safety
+/// Each non-null string operand must be a current, live WillowString in this
+/// runtime, with its aligned length word and immutable UTF-8 payload intact.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u8 {
     let mut parts = [PART_STRING, lhs as u64, PART_STRING, rhs as u64];
-    concat_parts(&mut parts)
+    // SAFETY: Both string words come directly from the caller, which supplies live strings or null.
+    unsafe { concat_parts(&mut parts) }
 }
 
 /// Concatenate `count` parts into one new string: one size-summed allocation,
@@ -257,46 +333,56 @@ pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u
 /// Called directly by generated code. The call roots the string slots of
 /// `parts` itself across its allocation, which may move their referents and
 /// rewrite those slots.
+///
+/// # Safety
+/// Invalid counts and null pointers with positive counts are rejected before
+/// reading any pairs. For an accepted nonempty input, supply one u64-aligned
+/// allocation containing `count` initialized kind/value pairs. Give the runtime
+/// exclusive read/write access through return, including GC rewrites of value
+/// words. Each nonzero PART_STRING value must be the current address of a live
+/// immutable WillowString. Integer parts carry i64 bits. Zero count permits null.
+///
+/// ```compile_fail,E0133
+/// use willow_runtime::string::willow_string_concat_n;
+/// willow_string_concat_n(std::ptr::null_mut(), 0);
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_string_concat_n(parts: *mut u64, count: i64) -> *mut u8 {
-    let Some(words) = usize::try_from(count)
-        .ok()
-        .and_then(|count| count.checked_mul(2))
-        .filter(|&words| words == 0 || !parts.is_null())
-    else {
+pub unsafe extern "C" fn willow_string_concat_n(parts: *mut u64, count: i64) -> *mut u8 {
+    if count == 0 {
+        // SAFETY: An empty list contains no string pointers.
+        return unsafe { concat_parts(&mut []) };
+    }
+    const MAX_PARTS: i64 = (isize::MAX as usize / size_of::<[u64; 2]>()) as i64;
+    if parts.is_null() || !(1..=MAX_PARTS).contains(&count) {
         crate::panic_context::fatal_invariant("invalid string concatenation parts");
-    };
-    // SAFETY: generated code passes `count` initialized part pairs that only
-    // this call accesses until it returns.
-    let parts = unsafe { std::slice::from_raw_parts_mut(parts, words) };
-    concat_parts(parts)
+    }
+    // SAFETY: The caller supplies one word-aligned, exclusively writable array of
+    // initialized pairs. The checked count bounds the slice's byte size by isize::MAX.
+    let parts = unsafe { std::slice::from_raw_parts_mut(parts, count as usize * 2) };
+    // SAFETY: String words meet the entry contract, including after collector rewrites.
+    unsafe { concat_parts(parts) }
 }
 
 /// Shared body of the concatenation entries. O(parts + result length) time,
 /// one managed allocation; it reaches a GC point only on a TLAB miss.
-fn concat_parts(parts: &mut [u64]) -> *mut u8 {
-    let mut total_len = 0usize;
-    for part in parts.chunks_exact(2) {
-        let len = match part[0] {
-            // SAFETY: a string part is null or a live WillowString payload.
-            PART_STRING => unsafe { ws_as_bytes(part[1] as *const u8) }.1,
-            PART_I64 => decimal_len(part[1] as i64),
-            _ => crate::panic_context::fatal_invariant("invalid string concatenation part"),
-        };
-        match total_len.checked_add(len) {
-            Some(sum) => total_len = sum,
-            None => return concat_overflow(),
-        }
-    }
-    let Some(payload_size) = string_payload_size(total_len) else {
-        return concat_overflow();
+///
+/// # Safety
+/// Each string word must be null or a current immutable WillowString in this runtime.
+unsafe fn concat_parts(parts: &mut [u64]) -> *mut u8 {
+    let lengths = parts.chunks_exact(2).map(|part| match part[0] {
+        // SAFETY: The caller supplies a current string or null for each string word.
+        PART_STRING => unsafe { ws_as_bytes(part[1] as *const u8) }.1,
+        PART_I64 => decimal_len(part[1] as i64),
+        _ => crate::panic_context::fatal_invariant("invalid string concatenation part"),
+    });
+    let Some((total_len, payload_size)) = concat_size(lengths) else {
+        return std::ptr::null_mut();
     };
-    let payload_size = payload_size as usize;
     let ptr = match crate::gc::try_alloc_young_string_payload(payload_size) {
         Some(ptr) => ptr,
         None => {
-            let _roots = PartRoots::push(parts);
+            let _roots = SlotRoots::for_string_parts(parts);
             crate::gc::alloc_string_payload_slow(payload_size)
         }
     };
@@ -308,7 +394,9 @@ fn concat_parts(parts: &mut [u64]) -> *mut u8 {
     // SAFETY: the payload holds the length word, `total_len` bytes and a NUL;
     // the parts were measured above and are unchanged since.
     unsafe {
-        *(ptr.add(LEN_OFFSET as usize) as *mut i64) = total_len as i64;
+        // SAFETY: The fresh word-aligned string has room for the checked byte count, its header
+        // and the terminating NUL.
+        initialize_length(ptr, total_len);
         let mut out = ptr.add(DATA_OFFSET);
         for part in parts.chunks_exact(2) {
             if part[0] == PART_STRING {
@@ -326,53 +414,77 @@ fn concat_parts(parts: &mut [u64]) -> *mut u8 {
     ptr
 }
 
-fn concat_overflow() -> *mut u8 {
+#[inline]
+fn concat_size(lengths: impl Iterator<Item = usize>) -> Option<(usize, usize)> {
+    let mut total = 0usize;
+    for len in lengths {
+        let Some(sum) = total.checked_add(len) else {
+            return concat_overflow();
+        };
+        total = sum;
+    }
+    match string_payload_size(total) {
+        Some(size) => Some((total, size as usize)),
+        None => concat_overflow(),
+    }
+}
+
+fn concat_overflow() -> Option<(usize, usize)> {
     crate::panic_context::raise_language_message("string concatenation size overflow");
-    std::ptr::null_mut()
-}
-
-/// Root slots for the string parts of one concatenation, popped on drop.
-struct PartRoots(i32);
-
-impl PartRoots {
-    fn push(parts: &mut [u64]) -> Self {
-        let mut pushed = 0;
-        for part in parts.chunks_exact_mut(2) {
-            if part[0] == PART_STRING && part[1] != 0 {
-                crate::gc::willow_push_root((&mut part[1] as *mut u64).cast());
-                pushed += 1;
-            }
-        }
-        Self(pushed)
-    }
-}
-
-impl Drop for PartRoots {
-    fn drop(&mut self) {
-        crate::gc::willow_pop_roots(self.0);
-    }
+    None
 }
 
 /// Shadow-stack root slots held by a runtime entry called directly by
-/// generated code, popped on drop. Pushing and popping touch only this
-/// thread's root stack: no runtime-root map entry or heap allocation.
+/// generated code, popped on drop. Pushing may grow the native shadow-stack
+/// vector. Registration and removal need no managed allocation or GC point.
 /// The slots must stay at their addresses until the guard drops; reload
 /// every managed pointer from its slot after each GC point.
-pub(crate) struct SlotRoots(i32);
+pub(crate) struct SlotRoots<'slots> {
+    count: usize,
+    storage: std::marker::PhantomData<&'slots [Cell<*mut u8>]>,
+}
 
-impl SlotRoots {
-    pub(crate) fn push(slots: &mut [*mut u8]) -> Self {
-        for slot in slots.iter_mut() {
-            crate::gc::willow_push_root(slot);
+impl<'slots> SlotRoots<'slots> {
+    fn for_string_parts(parts: &'slots mut [u64]) -> Self {
+        let mut roots = Self {
+            count: 0,
+            storage: std::marker::PhantomData,
+        };
+        roots.push_string_parts(parts);
+        roots
+    }
+
+    fn push_string_parts(&mut self, parts: &'slots mut [u64]) {
+        for part in parts.chunks_exact_mut(2) {
+            if part[0] == PART_STRING && part[1] != 0 {
+                // SAFETY: The concat input stays exclusively borrowed at a fixed address
+                // until the guard pops these tagged string slots.
+                unsafe { crate::gc::willow_push_root((&raw mut part[1]).cast()) };
+                self.count += 1;
+            }
         }
-        Self(slots.len() as i32)
+    }
+
+    /// # Safety
+    /// Until this guard drops, each cell must contain null or a current managed pointer.
+    /// Balance nested registrations before dropping the guard.
+    pub(crate) unsafe fn push(slots: &'slots [Cell<*mut u8>]) -> Self {
+        for slot in slots {
+            // SAFETY: The initialized cell provides a stable writable slot through the
+            // matching pop.
+            unsafe { crate::gc::willow_push_root(slot.as_ptr()) };
+        }
+        Self {
+            count: slots.len(),
+            storage: std::marker::PhantomData,
+        }
     }
 }
 
-impl Drop for SlotRoots {
+impl Drop for SlotRoots<'_> {
     fn drop(&mut self) {
-        if self.0 != 0 {
-            crate::gc::willow_pop_roots(self.0);
+        if self.count != 0 {
+            crate::gc::pop_roots(self.count);
         }
     }
 }
@@ -386,7 +498,9 @@ pub(crate) fn alloc_string_payload_rooted(payload_size: usize, roots: &mut [*mut
     if let Some(ptr) = crate::gc::try_alloc_young_string_payload(payload_size) {
         return ptr;
     }
-    let _roots = SlotRoots::push(roots);
+    // SAFETY: The entry supplies its current managed inputs and the guard drops before
+    // the borrowed root slice returns to the caller.
+    let _roots = unsafe { SlotRoots::push(Cell::from_mut(roots).as_slice_of_cells()) };
     crate::gc::alloc_string_payload_slow(payload_size)
 }
 
@@ -402,7 +516,9 @@ pub(crate) fn alloc_native_string(text: &str) -> *mut u8 {
         // SAFETY: the payload holds the length word, `text.len()` bytes and a
         // NUL; `text` is native memory, unaffected by any collection above.
         unsafe {
-            *(ptr.add(LEN_OFFSET as usize) as *mut i64) = text.len() as i64;
+            // SAFETY: The fresh word-aligned string has room for the checked byte count, its
+            // header and the terminating NUL.
+            initialize_length(ptr, text.len());
             std::ptr::copy_nonoverlapping(text.as_ptr(), ptr.add(DATA_OFFSET), text.len());
             *ptr.add(DATA_OFFSET + text.len()) = 0;
         }
@@ -448,7 +564,8 @@ unsafe fn write_decimal(out: *mut u8, value: i64) -> *mut u8 {
 /// `i64.to_string()`: decimal digits written straight into the new string.
 pub(crate) fn i64_to_string(value: i64) -> *mut u8 {
     let mut parts = [PART_I64, value as u64];
-    concat_parts(&mut parts)
+    // SAFETY: The only part is an integer.
+    unsafe { concat_parts(&mut parts) }
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +578,8 @@ pub fn willow_string_from_str(s: &str) -> *mut u8 {
         return std::ptr::null_mut();
     };
     // Rust strings already guarantee UTF-8: do not rescan formatted/file text.
+    // SAFETY: The input str supplies valid UTF-8 for its length and the checked allocation size
+    // includes header and NUL.
     unsafe { alloc_validated_bytes(s.as_ptr(), s.len(), payload_size) }
 }
 
@@ -474,8 +593,10 @@ fn require_utf8(bytes: &[u8]) -> &str {
 ///
 /// # Safety
 /// `s` must be null or a valid pointer to a WillowString allocated by this
-/// runtime; the returned slice borrows that allocation for `'a`.
+/// runtime. Its header and declared bytes must stay readable, immutable and
+/// at the same address for the entire returned borrow, including across any GC point.
 pub unsafe fn willow_string_as_str<'a>(s: *const u8) -> &'a str {
+    // SAFETY: The operand is null or a live string, and no safepoint intervenes in this borrow.
     require_utf8(unsafe { willow_string_as_bytes(s) })
 }
 
@@ -483,13 +604,17 @@ pub unsafe fn willow_string_as_str<'a>(s: *const u8) -> &'a str {
 /// UTF-8 scan. Byte operations do not require constructing a Rust `str`.
 ///
 /// # Safety
-/// `s` must be null or a valid live WillowString for the returned lifetime.
+/// A non-null string and its initialized bytes must remain live, immutable and
+/// at the same address for the entire returned lifetime.
 #[inline]
 pub(crate) unsafe fn willow_string_as_bytes<'a>(s: *const u8) -> &'a [u8] {
     if s.is_null() {
         return &[];
     }
-    let len = unsafe { *(s.add(LEN_OFFSET as usize) as *const i64) } as usize;
+    // SAFETY: The GC word-aligns the live string and the length is its first initialized i64.
+    let len = unsafe { payload_length(s) } as usize;
+    // SAFETY: The live string contains the recorded number of bytes immediately after its length
+    // word.
     unsafe { std::slice::from_raw_parts(s.add(DATA_OFFSET), len) }
 }
 
@@ -506,18 +631,26 @@ mod tests {
     #[ignore = "manual literal hot-path measurement"]
     fn literal_hot_path_measurement() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         static SLOT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
         let text = b"literal-heavy loop";
-        willow_string_literal_slot(&SLOT, text.as_ptr(), text.len() as i64);
+        // SAFETY: The static atomic is dedicated to this literal. The static bytes cover the
+        // requested prefix.
+        unsafe { willow_string_literal_slot(&SLOT, text.as_ptr(), text.len() as i64) };
         for hits in [1_000_000, 4_000_000, 16_000_000] {
             let start = std::time::Instant::now();
             for _ in 0..hits {
-                std::hint::black_box(willow_string_literal_slot(
-                    &SLOT,
-                    std::hint::black_box(text.as_ptr()),
-                    text.len() as i64,
-                ));
+                // SAFETY: The static atomic is dedicated to this literal. The static bytes cover
+                // the requested prefix.
+                std::hint::black_box(unsafe {
+                    willow_string_literal_slot(
+                        &SLOT,
+                        std::hint::black_box(text.as_ptr()),
+                        text.len() as i64,
+                    )
+                });
             }
             println!("hits={hits} elapsed_ns={}", start.elapsed().as_nanos());
         }
@@ -528,20 +661,28 @@ mod tests {
         const CHILD: &str = "WILLOW_TEST_INVALID_STRING_UTF8";
         if let Ok(case) = std::env::var(CHILD) {
             let _guard = isolated_runtime();
-            willow_gc_init();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { willow_gc_init() };
             match case.as_str() {
                 "alloc" => {
-                    willow_string_alloc([0xff].as_ptr(), 1);
+                    // SAFETY: The byte slice stays live and covers the full length supplied here.
+                    unsafe { willow_string_alloc([0xff].as_ptr(), 1) };
                 }
                 "literal" => {
                     static SLOT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
-                    willow_string_literal_slot(&SLOT, b"\xc0\x80".as_ptr(), 2);
+                    // SAFETY: The static atomic is dedicated to this literal. The static bytes
+                    // cover the requested prefix.
+                    unsafe { willow_string_literal_slot(&SLOT, b"\xc0\x80".as_ptr(), 2) };
                 }
                 "truncated" => {
-                    willow_string_alloc(b"\xe2\x82".as_ptr(), 2);
+                    // SAFETY: The byte slice stays live and covers the full length supplied here.
+                    unsafe { willow_string_alloc(b"\xe2\x82".as_ptr(), 2) };
                 }
                 "corrupt" => {
                     let ptr = willow_string_from_str("a");
+                    // SAFETY: The test owns a nonempty string and mutates its first data byte
+                    // before asking the runtime to validate it.
                     unsafe {
                         *ptr.add(DATA_OFFSET) = 0xff;
                         willow_string_as_str(ptr);
@@ -581,22 +722,34 @@ mod tests {
     #[test]
     fn utf8_byte_entries_preserve_content() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for repeats in [0, 1, 16, 256, 4096] {
             let text = "a\0é水🦀".repeat(repeats);
-            let ptr = willow_string_alloc(text.as_ptr(), text.len() as i64);
+            // SAFETY: The byte slice stays live and covers the full length supplied here.
+            let ptr = unsafe { willow_string_alloc(text.as_ptr(), text.len() as i64) };
             assert!(!ptr.is_null());
+            // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
             assert_eq!(unsafe { willow_string_as_str(ptr) }, text);
+            // SAFETY: String allocation reserves a trailing NUL at this byte offset after its
+            // contents.
             assert_eq!(unsafe { *ptr.add(DATA_OFFSET + text.len()) }, 0);
         }
         static SLOT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
         let text = "literal é水🦀";
-        let ptr = willow_string_literal_slot(&SLOT, text.as_ptr(), text.len() as i64);
+        // SAFETY: The static atomic is dedicated to this literal. The static bytes cover the
+        // requested prefix.
+        let ptr = unsafe { willow_string_literal_slot(&SLOT, text.as_ptr(), text.len() as i64) };
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { willow_string_as_str(ptr) }, text);
         assert_eq!(
-            willow_string_literal_slot(&SLOT, text.as_ptr(), text.len() as i64),
+            // SAFETY: The static atomic is dedicated to this literal. The static bytes cover the
+            // requested prefix.
+            unsafe { willow_string_literal_slot(&SLOT, text.as_ptr(), text.len() as i64) },
             ptr
         );
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { willow_string_as_str(std::ptr::null()) }, "");
     }
 
@@ -611,28 +764,43 @@ mod tests {
     #[test]
     fn concat_increasing_sizes_preserves_bytes_and_terminator() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for (left_len, right_len) in [(0, 0), (1, 1), (16, 256), (4096, 1)] {
             let left = "a".repeat(left_len);
             let right = "b".repeat(right_len);
-            let mut lhs = willow_string_from_str(&left);
-            crate::gc::willow_push_root(&mut lhs);
-            let mut rhs = willow_string_from_str(&right);
-            crate::gc::willow_push_root(&mut rhs);
-            let result = willow_string_concat(lhs, rhs);
+            let lhs = Cell::new(willow_string_from_str(&left));
+            // SAFETY: The initialized cell provides a stable writable slot through the
+            // matching pop.
+            unsafe { crate::gc::willow_push_root(lhs.as_ptr()) };
+            let rhs = Cell::new(willow_string_from_str(&right));
+            // SAFETY: The initialized cell provides a stable writable slot through the
+            // matching pop.
+            unsafe { crate::gc::willow_push_root(rhs.as_ptr()) };
+            // SAFETY: Both operands are current strings from this fixture or null; concat roots its
+            // own copies.
+            let result = unsafe { willow_string_concat(lhs.get(), rhs.get()) };
+            // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
             assert_eq!(unsafe { willow_string_as_str(result) }, left + &right);
             assert_eq!(
+                // SAFETY: String allocation reserves a trailing NUL at this byte offset after its
+                // contents.
                 unsafe { *result.add(DATA_OFFSET + left_len + right_len) },
                 0
             );
-            crate::gc::willow_pop_roots(2);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { crate::gc::willow_pop_roots(2) };
         }
     }
 
     #[test]
     fn concat_roots_inputs_across_allocation_and_balances_depth() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         struct RestoreStress;
         impl Drop for RestoreStress {
             fn drop(&mut self) {
@@ -642,25 +810,38 @@ mod tests {
         let _restore = RestoreStress;
         crate::gc::set_gc_stress_for_test(Some("alloc"));
         for (left, right) in [("", ""), ("left", "右"), ("same", "same")] {
-            let mut lhs = willow_string_from_str(left);
-            crate::gc::willow_push_root(&mut lhs);
+            let lhs = Cell::new(willow_string_from_str(left));
+            // SAFETY: The initialized cell provides a stable writable slot through the
+            // matching pop.
+            unsafe { crate::gc::willow_push_root(lhs.as_ptr()) };
             let rhs = willow_string_from_str(right);
-            crate::gc::willow_pop_roots(1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { crate::gc::willow_pop_roots(1) };
             // No caller roots remain: concat must protect its own inputs.
             let depth = crate::gc::willow_root_depth();
-            let result = willow_string_concat(lhs, rhs);
+            // SAFETY: Both operands are current strings from this fixture or null; concat roots its
+            // own copies.
+            let result = unsafe { willow_string_concat(lhs.get(), rhs) };
             assert_eq!(crate::gc::willow_root_depth(), depth);
             assert_eq!(
+                // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this
+                // borrow.
                 unsafe { willow_string_as_str(result) },
                 format!("{left}{right}")
             );
             assert_eq!(
+                // SAFETY: String allocation reserves a trailing NUL at this byte offset after its
+                // contents.
                 unsafe { *result.add(DATA_OFFSET + left.len() + right.len()) },
                 0
             );
         }
         let depth = crate::gc::willow_root_depth();
-        let result = willow_string_concat(std::ptr::null(), std::ptr::null());
+        // SAFETY: Both operands are current strings from this fixture or null; concat roots its own
+        // copies.
+        let result = unsafe { willow_string_concat(std::ptr::null(), std::ptr::null()) };
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { willow_string_as_str(result) }, "");
         assert_eq!(crate::gc::willow_root_depth(), depth);
     }
@@ -669,18 +850,24 @@ mod tests {
     fn concat_overflow_raises_before_reading_content() {
         use crate::panic_context::*;
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(944))));
-        // Only the length words exist: every case must fail before copying bytes.
-        for (left, right) in [(i64::MAX, 1_i64), (i64::MAX - 8, 0), (-1, 1)] {
-            let result =
-                willow_string_concat((&left as *const i64).cast(), (&right as *const i64).cast());
-            assert!(result.is_null());
+        // Exercise both size domains without constructing an impossible payload.
+        for lengths in [
+            [i64::MAX as usize, 1],
+            [i64::MAX as usize - 8, 0],
+            [usize::MAX, 1],
+        ] {
+            assert!(concat_size(lengths.into_iter()).is_none());
             assert_eq!(willow_panic_depth(), 1);
             willow_panic_enter_defer();
             let info = willow_panic_recover();
             willow_panic_leave_defer();
             assert_eq!(
+                // SAFETY: The retained PanicInfo keeps its initialized fields live through this
+                // read.
                 unsafe { panic_info_message(info) },
                 "string concatenation size overflow"
             );
@@ -690,53 +877,86 @@ mod tests {
     }
 
     unsafe fn ws_to_string(ptr: *const u8) -> String {
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         unsafe { willow_string_as_str(ptr) }.to_string()
     }
 
     #[test]
     fn string_unit_01_alloc_roundtrip() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let s = b"hello";
-        let ptr = willow_string_alloc(s.as_ptr(), 5);
+        // SAFETY: The byte slice stays live and covers the full length supplied here.
+        let ptr = unsafe { willow_string_alloc(s.as_ptr(), 5) };
         assert!(!ptr.is_null());
+        // SAFETY: The operand is null or a live string, and no safepoint intervenes in this
+        // borrow.
         assert_eq!(unsafe { ws_to_string(ptr) }, "hello");
     }
 
     #[test]
     fn string_unit_02_empty_string() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let ptr = willow_string_alloc(std::ptr::null(), 0);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: This null or negative-length case reads no input bytes.
+        let ptr = unsafe { willow_string_alloc(std::ptr::null(), 0) };
         assert!(!ptr.is_null());
+        // SAFETY: The operand is null or a live string, and no safepoint intervenes in this
+        // borrow.
         assert_eq!(unsafe { ws_to_string(ptr) }, "");
     }
 
     #[test]
     fn string_unit_03_concat_two_strings() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let a = willow_string_alloc(b"hello".as_ptr(), 5);
-        let b = willow_string_alloc(b" world".as_ptr(), 6);
-        let c = willow_string_concat(a, b);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: The byte slice stays live and covers the full length supplied here.
+        let a = unsafe { willow_string_alloc(b"hello".as_ptr(), 5) };
+        // SAFETY: The byte slice stays live and covers the full length supplied here.
+        let b = unsafe { willow_string_alloc(b" world".as_ptr(), 6) };
+        // SAFETY: Both operands are current strings from this fixture or null; concat roots its own
+        // copies.
+        let c = unsafe { willow_string_concat(a, b) };
+        // SAFETY: The operand is null or a live string, and no safepoint intervenes in this
+        // borrow.
         assert_eq!(unsafe { ws_to_string(c) }, "hello world");
     }
 
     #[test]
     fn string_unit_04_concat_null_lhs_is_rhs() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let b = willow_string_alloc(b"rhs".as_ptr(), 3);
-        let c = willow_string_concat(std::ptr::null(), b);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: The byte slice stays live and covers the full length supplied here.
+        let b = unsafe { willow_string_alloc(b"rhs".as_ptr(), 3) };
+        // SAFETY: Both operands are current strings from this fixture or null; concat roots its own
+        // copies.
+        let c = unsafe { willow_string_concat(std::ptr::null(), b) };
+        // SAFETY: The operand is null or a live string, and no safepoint intervenes in this
+        // borrow.
         assert_eq!(unsafe { ws_to_string(c) }, "rhs");
     }
 
     #[test]
     fn string_unit_05_concat_null_rhs_is_lhs() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let a = willow_string_alloc(b"lhs".as_ptr(), 3);
-        let c = willow_string_concat(a, std::ptr::null());
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: The byte slice stays live and covers the full length supplied here.
+        let a = unsafe { willow_string_alloc(b"lhs".as_ptr(), 3) };
+        // SAFETY: Both operands are current strings from this fixture or null; concat roots its own
+        // copies.
+        let c = unsafe { willow_string_concat(a, std::ptr::null()) };
+        // SAFETY: The operand is null or a live string, and no safepoint intervenes in this
+        // borrow.
         assert_eq!(unsafe { ws_to_string(c) }, "lhs");
     }
 
@@ -746,7 +966,9 @@ mod tests {
         static SLOTS: [AtomicPtr<u8>; 3] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 3];
         static TEXT: &str = "éclair";
         for _ in 0..3 {
-            willow_gc_init();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { willow_gc_init() };
             assert!(
                 SLOTS
                     .iter()
@@ -755,12 +977,23 @@ mod tests {
             let pointers: Vec<_> = SLOTS
                 .iter()
                 .zip([0, 2, 7])
-                .map(|(slot, len)| willow_string_literal_slot(slot, TEXT.as_ptr(), len))
+                // SAFETY: The static atomic is dedicated to this literal. The static bytes cover
+                // the requested prefix.
+                .map(|(slot, len)| unsafe { willow_string_literal_slot(slot, TEXT.as_ptr(), len) })
                 .collect();
             crate::gc::willow_gc_collect();
             for ((slot, len), ptr) in SLOTS.iter().zip([0, 2, 7]).zip(&pointers) {
-                assert_eq!(willow_string_literal_slot(slot, TEXT.as_ptr(), len), *ptr);
+                assert_eq!(
+                    // SAFETY: The static atomic is dedicated to this literal. The static bytes
+                    // cover the requested prefix.
+                    unsafe { willow_string_literal_slot(slot, TEXT.as_ptr(), len) },
+                    *ptr
+                );
+                // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this
+                // borrow.
                 assert_eq!(unsafe { willow_string_as_str(*ptr) }, &TEXT[..len as usize]);
+                // SAFETY: String allocation reserves a trailing NUL at this byte offset after its
+                // contents.
                 assert_eq!(unsafe { *ptr.add(DATA_OFFSET + len as usize) }, 0);
             }
             assert_ne!(pointers[0], pointers[1]);
@@ -772,13 +1005,20 @@ mod tests {
     fn literal_slots_invalid_input_restores_empty_slot() {
         let _guard = isolated_runtime();
         static SLOT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for (bytes, len) in [(b"abc".as_ptr(), -1), (std::ptr::null(), 3)] {
-            assert!(willow_string_literal_slot(&SLOT, bytes, len).is_null());
+            // SAFETY: The dedicated static slot survives reset. Both invalid byte arguments are
+            // rejected before a read.
+            assert!(unsafe { willow_string_literal_slot(&SLOT, bytes, len) }.is_null());
             assert!(SLOT.load(Ordering::Acquire).is_null());
             assert!(initialized_literal_slots().is_empty());
         }
-        let ptr = willow_string_literal_slot(&SLOT, b"abc".as_ptr(), 3);
+        // SAFETY: The static atomic is dedicated to this literal. The static bytes cover the
+        // requested prefix.
+        let ptr = unsafe { willow_string_literal_slot(&SLOT, b"abc".as_ptr(), 3) };
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { willow_string_as_str(ptr) }, "abc");
     }
 
@@ -788,18 +1028,24 @@ mod tests {
         static SLOTS: [AtomicPtr<u8>; 256] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 256];
         for count in [16, 64, 256] {
             for repetitions in [1, 8, 32] {
-                willow_gc_init();
+                // SAFETY: The test controls its isolated runtime at this reset boundary; no
+                // other mutator or subsequent access relies on the discarded heap.
+                unsafe { willow_gc_init() };
                 let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
                 let pointers: Vec<_> = SLOTS[..count]
                     .iter()
-                    .map(|slot| willow_string_literal_slot(slot, b"literal".as_ptr(), 7))
+                    // SAFETY: The static atomic is dedicated to this literal. The static bytes
+                    // cover the requested prefix.
+                    .map(|slot| unsafe { willow_string_literal_slot(slot, b"literal".as_ptr(), 7) })
                     .collect();
                 let after_misses = crate::gc::telemetry_heap_snapshot().0.allocation_count;
                 assert_eq!(after_misses - before, count as u64);
                 for _ in 0..repetitions {
                     for (slot, ptr) in SLOTS.iter().zip(&pointers) {
                         assert_eq!(
-                            willow_string_literal_slot(slot, b"literal".as_ptr(), 7),
+                            // SAFETY: The static atomic is dedicated to this literal. The static
+                            // bytes cover the requested prefix.
+                            unsafe { willow_string_literal_slot(slot, b"literal".as_ptr(), 7) },
                             *ptr
                         );
                     }
@@ -823,7 +1069,9 @@ mod tests {
         use crate::gc::*;
         use std::sync::atomic::AtomicBool;
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         static SLOT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
         SLOT.store(INITIALIZING, Ordering::Release);
         let ready = AtomicBool::new(false);
@@ -831,7 +1079,11 @@ mod tests {
             scope.spawn(crate::runtime::serving(|| {
                 let mutator = crate::gc::MutatorRegistration::new();
                 ready.store(true, Ordering::Release);
-                let ptr = willow_string_literal_slot(&SLOT, b"waiting".as_ptr(), 7);
+                // SAFETY: The static atomic is dedicated to this literal. The static bytes cover
+                // the requested prefix.
+                let ptr = unsafe { willow_string_literal_slot(&SLOT, b"waiting".as_ptr(), 7) };
+                // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this
+                // borrow.
                 assert_eq!(unsafe { willow_string_as_str(ptr) }, "waiting");
                 drop(mutator);
             }));
@@ -852,7 +1104,9 @@ mod tests {
         let _guard = isolated_runtime();
         static SLOTS: [AtomicPtr<u8>; 64] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 64];
         for workers in [2, 8] {
-            willow_gc_init();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { willow_gc_init() };
             let before = telemetry_heap_snapshot().0.allocation_count;
             let barrier = std::sync::Barrier::new(workers);
             std::thread::scope(|scope| {
@@ -864,11 +1118,18 @@ mod tests {
                         barrier.wait();
                         let mutator = crate::gc::MutatorRegistration::new();
                         for slot in &SLOTS {
-                            let ptr = willow_string_literal_slot(slot, b"racing".as_ptr(), 6);
+                            // SAFETY: The static atomic is dedicated to this literal. The static
+                            // bytes cover the requested prefix.
+                            let ptr =
+                                unsafe { willow_string_literal_slot(slot, b"racing".as_ptr(), 6) };
                             willow_gc_collect();
+                            // SAFETY: The string ABI permits null or a live UTF-8 payload
+                            // throughout this borrow.
                             assert_eq!(unsafe { willow_string_as_str(ptr) }, "racing");
                             assert_eq!(
-                                willow_string_literal_slot(slot, b"racing".as_ptr(), 6),
+                                // SAFETY: The static atomic is dedicated to this literal. The
+                                // static bytes cover the requested prefix.
+                                unsafe { willow_string_literal_slot(slot, b"racing".as_ptr(), 6) },
                                 ptr
                             );
                         }
@@ -884,9 +1145,14 @@ mod tests {
     #[test]
     fn string_unit_07_nul_terminator_present() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let ptr = willow_string_alloc(b"ab".as_ptr(), 2);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: The byte slice stays live and covers the full length supplied here.
+        let ptr = unsafe { willow_string_alloc(b"ab".as_ptr(), 2) };
         // NUL at offset 8+2
+        // SAFETY: String allocation reserves a trailing NUL at this byte offset after its
+        // contents.
         let nul = unsafe { *ptr.add(10) };
         assert_eq!(nul, 0);
     }
@@ -894,12 +1160,18 @@ mod tests {
     #[test]
     fn string_length_counts_utf8_bytes_including_embedded_nul() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        assert_eq!(willow_string_len(std::ptr::null()), 0);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Null is the empty length sentinel.
+        assert_eq!(unsafe { willow_string_len(std::ptr::null()) }, 0);
         for text in ["", "abc", "日本語", "😀", "e\u{301}", "a\0b"] {
-            let ptr = willow_string_alloc(text.as_ptr(), text.len() as i64);
+            // SAFETY: The byte slice stays live and covers the full length supplied here.
+            let ptr = unsafe { willow_string_alloc(text.as_ptr(), text.len() as i64) };
             assert!(!ptr.is_null());
-            assert_eq!(willow_string_len(ptr), text.len() as i64);
+            // SAFETY: The receiver is the string just allocated above, with its length word
+            // initialized.
+            assert_eq!(unsafe { willow_string_len(ptr) }, text.len() as i64);
         }
     }
 
@@ -907,44 +1179,68 @@ mod tests {
     #[test]
     fn string_unit_08_negative_len_returns_null() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        assert!(willow_string_alloc(b"abc".as_ptr(), -1).is_null());
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: This null or negative-length case reads no input bytes.
+        assert!(unsafe { willow_string_alloc(b"abc".as_ptr(), -1) }.is_null());
     }
 
     #[test]
     fn string_unit_09_positive_len_null_bytes_returns_null() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        assert!(willow_string_alloc(std::ptr::null(), 3).is_null());
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: This null or negative-length case reads no input bytes.
+        assert!(unsafe { willow_string_alloc(std::ptr::null(), 3) }.is_null());
     }
 
     #[test]
     fn string_unit_10_zero_len_null_bytes_is_empty() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let ptr = willow_string_alloc(std::ptr::null(), 0);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: This null or negative-length case reads no input bytes.
+        let ptr = unsafe { willow_string_alloc(std::ptr::null(), 0) };
         assert!(!ptr.is_null());
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { willow_string_as_str(ptr) }, "");
     }
 
     #[test]
     fn string_ordering_runtime_lengths_and_no_allocation() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let null = std::ptr::null();
         let empty = willow_string_from_str("");
-        assert_eq!(willow_string_cmp(null, null), 0);
-        assert_eq!(willow_string_cmp(null, empty), -1);
-        assert_eq!(willow_string_cmp(empty, null), 1);
+        // SAFETY: These operands are null or strings allocated in this isolated heap; comparison
+        // cannot collect.
+        assert_eq!(unsafe { willow_string_cmp(null, null) }, 0);
+        // SAFETY: These operands are null or strings allocated in this isolated heap; comparison
+        // cannot collect.
+        assert_eq!(unsafe { willow_string_cmp(null, empty) }, -1);
+        // SAFETY: These operands are null or strings allocated in this isolated heap; comparison
+        // cannot collect.
+        assert_eq!(unsafe { willow_string_cmp(empty, null) }, 1);
         for n in [0, 16, 256, 4096] {
             let prefix = "x".repeat(n);
             let a = willow_string_from_str(&(prefix.clone() + "\0a"));
             let b = willow_string_from_str(&(prefix + "\0b"));
             let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
             for _ in 0..32 {
-                assert_eq!(willow_string_cmp(a, b), -1);
-                assert_eq!(willow_string_cmp(b, a), 1);
-                assert_eq!(willow_string_cmp(a, a), 0);
+                // SAFETY: These operands are null or strings allocated in this isolated heap;
+                // comparison cannot collect.
+                assert_eq!(unsafe { willow_string_cmp(a, b) }, -1);
+                // SAFETY: These operands are null or strings allocated in this isolated heap;
+                // comparison cannot collect.
+                assert_eq!(unsafe { willow_string_cmp(b, a) }, 1);
+                // SAFETY: These operands are null or strings allocated in this isolated heap;
+                // comparison cannot collect.
+                assert_eq!(unsafe { willow_string_cmp(a, a) }, 0);
             }
             assert_eq!(
                 crate::gc::telemetry_heap_snapshot().0.allocation_count,
@@ -953,41 +1249,135 @@ mod tests {
         }
     }
 
-    fn concat_n(parts: &mut [u64]) -> String {
-        let ptr = willow_string_concat_n(parts.as_mut_ptr(), (parts.len() / 2) as i64);
+    /// Each string word must be null or a current fixture string.
+    unsafe fn concat_n(parts: &mut [u64]) -> String {
+        // SAFETY: The exclusive slice covers every pair; string words come from live fixture
+        // strings or null.
+        let ptr = unsafe { willow_string_concat_n(parts.as_mut_ptr(), (parts.len() / 2) as i64) };
         assert!(!ptr.is_null());
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         unsafe { willow_string_as_str(ptr) }.to_owned()
+    }
+
+    #[test]
+    fn concat_root_count_crosses_signed_abi_limit() {
+        let _guard = isolated_runtime();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        let empty = willow_string_from_str("") as u64;
+        let mut parts = [
+            PART_STRING,
+            empty,
+            PART_I64,
+            1,
+            PART_STRING,
+            0,
+            PART_STRING,
+            empty,
+        ];
+        // Model the already registered prefix numerically. Only the two new
+        // non-null string slots are on the real stack and need to be popped.
+        let prefix = i32::MAX as usize - 1;
+        let mut roots = SlotRoots {
+            count: prefix,
+            storage: std::marker::PhantomData,
+        };
+        roots.push_string_parts(&mut parts);
+        let count = roots.count;
+        roots.count -= prefix;
+        assert_eq!(count, i32::MAX as usize + 1);
+        assert_eq!(crate::gc::gc_thread_root_depth(), 2);
+        drop(roots);
+        assert_eq!(crate::gc::gc_thread_root_depth(), 0);
+    }
+
+    #[test]
+    fn raw_string_entries_respect_pair_extent_and_literal_reset() {
+        static EMPTY: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+        let _guard = isolated_runtime();
+        for _ in 0..2 {
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { willow_gc_init() };
+            assert!(EMPTY.load(Ordering::Acquire).is_null());
+            // SAFETY: The static slot belongs to this empty literal across both heap
+            // lifetimes. A zero byte length permits a null source.
+            let empty = unsafe { willow_string_literal_slot(&EMPTY, std::ptr::null(), 0) };
+            assert!(!empty.is_null());
+            let mut words = [91, PART_STRING, empty as u64, PART_I64, 42, 92];
+            let pairs = &mut words[1..5];
+            // SAFETY: The disjoint subslice contains exactly two initialized pairs.
+            // Its only string is the permanently rooted literal in this runtime.
+            let joined = unsafe { willow_string_concat_n(pairs.as_mut_ptr(), 2) };
+            // SAFETY: Concat returned a fresh string and no safepoint intervenes.
+            assert_eq!(unsafe { willow_string_as_str(joined) }, "42");
+            assert_eq!((words[0], words[5]), (91, 92));
+            assert_eq!(EMPTY.load(Ordering::Acquire), empty);
+        }
+    }
+
+    #[test]
+    fn concat_n_accepts_null_for_zero_parts() {
+        let _guard = isolated_runtime();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Zero pairs require no input storage.
+        let result = unsafe { willow_string_concat_n(std::ptr::null_mut(), 0) };
+        assert!(!result.is_null());
+        // SAFETY: The receiver is the string just allocated above, with its length word
+        // initialized.
+        assert_eq!(unsafe { willow_string_len(result) }, 0);
+        // SAFETY: The fresh empty string has a terminator immediately after its length word.
+        assert_eq!(unsafe { *result.add(DATA_OFFSET) }, 0);
     }
 
     #[test]
     fn concat_n_formats_every_part_kind() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let empty = willow_string_from_str("");
-        let wide = willow_string_from_str("é水🦀");
-        let nul = willow_string_from_str("a\0b");
-        assert_eq!(concat_n(&mut []), "");
-        assert_eq!(concat_n(&mut [PART_STRING, empty as u64]), "");
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        let empty = crate::gc::GcRootHandle::new(willow_string_from_str(""));
+        let wide = crate::gc::GcRootHandle::new(willow_string_from_str("é水🦀"));
+        let nul = crate::gc::GcRootHandle::new(willow_string_from_str("a\0b"));
+        // SAFETY: Only integers or an empty list are passed.
+        assert_eq!(unsafe { concat_n(&mut []) }, "");
         assert_eq!(
-            concat_n(&mut [
-                PART_STRING,
-                empty as u64,
-                PART_STRING,
-                0,
-                PART_STRING,
-                empty as u64
-            ]),
+            // SAFETY: The string words come from the current rooted slots or fresh strings, with no
+            // intervening GC point.
+            unsafe { concat_n(&mut [PART_STRING, empty.load() as u64]) },
             ""
         );
         assert_eq!(
-            concat_n(&mut [
-                PART_STRING,
-                wide as u64,
-                PART_STRING,
-                nul as u64,
-                PART_STRING,
-                wide as u64,
-            ]),
+            // SAFETY: The string words come from the current rooted slots or fresh strings, with no
+            // intervening GC point.
+            unsafe {
+                concat_n(&mut [
+                    PART_STRING,
+                    empty.load() as u64,
+                    PART_STRING,
+                    0,
+                    PART_STRING,
+                    empty.load() as u64,
+                ])
+            },
+            ""
+        );
+        assert_eq!(
+            // SAFETY: The string words come from the current rooted slots or fresh strings, with no
+            // intervening GC point.
+            unsafe {
+                concat_n(&mut [
+                    PART_STRING,
+                    wide.load() as u64,
+                    PART_STRING,
+                    nul.load() as u64,
+                    PART_STRING,
+                    wide.load() as u64,
+                ])
+            },
             "é水🦀a\0bé水🦀"
         );
         for value in [
@@ -1004,34 +1394,47 @@ mod tests {
             i64::MIN,
             i64::MIN + 1,
         ] {
-            assert_eq!(concat_n(&mut [PART_I64, value as u64]), value.to_string());
+            assert_eq!(
+                // SAFETY: Only integers or an empty list are passed.
+                unsafe { concat_n(&mut [PART_I64, value as u64]) },
+                value.to_string()
+            );
             assert_eq!(decimal_len(value), value.to_string().len());
             let ptr = i64_to_string(value);
+            // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
             assert_eq!(unsafe { willow_string_as_str(ptr) }, value.to_string());
         }
         assert_eq!(
-            concat_n(&mut [
-                PART_I64,
-                (-5i64) as u64,
-                PART_STRING,
-                wide as u64,
-                PART_I64,
-                0,
-                PART_STRING,
-                empty as u64,
-            ]),
+            // SAFETY: The string words come from the current rooted slots or fresh strings, with no
+            // intervening GC point.
+            unsafe {
+                concat_n(&mut [
+                    PART_I64,
+                    (-5i64) as u64,
+                    PART_STRING,
+                    wide.load() as u64,
+                    PART_I64,
+                    0,
+                    PART_STRING,
+                    empty.load() as u64,
+                ])
+            },
             "-5é水🦀0"
         );
         // Larger than a TLAB object: still one exact allocation.
         let long = willow_string_from_str(&"x".repeat(5000));
-        let joined = concat_n(&mut [
-            PART_STRING,
-            long as u64,
-            PART_I64,
-            42,
-            PART_STRING,
-            long as u64,
-        ]);
+        // SAFETY: The string words come from the current rooted slots or fresh strings, with no
+        // intervening GC point.
+        let joined = unsafe {
+            concat_n(&mut [
+                PART_STRING,
+                long as u64,
+                PART_I64,
+                42,
+                PART_STRING,
+                long as u64,
+            ])
+        };
         assert_eq!(joined.len(), 10_002);
         assert!(joined.starts_with('x') && joined.contains("42") && joined.ends_with('x'));
     }
@@ -1041,23 +1444,38 @@ mod tests {
         const CHILD: &str = "WILLOW_TEST_INVALID_CONCAT_PARTS";
         if let Ok(case) = std::env::var(CHILD) {
             let _guard = isolated_runtime();
-            willow_gc_init();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { willow_gc_init() };
             match case.as_str() {
                 "negative" => {
-                    willow_string_concat_n(std::ptr::null_mut(), -1);
+                    // SAFETY: The entry rejects this pointer/count combination before constructing
+                    // a slice.
+                    unsafe { willow_string_concat_n(std::ptr::null_mut(), -1) };
                 }
                 "null" => {
-                    willow_string_concat_n(std::ptr::null_mut(), 1);
+                    // SAFETY: The entry rejects this pointer/count combination before constructing
+                    // a slice.
+                    unsafe { willow_string_concat_n(std::ptr::null_mut(), 1) };
+                }
+                "size" => {
+                    let mut parts = [PART_I64, 0];
+                    let count = (isize::MAX as usize / size_of::<[u64; 2]>() + 1) as i64;
+                    // SAFETY: The entry rejects this pointer/count combination before constructing
+                    // a slice.
+                    unsafe { willow_string_concat_n(parts.as_mut_ptr(), count) };
                 }
                 "kind" => {
                     let mut parts = [7u64, 0];
-                    willow_string_concat_n(parts.as_mut_ptr(), 1);
+                    // SAFETY: The array holds one complete pair. Its unknown tag is rejected before
+                    // the value is used.
+                    unsafe { willow_string_concat_n(parts.as_mut_ptr(), 1) };
                 }
                 _ => panic!("unknown child case"),
             }
             return;
         }
-        for case in ["negative", "null", "kind"] {
+        for case in ["negative", "null", "size", "kind"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",

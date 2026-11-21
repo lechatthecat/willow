@@ -156,7 +156,11 @@ pub(super) fn span_for(payload_size: usize) -> Option<(usize, usize)> {
 }
 
 impl OldLab {
-    fn bump(
+    /// # Safety
+    /// The aligned span must cover the header and payload without overflow. The type, payload
+    /// extent and tracing mask must agree, including any required bitmap descriptor or native
+    /// hooks. Initialize native fields before the object can be traced or finalized.
+    unsafe fn bump(
         &self,
         inner: &mut Inner,
         phase: &std::sync::atomic::AtomicU8,
@@ -179,14 +183,18 @@ impl OldLab {
         // SAFETY: [offset, offset + span) lies in this buffer's exclusively
         // carved, unpublished part of a live region.
         unsafe { std::ptr::write_bytes(raw, 0, span) };
-        let object = HeapObject::initialize_at(
-            raw,
-            total,
-            type_id,
-            layout_id,
-            gc_ref_mask,
-            GC_GENERATION_OLD,
-        )
+        // SAFETY: The checked bump reserved and cleared the complete aligned span for this
+        // metadata; the cursor has exclusive access.
+        let object = unsafe {
+            HeapObject::initialize_at(
+                raw,
+                total,
+                type_id,
+                layout_id,
+                gc_ref_mask,
+                GC_GENERATION_OLD,
+            )
+        }
         .expect("carved region span is non-null");
         let granule = offset / GC_REGION_MARK_GRANULE;
         // Same publication order as `OldRegion::allocate_object`.
@@ -220,7 +228,12 @@ pub(super) fn available_in(owner: &crate::runtime::Runtime) -> bool {
 }
 
 /// Allocation from this thread's active buffer without the heap mutex.
-pub(super) fn try_allocate(
+///
+/// # Safety
+/// The type, tracing metadata and payload size must satisfy the allocation contract of
+/// willow_gc_alloc_layout, including reserved bitmap descriptors and native initialization.
+/// The allocation span must cover the complete aligned header and payload.
+pub(super) unsafe fn try_allocate(
     type_id: u32,
     layout_id: u64,
     gc_ref_mask: u64,
@@ -230,23 +243,31 @@ pub(super) fn try_allocate(
     LOCAL
         .try_with(|lab| {
             let mut inner = lab.inner.lock().unwrap();
-            lab.bump(
-                &mut inner,
-                crate::runtime::current().mark_phase(),
-                raw_heap::TraceMetadata {
-                    type_id,
-                    layout_id,
-                    gc_ref_mask,
-                    payload_size: total - GC_HEADER_SIZE,
-                },
-                span,
-            )
+            // SAFETY: The checked span covers the header plus this payload, rounded to the
+            // region granule. The caller provides the matching trace metadata.
+            unsafe {
+                lab.bump(
+                    &mut inner,
+                    crate::runtime::current().mark_phase(),
+                    raw_heap::TraceMetadata {
+                        type_id,
+                        layout_id,
+                        gc_ref_mask,
+                        payload_size: total - GC_HEADER_SIZE,
+                    },
+                    span,
+                )
+            }
         })
         .ok()
         .flatten()
 }
 
-pub(super) fn try_allocate_in(
+/// # Safety
+/// The type, tracing metadata and payload size must satisfy the allocation contract of
+/// willow_gc_alloc_layout, including reserved bitmap descriptors and native initialization.
+/// The allocation span must cover the complete aligned header and payload.
+pub(super) unsafe fn try_allocate_in(
     runtime: &crate::runtime::Runtime,
     type_id: u32,
     layout_id: u64,
@@ -255,22 +276,28 @@ pub(super) fn try_allocate_in(
     span: usize,
 ) -> Option<HeapObject> {
     if std::ptr::eq(runtime, crate::runtime::current()) {
-        return try_allocate(type_id, layout_id, gc_ref_mask, total, span);
+        // SAFETY: The allocation path forwards the validated payload extent, type and tracing
+        // layout; its caller initializes native fields before collection.
+        return unsafe { try_allocate(type_id, layout_id, gc_ref_mask, total, span) };
     }
     let owner = &*runtime.gc;
     with_local_in(owner, |lab| {
         let mut inner = lab.inner.lock().unwrap();
-        lab.bump(
-            &mut inner,
-            owner.mark_phase(),
-            raw_heap::TraceMetadata {
-                type_id,
-                layout_id,
-                gc_ref_mask,
-                payload_size: total - GC_HEADER_SIZE,
-            },
-            span,
-        )
+        // SAFETY: The checked span covers the header plus this payload, rounded to the region
+        // granule. The caller provides the matching trace metadata.
+        unsafe {
+            lab.bump(
+                &mut inner,
+                owner.mark_phase(),
+                raw_heap::TraceMetadata {
+                    type_id,
+                    layout_id,
+                    gc_ref_mask,
+                    payload_size: total - GC_HEADER_SIZE,
+                },
+                span,
+            )
+        }
     })
     .flatten()
 }
@@ -278,7 +305,12 @@ pub(super) fn try_allocate_in(
 /// Retire this thread's buffer, carve a new one, and allocate the object in
 /// it. Returns `None` when no region can supply `span` within the budget.
 /// Callers check [`available`] first.
-pub(super) fn refill_and_allocate(
+///
+/// # Safety
+/// The type, tracing metadata and payload size must satisfy the allocation contract of
+/// willow_gc_alloc_layout, including reserved bitmap descriptors and native initialization.
+/// The allocation span must cover the complete aligned header and payload.
+pub(super) unsafe fn refill_and_allocate(
     state: &mut GcState,
     type_id: u32,
     layout_id: u64,
@@ -286,18 +318,26 @@ pub(super) fn refill_and_allocate(
     total: usize,
     span: usize,
 ) -> Option<HeapObject> {
-    refill_and_allocate_in(
-        crate::runtime::current(),
-        state,
-        type_id,
-        layout_id,
-        gc_ref_mask,
-        total,
-        span,
-    )
+    // SAFETY: The allocation path forwards the validated payload extent, type and tracing
+    // layout; its caller initializes native fields before collection.
+    unsafe {
+        refill_and_allocate_in(
+            crate::runtime::current(),
+            state,
+            type_id,
+            layout_id,
+            gc_ref_mask,
+            total,
+            span,
+        )
+    }
 }
 
-pub(super) fn refill_and_allocate_in(
+/// # Safety
+/// The type, tracing metadata and payload size must satisfy the allocation contract of
+/// willow_gc_alloc_layout, including reserved bitmap descriptors and native initialization.
+/// The allocation span must cover the complete aligned header and payload.
+pub(super) unsafe fn refill_and_allocate_in(
     owner: &crate::runtime::Runtime,
     state: &mut GcState,
     type_id: u32,
@@ -342,17 +382,21 @@ pub(super) fn refill_and_allocate_in(
             pending_index: 0,
             pending_live: 0,
         };
-        let object = lab.bump(
-            &mut inner,
-            owner.gc.mark_phase(),
-            raw_heap::TraceMetadata {
-                type_id,
-                layout_id,
-                gc_ref_mask,
-                payload_size: total - GC_HEADER_SIZE,
-            },
-            span,
-        );
+        // SAFETY: The checked span covers the header plus this payload, rounded to the region
+        // granule. The caller provides the matching trace metadata.
+        let object = unsafe {
+            lab.bump(
+                &mut inner,
+                owner.gc.mark_phase(),
+                raw_heap::TraceMetadata {
+                    type_id,
+                    layout_id,
+                    gc_ref_mask,
+                    payload_size: total - GC_HEADER_SIZE,
+                },
+                span,
+            )
+        };
         drop(inner);
         state.old_lab_pending.insert(index);
         sync_record_in(&owner.gc, state, index);

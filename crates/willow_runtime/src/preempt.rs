@@ -126,8 +126,8 @@ unsafe fn flag_ref<'a>(flag: *const c_void) -> Option<&'a AtomicBool> {
     if flag.is_null() {
         None
     } else {
-        // Safety: callers pass a pointer obtained from `willow_preempt_flag_new`
-        // (a `Box<AtomicBool>`), still live for the duration of the call.
+        // SAFETY: The caller retains the aligned task-owned or standalone AtomicBool
+        // through the borrow.
         Some(unsafe { &*(flag as *const AtomicBool) })
     }
 }
@@ -159,9 +159,19 @@ pub extern "C" fn willow_preempt_flag_new() -> *mut c_void {
 }
 
 /// Free a flag from [`willow_preempt_flag_new`]. `null` is ignored.
+///
+/// # Safety
+/// A non-null flag must be the unique allocation returned by willow_preempt_flag_new.
+/// Release it exactly once, after all accesses and every bound or suspended quantum have
+/// ended.
+///
+/// ```compile_fail,E0133
+/// let flag = willow_runtime::preempt::willow_preempt_flag_new();
+/// willow_runtime::preempt::willow_preempt_flag_free(flag);
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_preempt_flag_free(flag: *mut c_void) {
+pub unsafe extern "C" fn willow_preempt_flag_free(flag: *mut c_void) {
     if !flag.is_null() {
         // Safety: `flag` came from `willow_preempt_flag_new` and is freed once.
         drop(unsafe { Box::from_raw(flag as *mut AtomicBool) });
@@ -171,27 +181,39 @@ pub extern "C" fn willow_preempt_flag_free(flag: *mut c_void) {
 /// Request preemption of the task owning `flag` (spec §9): set the flag with
 /// release ordering so a safepoint observing it (acquire) sees a happens-before
 /// edge. Safe to call from any thread (scheduler, GC, cancellation).
+///
+/// # Safety
+/// A non-null flag must point to a live, aligned AtomicBool accessed only atomically.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_preempt_request(flag: *const c_void) {
+pub unsafe extern "C" fn willow_preempt_request(flag: *const c_void) {
+    // SAFETY: The caller keeps the optional AtomicBool live and aligned through this access.
     if let Some(flag) = unsafe { flag_ref(flag) } {
         flag.store(true, Ordering::Release);
     }
 }
 
 /// Clear/acknowledge a preemption request on `flag` (spec §9 step 1).
+///
+/// # Safety
+/// A non-null flag must point to a live, aligned AtomicBool accessed only atomically.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_preempt_clear(flag: *const c_void) {
+pub unsafe extern "C" fn willow_preempt_clear(flag: *const c_void) {
+    // SAFETY: The caller keeps the optional AtomicBool live and aligned through this access.
     if let Some(flag) = unsafe { flag_ref(flag) } {
         flag.store(false, Ordering::Release);
     }
 }
 
 /// Query whether `flag` currently has a pending preemption request (acquire).
+///
+/// # Safety
+/// A non-null flag must point to a live, aligned AtomicBool accessed only atomically.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_preempt_requested(flag: *const c_void) -> i32 {
+pub unsafe extern "C" fn willow_preempt_requested(flag: *const c_void) -> i32 {
+    // SAFETY: The caller keeps the optional AtomicBool live and aligned through this access.
     match unsafe { flag_ref(flag) } {
         Some(flag) if flag.load(Ordering::Acquire) => 1,
         _ => 0,
@@ -204,16 +226,27 @@ pub extern "C" fn willow_preempt_requested(flag: *const c_void) -> i32 {
 /// poll runs: reset the safepoint budget and time deadline, bind the flag, and
 /// clear any stale request (the previous preemption was already honored by the
 /// requeue). `flag` may be `null` for budget/time-only quanta.
+///
+/// # Safety
+/// A non-null flag must point to a live, aligned AtomicBool accessed only atomically. Keep
+/// its address and allocation live throughout the bound quantum, including suspension and
+/// restoration, until unbound.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_preempt_begin(flag: *const c_void) {
-    begin_quantum(runtime_preempt_config(), flag);
+pub unsafe extern "C" fn willow_preempt_begin(flag: *const c_void) {
+    // SAFETY: The caller retains the flag at this address until the quantum has ended.
+    unsafe { begin_quantum(runtime_preempt_config(), flag) };
 }
 
 /// Core of [`willow_preempt_begin`] with an explicit config — env-free so tests
 /// exercise the quantum machinery deterministically without mutating the
 /// process-global environment (cargo runs unit tests in parallel threads).
-pub(crate) fn begin_quantum(config: PreemptConfig, flag: *const c_void) {
+///
+/// # Safety
+/// A non-null flag must point to a live, aligned AtomicBool accessed only atomically. Keep
+/// its address and allocation live throughout the bound quantum, including suspension and
+/// restoration, until unbound.
+pub(crate) unsafe fn begin_quantum(config: PreemptConfig, flag: *const c_void) {
     let deadline = Instant::now().checked_add(Duration::from_millis(config.time_quantum_ms()));
     QUANTUM.with(|q| {
         q.flag.set(flag as *const AtomicBool);
@@ -223,6 +256,7 @@ pub(crate) fn begin_quantum(config: PreemptConfig, flag: *const c_void) {
         q.direct_countdown.set(0);
         q.direct_granted.set(0);
     });
+    // SAFETY: The caller keeps the optional AtomicBool live and aligned through this access.
     if let Some(flag) = unsafe { flag_ref(flag) } {
         flag.store(false, Ordering::Release);
     }
@@ -407,6 +441,7 @@ pub(crate) fn charge_safepoints(count: u64) -> i32 {
         if q.no_preempt_depth.get() > 0 {
             return 0;
         }
+        // SAFETY: Binding a quantum requires its optional flag to stay live until unbinding.
         let flag = unsafe { flag_ref(q.flag.get() as *const c_void) };
 
         // (1) Explicit request already pending.
@@ -648,6 +683,8 @@ mod tests {
 
     fn direct_check() -> i32 {
         let counter = willow_async_poll_counter();
+        // SAFETY: This thread owns the active poll counter and keeps its storage live until the
+        // quantum ends.
         unsafe {
             if *counter > 1 {
                 *counter -= 1;
@@ -661,12 +698,17 @@ mod tests {
     #[test]
     fn production_budget_uses_deadline_and_bounds_runtime_checks() {
         for safepoints in [1024usize, 4096, 16384] {
-            begin_quantum(
-                PreemptConfig::from_env_values(None, Some("100000")),
-                std::ptr::null(),
-            );
+            // SAFETY: A null flag binds no storage and is explicitly supported.
+            unsafe {
+                begin_quantum(
+                    PreemptConfig::from_env_values(None, Some("100000")),
+                    std::ptr::null(),
+                )
+            };
             let mut calls = 0;
             for _ in 0..safepoints {
+                // SAFETY: This thread owns the active poll counter and keeps its storage live
+                // until the quantum ends.
                 calls += usize::from(unsafe { *willow_async_poll_counter() } <= 1);
                 assert_eq!(direct_check(), 0);
             }
@@ -684,9 +726,12 @@ mod tests {
     #[test]
     fn direct_async_batches_preserve_exact_budgets_and_bound_checks() {
         for budget in [1, 2, 3, 63, 64, 65, 127, 255, 256, 257, 1000, 4096] {
-            begin_quantum(cfg(budget, 100000), std::ptr::null());
+            // SAFETY: A null flag binds no storage and is explicitly supported.
+            unsafe { begin_quantum(cfg(budget, 100000), std::ptr::null()) };
             let mut calls = 0;
             for n in 1..=budget {
+                // SAFETY: This thread owns the active poll counter and keeps its storage live
+                // until the quantum ends.
                 if unsafe { *willow_async_poll_counter() } <= 1 {
                     calls += 1;
                 }
@@ -703,7 +748,8 @@ mod tests {
 
     #[test]
     fn direct_async_partial_batch_settles_before_helper_checks() {
-        begin_quantum(cfg(100, 100000), std::ptr::null());
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe { begin_quantum(cfg(100, 100000), std::ptr::null()) };
         for _ in 0..20 {
             assert_eq!(direct_check(), 0);
         }
@@ -716,7 +762,9 @@ mod tests {
     fn direct_async_request_and_deadline_trip_within_one_batch() {
         for explicit in [false, true] {
             let flag = AtomicBool::new(false);
-            begin_quantum(cfg(10000, 100000), std::ptr::from_ref(&flag).cast());
+            // SAFETY: The fixture keeps the flag at its registered address throughout this
+            // quantum and unbinds it before release.
+            unsafe { begin_quantum(cfg(10000, 100000), std::ptr::from_ref(&flag).cast()) };
             assert_eq!(direct_check(), 0);
             if explicit {
                 flag.store(true, Ordering::Release);
@@ -738,7 +786,8 @@ mod tests {
 
     #[test]
     fn direct_async_suppressed_work_does_not_consume_budget() {
-        begin_quantum(cfg(100, 100000), std::ptr::null());
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe { begin_quantum(cfg(100, 100000), std::ptr::null()) };
         for _ in 0..20 {
             assert_eq!(direct_check(), 0);
         }
@@ -755,12 +804,14 @@ mod tests {
 
     #[test]
     fn direct_async_new_quantum_discards_old_grant() {
-        begin_quantum(cfg(100, 100000), std::ptr::null());
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe { begin_quantum(cfg(100, 100000), std::ptr::null()) };
         for _ in 0..20 {
             assert_eq!(direct_check(), 0);
         }
         willow_preempt_end();
-        begin_quantum(cfg(1, 100000), std::ptr::null());
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe { begin_quantum(cfg(1, 100000), std::ptr::null()) };
         assert_eq!(direct_check(), 1);
         willow_preempt_end();
         assert_eq!(direct_check(), 0);
@@ -810,30 +861,49 @@ mod tests {
     #[test]
     fn flag_starts_clear_and_frees() {
         let flag = willow_preempt_flag_new();
-        assert_eq!(willow_preempt_requested(flag), 0);
-        willow_preempt_flag_free(flag);
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        assert_eq!(unsafe { willow_preempt_requested(flag) }, 0);
+        // SAFETY: This test owns the standalone flag and all accesses and bound quanta have
+        // ended.
+        unsafe { willow_preempt_flag_free(flag) };
     }
 
     // 7. request sets, clear resets (acquire/release visible on same thread).
     #[test]
     fn request_then_clear() {
         let flag = willow_preempt_flag_new();
-        willow_preempt_request(flag);
-        assert_eq!(willow_preempt_requested(flag), 1);
-        willow_preempt_clear(flag);
-        assert_eq!(willow_preempt_requested(flag), 0);
-        willow_preempt_flag_free(flag);
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        unsafe { willow_preempt_request(flag) };
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        assert_eq!(unsafe { willow_preempt_requested(flag) }, 1);
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        unsafe { willow_preempt_clear(flag) };
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        assert_eq!(unsafe { willow_preempt_requested(flag) }, 0);
+        // SAFETY: This test owns the standalone flag and all accesses and bound quanta have
+        // ended.
+        unsafe { willow_preempt_flag_free(flag) };
     }
 
     // 8. Null flag is inert across all flag ops.
     #[test]
     fn null_flag_is_inert() {
         let null = std::ptr::null();
-        assert_eq!(willow_preempt_requested(null), 0);
-        willow_preempt_request(null); // no panic
-        willow_preempt_clear(null); // no panic
-        assert_eq!(willow_preempt_requested(null), 0);
-        willow_preempt_flag_free(std::ptr::null_mut()); // no panic
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        assert_eq!(unsafe { willow_preempt_requested(null) }, 0);
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe { willow_preempt_request(null) }; // no panic
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe { willow_preempt_clear(null) }; // no panic
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        assert_eq!(unsafe { willow_preempt_requested(null) }, 0);
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe { willow_preempt_flag_free(std::ptr::null_mut()) }; // no panic
     }
 
     // 9. No active quantum (no begin) → check never preempts.
@@ -849,47 +919,69 @@ mod tests {
     #[test]
     fn budget_exhaustion_preempts() {
         let flag = willow_preempt_flag_new();
-        begin_quantum(cfg(4, 60_000), flag);
+        // SAFETY: The fixture keeps the flag at its registered address throughout this
+        // quantum and unbinds it before release.
+        unsafe { begin_quantum(cfg(4, 60_000), flag) };
         // budget=4 → first 3 checks pass, 4th trips.
         assert_eq!(willow_preempt_check(), 0);
         assert_eq!(willow_preempt_check(), 0);
         assert_eq!(willow_preempt_check(), 0);
         assert_eq!(willow_preempt_check(), 1);
         // Flag was set by the budget trip.
-        assert_eq!(willow_preempt_requested(flag), 1);
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        assert_eq!(unsafe { willow_preempt_requested(flag) }, 1);
         willow_preempt_end();
-        willow_preempt_flag_free(flag);
+        // SAFETY: This test owns the standalone flag and all accesses and bound quanta have
+        // ended.
+        unsafe { willow_preempt_flag_free(flag) };
     }
 
     // 11. begin clears a stale request from a prior quantum.
     #[test]
     fn begin_clears_stale_request() {
         let flag = willow_preempt_flag_new();
-        willow_preempt_request(flag);
-        begin_quantum(cfg(1000, 60_000), flag);
-        assert_eq!(willow_preempt_requested(flag), 0);
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        unsafe { willow_preempt_request(flag) };
+        // SAFETY: The fixture keeps the flag at its registered address throughout this
+        // quantum and unbinds it before release.
+        unsafe { begin_quantum(cfg(1000, 60_000), flag) };
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        assert_eq!(unsafe { willow_preempt_requested(flag) }, 0);
         assert_eq!(willow_preempt_check(), 0);
         willow_preempt_end();
-        willow_preempt_flag_free(flag);
+        // SAFETY: This test owns the standalone flag and all accesses and bound quanta have
+        // ended.
+        unsafe { willow_preempt_flag_free(flag) };
     }
 
     // 12. An explicit request mid-quantum trips the very next check.
     #[test]
     fn explicit_request_preempts_immediately() {
         let flag = willow_preempt_flag_new();
-        begin_quantum(cfg(1000, 60_000), flag);
+        // SAFETY: The fixture keeps the flag at its registered address throughout this
+        // quantum and unbinds it before release.
+        unsafe { begin_quantum(cfg(1000, 60_000), flag) };
         assert_eq!(willow_preempt_check(), 0);
-        willow_preempt_request(flag);
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        unsafe { willow_preempt_request(flag) };
         assert_eq!(willow_preempt_check(), 1);
         willow_preempt_end();
-        willow_preempt_flag_free(flag);
+        // SAFETY: This test owns the standalone flag and all accesses and bound quanta have
+        // ended.
+        unsafe { willow_preempt_flag_free(flag) };
     }
 
     // 13. Time quantum trips even with budget remaining.
     #[test]
     fn time_quantum_preempts() {
         let flag = willow_preempt_flag_new();
-        begin_quantum(cfg(1_000_000, 1), flag);
+        // SAFETY: The fixture keeps the flag at its registered address throughout this
+        // quantum and unbinds it before release.
+        unsafe { begin_quantum(cfg(1_000_000, 1), flag) };
         // Spin past the 1ms deadline, then a check must trip on time.
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(3) {
@@ -897,29 +989,41 @@ mod tests {
         }
         assert_eq!(willow_preempt_check(), 1);
         willow_preempt_end();
-        willow_preempt_flag_free(flag);
+        // SAFETY: This test owns the standalone flag and all accesses and bound quanta have
+        // ended.
+        unsafe { willow_preempt_flag_free(flag) };
     }
 
     // 14. No-preempt region overrides an explicit request.
     #[test]
     fn no_preempt_region_overrides_request() {
         let flag = willow_preempt_flag_new();
-        begin_quantum(cfg(1000, 60_000), flag);
-        willow_preempt_request(flag);
+        // SAFETY: The fixture keeps the flag at its registered address throughout this
+        // quantum and unbinds it before release.
+        unsafe { begin_quantum(cfg(1000, 60_000), flag) };
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        unsafe { willow_preempt_request(flag) };
         willow_preempt_enter_no_preempt();
         assert_eq!(willow_preempt_check(), 0);
         willow_preempt_leave_no_preempt();
         assert_eq!(willow_preempt_check(), 1);
         willow_preempt_end();
-        willow_preempt_flag_free(flag);
+        // SAFETY: This test owns the standalone flag and all accesses and bound quanta have
+        // ended.
+        unsafe { willow_preempt_flag_free(flag) };
     }
 
     // 15. No-preempt nesting requires matching leaves.
     #[test]
     fn no_preempt_region_nests() {
         let flag = willow_preempt_flag_new();
-        begin_quantum(cfg(1000, 60_000), flag);
-        willow_preempt_request(flag);
+        // SAFETY: The fixture keeps the flag at its registered address throughout this
+        // quantum and unbinds it before release.
+        unsafe { begin_quantum(cfg(1000, 60_000), flag) };
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        unsafe { willow_preempt_request(flag) };
         willow_preempt_enter_no_preempt();
         willow_preempt_enter_no_preempt();
         willow_preempt_leave_no_preempt();
@@ -927,25 +1031,32 @@ mod tests {
         willow_preempt_leave_no_preempt();
         assert_eq!(willow_preempt_check(), 1);
         willow_preempt_end();
-        willow_preempt_flag_free(flag);
+        // SAFETY: This test owns the standalone flag and all accesses and bound quanta have
+        // ended.
+        unsafe { willow_preempt_flag_free(flag) };
     }
 
     // 16. end() unbinds: a later check (no new begin) never preempts.
     #[test]
     fn end_unbinds_quantum() {
         let flag = willow_preempt_flag_new();
-        begin_quantum(cfg(2, 60_000), flag);
+        // SAFETY: The fixture keeps the flag at its registered address throughout this
+        // quantum and unbinds it before release.
+        unsafe { begin_quantum(cfg(2, 60_000), flag) };
         willow_preempt_end();
         for _ in 0..10 {
             assert_eq!(willow_preempt_check(), 0);
         }
-        willow_preempt_flag_free(flag);
+        // SAFETY: This test owns the standalone flag and all accesses and bound quanta have
+        // ended.
+        unsafe { willow_preempt_flag_free(flag) };
     }
 
     // 17. begin with a null flag still enforces budget (no per-task flag).
     #[test]
     fn null_flag_quantum_still_counts_budget() {
-        begin_quantum(cfg(2, 60_000), std::ptr::null());
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe { begin_quantum(cfg(2, 60_000), std::ptr::null()) };
         assert_eq!(willow_preempt_check(), 0);
         assert_eq!(willow_preempt_check(), 1);
         willow_preempt_end();
@@ -954,7 +1065,8 @@ mod tests {
     // 18. budget=1 trips on the first check.
     #[test]
     fn budget_one_trips_immediately() {
-        begin_quantum(cfg(1, 60_000), std::ptr::null());
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe { begin_quantum(cfg(1, 60_000), std::ptr::null()) };
         assert_eq!(willow_preempt_check(), 1);
         willow_preempt_end();
     }
@@ -963,16 +1075,24 @@ mod tests {
     #[test]
     fn rearm_after_exhaustion() {
         let flag = willow_preempt_flag_new();
-        begin_quantum(cfg(2, 60_000), flag);
+        // SAFETY: The fixture keeps the flag at its registered address throughout this
+        // quantum and unbinds it before release.
+        unsafe { begin_quantum(cfg(2, 60_000), flag) };
         assert_eq!(willow_preempt_check(), 0);
         assert_eq!(willow_preempt_check(), 1);
         // Re-arm for the next quantum.
-        begin_quantum(cfg(2, 60_000), flag);
-        assert_eq!(willow_preempt_requested(flag), 0);
+        // SAFETY: The fixture keeps the flag at its registered address throughout this
+        // quantum and unbinds it before release.
+        unsafe { begin_quantum(cfg(2, 60_000), flag) };
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        assert_eq!(unsafe { willow_preempt_requested(flag) }, 0);
         assert_eq!(willow_preempt_check(), 0);
         assert_eq!(willow_preempt_check(), 1);
         willow_preempt_end();
-        willow_preempt_flag_free(flag);
+        // SAFETY: This test owns the standalone flag and all accesses and bound quanta have
+        // ended.
+        unsafe { willow_preempt_flag_free(flag) };
     }
 
     // 20. ABI config getters return defaults when env is unset (no env mutation,
@@ -991,11 +1111,21 @@ mod tests {
     #[test]
     fn requested_reads_external_set() {
         let flag = willow_preempt_flag_new();
-        assert_eq!(willow_preempt_requested(flag), 0);
-        willow_preempt_request(flag);
-        willow_preempt_request(flag); // idempotent
-        assert_eq!(willow_preempt_requested(flag), 1);
-        willow_preempt_flag_free(flag);
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        assert_eq!(unsafe { willow_preempt_requested(flag) }, 0);
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        unsafe { willow_preempt_request(flag) };
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        unsafe { willow_preempt_request(flag) }; // idempotent
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        assert_eq!(unsafe { willow_preempt_requested(flag) }, 1);
+        // SAFETY: This test owns the standalone flag and all accesses and bound quanta have
+        // ended.
+        unsafe { willow_preempt_flag_free(flag) };
     }
 
     // 22. Cross-thread request is observed via acquire/release (§23).
@@ -1004,11 +1134,17 @@ mod tests {
         let flag = willow_preempt_flag_new();
         let addr = flag as usize;
         std::thread::spawn(crate::runtime::serving(move || {
-            willow_preempt_request(addr as *const c_void);
+            // SAFETY: The fixture retains the initialized AtomicBool through this access,
+            // including concurrent requests.
+            unsafe { willow_preempt_request(addr as *const c_void) };
         }))
         .join()
         .unwrap();
-        assert_eq!(willow_preempt_requested(flag), 1);
-        willow_preempt_flag_free(flag);
+        // SAFETY: The fixture retains the initialized AtomicBool through this access,
+        // including concurrent requests.
+        assert_eq!(unsafe { willow_preempt_requested(flag) }, 1);
+        // SAFETY: This test owns the standalone flag and all accesses and bound quanta have
+        // ended.
+        unsafe { willow_preempt_flag_free(flag) };
     }
 }

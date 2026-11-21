@@ -523,7 +523,9 @@ mod tests {
     fn completed_barrier_calls_do_not_inflate_trace_work_or_heap_goal() {
         use super::super::*;
         let _guard = isolated_runtime();
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
         let mut state = runtime().heap.lock().unwrap();
         state.pacer.set_enabled_for_test(true);
         for live in [0, 1024, 32 * 1024, MIN_GOAL] {
@@ -544,14 +546,18 @@ mod tests {
             }
         }
         drop(state);
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
     }
 
     #[test]
     fn threshold_policy_completion_reset_and_samples() {
         use super::super::*;
         let _guard = isolated_runtime();
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
         let mut state = runtime().heap.lock().unwrap();
         state.pacer.disable_for_test();
         state.last_major_policy_live_bytes = 3 * MIN_GOAL;
@@ -564,7 +570,9 @@ mod tests {
         assert_eq!(state.threshold_bytes, MIN_GOAL as usize);
         assert_eq!(state.pacer_trigger, MIN_GOAL);
         drop(state);
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
     }
 
     #[test]
@@ -813,7 +821,9 @@ mod tests {
     fn disabled_pacer_preserves_soft_memory_trigger() {
         use super::super::*;
         let _guard = isolated_runtime();
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
         {
             let mut state = runtime().heap.lock().unwrap();
             state.pacer.enabled = false;
@@ -821,7 +831,9 @@ mod tests {
             state.pacer_trigger = 1;
         }
         let mut root = willow_alloc(1024);
-        willow_push_root(&mut root);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
         assert!(!allocation_should_collect_with_sync_in(
             crate::runtime::current(),
             true
@@ -836,8 +848,12 @@ mod tests {
             crate::runtime::current(),
             true
         ));
-        willow_pop_root();
-        reset_internal();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
     }
     #[test]
     fn runtime_completed_cpu_excess_adjusts_next_goal() {
@@ -849,7 +865,9 @@ mod tests {
             (Some(u64::MAX / 64), CPU_NORMAL | CPU_HARD, 2 * MIN_GOAL),
             (None, CPU_MISSING, MIN_GOAL),
         ] {
-            reset_internal();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal() };
             runtime()
                 .heap
                 .lock()
@@ -873,7 +891,9 @@ mod tests {
                 }
             });
         }
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
     }
 
     #[test]
@@ -1003,7 +1023,9 @@ mod tests {
     fn decision_publication_is_a_coherent_group() {
         use super::super::*;
         let _guard = isolated_runtime();
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
         std::thread::scope(|scope| {
             scope.spawn(crate::runtime::serving(|| {
                 for n in 1..=10_000 {
@@ -1024,7 +1046,9 @@ mod tests {
                 }
             }));
         });
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
     }
 
     #[test]
@@ -1033,7 +1057,9 @@ mod tests {
         use crate::gc_telemetry::pacing;
         let _guard = isolated_runtime();
         for missing in [None, Some(0), Some(8)] {
-            reset_internal();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal() };
             crate::runtime::current().telemetry.pacing.begin_major(100);
             for i in 0..9 {
                 crate::runtime::current().telemetry.pacing.cycle(
@@ -1069,7 +1095,9 @@ mod tests {
                 );
             }
         }
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
     }
 
     #[test]
@@ -1139,7 +1167,9 @@ mod tests {
         }
         for paced in [false, true] {
             for payload in [64, 512, 4096] {
-                reset_internal();
+                // SAFETY: The test controls its isolated runtime at this reset boundary; no
+                // other mutator or subsequent access relies on the discarded heap.
+                unsafe { reset_internal() };
                 runtime()
                     .heap
                     .lock()
@@ -1148,7 +1178,9 @@ mod tests {
                     .set_enabled_for_test(paced);
                 let mut roots = [std::ptr::null_mut(); 128];
                 for root in &mut roots {
-                    willow_push_root(root);
+                    // SAFETY: The slot storage stays live and stationary through the matching
+                    // pop, including during collection.
+                    unsafe { willow_push_root(root) };
                     *root = willow_alloc(payload);
                 }
                 let start = std::time::Instant::now();
@@ -1180,9 +1212,13 @@ mod tests {
                     p.decision.reasons
                 );
                 for _ in &roots {
-                    willow_pop_root();
+                    // SAFETY: The removed shadow-stack entries belong to this operation and
+                    // their slot storage is still live.
+                    unsafe { willow_pop_root() };
                 }
-                reset_internal();
+                // SAFETY: The test controls its isolated runtime at this reset boundary; no
+                // other mutator or subsequent access relies on the discarded heap.
+                unsafe { reset_internal() };
             }
         }
     }

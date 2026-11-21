@@ -59,17 +59,33 @@ pub extern "C" fn willow_println_f64(value: f64) {
 }
 
 /// Print a WillowString (GC-managed heap object: len at offset 0, bytes at offset 8).
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
+///
+/// ```compile_fail,E0133
+/// willow_runtime::print::willow_print_string(std::ptr::null());
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_print_string(value: *const u8) {
+pub unsafe extern "C" fn willow_print_string(value: *const u8) {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let s = unsafe { willow_string_as_str(value) };
     write_stdout(s);
 }
 
 /// Print a WillowString followed by a newline.
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_println_string(value: *const u8) {
+pub unsafe extern "C" fn willow_println_string(value: *const u8) {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let s = unsafe { willow_string_as_str(value) };
     write_stdout(format!("{s}\n"));
 }
@@ -90,6 +106,7 @@ mod tests {
 
     #[test]
     fn print_unit_03_null_string_is_empty() {
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         let s = unsafe { willow_string_as_str(std::ptr::null()) };
         assert_eq!(s, "");
     }
@@ -97,10 +114,14 @@ mod tests {
     #[test]
     fn print_unit_04_willow_string_roundtrip() {
         use crate::gc::{isolated_runtime, willow_gc_init};
-        use crate::string::willow_string_alloc;
+        use crate::string::willow_string_from_str;
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let ptr = willow_string_alloc(b"hello".as_ptr(), 5);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+
+        let ptr = willow_string_from_str("hello");
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         let s = unsafe { willow_string_as_str(ptr) };
         assert_eq!(s, "hello");
     }

@@ -152,17 +152,24 @@ impl AsyncRwLock {
         Some(self.value.load(Ordering::Acquire))
     }
 
-    pub fn commit(&self, task: RuntimeTaskId, token: RegistrationToken, value: i64) -> bool {
+    /// # Safety
+    /// For a reference lock, self must be its live, nonmoving GC payload and value must be
+    /// null or the current address of a live managed referent for the store barrier.
+    pub unsafe fn commit(&self, task: RuntimeTaskId, token: RegistrationToken, value: i64) -> bool {
         if self.validated_state().active_access(task, token) != Some(LockAccess::Write) {
             return false;
         }
         if self.is_ref {
-            crate::gc::willow_gc_write_barrier(
-                self as *const Self as *mut u8,
-                self.value.load(Ordering::Acquire) as *mut u8,
-                value as *mut u8,
-                crate::gc::GcStoreDestination::AsyncRwLockCell as i64,
-            );
+            // SAFETY: The reference cell supplies its previous word and incoming value. This
+            // destination asserts no header bits.
+            unsafe {
+                crate::gc::willow_gc_write_barrier(
+                    self as *const Self as *mut u8,
+                    self.value.load(Ordering::Acquire) as *mut u8,
+                    value as *mut u8,
+                    crate::gc::GcStoreDestination::AsyncRwLockCell as i64,
+                )
+            };
         }
         self.value.store(value, Ordering::Release);
         true
@@ -221,6 +228,8 @@ impl AsyncRwLock {
 }
 
 unsafe fn snapshot_async_rwlock(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let value = unsafe { &*(payload as *const AsyncRwLock) };
     if value.is_ref {
         children.push(value.value.load(Ordering::Acquire) as *mut u8);
@@ -238,11 +247,15 @@ unsafe fn snapshot_async_rwlock_slice(
         "native trace slice requires positive work credit"
     );
     // One atomic reference load is the complete snapshot.
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     unsafe { snapshot_async_rwlock(payload, children) };
     crate::gc::TraceSliceProgress::Done
 }
 
 unsafe fn trace_async_rwlock(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let lock = unsafe { &*(payload as *const AsyncRwLock) };
     lock.validated_state();
     if lock.is_ref && lock.value.load(Ordering::Acquire) != 0 {
@@ -251,12 +264,16 @@ unsafe fn trace_async_rwlock(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
 }
 
 unsafe fn drop_async_rwlock(payload: *mut u8) {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let lock = unsafe { &*(payload as *const AsyncRwLock) };
     if lock.reclamation_status() != RwReclamationStatus::Reclaimable {
         crate::panic_context::fatal_invariant(
             "collector attempted to reclaim an active scheduler-aware RwLock",
         );
     }
+    // SAFETY: Sweep invokes this registered destructor once on an initialized, word-aligned GC
+    // payload after its last use.
     unsafe { std::ptr::drop_in_place(payload as *mut AsyncRwLock) };
 }
 
@@ -265,16 +282,23 @@ const ASYNC_RWLOCK_DROP_COUNT: crate::observation::Counter =
     crate::observation::Counter(crate::observation::Event::AsyncRwlockDropCount);
 const ASYNC_RWLOCK_REGISTRATION: crate::gc::NativeGcRegistration =
     crate::gc::NativeGcRegistration::AsyncRwLock;
-const ASYNC_RWLOCK_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
-    ASYNC_RWLOCK_TYPE_ID,
-    Some(trace_async_rwlock),
-    Some(drop_async_rwlock),
-)
-.with_concurrent_trace(snapshot_async_rwlock)
-.with_concurrent_slice(snapshot_async_rwlock_slice)];
+// SAFETY: The constructor initializes this exact lock type for the selected ID. Its
+// stopped tracer exposes the value slot, its concurrent tracers snapshot that slot
+// atomically, and its finalizer drops the initialized lock after its last use.
+const ASYNC_RWLOCK_GC_TYPES: &[crate::gc::NativeGcType] = &[unsafe {
+    crate::gc::NativeGcType::new(
+        ASYNC_RWLOCK_TYPE_ID,
+        Some(trace_async_rwlock),
+        Some(drop_async_rwlock),
+    )
+    .with_concurrent_trace(snapshot_async_rwlock)
+    .with_concurrent_slice(snapshot_async_rwlock_slice)
+}];
 
 fn ensure_async_rwlock_registered() {
-    ASYNC_RWLOCK_REGISTRATION.ensure(ASYNC_RWLOCK_GC_TYPES);
+    // SAFETY: This is the complete descriptor set for the async read/write lock registration
+    // group and its constructors.
+    unsafe { ASYNC_RWLOCK_REGISTRATION.ensure(ASYNC_RWLOCK_GC_TYPES) };
 }
 
 /// # Safety
@@ -283,6 +307,8 @@ fn ensure_async_rwlock_registered() {
 /// lifetime of the returned borrow. The caller must keep the owning Willow
 /// handle rooted while the reference is used.
 unsafe fn rwlock_from_raw<'a>(raw: *mut c_void) -> Option<&'a AsyncRwLock> {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     (!raw.is_null()).then(|| unsafe { &*(raw as *const AsyncRwLock) })
 }
 
@@ -299,44 +325,69 @@ fn access_from_abi(mode: i32) -> Option<LockAccess> {
     }
 }
 
+/// # Safety
+/// When is_ref is nonzero, value must be null or the current address of a live managed
+/// payload.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_rwlock_new(value: i64, is_ref: i64) -> *mut c_void {
+pub unsafe extern "C" fn willow_async_rwlock_new(value: i64, is_ref: i64) -> *mut c_void {
     ensure_async_rwlock_registered();
     let root = (is_ref != 0).then(|| crate::gc::GcRootHandle::new(value as *mut u8));
-    let payload = crate::gc::willow_alloc_with_layout(
-        crate::gc::GcObjectKind::LockHandle,
-        ASYNC_RWLOCK_TYPE_ID,
-        std::mem::size_of::<AsyncRwLock>() as i64,
-        0,
-    );
+    const { assert!(align_of::<AsyncRwLock>() <= align_of::<crate::gc::GcHeader>()) };
+    // SAFETY: The constructor selects the matching payload layout and initializes its fields
+    // before exposing it or reaching a GC point.
+    let payload = unsafe {
+        crate::gc::willow_alloc_with_layout(
+            crate::gc::GcObjectKind::LockHandle,
+            ASYNC_RWLOCK_TYPE_ID,
+            std::mem::size_of::<AsyncRwLock>() as i64,
+            0,
+        )
+    };
     if payload.is_null() {
         return std::ptr::null_mut();
     }
     let value = root.as_ref().map_or(value, |root| root.load() as i64);
+    // SAFETY: The fresh GC payload has the size of the lock and the GC allocator's word alignment.
     unsafe {
         (payload as *mut AsyncRwLock).write(AsyncRwLock::new_payload(value, is_ref != 0));
     }
     if is_ref != 0 {
-        crate::gc::willow_gc_write_barrier(
-            payload,
-            std::ptr::null_mut(),
-            value as *mut u8,
-            crate::gc::GcStoreDestination::AsyncRwLockCell as i64,
-        );
+        // SAFETY: The reference cell supplies its previous word and incoming value. This
+        // destination asserts no header bits.
+        unsafe {
+            crate::gc::willow_gc_write_barrier(
+                payload,
+                std::ptr::null_mut(),
+                value as *mut u8,
+                crate::gc::GcStoreDestination::AsyncRwLockCell as i64,
+            )
+        };
     }
     payload as *mut c_void
 }
 
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_rwlock_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released. Each non-null output
+/// must exclusively address an aligned, writable i64 through this call, disjoint from the
+/// lock and any other output.
+///
+/// ```compile_fail,E0133
+/// let mut word = 0i64;
+/// willow_runtime::async_rwlock::willow_async_rwlock_acquire(std::ptr::null_mut(), 1, &mut word);
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_rwlock_acquire(
+pub unsafe extern "C" fn willow_async_rwlock_acquire(
     raw: *mut c_void,
     mode: i32,
     out_token: *mut i64,
 ) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let (Some(lock), Some(task), Some(access)) = (
+        // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+        // keeps it live.
         unsafe { rwlock_from_raw(raw) },
         current_task(),
         access_from_abi(mode),
@@ -345,6 +396,8 @@ pub extern "C" fn willow_async_rwlock_acquire(
     };
     let store = |token: RegistrationToken| {
         if !out_token.is_null() {
+            // SAFETY: The ABI caller provides a live, aligned, writable output slot for this
+            // result.
             unsafe { *out_token = token as i64 };
         }
     };
@@ -362,10 +415,15 @@ pub extern "C" fn willow_async_rwlock_acquire(
     }
 }
 
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_rwlock_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_rwlock_poll(raw: *mut c_void, token: i64) -> i32 {
+pub unsafe extern "C" fn willow_async_rwlock_poll(raw: *mut c_void, token: i64) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let (Some(lock), Some(task)) = (unsafe { rwlock_from_raw(raw) }, current_task()) else {
         return MUTEX_STATUS_LOST;
     };
@@ -376,28 +434,50 @@ pub extern "C" fn willow_async_rwlock_poll(raw: *mut c_void, token: i64) -> i32 
     }
 }
 
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_rwlock_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_rwlock_load(raw: *mut c_void, token: i64) -> i64 {
+pub unsafe extern "C" fn willow_async_rwlock_load(raw: *mut c_void, token: i64) -> i64 {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let (Some(lock), Some(task)) = (unsafe { rwlock_from_raw(raw) }, current_task()) else {
         return 0;
     };
     lock.load(task, token as RegistrationToken).unwrap_or(0)
 }
 
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_rwlock_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released. For a reference payload
+/// the word must be null or the current address of a live managed object of the declared
+/// element type.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_rwlock_commit(raw: *mut c_void, token: i64, value: i64) -> i32 {
+pub unsafe extern "C" fn willow_async_rwlock_commit(
+    raw: *mut c_void,
+    token: i64,
+    value: i64,
+) -> i32 {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let (Some(lock), Some(task)) = (unsafe { rwlock_from_raw(raw) }, current_task()) else {
         return 0;
     };
-    lock.commit(task, token as RegistrationToken, value) as i32
+    // SAFETY: The ABI caller supplies the live managed reference lock and its new referent.
+    (unsafe { lock.commit(task, token as RegistrationToken, value) }) as i32
 }
 
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_rwlock_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_rwlock_release(raw: *mut c_void, token: i64) -> i32 {
+pub unsafe extern "C" fn willow_async_rwlock_release(raw: *mut c_void, token: i64) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let (Some(lock), Some(task)) = (unsafe { rwlock_from_raw(raw) }, current_task()) else {
         return 0;
     };
@@ -417,15 +497,23 @@ pub extern "C" fn willow_async_rwlock_cancel() -> i32 {
     !matches!(purge_task_lock_wait(task), MutexCancel::NoLink) as i32
 }
 
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_rwlock_recursive_panic(file: *const u8, line: i32, col: i32) {
-    crate::panic_context::raise_language_message_at(
-        "recursive or upgrade/downgrade acquisition on non-reentrant RwLock",
-        file,
-        line.into(),
-        col.into(),
-    );
+pub unsafe extern "C" fn willow_async_rwlock_recursive_panic(file: *const u8, line: i32, col: i32) {
+    // SAFETY: The optional source file is null or a current Willow string and the panic path
+    // roots its string inputs before allocation.
+    unsafe {
+        crate::panic_context::raise_language_message_at(
+            "recursive or upgrade/downgrade acquisition on non-reentrant RwLock",
+            file,
+            line.into(),
+            col.into(),
+        )
+    };
 }
 
 #[unsafe(no_mangle)]
@@ -478,12 +566,16 @@ mod tests {
         let RwAcquire::Acquired(reader) = lock.acquire(10, LockAccess::Read) else {
             panic!("reader");
         };
-        assert!(!lock.commit(10, reader, 8));
+        // SAFETY: The fixture uses scalar storage or the managed reference lock and live
+        // referents created for this store.
+        assert!(!unsafe { lock.commit(10, reader, 8) });
         lock.release(10, reader);
         let RwAcquire::Acquired(writer) = lock.acquire(20, LockAccess::Write) else {
             panic!("writer");
         };
-        assert!(lock.commit(20, writer, 8));
+        // SAFETY: The fixture uses scalar storage or the managed reference lock and live
+        // referents created for this store.
+        assert!(unsafe { lock.commit(20, writer, 8) });
         assert_eq!(lock.load(20, writer), Some(8));
     }
 
@@ -565,7 +657,9 @@ mod tests {
         ));
         assert_eq!(lock.writer(), Some((writer, writer_token)));
         assert_eq!(lock.poll_acquire(writer, writer_token), RwResume::Acquired);
-        assert!(lock.commit(writer, writer_token, 1));
+        // SAFETY: The fixture uses scalar storage or the managed reference lock and live
+        // referents created for this store.
+        assert!(unsafe { lock.commit(writer, writer_token, 1) });
         assert!(matches!(
             lock.release(writer, writer_token),
             RwRelease::Released { woken: 1_000 }
@@ -664,20 +758,30 @@ mod tests {
     fn gc_managed_handle_traces_value_and_reclaims_native_state() {
         let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let protected = willow_string_from_str("rw protected");
-        let raw = willow_async_rwlock_new(protected as i64, 1);
-        willow_gc_add_runtime_root(raw.cast::<u8>());
+        // SAFETY: The initial word matches the constructor’s reference flag.
+        let raw = unsafe { willow_async_rwlock_new(protected as i64, 1) };
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { willow_gc_add_runtime_root(raw.cast::<u8>()) };
         let _garbage = willow_string_from_str("garbage");
 
         willow_gc_collect();
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { willow_string_as_str(protected) }, "rw protected");
+        // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+        // keeps it live.
         let lock = unsafe { rwlock_from_raw(raw) }.expect("rwlock handle");
         assert_eq!(lock.gc_root(), Some(protected));
         assert_eq!(lock.reclamation_status(), RwReclamationStatus::Reclaimable);
 
         let before = ASYNC_RWLOCK_DROP_COUNT.load(Ordering::SeqCst);
-        willow_gc_remove_runtime_root(raw.cast::<u8>());
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { willow_gc_remove_runtime_root(raw.cast::<u8>()) };
         willow_gc_collect();
         assert_eq!(ASYNC_RWLOCK_DROP_COUNT.load(Ordering::SeqCst), before + 1);
     }
@@ -686,10 +790,13 @@ mod tests {
     fn repeated_unreachable_handles_are_finalized() {
         let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let before = ASYNC_RWLOCK_DROP_COUNT.load(Ordering::SeqCst);
         for value in 0..1_000 {
-            let _ = willow_async_rwlock_new(value, 0);
+            // SAFETY: The initial word matches the constructor’s reference flag.
+            let _ = unsafe { willow_async_rwlock_new(value, 0) };
         }
         willow_gc_collect();
         assert_eq!(

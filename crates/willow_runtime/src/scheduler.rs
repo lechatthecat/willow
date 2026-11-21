@@ -1213,7 +1213,9 @@ impl ShardedTaskTable {
         let transitioned = task.state.finish_terminal();
         if transitioned {
             after_transition();
-            crate::async_frame::frame_publish_terminal(task.frame, terminal_status);
+            // SAFETY: The frame owner retains the initialized ABI status word through this
+            // atomic access.
+            unsafe { crate::async_frame::frame_publish_terminal(task.frame, terminal_status) };
         }
         self.reconcile_blocked_transition(before, task.state.lifecycle());
         if !transitioned {
@@ -1807,7 +1809,11 @@ impl RuntimeScheduler {
     /// Spawn a cooperative task that runs `poll` over `frame`. The task starts
     /// ready; the caller is responsible for keeping `frame` GC-reachable (the
     /// runtime ABI roots it).
-    pub fn spawn_task_initialized(
+    ///
+    /// # Safety
+    /// The caller retains the frame until retirement. Each callback must accept that frame,
+    /// including null for frameless tasks. A non-null frame must implement the async-frame ABI.
+    pub unsafe fn spawn_task_initialized(
         &mut self,
         poll: RuntimePollFn,
         frame: *mut c_void,
@@ -1821,8 +1827,14 @@ impl RuntimeScheduler {
         id
     }
 
-    pub fn spawn_task(&mut self, poll: RuntimePollFn, frame: *mut c_void) -> RuntimeTaskId {
-        self.spawn_task_initialized(poll, frame, None, |_| {})
+    ///
+    /// # Safety
+    /// The caller retains the frame until retirement. Each callback must accept that frame,
+    /// including null for frameless tasks. A non-null frame must implement the async-frame ABI.
+    pub unsafe fn spawn_task(&mut self, poll: RuntimePollFn, frame: *mut c_void) -> RuntimeTaskId {
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        unsafe { self.spawn_task_initialized(poll, frame, None, |_| {}) }
     }
 
     /// The cooperative resume entry, frame, and stable preemption flag for an
@@ -1966,7 +1978,11 @@ impl RuntimeScheduler {
         self.tasks.with(id, read)
     }
 
-    pub fn with_task_mut<R>(
+    /// # Safety
+    /// Preserve the task identity, frame lifetime and root ownership. Its poll and cancel
+    /// callbacks must continue to accept that frame until retirement. Do not move a task
+    /// record or transfer its execution resources out of the scheduler.
+    pub unsafe fn with_task_mut<R>(
         &self,
         id: RuntimeTaskId,
         mutate: impl FnOnce(&mut RuntimeTask) -> R,
@@ -2668,8 +2684,7 @@ fn claimed_task_work(
     task: &mut RuntimeTask,
     cancel_epoch: &crate::task_state::CancelEpoch,
 ) -> ClaimedTaskWork {
-    let mut suspended = false;
-    let mut cleanup = false;
+    let stack_state = (false, false);
     #[cfg(any(
         all(
             target_os = "linux",
@@ -2682,10 +2697,10 @@ fn claimed_task_work(
         ),
         all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
-    if let Some(stack) = task.native_stack.as_ref() {
-        suspended = stack.is_suspended();
-        cleanup = stack.is_cleanup();
-    }
+    let stack_state = task.native_stack.as_ref().map_or(stack_state, |stack| {
+        (stack.is_suspended(), stack.is_cleanup())
+    });
+    let (suspended, cleanup) = stack_state;
     let work = ClaimedTaskWork {
         poll: task
             .poll
@@ -2937,10 +2952,9 @@ fn set_current_task(id: Option<RuntimeTaskId>) {
     });
     if id.is_none() {
         CURRENT_EXECUTION.with(|slot| {
-            let previous = slot.replace(TaskExecution::new());
             // Every runnable/terminal boundary publishes the stack first.
             // Dropping a suspended stack here would violate worker ownership.
-            drop(previous);
+            slot.replace(TaskExecution::new());
         });
     }
     crate::panic_context::replace_current_context(context);
@@ -2961,10 +2975,17 @@ pub(crate) fn current_worker() -> usize {
 /// Spawn a cooperative task on the global scheduler. The frame is rooted with
 /// the GC so it (and the values it references) survives collection while the
 /// task is pending. Returns the task id.
+///
+/// # Safety
+/// The callback must accept this frame and remain callable until retirement. A non-null
+/// frame must be an initialized nonmoving managed task frame in this runtime with the header
+/// and slots its callbacks access. Keep it live until the scheduler has taken its root.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_sched_spawn(poll: RuntimePollFn, frame: *mut c_void) -> u64 {
-    spawn_global_task_initialized(poll, frame, None, |_| {})
+pub unsafe extern "C" fn willow_sched_spawn(poll: RuntimePollFn, frame: *mut c_void) -> u64 {
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe { spawn_global_task_initialized(poll, frame, None, |_| {}) }
 }
 
 /// Spawn a native runtime task only after all state needed by its first poll
@@ -2972,23 +2993,44 @@ pub extern "C" fn willow_sched_spawn(poll: RuntimePollFn, frame: *mut c_void) ->
 /// id is reserved but outside `GLOBAL_SCHEDULER`, and before the task is visible
 /// in either the task table or a run queue. It may call scheduler APIs; the
 /// reserved task itself remains deliberately unobservable until publication.
-pub(crate) fn spawn_global_task_initialized(
+///
+/// # Safety
+/// The callback must accept this frame and remain callable until retirement. A non-null
+/// frame must be an initialized nonmoving managed task frame in this runtime with the header
+/// and slots its callbacks access. Keep it live until the scheduler has taken its root.
+pub(crate) unsafe fn spawn_global_task_initialized(
     poll: RuntimePollFn,
     frame: *mut c_void,
     cancel: Option<RuntimeCancelFn>,
     initialize: impl FnOnce(RuntimeTaskId),
 ) -> u64 {
-    spawn_global_task_initialized_inner(poll, frame, cancel, initialize, false)
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe { spawn_global_task_initialized_inner(poll, frame, cancel, initialize, false) }
 }
 
 /// Spawn a generated poll whose synchronous calls enter a stack lazily.
+///
+/// # Safety
+/// The callback must accept this frame and remain callable until retirement. A non-null
+/// frame must be an initialized nonmoving managed task frame in this runtime with the header
+/// and slots its callbacks access. Keep it live until the scheduler has taken its root.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_sched_spawn_cooperative(poll: RuntimePollFn, frame: *mut c_void) -> i64 {
-    spawn_global_task_initialized_inner(poll, frame, None, |_| {}, true) as i64
+pub unsafe extern "C" fn willow_sched_spawn_cooperative(
+    poll: RuntimePollFn,
+    frame: *mut c_void,
+) -> i64 {
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    (unsafe { spawn_global_task_initialized_inner(poll, frame, None, |_| {}, true) }) as i64
 }
 
-fn spawn_global_task_initialized_inner(
+/// # Safety
+/// The callback must accept this frame and remain callable until retirement. A non-null
+/// frame must be an initialized nonmoving managed task frame in this runtime with the header
+/// and slots its callbacks access. Keep it live until the scheduler has taken its root.
+unsafe fn spawn_global_task_initialized_inner(
     poll: RuntimePollFn,
     frame: *mut c_void,
     cancel: Option<RuntimeCancelFn>,
@@ -3080,6 +3122,8 @@ pub unsafe extern "C" fn willow_sched_wake_many(ids: *const u64, len: usize) {
     if len == 0 {
         return;
     }
+    // SAFETY: The caller supplies len initialized task IDs in a contiguous slice that stays live
+    // during wake processing.
     let ids = unsafe { std::slice::from_raw_parts(ids, len) };
     wake_channel_owners(ids, &mut WakeBatchScratch::default());
 }
@@ -3140,7 +3184,9 @@ pub extern "C" fn willow_sched_cancel(id: u64) {
             if outcome != CancelOutcome::NoChange {
                 // Mirror the request into the frame header so
                 // `Task::is_cancelled()` is a plain load.
-                crate::async_frame::frame_request_cancel(task.frame);
+                // SAFETY: The frame owner retains the initialized ABI status word through
+                // this atomic access.
+                unsafe { crate::async_frame::frame_request_cancel(task.frame) };
             }
             if outcome == CancelOutcome::Enqueue {
                 task.wake_deadline = None;
@@ -3163,9 +3209,15 @@ pub extern "C" fn willow_sched_cancel(id: u64) {
 /// Record the source location of the call that spawned task `id` (file is a
 /// WillowString; copied out of the GC heap). Shown in panic/debug traces.
 ///
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_sched_set_spawn_site(id: u64, file: *const u8, line: i64) {
+pub unsafe extern "C" fn willow_sched_set_spawn_site(id: u64, file: *const u8, line: i64) {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let file = unsafe { crate::string::willow_string_as_str(file) }.to_string();
     let id = id as RuntimeTaskId;
     global_task_table().with_mut(id, |task| {
@@ -3423,9 +3475,13 @@ fn report_poll_failure(id: u64, invalid_result: Option<i32>, async_chain: &str) 
 
 /// Attach the compiler-generated cancellation cleanup entry to a task. Called by the async-fn
 /// constructor right after spawn.
+///
+/// # Safety
+/// The callback must accept the frame registered for this task and remain callable through
+/// cancellation.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_sched_set_cancel_fn(id: u64, cancel: RuntimeCancelFn) {
+pub unsafe extern "C" fn willow_sched_set_cancel_fn(id: u64, cancel: RuntimeCancelFn) {
     let id = id as RuntimeTaskId;
     global_task_table().with_mut(id, |task| {
         task.cancel = Some(cancel);
@@ -3433,9 +3489,13 @@ pub extern "C" fn willow_sched_set_cancel_fn(id: u64, cancel: RuntimeCancelFn) {
 }
 
 /// Attach cooperative cleanup with its compiler-proven native stack requirement.
+///
+/// # Safety
+/// The callback must accept the frame registered for this task and remain callable through
+/// cancellation.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_sched_set_cancel_fn_cooperative(
+pub unsafe extern "C" fn willow_sched_set_cancel_fn_cooperative(
     id: u64,
     cancel: RuntimeCancelFn,
     needs_stack: i32,
@@ -3456,9 +3516,14 @@ pub extern "C" fn willow_sched_current_task() -> u64 {
 /// plus length, which must remain valid for the process lifetime). Emitted at
 /// the top of each async poll fn so a panic can render the async chain. No-op when no task is
 /// running.
+///
+/// # Safety
+/// For each non-null pointer with a positive length, provide that many initialized immutable
+/// bytes in a single allocation at a stable address for the lifetime of the process.
+/// Diagnostics retain the address.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) {
+pub unsafe extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) {
     if name.is_null() || name_len <= 0 {
         return;
     }
@@ -3650,13 +3715,19 @@ pub extern "C" fn willow_sched_await(awaitee: u64) -> i32 {
 ///
 /// `frame` null falls back to the id-only path so a synthetic/placeholder task
 /// still behaves.
+///
+/// # Safety
+/// A non-null frame must remain live through the call and provide the initialized, naturally
+/// aligned async-frame status word for atomic access.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_frame_await(frame: *mut c_void, awaitee: u64) -> i32 {
+pub unsafe extern "C" fn willow_frame_await(frame: *mut c_void, awaitee: u64) -> i32 {
     if frame.is_null() {
         return willow_sched_await(awaitee);
     }
-    if crate::async_frame::frame_is_terminal(frame) {
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    if unsafe { crate::async_frame::frame_is_terminal(frame) } {
         crate::gc::stress_collect("await");
         return 1;
     }
@@ -3665,9 +3736,13 @@ pub extern "C" fn willow_frame_await(frame: *mut c_void, awaitee: u64) -> i32 {
 
 /// Frame-backed post-await check: the cancelled test is a
 /// header load, and the id is carried only for the diagnostic message.
+///
+/// # Safety
+/// A non-null frame must remain live through the call and provide the initialized, naturally
+/// aligned async-frame status word for atomic access.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_frame_await_check(frame: *mut c_void, id: u64) {
+pub unsafe extern "C" fn willow_frame_await_check(frame: *mut c_void, id: u64) {
     if frame.is_null() {
         sched_await_check(id);
         return;
@@ -3682,7 +3757,9 @@ pub extern "C" fn willow_frame_await_check(frame: *mut c_void, id: u64) {
         // test harness) must still return normally.
         park_until_fatal_abort();
     }
-    let status = crate::async_frame::frame_terminal_status(frame);
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    let status = unsafe { crate::async_frame::frame_terminal_status(frame) };
     if status == crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED {
         report_await_of_cancelled_task(id);
     }
@@ -3961,7 +4038,9 @@ impl Drop for SchedulerDriveGuard {
             // The outer task still owns its frame and lifecycle; only its TLS
             // marker and preemption budget were displaced by the nested drive.
             if let Some(flag) = global_task_table().with(id, RuntimeTask::preempt_flag_ptr) {
-                crate::preempt::willow_preempt_begin(flag);
+                // SAFETY: The running task owns its stable flag until the poll or cleanup
+                // quantum is unbound, including nested drives.
+                unsafe { crate::preempt::willow_preempt_begin(flag) };
             }
         }
         if self.paused_parallel_poll
@@ -4700,6 +4779,8 @@ pub extern "C" fn willow_sync_poll_cancel_cleanup() {
         .flatten();
     if let Some((cancel, frame)) = cleanup {
         crate::preempt::willow_sync_cleanup_enter();
+        // SAFETY: The claimed task retains its frame and pairs it with the installed callback for
+        // this execution.
         unsafe {
             crate::generated_context::invoke(cancel as *const (), frame);
         }
@@ -5484,6 +5565,8 @@ fn scheduler_run_loop_in(
             ))]
             {
                 if work.direct_cancel {
+                    // SAFETY: The claimed task retains its frame and pairs it with the installed
+                    // callback for this execution.
                     unsafe {
                         crate::generated_context::invoke(cancel_fn as *const (), cancel_frame)
                     };
@@ -5497,7 +5580,11 @@ fn scheduler_run_loop_in(
                         .tasks
                         .with(id, RuntimeTask::preempt_flag_ptr)
                         .unwrap_or(std::ptr::null());
-                    crate::preempt::willow_preempt_begin(flag);
+                    // SAFETY: The running task owns its stable flag until the poll or cleanup
+                    // quantum is unbound, including nested drives.
+                    unsafe { crate::preempt::willow_preempt_begin(flag) };
+                    // SAFETY: The claimed task retains its frame and pairs it with the installed
+                    // callback for this execution.
                     let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
                     crate::preempt::willow_preempt_end();
                     if stack.is_suspended() {
@@ -5541,6 +5628,8 @@ fn scheduler_run_loop_in(
                 ),
                 all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
             )))]
+            // SAFETY: this worker exclusively claimed the registered cancellation callback
+            // and its live task frame. The runtime callback ABI does not unwind.
             unsafe {
                 crate::generated_context::invoke(cancel_fn as *const (), cancel_frame)
             };
@@ -5613,7 +5702,9 @@ fn scheduler_run_loop_in(
             id,
             0,
         );
-        crate::preempt::willow_preempt_begin(preempt_flag);
+        // SAFETY: The running task owns its stable flag until the poll or cleanup quantum is
+        // unbound, including nested drives.
+        unsafe { crate::preempt::willow_preempt_begin(preempt_flag) };
         #[cfg(any(
             all(
                 target_os = "linux",
@@ -5629,6 +5720,8 @@ fn scheduler_run_loop_in(
         let (result, native_cancelled) = {
             if work.direct_poll {
                 (
+                    // SAFETY: The claimed task retains its frame and pairs it with the installed
+                    // callback for this execution.
                     unsafe { crate::generated_context::invoke(poll as *const (), frame) },
                     false,
                 )
@@ -5638,6 +5731,8 @@ fn scheduler_run_loop_in(
                     .unwrap_or_else(|| {
                         crate::native_stack::NativeStack::acquire_in(owner, poll, frame)
                     });
+                // SAFETY: The claimed task retains its frame and pairs it with the installed
+                // callback for this execution.
                 let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
                 let cancelled = stack.is_cancelled();
                 if stack.is_suspended() {
@@ -5661,6 +5756,8 @@ fn scheduler_run_loop_in(
             all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
         )))]
         let (result, native_cancelled) = (
+            // SAFETY: the worker owns the poll claim and its registered frame remains live
+            // until this non-unwinding callback returns.
             unsafe { crate::generated_context::invoke(poll as *const (), frame) },
             false,
         );
@@ -5828,7 +5925,9 @@ pub fn reset_global_scheduler_for_test() {
         frames
     });
     for frame in frames {
-        crate::gc::willow_gc_remove_runtime_root(frame as *mut u8);
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { crate::gc::willow_gc_remove_runtime_root(frame as *mut u8) };
     }
     set_current_task(None);
     CURRENT_WORKER.with(|worker| worker.set(0));
@@ -5853,17 +5952,28 @@ fn replace_global_scheduler_for_test(worker_count: usize) {
 }
 
 /// Enter or resume a task-owned synchronous helper callback.
+///
+/// # Safety
+/// The callback must accept this frame and both must remain valid across any suspension
+/// until the callback returns.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_task_stack_enter(callback: RuntimePollFn, frame: *mut c_void) -> i32 {
+pub unsafe extern "C" fn willow_task_stack_enter(
+    callback: RuntimePollFn,
+    frame: *mut c_void,
+) -> i32 {
     task_stack_enter(callback, frame)
 }
 
 /// Generated-helper ABI: synchronous frames remain on their owning OS thread
 /// across implicit preemption, including frames holding non-Send local values.
+///
+/// # Safety
+/// The callback must accept this frame and both must remain valid across any suspension
+/// until the callback returns.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_task_stack_enter_generated(
+pub unsafe extern "C" fn willow_task_stack_enter_generated(
     callback: RuntimePollFn,
     frame: *mut c_void,
 ) -> i32 {
@@ -5893,6 +6003,8 @@ fn task_stack_enter(callback: RuntimePollFn, frame: *mut c_void) -> i32 {
             })
             .unwrap_or_else(|| crate::native_stack::NativeStack::acquire(callback, frame));
         let panic_depth = stack.entry_panic_depth();
+        // SAFETY: The claimed task retains its frame and pairs it with the installed callback for
+        // this execution.
         let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
         // A recovered cleanup panic must not revoke sticky cancellation, and
         // an already-active outer panic is not a new helper failure.
@@ -5920,6 +6032,8 @@ fn task_stack_enter(callback: RuntimePollFn, frame: *mut c_void) -> i32 {
         ),
         all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     )))]
+    // SAFETY: the task-stack entry ABI supplies the synchronous helper with its
+    // matching live frame. The direct call completes within that frame's lifetime.
     unsafe {
         crate::generated_context::invoke(callback as *const (), frame)
     }
@@ -6055,6 +6169,20 @@ pub fn gc_metrics_v1() -> GcMetricsV1 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    )
+))]
 #[path = "scheduler_switch_lock_tests.rs"]
 pub(crate) mod switch_lock_tests;

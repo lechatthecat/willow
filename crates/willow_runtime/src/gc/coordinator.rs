@@ -330,6 +330,8 @@ mod tests {
         _: &mut Vec<*mut u8>,
     ) -> TraceSliceProgress {
         // The rooted old-generation object retains its observation while tracing.
+        // SAFETY: The test registered this trace type and allocated its full size in word-aligned
+        // GC storage.
         let pause = unsafe { &*payload.cast::<TracePause>() };
         pause.entered.store(true, Ordering::Release);
         if pause.release.load(Ordering::Acquire) {
@@ -359,10 +361,16 @@ mod tests {
                         let root = {
                             let mut state = owner.gc.heap.lock().unwrap();
                             let object =
-                                allocate_old_region_object_locked(&mut state, 0, 0, size, 0, true)
+                                // SAFETY: The allocation path forwards the validated payload
+                                // extent, type and tracing layout; its caller initializes
+                                // native fields before collection.
+                                unsafe { allocate_old_region_object_locked(&mut state, 0, 0, size, 0, true) }
                                     .unwrap();
                             for _ in 0..128 {
-                                allocate_old_region_object_locked(&mut state, 0, 0, 8, 0, true)
+                                // SAFETY: The allocation path forwards the validated payload
+                                // extent, type and tracing layout; its caller initializes
+                                // native fields before collection.
+                                unsafe { allocate_old_region_object_locked(&mut state, 0, 0, 8, 0, true) }
                                     .unwrap();
                             }
                             object.payload().as_ptr()
@@ -401,14 +409,17 @@ mod tests {
                                 assert!(std::time::Instant::now() < deadline);
                                 std::thread::yield_now();
                             }
-                            let object = allocate_old_region_object_locked(
+                            // SAFETY: The allocation path forwards the validated payload
+                            // extent, type and tracing layout; its caller initializes native
+                            // fields before collection.
+                            let object = unsafe { allocate_old_region_object_locked(
                                 &mut owner.gc.heap.lock().unwrap(),
                                 0,
                                 0,
                                 size,
                                 0,
                                 true,
-                            )
+                            ) }
                             .unwrap();
                             let payload = object.payload().as_ptr();
                             owner.gc.runtime_roots.add(payload);
@@ -485,7 +496,9 @@ mod tests {
     #[test]
     fn shutdown_notification_spurious_wakes_and_stop_rounds() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let _mutator = MutatorRegistration::new();
         runtime()
             .wait_observation
@@ -540,13 +553,17 @@ mod tests {
         );
         assert_eq!(registered_mutator_count(), 1);
         drop(_mutator);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn shutdown_notification_idle_repeated_and_before_wait() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         shutdown(); // Absent coordinator.
         for _ in 0..64 {
             *runtime().coordinator.lock().unwrap() =
@@ -572,14 +589,18 @@ mod tests {
         completed
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn coordinator_panic_terminates_instead_of_disabling_collection() {
         use super::super::failure_policy_tests::{GC_FATAL_CASE, assert_fatal_child};
         if std::env::var_os(GC_FATAL_CASE).is_some() {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             willow_gc_register_mutator();
             runtime()
                 .wait_observation
@@ -601,17 +622,31 @@ mod tests {
     #[test]
     fn allocation_resumes_while_automatic_collection_is_tracing() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         const TYPE: u32 = 0xFA88;
-        willow_register_type_capability(
-            TYPE,
-            legacy,
-            NativeTraceCapability::SliceConcurrentSafe(paused_trace),
-        );
-        let mut root = willow_alloc_object(TYPE as i64, 8);
+        // SAFETY: The fixture controls every instance of this ID and installs the matching
+        // stopped tracer and synchronized snapshot capability, if present.
+        unsafe {
+            willow_register_type_capability(
+                TYPE,
+                legacy,
+                NativeTraceCapability::SliceConcurrentSafe(paused_trace),
+            )
+        };
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let mut root = unsafe { willow_alloc_object(TYPE as i64, 8) };
+        // SAFETY: The test registered this trace type and allocated its full size in word-aligned
+        // GC storage.
         unsafe { root.cast::<TracePause>().write(TracePause::default()) };
+        // SAFETY: The test registered this trace type and allocated its full size in word-aligned
+        // GC storage.
         let pause = unsafe { &*root.cast::<TracePause>() };
-        willow_push_root(&mut root);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
         willow_gc_register_mutator();
         runtime().heap.lock().unwrap().threshold_bytes = 1;
         crate::gc::invalidate_runtime_policy_budgets();
@@ -633,32 +668,50 @@ mod tests {
         shutdown();
         assert_eq!(runtime().heap.lock().unwrap().major_collections, 1);
         assert_eq!(registered_mutator_count(), 1);
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         willow_gc_unregister_mutator();
         collect_internal();
         assert_eq!(willow_gc_allocated_bytes(), 0);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn automatic_request_survives_explicit_collector_election_loss() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime()
             .wait_observation
             .sleeps
             .store(0, Ordering::Relaxed);
         const TYPE: u32 = 0xFA89;
-        willow_register_type_capability(
-            TYPE,
-            legacy,
-            NativeTraceCapability::SliceConcurrentSafe(paused_trace),
-        );
+        // SAFETY: The fixture controls every instance of this ID and installs the matching
+        // stopped tracer and synchronized snapshot capability, if present.
+        unsafe {
+            willow_register_type_capability(
+                TYPE,
+                legacy,
+                NativeTraceCapability::SliceConcurrentSafe(paused_trace),
+            )
+        };
         let _mutator = MutatorRegistration::new();
-        let mut root = willow_alloc_object(TYPE as i64, 8);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let mut root = unsafe { willow_alloc_object(TYPE as i64, 8) };
+        // SAFETY: The test registered this trace type and allocated its full size in word-aligned
+        // GC storage.
         unsafe { root.cast::<TracePause>().write(TracePause::default()) };
+        // SAFETY: The test registered this trace type and allocated its full size in word-aligned
+        // GC storage.
         let pause = unsafe { &*root.cast::<TracePause>() };
-        willow_push_root(&mut root);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         let explicit = std::thread::spawn(crate::runtime::serving(|| {
             let _mutator = MutatorRegistration::new();
@@ -715,9 +768,13 @@ mod tests {
             "explicit_cycles=1 retained_automatic_cycles=1 additional_requests=0 cooperative_sleeps={}",
             runtime().wait_observation.sleeps.load(Ordering::Relaxed)
         );
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
         drop(_mutator);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
@@ -725,16 +782,22 @@ mod tests {
         let _guard = isolated_runtime();
         for asynchronous in [false, true] {
             for handshake in [false, true] {
-                reset_internal_for_test();
+                // SAFETY: The test controls its isolated runtime at this reset boundary; no
+                // other mutator or subsequent access relies on the discarded heap.
+                unsafe { reset_internal_for_test() };
                 let _handshake_policy = runtime().handshake_policy.with_handshake_only(handshake);
                 let (ready_tx, ready_rx) = std::sync::mpsc::channel();
                 let (release_tx, release_rx) = std::sync::mpsc::channel();
                 let owner = std::thread::spawn(crate::runtime::serving(move || {
                     let mut root = willow_alloc(32);
-                    willow_push_root(&mut root);
+                    // SAFETY: The initialized slot stays at this address until its
+                    // registration is popped; collection may rewrite it there.
+                    unsafe { willow_push_root(&raw mut root) };
                     ready_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
-                    willow_pop_root();
+                    // SAFETY: The removed shadow-stack entries belong to this operation and
+                    // their slot storage is still live.
+                    unsafe { willow_pop_root() };
                 }));
                 ready_rx.recv().unwrap();
                 let registration = asynchronous.then(MutatorRegistration::new);
@@ -812,21 +875,29 @@ mod tests {
                 );
             }
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn m3_foreign_root_deferred_receipt_shutdown_stays_incomplete() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let owner = std::thread::spawn(crate::runtime::serving(move || {
             let mut root = willow_alloc(32);
-            willow_push_root(&mut root);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut root) };
             ready_tx.send(()).unwrap();
             release_rx.recv().unwrap();
-            willow_pop_root();
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
         }));
         ready_rx.recv().unwrap();
         let registration = MutatorRegistration::new();
@@ -849,13 +920,17 @@ mod tests {
         );
         assert_eq!(willow_gc_allocated_bytes(), 0);
         drop(registration);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn unregistered_native_callers_keep_synchronous_compatibility() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         assert!(!request());
         assert!(runtime().coordinator.lock().unwrap().is_none());
     }

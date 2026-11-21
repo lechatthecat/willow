@@ -338,7 +338,9 @@ mod tests {
         const KEY: &str = "WILLOW_M0_FAILURE_CASE";
         if let Ok(case) = std::env::var(KEY) {
             let _guard = crate::gc::isolated_runtime();
-            crate::gc::reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { crate::gc::reset_internal_for_test() };
             reproduction(7_276_289, 42);
             crate::gc::willow_alloc(16);
             match case.as_str() {

@@ -328,6 +328,8 @@ pub(crate) fn record(kind: RuntimeEventKind, worker: Option<usize>, task_id: u64
     }
 
     if let Some(registration) = registration {
+        // SAFETY: The registration keeps callback and context paired through delivery. The stack
+        // event remains live until the callback returns.
         unsafe { (registration.hook)(&event, registration.context as *mut c_void) };
         if registration.active_callbacks.fetch_sub(1, Ordering::AcqRel) == 1 {
             let _wait = registration
@@ -346,9 +348,13 @@ pub(crate) fn record(kind: RuntimeEventKind, worker: Option<usize>, task_id: u64
 /// it alive until the hook is cleared. Clearing/replacing the hook waits for
 /// callbacks already using the prior context. A callback must not itself call
 /// this registration function.
+///
+/// # Safety
+/// A supplied callback must safely accept the event and context on any delivering thread.
+/// Keep its code and context live through unregistration and completion of in-flight calls.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_runtime_set_event_hook_v1(
+pub unsafe extern "C" fn willow_runtime_set_event_hook_v1(
     hook: Option<RuntimeEventHookV1>,
     context: *mut c_void,
 ) {
@@ -382,14 +388,24 @@ pub extern "C" fn willow_runtime_set_event_hook_v1(
 
 /// Write a versioned cumulative runtime snapshot. Returns 0 on success and -1
 /// for a null output pointer.
+///
+/// # Safety
+/// A non-null output must exclusively address one aligned, writable WillowRuntimeMetricsV1
+/// for the duration of the call. Its storage may be uninitialized.
+///
+/// ```compile_fail,E0133
+/// willow_runtime::observability::willow_runtime_metrics_snapshot_v1(std::ptr::null_mut());
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_runtime_metrics_snapshot_v1(out: *mut WillowRuntimeMetricsV1) -> i32 {
-    let Some(out) = (unsafe { out.as_mut() }) else {
+pub unsafe extern "C" fn willow_runtime_metrics_snapshot_v1(
+    out: *mut WillowRuntimeMetricsV1,
+) -> i32 {
+    if out.is_null() {
         return -1;
-    };
+    }
     let events = &crate::runtime::current().events;
-    *out = WillowRuntimeMetricsV1 {
+    let record = WillowRuntimeMetricsV1 {
         version: RUNTIME_METRICS_VERSION,
         struct_size: std::mem::size_of::<WillowRuntimeMetricsV1>() as u32,
         task_spawns: events.counter_total(RuntimeEventKind::TaskSpawn),
@@ -409,6 +425,8 @@ pub extern "C" fn willow_runtime_metrics_snapshot_v1(out: *mut WillowRuntimeMetr
         blocking_detaches: events.counter_total(RuntimeEventKind::BlockingDetach),
         blocking_queue_full: events.counter_total(RuntimeEventKind::BlockingQueueFull),
     };
+    // SAFETY: The caller lends one aligned output record, which this write initializes.
+    unsafe { out.write(record) };
     0
 }
 
@@ -426,9 +444,13 @@ mod tests {
     }
 
     unsafe extern "C" fn capture(event: *const WillowRuntimeEventV1, context: *mut c_void) {
+        // SAFETY: The registration keeps callback and context paired through delivery. The stack
+        // event remains live until the callback returns.
         let event = unsafe { &*event };
         HOOK_TASK.store(event.task_id, Ordering::Release);
         let calls = context.cast::<AtomicU64>();
+        // SAFETY: The registration keeps callback and context paired through delivery. The stack
+        // event remains live until the callback returns.
         unsafe { &*calls }.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -436,6 +458,8 @@ mod tests {
         _event: *const WillowRuntimeEventV1,
         context: *mut c_void,
     ) {
+        // SAFETY: The registration keeps callback and context paired through delivery. The stack
+        // event remains live until the callback returns.
         let context = unsafe { &*context.cast::<BlockingHookContext>() };
         context.entered.store(true, Ordering::Release);
         while !context.release.load(Ordering::Acquire) {
@@ -445,9 +469,19 @@ mod tests {
 
     #[test]
     fn observability_01_snapshot_is_versioned_and_null_checked() {
-        assert_eq!(willow_runtime_metrics_snapshot_v1(std::ptr::null_mut()), -1);
-        let mut snapshot = WillowRuntimeMetricsV1::default();
-        assert_eq!(willow_runtime_metrics_snapshot_v1(&mut snapshot), 0);
+        assert_eq!(
+            // SAFETY: The snapshot API accepts null and returns before writing.
+            unsafe { willow_runtime_metrics_snapshot_v1(std::ptr::null_mut()) },
+            -1
+        );
+        let mut storage = std::mem::MaybeUninit::<WillowRuntimeMetricsV1>::uninit();
+        assert_eq!(
+            // SAFETY: storage owns one aligned record, initialized on success.
+            unsafe { willow_runtime_metrics_snapshot_v1(storage.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: The snapshot writer returned success.
+        let snapshot = unsafe { storage.assume_init() };
         assert_eq!(snapshot.version, RUNTIME_METRICS_VERSION);
         assert_eq!(
             snapshot.struct_size as usize,
@@ -459,17 +493,25 @@ mod tests {
     fn observability_02_record_updates_counter_and_hook() {
         let _guard = crate::gc::isolated_runtime();
         let mut before = WillowRuntimeMetricsV1::default();
-        willow_runtime_metrics_snapshot_v1(&mut before);
+        // SAFETY: The typed output owns one aligned, writable record for the call.
+        unsafe { willow_runtime_metrics_snapshot_v1(&mut before) };
         let calls = AtomicU64::new(0);
-        willow_runtime_set_event_hook_v1(
-            Some(capture),
-            (&calls as *const AtomicU64).cast_mut().cast(),
-        );
+        // SAFETY: The registration retains its callback context through delivery and
+        // unregisters before the storage expires.
+        unsafe {
+            willow_runtime_set_event_hook_v1(
+                Some(capture),
+                (&calls as *const AtomicU64).cast_mut().cast(),
+            )
+        };
         record(RuntimeEventKind::TaskSpawn, Some(3), 77, 0);
-        willow_runtime_set_event_hook_v1(None, std::ptr::null_mut());
+        // SAFETY: The registration retains its callback context through delivery and
+        // unregisters before the storage expires.
+        unsafe { willow_runtime_set_event_hook_v1(None, std::ptr::null_mut()) };
 
         let mut after = WillowRuntimeMetricsV1::default();
-        willow_runtime_metrics_snapshot_v1(&mut after);
+        // SAFETY: The typed output owns one aligned, writable record for the call.
+        unsafe { willow_runtime_metrics_snapshot_v1(&mut after) };
         assert_eq!(after.task_spawns, before.task_spawns + 1);
         assert_eq!(calls.load(Ordering::Acquire), 1);
         assert_eq!(HOOK_TASK.load(Ordering::Acquire), 77);
@@ -479,11 +521,13 @@ mod tests {
     fn observability_03_count_events_add_the_reported_batch() {
         let _guard = crate::gc::isolated_runtime();
         let mut before = WillowRuntimeMetricsV1::default();
-        willow_runtime_metrics_snapshot_v1(&mut before);
+        // SAFETY: The typed output owns one aligned, writable record for the call.
+        unsafe { willow_runtime_metrics_snapshot_v1(&mut before) };
         record(RuntimeEventKind::TimerWake, None, 0, 5);
         record(RuntimeEventKind::NetpollWake, None, 0, 3);
         let mut after = WillowRuntimeMetricsV1::default();
-        willow_runtime_metrics_snapshot_v1(&mut after);
+        // SAFETY: The typed output owns one aligned, writable record for the call.
+        unsafe { willow_runtime_metrics_snapshot_v1(&mut after) };
         assert_eq!(after.timer_wakes, before.timer_wakes + 5);
         assert_eq!(after.netpoll_wakes, before.netpoll_wakes + 3);
     }
@@ -496,10 +540,14 @@ mod tests {
             release: AtomicBool::new(false),
         };
         let cleared = AtomicBool::new(false);
-        willow_runtime_set_event_hook_v1(
-            Some(blocking_capture),
-            (&context as *const BlockingHookContext).cast_mut().cast(),
-        );
+        // SAFETY: The registration retains its callback context through delivery and
+        // unregisters before the storage expires.
+        unsafe {
+            willow_runtime_set_event_hook_v1(
+                Some(blocking_capture),
+                (&context as *const BlockingHookContext).cast_mut().cast(),
+            )
+        };
         std::thread::scope(|scope| {
             scope.spawn(crate::runtime::serving(|| {
                 record(RuntimeEventKind::TaskPoll, Some(0), 91, 0)
@@ -508,7 +556,9 @@ mod tests {
                 std::thread::yield_now();
             }
             scope.spawn(crate::runtime::serving(|| {
-                willow_runtime_set_event_hook_v1(None, std::ptr::null_mut());
+                // SAFETY: The registration retains its callback context through delivery and
+                // unregisters before the storage expires.
+                unsafe { willow_runtime_set_event_hook_v1(None, std::ptr::null_mut()) };
                 cleared.store(true, Ordering::Release);
             }));
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -521,7 +571,9 @@ mod tests {
     #[test]
     fn observability_05_no_sink_updates_metrics_without_building_an_event() {
         let _guard = crate::gc::isolated_runtime();
-        willow_runtime_set_event_hook_v1(None, std::ptr::null_mut());
+        // SAFETY: The registration retains its callback context through delivery and
+        // unregisters before the storage expires.
+        unsafe { willow_runtime_set_event_hook_v1(None, std::ptr::null_mut()) };
         if *crate::runtime::current().diagnostics.sched_trace
             || *crate::runtime::current().diagnostics.task_trace
         {

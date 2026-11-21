@@ -512,6 +512,8 @@ impl Cursor {
                 // Only background batches admit hooks. The live index no longer
                 // names the object, but its quarantined extent still owns it.
                 let began = Instant::now();
+                // SAFETY: The registered hook matches the allocation's type and runs while the
+                // collector retains its payload.
                 unsafe { run_drop_hook(&owner.gc, hook, payload, observed_type) };
                 self.report.hook_ns += began.elapsed().as_nanos() as u64;
                 owner.frame_lifetime.record_sweep(
@@ -551,6 +553,8 @@ impl Cursor {
                 let layout =
                     Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>())
                         .unwrap();
+                // SAFETY: The owner releases this block once with the same base and Layout used to
+                // allocate it.
                 unsafe { dealloc(chunk.base, layout) };
                 self.report.release_ns += began.elapsed().as_nanos() as u64;
                 true
@@ -616,6 +620,8 @@ impl Cursor {
             self.report.objects += 1;
             return Action::Build(index, std::mem::take(&mut region.free_spans));
         };
+        // SAFETY: Allocation metadata identifies a header-aligned object start within this live
+        // region or chunk.
         let object = HeapObject::from_raw(unsafe { region.base.add(offset) }.cast()).unwrap();
         let size = object.size();
         let header_marked = object.marked();
@@ -759,11 +765,15 @@ impl Cursor {
                             let offset = bit * GC_REGION_MARK_GRANULE;
                             assert_eq!(offset, end);
                             let object =
+                                // SAFETY: Allocation metadata identifies a header-aligned object
+                                // start within this live region or chunk.
                                 HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())
                                     .unwrap();
                             assert!(object.allocated() && !object.marked());
                             assert_eq!(object.generation(), GC_GENERATION_YOUNG);
                             assert!(!object.is_async_frame());
+                            // SAFETY: The test or sweep owner has a live, header-aligned nursery
+                            // span. Each object occupies a whole number of alignment units.
                             assert!(offset == 0 || !unsafe { (*object.as_ptr()).descriptor_owned });
                             end += object.size();
                         });
@@ -853,6 +863,8 @@ impl Cursor {
             }
         }
         let offset = self.offset;
+        // SAFETY: Allocation metadata identifies a header-aligned object start within this live
+        // region or chunk.
         let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast()).unwrap();
         let size = object.size();
         assert!(
@@ -1147,17 +1159,21 @@ mod tests {
     }
 
     // Model the compiler's static-descriptor bump path after one slow refill.
-    fn static_nursery(tls: &mut GcTlabState, objects: usize) -> *mut u8 {
+    fn static_nursery(tls: &TestTlab, objects: usize) -> *mut u8 {
         static DESCRIPTOR: willow_abi::GcLayoutDescriptor = willow_abi::GcLayoutDescriptor {
             type_id: 0,
             layout_id: 0,
             gc_ref_mask: 0,
             size: (GC_HEADER_SIZE + 8) as u64,
         };
-        let first = willow_gc_alloc_slow(tls, 0, 0, 8, 0);
+        // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size
+        // and tracing metadata describe the object initialized here.
+        let first = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 0, 0, 8, 0) };
         for _ in 1..objects {
             let cursor = tls.cursor.load(Ordering::Acquire);
             assert!(cursor + GC_HEADER_SIZE + 8 <= tls.limit.load(Ordering::Acquire));
+            // SAFETY: The test or sweep owner has a live, header-aligned nursery span. Each object
+            // occupies a whole number of alignment units.
             unsafe {
                 (cursor as *mut GcHeader).write(GcHeader {
                     marked: false,
@@ -1189,7 +1205,9 @@ mod tests {
         let _guard = isolated_runtime();
         for objects in [32usize, 128, 512] {
             for chunks in [1usize, 4, 16] {
-                reset_internal_for_test();
+                // SAFETY: The test controls its isolated runtime at this reset boundary; no
+                // other mutator or subsequent access relies on the discarded heap.
+                unsafe { reset_internal_for_test() };
                 {
                     let mut state = runtime().heap.lock().unwrap();
                     state.pacer.disable_for_test();
@@ -1203,9 +1221,9 @@ mod tests {
                     size: (GC_HEADER_SIZE + 8) as u64,
                 };
                 let before = layouts::references(shape);
-                let mut tls = tlab_state_for_test();
+                let tls = tlab_state_for_test();
                 for _ in 0..chunks {
-                    static_nursery(&mut tls, objects);
+                    static_nursery(&tls, objects);
                 }
                 let mut cursor = closed_cursor();
                 finish(&mut cursor);
@@ -1227,22 +1245,30 @@ mod tests {
                 );
             }
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bulk_nursery_sweep_preserves_live_chunks_and_falls_back_for_hooks() {
         let _guard = isolated_runtime();
         for hooks in [false, true] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
-            let mut tls = tlab_state_for_test();
-            let mut live = static_nursery(&mut tls, 128);
-            willow_push_root(&mut live);
-            static_nursery(&mut tls, 128);
+            let tls = tlab_state_for_test();
+            let mut live = static_nursery(&tls, 128);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut live) };
+            static_nursery(&tls, 128);
             COUNTED_HOOKS.store(0, Ordering::Relaxed);
             if hooks {
-                willow_register_drop(0, counted_hook);
+                // SAFETY: This fixture reserves the type ID for the payload consumed by this
+                // finalizer and initializes each instance before collection.
+                unsafe { willow_register_drop(0, counted_hook) };
             }
             let mut cursor = closed_cursor();
             finish(&mut cursor);
@@ -1253,24 +1279,34 @@ mod tests {
             );
             assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
             assert!(validate_payload_pointer_locked(&runtime().heap.lock().unwrap(), live).is_ok());
-            willow_pop_root();
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bulk_nursery_sweep_keeps_all_live_prefix_unindexed() {
         let _guard = isolated_runtime();
         for count in [32usize, 128, 512] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
-            let mut tls = tlab_state_for_test();
-            let first = static_nursery(&mut tls, count);
+            let tls = tlab_state_for_test();
+            let first = static_nursery(&tls, count);
             let mut roots: Vec<_> = (0..count)
+                // SAFETY: The test or sweep owner has a live, header-aligned nursery span. Each
+                // object occupies a whole number of alignment units.
                 .map(|i| unsafe { first.add(i * (GC_HEADER_SIZE + 8)) })
                 .collect();
             for root in &mut roots {
-                willow_push_root(root);
+                // SAFETY: The slot storage stays live and stationary through the matching
+                // pop, including during collection.
+                unsafe { willow_push_root(root) };
             }
             let mut cursor = closed_cursor();
             finish(&mut cursor);
@@ -1286,21 +1322,27 @@ mod tests {
                     .header_offsets
                     .is_empty()
             );
-            willow_pop_roots(count as i32);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(count as i32) };
             willow_gc_collect();
             assert_eq!(willow_gc_allocated_bytes(), 0);
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bulk_nursery_sweep_respects_cursor_modes_and_contention() {
         let _guard = isolated_runtime();
         for mode in 0..6 {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
-            let mut tls = tlab_state_for_test();
-            static_nursery(&mut tls, 128);
+            let tls = tlab_state_for_test();
+            static_nursery(&tls, 128);
             let mut cursor = closed_cursor();
             match mode {
                 0 => cursor.plan.authoritative_epoch_marks = false,
@@ -1340,14 +1382,18 @@ mod tests {
             }
             assert_eq!(willow_gc_allocated_bytes(), 0);
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bounded_sweep_one_object_batches_are_lossless_and_keep_live_start_bits() {
         let _guard = isolated_runtime();
         for objects in [1usize, 2, 17, 513, 8193] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
             let mut live = Vec::new();
             for index in 0..objects {
@@ -1406,13 +1452,17 @@ mod tests {
             assert!(cursor.report.objects <= 5 * objects as u64 + 3 * cursor.plan.old as u64 + 1);
             drop(state);
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bounded_sweep_fake_deadlines_preserve_the_unprocessed_suffix() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         for _ in 0..65 {
             willow_alloc(8);
@@ -1444,14 +1494,18 @@ mod tests {
             65 * (GC_HEADER_SIZE + 8) as u64
         );
         assert_eq!(willow_gc_allocated_bytes(), 0);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bounded_sweep_giant_objects_never_run_in_allocation_assistance() {
         let _guard = isolated_runtime();
         for size in [ALLOCATION.bytes as usize + 8, 1 << 20, 1 << 24] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
             willow_alloc(size as i64);
             let mut cursor = make_cursor();
@@ -1466,7 +1520,9 @@ mod tests {
             );
             assert_eq!(willow_gc_allocated_bytes(), 0);
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     static COUNTED_HOOKS: crate::runtime::PerRuntime<AtomicUsize> =
@@ -1479,13 +1535,19 @@ mod tests {
     #[test]
     fn bounded_sweep_hooks_force_deadline_samples_between_strides() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         COUNTED_HOOKS.store(0, Ordering::Relaxed);
-        willow_register_drop(99003, counted_hook);
+        // SAFETY: This fixture reserves the type ID for the payload consumed by this
+        // finalizer and initializes each instance before collection.
+        unsafe { willow_register_drop(99003, counted_hook) };
         let hooked = 4 * DEADLINE_STRIDE as usize;
         for _ in 0..hooked {
-            willow_gc_alloc_layout(0, 99003, 8, 0);
+            // SAFETY: The requested layout describes the initialized words of this object and
+            // its type’s tracing or finalization contract.
+            unsafe { willow_gc_alloc_layout(0, 99003, 8, 0) };
         }
         let mut cursor = make_cursor();
         let mut clock = 0;
@@ -1507,14 +1569,18 @@ mod tests {
         finish(&mut cursor);
         assert_eq!(COUNTED_HOOKS.load(Ordering::Relaxed), hooked);
         assert_eq!(willow_gc_allocated_bytes(), 0);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bounded_sweep_amortizes_heap_holds_and_index_reads_over_strides() {
         let _guard = isolated_runtime();
         for objects in [513usize, 8193, 40_000] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
             let mut live = Vec::new();
             for index in 0..objects {
@@ -1555,7 +1621,9 @@ mod tests {
             }
             drop(state);
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     static HOOK_CALLS: crate::runtime::PerRuntime<AtomicUsize> =
@@ -1580,13 +1648,19 @@ mod tests {
     #[test]
     fn bounded_sweep_delayed_hook_is_once_only_outside_heap_and_never_assisted() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         HOOK_CALLS.store(0, Ordering::Relaxed);
         HOOK_ENTERED.store(false, Ordering::Relaxed);
         ALLOCATED_DURING_HOOK.store(false, Ordering::Relaxed);
-        willow_register_drop(99001, delayed_hook);
-        willow_gc_alloc_layout(0, 99001, 8, 0);
+        // SAFETY: This fixture reserves the type ID for the payload consumed by this
+        // finalizer and initializes each instance before collection.
+        unsafe { willow_register_drop(99001, delayed_hook) };
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        unsafe { willow_gc_alloc_layout(0, 99001, 8, 0) };
         let cursor = Arc::new(Mutex::new(make_cursor()));
         set_active(Some(cursor.clone()));
         cursor.lock().unwrap().batch(ALLOCATION, true);
@@ -1598,6 +1672,7 @@ mod tests {
                 std::thread::yield_now();
             }
             let pointer = willow_alloc(8);
+            // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
             unsafe {
                 *pointer.cast::<u64>() = 77;
             }
@@ -1611,8 +1686,11 @@ mod tests {
         drop(guard);
         set_active(None);
         let pointer = worker.join().unwrap();
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         assert_eq!(unsafe { *(pointer as *const u64) }, 77);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     unsafe fn panicking_hook(_: *mut u8) {
@@ -1628,20 +1706,38 @@ mod tests {
     fn bounded_sweep_panicking_hooks_preserve_fatal_policy() {
         use failure_policy_tests::{GC_FATAL_CASE, assert_fatal_child};
         if let Ok(shape) = std::env::var(GC_FATAL_CASE) {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
-            willow_register_drop(99002, panicking_hook);
-            let mut tls = tlab_state_for_test();
+            // SAFETY: This fixture reserves the type ID for the payload consumed by this
+            // finalizer and initializes each instance before collection.
+            unsafe { willow_register_drop(99002, panicking_hook) };
+            let tls = tlab_state_for_test();
             for _ in 0..7 {
                 match shape.as_str() {
                     "large" => {
-                        willow_gc_alloc_layout(0, 99002, (GC_LARGE_OBJECT_THRESHOLD + 8) as i64, 0);
+                        // SAFETY: The requested layout describes the initialized words of
+                        // this object and its type’s tracing or finalization contract.
+                        unsafe {
+                            willow_gc_alloc_layout(
+                                0,
+                                99002,
+                                (GC_LARGE_OBJECT_THRESHOLD + 8) as i64,
+                                0,
+                            )
+                        };
                     }
                     "tlab" => {
-                        willow_gc_alloc_slow(&mut tls, 0, 99002, 8, 0);
+                        // SAFETY: The fixture owns the stable TLAB through unregistration.
+                        // The requested size and tracing metadata describe the object
+                        // initialized here.
+                        unsafe { willow_gc_alloc_slow(tls.as_ptr(), 0, 99002, 8, 0) };
                     }
                     _ => {
-                        willow_gc_alloc_layout(0, 99002, 8, 0);
+                        // SAFETY: The requested layout describes the initialized words of
+                        // this object and its type’s tracing or finalization contract.
+                        unsafe { willow_gc_alloc_layout(0, 99002, 8, 0) };
                     }
                 }
             }
@@ -1666,7 +1762,9 @@ mod tests {
     #[test]
     fn bounded_sweep_try_lock_and_stop_requests_never_consume_work() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         willow_alloc(8);
         let job = Arc::new(Mutex::new(make_cursor()));
         set_active(Some(job.clone()));
@@ -1691,13 +1789,17 @@ mod tests {
         runtime().stop_requested.store(false, Ordering::Release);
         finish(&mut job.lock().unwrap());
         set_active(None);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bounded_sweep_epoch_quarantine_releases_only_after_next_activation() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let pointer = willow_alloc(8);
         let object = HeapObject::from_payload(GcPayload::from_raw(pointer).unwrap());
         object.begin_trace();
@@ -1713,7 +1815,9 @@ mod tests {
             runtime().heap.lock().unwrap().old_region_candidates.len(),
             1
         );
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     fn delayed_release() {
@@ -1736,7 +1840,9 @@ mod tests {
     #[test]
     fn bounded_sweep_delayed_release_keeps_allocators_running_and_is_charged() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         willow_alloc((GC_LARGE_OBJECT_THRESHOLD + 8) as i64);
         HOOK_ENTERED.store(false, Ordering::Relaxed);
@@ -1760,13 +1866,17 @@ mod tests {
         set_active(None);
         let pointer = worker.join().unwrap();
         assert!(find_old_region_object(&runtime().heap.lock().unwrap(), pointer, false).is_some());
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bounded_sweep_next_epoch_keeps_previously_safe_holes_reusable() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let live = willow_alloc(8);
         let dead = willow_alloc(8);
         let survivor = HeapObject::from_payload(GcPayload::from_raw(live).unwrap());
@@ -1794,7 +1904,9 @@ mod tests {
             runtime().heap.lock().unwrap().old_region_candidates.len(),
             1
         );
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     static SCALE_START: crate::runtime::PerRuntime<AtomicBool> =
@@ -1811,22 +1923,31 @@ mod tests {
     fn bounded_sweep_fixed_root_scaling_reports_stalls_and_reclamation() {
         let _guard = isolated_runtime();
         for mib in [64usize, 256, 1024] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             let mut root = willow_alloc(8);
-            willow_push_root(&mut root);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut root) };
             {
                 let mut state = runtime().heap.lock().unwrap();
                 state.threshold_bytes = usize::MAX;
                 state.memory_limit_bytes = None;
                 for _ in 0..mib {
-                    allocate_old_region_object_locked(
-                        &mut state,
-                        0,
-                        0,
-                        (1 << 20) - GC_HEADER_SIZE,
-                        0,
-                        true,
-                    )
+                    // SAFETY: The allocation path forwards the validated payload extent, type
+                    // and tracing layout; its caller initializes native fields before
+                    // collection.
+                    unsafe {
+                        allocate_old_region_object_locked(
+                            &mut state,
+                            0,
+                            0,
+                            (1 << 20) - GC_HEADER_SIZE,
+                            0,
+                            true,
+                        )
+                    }
                     .unwrap();
                 }
             }
@@ -1917,9 +2038,13 @@ mod tests {
                 report.heap_holds <= report.objects + 2 * (mib + 1) as u64 + report.assists,
                 "{report:?}"
             );
-            willow_pop_root();
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     struct LabsEnabled(bool);
@@ -1937,7 +2062,9 @@ mod tests {
     #[test]
     fn bounded_sweep_release_reindexes_active_new_buffers_by_stable_base() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         willow_alloc((GC_LARGE_OBJECT_THRESHOLD + 8) as i64);
         let live = willow_alloc(8);
@@ -1965,13 +2092,17 @@ mod tests {
         let later = willow_alloc(8);
         assert!(later as usize > during as usize);
         old_lab::retire_all(&mut runtime().heap.lock().unwrap());
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bounded_sweep_competing_assists_share_ownership_without_double_reclamation() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         for _ in 0..2048 {
             willow_alloc(8);
@@ -1997,13 +2128,17 @@ mod tests {
         assert!(cursor.report.assist_objects > 0);
         drop(cursor);
         set_active(None);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bounded_sweep_competing_allocators_keep_forward_progress() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         for _ in 0..4096 {
             willow_alloc(8);
@@ -2019,6 +2154,8 @@ mod tests {
                     for _ in 0..128 {
                         let began = Instant::now();
                         let pointer = willow_alloc(8);
+                        // SAFETY: This GC allocation reserves an aligned word for the fixture's
+                        // scalar value.
                         unsafe {
                             *pointer.cast::<u64>() = 101;
                         }
@@ -2051,22 +2188,30 @@ mod tests {
         );
         drop(cursor);
         set_active(None);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bounded_sweep_partial_tlab_index_keeps_unprocessed_live_objects_visible() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
-        let mut tls = tlab_state_for_test();
-        let first = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+        let tls = tlab_state_for_test();
+        // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size
+        // and tracing metadata describe the object initialized here.
+        let first = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 0, 0, 8, 0) };
         HeapObject::from_payload(GcPayload::from_raw(first).unwrap()).begin_trace();
         let mut last = first;
         for _ in 0..5 {
             let cursor = tls.cursor.load(Ordering::Acquire);
             let object =
-                initialize_object_at(cursor as *mut u8, GC_HEADER_SIZE + 8, 0, 0, 0).unwrap();
+                // SAFETY: The allocation cursor reserves this aligned header and its complete
+                // payload. The supplied type and mask describe the initialized words.
+                unsafe { initialize_object_at(cursor as *mut u8, GC_HEADER_SIZE + 8, 0, 0, 0) }.unwrap();
             publish_tlab_start_for_test(&tls, cursor as *mut u8);
             tls.cursor
                 .store(cursor + GC_HEADER_SIZE + 8, Ordering::Release);
@@ -2103,23 +2248,32 @@ mod tests {
         assert!(object_in_retired_chunk(&state.tlab_chunks[0], last as usize, false).is_some());
         drop(state);
         assert_eq!(willow_gc_allocated_bytes(), 2 * (GC_HEADER_SIZE + 8) as i64);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bounded_sweep_fragmented_tlabs_skip_already_reclaimed_physical_headers() {
         let _guard = isolated_runtime();
         for objects in [128usize, 512, GC_TLAB_CHUNK_SIZE / (GC_HEADER_SIZE + 8)] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
-            let mut tls = tlab_state_for_test();
-            let live = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+            let tls = tlab_state_for_test();
+            // SAFETY: The fixture owns the stable TLAB through unregistration. The requested
+            // size and tracing metadata describe the object initialized here.
+            let live = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 0, 0, 8, 0) };
             let survivor = HeapObject::from_payload(GcPayload::from_raw(live).unwrap());
             survivor.begin_trace();
             for _ in 1..objects {
                 let at = tls.cursor.load(Ordering::Acquire);
                 assert!(at + GC_HEADER_SIZE + 8 <= tls.limit.load(Ordering::Acquire));
-                initialize_object_at(at as *mut u8, GC_HEADER_SIZE + 8, 0, 0, 0).unwrap();
+                // SAFETY: The allocation cursor reserves this aligned header and its complete
+                // payload. The supplied type and mask describe the initialized words.
+                unsafe { initialize_object_at(at as *mut u8, GC_HEADER_SIZE + 8, 0, 0, 0) }
+                    .unwrap();
                 publish_tlab_start_for_test(&tls, at as *mut u8);
                 tls.cursor.store(at + GC_HEADER_SIZE + 8, Ordering::Release);
             }
@@ -2150,7 +2304,9 @@ mod tests {
                 second.report.metadata_items
             );
             assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
         }
     }
 
@@ -2174,12 +2330,16 @@ mod tests {
     #[test]
     fn bounded_sweep_coordinator_shutdown_waits_for_owned_cleanup() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         willow_alloc((GC_LARGE_OBJECT_THRESHOLD + 8) as i64);
         let mut root = willow_alloc(8);
         let mutator = MutatorRegistration::new();
-        willow_push_root(&mut root);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
         SHUTDOWN_PAUSED.store(false, Ordering::Relaxed);
         SHUTDOWN_RESUME.store(false, Ordering::Relaxed);
         *runtime().sweep_observation.hook.lock().unwrap() = Some(pause_for_shutdown);
@@ -2202,18 +2362,26 @@ mod tests {
         assert!(runtime().heap.lock().unwrap().sweeping.is_none());
         assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
         assert!(runtime().heap.lock().unwrap().released_bytes > 0);
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         drop(mutator);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bounded_sweep_allocate_reclaim_waves_preserve_root_and_accounting() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         let mut root = willow_alloc(8);
-        willow_push_root(&mut root);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
         for wave in 0..20 {
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
             for _ in 0..512 {
@@ -2226,23 +2394,33 @@ mod tests {
             verify_old_region_metadata(&state).unwrap();
             assert!(state.old_reserved_bytes <= 2 * GC_OLD_REGION_SIZE);
         }
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn bounded_sweep_descriptor_writer_contention_preserves_work_and_references() {
         let _guard = isolated_runtime();
         for tlab in [false, true] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
-            let mut tls = tlab_state_for_test();
+            let tls = tlab_state_for_test();
             let pointer = if tlab {
-                willow_gc_alloc_slow(&mut tls, 887766, 99300, 8, 0)
+                // SAFETY: The fixture owns the stable TLAB through unregistration. The
+                // requested size and tracing metadata describe the object initialized here.
+                unsafe { willow_gc_alloc_slow(tls.as_ptr(), 887766, 99300, 8, 0) }
             } else {
-                willow_gc_alloc_layout(887766, 99300, 8, 0)
+                // SAFETY: The requested layout describes the initialized words of this object
+                // and its type’s tracing or finalization contract.
+                unsafe { willow_gc_alloc_layout(887766, 99300, 8, 0) }
             };
             let object = HeapObject::from_payload(GcPayload::from_raw(pointer).unwrap());
             let key = willow_abi::GcLayoutDescriptor {
@@ -2309,11 +2487,14 @@ mod tests {
             println!(
                 "descriptor_contention tlab={tlab} rejected_batches=128 object_work=0 retained_references=1 eventual_releases=1"
             );
-            reset_internal_for_test(); // TLS remains alive through reset.
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() }; // TLS remains alive through reset.
         }
     }
 
     unsafe fn verify_owned_payload_before_release(payload: *mut u8) {
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         assert_eq!(unsafe { *payload.cast::<u64>() }, 0xAABBCCDD);
         let state = runtime().heap.try_lock().expect("hook held heap mutex");
         let address = payload as usize;
@@ -2332,20 +2513,30 @@ mod tests {
     fn bounded_sweep_hook_runs_once_for_dead_payload_before_storage_release() {
         let _guard = isolated_runtime();
         for tlab in [false, true] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             HOOK_CALLS.store(0, Ordering::Relaxed);
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
-            willow_register_drop(99301, verify_owned_payload_before_release);
-            let mut tls = tlab_state_for_test();
-            let mut allocate = || {
+            // SAFETY: This fixture reserves the type ID for the payload consumed by this
+            // finalizer and initializes each instance before collection.
+            unsafe { willow_register_drop(99301, verify_owned_payload_before_release) };
+            let tls = tlab_state_for_test();
+            let allocate = || {
                 if tlab {
-                    willow_gc_alloc_slow(&mut tls, 887767, 99301, 8, 0)
+                    // SAFETY: The fixture owns the stable TLAB through unregistration. The
+                    // requested size and tracing metadata describe the object initialized
+                    // here.
+                    unsafe { willow_gc_alloc_slow(tls.as_ptr(), 887767, 99301, 8, 0) }
                 } else {
-                    willow_gc_alloc_layout(887767, 99301, 8, 0)
+                    // SAFETY: The requested layout describes the initialized words of this
+                    // object and its type’s tracing or finalization contract.
+                    unsafe { willow_gc_alloc_layout(887767, 99301, 8, 0) }
                 }
             };
             let dead = allocate();
             let live = allocate();
+            // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
             unsafe {
                 *dead.cast::<u64>() = 0xAABBCCDD;
                 *live.cast::<u64>() = 0xAABBCCDD;
@@ -2362,13 +2553,16 @@ mod tests {
                 1,
                 "live payload hook must not run"
             );
+            // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
             assert_eq!(unsafe { *live.cast::<u64>() }, 0xAABBCCDD);
             assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
             let mut second = make_cursor();
             finish(&mut second);
             assert_eq!(HOOK_CALLS.load(Ordering::Relaxed), 2);
             assert_eq!(willow_gc_allocated_bytes(), 0);
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
         }
     }
 }

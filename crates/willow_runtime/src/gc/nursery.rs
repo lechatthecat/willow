@@ -164,8 +164,10 @@ mod tests {
         let _guard = isolated_runtime();
         let initial = initial_budget();
         for n in [32, 128, 512] {
-            reset_internal();
-            let mut tls = tlab_state_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal() };
+            let tls = tlab_state_for_test();
             // Rewritable runtime-root slots; full capacity keeps them in place.
             let mut roots = Vec::<*mut u8>::with_capacity(n);
             assert_eq!(
@@ -173,10 +175,14 @@ mod tests {
                 initial as u64
             );
             for _ in 0..n {
-                let root = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+                // SAFETY: The fixture owns the stable TLAB through unregistration. The
+                // requested size and tracing metadata describe the object initialized here.
+                let root = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 0, 0, 8, 0) };
                 assert!(!root.is_null());
                 roots.push(root);
-                willow_gc_add_runtime_root_slot(roots.last_mut().unwrap());
+                // SAFETY: The registration and removal use the same initialized slot, whose
+                // storage spans both operations.
+                unsafe { willow_gc_add_runtime_root_slot(roots.last_mut().unwrap()) };
             }
             crate::gc::minor_collect_internal();
             let (counters, heap) = telemetry_heap_snapshot();
@@ -185,10 +191,14 @@ mod tests {
             assert_eq!(counters.promoted_objects, 0);
             assert_eq!(heap.minor_trigger_bytes, (2 * initial).min(CAP) as u64);
             for root in &mut roots {
-                willow_gc_remove_runtime_root_slot(root);
+                // SAFETY: The registration and removal use the same initialized slot, whose
+                // storage spans both operations.
+                unsafe { willow_gc_remove_runtime_root_slot(root) };
             }
             for _ in 0..n {
-                assert!(!willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0).is_null());
+                // SAFETY: The fixture owns the stable TLAB through unregistration. The
+                // requested size and tracing metadata describe the object initialized here.
+                assert!(!unsafe { willow_gc_alloc_slow(tls.as_ptr(), 0, 0, 8, 0) }.is_null());
             }
             crate::gc::minor_collect_internal();
             assert_eq!(
@@ -205,7 +215,9 @@ mod tests {
             eprintln!(
                 "nursery objects_per_batch={n} minor_cycles=3 policy_updates=3 initial={initial}"
             );
-            reset_internal();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal() };
         }
     }
 
@@ -237,19 +249,25 @@ mod tests {
             return;
         }
         let _guard = isolated_runtime();
-        reset_internal();
-        let mut tls = tlab_state_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
+        let tls = tlab_state_for_test();
         assert_eq!(telemetry_heap_snapshot().1.minor_trigger_bytes, 4194304);
         let before = runtime().heap.lock().unwrap().major_collections;
         for _ in 0..8 {
-            assert!(!willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0).is_null());
+            // SAFETY: The fixture owns the stable TLAB through unregistration. The requested
+            // size and tracing metadata describe the object initialized here.
+            assert!(!unsafe { willow_gc_alloc_slow(tls.as_ptr(), 0, 0, 8, 0) }.is_null());
         }
         if gc_stress_enabled("alloc") {
             assert_eq!(runtime().heap.lock().unwrap().major_collections - before, 8);
         }
         crate::gc::minor_collect_internal();
         assert_eq!(telemetry_heap_snapshot().1.minor_trigger_bytes, 4194304);
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
         assert_eq!(telemetry_heap_snapshot().1.minor_trigger_bytes, 4194304);
     }
 
@@ -345,7 +363,9 @@ fn startup_runway_is_worker_bounded_and_respects_limits() {
 fn scheduler_runway_only_initializes_a_cold_heap_once() {
     use crate::gc::*;
     let _guard = isolated_runtime();
-    reset_internal();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal() };
     {
         let mut state = runtime().heap.lock().unwrap();
         assert_eq!(state.nursery_threshold_bytes, FLOOR);
@@ -357,7 +377,9 @@ fn scheduler_runway_only_initializes_a_cold_heap_once() {
         assert_eq!(state.nursery_threshold_bytes, FLOOR);
     }
     for major in [false, true] {
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
         let mut state = runtime().heap.lock().unwrap();
         if major {
             state.major_collections = 1;
@@ -368,7 +390,9 @@ fn scheduler_runway_only_initializes_a_cold_heap_once() {
         assert_eq!(state.nursery_threshold_bytes, FLOOR);
         assert_eq!(state.threshold_bytes, 1024 * 1024);
     }
-    reset_internal();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal() };
     let (_, cycle) = root_handshake::begin().unwrap();
     {
         let mut state = runtime().heap.lock().unwrap();
@@ -381,7 +405,9 @@ fn scheduler_runway_only_initializes_a_cold_heap_once() {
         .mark_phase()
         .store(0, Ordering::Release);
     cycle.queue.end_epoch();
-    reset_internal();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal() };
     {
         let mut state = runtime().heap.lock().unwrap();
         state.nursery_policy = Policy { fixed: Some(8192) };
@@ -390,7 +416,9 @@ fn scheduler_runway_only_initializes_a_cold_heap_once() {
         self::scheduler_start(&mut state, 8);
         assert_eq!(state.nursery_threshold_bytes, 4096);
     }
-    reset_internal();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal() };
 }
 
 #[cfg(test)]
@@ -401,7 +429,9 @@ fn scheduler_capacity_preserves_compact_nursery_and_overrides() {
     for workers in [0, 1, 2, 8, 64, usize::MAX] {
         for fixed in [None, Some(8192), Some(4 * 1024 * 1024)] {
             for limit in [None, Some(4096)] {
-                reset_internal();
+                // SAFETY: The test controls its isolated runtime at this reset boundary; no
+                // other mutator or subsequent access relies on the discarded heap.
+                unsafe { reset_internal() };
                 let mut state = runtime().heap.lock().unwrap();
                 state.nursery_policy = Policy { fixed };
                 state.memory_limit_bytes = limit;
@@ -419,7 +449,9 @@ fn scheduler_capacity_preserves_compact_nursery_and_overrides() {
             }
         }
     }
-    reset_internal();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal() };
 }
 
 #[test]

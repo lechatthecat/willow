@@ -397,7 +397,9 @@ mod tests {
         }
         use crate::gc_telemetry::observations::{self, Kind};
         let _test = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         for explicit in [false, true] {
             let _collector = (!explicit).then(MutatorRegistration::new);
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -513,7 +515,9 @@ mod tests {
     #[test]
     fn explicit_collect_joins_active_cycles_without_busy_polling() {
         let _test = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         for count in [1, 4, 16, 32] {
             reset_counts();
             let elected = CollectorGuard::try_acquire().unwrap();
@@ -563,12 +567,16 @@ mod tests {
                 runtime().wait_observation.checks.load(Ordering::Relaxed)
             );
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     fn late_request_is_retired(reason: Option<crate::gc_telemetry::stops::StopReason>) {
         let _test = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         reset_counts();
         let elected = CollectorGuard::try_acquire().unwrap();
         // While COORD is held by a late stopped phase, launch a real explicit
@@ -612,7 +620,9 @@ mod tests {
                 .is_none()
         );
         drop(next);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
@@ -631,7 +641,9 @@ mod tests {
     #[test]
     fn budget_wait_spurious_wakeups_and_scaling() {
         let _test = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         for count in [1, 4, 16, 32] {
             reset_counts();
             let elected = CollectorGuard::try_acquire().unwrap();
@@ -671,13 +683,17 @@ mod tests {
                 count * 6
             );
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn budget_wait_participates_in_real_root_rounds_remark_and_recovery() {
         let _test = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         reset_counts();
         let elected = CollectorGuard::try_acquire().unwrap();
         let workers: Vec<_> = (0..16).map(|_| waiter()).collect();
@@ -713,13 +729,17 @@ mod tests {
         for worker in workers {
             worker.join().unwrap();
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn budget_wait_unwind_completes_generation_and_allows_next_election() {
         let _test = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         reset_counts();
         let mut workers = Vec::new();
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -734,13 +754,17 @@ mod tests {
         }
         let next = CollectorGuard::try_acquire().unwrap();
         drop(next);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn budget_wait_self_collection_and_completion_before_wait() {
         let _test = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         reset_counts();
         let elected = CollectorGuard::try_acquire().unwrap();
         collect_for_budget();
@@ -753,13 +777,17 @@ mod tests {
         // Completion before entry must not sleep on an already-published event.
         collect_for_budget();
         assert_eq!(runtime().wait_observation.sleeps.load(Ordering::Relaxed), 0);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn budget_wait_completed_generation_does_not_join_a_later_cycle() {
         let _test = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         reset_counts();
         let old_generation = runtime().coord.0.lock().unwrap().cycle_generation;
         let previous = CollectorGuard::try_acquire().unwrap();
@@ -775,7 +803,9 @@ mod tests {
         .unwrap();
         assert_eq!(runtime().wait_observation.sleeps.load(Ordering::Relaxed), 0);
         drop(next);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     // The previous production algorithm, retained only as a measured baseline.
@@ -823,7 +853,9 @@ mod tests {
     #[ignore = "opt-in waiter CPU comparison, 100ms holds per data point"]
     fn budget_wait_cpu_measurement() {
         let _test = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         for count in [1, 4, 16, 32] {
             for legacy in [true, false] {
                 reset_counts();
@@ -875,6 +907,8 @@ mod tests {
                 }
             }
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 }

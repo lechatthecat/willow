@@ -195,9 +195,21 @@ fn only_the_owner_commits_and_the_next_owner_sees_it() {
     let second = parked_task();
 
     let first_token = acquire_now(&mutex, first);
-    assert!(!mutex.commit(second, first_token, 99), "not the owner");
-    assert!(!mutex.commit(first, first_token + 1, 99), "stale token");
-    assert!(mutex.commit(first, first_token, 5));
+    assert!(
+        // SAFETY: The fixture uses scalar storage or the managed reference lock and live
+        // referents created for this store.
+        !unsafe { mutex.commit(second, first_token, 99) },
+        "not the owner"
+    );
+    assert!(
+        // SAFETY: The fixture uses scalar storage or the managed reference lock and live
+        // referents created for this store.
+        !unsafe { mutex.commit(first, first_token + 1, 99) },
+        "stale token"
+    );
+    // SAFETY: The fixture uses scalar storage or the managed reference lock and live
+    // referents created for this store.
+    assert!(unsafe { mutex.commit(first, first_token, 5) });
 
     let second_token = queue_on(&mutex, second);
     assert!(matches!(
@@ -629,7 +641,9 @@ fn ten_thousand_waiters_drain_in_fifo_order() {
         );
         // Each hop hands the value along, so a dropped handoff would show
         // up as a gap in the count.
-        assert!(mutex.commit(task, token, index as i64 + 1));
+        // SAFETY: The fixture uses scalar storage or the managed reference lock and live
+        // referents created for this store.
+        assert!(unsafe { mutex.commit(task, token, index as i64 + 1) });
         current = (task, token);
     }
 
@@ -779,6 +793,8 @@ fn gc_roots_cover_ref_words_only() {
     );
 
     let mut slots = Vec::new();
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     unsafe {
         trace_async_mutex(
             (&*scalar as *const AsyncMutex).cast_mut().cast::<u8>(),
@@ -787,6 +803,8 @@ fn gc_roots_cover_ref_words_only() {
     }
     assert!(slots.is_empty(), "scalar handles have no trace slot");
     let traced = AsyncMutex::new(pointer, true);
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     unsafe {
         trace_async_mutex(
             (&*traced as *const AsyncMutex).cast_mut().cast::<u8>(),
@@ -801,14 +819,19 @@ fn gc_roots_cover_ref_words_only() {
 fn a_real_collection_keeps_a_ref_cell_s_object_alive() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
 
     // The GC-managed mutex handle is the protected object's only parent.
     // Keep the handle itself as a runtime root, then prove its trace hook
     // retains the String child.
     let protected = willow_string_from_str("protected by the lock");
-    let mutex = willow_async_mutex_new(protected as i64, 1);
-    crate::gc::willow_gc_add_runtime_root(mutex.cast::<u8>());
+    // SAFETY: The initial word matches the constructor’s reference flag.
+    let mutex = unsafe { willow_async_mutex_new(protected as i64, 1) };
+    // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+    // removal.
+    unsafe { crate::gc::willow_gc_add_runtime_root(mutex.cast::<u8>()) };
 
     // The control: an identical allocation nobody references at all. It
     // proves this collection really does reclaim, so the survival of
@@ -829,6 +852,7 @@ fn a_real_collection_keeps_a_ref_cell_s_object_alive() {
     // path is non-moving), and still readable with its contents intact.
     // Reading it is the real assertion — a swept object's payload is gone.
     assert_eq!(
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         unsafe { willow_string_as_str(protected) },
         "protected by the lock",
         "an object whose only reference is a ref-typed lock cell must \
@@ -838,13 +862,17 @@ fn a_real_collection_keeps_a_ref_cell_s_object_alive() {
     // The cell itself is unowned and unqueued throughout: tracing must not
     // depend on anyone holding the lock (the collector reads the word
     // without ownership by design).
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let cell = unsafe { mutex_from_raw(mutex) }.expect("mutex");
     assert!(cell.is_ref());
     assert_eq!(cell.owner(), None);
     assert_eq!(cell.gc_root(), Some(protected));
 
     let drops_before = ASYNC_MUTEX_DROP_COUNT.load(Ordering::SeqCst);
-    crate::gc::willow_gc_remove_runtime_root(mutex.cast::<u8>());
+    // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+    // removal.
+    unsafe { crate::gc::willow_gc_remove_runtime_root(mutex.cast::<u8>()) };
     willow_gc_collect();
     assert_eq!(
         ASYNC_MUTEX_DROP_COUNT.load(Ordering::SeqCst),
@@ -857,10 +885,13 @@ fn a_real_collection_keeps_a_ref_cell_s_object_alive() {
 fn repeated_unreachable_mutex_handles_are_finalized() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     let before = ASYNC_MUTEX_DROP_COUNT.load(Ordering::SeqCst);
     for value in 0..1_000 {
-        let _ = willow_async_mutex_new(value, 0);
+        // SAFETY: The initial word matches the constructor’s reference flag.
+        let _ = unsafe { willow_async_mutex_new(value, 0) };
     }
     willow_gc_collect();
     assert_eq!(
@@ -876,7 +907,8 @@ fn c_abi_routes_the_full_acquire_release_cycle() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
-    let raw = willow_async_mutex_new(3, 0);
+    // SAFETY: The initial word matches the constructor’s reference flag.
+    let raw = unsafe { willow_async_mutex_new(3, 0) };
     let owner = parked_task();
     let waiter = parked_task();
 
@@ -885,40 +917,58 @@ fn c_abi_routes_the_full_acquire_release_cycle() {
 
     with_current_task_for_test(owner, || {
         assert_eq!(
-            willow_async_mutex_acquire(raw, &raw mut owner_token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire(raw, &raw mut owner_token) },
             MUTEX_STATUS_ACQUIRED
         );
         assert!(owner_token >= 0, "the token must be published to the frame");
-        assert_eq!(willow_async_mutex_load(raw, owner_token), 3);
-        assert_eq!(willow_async_mutex_commit(raw, owner_token, 8), 1);
+        // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+        // disjoint local word storage for this operation.
+        assert_eq!(unsafe { willow_async_mutex_load(raw, owner_token) }, 3);
+        // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+        // disjoint local word storage for this operation.
+        assert_eq!(unsafe { willow_async_mutex_commit(raw, owner_token, 8) }, 1);
         // Non-reentrant, and the ABI reports it as its own status so the
         // generated code can raise the language panic.
         assert_eq!(
-            willow_async_mutex_acquire(raw, &raw mut owner_token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire(raw, &raw mut owner_token) },
             MUTEX_STATUS_RECURSIVE
         );
     });
 
     with_current_task_for_test(waiter, || {
         assert_eq!(
-            willow_async_mutex_acquire(raw, &raw mut waiter_token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire(raw, &raw mut waiter_token) },
             MUTEX_STATUS_PENDING
         );
         assert_eq!(
-            willow_async_mutex_load(raw, waiter_token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_load(raw, waiter_token) },
             0,
             "not the owner"
         );
         assert_eq!(
-            willow_async_mutex_poll(raw, waiter_token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_poll(raw, waiter_token) },
             MUTEX_STATUS_PENDING
         );
     });
 
     with_current_task_for_test(owner, || {
-        assert_eq!(willow_async_mutex_release(raw, owner_token), 1);
+        // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+        // disjoint local word storage for this operation.
+        assert_eq!(unsafe { willow_async_mutex_release(raw, owner_token) }, 1);
         assert_eq!(
-            willow_async_mutex_release(raw, owner_token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_release(raw, owner_token) },
             0,
             "double release"
         );
@@ -926,12 +976,18 @@ fn c_abi_routes_the_full_acquire_release_cycle() {
 
     with_current_task_for_test(waiter, || {
         assert_eq!(
-            willow_async_mutex_poll(raw, waiter_token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_poll(raw, waiter_token) },
             MUTEX_STATUS_ACQUIRED
         );
-        assert_eq!(willow_async_mutex_load(raw, waiter_token), 8);
+        // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+        // disjoint local word storage for this operation.
+        assert_eq!(unsafe { willow_async_mutex_load(raw, waiter_token) }, 8);
         assert_eq!(willow_async_mutex_cancel(), 0, "the link was consumed");
-        assert_eq!(willow_async_mutex_release(raw, waiter_token), 1);
+        // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+        // disjoint local word storage for this operation.
+        assert_eq!(unsafe { willow_async_mutex_release(raw, waiter_token) }, 1);
     });
 }
 
@@ -941,34 +997,69 @@ fn c_abi_reports_loss_without_a_handle_or_a_running_task() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
-    let raw = willow_async_mutex_new(5, 0);
+    // SAFETY: The initial word matches the constructor’s reference flag.
+    let raw = unsafe { willow_async_mutex_new(5, 0) };
     let task = parked_task();
     let mut token: i64 = -1;
 
     // No running task: a lock statement outside a task is an ABI misuse.
     assert_eq!(
-        willow_async_mutex_acquire(raw, &raw mut token),
+        // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+        // disjoint local word storage for this operation.
+        unsafe { willow_async_mutex_acquire(raw, &raw mut token) },
         MUTEX_STATUS_LOST
     );
-    assert_eq!(willow_async_mutex_poll(raw, 0), MUTEX_STATUS_LOST);
-    assert_eq!(willow_async_mutex_load(raw, 0), 0);
-    assert_eq!(willow_async_mutex_commit(raw, 0, 77), 0);
-    assert_eq!(willow_async_mutex_release(raw, 0), 0);
+    assert_eq!(
+        // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+        // disjoint local word storage for this operation.
+        unsafe { willow_async_mutex_poll(raw, 0) },
+        MUTEX_STATUS_LOST
+    );
+    // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+    // disjoint local word storage for this operation.
+    assert_eq!(unsafe { willow_async_mutex_load(raw, 0) }, 0);
+    // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+    // disjoint local word storage for this operation.
+    assert_eq!(unsafe { willow_async_mutex_commit(raw, 0, 77) }, 0);
+    // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+    // disjoint local word storage for this operation.
+    assert_eq!(unsafe { willow_async_mutex_release(raw, 0) }, 0);
     assert_eq!(willow_async_mutex_cancel(), 0);
 
     with_current_task_for_test(task, || {
         let null = std::ptr::null_mut();
         assert_eq!(
-            willow_async_mutex_acquire(null, &raw mut token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire(null, &raw mut token) },
             MUTEX_STATUS_LOST
         );
-        assert_eq!(willow_async_mutex_poll(null, 0), MUTEX_STATUS_LOST);
-        assert_eq!(willow_async_mutex_commit(null, 0, 77), 0);
+        assert_eq!(
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_poll(null, 0) },
+            MUTEX_STATUS_LOST
+        );
+        // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+        // disjoint local word storage for this operation.
+        assert_eq!(unsafe { willow_async_mutex_commit(null, 0, 77) }, 0);
         // A rejected acquire leaves the value untouched.
+        // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+        // keeps it live.
         let owner_token = acquire_now(unsafe { mutex_from_raw(raw) }.expect("mutex"), task);
-        assert_eq!(willow_async_mutex_load(raw, owner_token as i64), 5);
+        assert_eq!(
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_load(raw, owner_token as i64) },
+            5
+        );
         // Leave a reclaimable GC handle for the next fixture's heap reset.
-        assert_eq!(willow_async_mutex_release(raw, owner_token as i64), 1);
+        assert_eq!(
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_release(raw, owner_token as i64) },
+            1
+        );
     });
     assert_eq!(token, -1, "no token is published on a lost acquire");
 }
@@ -979,14 +1070,17 @@ fn c_abi_reports_cancelled_without_publishing_a_waiter() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
 
-    let raw = willow_async_mutex_new(5, 0);
+    // SAFETY: The initial word matches the constructor’s reference flag.
+    let raw = unsafe { willow_async_mutex_new(5, 0) };
     let owner = parked_task();
     let cancelled = parked_task();
     let mut owner_token: i64 = -1;
     let mut token: i64 = -1;
     with_current_task_for_test(owner, || {
         assert_eq!(
-            willow_async_mutex_acquire(raw, &raw mut owner_token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire(raw, &raw mut owner_token) },
             MUTEX_STATUS_ACQUIRED
         );
     });
@@ -994,13 +1088,17 @@ fn c_abi_reports_cancelled_without_publishing_a_waiter() {
 
     with_current_task_for_test(cancelled, || {
         assert_eq!(
-            willow_async_mutex_acquire(raw, &raw mut token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire(raw, &raw mut token) },
             MUTEX_STATUS_CANCELLED
         );
     });
 
     assert_eq!(token, -1, "a cancelled acquire must not publish a token");
     assert_eq!(
+        // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+        // keeps it live.
         unsafe { mutex_from_raw(raw) }
             .expect("mutex")
             .waiter_count(),
@@ -1009,7 +1107,9 @@ fn c_abi_reports_cancelled_without_publishing_a_waiter() {
     );
     assert!(lock_wait_link_of(cancelled).is_none());
     with_current_task_for_test(owner, || {
-        assert_eq!(willow_async_mutex_release(raw, owner_token), 1);
+        // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+        // disjoint local word storage for this operation.
+        assert_eq!(unsafe { willow_async_mutex_release(raw, owner_token) }, 1);
     });
 }
 
@@ -1152,7 +1252,8 @@ fn sched_reset(is_ref: bool) -> *mut c_void {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clear();
-    let raw = willow_async_mutex_new(0, is_ref as i64);
+    // SAFETY: The initial word matches the constructor’s reference flag.
+    let raw = unsafe { willow_async_mutex_new(0, is_ref as i64) };
     SCHED_LOCK.store(raw as usize, Ordering::SeqCst);
     raw
 }
@@ -1181,7 +1282,9 @@ unsafe extern "C" fn poll_hold_across_a_park(_frame: *mut c_void) -> i32 {
     if SCHED_HOLDER_STEP.fetch_add(1, Ordering::SeqCst) == 0 {
         let mut token: i64 = -1;
         assert_eq!(
-            willow_async_mutex_acquire(sched_lock(), &raw mut token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire(sched_lock(), &raw mut token) },
             MUTEX_STATUS_ACQUIRED,
             "the first task to arrive takes the lock uncontended"
         );
@@ -1190,12 +1293,17 @@ unsafe extern "C" fn poll_hold_across_a_park(_frame: *mut c_void) -> i32 {
         record("holder acquired");
         // Spawned from inside the poll, so the waiter cannot possibly reach
         // the lock before it is held.
-        willow_sched_spawn(poll_wait_for_the_lock, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        unsafe { willow_sched_spawn(poll_wait_for_the_lock, std::ptr::null_mut()) };
         RUNTIME_POLL_PENDING
     } else {
         record("holder releasing");
         assert_eq!(
-            willow_async_mutex_release(sched_lock(), SCHED_HOLDER_TOKEN.load(Ordering::SeqCst)),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe {
+                willow_async_mutex_release(sched_lock(), SCHED_HOLDER_TOKEN.load(Ordering::SeqCst))
+            },
             1
         );
         RUNTIME_POLL_READY
@@ -1207,7 +1315,9 @@ unsafe extern "C" fn poll_wait_for_the_lock(_frame: *mut c_void) -> i32 {
     if SCHED_WAITER_STEP.fetch_add(1, Ordering::SeqCst) == 0 {
         let mut token: i64 = -1;
         assert_eq!(
-            willow_async_mutex_acquire(sched_lock(), &raw mut token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire(sched_lock(), &raw mut token) },
             MUTEX_STATUS_PENDING,
             "the lock is held, so this task must park rather than spin"
         );
@@ -1215,17 +1325,25 @@ unsafe extern "C" fn poll_wait_for_the_lock(_frame: *mut c_void) -> i32 {
         record("waiter parked");
         // Only now does the bystander exist: any work it records provably
         // happened while this task was parked on the lock.
-        willow_sched_spawn(poll_unrelated_work, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        unsafe { willow_sched_spawn(poll_unrelated_work, std::ptr::null_mut()) };
         RUNTIME_POLL_PENDING
     } else {
         let token = SCHED_WAITER_TOKEN.load(Ordering::SeqCst);
         assert_eq!(
-            willow_async_mutex_poll(sched_lock(), token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_poll(sched_lock(), token) },
             MUTEX_STATUS_ACQUIRED,
             "the resume must be the handoff, not a spurious wake"
         );
         record("waiter resumed");
-        assert_eq!(willow_async_mutex_release(sched_lock(), token), 1);
+        assert_eq!(
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_release(sched_lock(), token) },
+            1
+        );
         RUNTIME_POLL_READY
     }
 }
@@ -1246,7 +1364,8 @@ fn one_worker_keeps_working_while_a_task_is_parked_on_the_lock() {
     let _single = single_worker_for_test();
     sched_reset(false);
 
-    willow_sched_spawn(poll_hold_across_a_park, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    unsafe { willow_sched_spawn(poll_hold_across_a_park, std::ptr::null_mut()) };
     let completed = willow_sched_run();
 
     assert_eq!(
@@ -1267,6 +1386,8 @@ fn one_worker_keeps_working_while_a_task_is_parked_on_the_lock() {
          the handoff, and the waiter must not resume before the release"
     );
 
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let mutex = unsafe { mutex_from_raw(sched_lock()) }.expect("mutex");
     assert_eq!(mutex.owner(), None);
     assert_eq!(mutex.waiter_count(), 0);
@@ -1293,7 +1414,9 @@ unsafe extern "C" fn poll_chain_waiter(_frame: *mut c_void) -> i32 {
         None => {
             let mut token: i64 = -1;
             assert_eq!(
-                willow_async_mutex_acquire(sched_lock(), &raw mut token),
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_acquire(sched_lock(), &raw mut token) },
                 MUTEX_STATUS_PENDING,
                 "the holder still owns the lock, so every chained task parks"
             );
@@ -1303,9 +1426,11 @@ unsafe extern "C" fn poll_chain_waiter(_frame: *mut c_void) -> i32 {
             // Chain the next arrival from inside this poll so registration
             // order is fixed by causality, not by the run queue.
             if CHAIN_REMAINING.fetch_sub(1, Ordering::SeqCst) > 1 {
-                willow_sched_spawn(poll_chain_waiter, std::ptr::null_mut());
+                // SAFETY: The callback accepts a null frame and uses no frame storage.
+                unsafe { willow_sched_spawn(poll_chain_waiter, std::ptr::null_mut()) };
             } else {
-                willow_sched_spawn(poll_unrelated_work, std::ptr::null_mut());
+                // SAFETY: The callback accepts a null frame and uses no frame storage.
+                unsafe { willow_sched_spawn(poll_unrelated_work, std::ptr::null_mut()) };
             }
             RUNTIME_POLL_PENDING
         }
@@ -1314,12 +1439,19 @@ unsafe extern "C" fn poll_chain_waiter(_frame: *mut c_void) -> i32 {
             chain[index].2 = polls + 1;
             drop(chain);
             assert_eq!(
-                willow_async_mutex_poll(sched_lock(), token),
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_poll(sched_lock(), token) },
                 MUTEX_STATUS_ACQUIRED,
                 "waiter {index} was woken without owning the lock"
             );
             record(format!("acquired {}", index + 1));
-            assert_eq!(willow_async_mutex_release(sched_lock(), token), 1);
+            assert_eq!(
+                // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+                // disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_release(sched_lock(), token) },
+                1
+            );
             RUNTIME_POLL_READY
         }
     }
@@ -1329,16 +1461,23 @@ unsafe extern "C" fn poll_hold_then_start_a_chain(_frame: *mut c_void) -> i32 {
     if SCHED_HOLDER_STEP.fetch_add(1, Ordering::SeqCst) == 0 {
         let mut token: i64 = -1;
         assert_eq!(
-            willow_async_mutex_acquire(sched_lock(), &raw mut token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire(sched_lock(), &raw mut token) },
             MUTEX_STATUS_ACQUIRED
         );
         SCHED_HOLDER_TOKEN.store(token, Ordering::SeqCst);
         SCHED_HOLDER_TASK.store(willow_sched_current_task(), Ordering::SeqCst);
-        willow_sched_spawn(poll_chain_waiter, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        unsafe { willow_sched_spawn(poll_chain_waiter, std::ptr::null_mut()) };
         RUNTIME_POLL_PENDING
     } else {
         assert_eq!(
-            willow_async_mutex_release(sched_lock(), SCHED_HOLDER_TOKEN.load(Ordering::SeqCst)),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe {
+                willow_async_mutex_release(sched_lock(), SCHED_HOLDER_TOKEN.load(Ordering::SeqCst))
+            },
             1
         );
         RUNTIME_POLL_READY
@@ -1354,7 +1493,8 @@ fn one_worker_drains_a_chain_of_real_tasks_in_registration_order() {
 
     const WAITERS: usize = 16;
     CHAIN_REMAINING.store(WAITERS, Ordering::SeqCst);
-    willow_sched_spawn(poll_hold_then_start_a_chain, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    unsafe { willow_sched_spawn(poll_hold_then_start_a_chain, std::ptr::null_mut()) };
 
     let completed = willow_sched_run();
     assert_eq!(
@@ -1393,6 +1533,8 @@ fn one_worker_drains_a_chain_of_real_tasks_in_registration_order() {
     }
     drop(chain);
 
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let mutex = unsafe { mutex_from_raw(sched_lock()) }.expect("mutex");
     assert_eq!(mutex.reclamation_status(), ReclamationStatus::Reclaimable);
 }
@@ -1412,11 +1554,14 @@ unsafe extern "C" fn poll_park_then_retire_if_cancelled(_frame: *mut c_void) -> 
         CANCEL_VICTIM.store(task, Ordering::SeqCst);
         let mut token: i64 = -1;
         assert_eq!(
-            willow_async_mutex_acquire(sched_lock(), &raw mut token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire(sched_lock(), &raw mut token) },
             MUTEX_STATUS_PENDING
         );
         record("victim parked");
-        willow_sched_spawn(poll_wait_for_the_lock, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        unsafe { willow_sched_spawn(poll_wait_for_the_lock, std::ptr::null_mut()) };
         willow_sched_cancel(task);
         return RUNTIME_POLL_PENDING;
     }
@@ -1427,17 +1572,24 @@ unsafe extern "C" fn poll_hold_then_start_a_cancel(_frame: *mut c_void) -> i32 {
     if SCHED_HOLDER_STEP.fetch_add(1, Ordering::SeqCst) == 0 {
         let mut token: i64 = -1;
         assert_eq!(
-            willow_async_mutex_acquire(sched_lock(), &raw mut token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire(sched_lock(), &raw mut token) },
             MUTEX_STATUS_ACQUIRED
         );
         SCHED_HOLDER_TOKEN.store(token, Ordering::SeqCst);
         SCHED_HOLDER_TASK.store(willow_sched_current_task(), Ordering::SeqCst);
-        willow_sched_spawn(poll_park_then_retire_if_cancelled, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        unsafe { willow_sched_spawn(poll_park_then_retire_if_cancelled, std::ptr::null_mut()) };
         RUNTIME_POLL_PENDING
     } else {
         record("holder releasing");
         assert_eq!(
-            willow_async_mutex_release(sched_lock(), SCHED_HOLDER_TOKEN.load(Ordering::SeqCst)),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe {
+                willow_async_mutex_release(sched_lock(), SCHED_HOLDER_TOKEN.load(Ordering::SeqCst))
+            },
             1
         );
         RUNTIME_POLL_READY
@@ -1452,7 +1604,8 @@ fn a_cancelled_waiter_is_retired_without_stranding_the_lock() {
     sched_reset(false);
     CANCEL_VICTIM.store(0, Ordering::SeqCst);
 
-    willow_sched_spawn(poll_hold_then_start_a_cancel, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    unsafe { willow_sched_spawn(poll_hold_then_start_a_cancel, std::ptr::null_mut()) };
     let completed = willow_sched_run();
 
     let log = events();
@@ -1471,6 +1624,8 @@ fn a_cancelled_waiter_is_retired_without_stranding_the_lock() {
          lock — a stranded registration would park it forever: {log:?}"
     );
 
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let mutex = unsafe { mutex_from_raw(sched_lock()) }.expect("mutex");
     let victim = CANCEL_VICTIM.load(Ordering::SeqCst);
     assert_ne!(victim, 0);
@@ -1574,7 +1729,9 @@ fn scheduler_aware_lock_benchmark_reports_stage7_metrics() {
     let started = Instant::now();
     for value in 0..OPERATIONS {
         let token = acquire_now(&mutex, task);
-        assert!(mutex.commit(task, token, value as i64));
+        // SAFETY: The fixture uses scalar storage or the managed reference lock and live
+        // referents created for this store.
+        assert!(unsafe { mutex.commit(task, token, value as i64) });
         assert!(matches!(
             mutex.release(task, token),
             MutexRelease::Released { handed_to: None }
@@ -1588,7 +1745,9 @@ fn scheduler_aware_lock_benchmark_reports_stage7_metrics() {
         let RwAcquire::Acquired(token) = rwlock.acquire(task, LockAccess::Write) else {
             panic!("uncontended writer must acquire");
         };
-        assert!(rwlock.commit(task, token, value as i64));
+        // SAFETY: The fixture uses scalar storage or the managed reference lock and live
+        // referents created for this store.
+        assert!(unsafe { rwlock.commit(task, token, value as i64) });
         assert!(matches!(
             rwlock.release(task, token),
             RwRelease::Released { woken: 0 }
@@ -1620,7 +1779,9 @@ fn scheduler_aware_lock_benchmark_reports_stage7_metrics() {
         assert_eq!(contended.poll_acquire(task, token), MutexResume::Acquired);
         acquisition_ns.push(acquire_started.elapsed().as_nanos());
         let hold_started = Instant::now();
-        assert!(contended.commit(task, token, 1));
+        // SAFETY: The fixture uses scalar storage or the managed reference lock and live
+        // referents created for this store.
+        assert!(unsafe { contended.commit(task, token, 1) });
         hold_ns.push(hold_started.elapsed().as_nanos());
         current = (task, token);
     }
@@ -1631,19 +1792,26 @@ fn scheduler_aware_lock_benchmark_reports_stage7_metrics() {
     acquisition_ns.sort_unstable();
     hold_ns.sort_unstable();
 
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     let memory_before = crate::gc::willow_gc_allocated_bytes();
     let drops_before = ASYNC_MUTEX_DROP_COUNT.load(Ordering::SeqCst);
     let handles: Vec<_> = (0..WAITERS)
         .map(|value| {
-            let handle = willow_async_mutex_new(value as i64, 0).cast::<u8>();
-            crate::gc::willow_gc_add_runtime_root(handle);
+            // SAFETY: The initial word matches the constructor’s reference flag.
+            let handle = unsafe { willow_async_mutex_new(value as i64, 0) }.cast::<u8>();
+            // SAFETY: The runtime keeps this nonmoving payload at its registered address
+            // through removal.
+            unsafe { crate::gc::willow_gc_add_runtime_root(handle) };
             handle
         })
         .collect();
     let memory_peak = crate::gc::willow_gc_allocated_bytes();
     for handle in handles {
-        crate::gc::willow_gc_remove_runtime_root(handle);
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { crate::gc::willow_gc_remove_runtime_root(handle) };
     }
     willow_gc_collect();
     let memory_after = crate::gc::willow_gc_allocated_bytes();
@@ -1681,7 +1849,9 @@ fn fast_mutex_generation_scaling_has_two_transitions_per_section() {
             let token = acquire_now(&mutex, task);
             assert_eq!(token, 2 * i + 1);
             assert_eq!(mutex.frame_refs(), 1);
-            assert!(mutex.commit(task, token, i as i64 + 1));
+            // SAFETY: The fixture uses scalar storage or the managed reference lock and live
+            // referents created for this store.
+            assert!(unsafe { mutex.commit(task, token, i as i64 + 1) });
             assert!(matches!(
                 mutex.release(task, token),
                 MutexRelease::Released { handed_to: None }
@@ -1718,7 +1888,9 @@ fn fast_mutex_reopens_after_fifo_drain_without_reusing_tokens() {
             MutexRelease::Released { handed_to: Some(b) }
         );
         assert_eq!(mutex.poll_acquire(b, slow), MutexResume::Acquired);
-        assert!(!mutex.commit(a, fast, -1));
+        // SAFETY: The fixture uses scalar storage or the managed reference lock and live
+        // referents created for this store.
+        assert!(!unsafe { mutex.commit(a, fast, -1) });
         assert_eq!(
             mutex.release(b, slow),
             MutexRelease::Released { handed_to: None }
@@ -1727,7 +1899,9 @@ fn fast_mutex_reopens_after_fifo_drain_without_reusing_tokens() {
             mutex.fast.load(Ordering::Relaxed) & crate::async_mutex::SLOW,
             0
         );
-        assert!(!mutex.commit(b, slow, -1));
+        // SAFETY: The fixture uses scalar storage or the managed reference lock and live
+        // referents created for this store.
+        assert!(!unsafe { mutex.commit(b, slow, -1) });
         assert_eq!(mutex.release(b, slow), MutexRelease::NotOwner);
         previous_fast = fast;
         previous_slow = slow;
@@ -1835,7 +2009,9 @@ fn fast_mutex_concurrent_reopening_preserves_exclusion_and_sum() {
                     };
                     assert_eq!(inside.fetch_add(1, Ordering::SeqCst), 0);
                     let value = mutex.load(task, token).expect("owner");
-                    assert!(mutex.commit(task, token, value + 1));
+                    // SAFETY: The fixture uses scalar storage or the managed reference lock
+                    // and live referents created for this store.
+                    assert!(unsafe { mutex.commit(task, token, value + 1) });
                     assert_eq!(inside.fetch_sub(1, Ordering::SeqCst), 1);
                     assert!(matches!(
                         mutex.release(task, token),
@@ -1858,33 +2034,61 @@ fn fast_mutex_concurrent_reopening_preserves_exclusion_and_sum() {
 fn fused_commit_release_rejects_stale_and_wrong_owner() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
-    willow_gc_init();
-    let raw = willow_async_mutex_new(0, 0);
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
+    // SAFETY: The initial word matches the constructor’s reference flag.
+    let raw = unsafe { willow_async_mutex_new(0, 0) };
     let a = parked_task();
     let b = parked_task();
     let mut token = 0;
     with_current_task_for_test(a, || {
         assert_eq!(
-            willow_async_mutex_acquire(raw, &mut token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire(raw, &mut token) },
             MUTEX_STATUS_ACQUIRED
         );
     });
     with_current_task_for_test(b, || {
-        assert_eq!(willow_async_mutex_commit_release(raw, token, 99), 0);
+        assert_eq!(
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_commit_release(raw, token, 99) },
+            0
+        );
     });
     with_current_task_for_test(a, || {
-        assert_eq!(willow_async_mutex_commit_release(raw, token, 42), 1);
-        assert_eq!(willow_async_mutex_commit_release(raw, token, 99), 0);
         assert_eq!(
-            willow_async_mutex_commit_release(std::ptr::null_mut(), token, 99),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_commit_release(raw, token, 42) },
+            1
+        );
+        assert_eq!(
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_commit_release(raw, token, 99) },
             0
         );
         assert_eq!(
-            willow_async_mutex_acquire(raw, &mut token),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_commit_release(std::ptr::null_mut(), token, 99) },
+            0
+        );
+        assert_eq!(
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire(raw, &mut token) },
             MUTEX_STATUS_ACQUIRED
         );
-        assert_eq!(willow_async_mutex_load(raw, token), 42);
-        assert_eq!(willow_async_mutex_release(raw, token), 1);
+        // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+        // disjoint local word storage for this operation.
+        assert_eq!(unsafe { willow_async_mutex_load(raw, token) }, 42);
+        // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+        // disjoint local word storage for this operation.
+        assert_eq!(unsafe { willow_async_mutex_release(raw, token) }, 1);
     });
 }
 
@@ -1892,7 +2096,8 @@ fn fused_commit_release_rejects_stale_and_wrong_owner() {
 fn fused_scalar_acquire_and_poll_write_only_on_success() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
-    let raw = willow_async_mutex_new(7, 0);
+    // SAFETY: The initial word matches the constructor’s reference flag.
+    let raw = unsafe { willow_async_mutex_new(7, 0) };
     let a = parked_task();
     let b = parked_task();
     let mut ta = 0;
@@ -1900,47 +2105,65 @@ fn fused_scalar_acquire_and_poll_write_only_on_success() {
     let mut value = -99;
     with_current_task_for_test(a, || {
         assert_eq!(
-            willow_async_mutex_acquire_load(raw, &mut ta, &mut value),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire_load(raw, &mut ta, &mut value) },
             MUTEX_STATUS_ACQUIRED
         );
         assert_eq!(value, 7);
         value = -99;
         assert_eq!(
-            willow_async_mutex_acquire_load(raw, &mut ta, &mut value),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire_load(raw, &mut ta, &mut value) },
             MUTEX_STATUS_RECURSIVE
         );
         assert_eq!(value, -99);
     });
     with_current_task_for_test(b, || {
         assert_eq!(
-            willow_async_mutex_acquire_load(raw, &mut tb, &mut value),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire_load(raw, &mut tb, &mut value) },
             MUTEX_STATUS_PENDING
         );
         assert_eq!(value, -99);
         assert_eq!(
-            willow_async_mutex_poll_load(raw, tb, &mut value),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_poll_load(raw, tb, &mut value) },
             MUTEX_STATUS_PENDING
         );
         assert_eq!(value, -99);
     });
     with_current_task_for_test(a, || {
-        assert_eq!(willow_async_mutex_commit_release(raw, ta, 42), 1);
+        // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+        // disjoint local word storage for this operation.
+        assert_eq!(unsafe { willow_async_mutex_commit_release(raw, ta, 42) }, 1);
     });
     with_current_task_for_test(b, || {
         assert_eq!(
-            willow_async_mutex_poll_load(raw, tb, &mut value),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_poll_load(raw, tb, &mut value) },
             MUTEX_STATUS_ACQUIRED
         );
         assert_eq!(value, 42);
-        assert_eq!(willow_async_mutex_release(raw, tb), 1);
+        // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+        // disjoint local word storage for this operation.
+        assert_eq!(unsafe { willow_async_mutex_release(raw, tb) }, 1);
         value = -99;
         assert_eq!(
-            willow_async_mutex_poll_load(raw, tb, &mut value),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_poll_load(raw, tb, &mut value) },
             MUTEX_STATUS_LOST
         );
         assert_eq!(value, -99);
         assert_eq!(
-            willow_async_mutex_acquire_load(std::ptr::null_mut(), &mut tb, &mut value),
+            // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+            // disjoint local word storage for this operation.
+            unsafe { willow_async_mutex_acquire_load(std::ptr::null_mut(), &mut tb, &mut value) },
             MUTEX_STATUS_LOST
         );
         assert_eq!(value, -99);

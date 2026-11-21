@@ -43,6 +43,8 @@ const WORD: i64 = WORD_BYTES as i64;
 /// Read the published tracing prefix; the buffer remains independently traceable
 /// when a captured element reference keeps it alive after handle growth.
 unsafe fn buffer_len(buffer: *mut u8) -> i64 {
+    // SAFETY: The GC word-aligns the buffer. Its first word is reserved for the length and all
+    // concurrent accesses are atomic.
     unsafe { AtomicI64::from_ptr(buffer.cast()).load(Ordering::Acquire) }
 }
 
@@ -50,6 +52,8 @@ unsafe fn buffer_len(buffer: *mut u8) -> i64 {
 /// The concurrent marker may observe an older prefix; insertion barriers retain
 /// every newly stored reference even when its slot is outside that snapshot.
 unsafe fn set_buffer_len(buffer: *mut u8, len: i64) {
+    // SAFETY: The GC word-aligns the buffer. Its first word is reserved for the length and all
+    // concurrent accesses are atomic.
     unsafe { AtomicI64::from_ptr(buffer.cast()).store(len, Ordering::Release) };
 }
 
@@ -58,18 +62,25 @@ unsafe fn set_buffer_len(buffer: *mut u8, len: i64) {
 /// # Safety
 /// `payload` must point at a buffer allocated by [`alloc_buffer`].
 unsafe fn trace_array_ref(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+    // SAFETY: The trace hook receives a live reference buffer. Its published length bounds the
+    // initialized word slots.
     let len = unsafe { buffer_len(payload) };
     for index in 0..len {
+        // SAFETY: The trace hook receives a live reference buffer. Its published length bounds the
+        // initialized word slots.
         slots.push(unsafe { buf_slot(payload, index).cast() });
     }
 }
 
-/// The stopped minor collector can visit this built-in contiguous slot range
-/// without materializing a temporary vector. Registry overrides keep the hook
-/// path; the caller also requires a zero inline mask to avoid skipping slots.
+/// Visit the built-in array tracer's contiguous slots without allocating a
+/// slot vector. Other trace hooks and any inline mask are handled by the caller.
 ///
 /// # Safety
-/// `payload` is a live buffer of `type_id`, and all mutators are stopped.
+/// For a matching type and hook, `payload` must be a live, word-aligned
+/// reference buffer. Its acquire-loaded length covers initialized reference
+/// slots. Keep that storage live at the same address until the range has been
+/// consumed. Concurrent readers must use atomic slot loads. Rewriting the
+/// slots during evacuation requires exclusive access.
 pub(crate) unsafe fn minor_reference_range(
     type_id: u32,
     trace: Option<crate::gc::TraceFn>,
@@ -81,14 +92,21 @@ pub(crate) unsafe fn minor_reference_range(
     {
         return None;
     }
+    // SAFETY: The checked layout has a length word even when capacity is zero.
     let len = unsafe { buffer_len(payload) }.max(0) as usize;
+    // SAFETY: Index zero addresses the first slot or the end of a header-only
+    // buffer. Only indices below the returned length can be visited.
     Some((unsafe { buf_slot(payload, 0).cast() }, len))
 }
 
 /// Both length and reference slots use atomic publication for concurrent GC.
 unsafe fn snapshot_array_ref(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    // SAFETY: The trace hook receives a live reference buffer. Its published length bounds the
+    // initialized word slots.
     let len = unsafe { buffer_len(payload) };
     for index in 0..len {
+        // SAFETY: The trace hook receives a live reference buffer. Its published length bounds the
+        // initialized word slots.
         children.push(unsafe { crate::gc::load_gc_reference(buf_slot(payload, index).cast()) });
     }
 }
@@ -99,10 +117,14 @@ unsafe fn snapshot_array_ref_slice(
     limit: usize,
     children: &mut Vec<*mut u8>,
 ) -> crate::gc::TraceSliceProgress {
+    // SAFETY: The trace hook receives a live reference buffer. Its published length bounds the
+    // initialized word slots.
     let len = unsafe { buffer_len(payload) }.max(0) as usize;
     let end = cursor.saturating_add(limit).min(len);
     for index in cursor..end {
         children
+            // SAFETY: The trace hook receives a live reference buffer. Its published length bounds
+            // the initialized word slots.
             .push(unsafe { crate::gc::load_gc_reference(buf_slot(payload, index as i64).cast()) });
     }
     if end < len {
@@ -116,15 +138,21 @@ unsafe fn snapshot_array_ref_slice(
 /// `willow_gc_init` invalidates registration, so the next allocation reinstalls
 /// the hook after a reset; warmed allocations only check the generation.
 const ARRAY_REGISTRATION: crate::gc::NativeGcRegistration = crate::gc::NativeGcRegistration::Array;
-const ARRAY_GC_TYPES: &[crate::gc::NativeGcType] =
-    &[
+const ARRAY_GC_TYPES: &[crate::gc::NativeGcType] = &[
+    // SAFETY: The buffer ABI initializes capacity and aligned reference slots for this ID.
+    // Stopped tracing exposes the slots; snapshots atomically load their values over a
+    // bounded index range.
+    unsafe {
         crate::gc::NativeGcType::new(ARRAY_REF_TYPE_ID, Some(trace_array_ref), None)
             .with_concurrent_trace(snapshot_array_ref)
-            .with_concurrent_slice(snapshot_array_ref_slice),
-    ];
+            .with_concurrent_slice(snapshot_array_ref_slice)
+    },
+];
 
 pub(crate) fn ensure_trace_registered() {
-    ARRAY_REGISTRATION.ensure(ARRAY_GC_TYPES);
+    // SAFETY: This is the complete descriptor set for the reference-array buffer registration
+    // group and its constructors.
+    unsafe { ARRAY_REGISTRATION.ensure(ARRAY_GC_TYPES) };
 }
 
 /// Allocate an empty, zero-initialized buffer of `cap` slots (`[len=0, e0..]`).
@@ -138,14 +166,21 @@ fn alloc_buffer(cap: i64, flags: i64) -> *mut u8 {
     };
     let buf = if is_reference(flags) {
         ensure_trace_registered();
-        willow_alloc_with_layout(GcObjectKind::ArrayBuffer, ARRAY_REF_TYPE_ID, payload, 0)
+        // SAFETY: The constructor selects the matching payload layout and initializes its
+        // fields before exposing it or reaching a GC point.
+        unsafe {
+            willow_alloc_with_layout(GcObjectKind::ArrayBuffer, ARRAY_REF_TYPE_ID, payload, 0)
+        }
     } else {
-        willow_alloc_with_layout(GcObjectKind::ArrayBuffer, 0, payload, 0)
+        // SAFETY: The constructor selects the matching payload layout and initializes its
+        // fields before exposing it or reaching a GC point.
+        unsafe { willow_alloc_with_layout(GcObjectKind::ArrayBuffer, 0, payload, 0) }
     };
     if buf.is_null() {
         raise_with("array buffer allocation failed");
         return buf;
     }
+    // SAFETY: The freshly allocated buffer has a word-aligned length field, even at zero capacity.
     unsafe { set_buffer_len(buf, 0) };
     buf
 }
@@ -153,13 +188,22 @@ fn alloc_buffer(cap: i64, flags: i64) -> *mut u8 {
 /// Address of element slot `index` in a buffer (unchecked).
 ///
 /// # Safety
-/// `buffer` must be a buffer with at least `index + 1` slots.
+/// `buffer` must be a live word-slot buffer and `0 <= index <= capacity`.
+/// At capacity the pointer is one past the allocation and cannot be dereferenced.
 unsafe fn buf_slot(buffer: *mut u8, index: i64) -> *mut i64 {
+    // SAFETY: The caller bounds the index by capacity. The GC word-aligned base and header
+    // preserve the element stride's alignment.
     unsafe { (buffer as *mut i64).add(BUFFER_HEADER_WORDS + index as usize) }
 }
 
-/// Address within scalar or word storage; the caller proves the index valid.
+/// Compute a slot address using the declared width of the live buffer.
+///
+/// # Safety
+/// The flags must match the allocation and `0 <= index <= capacity`.
+/// At capacity the result is only an empty range boundary and must not be dereferenced.
 unsafe fn element_slot(buffer: *mut u8, index: i64, flags: i64) -> *mut u8 {
+    // SAFETY: The caller bounds the index by capacity. The GC word-aligned base and header
+    // preserve the element stride's alignment.
     unsafe {
         buffer
             .add(BUFFER_HEADER_WORDS * WORD_BYTES as usize + index as usize * element_width(flags))
@@ -168,7 +212,11 @@ unsafe fn element_slot(buffer: *mut u8, index: i64, flags: i64) -> *mut u8 {
 
 /// Preserve scalar bits; the compiler sign-extends signed narrow values.
 unsafe fn load_buffer_slot(buffer: *mut u8, index: i64, flags: i64) -> i64 {
+    // SAFETY: The caller bounds the index by capacity. The GC word-aligned base and header
+    // preserve the element stride's alignment.
     let slot = unsafe { element_slot(buffer, index, flags) };
+    // SAFETY: The GC word-aligns the buffer and its header. Each in-bounds element offset is a
+    // multiple of the selected width.
     unsafe {
         match element_width(flags) {
             1 => i64::from(slot.read()),
@@ -182,18 +230,30 @@ unsafe fn load_buffer_slot(buffer: *mut u8, index: i64, flags: i64) -> i64 {
 unsafe fn store_buffer_slot(buffer: *mut u8, index: i64, value: i64, flags: i64) {
     let is_ref = is_reference(flags);
     if is_ref {
+        // SAFETY: The caller bounds the index by capacity. The GC word-aligned base and header
+        // preserve the element stride's alignment.
         let slot = unsafe { buf_slot(buffer, index) }.cast::<u8>();
-        write_barrier_array_slot(
-            buffer,
-            slot,
-            unsafe { crate::gc::load_gc_reference(slot.cast()) },
-            value as *mut u8,
-        );
+        // SAFETY: The element slot belongs to this live reference buffer and the old and
+        // incoming words are its managed references.
+        unsafe {
+            write_barrier_array_slot(
+                buffer,
+                slot,
+                crate::gc::load_gc_reference(slot.cast()),
+                value as *mut u8,
+            )
+        };
     }
     if is_ref {
+        // SAFETY: Reference elements occupy full aligned words; the barrier above precedes
+        // publication.
         unsafe { crate::gc::store_gc_reference(buf_slot(buffer, index).cast(), value as *mut u8) };
     } else {
+        // SAFETY: The caller bounds the index by capacity. The GC word-aligned base and header
+        // preserve the element stride's alignment.
         let slot = unsafe { element_slot(buffer, index, flags) };
+        // SAFETY: The GC word-aligns the buffer and its header. Each in-bounds element offset is a
+        // multiple of the selected width.
         unsafe {
             match element_width(flags) {
                 1 => slot.write(value as u8),
@@ -206,16 +266,22 @@ unsafe fn store_buffer_slot(buffer: *mut u8, index: i64, value: i64, flags: i64)
 }
 
 unsafe fn handle_word(arr: *mut u8, w: usize) -> i64 {
+    // SAFETY: The GC word-aligns the handle and the field index selects one of its reserved words.
     unsafe { *((arr as *const i64).add(w)) }
 }
 unsafe fn set_handle_word(arr: *mut u8, w: usize, v: i64) {
     if w == H_BUF {
+        // SAFETY: The GC word-aligns the handle and the field index selects one of its reserved
+        // words.
         unsafe { crate::gc::store_gc_reference((arr as *mut i64).add(w).cast(), v as *mut u8) };
     } else {
+        // SAFETY: The GC word-aligns the handle and the field index selects one of its reserved
+        // words.
         unsafe { *((arr as *mut i64).add(w)) = v };
     }
 }
 unsafe fn handle_buffer(arr: *mut u8) -> *mut u8 {
+    // SAFETY: The GC word-aligns the handle and the field index selects one of its reserved words.
     unsafe { handle_word(arr, H_BUF) as *mut u8 }
 }
 
@@ -225,6 +291,7 @@ unsafe fn handle_buffer(arr: *mut u8) -> *mut u8 {
 /// any safepoint; reload the rooted handle first after such a call.
 #[inline]
 pub(crate) unsafe fn scalar_slot_unchecked(arr: *mut u8, index: i64) -> *mut i64 {
+    // SAFETY: The caller supplies a live word array and an index within its buffer.
     unsafe { buf_slot(handle_buffer(arr), index) }
 }
 
@@ -236,9 +303,13 @@ pub(crate) unsafe fn scalar_slot_unchecked(arr: *mut u8, index: i64) -> *mut i64
 /// root registration or old-region work. Only a TLAB miss
 /// reaches a GC point, which may move this thread's root-slot referents like
 /// any generated allocation; generated code reloads its values after the call.
+///
+/// # Safety
+/// The storage flags must describe a supported array layout. Reference elements
+/// always require full pointer-width slots, including when the buffer starts zeroed.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
+pub unsafe extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
     if len < 0 {
         return raise_negative_length(len);
     }
@@ -248,9 +319,13 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
 /// Allocation-only entry for compiler-proven constant-length array literals.
 /// Invalid ABI lengths are fatal; allocation exhaustion uses the runtime's
 /// non-recoverable resource failure policy. No language panic can return.
+///
+/// # Safety
+/// The storage flags must describe a supported array layout. Reference elements
+/// always require full pointer-width slots, including when the buffer starts zeroed.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_new_literal(len: i64, elem_is_ref: i64) -> *mut u8 {
+pub unsafe extern "C" fn willow_array_new_literal(len: i64, elem_is_ref: i64) -> *mut u8 {
     if buffer_bytes(len, elem_is_ref).is_none() {
         crate::failure::fatal_invariant("invalid constant array literal length");
     }
@@ -264,7 +339,7 @@ pub extern "C" fn willow_array_new_literal(len: i64, elem_is_ref: i64) -> *mut u
 // Shared allocation/GC/rooting path. Both callers validate non-negative length;
 // the literal entry also proves the old buffer payload cannot overflow.
 fn allocate_array(len: i64, elem_is_ref: i64) -> *mut u8 {
-    let Some(buffer_layout) = young_buffer_layout(len, elem_is_ref) else {
+    let Some(buffer_layout) = crate::gc::array_buffer_layout(len, elem_is_ref) else {
         return new_old_array(len, elem_is_ref);
     };
     let handle_layout = crate::gc::array_handle_layout();
@@ -276,31 +351,26 @@ fn allocate_array(len: i64, elem_is_ref: i64) -> *mut u8 {
                 return handle;
             }
             // The handle's slot is null, so a collection here traces it safely.
-            crate::gc::willow_push_root(&mut handle);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { crate::gc::willow_push_root(&raw mut handle) };
             let buffer = match crate::gc::try_alloc_young([buffer_layout]) {
                 Some([buffer]) => buffer,
                 None => crate::gc::alloc_young_layout_slow(buffer_layout),
             };
-            crate::gc::willow_pop_roots(1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { crate::gc::willow_pop_roots(1) };
             if buffer.is_null() {
                 return buffer;
             }
             (handle, buffer)
         }
     };
+    // SAFETY: Both fresh allocations are word-aligned and sized for the handle and the requested
+    // buffer capacity.
     unsafe { init_array(handle, buffer, len, elem_is_ref) };
     handle
-}
-
-/// TLAB layout of a buffer with `cap` slots, or `None` when it is too large
-/// for a TLAB object. Registers the reference-buffer trace hook first.
-fn young_buffer_layout(cap: i64, flags: i64) -> Option<crate::gc::YoungLayout> {
-    let payload = usize::try_from(buffer_bytes(cap, flags)?).ok()?;
-    let is_ref = is_reference(flags);
-    if is_ref {
-        ensure_trace_registered();
-    }
-    crate::gc::array_buffer_layout(payload, is_ref)
 }
 
 fn raise_negative_length(len: i64) -> *mut u8 {
@@ -319,12 +389,16 @@ pub(crate) fn new_old_array(len: i64, elem_is_ref: i64) -> *mut u8 {
     // Allocate the handle first (zero-filled, buffer slot null), root it, then
     // allocate the buffer — so a collection during the buffer allocation cannot
     // free the handle, and the still-null buffer slot traces safely.
-    let handle = willow_alloc_with_layout(
-        GcObjectKind::ArrayHandle,
-        0,
-        HANDLE_WORDS * WORD,
-        HANDLE_MASK,
-    );
+    // SAFETY: The constructor selects the matching payload layout and initializes its fields
+    // before exposing it or reaching a GC point.
+    let handle = unsafe {
+        willow_alloc_with_layout(
+            GcObjectKind::ArrayHandle,
+            0,
+            HANDLE_WORDS * WORD,
+            HANDLE_MASK,
+        )
+    };
     if handle.is_null() {
         return std::ptr::null_mut();
     }
@@ -334,6 +408,8 @@ pub(crate) fn new_old_array(len: i64, elem_is_ref: i64) -> *mut u8 {
         return std::ptr::null_mut();
     }
     let handle = handle_root.load();
+    // SAFETY: Both fresh allocations are word-aligned and sized for the handle and the requested
+    // buffer capacity.
     unsafe { init_array(handle, buffer, len, elem_is_ref) };
     handle
 }
@@ -341,17 +417,23 @@ pub(crate) fn new_old_array(len: i64, elem_is_ref: i64) -> *mut u8 {
 /// Borrow packed byte storage without a safepoint or an element-wise conversion.
 ///
 /// # Safety
-/// `array` is a live Array<u8>. The borrow must end before any GC safepoint,
+/// `array` is null or a live packed Array<u8>. The borrow must end before any GC safepoint,
 /// array mutation, or foreign call; native allocation alone is safe.
 pub(crate) unsafe fn packed_bytes<'a>(array: *mut u8) -> &'a [u8] {
     if array.is_null() {
         return &[];
     }
+    // SAFETY: The caller retains the packed byte array through this borrow. Its length bounds the
+    // bytes after the buffer header.
     let flags = unsafe { handle_word(array, H_IS_REF) };
     if flags != willow_abi::array_layout::storage_flags(1, false) {
         crate::failure::fatal_invariant("expected packed Array<u8>");
     }
+    // SAFETY: The caller retains the packed byte array through this borrow. Its length bounds the
+    // bytes after the buffer header.
     let len = unsafe { handle_word(array, H_LEN) } as usize;
+    // SAFETY: The caller retains the packed byte array through this borrow. Its length bounds the
+    // bytes after the buffer header.
     unsafe { std::slice::from_raw_parts(element_slot(handle_buffer(array), 0, flags), len) }
 }
 
@@ -362,6 +444,8 @@ pub(crate) fn from_native_bytes(bytes: &[u8]) -> *mut u8 {
     let flags = willow_abi::array_layout::storage_flags(1, false);
     let array = new_old_array(length, flags);
     if !bytes.is_empty() {
+        // SAFETY: The new packed array has space for the entire source slice in a distinct
+        // allocation.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
@@ -379,6 +463,8 @@ pub(crate) fn from_native_bytes(bytes: &[u8]) -> *mut u8 {
 /// # Safety
 /// `handle` and `buffer` are fresh allocations with `len` buffer slots.
 unsafe fn init_array(handle: *mut u8, buffer: *mut u8, len: i64, elem_is_ref: i64) {
+    // SAFETY: Both fresh allocations are word-aligned and sized for the handle and the requested
+    // buffer capacity.
     unsafe {
         set_buffer_len(buffer, len);
         set_handle_word(handle, H_LEN, len);
@@ -399,14 +485,20 @@ unsafe fn init_array(handle: *mut u8, buffer: *mut u8, len: i64, elem_is_ref: i6
 /// the copy has no mutation API and shares no buffer with the original, so it is
 /// safe to treat as immutable. Shallow per the element word (ref elements share
 /// their — Sync — referents).
+///
+/// # Safety
+/// A non-null `arr` must be a current, live Willow array handle with its initialized
+/// backing buffer. Exclude conflicting accesses for the duration of this operation.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_copy(arr: *mut u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_array_copy(arr: *mut u8) -> *mut u8 {
     if arr.is_null() {
         raise_with("cannot freeze a null array");
         return std::ptr::null_mut();
     }
-    let len = willow_array_len(arr);
+    // SAFETY: The caller supplied the current source handle and null was rejected.
+    let len = unsafe { willow_array_len(arr) };
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     let is_ref = unsafe { handle_word(arr, H_IS_REF) };
     let arr = crate::gc::GcRootHandle::new(arr);
     let copy = new_old_array(len, is_ref);
@@ -416,7 +508,9 @@ pub extern "C" fn willow_array_copy(arr: *mut u8) -> *mut u8 {
     let copy = crate::gc::GcRootHandle::new(copy);
     let mut i = 0;
     while i < len {
-        willow_array_set(copy.load(), i, willow_array_get(arr.load(), i));
+        // SAFETY: Both handles come from the source contract and the fresh copy of the same
+        // layout; each root is reloaded for this in-bounds transfer.
+        unsafe { willow_array_set(copy.load(), i, willow_array_get(arr.load(), i)) };
         i += 1;
     }
     copy.load()
@@ -424,14 +518,21 @@ pub extern "C" fn willow_array_copy(arr: *mut u8) -> *mut u8 {
 
 /// Freeze an array whose element words point to scalar or interface pair boxes. Copy the boxes too: mutable element references must not
 /// change the frozen snapshot. Both arrays remain rooted across every allocation.
+///
+/// # Safety
+/// A non-null `arr` must be a current, live Willow array handle with its initialized
+/// backing buffer. Exclude conflicting accesses for the duration of this operation.
+/// The reference buffer must store GC pair boxes with two aligned, initialized words
+/// and the element type's tracing layout. Zero slots are allowed.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_copy_scalar_pairs(arr: *mut u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_array_copy_scalar_pairs(arr: *mut u8) -> *mut u8 {
     if arr.is_null() {
         raise_with("cannot freeze a null array");
         return std::ptr::null_mut();
     }
-    let len = willow_array_len(arr);
+    // SAFETY: The source handle is live by the caller contract and passed the null check.
+    let len = unsafe { willow_array_len(arr) };
     let arr = crate::gc::GcRootHandle::new(arr);
     let copy = new_old_array(len, 1);
     if copy.is_null() {
@@ -439,14 +540,19 @@ pub extern "C" fn willow_array_copy_scalar_pairs(arr: *mut u8) -> *mut u8 {
     }
     let copy = crate::gc::GcRootHandle::new(copy);
     for index in 0..len {
-        if willow_array_get(arr.load(), index) == 0 {
+        // SAFETY: The source holds the declared pair slots and both arrays are reloaded from
+        // roots. The new box is stored before another allocation.
+        if unsafe { willow_array_get(arr.load(), index) } == 0 {
             continue;
         }
+        // SAFETY: The managed pair reserves two words at the GC allocator's word alignment.
         let pair = unsafe { copy_scalar_pair(willow_array_get(arr.load(), index) as *const i64) };
         if pair.is_null() {
             return std::ptr::null_mut();
         }
-        willow_array_set(copy.load(), index, pair as i64);
+        // SAFETY: The source holds the declared pair slots and both arrays are reloaded from
+        // roots. The new box is stored before another allocation.
+        unsafe { willow_array_set(copy.load(), index, pair as i64) };
     }
     copy.load()
 }
@@ -454,27 +560,34 @@ pub extern "C" fn willow_array_copy_scalar_pairs(arr: *mut u8) -> *mut u8 {
 /// Read immutable tracing metadata without borrowing mutable header bytes.
 /// Pair storage has either no references or a traced first word.
 unsafe fn pair_ref_mask(pair: *const i64) -> u64 {
-    let header =
-        unsafe { pair.cast::<u8>().sub(crate::gc::GC_HEADER_SIZE) }.cast::<crate::gc::GcHeader>();
-    let descriptor = unsafe { std::ptr::addr_of!((*header).descriptor).read() }
-        as *const willow_abi::GcLayoutDescriptor;
-    unsafe { (*descriptor).gc_ref_mask }
+    // SAFETY: the source is a live, unforwarded managed pair.
+    unsafe { crate::gc::GcHeader::live_descriptor(pair.cast()).gc_ref_mask }
 }
 
 /// Publish the object word through the same SATB/generational barrier used by
 /// ordinary array elements; the vtable word is never interpreted as a pointer.
 unsafe fn store_pair(pair: *mut i64, first: i64, second: i64, mask: u64) {
     if mask & 1 != 0 {
-        write_barrier_object_owner(
-            pair.cast(),
-            unsafe { crate::gc::load_gc_reference(pair.cast()) },
-            first as *mut u8,
-            GcStoreDestination::ArrayElement as i64,
-        );
+        // SAFETY: The initialized pair is a GC payload and its reference word and replacement
+        // match the pair layout.
+        unsafe {
+            write_barrier_object_owner(
+                pair.cast(),
+                crate::gc::load_gc_reference(pair.cast()),
+                first as *mut u8,
+                GcStoreDestination::ArrayElement as i64,
+            )
+        };
+        // SAFETY: The pair allocation contains two aligned words. Its layout selects reference
+        // access for the traced first word.
         unsafe { crate::gc::store_gc_reference(pair.cast(), first as *mut u8) };
     } else {
+        // SAFETY: The pair allocation contains two aligned words. Its layout selects reference
+        // access for the traced first word.
         unsafe { pair.write(first) };
     }
+    // SAFETY: The pair allocation contains two aligned words. Its layout selects reference access
+    // for the traced first word.
     unsafe { pair.add(1).write(second) };
 }
 
@@ -482,7 +595,11 @@ unsafe fn store_pair(pair: *mut i64, first: i64, second: i64, mask: u64) {
 /// object across allocation so a moving collection updates the copied pointer.
 /// The caller must publish or root the returned box before another safepoint.
 pub(crate) unsafe fn copy_scalar_pair(source: *const i64) -> *mut u8 {
+    // SAFETY: The pair allocation contains two aligned words. Its layout selects reference access
+    // for the traced first word.
     let mask = unsafe { pair_ref_mask(source) };
+    // SAFETY: The pair allocation contains two aligned words. Its layout selects reference access
+    // for the traced first word.
     let (first, second) = unsafe { (source.read(), source.add(1).read()) };
     // A successful bump allocation cannot collect: both source words remain
     // valid, and no root registration/old-region indexing is needed. The
@@ -490,15 +607,21 @@ pub(crate) unsafe fn copy_scalar_pair(source: *const i64) -> *mut u8 {
     if let Some([pair]) =
         crate::gc::array_pair_layout(mask).and_then(|layout| crate::gc::try_alloc_young([layout]))
     {
+        // SAFETY: The pair allocation contains two aligned words. Its layout selects reference
+        // access for the traced first word.
         unsafe { store_pair(pair.cast(), first, second, mask) };
         return pair;
     }
     let object = (mask & 1 != 0).then(|| crate::gc::GcRootHandle::new(first as *mut u8));
     let pair = crate::gc::array_pair_layout(mask).map_or_else(
-        || willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, mask),
+        // SAFETY: The constructor selects the matching payload layout and initializes its
+        // fields before exposing it or reaching a GC point.
+        || unsafe { willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, mask) },
         crate::gc::alloc_young_layout_slow,
     );
     if !pair.is_null() {
+        // SAFETY: The pair allocation contains two aligned words. Its layout selects reference
+        // access for the traced first word.
         unsafe {
             store_pair(
                 pair.cast(),
@@ -514,13 +637,18 @@ pub(crate) unsafe fn copy_scalar_pair(source: *const i64) -> *mut u8 {
 /// Number of elements in `arr`. Raises for a null array and for a malformed
 /// negative length: generated length reads guard both on their fast path and
 /// call here only to raise, so the call must not return normally for either.
+///
+/// # Safety
+/// A non-null `arr` must be a current, live Willow array handle with its initialized
+/// backing buffer. Exclude conflicting accesses for the duration of this operation.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_len(arr: *mut u8) -> i64 {
+pub unsafe extern "C" fn willow_array_len(arr: *mut u8) -> i64 {
     if arr.is_null() {
         raise_with("cannot take the length of a null array");
         return 0;
     }
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     let len = unsafe { handle_word(arr, H_LEN) };
     if len < 0 {
         raise_with(&format!("malformed array: negative length {len}"));
@@ -531,26 +659,43 @@ pub extern "C" fn willow_array_len(arr: *mut u8) -> i64 {
 
 /// Read scalar bits at `index`, zero-extending narrow storage. Callers interpret
 /// the bits according to the element type, including signed narrow integers.
+///
+/// # Safety
+/// A non-null `arr` must be a current, live Willow array handle with its initialized
+/// backing buffer. Exclude conflicting accesses for the duration of this operation.
+/// For reference elements this operation also writes the handle's exposure flags.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_get(arr: *mut u8, index: i64) -> i64 {
+pub unsafe extern "C" fn willow_array_get(arr: *mut u8, index: i64) -> i64 {
     if !check_bounds(arr, index) {
         return 0;
     }
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     unsafe { expose_pair_storage(arr) };
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     unsafe { load_buffer_slot(handle_buffer(arr), index, handle_word(arr, H_IS_REF)) }
 }
 
 /// Write the low element-width bits of `value` at `index`.
+///
+/// # Safety
+/// A non-null `arr` must be a current, live Willow array handle with its initialized
+/// backing buffer. Exclude conflicting accesses for the duration of this operation.
+/// For reference elements, `value` must be null or a current GC payload of the element type.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_set(arr: *mut u8, index: i64, value: i64) {
+pub unsafe extern "C" fn willow_array_set(arr: *mut u8, index: i64, value: i64) {
     if !check_bounds(arr, index) {
         return;
     }
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     unsafe { expose_pair_storage(arr) };
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     let flags = unsafe { handle_word(arr, H_IS_REF) };
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     let buffer = unsafe { handle_buffer(arr) };
+    // SAFETY: The GC word-aligns this live buffer. The index and element width select storage
+    // within its capacity.
     unsafe { store_buffer_slot(buffer, index, value, flags) };
 }
 
@@ -559,13 +704,20 @@ pub extern "C" fn willow_array_set(arr: *mut u8, index: i64, value: i64) {
 /// Used by compiler-generated `&xs[i]` / `&mut xs[i]` reference calls. NOTE: the
 /// returned address points into the current buffer; a `push` that grows the
 /// array reallocates the buffer and invalidates any address taken earlier.
+///
+/// # Safety
+/// A non-null `arr` must be a current, live Willow array handle with its initialized
+/// backing buffer. Exclude conflicting accesses for the duration of this operation.
+/// Use the result only at the element width while the same buffer stays live and stationary.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_element_addr(arr: *mut u8, index: i64) -> *mut u8 {
+pub unsafe extern "C" fn willow_array_element_addr(arr: *mut u8, index: i64) -> *mut u8 {
     if !check_bounds(arr, index) {
         return std::ptr::null_mut();
     }
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     unsafe { expose_pair_storage(arr) };
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     unsafe { element_slot(handle_buffer(arr), index, handle_word(arr, H_IS_REF)) }
 }
 
@@ -573,30 +725,45 @@ pub extern "C" fn willow_array_element_addr(arr: *mut u8, index: i64) -> *mut u8
 /// the array handle, this allocation remains the same owner after a resize.
 /// Generated code roots the returned base and keeps the original index, then
 /// recomputes the interior address after any moving collection or suspension.
+///
+/// # Safety
+/// A non-null `arr` must be a current, live Willow array handle with its initialized
+/// backing buffer. Exclude conflicting accesses for the duration of this operation.
+/// Root the returned owner and reload it after collection before computing a slot address.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_reference_owner(arr: *mut u8, index: i64) -> *mut u8 {
+pub unsafe extern "C" fn willow_array_reference_owner(arr: *mut u8, index: i64) -> *mut u8 {
     if !check_bounds(arr, index) {
         return std::ptr::null_mut();
     }
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     unsafe { expose_pair_storage(arr) };
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     unsafe { handle_buffer(arr) }
 }
 
 /// Exposing a reference slot or accepting externally owned storage forbids
 /// transferring pair boxes on the next growth. It does not affect scalar arrays.
 unsafe fn expose_pair_storage(arr: *mut u8) {
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     let flags = unsafe { handle_word(arr, H_IS_REF) };
     if is_reference(flags) {
+        // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
         unsafe { set_handle_word(arr, H_IS_REF, flags | PAIR_STORAGE_EXPOSED) };
     }
 }
 
 /// Change allocated logical storage while retaining the stable array handle.
 /// `pair_mask` is -1 for word elements, or the GC mask of a two-word slot.
+///
+/// # Safety
+/// A non-null `arr` must be a current, live Willow array handle with its initialized
+/// backing buffer. Exclude conflicting accesses for the duration of this operation.
+/// A nonnegative pair mask requires pair storage with that mask and live boxes in
+/// the slots to be popped. Use -1 for ordinary elements.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_resize(arr: *mut u8, length: i64, pair_mask: i64) {
+pub unsafe extern "C" fn willow_array_resize(arr: *mut u8, length: i64, pair_mask: i64) {
     if arr.is_null() || length < 0 || !(-1..=1).contains(&pair_mask) {
         raise_with("invalid array storage resize");
         return;
@@ -604,70 +771,107 @@ pub extern "C" fn willow_array_resize(arr: *mut u8, length: i64, pair_mask: i64)
     // `Array.push` lowers here once per element: a stack root keeps that path
     // free of the root registry and of a heap-allocated handle.
     let mut root = arr;
-    crate::gc::willow_push_root(&mut root);
-    resize_rooted(&root, length, pair_mask);
-    crate::gc::willow_pop_roots(1);
+    let slot = &raw mut root;
+    // SAFETY: The slot storage stays live and stationary through the matching pop, including
+    // during collection.
+    unsafe { crate::gc::willow_push_root(slot) };
+    // SAFETY: This initialized slot stays registered and live until the pop below.
+    unsafe { resize_rooted(slot, length, pair_mask) };
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { crate::gc::willow_pop_roots(1) };
 }
 
-/// `root` is a registered slot that a collection may rewrite, so it is read
-/// again after every call that can reach a GC point.
-fn resize_rooted(root: &*mut u8, length: i64, pair_mask: i64) {
+/// # Safety
+/// `root` must point to a registered, writable slot holding a live array
+/// handle throughout this call. A moving collector can rewrite it at GC points.
+unsafe fn resize_rooted(root: *mut *mut u8, length: i64, pair_mask: i64) {
+    // SAFETY: The slot stays initialized. Each load runs while the mutator
+    // owns the slot and reads the handle left by the most recent collection.
     let arr = || unsafe { std::ptr::read_volatile(root) };
     // Reject impossible requests before incremental growth can allocate or
     // mutate the array. Generated scalar in-capacity resizes stay inline;
     // this check belongs only to their runtime fallback.
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     if buffer_bytes(length, unsafe { handle_word(arr(), H_IS_REF) }).is_none() {
         raise_with(&format!("array capacity too large: {length}"));
         return;
     }
-    while willow_array_len(arr()) < length {
+    // SAFETY: Each call reads the current handle from the registered root slot.
+    let current_len = || unsafe { willow_array_len(arr()) };
+    while current_len() < length {
         let value = if pair_mask < 0 {
             0
         } else {
-            let pair = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, pair_mask as u64);
+            // SAFETY: The constructor selects the matching payload layout and initializes its
+            // fields before exposing it or reaching a GC point.
+            let pair =
+                unsafe { willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, pair_mask as u64) };
             if pair.is_null() {
                 return;
             }
             pair as i64
         };
-        let previous = willow_array_len(arr());
+        let previous = current_len();
         array_push(arr(), value, pair_mask >= 0, true);
-        if willow_array_len(arr()) == previous {
+        if current_len() == previous {
             return;
         }
     }
-    while willow_array_len(arr()) > length {
+    while current_len() > length {
         if pair_mask < 0 {
-            willow_array_pop(arr());
+            // SAFETY: arr() reloads the registered handle after any collection. The resize
+            // caller supplies the matching element representation.
+            unsafe { willow_array_pop(arr()) };
         } else {
             let mut words = [0_i64; 2];
-            willow_array_pop_scalar_pair_into(arr(), words.as_mut_ptr());
+            // SAFETY: The root supplies the current pair array; words is a disjoint two-i64
+            // stack array.
+            unsafe { willow_array_pop_scalar_pair_into(arr(), words.as_mut_ptr()) };
         }
     }
 }
 
 /// Append `value`, growing the buffer (doubling, min 4) when full.
+///
+/// # Safety
+/// A non-null `arr` must be a current, live Willow array handle with its initialized
+/// backing buffer. Exclude conflicting accesses for the duration of this operation.
+/// For reference elements, `value` must be null or a current GC payload of the element type.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
+pub unsafe extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
     array_push(arr, value, false, false);
 }
 
 /// Pair boxes are mutable element storage, not shared referents. A captured
 /// element reference belongs to the old buffer, so growth copies each pair's
 /// bits into independent storage in the new buffer.
+///
+/// # Safety
+/// A non-null `arr` must be a current, live Willow array handle with its initialized
+/// backing buffer. Exclude conflicting accesses for the duration of this operation.
+/// The reference buffer must store GC pair boxes with two aligned, initialized words
+/// and the element type's tracing layout. The incoming word must point to such a box.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_push_scalar_pairs(arr: *mut u8, value: i64) {
+pub unsafe extern "C" fn willow_array_push_scalar_pairs(arr: *mut u8, value: i64) {
     array_push(arr, value, true, false);
 }
 
 /// Compiler-only ownership transfer: `value` is a freshly boxed inline pair
 /// with no storage alias outside this call. Captured element references still
 /// force independent copies on growth; the ordinary public entry remains conservative.
+///
+/// # Safety
+/// A non-null `arr` must be a current, live Willow array handle with its initialized
+/// backing buffer. Exclude conflicting accesses for the duration of this operation.
+/// The reference buffer must store GC pair boxes with two aligned, initialized words
+/// and the element type's tracing layout. The incoming word must transfer a freshly allocated
+/// box of that layout with no other storage aliases.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_push_owned_pair(arr: *mut u8, value: i64) {
+pub unsafe extern "C" fn willow_array_push_owned_pair(arr: *mut u8, value: i64) {
     array_push(arr, value, true, true);
 }
 
@@ -700,10 +904,13 @@ fn grow_rooted(
         for index in 0..len {
             // Reload through the rooted handle on every iteration: cloning
             // can move both buffers and all still-live boxes.
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             let source = unsafe { *buf_slot(handle_buffer(arr), index) };
             let pair = if source == 0 {
                 std::ptr::null_mut()
             } else {
+                // SAFETY: The managed pair reserves two words at the GC allocator's word
+                // alignment.
                 let pair = unsafe { copy_scalar_pair(source as *const i64) };
                 if pair.is_null() {
                     return None;
@@ -712,6 +919,8 @@ fn grow_rooted(
             };
             arr = arr_root.load();
             new_buf = buffer_root.load();
+            // SAFETY: The rooted handle owns the source buffer. The destination has capacity for
+            // the live elements and the appended slot.
             unsafe {
                 store_buffer_slot(new_buf, index, pair as i64, 1);
                 // Keep each initialized pair visible to GC during the next
@@ -731,20 +940,24 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
         raise_with("cannot push to a null array");
         return;
     }
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     let len = unsafe { handle_word(arr, H_LEN) };
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     let cap = unsafe { handle_word(arr, H_CAP) };
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     let flags = unsafe { handle_word(arr, H_IS_REF) };
     let is_ref = is_reference(flags);
 
     if len == cap {
         let clone_pairs =
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             copy_pairs && unsafe { handle_word(arr, H_IS_REF) } & PAIR_STORAGE_EXPOSED != 0;
         let new_cap = if cap == 0 { 4 } else { cap.saturating_mul(2) };
         // A buffer that fits the TLAB is bump-allocated young without a GC
-        // point, so `arr` and `value` stay valid and need no roots. Pair
-        // arrays allocate per element and keep the rooted path.
+        // point, so `arr` and `value` stay valid and need no roots. Cloning
+        // exposed pairs can allocate per element and requires the rooted path.
         let young = (!clone_pairs)
-            .then(|| young_buffer_layout(new_cap, flags))
+            .then(|| crate::gc::array_buffer_layout(new_cap, flags))
             .flatten()
             .and_then(|layout| crate::gc::try_alloc_young([layout]));
         let new_buf = match young {
@@ -759,6 +972,8 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
                 buffer
             }
         };
+        // SAFETY: The handle owns the old buffer and is current after either allocation path.
+        // The new buffer has the same storage flags and room for the old elements plus one.
         unsafe {
             let old_buf = handle_buffer(arr);
             if is_ref && !clone_pairs {
@@ -774,10 +989,10 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
                     crate::gc::store_gc_reference(buf_slot(new_buf, i).cast(), value);
                     let card = i as usize / crate::gc::ARRAY_CARD_SLOTS;
                     if young_card != Some(card) && !value.is_null() {
-                        let header = value
-                            .sub(crate::gc::GC_HEADER_SIZE)
-                            .cast::<crate::gc::GcHeader>();
-                        if (*header).generation == willow_abi::gc_header::GENERATION_YOUNG {
+                        // The loaded edge points to a live object; this copy cannot safepoint.
+                        if crate::gc::GcHeader::live_generation(value)
+                            == willow_abi::gc_header::GENERATION_YOUNG
+                        {
                             young_card = Some(card);
                             write_barrier_array_slot(
                                 new_buf,
@@ -789,11 +1004,11 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
                     }
                 }
             } else if !is_ref && len != 0 {
-                // Separate live allocations; copy only initialized scalar slots.
-                // Empty arrays may have a null old buffer.
+                // Both buffers have a first element here. Copy the initialized scalar bytes
+                // between distinct allocations, with no safepoint before the copy finishes.
                 std::ptr::copy_nonoverlapping(
-                    buf_slot(old_buf, 0).cast::<u8>(),
-                    buf_slot(new_buf, 0).cast::<u8>(),
+                    element_slot(old_buf, 0, flags),
+                    element_slot(new_buf, 0, flags),
                     len as usize * element_width(flags),
                 );
             }
@@ -811,6 +1026,9 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
             set_handle_word(arr, H_IS_REF, flags & !PAIR_STORAGE_EXPOSED);
         }
     }
+    // SAFETY: Spare capacity and successful young growth reach no safepoint.
+    // grow_rooted reloads the handle and any reference value after its last allocation.
+    // The current buffer has room at len, and the barriers and stores below cannot safepoint.
     unsafe {
         if !owned_pair {
             expose_pair_storage(arr);
@@ -822,8 +1040,11 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
             0
         };
         if existing != 0 {
-            // A popped pair retains its buffer slot identity. Updating the
-            // words also updates any outstanding element reference.
+            // Pair pushes supply a GC-aligned box with two initialized words
+            // (resize supplies a zeroed two-word box). Pair pop clears both words
+            // but keeps the box in the buffer's traced prefix. Thus the nonzero
+            // slot still owns live, aligned storage of the same pair layout.
+            // Reusing it preserves outstanding element references.
             let source = value as *const i64;
             let target = existing as *mut i64;
             let mask = pair_ref_mask(target);
@@ -852,19 +1073,26 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
 /// traced prefix for its referent to be kept and relocated. Tracing costs
 /// O(high-water) <= capacity, and a value stored through such a reference is
 /// retained until the slot is overwritten or the buffer dies.
+///
+/// # Safety
+/// A non-null `arr` must be a current, live Willow array handle with its initialized
+/// backing buffer. Exclude conflicting accesses for the duration of this operation.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_pop(arr: *mut u8) -> i64 {
+pub unsafe extern "C" fn willow_array_pop(arr: *mut u8) -> i64 {
     if arr.is_null() {
         raise_with("cannot pop from a null array");
         return 0;
     }
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     let len = unsafe { handle_word(arr, H_LEN) };
     if len == 0 {
         raise_with("cannot pop from an empty array");
         return 0;
     }
     let last = len - 1;
+    // SAFETY: The checked positive length selects an initialized last slot in the handle's live
+    // buffer.
     unsafe {
         let buffer = handle_buffer(arr);
         let flags = handle_word(arr, H_IS_REF);
@@ -879,10 +1107,23 @@ pub extern "C" fn willow_array_pop(arr: *mut u8) -> i64 {
 /// mutable element storage. The box stays in its buffer slot and remains traced
 /// until that buffer dies, so references captured before later arguments (or
 /// already held by a callee) survive removal and observe a subsequent push.
-/// `out` must be aligned writable storage for two i64 words during this call.
+///
+/// # Safety
+/// A non-null `arr` must be a current, live Willow array handle with its initialized
+/// backing buffer. Exclude conflicting accesses for the duration of this operation.
+/// The reference buffer must store GC pair boxes with two aligned, initialized words
+/// and the element type's tracing layout. A populated last slot must contain a non-null box.
+/// Even for an empty or null array, `out` must exclusively address two consecutive,
+/// aligned writable i64 words disjoint from the array and its elements.
+///
+/// ```compile_fail,E0133
+/// let mut words = [0_i64; 2];
+/// willow_runtime::array::willow_array_pop_scalar_pair_into(std::ptr::null_mut(), words.as_mut_ptr());
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_pop_scalar_pair_into(arr: *mut u8, out: *mut i64) {
+pub unsafe extern "C" fn willow_array_pop_scalar_pair_into(arr: *mut u8, out: *mut i64) {
+    // SAFETY: The caller lends two consecutive writable i64 words even on the error path.
     unsafe {
         out.write(0);
         out.add(1).write(0);
@@ -891,11 +1132,14 @@ pub extern "C" fn willow_array_pop_scalar_pair_into(arr: *mut u8, out: *mut i64)
         raise_with("cannot pop from a null array");
         return;
     }
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     let len = unsafe { handle_word(arr, H_LEN) };
     if len == 0 {
         raise_with("cannot pop from an empty array");
         return;
     }
+    // SAFETY: The last slot owns a live two-word GC pair of the declared layout. Both
+    // initialized words can be copied to the disjoint output before the box is cleared.
     unsafe {
         let pair = *buf_slot(handle_buffer(arr), len - 1) as *mut i64;
         out.write(pair.read());
@@ -911,6 +1155,7 @@ fn check_bounds(arr: *mut u8, index: i64) -> bool {
         raise_with("cannot index a null array");
         return false;
     }
+    // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     let len = unsafe { handle_word(arr, H_LEN) };
     if index < 0 || index >= len {
         raise_with(&format!(
@@ -927,7 +1172,9 @@ fn raise_with(message: &str) {
     crate::panic_context::raise_language_message(message);
 }
 
-pub(crate) fn element_word_to_string(word: i64, kind: i64) -> String {
+/// # Safety
+/// For the string kind, a nonzero word must denote a current immutable WillowString.
+pub(crate) unsafe fn element_word_to_string(word: i64, kind: i64) -> String {
     use willow_abi::collection_element as element;
     match kind {
         element::I8 => (word as i8).to_string(),
@@ -945,6 +1192,7 @@ pub(crate) fn element_word_to_string(word: i64, kind: i64) -> String {
         element::F64 => crate::math::format_f64_shortest(f64::from_bits(word as u64)),
         element::BOOL => if word != 0 { "true" } else { "false" }.to_string(),
         element::STRING => {
+            // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
             let s = unsafe { crate::string::willow_string_as_str(word as *const u8) };
             format!("{s:?}")
         }
@@ -955,21 +1203,33 @@ pub(crate) fn element_word_to_string(word: i64, kind: i64) -> String {
 /// Debug display of a whole array: `[1, 2, 3]` (strings quoted, f64 shortest
 /// round-trip). `elem_kind` uses the shared `collection_element` tags.
 /// Returns a newly allocated WillowString.
+///
+/// # Safety
+/// A non-null `arr` must be a current, live Willow array handle with its initialized
+/// backing buffer. Exclude conflicting accesses for the duration of this operation.
+/// `elem_kind` must match the stored words. String elements must be null or live WillowStrings.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_to_string(arr: *mut u8, elem_kind: i64) -> *mut u8 {
+pub unsafe extern "C" fn willow_array_to_string(arr: *mut u8, elem_kind: i64) -> *mut u8 {
     if arr.is_null() {
         raise_with("cannot convert a null array to String");
         return std::ptr::null_mut();
     }
-    let len = willow_array_len(arr);
+    // SAFETY: The caller supplies a live array with this element kind.
+    let len = unsafe { willow_array_len(arr) };
     let mut out = String::from("[");
     for index in 0..len {
         if index > 0 {
             out.push_str(", ");
         }
-        let word = willow_array_get(arr, index);
-        out.push_str(&element_word_to_string(word, elem_kind));
+        // SAFETY: No GC point intervenes while formatting. The word read at this
+        // index has the declared kind, including a live or null string pointer.
+        unsafe {
+            out.push_str(&element_word_to_string(
+                willow_array_get(arr, index),
+                elem_kind,
+            ))
+        };
     }
     out.push(']');
     crate::string::willow_string_from_str(&out)
@@ -991,7 +1251,9 @@ mod tests {
     fn array_width_collection_display_and_snapshot_layout() {
         use willow_abi::collection_element as element;
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for (kind, value, width, expected) in [
             (element::I8, 128, 1, "-128"),
             (element::I16, 32768, 2, "-32768"),
@@ -1009,11 +1271,19 @@ mod tests {
             let flags = element::storage_flags(kind, false);
             assert_eq!(element_width(flags), width);
             assert!(!is_reference(flags));
-            assert_eq!(element_word_to_string(value, kind), expected);
-            let array = willow_array_new(1, flags);
-            willow_array_set(array, 0, value);
-            let text = willow_array_to_string(array, kind);
+            // SAFETY: The fixture supplies scalar kind tags for these numeric words.
+            assert_eq!(unsafe { element_word_to_string(value, kind) }, expected);
+            // SAFETY: The width flags here describe untraced scalar storage.
+            let array = unsafe { willow_array_new(1, flags) };
+            // SAFETY: The fixture retains the array and stores a word matching its element
+            // layout.
+            unsafe { willow_array_set(array, 0, value) };
+            // SAFETY: The array was just populated using the same element kind and storage
+            // flags.
+            let text = unsafe { willow_array_to_string(array, kind) };
             assert_eq!(
+                // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this
+                // borrow.
                 unsafe { willow_string_as_str(text) },
                 format!("[{expected}]")
             );
@@ -1026,7 +1296,8 @@ mod tests {
         }
         let text = willow_string_from_str("quoted");
         assert_eq!(
-            element_word_to_string(text as i64, element::STRING),
+            // SAFETY: text is the string just allocated above.
+            unsafe { element_word_to_string(text as i64, element::STRING) },
             "\"quoted\""
         );
     }
@@ -1034,7 +1305,9 @@ mod tests {
     #[test]
     fn array_width_storage_operations_and_captured_owner() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for width in [1, 2, 4, 8] {
             let flags = willow_abi::array_layout::storage_flags(width, false);
             let mask = if width == 8 {
@@ -1042,62 +1315,110 @@ mod tests {
             } else {
                 (1_i64 << (width * 8)) - 1
             };
-            let mut array = willow_array_new(3, flags);
-            willow_push_root(&mut array);
+            // SAFETY: The width flags here describe untraced scalar storage.
+            let mut array = unsafe { willow_array_new(3, flags) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut array) };
             for (index, value) in [-1, i64::MIN, 42].into_iter().enumerate() {
-                willow_array_set(array, index as i64, value);
-                assert_eq!(willow_array_get(array, index as i64), value & mask);
+                // SAFETY: The fixture retains the array and stores a word matching its
+                // element layout.
+                unsafe { willow_array_set(array, index as i64, value) };
+                assert_eq!(
+                    // SAFETY: The fixture retains the array allocated for these accesses.
+                    unsafe { willow_array_get(array, index as i64) },
+                    value & mask
+                );
             }
-            let first = willow_array_element_addr(array, 0);
-            let second = willow_array_element_addr(array, 1);
+            // SAFETY: The index selects initialized storage in the current array; the
+            // returned address is used while its buffer is live.
+            let first = unsafe { willow_array_element_addr(array, 0) };
+            // SAFETY: The index selects initialized storage in the current array; the
+            // returned address is used while its buffer is live.
+            let second = unsafe { willow_array_element_addr(array, 1) };
+            // SAFETY: Both pointers denote slots in the same allocated buffer, so their byte
+            // distance is defined.
             assert_eq!(unsafe { second.byte_offset_from(first) }, width as isize);
-            let mut owner = willow_array_reference_owner(array, 2);
-            willow_push_root(&mut owner);
-            willow_array_push(array, -1);
+            // SAFETY: The index selects initialized storage in the current array; the
+            // returned address is used while its buffer is live.
+            let mut owner = unsafe { willow_array_reference_owner(array, 2) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut owner) };
+            // SAFETY: The fixture retains the array and stores a word matching its element
+            // layout.
+            unsafe { willow_array_push(array, -1) };
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             assert_ne!(unsafe { handle_buffer(array) }, owner);
+            // SAFETY: The GC word-aligns this live buffer. The index and element width select
+            // storage within its capacity.
             assert_eq!(unsafe { load_buffer_slot(owner, 2, flags) }, 42);
-            assert_eq!(willow_array_pop(array), mask);
-            assert_eq!(willow_array_len(array), 3);
-            willow_array_resize(array, 33, -1);
-            assert_eq!(willow_array_get(array, 2), 42);
+            // SAFETY: The fixture retains the array allocated for these accesses. The live
+            // array has the storage layout selected by the resize mask.
+            unsafe {
+                assert_eq!(willow_array_pop(array), mask);
+                assert_eq!(willow_array_len(array), 3);
+                willow_array_resize(array, 33, -1);
+                assert_eq!(willow_array_get(array, 2), 42);
+            }
             for index in 3..33 {
-                assert_eq!(willow_array_get(array, index), 0);
+                // SAFETY: The fixture retains the array allocated for these accesses.
+                assert_eq!(unsafe { willow_array_get(array, index) }, 0);
             }
-            willow_array_set(array, 32, -1);
-            let mut copy = willow_array_copy(array);
-            willow_push_root(&mut copy);
-            willow_array_set(array, 32, 7);
+            // SAFETY: The fixture retains the array and stores a word matching its element
+            // layout.
+            unsafe { willow_array_set(array, 32, -1) };
+            // SAFETY: The fixture retains the array allocated for these accesses.
+            let mut copy = unsafe { willow_array_copy(array) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut copy) };
+            // SAFETY: The fixture retains the array and stores a word matching its element
+            // layout.
+            unsafe { willow_array_set(array, 32, 7) };
             willow_gc_collect();
-            assert_eq!(willow_array_get(copy, 32), mask);
-            assert_eq!(willow_array_get(array, 32), 7);
-            assert_eq!(unsafe { handle_word(copy, H_IS_REF) }, flags);
-            assert_eq!(unsafe { load_buffer_slot(owner, 2, flags) }, 42);
-            willow_array_resize(array, 0, -1);
-            willow_array_resize(array, 33, -1);
-            for index in 0..33 {
-                assert_eq!(willow_array_get(array, index), 0);
+            // SAFETY: The fixture retains the array allocated for these accesses.
+            unsafe {
+                assert_eq!(willow_array_get(copy, 32), mask);
+                assert_eq!(willow_array_get(array, 32), 7);
             }
-            willow_pop_roots(3);
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
+            assert_eq!(unsafe { handle_word(copy, H_IS_REF) }, flags);
+            // SAFETY: The GC word-aligns this live buffer. The index and element width select
+            // storage within its capacity.
+            assert_eq!(unsafe { load_buffer_slot(owner, 2, flags) }, 42);
+            // SAFETY: The live array has the storage layout selected by the resize mask.
+            unsafe {
+                willow_array_resize(array, 0, -1);
+                willow_array_resize(array, 33, -1);
+            }
+            for index in 0..33 {
+                // SAFETY: The fixture retains the array allocated for these accesses.
+                assert_eq!(unsafe { willow_array_get(array, index) }, 0);
+            }
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(3) };
         }
     }
 
     #[test]
     fn array_width_allocation_bytes_and_alignment() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for width in [1, 2, 4, 8] {
             let flags = willow_abi::array_layout::storage_flags(width, false);
             for length in [0, 1, 3, 1000, 100_000] {
                 let logical = 8 + length * i64::from(width);
                 assert_eq!(buffer_bytes(length, flags), Some(logical));
-                let array = willow_array_new_literal(length, flags);
+                // SAFETY: The width flags here describe untraced scalar storage.
+                let array = unsafe { willow_array_new_literal(length, flags) };
+                // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
                 unsafe {
                     let buffer = handle_buffer(array);
-                    let header = buffer
-                        .sub(crate::gc::GC_HEADER_SIZE)
-                        .cast::<crate::gc::GcHeader>();
-                    let descriptor =
-                        &*((*header).descriptor as *const willow_abi::GcLayoutDescriptor);
+                    let descriptor = crate::gc::GcHeader::live_descriptor(buffer);
                     let expected = (crate::gc::GC_HEADER_SIZE + logical as usize)
                         .next_multiple_of(std::mem::align_of::<crate::gc::GcHeader>());
                     assert_eq!(descriptor.size, expected as u64);
@@ -1117,12 +1438,17 @@ mod tests {
     #[test]
     fn array_width_scalar_bytes_survive_collections_and_growth() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for width in [1, 2, 4] {
             let flags = willow_abi::array_layout::storage_flags(width, false);
             let pointer = willow_string_from_str("untraced scalar bits") as usize;
-            let mut array = willow_array_new(0, flags);
-            willow_push_root(&mut array);
+            // SAFETY: The width flags here describe untraced scalar storage.
+            let mut array = unsafe { willow_array_new(0, flags) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut array) };
             let depth = crate::gc::willow_root_depth();
             let mask = (1_u64 << (width * 8)) - 1;
             let values: Vec<_> = (0..32)
@@ -1130,17 +1456,23 @@ mod tests {
                 .collect();
             crate::gc::set_gc_stress_for_test(Some("alloc"));
             for &value in &values {
-                willow_array_push(array, value);
+                // SAFETY: The fixture retains the array and stores a word matching its
+                // element layout.
+                unsafe { willow_array_push(array, value) };
             }
             crate::gc::set_gc_stress_for_test(None);
             crate::gc::willow_gc_minor_collect();
             willow_gc_collect();
             assert_eq!(crate::gc::willow_root_depth(), depth);
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             assert_eq!(unsafe { handle_word(array, H_IS_REF) }, flags);
             for (index, &value) in values.iter().enumerate() {
-                assert_eq!(willow_array_get(array, index as i64), value);
+                // SAFETY: The fixture retains the array allocated for these accesses.
+                assert_eq!(unsafe { willow_array_get(array, index as i64) }, value);
             }
-            willow_pop_roots(1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(1) };
         }
     }
 
@@ -1148,14 +1480,17 @@ mod tests {
     fn array_literal_invalid_lengths_and_exhaustion_never_return() {
         const KEY: &str = "WILLOW_TEST_LITERAL_FAILURE";
         if let Ok(case) = std::env::var(KEY) {
-            willow_gc_init();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { willow_gc_init() };
             let len = match case.as_str() {
                 "negative" => -1,
                 "overflow" => i64::MAX,
                 "exhaustion" => 1000,
                 _ => unreachable!(),
             };
-            willow_array_new_literal(len, 0);
+            // SAFETY: Flag 0 selects untraced word storage.
+            unsafe { willow_array_new_literal(len, 0) };
             eprintln!("LITERAL_FAILURE_RETURNED");
             return;
         }
@@ -1191,15 +1526,22 @@ mod tests {
     #[test]
     fn push_growth_copies_stay_linear_in_pushes() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for elem_is_ref in [0, 1] {
             for count in [1_i64, 5, 64, 1000, 4096, 100_000] {
-                let mut array = willow_array_new(0, elem_is_ref);
-                willow_push_root(&mut array);
+                // SAFETY: The fixture selects only word-sized scalar or reference storage.
+                let mut array = unsafe { willow_array_new(0, elem_is_ref) };
+                // SAFETY: The initialized slot stays at this address until its registration
+                // is popped; collection may rewrite it there.
+                unsafe { willow_push_root(&raw mut array) };
                 let mut copied = 0;
                 let mut reallocations = 0;
                 for i in 0..count {
                     let (len, cap) =
+                        // SAFETY: The live handle owns its buffer and the ABI fixes these word
+                        // offsets.
                         unsafe { (handle_word(array, H_LEN), handle_word(array, H_CAP)) };
                     assert_eq!(len, i);
                     if len == cap {
@@ -1207,12 +1549,17 @@ mod tests {
                         reallocations += 1;
                     }
                     let value = if elem_is_ref == 0 { i } else { 0 };
-                    willow_array_resize(array, i + 1, -1);
+                    // SAFETY: The live array has the storage layout selected by the resize
+                    // mask.
+                    unsafe { willow_array_resize(array, i + 1, -1) };
                     if elem_is_ref == 0 {
-                        willow_array_set(array, i, value);
+                        // SAFETY: The fixture retains the array and stores a word matching
+                        // its element layout.
+                        unsafe { willow_array_set(array, i, value) };
                     }
                 }
-                assert_eq!(willow_array_len(array), count);
+                // SAFETY: The fixture retains the array allocated for these accesses.
+                assert_eq!(unsafe { willow_array_len(array) }, count);
                 assert!(copied < 2 * count, "count={count} copied={copied}");
                 // Geometric growth: one reallocation per doubling.
                 assert!(
@@ -1222,7 +1569,9 @@ mod tests {
                 eprintln!(
                     "array push elem_is_ref={elem_is_ref} count={count} copied={copied} reallocations={reallocations}"
                 );
-                willow_pop_roots(1);
+                // SAFETY: The removed shadow-stack entries belong to this operation and their
+                // slot storage is still live.
+                unsafe { willow_pop_roots(1) };
             }
         }
     }
@@ -1230,9 +1579,15 @@ mod tests {
     #[test]
     fn array_shared_layout_matches_allocated_payload() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let array = willow_array_new(3, 0);
-        willow_array_push(array, 42);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Flag 0 selects untraced word storage.
+        let array = unsafe { willow_array_new(3, 0) };
+        // SAFETY: The fixture retains the array and stores a word matching its element
+        // layout.
+        unsafe { willow_array_push(array, 42) };
+        // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
         unsafe {
             assert_eq!(WORD_BYTES as usize, std::mem::size_of::<i64>());
             assert_eq!(handle_word(array, H_LEN), 4);
@@ -1250,6 +1605,7 @@ mod tests {
                 .enumerate()
             {
                 let offset = SharedLayout::ArrayHandle.field_offset(field, 8).unwrap();
+                // SAFETY: The ABI offsets are word multiples in the GC word-aligned array handle.
                 assert_eq!(*array.add(offset as usize).cast::<i64>(), value);
             }
             assert_eq!(
@@ -1262,139 +1618,218 @@ mod tests {
     #[test]
     fn array_unit_01_new_sets_length() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let arr = willow_array_new(3, 0);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Flag 0 selects untraced word storage.
+        let arr = unsafe { willow_array_new(3, 0) };
         assert!(!arr.is_null());
-        assert_eq!(willow_array_len(arr), 3);
+        // SAFETY: The fixture retains the array allocated for these accesses.
+        assert_eq!(unsafe { willow_array_len(arr) }, 3);
     }
 
     #[test]
     fn array_unit_02_zero_length_array() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let arr = willow_array_new(0, 0);
-        assert_eq!(willow_array_len(arr), 0);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: The constructor selects scalar word storage. This fixture uses the resulting
+        // handle before any collection.
+        unsafe {
+            let arr = willow_array_new(0, 0);
+            assert_eq!(willow_array_len(arr), 0);
+        }
     }
 
     #[test]
     fn array_unit_03_scalar_get_set_roundtrip() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let arr = willow_array_new(4, 0);
-        willow_array_set(arr, 0, 10);
-        willow_array_set(arr, 1, -20);
-        willow_array_set(arr, 3, 99);
-        assert_eq!(willow_array_get(arr, 0), 10);
-        assert_eq!(willow_array_get(arr, 1), -20);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Flag 0 selects untraced word storage.
+        let arr = unsafe { willow_array_new(4, 0) };
+        // SAFETY: The fixture retains the array and stores a word matching its element layout.
+        // The fixture retains the array allocated for these accesses.
+        unsafe {
+            willow_array_set(arr, 0, 10);
+            willow_array_set(arr, 1, -20);
+            willow_array_set(arr, 3, 99);
+            assert_eq!(willow_array_get(arr, 0), 10);
+            assert_eq!(willow_array_get(arr, 1), -20);
+        }
         // Slot 2 was never written — zero-initialized.
-        assert_eq!(willow_array_get(arr, 2), 0);
-        assert_eq!(willow_array_get(arr, 3), 99);
+        // SAFETY: The fixture retains the array allocated for these accesses.
+        unsafe {
+            assert_eq!(willow_array_get(arr, 2), 0);
+            assert_eq!(willow_array_get(arr, 3), 99);
+        }
     }
 
     #[test]
     fn array_unit_04_reference_elements_roundtrip() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         // Root the array as generated code would (Array is GC-managed): the
         // string allocation below can trigger a collection under GC stress.
-        let mut arr = willow_array_new(2, 1);
-        willow_push_root(&mut arr as *mut *mut u8);
+        // SAFETY: Flag 1 allocates full-width reference slots.
+        let mut arr = unsafe { willow_array_new(2, 1) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut arr) };
         let s = willow_string_from_str("hello");
-        willow_array_set(arr, 0, s as i64);
-        let got = willow_array_get(arr, 0) as *mut u8;
+        // SAFETY: The destination is the live fixture array; the element word matches its
+        // declared storage and tracing layout.
+        unsafe { willow_array_set(arr, 0, s as i64) };
+        // SAFETY: The fixture retains the array allocated for these accesses.
+        let got = unsafe { willow_array_get(arr, 0) } as *mut u8;
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { willow_string_as_str(got) }, "hello");
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
     }
 
     #[test]
     fn array_unit_05_reference_elements_survive_collection_when_rooted() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let mut arr = willow_array_new(1, 1);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Flag 1 allocates full-width reference slots.
+        let mut arr = unsafe { willow_array_new(1, 1) };
         // Root the array slot so the collector can reach it.
-        willow_push_root(&mut arr as *mut *mut u8 as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut arr) };
         let s = willow_string_from_str("kept");
-        willow_array_set(arr, 0, s as i64);
+        // SAFETY: The destination is the live fixture array; the element word matches its
+        // declared storage and tracing layout.
+        unsafe { willow_array_set(arr, 0, s as i64) };
         willow_gc_collect();
-        let got = willow_array_get(arr, 0) as *mut u8;
+        // SAFETY: The fixture retains the array allocated for these accesses.
+        let got = unsafe { willow_array_get(arr, 0) } as *mut u8;
         assert!(
             !got.is_null(),
             "element string must survive GC via array trace"
         );
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { willow_string_as_str(got) }, "kept");
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
     }
 
     #[test]
     fn array_unit_06_large_reference_array_traces_all_elements() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         // More than 64 elements: exercises the trace function, not gc_ref_mask.
         let n = 100i64;
-        let mut arr = willow_array_new(n, 1);
-        willow_push_root(&mut arr as *mut *mut u8 as *mut *mut u8);
+        // SAFETY: Flag 1 allocates full-width reference slots.
+        let mut arr = unsafe { willow_array_new(n, 1) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut arr) };
         for i in 0..n {
             let s = willow_string_from_str(&format!("e{i}"));
-            willow_array_set(arr, i, s as i64);
+            // SAFETY: The destination is the live fixture array; the element word matches its
+            // declared storage and tracing layout.
+            unsafe { willow_array_set(arr, i, s as i64) };
         }
         willow_gc_collect();
         assert_eq!(
+            // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
             unsafe { willow_string_as_str(willow_array_get(arr, 99) as *mut u8) },
             "e99"
         );
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
     }
 
     #[test]
     fn array_unit_07_push_grows_and_reads() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let arr = willow_array_new(0, 0);
-        assert_eq!(willow_array_len(arr), 0);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Flag 0 selects untraced word storage.
+        let arr = unsafe { willow_array_new(0, 0) };
+        // SAFETY: The fixture retains the array allocated for these accesses.
+        assert_eq!(unsafe { willow_array_len(arr) }, 0);
         for i in 0..10 {
-            willow_array_push(arr, i * 100);
+            // SAFETY: The fixture retains the array and stores a word matching its element
+            // layout.
+            unsafe { willow_array_push(arr, i * 100) };
         }
-        assert_eq!(willow_array_len(arr), 10);
-        assert_eq!(willow_array_get(arr, 0), 0);
-        assert_eq!(willow_array_get(arr, 9), 900);
+        // SAFETY: The fixture retains the array allocated for these accesses.
+        unsafe {
+            assert_eq!(willow_array_len(arr), 10);
+            assert_eq!(willow_array_get(arr, 0), 0);
+            assert_eq!(willow_array_get(arr, 9), 900);
+        }
     }
 
     #[test]
     fn array_unit_08_pop_returns_last_and_shrinks() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let arr = willow_array_new(0, 0);
-        willow_array_push(arr, 1);
-        willow_array_push(arr, 2);
-        willow_array_push(arr, 3);
-        assert_eq!(willow_array_pop(arr), 3);
-        assert_eq!(willow_array_pop(arr), 2);
-        assert_eq!(willow_array_len(arr), 1);
-        assert_eq!(willow_array_get(arr, 0), 1);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: The constructor selects scalar word storage. This fixture uses the resulting
+        // handle before any collection.
+        unsafe {
+            let arr = willow_array_new(0, 0);
+            willow_array_push(arr, 1);
+            willow_array_push(arr, 2);
+            willow_array_push(arr, 3);
+            assert_eq!(willow_array_pop(arr), 3);
+            assert_eq!(willow_array_pop(arr), 2);
+            assert_eq!(willow_array_len(arr), 1);
+            assert_eq!(willow_array_get(arr, 0), 1);
+        }
     }
 
     #[test]
     fn array_unit_09_pushed_reference_values_survive_gc_across_growth() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let mut arr = willow_array_new(0, 1);
-        willow_push_root(&mut arr as *mut *mut u8);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Flag 1 allocates full-width reference slots.
+        let mut arr = unsafe { willow_array_new(0, 1) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut arr) };
         // Push past several growth points; each push may reallocate the buffer.
         for i in 0..20 {
             let s = willow_string_from_str(&format!("v{i}"));
-            willow_array_push(arr, s as i64);
+            // SAFETY: The destination is the live fixture array; the element word matches its
+            // declared storage and tracing layout.
+            unsafe { willow_array_push(arr, s as i64) };
         }
         willow_gc_collect();
-        assert_eq!(willow_array_len(arr), 20);
+        // SAFETY: The fixture retains the array allocated for these accesses.
+        assert_eq!(unsafe { willow_array_len(arr) }, 20);
         assert_eq!(
+            // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
             unsafe { willow_string_as_str(willow_array_get(arr, 0) as *mut u8) },
             "v0"
         );
         assert_eq!(
+            // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
             unsafe { willow_string_as_str(willow_array_get(arr, 19) as *mut u8) },
             "v19"
         );
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
     }
 
     // Deterministic slot counts isolate tracing cost from allocation and GC timing.
@@ -1403,27 +1838,43 @@ mod tests {
     #[test]
     fn array_trace_work_is_bounded_by_high_water_after_pop_and_regrowth() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for capacity in [16, 256, 4096] {
-            let mut arr = willow_array_new(capacity, 1);
-            willow_push_root(&mut arr);
+            // SAFETY: Flag 1 allocates full-width reference slots.
+            let mut arr = unsafe { willow_array_new(capacity, 1) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut arr) };
             let value = willow_string_from_str("retained");
             for index in 0..capacity {
-                willow_array_set(arr, index, value as i64);
+                // SAFETY: The destination is the live fixture array; the element word matches
+                // its declared storage and tracing layout.
+                unsafe { willow_array_set(arr, index, value as i64) };
             }
             for _ in 3..capacity {
-                assert_eq!(willow_array_pop(arr), value as i64);
+                // SAFETY: The fixture retains the array allocated for these accesses.
+                assert_eq!(unsafe { willow_array_pop(arr) }, value as i64);
             }
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             let buffer = unsafe { handle_buffer(arr) };
             for length in [3, 0, 1, 8, 16] {
-                while willow_array_len(arr) > length {
-                    willow_array_pop(arr);
+                // SAFETY: The fixture retains the array allocated for these accesses.
+                while unsafe { willow_array_len(arr) } > length {
+                    // SAFETY: The fixture retains the array allocated for these accesses.
+                    unsafe { willow_array_pop(arr) };
                 }
-                while willow_array_len(arr) < length {
-                    willow_array_push(arr, value as i64);
+                // SAFETY: The fixture retains the array allocated for these accesses.
+                while unsafe { willow_array_len(arr) } < length {
+                    // SAFETY: The destination is the live fixture array; the element word
+                    // matches its declared storage and tracing layout.
+                    unsafe { willow_array_push(arr, value as i64) };
                 }
                 let mut slots = Vec::new();
                 let mut children = Vec::new();
+                // SAFETY: The live reference buffer and its initialized length meet the registered
+                // array tracer's contract.
                 unsafe {
                     trace_array_ref(buffer, &mut slots);
                     snapshot_array_ref(buffer, &mut children);
@@ -1438,54 +1889,92 @@ mod tests {
                     children.len()
                 );
                 for (index, slot) in slots.into_iter().enumerate() {
+                    // SAFETY: The GC word-aligns this live buffer. The index and element width
+                    // select storage within its capacity.
                     assert_eq!(slot, unsafe { buf_slot(buffer, index as i64).cast() });
                 }
             }
             willow_gc_collect();
             assert_eq!(
+                // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this
+                // borrow.
                 unsafe { willow_string_as_str(willow_array_get(arr, 0) as *mut u8) },
                 "retained"
             );
-            willow_pop_roots(1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(1) };
         }
     }
 
     #[test]
     fn array_trace_preserves_captured_reference_buffer_after_growth() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let mut arr = willow_array_new(1, 1);
-        willow_push_root(&mut arr);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Flag 1 allocates full-width reference slots.
+        let mut arr = unsafe { willow_array_new(1, 1) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut arr) };
         let value = willow_string_from_str("captured");
-        willow_array_set(arr, 0, value as i64);
-        let mut captured = willow_array_reference_owner(arr, 0);
-        willow_push_root(&mut captured);
-        willow_array_push(arr, value as i64);
+        // SAFETY: The destination is the live fixture array; the element word matches its
+        // declared storage and tracing layout.
+        unsafe { willow_array_set(arr, 0, value as i64) };
+        // SAFETY: The index selects initialized storage in the current array; the returned
+        // address is used while its buffer is live.
+        let mut captured = unsafe { willow_array_reference_owner(arr, 0) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut captured) };
+        // SAFETY: The destination is the live fixture array; the element word matches its
+        // declared storage and tracing layout.
+        unsafe { willow_array_push(arr, value as i64) };
+        // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
         assert_ne!(captured, unsafe { handle_buffer(arr) });
-        willow_array_pop(arr);
-        willow_array_pop(arr);
+        // SAFETY: The fixture retains the array allocated for these accesses.
+        unsafe {
+            willow_array_pop(arr);
+            willow_array_pop(arr);
+        }
         willow_gc_collect();
         let mut children = Vec::new();
+        // SAFETY: The live reference buffer and its initialized length meet the registered array
+        // tracer's contract.
         unsafe { snapshot_array_ref(captured, &mut children) };
         assert_eq!(children.len(), 1);
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { willow_string_as_str(children[0]) }, "captured");
         children.clear();
+        // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
         unsafe { snapshot_array_ref(handle_buffer(arr), &mut children) };
         assert!(children.iter().all(|child| child.is_null()));
-        willow_pop_roots(2);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(2) };
     }
 
     #[test]
     fn array_snapshot_length_publication_during_push_pop() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let mut arr = willow_array_new(256, 1);
-        willow_push_root(&mut arr);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Flag 1 allocates full-width reference slots.
+        let mut arr = unsafe { willow_array_new(256, 1) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut arr) };
         let mut value = willow_string_from_str("published");
-        willow_push_root(&mut value);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut value) };
         for _ in 0..256 {
-            willow_array_pop(arr);
+            // SAFETY: The fixture retains the array allocated for these accesses.
+            unsafe { willow_array_pop(arr) };
         }
+        // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
         let buffer = unsafe { handle_buffer(arr) } as usize;
         let expected = value as usize;
         let start = std::sync::Barrier::new(2);
@@ -1496,6 +1985,8 @@ mod tests {
                 let mut children = Vec::new();
                 for _ in 0..4096 {
                     children.clear();
+                    // SAFETY: The live reference buffer and its initialized length meet the
+                    // registered array tracer's contract.
                     unsafe { snapshot_array_ref(buffer as *mut u8, &mut children) };
                     assert!(children.len() <= 256);
                     assert!(
@@ -1508,17 +1999,23 @@ mod tests {
             start.wait();
             for _ in 0..16 {
                 for _ in 0..256 {
-                    willow_array_push(arr, value as i64);
+                    // SAFETY: The destination is the live fixture array; the element word
+                    // matches its declared storage and tracing layout.
+                    unsafe { willow_array_push(arr, value as i64) };
                 }
                 for _ in 0..256 {
-                    willow_array_pop(arr);
+                    // SAFETY: The fixture retains the array allocated for these accesses.
+                    unsafe { willow_array_pop(arr) };
                 }
             }
             reader.join().unwrap();
         });
         // Pops clear slots but keep the high-water prefix.
+        // SAFETY: The retained GC buffer begins with its aligned atomic length word.
         assert_eq!(unsafe { buffer_len(buffer as *mut u8) }, 256);
-        willow_pop_roots(2);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(2) };
     }
 
     // Regression: pushing scalars while a collection runs during buffer growth
@@ -1527,59 +2024,95 @@ mod tests {
     #[test]
     fn array_unit_10_scalar_push_grow_under_gc_stress() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let mut arr = willow_array_new(0, 0); // scalar (non-reference) array
-        willow_push_root(&mut arr as *mut *mut u8);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Flag 0 selects untraced word storage.
+        let mut arr = unsafe { willow_array_new(0, 0) }; // scalar (non-reference) array
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut arr) };
         // Guarded because the stress override is global to the test binary.
         let collections = crate::gc::willow_gc_major_collections();
         crate::gc::set_gc_stress_for_test(Some("alloc"));
         for i in 0..12 {
-            willow_array_push(arr, i * 7); // crosses several growth points
+            // SAFETY: The fixture retains the array and stores a word matching its element
+            // layout.
+            unsafe { willow_array_push(arr, i * 7) }; // crosses several growth points
         }
         crate::gc::set_gc_stress_for_test(None);
         assert!(crate::gc::willow_gc_major_collections() > collections);
-        assert_eq!(willow_array_len(arr), 12);
-        assert_eq!(willow_array_get(arr, 0), 0);
-        assert_eq!(willow_array_get(arr, 11), 77);
-        willow_pop_roots(1);
+        // SAFETY: The fixture retains the array allocated for these accesses.
+        unsafe {
+            assert_eq!(willow_array_len(arr), 12);
+            assert_eq!(willow_array_get(arr, 0), 0);
+            assert_eq!(willow_array_get(arr, 11), 77);
+        }
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
     }
 
     #[test]
     fn array_copy_and_reference_growth_keep_temporary_roots_under_gc_stress() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let mut arr = willow_array_new(0, 1);
-        willow_push_root(&mut arr);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Flag 1 allocates full-width reference slots.
+        let mut arr = unsafe { willow_array_new(0, 1) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut arr) };
         let depth = crate::gc::willow_root_depth();
         crate::gc::set_gc_stress_for_test(Some("alloc"));
         for i in 0..12 {
             let value = willow_string_from_str(&format!("temporary-{i}"));
-            willow_array_push(arr, value as i64);
+            // SAFETY: The destination is the live fixture array; the element word matches its
+            // declared storage and tracing layout.
+            unsafe { willow_array_push(arr, value as i64) };
             assert_eq!(crate::gc::willow_root_depth(), depth);
         }
         // Leave source liveness to array_copy's own root during its allocations.
-        willow_pop_roots(1);
-        let mut copy = willow_array_copy(arr);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
+        // SAFETY: The fixture retains the array allocated for these accesses.
+        let mut copy = unsafe { willow_array_copy(arr) };
         crate::gc::set_gc_stress_for_test(None);
         assert_eq!(crate::gc::willow_root_depth(), depth - 1);
-        willow_push_root(&mut copy);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut copy) };
         willow_gc_collect();
-        assert_eq!(willow_array_len(copy), 12);
+        // SAFETY: The fixture retains the array allocated for these accesses.
+        assert_eq!(unsafe { willow_array_len(copy) }, 12);
         for i in 0..12 {
             assert_eq!(
+                // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this
+                // borrow.
                 unsafe { willow_string_as_str(willow_array_get(copy, i) as *mut u8) },
                 format!("temporary-{i}")
             );
         }
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
     }
 
     fn interface_pair_for_test(text: &str, vtable: i64) -> *mut u8 {
         let mut object = willow_string_from_str(text);
-        willow_push_root(&mut object);
-        let pair = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 1);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut object) };
+        // SAFETY: The constructor selects the matching payload layout and initializes its
+        // fields before exposing it or reaching a GC point.
+        let pair = unsafe { willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 1) };
+        // SAFETY: The managed pair reserves two words at the GC allocator's word alignment.
         unsafe { store_pair(pair.cast(), object as i64, vtable, 1) };
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
         pair
     }
 
@@ -1587,23 +2120,42 @@ mod tests {
     fn minor_contiguous_range_requires_the_builtin_trace_registration() {
         unsafe fn replacement(_: *mut u8, _: &mut Vec<*mut *mut u8>) {}
         let _guard = isolated_runtime();
-        willow_gc_init();
-        for count in [1, 32, 10_000] {
-            let mut array = willow_array_new(count, 1);
-            willow_push_root(&mut array);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        for count in [0, 1, 32, 10_000] {
+            // SAFETY: Flag 1 allocates full-width reference slots.
+            let mut array = unsafe { willow_array_new(count, 1) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut array) };
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             let buffer = unsafe { handle_buffer(array) };
             let range =
+                // SAFETY: The live reference buffer and its initialized length meet the registered
+                // array tracer's contract.
                 unsafe { minor_reference_range(ARRAY_REF_TYPE_ID, Some(trace_array_ref), buffer) }
                     .unwrap();
-            assert_eq!(range.0, unsafe { buf_slot(buffer, 0).cast() });
+            // SAFETY: Every buffer contains the full header. With zero capacity
+            // its end is one past the allocation and is only compared here.
+            let start = unsafe { buffer.add(BUFFER_HEADER_WORDS * WORD_BYTES as usize) };
+            assert_eq!(range.0, start.cast());
             assert_eq!(range.1, count as usize);
             assert!(
+                // SAFETY: The live reference buffer and its initialized length meet the registered
+                // array tracer's contract.
                 unsafe { minor_reference_range(ARRAY_REF_TYPE_ID, Some(replacement), buffer) }
                     .is_none()
             );
+            // SAFETY: The live reference buffer and its initialized length meet the registered
+            // array tracer's contract.
             assert!(unsafe { minor_reference_range(ARRAY_REF_TYPE_ID, None, buffer) }.is_none());
+            // SAFETY: The live reference buffer and its initialized length meet the registered
+            // array tracer's contract.
             assert!(unsafe { minor_reference_range(0, Some(trace_array_ref), buffer) }.is_none());
-            willow_pop_roots(1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(1) };
         }
     }
 
@@ -1611,117 +2163,185 @@ mod tests {
     fn owned_pair_growth_transfers_only_unexposed_storage() {
         let _guard = isolated_runtime();
         for count in [4i64, 16, 1024] {
-            willow_gc_init();
-            let mut arr = willow_array_new(0, 1);
-            willow_push_root(&mut arr);
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { willow_gc_init() };
+            // SAFETY: Flag 1 allocates full-width reference slots.
+            let mut arr = unsafe { willow_array_new(0, 1) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut arr) };
             for i in 0..count {
                 let pair = interface_pair_for_test("private", i);
-                willow_array_push_owned_pair(arr, pair as i64);
+                // SAFETY: This is a fresh, unaliased two-word box with the reference array’s
+                // declared pair layout.
+                unsafe { willow_array_push_owned_pair(arr, pair as i64) };
             }
             // Private test inspection does not expose storage through the ABI.
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             let first = unsafe { *buf_slot(handle_buffer(arr), 0) };
             let incoming = interface_pair_for_test("new", 99);
             let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
-            willow_array_push_owned_pair(arr, incoming as i64);
+            // SAFETY: This is a fresh, unaliased two-word box with the reference array’s
+            // declared pair layout.
+            unsafe { willow_array_push_owned_pair(arr, incoming as i64) };
             assert_eq!(
                 crate::gc::telemetry_heap_snapshot().0.allocation_count - before,
                 1
             );
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             assert_eq!(unsafe { *buf_slot(handle_buffer(arr), 0) }, first);
             for _ in count + 1..2 * count {
                 let pair = interface_pair_for_test("private", 5);
-                willow_array_push_owned_pair(arr, pair as i64);
+                // SAFETY: This is a fresh, unaliased two-word box with the reference array’s
+                // declared pair layout.
+                unsafe { willow_array_push_owned_pair(arr, pair as i64) };
             }
-            let mut captured = willow_array_reference_owner(arr, 0);
-            willow_push_root(&mut captured);
+            // SAFETY: The index selects initialized storage in the current array; the
+            // returned address is used while its buffer is live.
+            let mut captured = unsafe { willow_array_reference_owner(arr, 0) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut captured) };
             let incoming = interface_pair_for_test("new", 100);
-            willow_array_push_owned_pair(arr, incoming as i64);
+            // SAFETY: This is a fresh, unaliased two-word box with the reference array’s
+            // declared pair layout.
+            unsafe { willow_array_push_owned_pair(arr, incoming as i64) };
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             let fresh = unsafe { *buf_slot(handle_buffer(arr), 0) };
+            // SAFETY: The GC word-aligns this live buffer. The index and element width select
+            // storage within its capacity.
             let old = unsafe { *buf_slot(captured, 0) };
             assert_ne!(fresh, old);
+            // SAFETY: The managed pair reserves two words at the GC allocator's word alignment.
             unsafe { store_pair(old as *mut i64, 0, 777, 1) };
             assert_eq!(
+                // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this
+                // borrow.
                 unsafe { willow_string_as_str(*(fresh as *const *mut u8)) },
                 "private"
             );
             for _ in 2 * count + 1..4 * count {
                 let pair = interface_pair_for_test("private", 5);
-                willow_array_push_owned_pair(arr, pair as i64);
+                // SAFETY: This is a fresh, unaliased two-word box with the reference array’s
+                // declared pair layout.
+                unsafe { willow_array_push_owned_pair(arr, pair as i64) };
             }
             let incoming = interface_pair_for_test("new", 101);
-            willow_array_push_owned_pair(arr, incoming as i64);
+            // SAFETY: This is a fresh, unaliased two-word box with the reference array’s
+            // declared pair layout.
+            unsafe { willow_array_push_owned_pair(arr, incoming as i64) };
             // Capturing the obsolete buffer does not expose a later buffer.
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             assert_eq!(unsafe { *buf_slot(handle_buffer(arr), 0) }, fresh);
             assert_eq!(
+                // SAFETY: The GC word-aligns this live buffer. The index and element width select
+                // storage within its capacity.
                 unsafe { *((*buf_slot(captured, 0) as *const i64).add(1)) },
                 777
             );
             willow_gc_collect();
-            assert_eq!(willow_array_len(arr), 4 * count + 1);
-            willow_pop_roots(2);
+            // SAFETY: The fixture retains the array allocated for these accesses.
+            assert_eq!(unsafe { willow_array_len(arr) }, 4 * count + 1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(2) };
         }
     }
 
     #[test]
     fn interface_pair_copies_use_tlab_and_preserve_moving_references() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _owner = crate::gc::RuntimeTlabOwner::enter();
         let mut source = interface_pair_for_test("retained", 1234);
-        willow_push_root(&mut source);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut source) };
         for count in [1, 100, 10_000] {
-            let mut array = willow_array_new(count, 1);
-            willow_push_root(&mut array);
+            // SAFETY: Flag 1 allocates full-width reference slots.
+            let mut array = unsafe { willow_array_new(count, 1) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut array) };
             for index in 0..count {
+                // SAFETY: The managed pair reserves two words at the GC allocator's word
+                // alignment.
                 let pair = unsafe { copy_scalar_pair(source.cast()) };
                 assert!(!pair.is_null());
                 assert_ne!(pair, source);
                 // Both slow refill and fast copies on a TLAB-owning thread
                 // allocate young. The source object survives any refill GC.
-                let header = unsafe {
-                    &*pair
-                        .sub(crate::gc::GC_HEADER_SIZE)
-                        .cast::<crate::gc::GcHeader>()
-                };
-                assert_eq!(header.generation, willow_abi::gc_header::GENERATION_YOUNG);
-                willow_array_set(array, index, pair as i64);
+                // SAFETY: The managed pair reserves two words at the GC allocator's word
+                // alignment.
+                let generation = unsafe { crate::gc::GcHeader::live_generation(pair) };
+                assert_eq!(generation, willow_abi::gc_header::GENERATION_YOUNG);
+                // SAFETY: The destination is the live fixture array; the element word matches
+                // its declared storage and tracing layout.
+                unsafe { willow_array_set(array, index, pair as i64) };
             }
             crate::gc::minor_collect_internal();
             for index in 0..count {
-                let pair = willow_array_get(array, index) as *mut i64;
+                // SAFETY: The fixture retains the array allocated for these accesses.
+                let pair = unsafe { willow_array_get(array, index) } as *mut i64;
+                // SAFETY: The managed pair reserves two words at the GC allocator's word
+                // alignment.
                 unsafe {
                     assert_eq!(pair_ref_mask(pair), 1);
                     assert_eq!(willow_string_as_str(pair.read() as *mut u8), "retained");
                     assert_eq!(pair.add(1).read(), 1234);
                 }
             }
-            willow_pop_roots(1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(1) };
         }
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
     }
 
     #[test]
     fn interface_pair_copy_and_growth_preserve_tracing_and_independent_storage() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for count in [1, 16, 64] {
-            let mut arr = willow_array_new(count, 1);
-            willow_push_root(&mut arr);
+            // SAFETY: Flag 1 allocates full-width reference slots.
+            let mut arr = unsafe { willow_array_new(count, 1) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut arr) };
             for index in 0..count {
                 let pair = interface_pair_for_test(&format!("object-{index}"), 1234);
-                willow_array_set(arr, index, pair as i64);
+                // SAFETY: The destination is the live fixture array; the element word matches
+                // its declared storage and tracing layout.
+                unsafe { willow_array_set(arr, index, pair as i64) };
             }
             crate::gc::set_gc_stress_for_test(Some("alloc"));
-            let mut copy = willow_array_copy_scalar_pairs(arr);
-            willow_push_root(&mut copy);
+            // SAFETY: The live reference array holds zero or the initialized two-word boxes
+            // allocated by this fixture.
+            let mut copy = unsafe { willow_array_copy_scalar_pairs(arr) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut copy) };
             let incoming = interface_pair_for_test("new", 5678);
-            willow_array_push_scalar_pairs(arr, incoming as i64);
+            // SAFETY: The incoming box and stored boxes have the same initialized two-word
+            // layout in this reference array.
+            unsafe { willow_array_push_scalar_pairs(arr, incoming as i64) };
             crate::gc::set_gc_stress_for_test(None);
             willow_gc_collect();
             for index in 0..count {
-                let source = willow_array_get(arr, index) as *mut i64;
-                let frozen = willow_array_get(copy, index) as *mut i64;
+                // SAFETY: The fixture retains the array allocated for these accesses.
+                let source = unsafe { willow_array_get(arr, index) } as *mut i64;
+                // SAFETY: The fixture retains the array allocated for these accesses.
+                let frozen = unsafe { willow_array_get(copy, index) } as *mut i64;
                 assert_ne!(source, frozen);
+                // SAFETY: The managed pair reserves two words at the GC allocator's word
+                // alignment.
                 unsafe {
                     assert_eq!(pair_ref_mask(source), 1);
                     assert_eq!(pair_ref_mask(frozen), 1);
@@ -1740,35 +2360,54 @@ mod tests {
                 }
             }
             willow_gc_collect();
-            let frozen = willow_array_get(copy, 0) as *mut i64;
+            // SAFETY: The fixture retains the array allocated for these accesses.
+            let frozen = unsafe { willow_array_get(copy, 0) } as *mut i64;
             assert_eq!(
+                // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this
+                // borrow.
                 unsafe { willow_string_as_str(frozen.read() as *mut u8) },
                 "object-0"
             );
-            willow_pop_roots(2);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(2) };
         }
     }
 
     #[test]
     fn interface_pair_pop_reuse_clears_edges_and_preserves_storage() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let mut arr = willow_array_new(1, 1);
-        willow_push_root(&mut arr);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Flag 1 allocates full-width reference slots.
+        let mut arr = unsafe { willow_array_new(1, 1) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut arr) };
         let pair = interface_pair_for_test("first", 1234);
-        willow_array_set(arr, 0, pair as i64);
+        // SAFETY: The destination is the live fixture array; the element word matches its
+        // declared storage and tracing layout.
+        unsafe { willow_array_set(arr, 0, pair as i64) };
         willow_gc_collect();
-        let mut retained = willow_array_get(arr, 0) as *mut u8;
-        willow_push_root(&mut retained);
+        // SAFETY: The fixture retains the array allocated for these accesses.
+        let mut retained = unsafe { willow_array_get(arr, 0) } as *mut u8;
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut retained) };
         let mut out = [0i64; 2];
         let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
-        willow_array_pop_scalar_pair_into(arr, out.as_mut_ptr());
+        // SAFETY: The last element is an initialized two-word pair; out provides two disjoint
+        // writable i64 words.
+        unsafe { willow_array_pop_scalar_pair_into(arr, out.as_mut_ptr()) };
         assert_eq!(
             crate::gc::telemetry_heap_snapshot().0.allocation_count,
             before
         );
         assert_eq!(out[1], 1234);
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { willow_string_as_str(out[0] as *mut u8) }, "first");
+        // SAFETY: The managed pair reserves two words at the GC allocator's word alignment.
         unsafe {
             assert_eq!(pair_ref_mask(retained.cast()), 1);
             assert_eq!(
@@ -1781,49 +2420,73 @@ mod tests {
         }
         let incoming = interface_pair_for_test("replacement", 5678);
         let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
-        willow_array_push_scalar_pairs(arr, incoming as i64);
+        // SAFETY: The incoming box and stored boxes have the same initialized two-word layout
+        // in this reference array.
+        unsafe { willow_array_push_scalar_pairs(arr, incoming as i64) };
         assert_eq!(
             crate::gc::telemetry_heap_snapshot().0.allocation_count,
             before
         );
-        assert_eq!(willow_array_get(arr, 0), retained as i64);
+        // SAFETY: The fixture retains the array allocated for these accesses.
+        assert_eq!(unsafe { willow_array_get(arr, 0) }, retained as i64);
         willow_gc_collect();
+        // SAFETY: The managed pair reserves two words at the GC allocator's word alignment.
         unsafe {
             let words = retained.cast::<i64>();
             assert_eq!(pair_ref_mask(words), 1);
             assert_eq!(willow_string_as_str(words.read() as *mut u8), "replacement");
             assert_eq!(words.add(1).read(), 5678);
         }
-        willow_pop_roots(2);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(2) };
     }
 
     #[test]
     fn scalar_pair_freeze_copies_boxes_and_survives_gc_stress() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        let mut arr = willow_array_new(4, 1);
-        willow_push_root(&mut arr);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Flag 1 allocates full-width reference slots.
+        let mut arr = unsafe { willow_array_new(4, 1) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut arr) };
         let words = [(0, 0), (1, i64::MIN), (0, f64::NAN.to_bits() as i64)];
         for (index, &(tag, payload)) in words.iter().enumerate() {
-            let pair = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0);
+            // SAFETY: The constructor selects the matching payload layout and initializes its
+            // fields before exposing it or reaching a GC point.
+            let pair = unsafe { willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0) };
+            // SAFETY: The managed pair reserves two words at the GC allocator's word alignment.
             unsafe {
                 (pair as *mut i64).write(tag);
                 (pair as *mut i64).add(1).write(payload);
             }
-            willow_array_set(arr, index as i64, pair as i64);
+            // SAFETY: The destination is the live fixture array; the element word matches its
+            // declared storage and tracing layout.
+            unsafe { willow_array_set(arr, index as i64, pair as i64) };
         }
         let depth = crate::gc::willow_root_depth();
         crate::gc::set_gc_stress_for_test(Some("alloc"));
-        let mut copy = willow_array_copy_scalar_pairs(arr);
+        // SAFETY: The live reference array holds zero or the initialized two-word boxes
+        // allocated by this fixture.
+        let mut copy = unsafe { willow_array_copy_scalar_pairs(arr) };
         crate::gc::set_gc_stress_for_test(None);
         assert_eq!(crate::gc::willow_root_depth(), depth);
-        willow_push_root(&mut copy);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut copy) };
         willow_gc_collect();
-        assert_eq!(willow_array_get(copy, 3), 0);
+        // SAFETY: The fixture retains the array allocated for these accesses.
+        assert_eq!(unsafe { willow_array_get(copy, 3) }, 0);
         for (index, &(tag, payload)) in words.iter().enumerate() {
-            let source = willow_array_get(arr, index as i64) as *mut i64;
-            let frozen = willow_array_get(copy, index as i64) as *const i64;
+            // SAFETY: The fixture retains the array allocated for these accesses.
+            let source = unsafe { willow_array_get(arr, index as i64) } as *mut i64;
+            // SAFETY: The fixture retains the array allocated for these accesses.
+            let frozen = unsafe { willow_array_get(copy, index as i64) } as *const i64;
             assert_ne!(source as *const i64, frozen);
+            // SAFETY: The managed pair reserves two words at the GC allocator's word alignment.
             unsafe {
                 source.write(99);
                 source.add(1).write(123);
@@ -1831,32 +2494,53 @@ mod tests {
                 assert_eq!(frozen.add(1).read(), payload);
             }
         }
-        willow_pop_roots(2);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(2) };
     }
 
     #[test]
     fn scalar_pair_growth_copies_each_element_once_and_preserves_old_buffer() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for count in [1, 16, 128] {
-            let mut arr = willow_array_new(count, 1);
-            willow_push_root(&mut arr);
+            // SAFETY: Flag 1 allocates full-width reference slots.
+            let mut arr = unsafe { willow_array_new(count, 1) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut arr) };
             for index in 0..count {
-                let pair = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0);
+                // SAFETY: The constructor selects the matching payload layout and initializes
+                // its fields before exposing it or reaching a GC point.
+                let pair = unsafe { willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0) };
+                // SAFETY: The managed pair reserves two words at the GC allocator's word
+                // alignment.
                 unsafe {
                     pair.cast::<i64>().write(index % 2);
                     pair.cast::<i64>().add(1).write(i64::MIN + index);
                 }
-                willow_array_set(arr, index, pair as i64);
+                // SAFETY: The destination is the live fixture array; the element word matches
+                // its declared storage and tracing layout.
+                unsafe { willow_array_set(arr, index, pair as i64) };
             }
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             let mut old_buffer = unsafe { handle_buffer(arr) };
-            willow_push_root(&mut old_buffer);
-            let pushed = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut old_buffer) };
+            // SAFETY: The constructor selects the matching payload layout and initializes its
+            // fields before exposing it or reaching a GC point.
+            let pushed = unsafe { willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0) };
+            // SAFETY: The managed pair reserves two words at the GC allocator's word alignment.
             unsafe { pushed.cast::<i64>().add(1).write(777) };
             let depth = crate::gc::willow_root_depth();
             let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
             crate::gc::set_gc_stress_for_test(Some("alloc"));
-            willow_array_push_scalar_pairs(arr, pushed as i64);
+            // SAFETY: The incoming box and stored boxes have the same initialized two-word
+            // layout in this reference array.
+            unsafe { willow_array_push_scalar_pairs(arr, pushed as i64) };
             crate::gc::set_gc_stress_for_test(None);
             let allocations = crate::gc::telemetry_heap_snapshot().0.allocation_count - before;
             // One new buffer and exactly one box per live copied element.
@@ -1864,14 +2548,21 @@ mod tests {
             eprintln!("pair-growth count={count} allocations={allocations}");
             assert_eq!(crate::gc::willow_root_depth(), depth);
             willow_gc_collect();
-            assert_eq!(willow_array_len(arr), count + 1);
+            // SAFETY: The fixture retains the array allocated for these accesses.
+            assert_eq!(unsafe { willow_array_len(arr) }, count + 1);
+            // SAFETY: The retained GC buffer begins with its aligned atomic length word.
             assert_eq!(unsafe { buffer_len(old_buffer) }, count);
             let mut unique = std::collections::HashSet::new();
             for index in 0..count {
+                // SAFETY: The GC word-aligns this live buffer. The index and element width select
+                // storage within its capacity.
                 let old_pair = unsafe { *buf_slot(old_buffer, index) } as *mut i64;
-                let new_pair = willow_array_get(arr, index) as *const i64;
+                // SAFETY: The fixture retains the array allocated for these accesses.
+                let new_pair = unsafe { willow_array_get(arr, index) } as *const i64;
                 assert_ne!(old_pair as *const i64, new_pair);
                 assert!(unique.insert(new_pair));
+                // SAFETY: The managed pair reserves two words at the GC allocator's word
+                // alignment.
                 unsafe {
                     assert_eq!(new_pair.read(), index % 2);
                     assert_eq!(new_pair.add(1).read(), i64::MIN + index);
@@ -1881,71 +2572,113 @@ mod tests {
             }
             assert_eq!(unique.len(), count as usize);
             assert_eq!(
+                // SAFETY: The test inserted a two-word GC pair at this index. Its second word is
+                // aligned and initialized.
                 unsafe { (willow_array_get(arr, count) as *const i64).add(1).read() },
                 777
             );
-            willow_pop_roots(2);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(2) };
         }
     }
 
     #[test]
     fn scalar_pair_pop_reuse_preserves_storage_and_tracing() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for count in [1, 16, 128] {
-            let mut arr = willow_array_new(count, 1);
-            willow_push_root(&mut arr);
+            // SAFETY: Flag 1 allocates full-width reference slots.
+            let mut arr = unsafe { willow_array_new(count, 1) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut arr) };
             for index in 0..count {
-                let pair = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0);
+                // SAFETY: The constructor selects the matching payload layout and initializes
+                // its fields before exposing it or reaching a GC point.
+                let pair = unsafe { willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0) };
+                // SAFETY: The managed pair reserves two words at the GC allocator's word
+                // alignment.
                 unsafe {
                     pair.cast::<i64>().write(index % 2);
                     pair.cast::<i64>().add(1).write(i64::MIN + index);
                 }
-                willow_array_set(arr, index, pair as i64);
+                // SAFETY: The destination is the live fixture array; the element word matches
+                // its declared storage and tracing layout.
+                unsafe { willow_array_set(arr, index, pair as i64) };
             }
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             let mut owner = unsafe { handle_buffer(arr) };
-            willow_push_root(&mut owner);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut owner) };
             let depth = crate::gc::willow_root_depth();
             let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
             for index in (0..count).rev() {
                 let mut out = [-1; 2];
-                willow_array_pop_scalar_pair_into(arr, out.as_mut_ptr());
+                // SAFETY: The last element is an initialized two-word pair; out provides two
+                // disjoint writable i64 words.
+                unsafe { willow_array_pop_scalar_pair_into(arr, out.as_mut_ptr()) };
                 assert_eq!(out, [index % 2, i64::MIN + index]);
+                // SAFETY: The GC word-aligns this live buffer. The index and element width select
+                // storage within its capacity.
                 let pair = unsafe { *buf_slot(owner, index) } as *const i64;
                 assert!(!pair.is_null());
+                // SAFETY: The managed pair reserves two words at the GC allocator's word
+                // alignment.
                 assert_eq!(unsafe { [pair.read(), pair.add(1).read()] }, [0, 0]);
             }
             assert_eq!(
                 crate::gc::telemetry_heap_snapshot().0.allocation_count,
                 before
             );
-            assert_eq!(willow_array_len(arr), 0);
+            // SAFETY: The fixture retains the array allocated for these accesses.
+            assert_eq!(unsafe { willow_array_len(arr) }, 0);
+            // SAFETY: The retained GC buffer begins with its aligned atomic length word.
             assert_eq!(unsafe { buffer_len(owner) }, count);
             let mut slots = Vec::new();
+            // SAFETY: The live reference buffer and its initialized length meet the registered
+            // array tracer's contract.
             unsafe { trace_array_ref(owner, &mut slots) };
             assert_eq!(slots.len(), count as usize);
             willow_gc_collect();
             crate::gc::set_gc_stress_for_test(Some("alloc"));
             for index in 0..count {
-                let incoming = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0);
+                // SAFETY: The constructor selects the matching payload layout and initializes
+                // its fields before exposing it or reaching a GC point.
+                let incoming = unsafe { willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0) };
+                // SAFETY: The managed pair reserves two words at the GC allocator's word
+                // alignment.
                 unsafe { incoming.cast::<i64>().add(1).write(index + 99) };
                 // Read the old identity only after allocation, which may move it.
+                // SAFETY: The GC word-aligns this live buffer. The index and element width select
+                // storage within its capacity.
                 let old_pair = unsafe { *buf_slot(owner, index) } as *mut i64;
                 let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
-                willow_array_push_scalar_pairs(arr, incoming as i64);
+                // SAFETY: The incoming box and stored boxes have the same initialized two-
+                // word layout in this reference array.
+                unsafe { willow_array_push_scalar_pairs(arr, incoming as i64) };
                 assert_eq!(
                     crate::gc::telemetry_heap_snapshot().0.allocation_count,
                     before
                 );
-                assert_eq!(willow_array_get(arr, index), old_pair as i64);
+                // SAFETY: The fixture retains the array allocated for these accesses.
+                assert_eq!(unsafe { willow_array_get(arr, index) }, old_pair as i64);
+                // SAFETY: The managed pair reserves two words at the GC allocator's word
+                // alignment.
                 unsafe {
                     assert_eq!(old_pair.add(1).read(), index + 99);
                     old_pair.add(1).write(777);
                 }
                 assert_eq!(
+                    // SAFETY: The test inserted a two-word GC pair at this index. Its second word
+                    // is aligned and initialized.
                     unsafe { (willow_array_get(arr, index) as *const i64).add(1).read() },
                     777
                 );
+                // SAFETY: The retained GC buffer begins with its aligned atomic length word.
                 assert_eq!(unsafe { buffer_len(owner) }, count);
             }
             crate::gc::set_gc_stress_for_test(None);
@@ -1954,7 +2687,9 @@ mod tests {
                 "pair-pop-reuse count={count} retained-slots={} pop-allocations=0 reuse-runtime-allocations=0",
                 slots.len()
             );
-            willow_pop_roots(2);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(2) };
         }
     }
 
@@ -1962,22 +2697,28 @@ mod tests {
     fn scalar_pair_pop_errors_initialize_output_without_losing_roots() {
         use crate::panic_context::*;
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(905))));
         let depth = crate::gc::willow_root_depth();
-        let empty = willow_array_new(0, 1);
+        // SAFETY: Flag 1 allocates full-width reference slots.
+        let empty = unsafe { willow_array_new(0, 1) };
         for (arr, message) in [
             (empty, "cannot pop from an empty array"),
             (std::ptr::null_mut(), "cannot pop from a null array"),
         ] {
-            let mut out = [-1; 2];
-            willow_array_pop_scalar_pair_into(arr, out.as_mut_ptr());
-            assert_eq!(out, [0, 0]);
+            let mut out = [-11, -1, -1, -22];
+            // SAFETY: arr is null or the empty reference array; out provides two aligned, disjoint output
+            // words beginning at index one, including on both error paths.
+            unsafe { willow_array_pop_scalar_pair_into(arr, out[1..3].as_mut_ptr()) };
+            assert_eq!(out, [-11, 0, 0, -22]);
             assert_eq!(crate::gc::willow_root_depth(), depth);
             assert_eq!(willow_panic_depth(), 1);
             willow_panic_enter_defer();
             let info = willow_panic_recover();
             willow_panic_leave_defer();
+            // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
             assert_eq!(unsafe { panic_info_message(info) }, message);
             willow_panic_release_recovered(info);
         }
@@ -1988,16 +2729,20 @@ mod tests {
     fn scalar_pair_freeze_null_preserves_root_depth_and_raises() {
         use crate::panic_context::*;
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(904))));
         let depth = crate::gc::willow_root_depth();
-        assert!(willow_array_copy_scalar_pairs(std::ptr::null_mut()).is_null());
+        // SAFETY: A null array is accepted by this error path.
+        assert!(unsafe { willow_array_copy_scalar_pairs(std::ptr::null_mut()) }.is_null());
         assert_eq!(crate::gc::willow_root_depth(), depth);
         assert_eq!(willow_panic_depth(), 1);
         willow_panic_enter_defer();
         let info = willow_panic_recover();
         willow_panic_leave_defer();
         assert_eq!(
+            // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
             unsafe { panic_info_message(info) },
             "cannot freeze a null array"
         );
@@ -2009,27 +2754,39 @@ mod tests {
     fn array_len_raises_for_null_and_negative_lengths() {
         use crate::panic_context::*;
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(906))));
-        let arr = willow_array_new(2, 0);
-        unsafe { set_handle_word(arr, H_LEN, -3) };
-        for (target, message) in [
-            (
-                std::ptr::null_mut(),
-                "cannot take the length of a null array",
-            ),
-            (arr, "malformed array: negative length -3"),
+        // SAFETY: Flag 0 selects untraced word storage.
+        let arr = crate::gc::GcRootHandle::new(unsafe { willow_array_new(2, 0) });
+        // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
+        unsafe { set_handle_word(arr.load(), H_LEN, -3) };
+        for (null, message) in [
+            (true, "cannot take the length of a null array"),
+            (false, "malformed array: negative length -3"),
         ] {
-            assert_eq!(willow_array_len(target), 0);
+            let target = if null {
+                std::ptr::null_mut()
+            } else {
+                arr.load()
+            };
+            // SAFETY: The operand is null or the allocated handle with an initialized length
+            // word.
+            assert_eq!(unsafe { willow_array_len(target) }, 0);
             assert_eq!(willow_panic_depth(), 1);
             willow_panic_enter_defer();
             let info = willow_panic_recover();
             willow_panic_leave_defer();
+            // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
             assert_eq!(unsafe { panic_info_message(info) }, message);
             willow_panic_release_recovered(info);
         }
-        unsafe { set_handle_word(arr, H_LEN, 2) };
-        assert_eq!(willow_array_len(arr), 2);
+        // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
+        unsafe { set_handle_word(arr.load(), H_LEN, 2) };
+        // SAFETY: The operand is null or the allocated handle with an initialized length
+        // word.
+        assert_eq!(unsafe { willow_array_len(arr.load()) }, 2);
         assert_eq!(willow_panic_depth(), 0);
         replace_current_context(previous);
     }
@@ -2038,16 +2795,20 @@ mod tests {
     fn array_null_push_preserves_error_and_root_depth() {
         use crate::panic_context::*;
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(903))));
         let depth = crate::gc::willow_root_depth();
-        willow_array_push(std::ptr::null_mut(), 42);
+        // SAFETY: A null array is accepted by this error path.
+        unsafe { willow_array_push(std::ptr::null_mut(), 42) };
         assert_eq!(crate::gc::willow_root_depth(), depth);
         assert_eq!(willow_panic_depth(), 1);
         willow_panic_enter_defer();
         let info = willow_panic_recover();
         willow_panic_leave_defer();
         assert_eq!(
+            // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
             unsafe { panic_info_message(info) },
             "cannot push to a null array"
         );
@@ -2061,48 +2822,68 @@ mod tests {
     fn array_allocation_overflow_preserves_state_and_roots() {
         use crate::panic_context::*;
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(902))));
         for (is_ref, nonnull_value) in [(false, false), (true, false), (true, true)] {
-            let mut arr = willow_array_new(1, i64::from(is_ref));
-            willow_push_root(&mut arr);
+            // SAFETY: The fixture selects only word-sized scalar or reference storage.
+            let mut arr = unsafe { willow_array_new(1, i64::from(is_ref)) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut arr) };
             let value = if nonnull_value {
                 willow_string_from_str("rooted") as i64
             } else {
                 0
             };
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             let buffer = unsafe { handle_buffer(arr) };
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             unsafe {
                 set_handle_word(arr, H_LEN, i64::MAX);
                 set_handle_word(arr, H_CAP, i64::MAX);
             }
             let depth = crate::gc::willow_root_depth();
-            willow_array_push(arr, value);
+            // SAFETY: The live handle has an overflowing requested capacity, rejected before
+            // any element access. Its real buffer remains initialized.
+            unsafe { willow_array_push(arr, value) };
             assert_eq!(crate::gc::willow_root_depth(), depth);
             assert_eq!(willow_panic_depth(), 1);
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             assert_eq!(unsafe { handle_buffer(arr) }, buffer);
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             assert_eq!(unsafe { handle_word(arr, H_LEN) }, i64::MAX);
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             assert_eq!(unsafe { handle_word(arr, H_CAP) }, i64::MAX);
             willow_panic_enter_defer();
             let info = willow_panic_recover();
             willow_panic_leave_defer();
+            // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
             assert!(unsafe { panic_info_message(info) }.starts_with("array capacity too large:"));
             willow_panic_release_recovered(info);
 
-            assert!(willow_array_copy(arr).is_null());
+            // SAFETY: The live handle has an overflowing requested capacity, rejected before
+            // any element access. Its real buffer remains initialized.
+            assert!(unsafe { willow_array_copy(arr) }.is_null());
             assert_eq!(crate::gc::willow_root_depth(), depth);
             assert_eq!(willow_panic_depth(), 1);
             willow_panic_enter_defer();
             let info = willow_panic_recover();
             willow_panic_leave_defer();
+            // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
             assert!(unsafe { panic_info_message(info) }.starts_with("array capacity too large:"));
             willow_panic_release_recovered(info);
+            // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
             unsafe {
                 set_handle_word(arr, H_LEN, 1);
                 set_handle_word(arr, H_CAP, 1);
             }
-            assert_eq!(willow_array_get(arr, 0), 0);
-            willow_pop_roots(1);
+            // SAFETY: The fixture retains the array allocated for these accesses.
+            assert_eq!(unsafe { willow_array_get(arr, 0) }, 0);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(1) };
         }
         replace_current_context(previous);
     }

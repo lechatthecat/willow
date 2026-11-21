@@ -124,6 +124,8 @@ pub(crate) mod counting_allocator {
     // re-enter the allocator.
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: The wrapper forwards the allocator contract to System, preserving the
+            // supplied pointer, allocation layout and requested size.
             let ptr = unsafe { System.alloc(layout) };
             if !ptr.is_null() {
                 LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
@@ -135,10 +137,14 @@ pub(crate) mod counting_allocator {
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+            // SAFETY: The wrapper forwards the allocator contract to System, preserving the
+            // supplied pointer, allocation layout and requested size.
             unsafe { System.dealloc(ptr, layout) }
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: The wrapper forwards the allocator contract to System, preserving the
+            // supplied pointer, allocation layout and requested size.
             let ptr = unsafe { System.alloc_zeroed(layout) };
             if !ptr.is_null() {
                 LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
@@ -149,6 +155,8 @@ pub(crate) mod counting_allocator {
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            // SAFETY: The wrapper forwards the allocator contract to System, preserving the
+            // supplied pointer, allocation layout and requested size.
             let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
             if !new_ptr.is_null() {
                 LIVE_BYTES.fetch_add(new_size, Ordering::Relaxed);
@@ -258,15 +266,18 @@ fn task_inspection_does_not_allocate_or_duplicate_payloads() {
                 scheduler.complete(id);
             }
             for &id in ids.iter().step_by(2) {
-                scheduler
-                    .with_task_mut(id, |task| {
+                // SAFETY: The fixture updates task metadata under the shard lock and
+                // preserves the frame, callbacks and root ownership.
+                unsafe {
+                    scheduler.with_task_mut(id, |task| {
                         task.set_name("inspection-worker".repeat(16));
                         for waiter in 0..relationships as u64 {
                             task.register_waiter(10_000 + waiter);
                             task.add_awaiting(20_000 + waiter);
                         }
                     })
-                    .unwrap();
+                }
+                .unwrap();
             }
             let live = scheduler.task_count();
             let mut single_reads = 0;
@@ -465,13 +476,17 @@ fn scaling_05_active_task_footprint_by_workload() {
         let start = std::time::Instant::now();
         for index in 0..tasks {
             let id = scheduler.spawn_parked_placeholder();
-            scheduler.with_task_mut(id, |task| {
-                task.install_channel_ownership(crate::task::ChannelOwnershipToken {
-                    channel: 0x1000 + index,
-                    role: crate::task::ChannelRole::RecvWait,
-                    generation: 1,
-                });
-            });
+            // SAFETY: The fixture updates task metadata under the shard lock and preserves
+            // the frame, callbacks and root ownership.
+            unsafe {
+                scheduler.with_task_mut(id, |task| {
+                    task.install_channel_ownership(crate::task::ChannelOwnershipToken {
+                        channel: 0x1000 + index,
+                        role: crate::task::ChannelRole::RecvWait,
+                        generation: 1,
+                    });
+                })
+            };
         }
         report(
             "active_channel_waiting_tasks",
@@ -486,10 +501,14 @@ fn scaling_05_active_task_footprint_by_workload() {
         let start = std::time::Instant::now();
         for index in 0..tasks {
             let id = scheduler.spawn_parked_placeholder();
-            scheduler.with_task_mut(id, |task| {
-                task.set_name(format!("task_{index}"));
-                task.set_spawn_site(String::from("src/main.wi"), index as u32);
-            });
+            // SAFETY: The fixture updates task metadata under the shard lock and preserves
+            // the frame, callbacks and root ownership.
+            unsafe {
+                scheduler.with_task_mut(id, |task| {
+                    task.set_name(format!("task_{index}"));
+                    task.set_spawn_site(String::from("src/main.wi"), index as u32);
+                })
+            };
         }
         report(
             "active_debug_tagged_tasks",
@@ -576,13 +595,17 @@ fn scaling_07_measured_heap_per_active_task() {
                 let mut scheduler = RuntimeScheduler::with_worker_count(1);
                 for index in 0..tasks {
                     let id = scheduler.spawn_parked_placeholder();
-                    scheduler.with_task_mut(id, |task| {
-                        task.install_channel_ownership(crate::task::ChannelOwnershipToken {
-                            channel: 0x1000 + index,
-                            role: crate::task::ChannelRole::RecvWait,
-                            generation: 1,
-                        });
-                    });
+                    // SAFETY: The fixture updates task metadata under the shard lock and
+                    // preserves the frame, callbacks and root ownership.
+                    unsafe {
+                        scheduler.with_task_mut(id, |task| {
+                            task.install_channel_ownership(crate::task::ChannelOwnershipToken {
+                                channel: 0x1000 + index,
+                                role: crate::task::ChannelRole::RecvWait,
+                                generation: 1,
+                            });
+                        })
+                    };
                 }
                 scheduler
             }),
@@ -595,10 +618,14 @@ fn scaling_07_measured_heap_per_active_task() {
                 let mut scheduler = RuntimeScheduler::with_worker_count(1);
                 for index in 0..tasks {
                     let id = scheduler.spawn_parked_placeholder();
-                    scheduler.with_task_mut(id, |task| {
-                        task.set_name(format!("task_{index}"));
-                        task.set_spawn_site(String::from("src/main.wi"), index as u32);
-                    });
+                    // SAFETY: The fixture updates task metadata under the shard lock and
+                    // preserves the frame, callbacks and root ownership.
+                    unsafe {
+                        scheduler.with_task_mut(id, |task| {
+                            task.set_name(format!("task_{index}"));
+                            task.set_spawn_site(String::from("src/main.wi"), index as u32);
+                        })
+                    };
                 }
                 scheduler
             }),

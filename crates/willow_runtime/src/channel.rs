@@ -156,6 +156,7 @@ use willow_abi::runtime_type_ids::CHANNEL_TYPE_ID;
 /// # Safety
 /// `payload` must be a [`WillowAbiChannel`] allocated by `willow_channel_new`.
 unsafe fn trace_channel(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let channel = unsafe { &*(payload as *const WillowAbiChannel) };
     if !channel.is_ref {
         return;
@@ -187,6 +188,7 @@ unsafe fn trace_channel(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
 }
 
 unsafe fn snapshot_channel(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let channel = unsafe { &*(payload as *const WillowAbiChannel) };
     if channel.is_ref {
         // As in STW tracing, poison must never suppress queued roots. Copy
@@ -199,6 +201,8 @@ unsafe fn snapshot_channel(payload: *mut u8, children: &mut Vec<*mut u8>) {
             state
                 .values
                 .iter()
+                // SAFETY: The channel element ABI supplies the initialized union representation
+                // read by this operation.
                 .map(|value| unsafe { value.ptr_value as *mut u8 }),
         );
         // Copied, never absorbed: GC paths must not change native accounting.
@@ -211,6 +215,8 @@ unsafe fn snapshot_channel(payload: *mut u8, children: &mut Vec<*mut u8>) {
                 inbox
                     .values
                     .iter()
+                    // SAFETY: The channel element ABI supplies the initialized union
+                    // representation read by this operation.
                     .map(|value| unsafe { value.ptr_value as *mut u8 }),
             );
         }
@@ -224,6 +230,7 @@ unsafe fn snapshot_channel_slice(
     children: &mut Vec<*mut u8>,
 ) -> crate::gc::TraceSliceProgress {
     use crate::gc::TraceSliceProgress;
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let channel = unsafe { &*payload.cast::<WillowAbiChannel>() };
     if !channel.is_ref {
         return TraceSliceProgress::Done;
@@ -269,6 +276,8 @@ unsafe fn snapshot_channel_slice(
                 .expect("a scan window past the queue lies in the open inbox")
                 .values[index - values_len]
         };
+        // SAFETY: The channel element ABI supplies the initialized union representation read by
+        // this operation.
         children.push(unsafe { value.ptr_value }.cast());
     }
     drop(inbox);
@@ -288,6 +297,7 @@ unsafe fn snapshot_channel_slice(
 /// # Safety
 /// `payload` must point to an initialized [`WillowAbiChannel`].
 unsafe fn drop_channel(payload: *mut u8) {
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     unsafe {
         std::ptr::drop_in_place(payload as *mut WillowAbiChannel);
     }
@@ -299,12 +309,16 @@ const CHANNEL_DROP_COUNT: crate::observation::Counter =
 
 const CHANNEL_REGISTRATION: crate::gc::NativeGcRegistration =
     crate::gc::NativeGcRegistration::Channel;
-const CHANNEL_GC_TYPES: &[crate::gc::NativeGcType] =
-    &[
+const CHANNEL_GC_TYPES: &[crate::gc::NativeGcType] = &[
+    // SAFETY: This ID denotes the initialized channel wrapper and its stable native core.
+    // Stopped tracing visits reference queues; concurrent snapshots synchronize with their
+    // writers and bound the queue range.
+    unsafe {
         crate::gc::NativeGcType::new(CHANNEL_TYPE_ID, Some(trace_channel), Some(drop_channel))
             .with_concurrent_trace(snapshot_channel)
-            .with_concurrent_slice(snapshot_channel_slice),
-    ];
+            .with_concurrent_slice(snapshot_channel_slice)
+    },
+];
 
 #[cfg(test)]
 const CHANNEL_REGISTRATION_COUNT: crate::observation::Counter =
@@ -314,9 +328,39 @@ const CHANNEL_REGISTRATION_COUNT: crate::observation::Counter =
 /// allocation path performs only two atomic loads; the mutex and registry
 /// HashMap locks are taken only after a GC reset/unregister invalidates hooks.
 fn ensure_channel_registered() {
-    if CHANNEL_REGISTRATION.ensure(CHANNEL_GC_TYPES) {
+    // SAFETY: This is the complete descriptor set for the channel wrapper registration group
+    // and its constructors.
+    if unsafe { CHANNEL_REGISTRATION.ensure(CHANNEL_GC_TYPES) } {
         crate::observation::record(crate::observation::Event::ChannelRegistrationCount, 1);
     }
+}
+
+/// Exercise the channel ABI with a wrapper that the next minor can evacuate.
+#[cfg(test)]
+pub(crate) fn young_channel_for_test(is_ref: bool) -> *mut u8 {
+    ensure_channel_registered();
+    let bytes = size_of::<WillowAbiChannel>() as i64;
+    let type_id = i64::from(CHANNEL_TYPE_ID);
+    let layout = crate::gc::gc_layout_id(crate::gc::GcObjectKind::Channel, bytes, type_id, 0);
+    // SAFETY: The current mutator owns the runtime TLS block until retirement; this fixture
+    // uses its word layout and inline mask.
+    let raw = unsafe {
+        crate::gc::willow_gc_alloc_slow(
+            crate::gc::willow_gc_current_tlab(),
+            layout,
+            type_id,
+            bytes,
+            0,
+        )
+    };
+    assert!(!raw.is_null());
+    // SAFETY: The TLAB reserves word-aligned storage of the wrapper's exact size.
+    // Initialize it before another allocation or collection can invoke the channel hooks.
+    unsafe {
+        raw.cast::<WillowAbiChannel>()
+            .write(WillowAbiChannel::new(is_ref))
+    };
+    raw
 }
 
 /// Move every inbox value to the back of `values`: one inbox acquisition per
@@ -385,6 +429,7 @@ fn state_is_full(state: &WillowChannelState) -> bool {
 }
 
 fn token(raw: *mut c_void, role: ChannelRole, generation: u64) -> ChannelOwnershipToken {
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let channel = unsafe { channel_from_raw(raw) }.expect("ownership requires a live channel");
     core_token(channel, role, generation)
 }
@@ -431,16 +476,26 @@ fn clear_reservation(raw: *mut c_void, owners: &mut IdMap<u64, u64>, task: u64, 
 }
 
 /// Successful sends reserve one value for each receiver we actually wake.
-fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
+///
+/// # Safety
+/// A non-null raw pointer must identify a current live channel. The union value must have
+/// the initialized representation selected by its channel; a reference word must be null or
+/// the current address of a managed payload.
+unsafe fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return 1;
     };
+    // Keep only the stable native core across receiver and sender wakes.
+    let channel: &ChannelCore = channel;
     if channel.is_ref {
         // Any receiver task may take the value: publish it before it is
         // queued. O(1) when the blocking send already published it.
         crate::gc::publish_in(
             crate::runtime::current(),
+            // SAFETY: The channel element ABI supplies the initialized union representation read
+            // by this operation.
             unsafe { value.ptr_value } as *mut u8,
             crate::gc::PublicationPoint::ChannelSend,
             false,
@@ -455,7 +510,10 @@ fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
             // Open implies unbounded, unclosed and no receive waiter: there is
             // no capacity, handoff or wake decision to make.
             if channel.is_ref {
-                channel_send_barrier(raw, value);
+                // SAFETY: The typed send supplies the live channel and matching union member;
+                // after a collecting wait both the channel and any reference value are
+                // reloaded from roots.
+                unsafe { channel_send_barrier(raw, value) };
             }
             inbox.values.push_back(value);
             return 1;
@@ -490,7 +548,10 @@ fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
             ChannelRole::SendHandoff,
         );
         if channel.is_ref {
-            channel_send_barrier(raw, value);
+            // SAFETY: The typed send supplies the live channel and matching union member;
+            // after a collecting wait both the channel and any reference value are reloaded
+            // from roots.
+            unsafe { channel_send_barrier(raw, value) };
         }
         state.values.push_back(value);
         let receive =
@@ -513,13 +574,24 @@ fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
 /// the value a published payload: with the header facts an old channel is
 /// remembered once per minor (its header claim filters later sends) instead of
 /// logging one unresolved edge per send and flushing them under the heap lock.
-fn channel_send_barrier(raw: *mut c_void, value: WillowChannelValue) {
-    crate::gc::write_barrier_object_owner(
-        raw as *mut u8,
-        std::ptr::null_mut(),
-        unsafe { value.ptr_value } as *mut u8,
-        crate::gc::GcStoreDestination::ContainerInternal as i64,
-    );
+///
+/// # Safety
+/// A non-null raw pointer must identify a current live channel. The union value must have
+/// the initialized representation selected by its channel; a reference word must be null or
+/// the current address of a managed payload.
+unsafe fn channel_send_barrier(raw: *mut c_void, value: WillowChannelValue) {
+    // SAFETY: A live reference channel is inserting its matching payload into a fresh queue
+    // position.
+    unsafe {
+        crate::gc::write_barrier_object_owner(
+            raw as *mut u8,
+            std::ptr::null_mut(),
+            // SAFETY: The channel element ABI supplies the initialized union representation read by
+            // this operation.
+            value.ptr_value as *mut u8,
+            crate::gc::GcStoreDestination::ContainerInternal as i64,
+        )
+    };
 }
 
 /// Remove a completed/cancelled task from every channel waiter queue. This is
@@ -549,6 +621,8 @@ pub(crate) fn purge_task_from_tokens(
         debug_assert_ne!(address, 0);
         // Frame retention keeps the owning wrapper (and its native box) live.
         // This identity never points into relocatable GC storage.
+        // SAFETY: The retained ownership token keeps the channel core at its stable address during
+        // cleanup.
         let channel = unsafe { &*(address as *const ChannelCore) };
         {
             let mut state = channel.state.lock().expect("channel mutex poisoned");
@@ -591,24 +665,38 @@ unsafe fn channel_from_raw<'a>(raw: *mut c_void) -> Option<&'a WillowAbiChannel>
     if raw.is_null() {
         None
     } else {
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         Some(unsafe { &*(raw as *mut WillowAbiChannel) })
     }
 }
 
-fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
+///
+/// # Safety
+/// A non-null raw pointer must identify a current live channel. The union value must have
+/// the initialized representation selected by its channel; a reference word must be null or
+/// the current address of a managed payload.
+unsafe fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
     // A blocking send drives the scheduler (a GC point), so a large graph
     // may park mid-publication here.
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let is_ref = unsafe { channel_from_raw(raw) }.is_some_and(|channel| channel.is_ref);
-    if is_ref {
-        crate::gc::publish_in(
-            crate::runtime::current(),
-            unsafe { value.ptr_value } as *mut u8,
-            crate::gc::PublicationPoint::ChannelSend,
-            true,
-        );
-    }
+    let (raw, value) = if is_ref {
+        // SAFETY: A reference channel carries the pointer member of the ABI union.
+        let [channel, message] =
+            crate::gc::publish_channel_send(raw.cast(), unsafe { value.ptr_value.cast() });
+        (
+            channel.cast(),
+            WillowChannelValue {
+                ptr_value: message.cast(),
+            },
+        )
+    } else {
+        (raw, value)
+    };
     // Fast path + unbounded path: try once and assign receiver claims.
-    if channel_try_send_value(raw, value) != 0 {
+    // SAFETY: The typed send supplies the live channel and matching union member; after a
+    // collecting wait both the channel and any reference value are reloaded from roots.
+    if (unsafe { channel_try_send_value(raw, value) }) != 0 {
         return;
     }
     // A minor collection inside the drives below may move the channel
@@ -616,6 +704,8 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
     // them after every drive. Only this blocking slow path pays for it.
     let raw_root = crate::gc::GcRootHandle::new(raw.cast());
     let value_root =
+        // SAFETY: The channel element ABI supplies the initialized union representation read by
+        // this operation.
         is_ref.then(|| crate::gc::GcRootHandle::new(unsafe { value.ptr_value }.cast()));
     // Bounded channel is FULL in a synchronous context: help drive the
     // scheduler so consumers can free space (mirror of sync recv). If no
@@ -634,11 +724,15 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
             .map_or(value, |root| WillowChannelValue {
                 ptr_value: root.load().cast(),
             });
-        if channel_try_send_value(raw, value) != 0 {
+        // SAFETY: The typed send supplies the live channel and matching union member; after a
+        // collecting wait both the channel and any reference value are reloaded from roots.
+        if (unsafe { channel_try_send_value(raw, value) }) != 0 {
             // The failed attempts registered this task as a send waiter (a
             // no-op outside a task). Drop that registration: nobody will
             // consume the wake, and a stale entry costs a spurious wakeup.
-            willow_channel_unregister_waiter(raw);
+            // A successful send can wake a task and collect under scheduler stress.
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            unsafe { willow_channel_unregister_waiter(raw_root.load().cast()) };
             return;
         }
         if completed == 0 {
@@ -650,7 +744,8 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
                 crate::scheduler::wait_for_any_wake_briefly();
                 continue;
             }
-            willow_channel_unregister_waiter(raw);
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            unsafe { willow_channel_unregister_waiter(raw) };
             channel_raise_with("send on full bounded channel would block");
             return;
         }
@@ -901,6 +996,8 @@ fn wake_closed_empty(channel: &ChannelCore) {
     }
     let wake: Vec<_> = wake.into_iter().collect();
     // The native Vec remains valid across scheduler GC stress points.
+    // SAFETY: The slice supplies exactly the indicated number of task IDs and remains live for the
+    // call.
     unsafe { crate::scheduler::willow_sched_wake_many(wake.as_ptr(), wake.len()) };
 }
 
@@ -913,9 +1010,12 @@ fn take_value(
         clear_reservation(raw, &mut state.recv_claims, current, ChannelRole::RecvClaim);
         clear_wait(raw, &mut state.waiters, current, ChannelRole::RecvWait);
         if let Some(value) = state.values.front()
+            // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
             && unsafe { channel_from_raw(raw) }.is_some_and(|channel| channel.is_ref)
         {
             // Snapshot the logical old edge while the queue lock still owns it.
+            // SAFETY: The channel element ABI supplies the initialized union representation read
+            // by this operation.
             crate::gc::satb_delete(unsafe { value.ptr_value }.cast());
         }
         let value = state.values.pop_front();
@@ -952,6 +1052,8 @@ fn finish_take(
     // The popped reference no longer has the queue as its root.
     let root = channel
         .is_ref
+        // SAFETY: The channel element ABI supplies the initialized union representation read by
+        // this operation.
         .then(|| crate::gc::GcRootHandle::new(unsafe { value.ptr_value.cast() }));
     let raw = if let Some(first) = wake_senders {
         publish_first_waiter_bounded(raw, channel, false, first)
@@ -983,33 +1085,58 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
 /// channel also answers `None`. Other failures (a wait that can never be
 /// satisfied) still raise.
 fn channel_recv_or_closed(raw: *mut c_void) -> Option<WillowChannelValue> {
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let channel: &ChannelCore = unsafe { channel_from_raw(raw) }?;
     let current = crate::scheduler::willow_sched_current_task();
-    let mut no_progress = false;
+    match try_recv_or_closed(raw, channel, current) {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => wait_for_value(raw, channel, current),
+    }
+}
+
+fn try_recv_or_closed(
+    raw: *mut c_void,
+    channel: &ChannelCore,
+    current: u64,
+) -> std::task::Poll<Option<WillowChannelValue>> {
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    let mut state = channel.state.lock().expect("channel mutex poisoned");
+    refill_from_inbox(channel, &mut state);
+    if let Some(value) = take_value(raw, &mut state, current) {
+        open_inbox_if_idle(channel, &mut state);
+        return std::task::Poll::Ready(Some(finish_take(raw, channel, state, value)));
+    }
+    if state.closed && state.values.is_empty() {
+        return std::task::Poll::Ready(None);
+    }
+    std::task::Poll::Pending
+}
+
+// Only the blocking path needs a root. The wrapper can move during a scheduler
+// drive, while its boxed core stays at the same address until the root drops.
+#[inline(never)]
+fn wait_for_value(
+    raw: *mut c_void,
+    channel: &ChannelCore,
+    current: u64,
+) -> Option<WillowChannelValue> {
+    let root = crate::gc::GcRootHandle::new(raw.cast());
     loop {
+        let completed = crate::scheduler::willow_sched_run_until_deadline(
+            crate::scheduler::willow_monotonic_millis().saturating_add(1),
+        );
+        if let std::task::Poll::Ready(result) =
+            try_recv_or_closed(root.load().cast(), channel, current)
         {
-            let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-            let mut state = channel.state.lock().expect("channel mutex poisoned");
-            refill_from_inbox(channel, &mut state);
-            if let Some(value) = take_value(raw, &mut state, current) {
-                open_inbox_if_idle(channel, &mut state);
-                return Some(finish_take(raw, channel, state, value));
-            }
-            if state.closed && state.values.is_empty() {
-                return None;
-            }
+            return result;
         }
-        if no_progress {
-            if crate::scheduler::scheduler_has_wake_source() {
-                crate::scheduler::wait_for_any_wake_briefly();
-            } else {
+        if completed == 0 {
+            if !crate::scheduler::scheduler_has_wake_source() {
                 channel_raise_with("recv on empty open channel would block");
                 return Some(WillowChannelValue::default());
             }
+            crate::scheduler::wait_for_any_wake_briefly();
         }
-        no_progress = crate::scheduler::willow_sched_run_until_deadline(
-            crate::scheduler::willow_monotonic_millis().saturating_add(1),
-        ) == 0;
     }
 }
 

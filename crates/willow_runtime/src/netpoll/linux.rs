@@ -34,12 +34,18 @@ impl Backend {
         if self.epoll_fd.is_some() {
             return 0;
         }
+        // SAFETY: This descriptor constructor takes only scalar arguments and reports failure with
+        // a negative result.
         let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if epoll_fd < 0 {
             return -1;
         }
+        // SAFETY: This descriptor constructor takes only scalar arguments and reports failure with
+        // a negative result.
         let wake_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if wake_fd < 0 {
+            // SAFETY: This backend owns the successfully opened descriptor and closes it once
+            // after use.
             unsafe {
                 libc::close(epoll_fd);
             }
@@ -49,8 +55,11 @@ impl Backend {
             events: libc::EPOLLIN as u32,
             u64: WAKE_TOKEN as u64,
         };
+        // SAFETY: The poller owns the epoll fd; the event pointer is valid for the control call.
         let added = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, wake_fd, &mut event) };
         if added != 0 {
+            // SAFETY: This backend owns the successfully opened descriptor and closes it once
+            // after use.
             unsafe {
                 libc::close(wake_fd);
                 libc::close(epoll_fd);
@@ -68,6 +77,8 @@ impl Backend {
         };
         let Some(interest) = interest else {
             let mut event = libc::epoll_event { events: 0, u64: 0 };
+            // SAFETY: The poller owns the epoll fd; the event pointer is valid for the control
+            // call.
             unsafe {
                 libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd as i32, &mut event);
             }
@@ -78,11 +89,14 @@ impl Backend {
             u64: fd as u64,
         };
         let fd = fd as i32;
+        // SAFETY: The poller owns the epoll fd; the event pointer is valid for the control call.
         let add = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) };
         if add == 0 {
             return 0;
         }
         if std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
+            // SAFETY: The poller owns the epoll fd; the event pointer is valid for the control
+            // call.
             let modify = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_MOD, fd, &mut event) };
             if modify == 0 {
                 return 0;
@@ -96,6 +110,8 @@ impl Backend {
             return;
         };
         let value = 1_u64;
+        // SAFETY: The descriptor is live and the call's counts match the readable or writable
+        // event or byte buffers passed here.
         unsafe {
             libc::write(
                 wake_fd,
@@ -111,6 +127,8 @@ impl Backend {
         };
         loop {
             let mut value = 0_u64;
+            // SAFETY: The descriptor is live and the call's counts match the readable or writable
+            // event or byte buffers passed here.
             let read = unsafe {
                 libc::read(
                     wake_fd,
@@ -126,11 +144,15 @@ impl Backend {
 
     pub(super) fn close_platform(&mut self) {
         if let Some(wake_fd) = self.wake_fd.take() {
+            // SAFETY: This backend owns the successfully opened descriptor and closes it once
+            // after use.
             unsafe {
                 libc::close(wake_fd);
             }
         }
         if let Some(epoll_fd) = self.epoll_fd.take() {
+            // SAFETY: This backend owns the successfully opened descriptor and closes it once
+            // after use.
             unsafe {
                 libc::close(epoll_fd);
             }
@@ -173,6 +195,8 @@ pub(super) fn wait_platform_events(epoll_fd: i32, timeout: Option<Duration>) -> 
         Some(duration) => duration.as_millis().min(i32::MAX as u128) as i32,
     };
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 64];
+    // SAFETY: The descriptor is live and the call's counts match the readable or writable event or
+    // byte buffers passed here.
     let n = unsafe {
         libc::epoll_wait(
             epoll_fd,

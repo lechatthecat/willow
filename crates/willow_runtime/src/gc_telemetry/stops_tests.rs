@@ -137,7 +137,9 @@ fn saturated_counters_are_explicitly_invalid_for_acceptance() {
 fn v2_negotiation_preserves_v1_and_guards_unaligned_output() {
     use crate::gc_telemetry::*;
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     assert_eq!(std::mem::size_of::<WillowGcStatsV1>(), 2112);
     assert_eq!(std::mem::offset_of!(WillowGcStatsV2, baseline), 16);
     assert_eq!(std::mem::offset_of!(WillowGcStatsV2, stops), 2128);
@@ -148,14 +150,29 @@ fn v2_negotiation_preserves_v1_and_guards_unaligned_output() {
     assert_eq!(std::mem::size_of::<WillowGcStatsV2>(), 6920);
     let size = willow_gc_stats_size(2) as usize;
     let mut buffer = vec![0xa5; size + 2];
+    // SAFETY: The negotiated size covers the selected record. Unaligned record access supports
+    // byte-aligned caller storage.
     let out = unsafe { buffer.as_mut_ptr().add(1) };
-    assert_eq!(willow_gc_stats_snapshot(2, out, size as i64 - 1), 0);
+    assert_eq!(
+        // SAFETY: The backing buffer covers the selected record on success; rejected requests
+        // write nothing.
+        unsafe { willow_gc_stats_snapshot(2, out, size as i64 - 1) },
+        0
+    );
     assert!(buffer.iter().all(|&byte| byte == 0xa5));
     assert_eq!(
-        willow_gc_stats_snapshot(2, std::ptr::null_mut(), size as i64),
+        // SAFETY: The snapshot API accepts null and returns before writing.
+        unsafe { willow_gc_stats_snapshot(2, std::ptr::null_mut(), size as i64) },
         -1
     );
-    assert_eq!(willow_gc_stats_snapshot(2, out, size as i64), size as i64);
+    assert_eq!(
+        // SAFETY: The backing buffer covers the selected record on success; rejected requests
+        // write nothing.
+        unsafe { willow_gc_stats_snapshot(2, out, size as i64) },
+        size as i64
+    );
+    // SAFETY: The negotiated size covers the selected record. Unaligned record access supports
+    // byte-aligned caller storage.
     let snapshot = unsafe { out.cast::<WillowGcStatsV2>().read_unaligned() };
     assert_eq!(snapshot.version, 2);
     assert_eq!(snapshot.struct_size as usize, size);
@@ -169,7 +186,9 @@ fn v2_negotiation_preserves_v1_and_guards_unaligned_output() {
 fn actual_baseline_stops_are_visible_even_for_empty_heaps() {
     use crate::gc::*;
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     willow_gc_collect();
     crate::gc::minor_collect_internal();
     let stats = snapshot_stops();
@@ -180,7 +199,9 @@ fn actual_baseline_stops_are_visible_even_for_empty_heaps() {
     assert_eq!(stats.by_reason.map(|t| t.completed), [1, 2, 1, 0]);
     let sequence = stats.last_sequence;
     let generation = stats.reset_generation;
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let reset = snapshot_stops();
     assert_eq!(reset.last_sequence, sequence);
     assert_eq!(reset.reset_generation, generation + 1);
@@ -192,7 +213,9 @@ fn normal_old_cycles_do_not_scan_headers_or_sweep_under_stops() {
     use crate::gc::*;
     let _guard = isolated_runtime();
     for n in [16, 64, 256, 1024] {
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         for _ in 0..n {
             willow_alloc(8);
         }
@@ -209,13 +232,17 @@ fn normal_old_cycles_do_not_scan_headers_or_sweep_under_stops() {
         assert_eq!(willow_gc_allocated_bytes(), 0);
         println!("heap_objects={n} roots=0 initial_headers=0 remark_headers=0 stopped_sweep=0");
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn unfinished_measurement_records_failure_instead_of_zero_stops() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let result = std::panic::catch_unwind(|| {
         let _stop = StopMeasurement::begin(StopReason::Recovery);
         panic!("injected measurement unwind");
@@ -225,7 +252,9 @@ fn unfinished_measurement_records_failure_instead_of_zero_stops() {
     assert_ne!(stats.flags & STOP_PROTOCOL_ERROR, 0);
     assert_eq!(stats.by_reason[3].requests, 1);
     assert_eq!(stats.by_reason[3].aborted, 1);
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
 }
 
 #[test]

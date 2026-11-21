@@ -19,8 +19,12 @@ impl StorageAllocation for SystemStorage {
     }
     unsafe fn allocate<const ZEROED: bool>(&self, layout: Layout) -> *mut u8 {
         if ZEROED {
+            // SAFETY: The allocator receives a nonzero Layout. Successful storage has its
+            // requested size and alignment and is released once with that Layout.
             unsafe { alloc_zeroed(layout) }
         } else {
+            // SAFETY: The allocator receives a nonzero Layout. Successful storage has its
+            // requested size and alignment and is released once with that Layout.
             unsafe { alloc(layout) }
         }
     }
@@ -88,6 +92,8 @@ mod tests {
             if fail {
                 return std::ptr::null_mut();
             }
+            // SAFETY: The allocator receives a nonzero Layout. Successful storage has its
+            // requested size and alignment and is released once with that Layout.
             unsafe { SystemStorage::default().allocate::<ZEROED>(layout) }
         }
     }
@@ -109,20 +115,33 @@ mod tests {
                         for round in 1..=64 {
                             first.set_failures(1);
                             barrier.wait();
+                            // SAFETY: The allocator receives a nonzero Layout. Successful storage
+                            // has its requested size and alignment and is released once with that
+                            // Layout.
                             let failed = unsafe { shared.allocate::<true>(layout) };
                             correct &= failed.is_null();
                             if !failed.is_null() {
+                                // SAFETY: The owner releases this block once with the same base
+                                // and Layout used to allocate it.
                                 unsafe {
                                     std::alloc::dealloc(failed, layout);
                                 }
                             }
+                            // SAFETY: The allocator receives a nonzero Layout. Successful storage
+                            // has its requested size and alignment and is released once with that
+                            // Layout.
                             let actual = unsafe { second.allocate::<true>(layout) };
                             correct &= !actual.is_null();
                             if !actual.is_null() {
                                 correct &=
+                                    // SAFETY: The allocator receives a nonzero Layout. Successful
+                                    // storage has its requested size and alignment and is released
+                                    // once with that Layout.
                                     unsafe { std::slice::from_raw_parts(actual, layout.size()) }
                                         .iter()
                                         .all(|b| *b == 0);
+                                // SAFETY: The owner releases this block once with the same base
+                                // and Layout used to allocate it.
                                 unsafe {
                                     std::alloc::dealloc(actual, layout);
                                 }

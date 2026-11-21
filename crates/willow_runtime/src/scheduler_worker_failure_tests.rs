@@ -70,9 +70,12 @@ fn private_worker_pools_execute_owned_schedulers_and_join_captured_owners() {
                 for _ in 0..tasks_per_drive {
                     // A native callback with no frame is a normal runtime task;
                     // no unmanaged object is passed off as a GC allocation.
-                    let id = scheduler.spawn_task(ready, std::ptr::null_mut());
+                    // SAFETY: The callback accepts a null frame and uses no frame storage.
+                    let id = unsafe { scheduler.spawn_task(ready, std::ptr::null_mut()) };
                     scheduler.set_running(id);
                     let (poll, frame, _) = scheduler.task_work(id).unwrap();
+                    // SAFETY: The claimed task retains its frame and pairs it with the installed
+                    // callback for this execution.
                     let result = unsafe { poll(frame) };
                     if result != RUNTIME_POLL_READY || current_task_id() != Some(id) {
                         worker_errors.fetch_add(1, Ordering::Relaxed);
@@ -114,7 +117,9 @@ fn persistent_worker_teardown_cooperates_with_collection() {
     const CHILD: &str = "WILLOW_WORKER_JOIN_COLLECTION_CHILD";
     if std::env::var_os(CHILD).is_some() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
         let collections = crate::gc::gc_progress().successful_collections;
         let joining_mutator = crate::gc::MutatorRegistration::new();
         let (entered, running) = std::sync::mpsc::channel();
@@ -172,10 +177,13 @@ fn collector_panic_on_worker_terminates_process() {
         // load that handler can outlast the parent's hang deadline. A zero
         // RLIMIT_CORE does not stop a piped core_pattern; non-dumpable does.
         #[cfg(target_os = "linux")]
+        // SAFETY: This subprocess sets the Linux dumpable flag with scalar prctl arguments.
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) }, 0);
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::reset_internal_for_test();
-        crate::gc::willow_gc_add_runtime_root(std::ptr::dangling_mut::<u8>());
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
+        crate::gc::inject_invalid_runtime_root_for_test();
         let mut pool = PersistentWorkers::default();
         pool.start_worker(
             Some(crate::runtime::current()),
@@ -252,7 +260,9 @@ fn private_runtime_production_run_loops_complete_independent_native_tasks() {
                         |scheduler| {
                             let mut last = 0;
                             for _ in 0..batch {
-                                last = scheduler.spawn_task(ready, std::ptr::null_mut());
+                                // SAFETY: The callback accepts a null frame and uses no frame
+                                // storage.
+                                last = unsafe { scheduler.spawn_task(ready, std::ptr::null_mut()) };
                             }
                             last
                         },
@@ -275,7 +285,9 @@ fn private_runtime_production_run_loops_complete_independent_native_tasks() {
                     }
                     let target = SchedulerServices::with_scheduler(
                         || runtime.scheduler(),
-                        |scheduler| scheduler.spawn_task(ready, std::ptr::null_mut()),
+                        // SAFETY: The callback accepts a null frame and uses no frame
+                        // storage.
+                        |scheduler| unsafe { scheduler.spawn_task(ready, std::ptr::null_mut()) },
                     );
                     assert_eq!(
                         scheduler_run_loop_in(&runtime, Some(target), 0, None, false, None),
@@ -313,7 +325,9 @@ fn private_persistent_production_pools_keep_wakes_and_teardown_independent() {
                         || owner.scheduler(),
                         |scheduler| {
                             for _ in 0..count {
-                                scheduler.spawn_task(ready, std::ptr::null_mut());
+                                // SAFETY: The callback accepts a null frame and uses no frame
+                                // storage.
+                                unsafe { scheduler.spawn_task(ready, std::ptr::null_mut()) };
                             }
                         },
                     );

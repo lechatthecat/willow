@@ -23,7 +23,9 @@ pub extern "C" fn willow_user_main() {
     // Root slots have stable addresses before registration.
     let mut roots = vec![std::ptr::null_mut(); n];
     for root in &mut roots {
-        gc::willow_push_root(root);
+        // SAFETY: The slot storage stays live and stationary through the matching pop,
+        // including during collection.
+        unsafe { gc::willow_push_root(root) };
     }
     for root in &mut roots {
         *root = gc::willow_alloc_typed((fanout * 8) as i64, (1 << fanout) - 1);
@@ -31,14 +33,22 @@ pub extern "C" fn willow_user_main() {
     for (i, &owner) in roots.iter().enumerate() {
         for j in 0..fanout {
             let value = roots[(i + 1 + j) % n];
-            gc::willow_gc_write_barrier(owner, std::ptr::null_mut(), value, 1);
+            // SAFETY: The destination describes this reference update. Any asserted header
+            // belongs to its live GC payload.
+            unsafe { gc::willow_gc_write_barrier(owner, std::ptr::null_mut(), value, 1) };
             // SAFETY: initialized pointer-aligned payload with matching reference mask.
+            // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the
+            // accessed words.
             unsafe { &*owner.cast::<AtomicPtr<u8>>().add(j) }.store(value, Ordering::Release);
         }
     }
-    gc::willow_pop_roots(n as i32);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { gc::willow_pop_roots(n as i32) };
     let mut root = roots[0];
-    gc::willow_push_root(&mut root);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { gc::willow_push_root(&raw mut root) };
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
     let (ready, started) = std::sync::mpsc::channel();
@@ -93,12 +103,16 @@ pub extern "C" fn willow_user_main() {
     // Reading every live payload after repeated collection checks graph survival.
     for &owner in &roots {
         assert!(
+            // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the
+            // accessed words.
             !unsafe { &*owner.cast::<AtomicPtr<u8>>() }
                 .load(Ordering::Acquire)
                 .is_null()
         );
     }
-    gc::willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { gc::willow_pop_root() };
     gc::willow_gc_collect();
     let elapsed = start.elapsed().as_nanos();
     println!(

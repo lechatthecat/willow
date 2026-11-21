@@ -6,12 +6,17 @@ static LIVE: crate::runtime::PerRuntime<AtomicUsize> =
     crate::runtime::PerRuntime::new(|| AtomicUsize::new(0));
 
 unsafe fn drop_owner(payload: *mut u8) {
+    // SAFETY: initialize_owner stores a Box<usize> via Box::into_raw in this
+    // object's aligned pointer slot. Moving transfers ownership to the survivor.
+    // Sweep or reset finalizes the owning object once, consuming that box.
     unsafe { drop(Box::from_raw(*payload.cast::<*mut usize>())) };
     LIVE.fetch_sub(1, Ordering::Relaxed);
 }
 
 fn initialize_owner(payload: *mut u8) {
     assert!(!payload.is_null());
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     unsafe { *payload.cast::<*mut usize>() = Box::into_raw(Box::new(42)) };
     LIVE.fetch_add(1, Ordering::Relaxed);
 }
@@ -19,35 +24,54 @@ fn initialize_owner(payload: *mut u8) {
 #[test]
 fn reset_finalizes_native_owners_in_every_storage_kind() {
     let _guard = isolated_runtime();
-    reset_internal();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal() };
     for kind in ["old", "large", "young", "survivor", "tenured", "fragmented"] {
         for count in [1usize, 8, 32] {
-            willow_register_drop(OWNER_TYPE, drop_owner);
-            let mut tls = tlab_state_for_test();
+            // SAFETY: This fixture reserves the type ID for the payload consumed by this
+            // finalizer and initializes each instance before collection.
+            unsafe { willow_register_drop(OWNER_TYPE, drop_owner) };
+            let tls = tlab_state_for_test();
             // Young referents need rewritable slots; full capacity keeps the
             // registered slot addresses stable.
             let mut young_slots = Vec::<*mut u8>::with_capacity(count);
             for index in 0..count {
                 let payload = if matches!(kind, "young" | "survivor" | "tenured") {
-                    willow_gc_alloc_slow(&mut tls, 1, OWNER_TYPE as i64, 8, 0)
+                    // SAFETY: The fixture owns the stable TLAB through unregistration. The
+                    // requested size and tracing metadata describe the object initialized
+                    // here.
+                    unsafe { willow_gc_alloc_slow(tls.as_ptr(), 1, OWNER_TYPE as i64, 8, 0) }
                 } else {
                     let size = if kind == "large" {
                         GC_LARGE_OBJECT_THRESHOLD
                     } else {
                         8
                     };
-                    willow_alloc_with_layout(GcObjectKind::Class, OWNER_TYPE, size as i64, 0)
+                    // SAFETY: The requested layout describes the initialized words of this
+                    // object and its type’s tracing or finalization contract.
+                    unsafe {
+                        willow_alloc_with_layout(GcObjectKind::Class, OWNER_TYPE, size as i64, 0)
+                    }
                 };
                 initialize_owner(payload);
                 if matches!(kind, "survivor" | "tenured") {
                     let owner = willow_alloc_typed(8, 1);
+                    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves
+                    // the accessed words.
                     unsafe { *owner.cast::<*mut u8>() = payload };
-                    willow_gc_add_runtime_root(owner);
+                    // SAFETY: The runtime keeps this nonmoving payload at its registered
+                    // address through removal.
+                    unsafe { willow_gc_add_runtime_root(owner) };
                 } else if kind == "young" {
                     young_slots.push(payload);
-                    willow_gc_add_runtime_root_slot(young_slots.last_mut().unwrap());
+                    // SAFETY: The registration and removal use the same initialized slot,
+                    // whose storage spans both operations.
+                    unsafe { willow_gc_add_runtime_root_slot(young_slots.last_mut().unwrap()) };
                 } else if kind != "fragmented" || index % 2 == 0 {
-                    willow_gc_add_runtime_root(payload);
+                    // SAFETY: The runtime keeps this nonmoving payload at its registered
+                    // address through removal.
+                    unsafe { willow_gc_add_runtime_root(payload) };
                 }
             }
             if matches!(kind, "survivor" | "tenured") {
@@ -65,7 +89,9 @@ fn reset_finalizes_native_owners_in_every_storage_kind() {
                 assert_eq!(LIVE.load(Ordering::Relaxed), count);
             }
             // Reset also owns objects still present in the runtime root table.
-            reset_internal();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal() };
             assert_eq!(
                 LIVE.load(Ordering::Relaxed),
                 0,
@@ -73,7 +99,9 @@ fn reset_finalizes_native_owners_in_every_storage_kind() {
             );
             assert_eq!(willow_gc_allocated_bytes(), 0);
             drop(young_slots);
-            reset_internal();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal() };
             assert_eq!(LIVE.load(Ordering::Relaxed), 0);
             eprintln!("reset storage={kind} owners={count} live_owners=0");
         }
@@ -88,15 +116,25 @@ fn native_drop_panics_terminate_reset_and_collection() {
             eprintln!("DROP_HOOK_ENTERED");
             panic!("injected native destructor panic");
         }
-        reset_internal();
-        willow_register_drop(OWNER_TYPE, panic_drop);
-        let mut tls = tlab_state_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
+        // SAFETY: This fixture reserves the type ID for the payload consumed by this
+        // finalizer and initializes each instance before collection.
+        unsafe { willow_register_drop(OWNER_TYPE, panic_drop) };
+        let tls = tlab_state_for_test();
         for _ in 0..4 {
-            willow_alloc_with_layout(GcObjectKind::Class, OWNER_TYPE, 8, 0);
-            willow_gc_alloc_slow(&mut tls, 1, OWNER_TYPE as i64, 8, 0);
+            // SAFETY: The requested layout describes the initialized words of this object and
+            // its type’s tracing or finalization contract.
+            unsafe { willow_alloc_with_layout(GcObjectKind::Class, OWNER_TYPE, 8, 0) };
+            // SAFETY: The fixture owns the stable TLAB through unregistration. The requested
+            // size and tracing metadata describe the object initialized here.
+            unsafe { willow_gc_alloc_slow(tls.as_ptr(), 1, OWNER_TYPE as i64, 8, 0) };
         }
         if case == "reset" {
-            reset_internal();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal() };
         } else {
             willow_gc_collect();
         }
@@ -117,7 +155,9 @@ fn native_drop_panics_terminate_reset_and_collection() {
 #[test]
 fn reset_recovers_runtime_locks_poisoned_by_a_failed_test() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     // A test that panics while asserting under these locks poisons them.
     let poison = || {
         let _ = std::panic::catch_unwind(|| {
@@ -132,16 +172,24 @@ fn reset_recovers_runtime_locks_poisoned_by_a_failed_test() {
         poison();
         assert!(runtime().heap.is_poisoned());
         // The FFI boundary aborts on a panic; reset must not raise one.
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         assert!(!runtime().heap.is_poisoned());
         assert!(!runtime().coord.0.is_poisoned());
         assert!(!runtime().parked_stack_roots.is_poisoned());
         assert!(!runtime().root_stack_owner.is_poisoned());
         let mut root = willow_alloc(8);
         assert!(!root.is_null());
-        willow_push_root(&mut root);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
         willow_gc_collect();
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }

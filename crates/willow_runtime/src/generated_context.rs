@@ -52,6 +52,8 @@ impl<'a> ShadowRoots<'a> {
         let mut storage = self.storage.borrow_mut();
         // Generated pushes initialize each slot before publishing top.
         assert!(self.top.get() <= storage.capacity());
+        // SAFETY: Generated pushes initialize all slots below top, within the reserved Vec
+        // capacity.
         unsafe {
             storage.set_len(self.top.get());
         }
@@ -92,16 +94,20 @@ impl Drop for RootBorrow<'_> {
 }
 
 pub(crate) fn with_roots<R>(f: impl FnOnce(&ShadowRoots<'_>) -> R) -> R {
+    // SAFETY: This activation keeps the installed context and its parent chain live.
     f(&unsafe { &*active() }.shadow_roots())
 }
 pub(crate) fn depth() -> usize {
+    // SAFETY: This activation keeps the installed context and its parent chain live.
     let context = unsafe { &*active() };
     context.parent_depth.get() + context.roots.top.get()
 }
 pub(crate) fn parent_depth() -> usize {
+    // SAFETY: This activation keeps the installed context and its parent chain live.
     unsafe { &*active() }.parent_depth.get()
 }
 pub(crate) fn has_active_bridge() -> bool {
+    // SAFETY: This activation keeps the installed context and its parent chain live.
     let context = unsafe { &*active() };
     context.bridge_depth.get() != 0 || context.parent_bridge_active.get()
 }
@@ -109,6 +115,7 @@ pub(crate) fn has_active_bridge() -> bool {
 pub(crate) fn visit_roots(mut visit: impl FnMut(&[*mut *mut u8])) {
     let mut context = active();
     while !context.is_null() {
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         let current = unsafe { &*context };
         visit(&current.shadow_roots().borrow());
         context = current.parent.get();
@@ -128,11 +135,14 @@ pub(crate) unsafe fn visit_quiescent_roots(
     mut visit: impl FnMut(&[*mut *mut u8]),
 ) {
     while !context.is_null() {
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         let current = unsafe { &*context };
         let top = current.roots.top.get();
         if top != 0 {
             // Every length change republishes `base`, and generated pushes stay
             // below the capacity that `base` covers.
+            // SAFETY: The root stack owns its backing allocation. Top counts initialized slots and
+            // the push protocol reserves capacity first.
             visit(unsafe { std::slice::from_raw_parts(current.roots.base.get(), top) });
         }
         context = current.parent.get();
@@ -266,6 +276,7 @@ impl Context {
 
 pub(crate) fn set_barrier_buffer(address: usize) {
     // Context refresh on resume prevents caching a previous worker's buffer.
+    // SAFETY: This activation keeps the installed context and its parent chain live.
     unsafe { &*active() }.barrier_buffer.set(address);
 }
 
@@ -273,6 +284,7 @@ pub(crate) fn set_barrier_buffer(address: usize) {
 /// buffer pointer this value proof can migrate: the global epoch invalidates
 /// it before remembered membership can disappear or the owner be reused.
 pub(crate) fn set_remembered_card(owner: usize, card: usize, epoch: u64) {
+    // SAFETY: This activation keeps the installed context and its parent chain live.
     let context = unsafe { &*active() };
     context.card_owner.set(owner);
     context.card_index.set(card);
@@ -284,6 +296,7 @@ pub(crate) fn revoke_barrier_buffers() {
     // ancestors before releasing the Arc that keeps their pointers alive.
     let mut context = active();
     while !context.is_null() {
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         let state = unsafe { &*context };
         state.barrier_buffer.set(0);
         context = state.parent.get();
@@ -367,6 +380,7 @@ pub(crate) fn publish_selected_gates() {
     THREAD.with(|context| context.publish_gates(runtime));
     let active = ACTIVE.get();
     if !active.is_null() {
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         unsafe { &*active }.publish_gates(runtime);
     }
 }
@@ -379,6 +393,7 @@ pub(crate) fn refresh_panic_depth() {
     if active.is_null() {
         THREAD.with(Context::refresh_panic_depth);
     } else {
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         unsafe { &*active }.refresh_panic_depth();
     }
 }
@@ -386,8 +401,10 @@ pub(crate) fn refresh_panic_depth() {
 pub(crate) fn replace(context: *const Context) -> *const Context {
     let previous = active();
     if !context.is_null() && context != previous {
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         let target = unsafe { &*context };
         // Returning to an ancestor must not introduce a cycle.
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         if unsafe { &*previous }.parent.get() != context {
             target.parent.set(previous);
             target.parent_depth.set(depth());
@@ -408,6 +425,7 @@ pub(crate) fn active() -> *const Context {
 /// Read exactly the pointers that generated gate loads consume.
 #[cfg(test)]
 pub(crate) fn published_sync_gates() -> (*mut i32, *const u8) {
+    // SAFETY: This activation keeps the installed context and its parent chain live.
     let context = unsafe { &*active() };
     (context.sync_counter.get(), context.gc_stop.get())
 }
@@ -417,12 +435,14 @@ pub(crate) fn published_sync_gates() -> (*mut i32, *const u8) {
 pub(crate) fn published_depth() -> usize {
     let read = |context: &Context| {
         let pointer = context.panic_depth.load(Ordering::Relaxed);
+        // SAFETY: The installed panic context owns the depth atomic for the duration of this read.
         unsafe { &*pointer }.load(Ordering::Acquire)
     };
     let active = ACTIVE.get();
     if active.is_null() {
         THREAD.with(read)
     } else {
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         read(unsafe { &*active })
     }
 }
@@ -433,6 +453,8 @@ pub(crate) fn published_depth() -> usize {
 /// `entry` and `frame` must satisfy the callback's contract; it must not unwind.
 #[inline]
 pub(crate) unsafe extern "C" fn invoke(entry: *const (), frame: *mut c_void) -> i32 {
+    // SAFETY: The entry has the indicated generated calling convention. The bridge supplies its
+    // frame or word arguments and the live context register.
     unsafe { invoke_word(entry, frame as usize) as i32 }
 }
 
@@ -443,6 +465,8 @@ pub(crate) unsafe extern "C" fn invoke(entry: *const (), frame: *mut c_void) -> 
 #[inline]
 #[cfg(test)]
 pub(crate) unsafe fn invoke_i64(entry: unsafe extern "C" fn(i64) -> i64, value: i64) -> i64 {
+    // SAFETY: The entry has the indicated generated calling convention. The bridge supplies its
+    // frame or word arguments and the live context register.
     unsafe { invoke_word(entry as *const (), value as usize) as i64 }
 }
 
@@ -457,6 +481,8 @@ pub(crate) unsafe fn invoke_i64(entry: unsafe extern "C" fn(i64) -> i64, value: 
 #[inline(never)]
 unsafe extern "C" fn invoke_word(entry: *const (), argument: usize) -> usize {
     let bridge = ScalarBridge::enter();
+    // SAFETY: The entry has the indicated generated calling convention. The bridge supplies its
+    // frame or word arguments and the live context register.
     unsafe { call_word(entry, argument, bridge.context) }
 }
 
@@ -471,6 +497,7 @@ pub(crate) struct ScalarBridge {
 impl ScalarBridge {
     pub(crate) fn enter() -> Self {
         let context = active();
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         let state = unsafe { &*context };
         state.refresh();
         state.bridge_depth.set(state.bridge_depth.get() + 1);
@@ -483,6 +510,8 @@ impl ScalarBridge {
     /// The mapper must obey the scalar generated C ABI and never unwind.
     #[inline]
     pub(crate) unsafe fn call(&self, entry: unsafe extern "C" fn(i64) -> i64, value: i64) -> i64 {
+        // SAFETY: The entry has the indicated generated calling convention. The bridge supplies
+        // its frame or word arguments and the live context register.
         unsafe { call_word(entry as *const (), value as usize, self.context) as i64 }
     }
 
@@ -496,14 +525,18 @@ impl ScalarBridge {
         value: i64,
         environment: *mut u8,
     ) -> i64 {
+        // SAFETY: The entry has the indicated generated calling convention. The bridge supplies
+        // its frame or word arguments and the live context register.
         unsafe { call_word2(code, value as usize, environment as usize, self.context) as i64 }
     }
 
     #[inline]
     pub(crate) fn panicked(&self) -> bool {
+        // SAFETY: The installed panic context owns the depth atomic for the duration of this read.
         let depth = unsafe { &*self.context }
             .panic_depth
             .load(Ordering::Relaxed);
+        // SAFETY: The installed panic context owns the depth atomic for the duration of this read.
         unsafe { &*depth }.load(Ordering::Relaxed) != 0
     }
 }
@@ -512,6 +545,7 @@ impl Drop for ScalarBridge {
     #[inline]
     fn drop(&mut self) {
         // A nested generated callee must not leak its name into the caller.
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         let state = unsafe { &*self.context };
         state.helper.store(self.helper, Ordering::Relaxed);
         state.bridge_depth.set(state.bridge_depth.get() - 1);
@@ -523,6 +557,8 @@ impl Drop for ScalarBridge {
 unsafe fn call_word(entry: *const (), argument: usize, context: *const Context) -> usize {
     let result: usize;
     #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    // SAFETY: The entry takes its arguments in the SysV and generated-context registers below;
+    // clobber_abi covers volatile registers.
     unsafe {
         std::arch::asm!("call rax",
             inlateout("rax") entry => result,
@@ -530,6 +566,8 @@ unsafe fn call_word(entry: *const (), argument: usize, context: *const Context) 
             clobber_abi("C"));
     }
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    // SAFETY: The Win64 entry uses the declared registers and 32-byte shadow space. clobber_abi
+    // covers the call's volatile registers.
     unsafe {
         std::arch::asm!("sub rsp, 32", "call rax", "add rsp, 32",
             inlateout("rax") entry => result,
@@ -537,6 +575,8 @@ unsafe fn call_word(entry: *const (), argument: usize, context: *const Context) 
             clobber_abi("C"));
     }
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: The entry matches the AArch64 argument and context registers below; clobber_abi
+    // covers volatile registers.
     unsafe {
         std::arch::asm!("blr x9",
             in("x9") entry, inlateout("x0") argument => result,
@@ -556,6 +596,8 @@ unsafe fn call_word2(
 ) -> usize {
     let result: usize;
     #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    // SAFETY: The entry takes its arguments in the SysV and generated-context registers below;
+    // clobber_abi covers volatile registers.
     unsafe {
         std::arch::asm!("call rax",
             inlateout("rax") entry => result,
@@ -563,6 +605,8 @@ unsafe fn call_word2(
             clobber_abi("C"));
     }
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    // SAFETY: The Win64 entry uses the declared registers and 32-byte shadow space. clobber_abi
+    // covers the call's volatile registers.
     unsafe {
         std::arch::asm!("sub rsp, 32", "call rax", "add rsp, 32",
             inlateout("rax") entry => result,
@@ -570,6 +614,8 @@ unsafe fn call_word2(
             clobber_abi("C"));
     }
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: The entry matches the AArch64 argument and context registers below; clobber_abi
+    // covers volatile registers.
     unsafe {
         std::arch::asm!("blr x9",
             in("x9") entry, inlateout("x0") first => result, in("x1") second,
@@ -593,18 +639,23 @@ mod tests {
             )
         };
         let outer = active();
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         let saved = values(unsafe { &*outer });
         set_remembered_card(123, 4, 5);
         let nested = Context::new();
         let old = replace(&nested);
         assert_eq!(values(&nested), (0, 0, 0));
         set_remembered_card(456, 7, 8);
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         assert_eq!(values(unsafe { &*outer }), (123, 4, 5));
         replace(old);
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         assert_eq!(values(unsafe { &*active() }), (123, 4, 5));
         set_remembered_card(saved.0, saved.1, saved.2);
         let address = Box::into_raw(Box::new(nested)) as usize;
         std::thread::spawn(crate::runtime::serving(move || {
+            // SAFETY: The test transfers this uniquely owned Context through Box::into_raw and
+            // reconstructs it once.
             let context = unsafe { Box::from_raw(address as *mut Context) };
             context.refresh();
             // This is a value proof, not a pointer into the departed worker.
@@ -631,6 +682,7 @@ mod tests {
         set_barrier_buffer(456);
         revoke_barrier_buffers();
         assert_eq!(nested.barrier_buffer.get(), 0);
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         assert_eq!(unsafe { &*outer }.barrier_buffer.get(), 0);
         replace(old);
         let context = Box::new(Context::new());
@@ -639,6 +691,8 @@ mod tests {
         // thread retains a reference while the receiving worker refreshes it.
         let address = Box::into_raw(context) as usize;
         std::thread::spawn(crate::runtime::serving(move || {
+            // SAFETY: The test transfers this uniquely owned Context through Box::into_raw and
+            // reconstructs it once.
             let context = unsafe { Box::from_raw(address as *mut Context) };
             context.refresh();
             assert_eq!(context.barrier_buffer.get(), 0);
@@ -651,6 +705,7 @@ mod tests {
     fn sync_gates_thread_nested_and_restored_contexts() {
         let _guard = crate::gc::isolated_runtime();
         let outer = active();
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         unsafe { &*outer }.refresh();
         let expected = (
             crate::preempt::willow_sync_poll_counter(),
@@ -702,7 +757,9 @@ mod tests {
             assert!(gates(&unselected).0.is_null());
             unselected.refresh();
             assert_eq!(gates(&unselected), gates_of(default));
+            // SAFETY: This activation keeps the installed context and its parent chain live.
             unsafe { &*active() }.refresh();
+            // SAFETY: This activation keeps the installed context and its parent chain live.
             assert_eq!(gates(unsafe { &*active() }), gates_of(default));
             let fresh = Context::for_runtime(default);
             assert_eq!(gates(&fresh), gates_of(default));
@@ -712,6 +769,7 @@ mod tests {
             assert_ne!(gates_of(isolated).1, gates_of(default).1);
             assert_ne!(gates_of(isolated).2, gates_of(default).2);
             // Selection published the thread context before any refresh.
+            // SAFETY: This activation keeps the installed context and its parent chain live.
             assert_eq!(gates(unsafe { &*active() }), gates_of(isolated));
             let task = Context::for_runtime(isolated);
             assert_eq!(gates(&task), gates_of(isolated));
@@ -732,6 +790,8 @@ mod tests {
     unsafe fn inline_push(roots: &RootWindow, slot: *mut *mut u8) {
         let top = roots.top.get();
         assert!(top < roots.limit.get());
+        // SAFETY: The root stack owns its backing allocation. Top counts initialized slots and the
+        // push protocol reserves capacity first.
         unsafe {
             roots.base.get().add(top).write(slot);
         }
@@ -741,50 +801,72 @@ mod tests {
     #[test]
     fn shadow_roots_inline_and_runtime_mutations_share_storage() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
         for count in [1, 16, 256, 4096] {
             let mut slots = vec![std::ptr::null_mut(); count + 1];
             crate::gc::willow_reserve_roots(count);
             with_roots(|roots| {
                 for slot in &mut slots[..count] {
+                    // SAFETY: The root stack owns its backing allocation. Top counts initialized
+                    // slots and the push protocol reserves capacity first.
                     unsafe {
                         inline_push(roots, slot);
                     }
                 }
             });
-            crate::gc::willow_push_root(&mut slots[count]);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { crate::gc::willow_push_root(&raw mut slots[count]) };
             assert_eq!(depth(), count + 1);
             with_roots(|roots| {
                 assert_eq!(roots.borrow()[count], &raw mut slots[count]);
                 roots.top.set(1);
             });
-            crate::gc::willow_pop_root();
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { crate::gc::willow_pop_root() };
             assert_eq!(depth(), 0);
         }
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
     }
 
     #[test]
     fn shadow_roots_nested_contexts_preserve_parent_slots() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
         let mut outer_slot = std::ptr::null_mut();
-        crate::gc::willow_push_root(&mut outer_slot);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { crate::gc::willow_push_root(&raw mut outer_slot) };
         let context = Context::new();
         let outer = replace(&context);
         assert_eq!(depth(), 1);
         let mut child_slot = std::ptr::null_mut();
-        crate::gc::willow_push_root(&mut child_slot);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { crate::gc::willow_push_root(&raw mut child_slot) };
         assert_eq!(depth(), 2);
         let mut slots = Vec::new();
         visit_roots(|roots| slots.extend_from_slice(roots));
         assert_eq!(slots, [&raw mut child_slot, &raw mut outer_slot]);
-        crate::gc::willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { crate::gc::willow_pop_root() };
         replace(outer);
         assert_eq!(depth(), 1);
-        crate::gc::willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { crate::gc::willow_pop_root() };
         assert_eq!(depth(), 0);
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
     }
 
     unsafe extern "C" fn unregister_then_push(_: *mut c_void) -> i32 {
@@ -792,6 +874,8 @@ mod tests {
         crate::gc::willow_gc_unregister_mutator();
         assert!(crate::gc::generated_roots_admitted());
         let mut slot = std::ptr::null_mut();
+        // SAFETY: The root stack owns its backing allocation. Top counts initialized slots and the
+        // push protocol reserves capacity first.
         with_roots(|roots| unsafe {
             inline_push(roots, &mut slot);
         });
@@ -803,23 +887,32 @@ mod tests {
     #[test]
     fn shadow_roots_unregister_empty_bridge_keeps_admission() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
         crate::gc::willow_gc_register_mutator();
         assert_eq!(
+            // SAFETY: The entry has the indicated generated calling convention. The bridge
+            // supplies its frame or word arguments and the live context register.
             unsafe { invoke(unregister_then_push as *const (), std::ptr::null_mut()) },
             1
         );
         assert!(!crate::gc::generated_roots_admitted());
         assert_eq!(depth(), 0);
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
     }
 
     #[test]
     fn shadow_roots_refresh_requires_new_legacy_admission() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
         crate::gc::willow_reserve_roots(8);
         crate::gc::leave_generated_roots();
+        // SAFETY: This activation keeps the installed context and its parent chain live.
         unsafe { &*active() }.refresh();
         with_roots(|roots| assert_eq!(roots.limit.get(), 0));
         // An empty collector snapshot must not accidentally grant admission.
@@ -828,7 +921,9 @@ mod tests {
         crate::gc::willow_reserve_roots(8);
         assert!(crate::gc::generated_roots_admitted());
         crate::gc::leave_generated_roots();
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
     }
 
     #[unsafe(naked)]
@@ -863,6 +958,8 @@ mod tests {
     #[test]
     fn bridge_preserves_native_callers_register() {
         assert_eq!(
+            // SAFETY: The entry has the indicated generated calling convention. The bridge
+            // supplies its frame or word arguments and the live context register.
             unsafe {
                 check_preserved_register(check_register as *const (), active().cast_mut().cast())
             },
@@ -874,6 +971,8 @@ mod tests {
     fn bridge_installs_thread_and_nested_stable_contexts() {
         let thread = active();
         assert_eq!(
+            // SAFETY: The entry has the indicated generated calling convention. The bridge
+            // supplies its frame or word arguments and the live context register.
             unsafe { invoke(check_register as *const (), thread.cast_mut().cast()) },
             1
         );
@@ -882,6 +981,8 @@ mod tests {
         let old = replace(&context);
         assert!(old.is_null());
         assert_eq!(
+            // SAFETY: The entry has the indicated generated calling convention. The bridge
+            // supplies its frame or word arguments and the live context register.
             unsafe {
                 invoke(
                     check_register as *const (),
@@ -895,6 +996,8 @@ mod tests {
         let outer = replace(&nested);
         assert_eq!(outer, &raw const context);
         assert_eq!(
+            // SAFETY: The entry has the indicated generated calling convention. The bridge
+            // supplies its frame or word arguments and the live context register.
             unsafe {
                 invoke(
                     check_register as *const (),
@@ -927,6 +1030,8 @@ mod tests {
         context.refresh();
         let old = replace(&context);
         assert_eq!(
+            // SAFETY: The entry has the indicated generated calling convention. The bridge
+            // supplies its frame or word arguments and the live context register.
             unsafe { invoke(clear_helper as *const (), std::ptr::null_mut()) },
             7
         );
@@ -956,6 +1061,8 @@ mod tests {
         let old = replace(&context);
         for value in [i64::MIN, i64::MAX, -4294967297, 4294967297, -1, 0, 1] {
             assert_eq!(
+                // SAFETY: The entry has the indicated generated calling convention. The bridge
+                // supplies its frame or word arguments and the live context register.
                 unsafe { invoke_i64(scalar_echo_and_clear_helper, value) },
                 value
             );
@@ -967,6 +1074,8 @@ mod tests {
             assert_eq!(context.bridge_depth.get(), initial_depth + 1);
             for value in [i64::MIN, i64::MAX, -4294967297, 4294967297, -1, 0, 1] {
                 assert_eq!(
+                    // SAFETY: The entry has the indicated generated calling convention. The bridge
+                    // supplies its frame or word arguments and the live context register.
                     unsafe { bridge.call(scalar_echo_and_clear_helper, value) },
                     value
                 );

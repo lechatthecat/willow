@@ -20,8 +20,10 @@ fn m4_pause_scaling_probe() {
     let samples = setting("M4_SAMPLES", 101);
     assert!(chunks > 0 && roots > 0 && remembered <= 256);
     for sample in 0..samples {
-        reset_internal();
-        let mut tls = tlab_state_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
+        let tls = tlab_state_for_test();
         {
             let mut state = runtime().heap.lock().unwrap();
             state.threshold_bytes = usize::MAX;
@@ -57,14 +59,22 @@ fn m4_pause_scaling_probe() {
         for _ in 0..chunks {
             for index in 0..per_chunk {
                 let node = if index == 0 {
-                    willow_gc_alloc_slow(&mut tls, 1, 0, 8, 1)
+                    // SAFETY: The fixture owns the stable TLAB through unregistration. The
+                    // requested size and tracing metadata describe the object initialized
+                    // here.
+                    unsafe { willow_gc_alloc_slow(tls.as_ptr(), 1, 0, 8, 1) }
                 } else {
                     let cursor = tls.cursor.load(Ordering::Acquire);
-                    initialize_object_at(cursor as *mut u8, size, 0, 1, 1).unwrap();
+                    // SAFETY: The allocation cursor reserves this aligned header and its
+                    // complete payload. The supplied type and mask describe the initialized
+                    // words.
+                    unsafe { initialize_object_at(cursor as *mut u8, size, 0, 1, 1) }.unwrap();
                     publish_tlab_start_for_test(&tls, cursor as *mut u8);
                     tls.cursor.store(cursor + size, Ordering::Release);
                     (cursor + GC_HEADER_SIZE) as *mut u8
                 };
+                // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the
+                // accessed words.
                 unsafe {
                     *node.cast::<*mut u8>() = head;
                 }
@@ -74,7 +84,9 @@ fn m4_pause_scaling_probe() {
         }
         let mut root_slots = vec![head; roots];
         for slot in &mut root_slots {
-            willow_gc_add_runtime_root_slot(slot);
+            // SAFETY: The registration and removal use the same initialized slot, whose
+            // storage spans both operations.
+            unsafe { willow_gc_add_runtime_root_slot(slot) };
         }
         let mut pin_slots: Vec<_> = nodes.iter().copied().take(pins).collect();
         assert_eq!(pin_slots.len(), pins);
@@ -82,7 +94,11 @@ fn m4_pause_scaling_probe() {
             runtime().pin_lease_slots.add((slot as *mut *mut u8).cast());
         }
         for &owner in owners.iter().take(remembered) {
-            willow_gc_write_barrier(owner, std::ptr::null_mut(), head, 1);
+            // SAFETY: The destination describes this reference update. Any asserted header
+            // belongs to its live GC payload.
+            unsafe { willow_gc_write_barrier(owner, std::ptr::null_mut(), head, 1) };
+            // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the
+            // accessed words.
             unsafe {
                 *owner.cast::<*mut u8>() = head;
             }
@@ -107,6 +123,8 @@ fn m4_pause_scaling_probe() {
         let mut cursor = root_slots[0];
         for _ in 0..nodes.len() {
             assert!(!cursor.is_null());
+            // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the
+            // accessed words.
             cursor = unsafe { *cursor.cast::<*mut u8>() };
         }
         assert!(cursor.is_null());
@@ -130,7 +148,9 @@ fn m4_pause_scaling_probe() {
         // M4_COMPONENTS_END
         drop(state);
         for slot in &mut root_slots {
-            willow_gc_remove_runtime_root_slot(slot);
+            // SAFETY: The registration and removal use the same initialized slot, whose
+            // storage spans both operations.
+            unsafe { willow_gc_remove_runtime_root_slot(slot) };
         }
         for slot in &mut pin_slots {
             runtime()
@@ -138,6 +158,8 @@ fn m4_pause_scaling_probe() {
                 .remove((slot as *mut *mut u8).cast());
         }
         std::hint::black_box(background);
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
     }
 }

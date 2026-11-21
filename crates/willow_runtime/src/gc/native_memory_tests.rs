@@ -43,20 +43,26 @@ fn short_lived_string_churn_bounds_reservations_and_rss() {
         (150_000, 40_000),
         (1_000_000, 4_000),
     ] {
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let source = vec![b'x'; size];
-        let base = GcRootHandle::new(crate::string::willow_string_alloc(
-            source.as_ptr(),
-            size as i64,
-        ));
+        // SAFETY: The source vector contains exactly size initialized bytes.
+        let base = GcRootHandle::new(unsafe {
+            crate::string::willow_string_alloc(source.as_ptr(), size as i64)
+        });
         drop(source);
         let before = telemetry_heap_snapshot().0;
         let mut peak_reserved = 0;
         let mut peak_sample = crate::gc_telemetry::measurement::GcMemoryV3::default();
         let mut total = 0u64;
         for i in 0..n {
-            let rest = crate::string::willow_string_substring(base.load(), i as i64, size as i64);
-            total += crate::string::willow_string_len(rest) as u64;
+            // SAFETY: The base handle supplies the current live string.
+            let rest = unsafe {
+                crate::string::willow_string_substring(base.load(), i as i64, size as i64)
+            };
+            // SAFETY: The substring just returned a live result; no collection intervened.
+            total += unsafe { crate::string::willow_string_len(rest) } as u64;
             // Sampling heap counters does not allocate managed objects or GC.
             let mut state = runtime().heap.lock().unwrap();
             sync_tlab_accounting(&mut state);
@@ -89,7 +95,11 @@ fn short_lived_string_churn_bounds_reservations_and_rss() {
         let (counters, heap) = telemetry_heap_snapshot();
         assert_eq!(heap.occupied_bytes, (size + GC_HEADER_SIZE + 9) as u64);
         assert_eq!(counters.allocation_count - counters.freed_objects, 1);
-        assert_eq!(crate::string::willow_string_len(base.load()), size as i64);
+        assert_eq!(
+            // SAFETY: The base handle supplies the current live string.
+            unsafe { crate::string::willow_string_len(base.load()) },
+            size as i64
+        );
         drop(base);
         willow_gc_collect();
         assert_eq!(telemetry_heap_snapshot().1.occupied_bytes, 0);
@@ -123,11 +133,16 @@ fn short_lived_string_churn_bounds_reservations_and_rss() {
 #[test]
 fn native_bytes_participate_in_reservation_and_trigger_inputs() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     let mut map = crate::map::willow_map_new(0, 0, 0);
-    willow_push_root(&mut map);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut map) };
     for key in 0..1024 {
-        crate::map::willow_map_insert(map, key, 0, key, 0);
+        // SAFETY: This live map was constructed with scalar key and value slots.
+        unsafe { crate::map::willow_map_insert(map, key, 0, key, 0) };
     }
     let external = external_bytes();
     assert!(external > 0);
@@ -147,7 +162,9 @@ fn native_bytes_participate_in_reservation_and_trigger_inputs() {
         true
     ));
     runtime().heap.lock().unwrap().memory_limit_bytes = None;
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
     willow_gc_collect();
     assert_eq!(external_bytes(), 0);
 }
@@ -155,15 +172,20 @@ fn native_bytes_participate_in_reservation_and_trigger_inputs() {
 #[test]
 fn native_growth_requests_collection_without_a_managed_allocation() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     let mut map = crate::map::willow_map_new(0, 0, 0);
-    willow_push_root(&mut map);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut map) };
     willow_gc_register_mutator();
     runtime().heap.lock().unwrap().threshold_bytes = 1;
     // A direct policy write must re-arm lock-free native charging.
     invalidate_runtime_policy_budgets();
     let allocations = runtime().heap.lock().unwrap().total_allocs;
-    crate::map::willow_map_insert(map, 42, 0, 7, 0);
+    // SAFETY: This live map was constructed with scalar key and value slots.
+    unsafe { crate::map::willow_map_insert(map, 42, 0, 7, 0) };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while runtime().heap.lock().unwrap().major_collections == 0 {
         willow_gc_safepoint();
@@ -175,10 +197,13 @@ fn native_growth_requests_collection_without_a_managed_allocation() {
     }
     coordinator::shutdown();
     assert_eq!(runtime().heap.lock().unwrap().total_allocs, allocations);
-    assert_eq!(crate::map::willow_map_len(map), 1);
+    // SAFETY: The handle is a live map from this fixture or its frozen copy.
+    assert_eq!(unsafe { crate::map::willow_map_len(map) }, 1);
     assert!(external_bytes() > 0);
     willow_gc_unregister_mutator();
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
     willow_gc_collect();
     assert_eq!(external_bytes(), 0);
 }
@@ -186,7 +211,9 @@ fn native_growth_requests_collection_without_a_managed_allocation() {
 #[test]
 fn native_allocation_progress_reaches_soft_controller_without_managed_allocations() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     let map = crate::map::willow_map_new(0, 0, 0);
     let before = {
         let state = runtime().heap.lock().unwrap();
@@ -194,7 +221,8 @@ fn native_allocation_progress_reaches_soft_controller_without_managed_allocation
     };
     let managed = runtime().heap.lock().unwrap().total_allocated_bytes;
     for key in 0..128 {
-        crate::map::willow_map_insert(map, key, 0, key, 0);
+        // SAFETY: This live map was constructed with scalar key and value slots.
+        unsafe { crate::map::willow_map_insert(map, key, 0, key, 0) };
     }
     let state = runtime().heap.lock().unwrap();
     assert_eq!(state.total_allocated_bytes, managed);
@@ -211,13 +239,19 @@ fn native_allocation_progress_reaches_soft_controller_without_managed_allocation
 #[test]
 fn gc_owned_async_lock_finalizers_release_the_boxed_states() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     for reset in [false, true] {
-        crate::async_mutex::willow_async_mutex_new(42, 0);
-        crate::async_rwlock::willow_async_rwlock_new(42, 0);
+        // SAFETY: The initial word matches the constructor’s reference flag.
+        unsafe { crate::async_mutex::willow_async_mutex_new(42, 0) };
+        // SAFETY: The initial word matches the constructor’s reference flag.
+        unsafe { crate::async_rwlock::willow_async_rwlock_new(42, 0) };
         assert!(external_bytes() > 0);
         if reset {
-            willow_gc_init();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { willow_gc_init() };
         } else {
             willow_gc_collect();
         }
@@ -228,11 +262,16 @@ fn gc_owned_async_lock_finalizers_release_the_boxed_states() {
 #[test]
 fn managed_growth_crosses_pacer_trigger_with_constant_native_storage() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     let mut map = crate::map::willow_map_new(0, 0, 0);
-    willow_push_root(&mut map);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut map) };
     for key in 0..128 {
-        crate::map::willow_map_insert(map, key, 0, key, 0);
+        // SAFETY: This live map was constructed with scalar key and value slots.
+        unsafe { crate::map::willow_map_insert(map, key, 0, key, 0) };
     }
     let native = external_bytes();
     assert!(native > 256);
@@ -259,16 +298,22 @@ fn managed_growth_crosses_pacer_trigger_with_constant_native_storage() {
         allocation_should_collect_with_sync_in(crate::runtime::current(), true),
         "combined occupancy crossed the pacer trigger"
     );
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
     willow_gc_collect();
 }
 
 #[test]
 fn native_growth_is_included_in_allocation_path_pacer_sample() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     let mut map = crate::map::willow_map_new(0, 0, 0);
-    willow_push_root(&mut map);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut map) };
     {
         let mut state = runtime().heap.lock().unwrap();
         let total = memory_inputs(&state).allocated_total;
@@ -278,7 +323,8 @@ fn native_growth_is_included_in_allocation_path_pacer_sample() {
     // per-entry size depends on the map layout, so do not fix a key count.
     let mut key = 0;
     while external_bytes() < 65536 {
-        crate::map::willow_map_insert(map, key, 0, key, 0);
+        // SAFETY: This live map was constructed with scalar key and value slots.
+        unsafe { crate::map::willow_map_insert(map, key, 0, key, 0) };
         key += 1;
         assert!(key < 1 << 20, "map growth was not accounted");
     }
@@ -298,17 +344,22 @@ fn native_growth_is_included_in_allocation_path_pacer_sample() {
         );
         assert!(state.pacer.sample_due(total + 65536));
     }
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
     willow_gc_collect();
 }
 
 #[test]
 fn cycle_completion_pacer_sample_keeps_cumulative_native_growth_after_drop() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     let map = crate::map::willow_map_new(0, 0, 0);
     for key in 0..128 {
-        crate::map::willow_map_insert(map, key, 0, key, 0);
+        // SAFETY: This live map was constructed with scalar key and value slots.
+        unsafe { crate::map::willow_map_insert(map, key, 0, key, 0) };
     }
     assert!(external_bytes() > 0);
     let total = {
@@ -330,12 +381,16 @@ fn cycle_completion_pacer_sample_keeps_cumulative_native_growth_after_drop() {
 fn unchanged_high_reservations_do_not_collect_per_managed_allocation() {
     let _guard = isolated_runtime();
     for count in [16, 128, 1024] {
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         runtime().heap.lock().unwrap().memory_limit_bytes = Some(300 * 1024);
         let mut roots = vec![std::ptr::null_mut(); count];
         for root in &mut roots {
             *root = willow_alloc(8);
-            willow_push_root(root);
+            // SAFETY: The slot storage stays live and stationary through the matching pop,
+            // including during collection.
+            unsafe { willow_push_root(root) };
         }
         let mut state = runtime().heap.lock().unwrap();
         assert_eq!(state.old_reserved_bytes, 256 * 1024);
@@ -358,7 +413,9 @@ fn unchanged_high_reservations_do_not_collect_per_managed_allocation() {
             state.old_reserved_bytes, state.allocated_bytes, state.major_collections
         );
         drop(state);
-        willow_pop_roots(count as i32);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(count as i32) };
         willow_gc_collect();
     }
 }
@@ -366,7 +423,9 @@ fn unchanged_high_reservations_do_not_collect_per_managed_allocation() {
 #[test]
 fn reservation_pressure_hysteresis_rearms_after_reclamation_and_reset() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     let mut state = GcState {
         memory_limit_bytes: Some(400),
         ..GcState::default()
@@ -395,7 +454,9 @@ fn reservation_pressure_hysteresis_rearms_after_reclamation_and_reset() {
     for _ in 0..2 {
         runtime().heap.lock().unwrap().memory_limit_bytes = Some(300 * 1024);
         let mut root = willow_alloc(8);
-        willow_push_root(&mut root);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
         assert!(allocation_should_collect_with_sync_in(
             crate::runtime::current(),
             true
@@ -404,7 +465,9 @@ fn reservation_pressure_hysteresis_rearms_after_reclamation_and_reset() {
             crate::runtime::current(),
             true
         ));
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         willow_gc_collect();
         let state = runtime().heap.lock().unwrap();
         assert_eq!(state.old_reserved_bytes, 0);
@@ -414,16 +477,22 @@ fn reservation_pressure_hysteresis_rearms_after_reclamation_and_reset() {
         );
     }
     runtime().heap.lock().unwrap().hard_pressure_triggered = true;
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     assert!(!runtime().heap.lock().unwrap().hard_pressure_triggered);
 }
 
 #[test]
 fn reservation_latch_does_not_suppress_occupied_pacer_pressure() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     let mut root = willow_alloc(8);
-    willow_push_root(&mut root);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut root) };
     let mut state = runtime().heap.lock().unwrap();
     state.memory_limit_bytes = Some(300 * 1024);
     assert!(hard_reservation_pressure(&mut state));
@@ -436,14 +505,18 @@ fn reservation_latch_does_not_suppress_occupied_pacer_pressure() {
         allocation_should_collect_with_sync_in(crate::runtime::current(), true),
         "occupancy must still trigger while reservation pressure is latched"
     );
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
     willow_gc_collect();
 }
 
 #[test]
 fn managed_growth_consumes_lock_free_native_headroom_before_pacer_crossing() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     willow_gc_register_mutator();
     let room = 4096u64;
     {
@@ -498,7 +571,9 @@ fn managed_growth_consumes_lock_free_native_headroom_before_pacer_crossing() {
 #[test]
 fn native_charges_far_below_a_hard_cap_skip_the_heap_lock() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     let cap = 1usize << 40;
     {
         let mut state = runtime().heap.lock().unwrap();
@@ -556,12 +631,15 @@ fn native_charges_far_below_a_hard_cap_skip_the_heap_lock() {
 #[test]
 fn native_pressure_is_estimated_separately_from_managed_telemetry() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     let map = crate::map::willow_map_new(0, 0, 0);
     let root = GcRootHandle::new(map);
     let before = telemetry_heap_snapshot();
     for key in 0..1024 {
-        crate::map::willow_map_insert(root.load(), key, 0, key, 0);
+        // SAFETY: This live map was constructed with scalar key and value slots.
+        unsafe { crate::map::willow_map_insert(root.load(), key, 0, key, 0) };
     }
     let native = crate::gc_telemetry::native_memory_snapshot();
     assert!(native.requested_bytes > 0);
@@ -603,7 +681,9 @@ fn native_pressure_is_estimated_separately_from_managed_telemetry() {
 #[test]
 fn native_accounting_underflow_does_not_wrap_or_change_the_gauge() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     let before = external_bytes();
     assert!(std::panic::catch_unwind(|| release_external(before + 1)).is_err());
     assert_eq!(external_bytes(), before);
@@ -614,7 +694,9 @@ fn m0_threshold_locked_sample_reports_actual_limit_and_categories() {
     const CHILD: &str = "WILLOW_TEST_CAPTURED_THRESHOLD";
     if std::env::var_os(CHILD).is_some() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         std::panic::set_hook(Box::new(|_| {}));
         willow_alloc(8);
         charge_external(123);
@@ -657,7 +739,9 @@ fn m0_threshold_locked_sample_reports_actual_limit_and_categories() {
 #[test]
 fn lock_free_native_headroom_counts_retained_region_storage() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     {
         let mut state = runtime().heap.lock().unwrap();
         state.memory_limit_bytes = Some(1 << 30);
@@ -666,7 +750,9 @@ fn lock_free_native_headroom_counts_retained_region_storage() {
     }
     invalidate_runtime_policy_budgets();
     while willow_gc_old_region_count() < 4 {
-        willow_alloc_object(1, 8);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        unsafe { willow_alloc_object(1, 8) };
     }
     willow_gc_collect();
     let retained = runtime().heap.lock().unwrap().region_cache.retained_bytes();
@@ -721,7 +807,9 @@ fn lock_free_native_headroom_counts_retained_region_storage() {
     release_external(1 + room);
     runtime().heap.lock().unwrap().memory_limit_bytes = None;
     willow_gc_collect();
-    reset_internal();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal() };
 }
 
 /// a soft limit bounds retained region storage. A collection
@@ -729,12 +817,16 @@ fn lock_free_native_headroom_counts_retained_region_storage() {
 #[test]
 fn soft_limit_bounds_retained_region_storage() {
     let _guard = isolated_runtime();
-    willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { willow_gc_init() };
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX / 2;
     invalidate_runtime_policy_budgets();
     let fill_cache = || {
         while willow_gc_old_region_count() < 4 {
-            willow_alloc_object(1, 8);
+            // SAFETY: The requested layout describes the initialized words of this object and
+            // its type’s tracing or finalization contract.
+            unsafe { willow_alloc_object(1, 8) };
         }
         willow_gc_collect();
     };
@@ -792,7 +884,9 @@ fn soft_limit_bounds_retained_region_storage() {
     willow_gc_set_memory_limit(limit as u64);
     // Soft pressure may collect during this loop; each release is bounded.
     for _ in 0..4 * GC_OLD_REGION_SIZE / (GC_HEADER_SIZE + 8) {
-        willow_alloc_object(1, 8);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        unsafe { willow_alloc_object(1, 8) };
     }
     willow_gc_collect();
     let (pressure, retained) = footprint();
@@ -802,7 +896,9 @@ fn soft_limit_bounds_retained_region_storage() {
         "{pressure} + {retained} > {limit}"
     );
     willow_gc_set_memory_limit(0);
-    reset_internal();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal() };
 }
 
 #[test]

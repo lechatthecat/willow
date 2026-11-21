@@ -38,6 +38,8 @@ impl NativeFrameSpec for NetTaskFrame {
 }
 
 unsafe fn net_frame(frame: *mut c_void) -> NativeTaskFrame<NetTaskFrame> {
+    // SAFETY: The scheduler passes the frame allocated for this native callback and retains it
+    // during the poll.
     unsafe { NativeTaskFrame::from_raw(frame) }
 }
 
@@ -47,6 +49,8 @@ enum NetworkHandle {
 }
 
 unsafe fn drop_network_handle(payload: *mut u8) {
+    // SAFETY: The collector calls the matching finalizer once before releasing the initialized,
+    // word-aligned GC payload.
     unsafe { std::ptr::drop_in_place(payload.cast::<NetworkHandle>()) };
 }
 
@@ -56,31 +60,42 @@ const NETWORK_HANDLE_DROP_COUNT: crate::observation::Counter =
 
 const NETWORK_REGISTRATION: crate::gc::NativeGcRegistration =
     crate::gc::NativeGcRegistration::Network;
-const NETWORK_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
-    NETWORK_HANDLE_TYPE_ID,
-    None,
-    Some(drop_network_handle),
-)];
+// SAFETY: The network handle constructor installs this ID only on its matching initialized
+// representation. The callbacks use that same layout.
+const NETWORK_GC_TYPES: &[crate::gc::NativeGcType] = &[unsafe {
+    crate::gc::NativeGcType::new(NETWORK_HANDLE_TYPE_ID, None, Some(drop_network_handle))
+}];
 
 fn ensure_network_handle_registered() {
-    NETWORK_REGISTRATION.ensure(NETWORK_GC_TYPES);
+    // SAFETY: This is the complete descriptor set for the network handle registration group
+    // and its constructors.
+    unsafe { NETWORK_REGISTRATION.ensure(NETWORK_GC_TYPES) };
 }
 
 fn alloc_handle(handle: NetworkHandle) -> *mut u8 {
     ensure_network_handle_registered();
-    let payload = crate::gc::willow_alloc_with_layout(
-        GcObjectKind::Class,
-        NETWORK_HANDLE_TYPE_ID,
-        std::mem::size_of::<NetworkHandle>() as i64,
-        0,
-    );
+    const { assert!(align_of::<NetworkHandle>() <= align_of::<crate::gc::GcHeader>()) };
+    // SAFETY: The constructor selects the matching payload layout and initializes its fields
+    // before exposing it or reaching a GC point.
+    let payload = unsafe {
+        crate::gc::willow_alloc_with_layout(
+            GcObjectKind::Class,
+            NETWORK_HANDLE_TYPE_ID,
+            std::mem::size_of::<NetworkHandle>() as i64,
+            0,
+        )
+    };
     if !payload.is_null() {
+        // SAFETY: The network constructor reserves word-aligned GC storage sized for
+        // NetworkHandle. A non-null handle designates that payload.
         unsafe { payload.cast::<NetworkHandle>().write(handle) };
     }
     payload
 }
 
 unsafe fn handle<'a>(payload: *mut u8) -> Option<&'a NetworkHandle> {
+    // SAFETY: The network constructor reserves word-aligned GC storage sized for NetworkHandle. A
+    // non-null handle designates that payload.
     unsafe { payload.cast::<NetworkHandle>().as_ref() }
 }
 
@@ -89,21 +104,30 @@ fn ok_handle(handle: NetworkHandle) -> *mut u8 {
     if handle.is_null() {
         return std::ptr::null_mut();
     }
-    willow_push_root(&mut handle as *mut *mut u8);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut handle) };
     let result = crate::fs::alloc_ok(handle as i64, true);
-    willow_pop_roots(1);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_roots(1) };
     result
 }
 
 fn ok_string(value: &str) -> *mut u8 {
     let mut string = crate::string::willow_string_from_str(value);
-    willow_push_root(&mut string as *mut *mut u8);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut string) };
     let result = crate::fs::alloc_ok(string as i64, true);
-    willow_pop_roots(1);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_roots(1) };
     result
 }
 
 fn parse_address(address: *const u8) -> Result<(String, SocketAddr), *mut u8> {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let address = unsafe { willow_string_as_str(address) }.to_string();
     match address.parse::<SocketAddr>() {
         Ok(parsed) => Ok((address, parsed)),
@@ -116,9 +140,12 @@ fn parse_address(address: *const u8) -> Result<(String, SocketAddr), *mut u8> {
 /// Bind a non-blocking TCP listener. Address resolution is deliberately not
 /// hidden in this operation: v1 accepts numeric `IP:port` strings, avoiding a
 /// DNS lookup on a scheduler worker.
+///
+/// # Safety
+/// A non-null address must be a current immutable WillowString through the address copy.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_net_bind(address: *const u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_net_bind(address: *const u8) -> *mut u8 {
     let (address, parsed) = match parse_address(address) {
         Ok(value) => value,
         Err(error) => return error,
@@ -132,9 +159,14 @@ pub extern "C" fn willow_net_bind(address: *const u8) -> *mut u8 {
     }
 }
 
+/// # Safety
+/// A non-null `listener` must be a live network handle allocated by this runtime.
+/// Keep it reachable through the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_net_local_addr(listener: *mut u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_net_local_addr(listener: *mut u8) -> *mut u8 {
+    // SAFETY: The network constructor reserves word-aligned GC storage sized for NetworkHandle. A
+    // non-null handle designates that payload.
     let Some(NetworkHandle::Listener(listener)) = (unsafe { handle(listener) }) else {
         return crate::fs::alloc_io_err("net::local_addr: invalid TcpListener");
     };
@@ -144,9 +176,14 @@ pub extern "C" fn willow_net_local_addr(listener: *mut u8) -> *mut u8 {
     }
 }
 
+/// # Safety
+/// A non-null `stream` must be a live network handle allocated by this runtime.
+/// Keep it reachable through the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_net_peer_addr(stream: *mut u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_net_peer_addr(stream: *mut u8) -> *mut u8 {
+    // SAFETY: The network constructor reserves word-aligned GC storage sized for NetworkHandle. A
+    // non-null handle designates that payload.
     let Some(NetworkHandle::Stream(stream)) = (unsafe { handle(stream) }) else {
         return crate::fs::alloc_io_err("net::peer_addr: invalid TcpStream");
     };
@@ -156,9 +193,14 @@ pub extern "C" fn willow_net_peer_addr(stream: *mut u8) -> *mut u8 {
     }
 }
 
+/// # Safety
+/// A non-null `stream` must be a live network handle allocated by this runtime.
+/// Keep it reachable through the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_net_shutdown(stream: *mut u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_net_shutdown(stream: *mut u8) -> *mut u8 {
+    // SAFETY: The network constructor reserves word-aligned GC storage sized for NetworkHandle. A
+    // non-null handle designates that payload.
     let Some(NetworkHandle::Stream(stream)) = (unsafe { handle(stream) }) else {
         return crate::fs::alloc_io_err("net::shutdown: invalid TcpStream");
     };
@@ -194,6 +236,8 @@ enum NetOperation {
 }
 
 unsafe fn task_handle(frame: *mut c_void) -> *mut u8 {
+    // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+    // frame.
     unsafe { net_frame(frame) }.load_gc(NET_TASK_HANDLE_SLOT)
 }
 
@@ -239,6 +283,8 @@ fn register(fd: i64, interest: i32) -> Result<(), String> {
 }
 
 unsafe fn store_handle(frame: *mut c_void, handle: *mut u8) {
+    // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+    // frame.
     unsafe { net_frame(frame) }.store_gc(NET_TASK_HANDLE_SLOT, handle);
 }
 
@@ -246,6 +292,10 @@ unsafe fn finish(frame: *mut c_void, result: *mut u8, fd: Option<i64>) -> i32 {
     if let Some(fd) = fd {
         crate::netpoll::deregister_current(fd);
     }
+    // SAFETY: The scheduler keeps this frame live and serializes its poll and cancel
+    // callbacks. Every non-null operation slot holds a Box::into_raw pointer. take_native
+    // clears the slot, so only the callback that took it may reclaim the Box. When the
+    // poll already owns the Box, finish sees a null slot and the poll drops it on return.
     unsafe {
         let frame = net_frame(frame);
         frame.store_gc(NET_TASK_RESULT_SLOT, result);
@@ -259,6 +309,8 @@ unsafe fn finish(frame: *mut c_void, result: *mut u8, fd: Option<i64>) -> i32 {
 
 unsafe fn finish_error(frame: *mut c_void, message: &str, fd: Option<i64>) -> i32 {
     let error = crate::fs::alloc_io_err(message);
+    // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+    // frame.
     unsafe { finish(frame, error, fd) }
 }
 
@@ -270,10 +322,14 @@ unsafe fn poll_connect(frame: *mut c_void, operation: &mut NetOperation) -> i32 
         started,
     } = operation
     else {
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         return unsafe { finish_error(frame, "net::connect_async: invalid operation", None) };
     };
 
     let Some(active) = socket.as_ref() else {
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         return unsafe { finish_error(frame, "net::connect_async: missing socket", None) };
     };
     let fd = raw_socket(active);
@@ -284,11 +340,15 @@ unsafe fn poll_connect(frame: *mut c_void, operation: &mut NetOperation) -> i32 
             Err(error) if connect_in_progress(&error) => {
                 return match register(fd, crate::netpoll::WILLOW_NETPOLL_WRITABLE) {
                     Ok(()) => crate::task::RUNTIME_POLL_PENDING,
+                    // SAFETY: The scheduler pairs this network callback with its live, initialized
+                    // operation frame.
                     Err(message) => unsafe { finish_error(frame, &message, Some(fd)) },
                 };
             }
             Err(error) => {
                 let message = format!("{address_text}: {error}");
+                // SAFETY: The scheduler pairs this network callback with its live, initialized
+                // operation frame.
                 return unsafe { finish_error(frame, &message, Some(fd)) };
             }
         }
@@ -296,10 +356,14 @@ unsafe fn poll_connect(frame: *mut c_void, operation: &mut NetOperation) -> i32 
         match active.take_error() {
             Ok(Some(error)) => {
                 let message = format!("{address_text}: {error}");
+                // SAFETY: The scheduler pairs this network callback with its live, initialized
+                // operation frame.
                 return unsafe { finish_error(frame, &message, Some(fd)) };
             }
             Err(error) => {
                 let message = format!("{address_text}: {error}");
+                // SAFETY: The scheduler pairs this network callback with its live, initialized
+                // operation frame.
                 return unsafe { finish_error(frame, &message, Some(fd)) };
             }
             Ok(None) => {
@@ -309,10 +373,14 @@ unsafe fn poll_connect(frame: *mut c_void, operation: &mut NetOperation) -> i32 
                     {
                         return match register(fd, crate::netpoll::WILLOW_NETPOLL_WRITABLE) {
                             Ok(()) => crate::task::RUNTIME_POLL_PENDING,
+                            // SAFETY: The scheduler pairs this network callback with its live,
+                            // initialized operation frame.
                             Err(message) => unsafe { finish_error(frame, &message, Some(fd)) },
                         };
                     }
                     let message = format!("{address_text}: {error}");
+                    // SAFETY: The scheduler pairs this network callback with its live, initialized
+                    // operation frame.
                     return unsafe { finish_error(frame, &message, Some(fd)) };
                 }
             }
@@ -323,42 +391,68 @@ unsafe fn poll_connect(frame: *mut c_void, operation: &mut NetOperation) -> i32 
     let stream: TcpStream = socket.into();
     let handle = alloc_handle(NetworkHandle::Stream(stream));
     if handle.is_null() {
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         return unsafe { finish(frame, std::ptr::null_mut(), Some(fd)) };
     }
+    // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+    // frame.
     unsafe { store_handle(frame, handle) };
     let result = crate::fs::alloc_ok(handle as i64, true);
+    // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+    // frame.
     unsafe { finish(frame, result, Some(fd)) }
 }
 
 unsafe fn poll_accept(frame: *mut c_void) -> i32 {
+    // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+    // frame.
     let handle_ptr = unsafe { task_handle(frame) };
+    // SAFETY: The network constructor reserves word-aligned GC storage sized for NetworkHandle. A
+    // non-null handle designates that payload.
     let Some(NetworkHandle::Listener(listener)) = (unsafe { handle(handle_ptr) }) else {
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         return unsafe { finish_error(frame, "net::accept_async: invalid TcpListener", None) };
     };
     let fd = raw_socket(listener);
     match listener.accept() {
         Ok((stream, _)) => {
             if let Err(error) = stream.set_nonblocking(true) {
+                // SAFETY: The scheduler pairs this network callback with its live, initialized
+                // operation frame.
                 return unsafe {
                     finish_error(frame, &format!("net::accept_async: {error}"), Some(fd))
                 };
             }
             let accepted = alloc_handle(NetworkHandle::Stream(stream));
             if accepted.is_null() {
+                // SAFETY: The scheduler pairs this network callback with its live, initialized
+                // operation frame.
                 return unsafe { finish(frame, std::ptr::null_mut(), Some(fd)) };
             }
             let mut accepted_root = accepted;
-            willow_push_root(&mut accepted_root as *mut *mut u8);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut accepted_root) };
             let result = crate::fs::alloc_ok(accepted_root as i64, true);
-            willow_pop_roots(1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(1) };
+            // SAFETY: The scheduler pairs this network callback with its live, initialized
+            // operation frame.
             unsafe { finish(frame, result, Some(fd)) }
         }
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
             match register(fd, crate::netpoll::WILLOW_NETPOLL_READABLE) {
                 Ok(()) => crate::task::RUNTIME_POLL_PENDING,
+                // SAFETY: The scheduler pairs this network callback with its live, initialized
+                // operation frame.
                 Err(message) => unsafe { finish_error(frame, &message, Some(fd)) },
             }
         }
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         Err(error) => unsafe {
             finish_error(frame, &format!("net::accept_async: {error}"), Some(fd))
         },
@@ -371,8 +465,14 @@ unsafe fn poll_read(
     binary: bool,
     buffered: &mut Vec<u8>,
 ) -> i32 {
+    // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+    // frame.
     let handle_ptr = unsafe { task_handle(frame) };
+    // SAFETY: The network constructor reserves word-aligned GC storage sized for NetworkHandle. A
+    // non-null handle designates that payload.
     let Some(NetworkHandle::Stream(stream)) = (unsafe { handle(handle_ptr) }) else {
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         return unsafe { finish_error(frame, "net::read_async: invalid TcpStream", None) };
     };
     let fd = raw_socket(stream);
@@ -384,23 +484,35 @@ unsafe fn poll_read(
         Ok(read) => {
             if binary {
                 let mut array = crate::array::from_native_bytes(&bytes[..read]);
-                willow_push_root(&mut array);
+                // SAFETY: The initialized slot stays at this address until its registration
+                // is popped; collection may rewrite it there.
+                unsafe { willow_push_root(&raw mut array) };
                 let result = crate::fs::alloc_ok(array as i64, true);
-                willow_pop_roots(1);
+                // SAFETY: The removed shadow-stack entries belong to this operation and their
+                // slot storage is still live.
+                unsafe { willow_pop_roots(1) };
+                // SAFETY: The scheduler pairs this network callback with its live, initialized
+                // operation frame.
                 return unsafe { finish(frame, result, Some(fd)) };
             }
             buffered.extend_from_slice(&bytes[..read]);
             match std::str::from_utf8(buffered) {
                 Ok(text) => {
                     let result = ok_string(text);
+                    // SAFETY: The scheduler pairs this network callback with its live, initialized
+                    // operation frame.
                     unsafe { finish(frame, result, Some(fd)) }
                 }
                 Err(error) if error.error_len().is_none() && buffered.len() < max_bytes => {
                     match register(fd, crate::netpoll::WILLOW_NETPOLL_READABLE) {
                         Ok(()) => crate::task::RUNTIME_POLL_PENDING,
+                        // SAFETY: The scheduler pairs this network callback with its live,
+                        // initialized operation frame.
                         Err(message) => unsafe { finish_error(frame, &message, Some(fd)) },
                     }
                 }
+                // SAFETY: The scheduler pairs this network callback with its live, initialized
+                // operation frame.
                 Err(error) => unsafe {
                     finish_error(
                         frame,
@@ -413,9 +525,13 @@ unsafe fn poll_read(
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
             match register(fd, crate::netpoll::WILLOW_NETPOLL_READABLE) {
                 Ok(()) => crate::task::RUNTIME_POLL_PENDING,
+                // SAFETY: The scheduler pairs this network callback with its live, initialized
+                // operation frame.
                 Err(message) => unsafe { finish_error(frame, &message, Some(fd)) },
             }
         }
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         Err(error) => unsafe {
             finish_error(frame, &format!("net::read_async: {error}"), Some(fd))
         },
@@ -423,17 +539,27 @@ unsafe fn poll_read(
 }
 
 unsafe fn poll_write(frame: *mut c_void, bytes: &[u8], offset: &mut usize) -> i32 {
+    // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+    // frame.
     let handle_ptr = unsafe { task_handle(frame) };
+    // SAFETY: The network constructor reserves word-aligned GC storage sized for NetworkHandle. A
+    // non-null handle designates that payload.
     let Some(NetworkHandle::Stream(stream)) = (unsafe { handle(handle_ptr) }) else {
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         return unsafe { finish_error(frame, "net::write_async: invalid TcpStream", None) };
     };
     let fd = raw_socket(stream);
     if bytes.is_empty() {
         let result = crate::fs::alloc_ok(0, false);
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         return unsafe { finish(frame, result, Some(fd)) };
     }
     let mut stream_ref = stream;
     match stream_ref.write(&bytes[*offset..]) {
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         Ok(0) => unsafe {
             finish_error(
                 frame,
@@ -445,10 +571,14 @@ unsafe fn poll_write(frame: *mut c_void, bytes: &[u8], offset: &mut usize) -> i3
             *offset += written;
             if *offset == bytes.len() {
                 let result = crate::fs::alloc_ok(0, false);
+                // SAFETY: The scheduler pairs this network callback with its live, initialized
+                // operation frame.
                 unsafe { finish(frame, result, Some(fd)) }
             } else {
                 match register(fd, crate::netpoll::WILLOW_NETPOLL_WRITABLE) {
                     Ok(()) => crate::task::RUNTIME_POLL_PENDING,
+                    // SAFETY: The scheduler pairs this network callback with its live, initialized
+                    // operation frame.
                     Err(message) => unsafe { finish_error(frame, &message, Some(fd)) },
                 }
             }
@@ -456,9 +586,13 @@ unsafe fn poll_write(frame: *mut c_void, bytes: &[u8], offset: &mut usize) -> i3
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
             match register(fd, crate::netpoll::WILLOW_NETPOLL_WRITABLE) {
                 Ok(()) => crate::task::RUNTIME_POLL_PENDING,
+                // SAFETY: The scheduler pairs this network callback with its live, initialized
+                // operation frame.
                 Err(message) => unsafe { finish_error(frame, &message, Some(fd)) },
             }
         }
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         Err(error) => unsafe {
             finish_error(frame, &format!("net::write_async: {error}"), Some(fd))
         },
@@ -467,6 +601,8 @@ unsafe fn poll_write(frame: *mut c_void, bytes: &[u8], offset: &mut usize) -> i3
 
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_net_operation(frame: *mut c_void) -> i32 {
+    // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+    // frame.
     let native_frame = unsafe { net_frame(frame) };
     let raw = native_frame.take_native::<NetOperation>(NET_TASK_OPERATION_SLOT);
     if raw.is_null() {
@@ -474,18 +610,30 @@ unsafe extern "C" fn poll_net_operation(frame: *mut c_void) -> i32 {
     }
     // Poll/cancel callbacks for a task are serialized by the scheduler. Take
     // ownership so finish() cannot free fields borrowed by the poll helpers.
+    // SAFETY: Taking the frame slot transfers its Box::into_raw operation pointer to this poll
+    // once.
     let mut operation = unsafe { Box::from_raw(raw) };
     let status = match operation.as_mut() {
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         NetOperation::Connect { .. } => unsafe { poll_connect(frame, &mut operation) },
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         NetOperation::Accept => unsafe { poll_accept(frame) },
         NetOperation::Read {
             max_bytes,
             binary,
             bytes,
+            // SAFETY: The scheduler pairs this network callback with its live, initialized
+            // operation frame.
         } => unsafe { poll_read(frame, *max_bytes, *binary, bytes) },
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         NetOperation::Write { bytes, offset } => unsafe { poll_write(frame, bytes, offset) },
         NetOperation::ImmediateError(message) => {
             let message = std::mem::take(message);
+            // SAFETY: The scheduler pairs this network callback with its live, initialized
+            // operation frame.
             unsafe { finish_error(frame, &message, None) }
         }
     };
@@ -497,6 +645,10 @@ unsafe extern "C" fn poll_net_operation(frame: *mut c_void) -> i32 {
 
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn cancel_net_operation(frame: *mut c_void) {
+    // SAFETY: The scheduler keeps this frame live and serializes cancellation with polling.
+    // Spawn and pending polls store the operation with Box::into_raw. take_native clears
+    // the slot, giving cancellation sole ownership of a non-null pointer through socket
+    // deregistration and the final Box::from_raw drop. The frame roots the socket handle.
     unsafe {
         let frame = net_frame(frame);
         let raw = frame.take_native::<NetOperation>(NET_TASK_OPERATION_SLOT);
@@ -531,18 +683,25 @@ fn spawn_operation(handle: *mut u8, operation: NetOperation) -> *mut c_void {
     frame.store_gc(NET_TASK_HANDLE_SLOT, handle);
     frame.store_native(NET_TASK_OPERATION_SLOT, Box::into_raw(Box::new(operation)));
     let raw = frame.as_raw();
-    crate::scheduler::spawn_global_task_initialized(
-        poll_net_operation,
-        raw,
-        Some(cancel_net_operation),
-        |task_id| frame.store_word(NET_TASK_ID_SLOT, task_id as i64),
-    );
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe {
+        crate::scheduler::spawn_global_task_initialized(
+            poll_net_operation,
+            raw,
+            Some(cancel_net_operation),
+            |task_id| frame.store_word(NET_TASK_ID_SLOT, task_id as i64),
+        )
+    };
     raw
 }
 
+/// # Safety
+/// A non-null address must be a current immutable WillowString through the address copy.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_net_connect_async(address: *const u8) -> *mut c_void {
+pub unsafe extern "C" fn willow_net_connect_async(address: *const u8) -> *mut c_void {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let address_text = unsafe { willow_string_as_str(address) }.to_string();
     let parsed = match address_text.parse::<SocketAddr>() {
         Ok(address) => address,
@@ -583,15 +742,21 @@ pub extern "C" fn willow_net_connect_async(address: *const u8) -> *mut c_void {
     )
 }
 
+/// # Safety
+/// A non-null `listener` must be a live network handle allocated by this runtime.
+/// Keep it reachable through the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_net_accept_async(listener: *mut u8) -> *mut c_void {
+pub unsafe extern "C" fn willow_net_accept_async(listener: *mut u8) -> *mut c_void {
     spawn_operation(listener, NetOperation::Accept)
 }
 
+/// # Safety
+/// A non-null `stream` must be a live network handle allocated by this runtime.
+/// Keep it reachable through the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_net_read_async(stream: *mut u8, max_bytes: i64) -> *mut c_void {
+pub unsafe extern "C" fn willow_net_read_async(stream: *mut u8, max_bytes: i64) -> *mut c_void {
     let operation = match usize::try_from(max_bytes) {
         Ok(max_bytes) if (1..=MAX_READ_BYTES).contains(&max_bytes) => NetOperation::Read {
             max_bytes,
@@ -605,9 +770,17 @@ pub extern "C" fn willow_net_read_async(stream: *mut u8, max_bytes: i64) -> *mut
     spawn_operation(stream, operation)
 }
 
+/// # Safety
+/// A non-null `stream` must be a live network handle allocated by this runtime.
+/// Keep it reachable through the call. A non-null `contents` must be a current
+/// immutable WillowString until its bytes have been copied.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_net_write_async(stream: *mut u8, contents: *const u8) -> *mut c_void {
+pub unsafe extern "C" fn willow_net_write_async(
+    stream: *mut u8,
+    contents: *const u8,
+) -> *mut c_void {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let bytes = unsafe { willow_string_as_str(contents) }
         .as_bytes()
         .to_vec();
@@ -622,55 +795,87 @@ mod tests {
     use crate::string::willow_string_from_str;
 
     fn result_tag(result: *mut u8) -> i64 {
+        // SAFETY: The returned Result stores its tag in the first word of a word-aligned GC
+        // allocation.
         unsafe { *(result.cast::<i64>()) }
     }
 
     #[test]
     fn bind_rejects_hostname_without_blocking_dns() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
-        let result = willow_net_bind(willow_string_from_str("localhost:80"));
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
+        // SAFETY: The freshly allocated address string is copied on entry, before any GC point.
+        let result = unsafe { willow_net_bind(willow_string_from_str("localhost:80")) };
         assert_eq!(result_tag(result), 1);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn connect_error_is_delivered_through_task_result() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         reset_global_scheduler_for_test();
-        let task = willow_net_connect_async(willow_string_from_str("invalid"));
+        // SAFETY: The freshly allocated address string is copied on entry, before any GC point.
+        let task = unsafe { willow_net_connect_async(willow_string_from_str("invalid")) };
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         let id = unsafe { net_frame(task) }.load_word(NET_TASK_ID_SLOT) as u64;
         assert_eq!(willow_sched_run_until(id), 1);
+        // SAFETY: The scheduler pairs this network callback with its live, initialized operation
+        // frame.
         let result = unsafe { net_frame(task) }.load_gc(NET_TASK_RESULT_SLOT);
         assert_eq!(result_tag(result), 1);
         reset_global_scheduler_for_test();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn unreachable_listener_runs_socket_finalizer() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         NETWORK_HANDLE_DROP_COUNT.store(0, Ordering::SeqCst);
 
-        let mut result = willow_net_bind(willow_string_from_str("127.0.0.1:0"));
+        // SAFETY: The freshly allocated address string is copied on entry, before any GC point.
+        let mut result = unsafe { willow_net_bind(willow_string_from_str("127.0.0.1:0")) };
         assert_eq!(result_tag(result), 0);
-        willow_push_root(&mut result as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut result) };
         crate::gc::willow_gc_collect();
         assert_eq!(NETWORK_HANDLE_DROP_COUNT.load(Ordering::SeqCst), 0);
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
         crate::gc::willow_gc_collect();
         assert_eq!(NETWORK_HANDLE_DROP_COUNT.load(Ordering::SeqCst), 1);
 
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 }
 
 /// Read arbitrary bytes through the same readiness and cancellation path as text.
+///
+/// # Safety
+/// A non-null `stream` must be a live network handle allocated by this runtime.
+/// Keep it reachable through the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_net_read_bytes_async(stream: *mut u8, max_bytes: i64) -> *mut c_void {
+pub unsafe extern "C" fn willow_net_read_bytes_async(
+    stream: *mut u8,
+    max_bytes: i64,
+) -> *mut c_void {
     let operation = match usize::try_from(max_bytes) {
         Ok(max_bytes) if (1..=MAX_READ_BYTES).contains(&max_bytes) => NetOperation::Read {
             max_bytes,
@@ -685,10 +890,20 @@ pub extern "C" fn willow_net_read_bytes_async(stream: *mut u8, max_bytes: i64) -
 }
 
 /// Snapshot packed bytes before handing ownership to the scheduler.
+///
+/// # Safety
+/// A non-null `stream` must be a live network handle allocated by this runtime.
+/// Keep it reachable through the call. A non-null `contents` must be a current packed
+/// Array<u8> with stable length and contents through the synchronous copy.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_net_write_bytes_async(stream: *mut u8, contents: *mut u8) -> *mut c_void {
+pub unsafe extern "C" fn willow_net_write_bytes_async(
+    stream: *mut u8,
+    contents: *mut u8,
+) -> *mut c_void {
     // Snapshot before scheduler admission; no managed borrow crosses a safepoint.
+    // SAFETY: The ABI supplies a live packed byte array. The copy completes before the frame can
+    // suspend.
     let bytes = unsafe { crate::array::packed_bytes(contents) }.to_vec();
     spawn_operation(stream, NetOperation::Write { bytes, offset: 0 })
 }

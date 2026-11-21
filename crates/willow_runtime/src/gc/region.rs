@@ -232,6 +232,8 @@ impl OldRegion {
     /// # Safety
     /// As for [`Self::with_storage`] with `pristine == false`.
     pub(super) unsafe fn reuse(kind: RegionKind, capacity: usize, base: *mut u8) -> Self {
+        // SAFETY: The caller transfers ownership of an aligned allocation with this exact
+        // capacity.
         unsafe { Self::with_storage(kind, capacity, base, false) }
     }
 
@@ -295,17 +297,30 @@ impl OldRegion {
         address >= self.start() && address < self.end()
     }
 
-    pub(super) fn allocate_object(
+    /// # Safety
+    /// The type, payload extent and tracing mask must agree, including any required bitmap
+    /// descriptor or native hooks. Initialize native fields before the object can be traced
+    /// or finalized.
+    pub(super) unsafe fn allocate_object(
         &mut self,
         type_id: u32,
         layout_id: u64,
         gc_ref_mask: u64,
         payload_size: usize,
     ) -> Option<(HeapObject, bool)> {
-        self.allocate_object_for_move(type_id, layout_id, gc_ref_mask, payload_size, None)
+        // SAFETY: This fresh allocation forwards the caller’s validated type, size and mask
+        // and has no evacuation source.
+        unsafe {
+            self.allocate_object_for_move(type_id, layout_id, gc_ref_mask, payload_size, None)
+        }
     }
 
-    pub(super) fn allocate_object_for_move(
+    /// # Safety
+    /// The type, payload extent and tracing mask must agree, including any required bitmap
+    /// descriptor or native hooks. Initialize native fields before the object can be traced
+    /// or finalized. For evacuation, the mutators must be stopped, the source must be live
+    /// and match the metadata, and ownership of its descriptor must transfer exactly once.
+    pub(super) unsafe fn allocate_object_for_move(
         &mut self,
         type_id: u32,
         layout_id: u64,
@@ -313,24 +328,33 @@ impl OldRegion {
         payload_size: usize,
         source: Option<HeapObject>,
     ) -> Option<(HeapObject, bool)> {
-        self.allocate_object_for_move_buffered(
-            crate::runtime::current().mark_phase(),
-            raw_heap::TraceMetadata {
-                type_id,
-                layout_id,
-                gc_ref_mask,
-                payload_size,
-            },
-            source,
-            None,
-        )
+        // SAFETY: The caller establishes the type and layout and exclusive access to any
+        // evacuation source. The region owns the destination storage.
+        unsafe {
+            self.allocate_object_for_move_buffered(
+                crate::runtime::current().mark_phase(),
+                raw_heap::TraceMetadata {
+                    type_id,
+                    layout_id,
+                    gc_ref_mask,
+                    payload_size,
+                },
+                source,
+                None,
+            )
+        }
     }
 
     /// A stopped collector may buffer entries for a newly reserved region;
     /// it must publish them before exposing the region to any heap index reader.
     /// A non-null `source` also requires all bitmap writers to be quiescent;
     /// only stopped minor evacuation supplies one.
-    pub(super) fn allocate_object_for_move_buffered(
+    /// # Safety
+    /// The type, payload extent and tracing mask must agree, including any required bitmap
+    /// descriptor or native hooks. Initialize native fields before the object can be traced
+    /// or finalized. For evacuation, the mutators must be stopped, the source must be live
+    /// and match the metadata, and ownership of its descriptor must transfer exactly once.
+    pub(super) unsafe fn allocate_object_for_move_buffered(
         &mut self,
         phase: &std::sync::atomic::AtomicU8,
         metadata: raw_heap::TraceMetadata,
@@ -377,22 +401,30 @@ impl OldRegion {
         // serialize page faults before parallel writers can fill their chunks.
         // Every later allocation clears its span, even after used returns to 0.
         if source.is_none() && !self.pristine {
+            // SAFETY: The region owner reserves this contiguous span. The byte count or offset is
+            // bounded by its allocation.
             unsafe { std::ptr::write_bytes(raw, 0, span_size) };
             self.observation.cleared(span_size);
         }
         self.pristine = false;
         let object = if let Some(source) = source {
             debug_assert_eq!(source.size(), total_size);
-            HeapObject::initialize_moved_at(raw, source, GC_GENERATION_OLD)
+            // SAFETY: The stopped collector owns the live source and a distinct aligned span
+            // of its full size. It transfers descriptor ownership to this destination.
+            unsafe { HeapObject::initialize_moved_at(raw, source, GC_GENERATION_OLD) }
         } else {
-            HeapObject::initialize_at(
-                raw,
-                total_size,
-                type_id,
-                layout_id,
-                gc_ref_mask,
-                GC_GENERATION_OLD,
-            )
+            // SAFETY: The region carved an exclusive aligned span covering the checked header
+            // and payload size for the supplied metadata.
+            unsafe {
+                HeapObject::initialize_at(
+                    raw,
+                    total_size,
+                    type_id,
+                    layout_id,
+                    gc_ref_mask,
+                    GC_GENERATION_OLD,
+                )
+            }
         }?;
         if let Some(pending) = pending {
             debug_assert!(!reused, "buffered promotion uses a fresh region");
@@ -427,7 +459,10 @@ impl OldRegion {
     /// Stopped evacuation into a fresh, exclusively owned promotion region.
     /// No free-span search, zeroing, or per-object tree insertion is needed.
     #[inline]
-    pub(super) fn allocate_fresh_promotion(
+    /// # Safety
+    /// The stopped collector must own the live source, transfer it exactly once,
+    /// and supply its full object size and an exclusive fresh promotion region.
+    pub(super) unsafe fn allocate_fresh_promotion(
         &mut self,
         phase: &std::sync::atomic::AtomicU8,
         source: HeapObject,
@@ -445,11 +480,17 @@ impl OldRegion {
         let offset = self.used;
         // The validated young span is aligned and this cursor owns its tail.
         self.pristine = false;
-        let object = HeapObject::initialize_moved_at(
-            unsafe { self.base.add(offset) },
-            source,
-            GC_GENERATION_OLD,
-        )?;
+        // SAFETY: The stopped collector owns the live source and a distinct aligned span of
+        // its full size. It transfers descriptor ownership to this destination.
+        let object = unsafe {
+            HeapObject::initialize_moved_at(
+                // SAFETY: The region owner reserves this contiguous span. The byte count or offset is
+                // bounded by its allocation.
+                self.base.add(offset),
+                source,
+                GC_GENERATION_OLD,
+            )
+        }?;
         self.used += size;
         self.live_bytes += size;
         pending.push((offset, size));
@@ -593,6 +634,8 @@ pub(super) unsafe fn allocate_region_storage(
     allocator: &RuntimeStorageAllocator,
     layout: Layout,
 ) -> *mut u8 {
+    // SAFETY: The computed nonzero region Layout supplies the required header alignment to the
+    // allocator.
     unsafe { allocator.allocate::<true>(layout) }
 }
 
@@ -603,6 +646,8 @@ pub(super) unsafe fn allocate_survivor_storage(
     allocator: &RuntimeStorageAllocator,
     layout: Layout,
 ) -> *mut u8 {
+    // SAFETY: The computed nonzero region Layout supplies the required header alignment to the
+    // allocator.
     unsafe { allocator.allocate::<false>(layout) }
 }
 
@@ -640,6 +685,8 @@ mod zero_initialization_tests {
     }
 
     fn assert_zero(object: HeapObject, bytes: usize) {
+        // SAFETY: The region owner reserves this contiguous span. The byte count or offset is
+        // bounded by its allocation.
         let payload = unsafe { std::slice::from_raw_parts(object.payload().as_ptr(), bytes) };
         assert!(payload.iter().all(|byte| *byte == 0));
     }
@@ -652,10 +699,14 @@ mod zero_initialization_tests {
                 let mut region =
                     OldRegion::new(&RuntimeStorageAllocator::default(), kind, 131072).unwrap();
                 assert!(region.pristine);
-                let (first, _) = region.allocate_object(0, 0, 0, bytes).unwrap();
+                // SAFETY: The requested layout describes the initialized words of this object
+                // and its type’s tracing or finalization contract.
+                let (first, _) = unsafe { region.allocate_object(0, 0, 0, bytes) }.unwrap();
                 assert!(!region.pristine);
                 assert_zero(first, bytes);
                 assert_eq!(region.observation.cleared_bytes, 0);
+                // SAFETY: The region owner reserves this contiguous span. The byte count or offset
+                // is bounded by its allocation.
                 unsafe { std::ptr::write_bytes(first.payload().as_ptr(), 0xa5, bytes) };
                 region.release_object(first);
                 assert_eq!(region.used, 0);
@@ -663,7 +714,9 @@ mod zero_initialization_tests {
                     !region.pristine,
                     "tail trimming must not restore pristine state"
                 );
-                let (second, _) = region.allocate_object(0, 0, 0, bytes).unwrap();
+                // SAFETY: The requested layout describes the initialized words of this object
+                // and its type’s tracing or finalization contract.
+                let (second, _) = unsafe { region.allocate_object(0, 0, 0, bytes) }.unwrap();
                 assert_zero(second, bytes);
                 assert_eq!(
                     region.observation.cleared_bytes,
@@ -684,13 +737,17 @@ mod zero_initialization_tests {
                 OldRegion::new(&RuntimeStorageAllocator::default(), kind, 4096).unwrap();
             let base = released.take_storage();
             drop(released);
+            // SAFETY: The region owner reserves this contiguous span. The byte count or offset is
+            // bounded by its allocation.
             unsafe { std::ptr::write_bytes(base, 0xa5, 4096) };
             // SAFETY: released storage of exactly 4096 bytes, owned here.
             let mut region = unsafe { OldRegion::reuse(kind, 4096, base) };
             assert_eq!(region.start(), base as usize);
             assert!(!region.pristine);
             let bytes = 4096 - GC_HEADER_SIZE;
-            let (object, _) = region.allocate_object(0, 0, 0, bytes).unwrap();
+            // SAFETY: The requested layout describes the initialized words of this object and
+            // its type’s tracing or finalization contract.
+            let (object, _) = unsafe { region.allocate_object(0, 0, 0, bytes) }.unwrap();
             assert_zero(object, bytes);
             assert_eq!(region.observation.cleared_bytes, 4096);
         }
@@ -701,11 +758,19 @@ mod zero_initialization_tests {
         let _guard = isolated_runtime();
         let mut region =
             OldRegion::new(&RuntimeStorageAllocator::default(), RegionKind::Old, 4096).unwrap();
-        let (first, _) = region.allocate_object(0, 0, 0, 64).unwrap();
-        let (_last, _) = region.allocate_object(0, 0, 0, 64).unwrap();
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let (first, _) = unsafe { region.allocate_object(0, 0, 0, 64) }.unwrap();
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let (_last, _) = unsafe { region.allocate_object(0, 0, 0, 64) }.unwrap();
+        // SAFETY: The region owner reserves this contiguous span. The byte count or offset is
+        // bounded by its allocation.
         unsafe { std::ptr::write_bytes(first.payload().as_ptr(), 0xa5, 64) };
         region.release_object(first);
-        let (replacement, reused) = region.allocate_object(0, 0, 0, 64).unwrap();
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let (replacement, reused) = unsafe { region.allocate_object(0, 0, 0, 64) }.unwrap();
         assert!(reused);
         assert_zero(replacement, 64);
     }
@@ -718,38 +783,52 @@ mod zero_initialization_tests {
         assert!(carved.carve(4096, 4096).is_some());
         assert!(!carved.pristine);
         // Model a dirty retired LAB whose whole span became the bump tail.
+        // SAFETY: The region owner reserves this contiguous span. The byte count or offset is
+        // bounded by its allocation.
         unsafe { std::ptr::write_bytes(carved.base, 0xa5, carved.capacity) };
         carved.used = 0;
-        let (object, _) = carved.allocate_object(0, 0, 0, 64).unwrap();
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let (object, _) = unsafe { carved.allocate_object(0, 0, 0, 64) }.unwrap();
         assert_zero(object, 64);
 
-        let mut source_region =
-            OldRegion::new(&RuntimeStorageAllocator::default(), RegionKind::Old, 4096).unwrap();
-        let (source, _) = source_region.allocate_object(0, 0, 0, 64).unwrap();
-        unsafe { std::ptr::write_bytes(source.payload().as_ptr(), 0xa5, 64) };
         for buffered in [false, true] {
+            let mut source_region =
+                OldRegion::new(&RuntimeStorageAllocator::default(), RegionKind::Old, 4096).unwrap();
+            // SAFETY: The requested layout describes the initialized words of this object and its
+            // type’s tracing or finalization contract.
+            let (source, _) = unsafe { source_region.allocate_object(0, 0, 0, 64) }.unwrap();
+            // SAFETY: The region owner reserves this contiguous span. The byte count or offset is
+            // bounded by its allocation.
+            unsafe { std::ptr::write_bytes(source.payload().as_ptr(), 0xa5, 64) };
             let mut destination =
                 OldRegion::new(&RuntimeStorageAllocator::default(), RegionKind::Old, 4096).unwrap();
             let copied = if buffered {
                 let mut pending = Vec::new();
-                let copied = destination
-                    .allocate_fresh_promotion(
+                // SAFETY: The caller establishes the type and layout and exclusive access to
+                // any evacuation source. The region owns the destination storage.
+                let copied = unsafe {
+                    destination.allocate_fresh_promotion(
                         crate::runtime::current().mark_phase(),
                         source,
                         source.size(),
                         &mut pending,
                     )
-                    .unwrap();
+                }
+                .unwrap();
                 destination.allocations.extend(pending);
                 copied
             } else {
-                destination
-                    .allocate_object_for_move(0, 0, 0, 64, Some(source))
+                // SAFETY: The stopped evacuation uses metadata and size from the live source
+                // and transfers it once into a distinct region span.
+                unsafe { destination.allocate_object_for_move(0, 0, 0, 64, Some(source)) }
                     .unwrap()
                     .0
             };
             // Evacuation's caller copies payload bytes after the region has
             // initialized the destination header and before publication.
+            // SAFETY: The live source and fresh destination are distinct, and both reserve the
+            // requested payload size.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     source.payload().as_ptr(),
@@ -758,9 +837,13 @@ mod zero_initialization_tests {
                 )
             };
             assert!(!destination.pristine);
+            // SAFETY: The region owner reserves this contiguous span. The byte count or offset is
+            // bounded by its allocation.
             assert_eq!(unsafe { copied.payload().as_ptr().read() }, 0xa5);
             destination.release_object(copied);
-            let (replacement, _) = destination.allocate_object(0, 0, 0, 64).unwrap();
+            // SAFETY: The requested layout describes the initialized words of this object and
+            // its type’s tracing or finalization contract.
+            let (replacement, _) = unsafe { destination.allocate_object(0, 0, 0, 64) }.unwrap();
             assert_zero(replacement, 64);
         }
     }

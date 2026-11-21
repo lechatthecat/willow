@@ -122,9 +122,13 @@ mod tests {
     #[test]
     fn generation_index_tracks_active_retired_survivor_and_released_chunks() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
-        let mut tls = Box::new(GcTlabState::new());
-        let young = willow_gc_alloc_slow(&mut *tls, 0, 0, 8, 0);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
+        let tls = tlab_state_for_test();
+        // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size
+        // and tracing metadata describe the object initialized here.
+        let young = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 0, 0, 8, 0) };
         assert_eq!(
             runtime().root_tlabs.generation(young as usize),
             Some(GC_GENERATION_YOUNG)
@@ -143,17 +147,23 @@ mod tests {
             Some(GC_GENERATION_YOUNG)
         );
         let mut slot = young;
-        willow_push_root(&mut slot);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut slot) };
         willow_gc_minor_collect();
         assert_ne!(slot, young, "minor collection copies the live root");
         assert_eq!(
             runtime().root_tlabs.generation(slot as usize),
             Some(GC_GENERATION_YOUNG)
         );
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
         willow_gc_collect();
         assert_eq!(runtime().root_tlabs.generation(slot as usize), None);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         assert!(runtime().root_tlabs.0.read().unwrap().is_empty());
     }
 }

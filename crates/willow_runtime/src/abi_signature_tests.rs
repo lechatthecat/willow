@@ -49,15 +49,16 @@ fn scheduler_callbacks_and_frame_handles_are_native_pointers() {
     }
     let _: fn(unsafe extern "C" fn(*mut c_void) -> i32) -> task::RuntimePollFn = poll_alias;
     let _: fn(unsafe extern "C" fn(*mut c_void)) -> task::RuntimeCancelFn = cancel_alias;
-    let _: extern "C" fn(task::RuntimePollFn, *mut c_void) -> u64 = scheduler::willow_sched_spawn;
-    let _: extern "C" fn(u64, task::RuntimeCancelFn) = scheduler::willow_sched_set_cancel_fn;
-    let _: extern "C" fn(u64, task::RuntimeCancelFn, i32) =
+    let _: unsafe extern "C" fn(task::RuntimePollFn, *mut c_void) -> u64 =
+        scheduler::willow_sched_spawn;
+    let _: unsafe extern "C" fn(u64, task::RuntimeCancelFn) = scheduler::willow_sched_set_cancel_fn;
+    let _: unsafe extern "C" fn(u64, task::RuntimeCancelFn, i32) =
         scheduler::willow_sched_set_cancel_fn_cooperative;
     let _: extern "C" fn(u64) = scheduler::willow_sched_wake;
     let _: unsafe extern "C" fn(*const u64, usize) = scheduler::willow_sched_wake_many;
     let _: extern "C" fn() -> u64 = scheduler::willow_sched_current_task;
     let _: extern "C" fn() -> u64 = scheduler::willow_sched_active_workers;
-    let _: extern "C" fn(*mut c_void, u64) -> i32 = scheduler::willow_frame_await;
+    let _: unsafe extern "C" fn(*mut c_void, u64) -> i32 = scheduler::willow_frame_await;
     let _: extern "C" fn(i64, u64) -> *mut c_void = async_frame::willow_async_frame_alloc;
 }
 
@@ -67,24 +68,25 @@ fn parallel_mapper_is_a_managed_function_value() {
         callback
     }
     let _: fn(unsafe extern "C" fn(i64, *mut u8) -> i64) -> parallel::I64Mapper = mapper_alias;
-    let _: extern "C" fn(*mut u8, *mut u8) -> *mut c_void = parallel::willow_parallel_map_i64;
+    let _: unsafe extern "C" fn(*mut u8, *mut u8) -> *mut c_void =
+        parallel::willow_parallel_map_i64;
 }
 
 #[test]
 fn gc_objects_metadata_and_root_slots_are_pointers() {
     let _: extern "C" fn(i64) -> *mut u8 = gc::willow_alloc;
-    let _: extern "C" fn(i64, i64) -> *mut u8 = gc::willow_alloc_object;
+    let _: unsafe extern "C" fn(i64, i64) -> *mut u8 = gc::willow_alloc_object;
     let _: extern "C" fn(i64, u64) -> *mut u8 = gc::willow_alloc_typed;
-    let _: extern "C" fn(i64, i64, *const u64) -> *mut u8 = gc::willow_gc_alloc_bitmap;
-    let _: extern "C" fn(*mut *mut u8) = gc::willow_push_root;
-    let _: extern "C" fn(*mut u8) = gc::willow_gc_add_runtime_root;
-    let _: extern "C" fn(*mut u8) = gc::willow_gc_remove_runtime_root;
-    let _: extern "C" fn(*mut *mut u8) = gc::willow_gc_add_runtime_root_slot;
-    let _: extern "C" fn(*mut *mut u8) = gc::willow_gc_remove_runtime_root_slot;
-    let _: extern "C" fn(*mut u8, *mut u8, *mut u8, i64) = gc::willow_gc_write_barrier;
-    let _: extern "C" fn(*mut u8, *mut u8, *mut u8, *mut u8, i64) =
+    let _: unsafe extern "C" fn(i64, i64, *const u64) -> *mut u8 = gc::willow_gc_alloc_bitmap;
+    let _: unsafe extern "C" fn(*mut *mut u8) = gc::willow_push_root;
+    let _: unsafe extern "C" fn(*mut u8) = gc::willow_gc_add_runtime_root;
+    let _: unsafe extern "C" fn(*mut u8) = gc::willow_gc_remove_runtime_root;
+    let _: unsafe extern "C" fn(*mut *mut u8) = gc::willow_gc_add_runtime_root_slot;
+    let _: unsafe extern "C" fn(*mut *mut u8) = gc::willow_gc_remove_runtime_root_slot;
+    let _: unsafe extern "C" fn(*mut u8, *mut u8, *mut u8, i64) = gc::willow_gc_write_barrier;
+    let _: unsafe extern "C" fn(*mut u8, *mut u8, *mut u8, *mut u8, i64) =
         gc::willow_gc_array_write_barrier;
-    let _: extern "C" fn(*mut u8) = gc::willow_gc_publish_stored_value;
+    let _: unsafe extern "C" fn(*mut u8) = gc::willow_gc_publish_stored_value;
     let _: extern "C" fn() -> i64 = gc::willow_gc_allocated_bytes;
     let _: extern "C" fn(u64) -> u64 = gc::willow_gc_set_memory_limit;
     assert_schema("willow_gc_set_memory_limit", &[I64], Some(I64));
@@ -92,66 +94,70 @@ fn gc_objects_metadata_and_root_slots_are_pointers() {
 
 #[test]
 fn collection_handles_are_pointers_and_payload_words_remain_i64() {
-    let _: extern "C" fn(*const std::sync::atomic::AtomicPtr<u8>, *const u8, i64) -> *mut u8 =
-        string::willow_string_literal_slot;
+    let _: unsafe extern "C" fn(
+        *const std::sync::atomic::AtomicPtr<u8>,
+        *const u8,
+        i64,
+    ) -> *mut u8 = string::willow_string_literal_slot;
     assert_schema("willow_string_literal_slot", &[Ptr, Ptr, I64], Some(Ptr));
-    let _: extern "C" fn(*const std::sync::atomic::AtomicPtr<u8>, *const u8) -> *mut u8 =
+    let _: unsafe extern "C" fn(*const std::sync::atomic::AtomicPtr<u8>, *const u8) -> *mut u8 =
         crate::function_value::willow_function_value_slot;
     assert_schema("willow_function_value_slot", &[Ptr, Ptr], Some(Ptr));
-    let _: extern "C" fn(*const u8, i64) -> *mut u8 = string::willow_string_alloc;
-    let _: extern "C" fn(*const u8, *const u8) -> *mut u8 = string::willow_string_concat;
-    let _: extern "C" fn(*mut u64, i64) -> *mut u8 = string::willow_string_concat_n;
-    let _: extern "C" fn(*const u8, *const u8) -> i64 = string::willow_string_eq;
-    let _: extern "C" fn(*const u8, *const u8) -> i64 = string::willow_string_cmp;
-    let _: extern "C" fn(*const u8) -> i64 = string::willow_string_len;
+    let _: unsafe extern "C" fn(*const u8, i64) -> *mut u8 = string::willow_string_alloc;
+    let _: unsafe extern "C" fn(*const u8, *const u8) -> *mut u8 = string::willow_string_concat;
+    let _: unsafe extern "C" fn(*mut u64, i64) -> *mut u8 = string::willow_string_concat_n;
+    let _: unsafe extern "C" fn(*const u8, *const u8) -> i64 = string::willow_string_eq;
+    let _: unsafe extern "C" fn(*const u8, *const u8) -> i64 = string::willow_string_cmp;
+    let _: unsafe extern "C" fn(*const u8) -> i64 = string::willow_string_len;
     assert_schema("willow_string_len", &[Ptr], Some(I64));
-    let _: extern "C" fn(i64, i64) -> *mut u8 = array::willow_array_new;
-    let _: extern "C" fn(*mut u8) -> *mut u8 = array::willow_array_copy_scalar_pairs;
-    let _: extern "C" fn(*mut u8, *mut i64) = array::willow_array_pop_scalar_pair_into;
+    let _: unsafe extern "C" fn(i64, i64) -> *mut u8 = array::willow_array_new;
+    let _: unsafe extern "C" fn(*mut u8) -> *mut u8 = array::willow_array_copy_scalar_pairs;
+    let _: unsafe extern "C" fn(*mut u8, *mut i64) = array::willow_array_pop_scalar_pair_into;
     assert_schema("willow_array_pop_scalar_pair_into", &[Ptr, Ptr], None);
     assert_schema("willow_array_copy_scalar_pairs", &[Ptr], Some(Ptr));
-    let _: extern "C" fn(*mut u8) -> i64 = array::willow_array_len;
-    let _: extern "C" fn(*mut u8, i64) -> i64 = array::willow_array_get;
-    let _: extern "C" fn(*mut u8, i64, i64) = array::willow_array_set;
-    let _: extern "C" fn(*mut u8, i64) -> *mut u8 = array::willow_array_element_addr;
+    let _: unsafe extern "C" fn(*mut u8) -> i64 = array::willow_array_len;
+    let _: unsafe extern "C" fn(*mut u8, i64) -> i64 = array::willow_array_get;
+    let _: unsafe extern "C" fn(*mut u8, i64, i64) = array::willow_array_set;
+    let _: unsafe extern "C" fn(*mut u8, i64) -> *mut u8 = array::willow_array_element_addr;
     let _: extern "C" fn(i64, i64, i64) -> *mut u8 = map::willow_map_new;
-    let _: extern "C" fn(*mut u8, i64, i64, i64, i64) = map::willow_map_insert;
-    let _: extern "C" fn(*mut u8, i64, i64, i64) -> *mut u8 = map::willow_map_get;
-    let _: extern "C" fn(*mut u8, i64, i64, *mut i64) -> i64 = map::willow_map_get_into;
-    let _: extern "C" fn(*mut u8, i64, i64, *mut i64) -> i64 = map::willow_map_remove_into;
-    let _: extern "C" fn(*mut u8, i64, i64) -> *mut u8 = map::willow_map_snapshot;
+    let _: unsafe extern "C" fn(*mut u8, i64, i64, i64, i64) = map::willow_map_insert;
+    let _: unsafe extern "C" fn(*mut u8, i64, i64, i64) -> *mut u8 = map::willow_map_get;
+    let _: unsafe extern "C" fn(*mut u8, i64, i64, *mut i64) -> i64 = map::willow_map_get_into;
+    let _: unsafe extern "C" fn(*mut u8, i64, i64, *mut i64) -> i64 = map::willow_map_remove_into;
+    let _: unsafe extern "C" fn(*mut u8, i64, i64) -> *mut u8 = map::willow_map_snapshot;
 }
 
 #[test]
 fn string_methods_abi_signatures() {
-    let _: extern "C" fn(*const u8, i64) -> i64 = string::willow_string_byte_at;
+    let _: unsafe extern "C" fn(*const u8, i64) -> i64 = string::willow_string_byte_at;
     assert_schema("willow_string_byte_at", &[Ptr, I64], Some(I64));
-    let _: extern "C" fn(*mut u8, i64, i64) -> *mut u8 = string::willow_string_substring;
+    let _: unsafe extern "C" fn(*mut u8, i64, i64) -> *mut u8 = string::willow_string_substring;
     assert_schema("willow_string_substring", &[Ptr, I64, I64], Some(Ptr));
-    let _: extern "C" fn(*mut u8, i64) -> *mut u8 = string::willow_string_repeat;
+    let _: unsafe extern "C" fn(*mut u8, i64) -> *mut u8 = string::willow_string_repeat;
     assert_schema("willow_string_repeat", &[Ptr, I64], Some(Ptr));
-    let _: extern "C" fn(*mut u8, *const u8) -> *mut u8 = string::willow_string_split;
+    let _: unsafe extern "C" fn(*mut u8, *const u8) -> *mut u8 = string::willow_string_split;
     assert_schema("willow_string_split", &[Ptr, Ptr], Some(Ptr));
-    let _: extern "C" fn(*mut u8) -> *mut u8 = string::willow_string_trim;
+    let _: unsafe extern "C" fn(*mut u8) -> *mut u8 = string::willow_string_trim;
     assert_schema("willow_string_trim", &[Ptr], Some(Ptr));
     for (name, function) in [
         (
             "willow_string_trim_start",
-            string::willow_string_trim_start as extern "C" fn(*mut u8) -> *mut u8,
+            string::willow_string_trim_start as unsafe extern "C" fn(*mut u8) -> *mut u8,
         ),
         ("willow_string_trim_end", string::willow_string_trim_end),
         ("willow_string_to_lower", string::willow_string_to_lower),
         ("willow_string_to_upper", string::willow_string_to_upper),
     ] {
-        let _: extern "C" fn(*mut u8) -> *mut u8 = function;
+        let _: unsafe extern "C" fn(*mut u8) -> *mut u8 = function;
         assert_schema(name, &[Ptr], Some(Ptr));
     }
-    let _: extern "C" fn(*mut u8, *mut u8, *mut u8) -> *mut u8 = string::willow_string_replace;
+    let _: unsafe extern "C" fn(*mut u8, *mut u8, *mut u8) -> *mut u8 =
+        string::willow_string_replace;
     assert_schema("willow_string_replace", &[Ptr, Ptr, Ptr], Some(Ptr));
     for (name, function) in [
         (
             "willow_string_contains",
-            string::willow_string_contains as extern "C" fn(*const u8, *const u8) -> i64,
+            string::willow_string_contains as unsafe extern "C" fn(*const u8, *const u8) -> i64,
         ),
         ("willow_string_find", string::willow_string_find),
         ("willow_string_ends_with", string::willow_string_ends_with),
@@ -160,7 +166,7 @@ fn string_methods_abi_signatures() {
             string::willow_string_starts_with,
         ),
     ] {
-        let _: extern "C" fn(*const u8, *const u8) -> i64 = function;
+        let _: unsafe extern "C" fn(*const u8, *const u8) -> i64 = function;
         assert_schema(name, &[Ptr, Ptr], Some(I64));
     }
 }
@@ -169,7 +175,7 @@ fn string_methods_abi_signatures() {
 fn scalar_width_conversion_abi_signatures() {
     let _: extern "C" fn(i64, i64) -> *mut u8 = string::willow_scalar_to_string;
     assert_schema("willow_scalar_to_string", &[I64, I64], Some(Ptr));
-    let _: extern "C" fn(*mut u8, i64, *mut u64) -> u8 = string::willow_scalar_parse;
+    let _: unsafe extern "C" fn(*mut u8, i64, *mut u64) -> u8 = string::willow_scalar_parse;
     assert_schema("willow_scalar_parse", &[Ptr, I64, Ptr], Some(I8));
     assert_eq!(
         runtime_symbol("willow_scalar_parse").unwrap().effects,
@@ -231,35 +237,38 @@ const WORD_PINS: &[(&str, &[AbiTy], Option<AbiTy>)] = &[
 
 #[test]
 fn word_carrying_rows_keep_i64_payload_types_in_rust() {
-    let _: extern "C" fn(*mut u8, i64) -> i64 = array::willow_array_get;
-    let _: extern "C" fn(*mut u8, i64, i64) = array::willow_array_set;
-    let _: extern "C" fn(*mut u8, i64) = array::willow_array_push;
-    let _: extern "C" fn(*mut u8, i64) = array::willow_array_push_scalar_pairs;
-    let _: extern "C" fn(*mut u8, i64) = array::willow_array_push_owned_pair;
-    let _: extern "C" fn(*mut u8) -> i64 = array::willow_array_pop;
-    let _: extern "C" fn(*mut u8, i64, i64, i64, i64) = map::willow_map_insert;
-    let _: extern "C" fn(*mut u8, i64, i64, i64) -> *mut u8 = map::willow_map_get;
-    let _: extern "C" fn(*mut u8, i64, i64, *mut i64) -> i64 = map::willow_map_get_into;
-    let _: extern "C" fn(*mut u8, i64, i64, *mut i64) -> i64 = map::willow_map_remove_into;
-    let _: extern "C" fn(*mut u8, i64, i64) -> *mut u8 = map::willow_map_snapshot;
-    let _: extern "C" fn(*mut u8, i64, i64) -> i64 = map::willow_map_contains;
-    let _: extern "C" fn(i64, i64) -> *mut c_void = lock::willow_blocking_cell_new;
-    let _: extern "C" fn(*mut c_void) -> i64 = lock::willow_blocking_cell_get;
-    let _: extern "C" fn(*mut c_void, i64) = lock::willow_blocking_cell_set;
-    let _: extern "C" fn(i64, i64) -> *mut c_void = lock::willow_blocking_rw_cell_new;
-    let _: extern "C" fn(*mut c_void) -> i64 = lock::willow_blocking_rw_cell_read;
-    let _: extern "C" fn(*mut c_void, i64) = lock::willow_blocking_rw_cell_write;
-    let _: extern "C" fn(i64, i64) -> *mut c_void = async_mutex::willow_async_mutex_new;
-    let _: extern "C" fn(*mut c_void, i64) -> i64 = async_mutex::willow_async_mutex_load;
-    let _: extern "C" fn(*mut c_void, i64, i64) -> i32 = async_mutex::willow_async_mutex_commit;
-    let _: extern "C" fn(*mut c_void, i64, i64) -> i32 =
+    let _: unsafe extern "C" fn(*mut u8, i64) -> i64 = array::willow_array_get;
+    let _: unsafe extern "C" fn(*mut u8, i64, i64) = array::willow_array_set;
+    let _: unsafe extern "C" fn(*mut u8, i64) = array::willow_array_push;
+    let _: unsafe extern "C" fn(*mut u8, i64) = array::willow_array_push_scalar_pairs;
+    let _: unsafe extern "C" fn(*mut u8, i64) = array::willow_array_push_owned_pair;
+    let _: unsafe extern "C" fn(*mut u8) -> i64 = array::willow_array_pop;
+    let _: unsafe extern "C" fn(*mut u8, i64, i64, i64, i64) = map::willow_map_insert;
+    let _: unsafe extern "C" fn(*mut u8, i64, i64, i64) -> *mut u8 = map::willow_map_get;
+    let _: unsafe extern "C" fn(*mut u8, i64, i64, *mut i64) -> i64 = map::willow_map_get_into;
+    let _: unsafe extern "C" fn(*mut u8, i64, i64, *mut i64) -> i64 = map::willow_map_remove_into;
+    let _: unsafe extern "C" fn(*mut u8, i64, i64) -> *mut u8 = map::willow_map_snapshot;
+    let _: unsafe extern "C" fn(*mut u8, i64, i64) -> i64 = map::willow_map_contains;
+    let _: unsafe extern "C" fn(i64, i64) -> *mut c_void = lock::willow_blocking_cell_new;
+    let _: unsafe extern "C" fn(*mut c_void) -> i64 = lock::willow_blocking_cell_get;
+    let _: unsafe extern "C" fn(*mut c_void, i64) = lock::willow_blocking_cell_set;
+    let _: unsafe extern "C" fn(i64, i64) -> *mut c_void = lock::willow_blocking_rw_cell_new;
+    let _: unsafe extern "C" fn(*mut c_void) -> i64 = lock::willow_blocking_rw_cell_read;
+    let _: unsafe extern "C" fn(*mut c_void, i64) = lock::willow_blocking_rw_cell_write;
+    let _: unsafe extern "C" fn(i64, i64) -> *mut c_void = async_mutex::willow_async_mutex_new;
+    let _: unsafe extern "C" fn(*mut c_void, i64) -> i64 = async_mutex::willow_async_mutex_load;
+    let _: unsafe extern "C" fn(*mut c_void, i64, i64) -> i32 =
+        async_mutex::willow_async_mutex_commit;
+    let _: unsafe extern "C" fn(*mut c_void, i64, i64) -> i32 =
         async_mutex::willow_async_mutex_commit_release;
-    let _: extern "C" fn(*mut c_void, i64) -> i64 = crate::lock_group::willow_lock_group_load;
-    let _: extern "C" fn(*mut c_void, i64, i64) -> i32 =
+    let _: unsafe extern "C" fn(*mut c_void, i64) -> i64 =
+        crate::lock_group::willow_lock_group_load;
+    let _: unsafe extern "C" fn(*mut c_void, i64, i64) -> i32 =
         crate::lock_group::willow_lock_group_commit;
-    let _: extern "C" fn(i64, i64) -> *mut c_void = async_rwlock::willow_async_rwlock_new;
-    let _: extern "C" fn(*mut c_void, i64) -> i64 = async_rwlock::willow_async_rwlock_load;
-    let _: extern "C" fn(*mut c_void, i64, i64) -> i32 = async_rwlock::willow_async_rwlock_commit;
+    let _: unsafe extern "C" fn(i64, i64) -> *mut c_void = async_rwlock::willow_async_rwlock_new;
+    let _: unsafe extern "C" fn(*mut c_void, i64) -> i64 = async_rwlock::willow_async_rwlock_load;
+    let _: unsafe extern "C" fn(*mut c_void, i64, i64) -> i32 =
+        async_rwlock::willow_async_rwlock_commit;
 }
 
 #[test]
@@ -296,10 +305,10 @@ fn every_word_carrying_row_is_pinned_by_the_runtime() {
 fn payload_free_collection_and_lock_rows_stay_i64() {
     // Constructors, lengths, indexes and lock tokens next to the Word rows
     // above carry kind tags, flags and ids only, never a payload word.
-    let _: extern "C" fn(i64, i64) -> *mut u8 = array::willow_array_new;
-    let _: extern "C" fn(*mut u8, i64) -> *mut u8 = array::willow_array_element_addr;
+    let _: unsafe extern "C" fn(i64, i64) -> *mut u8 = array::willow_array_new;
+    let _: unsafe extern "C" fn(*mut u8, i64) -> *mut u8 = array::willow_array_element_addr;
     let _: extern "C" fn(i64, i64, i64) -> *mut u8 = map::willow_map_new;
-    let _: extern "C" fn(i64, i64) -> *mut u8 = array::willow_array_new_literal;
+    let _: unsafe extern "C" fn(i64, i64) -> *mut u8 = array::willow_array_new_literal;
     assert_schema("willow_array_new_literal", &[I64, I64], Some(Ptr));
     assert_schema("willow_array_new", &[I64, I64], Some(Ptr));
     assert_schema("willow_array_len", &[Ptr], Some(I64));
@@ -321,8 +330,8 @@ fn typed_scalar_rows_never_carry_a_word() {
     // Scalar-typed channel, atomic and future entry points are monomorphic
     // `i64` payloads with `_ptr`/`_bool`/`_f64` siblings; they are `I64`, not
     // `Word`, and their pointer siblings are `Ptr`.
-    let _: extern "C" fn(*mut c_void, i64) = channel::willow_channel_send_i64;
-    let _: extern "C" fn(*mut c_void, *mut c_void) = channel::willow_channel_send_ptr;
+    let _: unsafe extern "C" fn(*mut c_void, i64) = channel::willow_channel_send_i64;
+    let _: unsafe extern "C" fn(*mut c_void, *mut c_void) = channel::willow_channel_send_ptr;
     assert_schema("willow_channel_send_i64", &[Ptr, I64], None);
     assert_schema("willow_channel_send_ptr", &[Ptr, Ptr], None);
     assert_schema("willow_channel_recv_i64", &[Ptr], Some(I64));
@@ -411,35 +420,40 @@ fn future_pointer_and_scalar_payloads_have_distinct_signatures() {
 #[test]
 fn channel_pointer_and_scalar_payloads_have_distinct_signatures() {
     let _: extern "C" fn(i64, i64) -> *mut c_void = channel::willow_channel_new_bounded;
-    let _: extern "C" fn(*mut c_void, *mut c_void) -> i32 = channel::willow_channel_try_send_ptr;
-    let _: extern "C" fn(*mut c_void, *mut c_void) = channel::willow_channel_send_ptr;
-    let _: extern "C" fn(*mut c_void) -> *mut c_void = channel::willow_channel_recv_ptr;
-    let _: extern "C" fn(*mut c_void, *mut i64) -> i64 = channel::willow_channel_recv_opt_into;
-    let _: extern "C" fn(*mut c_void, *mut i64) -> i32 = channel::willow_channel_recv_take;
-    let _: extern "C" fn(*mut c_void, i64) = channel::willow_channel_send_i64;
-    let _: extern "C" fn(*mut c_void) -> i64 = channel::willow_channel_recv_i64;
-    let _: extern "C" fn(*mut c_void, u8) = channel::willow_channel_send_bool;
-    let _: extern "C" fn(*mut c_void) -> u8 = channel::willow_channel_recv_bool;
-    let _: extern "C" fn(*mut c_void, f64) = channel::willow_channel_send_f64;
-    let _: extern "C" fn(*mut c_void) -> f64 = channel::willow_channel_recv_f64;
+    let _: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 =
+        channel::willow_channel_try_send_ptr;
+    let _: unsafe extern "C" fn(*mut c_void, *mut c_void) = channel::willow_channel_send_ptr;
+    let _: unsafe extern "C" fn(*mut c_void) -> *mut c_void = channel::willow_channel_recv_ptr;
+    let _: unsafe extern "C" fn(*mut c_void, *mut i64) -> i64 =
+        channel::willow_channel_recv_opt_into;
+    let _: unsafe extern "C" fn(*mut c_void, *mut i64) -> i32 = channel::willow_channel_recv_take;
+    let _: unsafe extern "C" fn(*mut c_void, i64) = channel::willow_channel_send_i64;
+    let _: unsafe extern "C" fn(*mut c_void) -> i64 = channel::willow_channel_recv_i64;
+    let _: unsafe extern "C" fn(*mut c_void, u8) = channel::willow_channel_send_bool;
+    let _: unsafe extern "C" fn(*mut c_void) -> u8 = channel::willow_channel_recv_bool;
+    let _: unsafe extern "C" fn(*mut c_void, f64) = channel::willow_channel_send_f64;
+    let _: unsafe extern "C" fn(*mut c_void) -> f64 = channel::willow_channel_recv_f64;
 }
 
 #[test]
 fn lock_handles_are_pointers_and_tokens_and_payloads_remain_i64() {
-    let _: extern "C" fn(i64, i64) -> *mut c_void = lock::willow_blocking_cell_new;
-    let _: extern "C" fn(*mut c_void) -> i64 = lock::willow_blocking_cell_get;
-    let _: extern "C" fn(*mut c_void, i64) = lock::willow_blocking_cell_set;
-    let _: extern "C" fn(i64, i64) -> *mut c_void = async_mutex::willow_async_mutex_new;
-    let _: extern "C" fn(*mut c_void, *mut i64) -> i32 = async_mutex::willow_async_mutex_acquire;
-    let _: extern "C" fn(*mut c_void, i64) -> i32 = async_mutex::willow_async_mutex_poll;
-    let _: extern "C" fn(*mut c_void, i64) -> i64 = async_mutex::willow_async_mutex_load;
-    let _: extern "C" fn(*mut c_void, i64, i64) -> i32 = async_mutex::willow_async_mutex_commit;
-    let _: extern "C" fn(i64, i64) -> *mut c_void = async_rwlock::willow_async_rwlock_new;
-    let _: extern "C" fn(*mut c_void, i32, *mut i64) -> i32 =
+    let _: unsafe extern "C" fn(i64, i64) -> *mut c_void = lock::willow_blocking_cell_new;
+    let _: unsafe extern "C" fn(*mut c_void) -> i64 = lock::willow_blocking_cell_get;
+    let _: unsafe extern "C" fn(*mut c_void, i64) = lock::willow_blocking_cell_set;
+    let _: unsafe extern "C" fn(i64, i64) -> *mut c_void = async_mutex::willow_async_mutex_new;
+    let _: unsafe extern "C" fn(*mut c_void, *mut i64) -> i32 =
+        async_mutex::willow_async_mutex_acquire;
+    let _: unsafe extern "C" fn(*mut c_void, i64) -> i32 = async_mutex::willow_async_mutex_poll;
+    let _: unsafe extern "C" fn(*mut c_void, i64) -> i64 = async_mutex::willow_async_mutex_load;
+    let _: unsafe extern "C" fn(*mut c_void, i64, i64) -> i32 =
+        async_mutex::willow_async_mutex_commit;
+    let _: unsafe extern "C" fn(i64, i64) -> *mut c_void = async_rwlock::willow_async_rwlock_new;
+    let _: unsafe extern "C" fn(*mut c_void, i32, *mut i64) -> i32 =
         async_rwlock::willow_async_rwlock_acquire;
-    let _: extern "C" fn(*mut c_void, i64) -> i32 = async_rwlock::willow_async_rwlock_poll;
-    let _: extern "C" fn(*mut c_void, i64) -> i64 = async_rwlock::willow_async_rwlock_load;
-    let _: extern "C" fn(*mut c_void, i64, i64) -> i32 = async_rwlock::willow_async_rwlock_commit;
+    let _: unsafe extern "C" fn(*mut c_void, i64) -> i32 = async_rwlock::willow_async_rwlock_poll;
+    let _: unsafe extern "C" fn(*mut c_void, i64) -> i64 = async_rwlock::willow_async_rwlock_load;
+    let _: unsafe extern "C" fn(*mut c_void, i64, i64) -> i32 =
+        async_rwlock::willow_async_rwlock_commit;
 }
 
 #[test]
@@ -470,11 +484,11 @@ fn interface_dispatch_layout_matches_native_pointer_aggregate() {
 
 #[test]
 fn lazy_task_stack_entrypoints_keep_pointer_callback_abi() {
-    let _: extern "C" fn(crate::task::RuntimePollFn, *mut c_void) -> i64 =
+    let _: unsafe extern "C" fn(crate::task::RuntimePollFn, *mut c_void) -> i64 =
         crate::scheduler::willow_sched_spawn_cooperative;
-    let _: extern "C" fn(crate::task::RuntimePollFn, *mut c_void) -> i32 =
+    let _: unsafe extern "C" fn(crate::task::RuntimePollFn, *mut c_void) -> i32 =
         crate::scheduler::willow_task_stack_enter;
-    let _: extern "C" fn(crate::task::RuntimePollFn, *mut c_void) -> i32 =
+    let _: unsafe extern "C" fn(crate::task::RuntimePollFn, *mut c_void) -> i32 =
         crate::scheduler::willow_task_stack_enter_generated;
     let _: extern "C" fn() -> *mut crate::gc::GcTlabState = crate::gc::willow_gc_current_tlab;
     let _: extern "C" fn() = crate::scheduler::willow_task_stack_leave;
@@ -629,25 +643,26 @@ fn aggregate_bridge_runtime_abi_matches_schema() {
         ffi::{WillowBridgeValue, WillowSliceU8},
     };
     let _: extern "C" fn() -> *mut u8 = willow_rust_bridge_frame_new;
-    let _: extern "C" fn(*mut u8) = willow_rust_bridge_frame_drop;
-    let _: extern "C" fn(*mut u8, u64) = willow_rust_bridge_root;
-    let _: extern "C" fn(u64, *mut WillowSliceU8) = willow_rust_bridge_string_data;
-    let _: extern "C" fn(u64) -> usize = willow_rust_bridge_bytes_len;
-    let _: extern "C" fn(u64, *mut u8, usize) = willow_rust_bridge_bytes_copy;
-    let _: extern "C" fn(*mut u8, *const u8, usize, u32) -> u64 = willow_rust_bridge_buffer;
-    let _: extern "C" fn(*mut u8, usize, u32) -> u64 = willow_rust_bridge_array_new;
-    let _: extern "C" fn(u64, usize) -> u64 = willow_rust_bridge_array_get;
-    let _: extern "C" fn(u64, usize, u64) = willow_rust_bridge_array_set;
-    let _: extern "C" fn(*mut u8, *const u64, usize, *const u64, u64) -> u64 =
+    let _: unsafe extern "C" fn(*mut u8) = willow_rust_bridge_frame_drop;
+    let _: unsafe extern "C" fn(*mut u8, u64) = willow_rust_bridge_root;
+    let _: unsafe extern "C" fn(u64, *mut WillowSliceU8) = willow_rust_bridge_string_data;
+    let _: unsafe extern "C" fn(u64) -> usize = willow_rust_bridge_bytes_len;
+    let _: unsafe extern "C" fn(u64, *mut u8, usize) = willow_rust_bridge_bytes_copy;
+    let _: unsafe extern "C" fn(*mut u8, *const u8, usize, u32) -> u64 = willow_rust_bridge_buffer;
+    let _: unsafe extern "C" fn(*mut u8, usize, u32) -> u64 = willow_rust_bridge_array_new;
+    let _: unsafe extern "C" fn(u64, usize) -> u64 = willow_rust_bridge_array_get;
+    let _: unsafe extern "C" fn(u64, usize, u64) = willow_rust_bridge_array_set;
+    let _: unsafe extern "C" fn(*mut u8, *const u64, usize, *const u64, u64) -> u64 =
         willow_rust_bridge_record_new;
-    let _: extern "C" fn(u64, usize, u32, *mut WillowBridgeValue) = willow_rust_bridge_record_get;
-    let _: extern "C" fn(u64, usize, *const WillowBridgeValue, u32, u32) =
+    let _: unsafe extern "C" fn(u64, usize, u32, *mut WillowBridgeValue) =
+        willow_rust_bridge_record_get;
+    let _: unsafe extern "C" fn(u64, usize, *const WillowBridgeValue, u32, u32) =
         willow_rust_bridge_record_set;
-    let _: extern "C" fn(u64) -> u64 = willow_rust_bridge_tag;
-    let _: extern "C" fn(u64, u32, *mut WillowBridgeValue) = willow_rust_bridge_payload;
-    let _: extern "C" fn(*mut u8, u64, *const WillowBridgeValue, u32, u32) -> u64 =
+    let _: unsafe extern "C" fn(u64) -> u64 = willow_rust_bridge_tag;
+    let _: unsafe extern "C" fn(u64, u32, *mut WillowBridgeValue) = willow_rust_bridge_payload;
+    let _: unsafe extern "C" fn(*mut u8, u64, *const WillowBridgeValue, u32, u32) -> u64 =
         willow_rust_bridge_enum;
-    let _: extern "C" fn(*const u8, usize) -> ! = willow_rust_bridge_panic_message;
+    let _: unsafe extern "C" fn(*const u8, usize) -> ! = willow_rust_bridge_panic_message;
     for (name, params, result) in [
         ("willow_rust_bridge_frame_new", &[][..], Some(Ptr)),
         ("willow_rust_bridge_frame_drop", &[Ptr][..], None),
@@ -709,9 +724,9 @@ fn task_frame_diagnostics_are_void_and_may_block_on_output() {
 
 #[test]
 fn fused_mutex_out_slots_have_native_pointer_signatures() {
-    let _: extern "C" fn(*mut c_void, *mut i64, *mut i64) -> i32 =
+    let _: unsafe extern "C" fn(*mut c_void, *mut i64, *mut i64) -> i32 =
         async_mutex::willow_async_mutex_acquire_load;
-    let _: extern "C" fn(*mut c_void, i64, *mut i64) -> i32 =
+    let _: unsafe extern "C" fn(*mut c_void, i64, *mut i64) -> i32 =
         async_mutex::willow_async_mutex_poll_load;
     assert_schema(
         "willow_async_mutex_acquire_load",

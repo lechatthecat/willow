@@ -92,14 +92,20 @@ pub(crate) fn replace_task_helper(helper: TaskHelper) -> TaskHelper {
 
 /// Record the executing helper outside signal/exception context. Generated
 /// code passes process-lifetime UTF-8 bytes. OS-stack execution stays untagged.
+///
+/// # Safety
+/// For each non-null pointer with a positive length, provide that many initialized immutable
+/// bytes in a single allocation at a stable address for the lifetime of the process.
+/// Diagnostics retain the address.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_stack_helper_set(name: *const u8, len: i64) {
+pub unsafe extern "C" fn willow_stack_helper_set(name: *const u8, len: i64) {
     PROTECTION.with(|slot| {
         if let Some(protection) = slot.borrow().as_ref() {
             let state = protection.diagnostic();
             let context = state.context.load(std::sync::atomic::Ordering::SeqCst);
             if !context.is_null() {
+                // SAFETY: The current activation keeps its installed generated context live.
                 unsafe { &*context }.clear_helper();
             }
             if state.task.load(std::sync::atomic::Ordering::SeqCst) {
@@ -218,10 +224,12 @@ mod platform {
     fn thread_key() -> usize {
         // POSIX permits pthread_self in an asynchronous signal handler. Its
         // representation on these two targets is a nonzero integer/pointer.
+        // SAFETY: This scalar POSIX query takes no caller-managed buffer.
         unsafe { libc::pthread_self() as usize }
     }
 
     fn page_size() -> Result<usize, String> {
+        // SAFETY: This scalar POSIX query takes no caller-managed buffer.
         let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if size < 4096 {
             return Err("native page size is smaller than compiler stack probes".into());
@@ -235,6 +243,8 @@ mod platform {
 
     fn install_handlers() -> Result<(), String> {
         INITIALIZED
+            // SAFETY: Installation initializes and retains the previous signal dispositions for
+            // the lifetime of the handler.
             .get_or_init(|| unsafe {
                 let mut previous = Box::new(Previous {
                     segv: std::mem::zeroed(),
@@ -279,11 +289,17 @@ mod platform {
     ) {
         // All allocations and publication happen during setup. The handler
         // uses only native pointer-sized atomics and POSIX signal-safe calls.
+        // SAFETY: The OS invokes this handler with a valid signal or exception record for this
+        // delivery.
         let address = unsafe { (*info).si_addr() as usize };
+        // SAFETY: The OS invokes this handler with a valid signal or exception record for this
+        // delivery.
         if unsafe { (*info).si_code } > 0 && address != 0 {
             let key = thread_key();
             let mut node = SLOTS.load(Ordering::Acquire);
             while !node.is_null() {
+                // SAFETY: Published slot nodes have process lifetime. The registration protocol
+                // synchronizes their per-thread state.
                 let slot = unsafe { &*node };
                 if slot.key.load(Ordering::Acquire) == key {
                     let bounds = Bounds {
@@ -291,6 +307,10 @@ mod platform {
                         upper: slot.upper.load(Ordering::Relaxed),
                     };
                     if bounds.contains(address) {
+                        // SAFETY: Each write uses the pointer and byte count from the same
+                        // slice. The diagnostic literals and the published helper name have
+                        // static storage and remain readable throughout each write. POSIX
+                        // specifies both write and _exit as async-signal-safe.
                         unsafe {
                             if let Some(name) = slot.diagnostic.get() {
                                 for bytes in [super::TASK_DIAGNOSTIC, name, b"\n"] {
@@ -318,6 +338,8 @@ mod platform {
 
         let previous = PREVIOUS.load(Ordering::Acquire);
         if !previous.is_null() {
+            // SAFETY: Installation initializes and retains the previous signal dispositions for
+            // the lifetime of the handler.
             let (action, reset) = unsafe {
                 if signal == libc::SIGBUS {
                     (&(*previous).bus, &(*previous).bus_reset)
@@ -334,10 +356,17 @@ mod platform {
                 // Restore the fatal disposition and redeliver explicitly.
                 // Darwin can report SEGV_ACCERR even for raise(SIGSEGV), so
                 // si_code cannot tell us whether an instruction will repeat.
+                // SAFETY: the flags and handler union in a zeroed sigaction permit SIG_DFL.
                 let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
                 default.sa_sigaction = libc::SIG_DFL;
-                unsafe { libc::sigemptyset(&mut default.sa_mask) };
-                unsafe { libc::sigaction(signal, &default, ptr::null_mut()) };
+                // SAFETY: sa_mask is writable, and sigaction copies the initialized record.
+                unsafe {
+                    libc::sigemptyset(&mut default.sa_mask);
+                    libc::sigaction(signal, &default, ptr::null_mut());
+                }
+                // SAFETY: the kernel passed SIGSEGV or SIGBUS to this handler. raise is
+                // async-signal-safe and requeues it on this thread under the restored SIG_DFL
+                // disposition. The signal is blocked until this handler returns.
                 unsafe { libc::raise(signal) };
                 return;
             }
@@ -346,12 +375,22 @@ mod platform {
             // siginfo/ucontext while retaining Willow's process disposition,
             // so subsequent overflows still reach us. Reproduce its blocking
             // mask and one-shot semantics without allocating or locking.
+            // SAFETY: The native signal record or mask has a valid zero representation. The OS
+            // call receives live initialized inputs or writable outputs.
             let mut saved_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+            // SAFETY: The native signal record or mask has a valid zero representation. The OS
+            // call receives live initialized inputs or writable outputs.
             unsafe { libc::sigprocmask(libc::SIG_BLOCK, &action.sa_mask, &mut saved_mask) };
             if action.sa_flags & libc::SA_NODEFER != 0
+                // SAFETY: The native signal record or mask has a valid zero representation. The OS
+                // call receives live initialized inputs or writable outputs.
                 && unsafe { libc::sigismember(&action.sa_mask, signal) } == 0
             {
+                // SAFETY: The native signal record or mask has a valid zero representation. The OS
+                // call receives live initialized inputs or writable outputs.
                 let mut signal_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+                // SAFETY: The native signal record or mask has a valid zero representation. The OS
+                // call receives live initialized inputs or writable outputs.
                 unsafe {
                     libc::sigemptyset(&mut signal_mask);
                     libc::sigaddset(&mut signal_mask, signal);
@@ -363,13 +402,23 @@ mod platform {
                     libc::c_int,
                     *mut libc::siginfo_t,
                     *mut libc::c_void,
+                    // SAFETY: The saved disposition's SA_SIGINFO bit selects the handler signature.
+                    // OS-provided arguments remain live through chaining.
                 ) = unsafe { std::mem::transmute(action.sa_sigaction) };
+                // SAFETY: The saved disposition's SA_SIGINFO bit selects the handler signature.
+                // OS-provided arguments remain live through chaining.
                 unsafe { handler(signal, info, context) };
             } else {
                 let handler: unsafe extern "C" fn(libc::c_int) =
+                    // SAFETY: The saved disposition's SA_SIGINFO bit selects the handler
+                    // signature. OS-provided arguments remain live through chaining.
                     unsafe { std::mem::transmute(action.sa_sigaction) };
+                // SAFETY: The saved disposition's SA_SIGINFO bit selects the handler signature.
+                // OS-provided arguments remain live through chaining.
                 unsafe { handler(signal) };
             }
+            // SAFETY: The native signal record or mask has a valid zero representation. The OS
+            // call receives live initialized inputs or writable outputs.
             unsafe { libc::sigprocmask(libc::SIG_SETMASK, &saved_mask, ptr::null_mut()) };
         }
     }
@@ -382,6 +431,8 @@ mod platform {
         let _setup = SETUP.lock().unwrap_or_else(|poison| poison.into_inner());
         let mut node = SLOTS.load(Ordering::Acquire);
         while !node.is_null() {
+            // SAFETY: Published slot nodes have process lifetime. The registration protocol
+            // synchronizes their per-thread state.
             let slot = unsafe { &*node };
             if slot.claim(key, bounds) {
                 return Ok(node);
@@ -408,6 +459,8 @@ mod platform {
 
     impl AlternateStack {
         fn install(page: usize) -> Result<Option<Self>, String> {
+            // SAFETY: The current thread owns the alternate-stack registration and its backing
+            // mapping through restoration.
             unsafe {
                 let mut previous: libc::stack_t = std::mem::zeroed();
                 if libc::sigaltstack(ptr::null(), &mut previous) != 0 {
@@ -460,6 +513,8 @@ mod platform {
 
     impl Drop for AlternateStack {
         fn drop(&mut self) {
+            // SAFETY: The current thread owns the alternate-stack registration and its backing
+            // mapping through restoration.
             unsafe {
                 let mut current: libc::stack_t = std::mem::zeroed();
                 if libc::sigaltstack(ptr::null(), &mut current) != 0 {
@@ -484,10 +539,14 @@ mod platform {
 
     impl Protection {
         pub(super) fn diagnostic(&self) -> &super::DiagnosticState {
+            // SAFETY: Published slot nodes have process lifetime. The registration protocol
+            // synchronizes their per-thread state.
             unsafe { &(*self.slot).diagnostic }
         }
 
         pub(super) fn replace_guard(&self, lower: usize, upper: usize) -> (usize, usize) {
+            // SAFETY: Published slot nodes have process lifetime. The registration protocol
+            // synchronizes their per-thread state.
             let slot = unsafe { &*self.slot };
             let previous = (
                 slot.lower.load(Ordering::Relaxed),
@@ -515,12 +574,16 @@ mod platform {
         fn drop(&mut self) {
             // Teardown occurs on this same thread; its handler cannot race a
             // concurrent unregister/reuse while reading matching bounds.
+            // SAFETY: Published slot nodes have process lifetime. The registration protocol
+            // synchronizes their per-thread state.
             unsafe { &*self.slot }.key.store(0, Ordering::Release);
         }
     }
 
     #[cfg(target_os = "linux")]
     fn current_bounds(page: usize) -> Result<Bounds, String> {
+        // SAFETY: The pthread query uses the current thread and live output storage, inspected
+        // only after successful initialization.
         unsafe {
             let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
             let result = libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr());
@@ -561,7 +624,11 @@ mod platform {
     fn musl_main_bounds(page: usize) -> Result<Bounds, String> {
         // musl reports only currently mapped main-stack bytes. The mapping's
         // upper end and finite rlimit describe how far Linux may grow it.
-        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: limit is an exclusively borrowed, writable rlimit for the entire call.
         if unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut limit) } != 0 {
             return Err(system_error("reading the main stack limit"));
         }
@@ -592,6 +659,8 @@ mod platform {
 
     #[cfg(target_os = "macos")]
     fn current_bounds(page: usize) -> Result<Bounds, String> {
+        // SAFETY: The pthread query uses the current thread and live output storage, inspected
+        // only after successful initialization.
         unsafe {
             let thread = libc::pthread_self();
             let top = libc::pthread_get_stackaddr_np(thread) as usize;
@@ -686,9 +755,15 @@ mod platform {
                     rlim_cur: 0,
                     rlim_max: 0,
                 };
+                // SAFETY: no_core is an initialized libc::rlimit and remains readable
+                // throughout setrlimit's call for RLIMIT_CORE.
                 assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) }, 0);
+                // SAFETY: The isolated signal probe sets dispositions or raises the signal only
+                // within its own process.
                 unsafe { libc::signal(libc::SIGSEGV, libc::SIG_DFL) };
                 super::super::protect_current_thread();
+                // SAFETY: The isolated signal probe sets dispositions or raises the signal only
+                // within its own process.
                 unsafe { libc::raise(libc::SIGSEGV) };
                 panic!("default SIGSEGV disposition was swallowed");
             }
@@ -707,6 +782,8 @@ mod platform {
         fn recoverable_custom_signal_keeps_overflow_handler_installed() {
             const TEST: &str = "recoverable_custom_signal_keeps_overflow_handler_installed";
             if is_child(TEST) {
+                // SAFETY: The isolated signal probe sets dispositions or raises the signal only
+                // within its own process.
                 unsafe {
                     libc::signal(libc::SIGSEGV, custom_handler as *const () as usize);
                 }
@@ -715,11 +792,17 @@ mod platform {
                 // to the host handler rather than the overflow diagnostic.
                 super::super::replace_task_helper(Some(b"task_helper"));
                 for _ in 0..2 {
+                    // SAFETY: The isolated signal probe sets dispositions or raises the signal
+                    // only within its own process.
                     assert_eq!(unsafe { libc::raise(libc::SIGSEGV) }, 0);
                 }
                 assert_eq!(CUSTOM_CALLS.load(Ordering::Relaxed), 2);
+                // SAFETY: The native signal record or mask has a valid zero representation. The OS
+                // call receives live initialized inputs or writable outputs.
                 let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
                 assert_eq!(
+                    // SAFETY: The native signal record or mask has a valid zero representation.
+                    // The OS call receives live initialized inputs or writable outputs.
                     unsafe { libc::sigaction(libc::SIGSEGV, ptr::null(), &mut action) },
                     0
                 );
@@ -754,6 +837,8 @@ mod platform {
                     .join()
                     .unwrap();
                     assert_eq!(
+                        // SAFETY: Published slot nodes have process lifetime. The registration
+                        // protocol synchronizes their per-thread state.
                         unsafe { &*(slot as *const ThreadSlot) }
                             .key
                             .load(Ordering::Acquire),
@@ -775,6 +860,8 @@ mod platform {
         fn owned_alternate_stack_restores_disabled_state() {
             const TEST: &str = "owned_alternate_stack_restores_disabled_state";
             if is_child(TEST) {
+                // SAFETY: The current thread owns the alternate-stack registration and its backing
+                // mapping through restoration.
                 unsafe {
                     let mut original: libc::stack_t = std::mem::zeroed();
                     assert_eq!(libc::sigaltstack(ptr::null(), &mut original), 0);
@@ -906,7 +993,11 @@ mod platform {
     }
 
     unsafe extern "system" fn exception_handler(info: *mut ExceptionPointers) -> i32 {
+        // SAFETY: The OS invokes this handler with a valid signal or exception record for this
+        // delivery.
         if unsafe { (*(*info).record).code } == STATUS_STACK_OVERFLOW {
+            // SAFETY: TLS is null or holds the current thread's boxed DiagnosticState.
+            // The diagnostic slices outlive WriteFile and written is its writable output.
             unsafe {
                 let mut written = 0;
                 let index = TLS_INDEX.load(std::sync::atomic::Ordering::Acquire);
@@ -944,6 +1035,7 @@ mod platform {
 
     impl Drop for Protection {
         fn drop(&mut self) {
+            // SAFETY: Clear this thread's TLS pointer before its boxed DiagnosticState drops.
             unsafe {
                 TlsSetValue(
                     TLS_INDEX.load(std::sync::atomic::Ordering::Acquire),
@@ -962,6 +1054,7 @@ mod platform {
             // A guarantee is thread-lifetime OS state. Windows only increases
             // an existing guarantee, so no previous reservation is destroyed.
             let mut guarantee = 64 * 1024;
+            // SAFETY: Windows can read and update the live u32 stack-size argument.
             if unsafe { SetThreadStackGuarantee(&mut guarantee) } == 0 {
                 return Err(format!(
                     "SetThreadStackGuarantee: {}",
@@ -971,11 +1064,13 @@ mod platform {
             static INSTALLED: OnceLock<Result<(), String>> = OnceLock::new();
             INSTALLED
                 .get_or_init(|| {
+                    // SAFETY: TlsAlloc takes no arguments; the process retains the returned index.
                     let index = unsafe { TlsAlloc() };
                     if index == u32::MAX {
                         return Err("TlsAlloc for overflow diagnostics failed".into());
                     }
                     TLS_INDEX.store(index, std::sync::atomic::Ordering::Release);
+                    // SAFETY: The handler has the system ABI and remains executable for the process lifetime.
                     if unsafe { AddVectoredExceptionHandler(1, exception_handler) }.is_null() {
                         Err(format!(
                             "AddVectoredExceptionHandler: {}",
@@ -987,6 +1082,7 @@ mod platform {
                 })
                 .clone()?;
             let state = Box::<super::DiagnosticState>::default();
+            // SAFETY: The Box keeps DiagnosticState aligned and immobile until Drop clears this TLS slot.
             if unsafe {
                 TlsSetValue(
                     TLS_INDEX.load(std::sync::atomic::Ordering::Acquire),
@@ -1035,20 +1131,26 @@ mod diagnostic_tests {
     fn helper_publication_preserves_native_and_handles_empty_names() {
         protect_current_thread();
         let previous = replace_task_helper(None);
-        willow_stack_helper_set(b"not-a-task".as_ptr(), 10);
+        // SAFETY: The nonempty diagnostic names are byte literals with process lifetime and
+        // the supplied lengths fit those literals.
+        unsafe { willow_stack_helper_set(b"not-a-task".as_ptr(), 10) };
         assert_eq!(replace_task_helper(Some(b"initial")), None);
         for (pointer, len) in [
             (std::ptr::null(), 12),
             (b"ignored".as_ptr(), 0),
             (b"ignored".as_ptr(), -1),
         ] {
-            willow_stack_helper_set(pointer, len);
+            // SAFETY: The nonempty diagnostic names are byte literals with process lifetime
+            // and the supplied lengths fit those literals.
+            unsafe { willow_stack_helper_set(pointer, len) };
             assert_eq!(
                 replace_task_helper(Some(b"initial")),
                 Some(&b"<unknown>"[..])
             );
         }
-        willow_stack_helper_set("補助関数".as_ptr(), "補助関数".len() as i64);
+        // SAFETY: The nonempty diagnostic names are byte literals with process lifetime and
+        // the supplied lengths fit those literals.
+        unsafe { willow_stack_helper_set("補助関数".as_ptr(), "補助関数".len() as i64) };
         assert_eq!(replace_task_helper(previous), Some("補助関数".as_bytes()));
     }
 

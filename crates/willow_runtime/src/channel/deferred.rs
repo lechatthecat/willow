@@ -29,28 +29,40 @@ pub(super) fn schedule(raw: *mut c_void, channel: &ChannelCore, receive: bool) -
     let channel_root = crate::gc::GcRootHandle::new(raw.cast());
     let frame = willow_async_frame_alloc(1, 1);
     let value = channel_root.load();
-    crate::gc::willow_gc_write_barrier(
-        frame.cast(),
-        std::ptr::null_mut(),
-        value,
-        crate::gc::GcStoreDestination::AsyncFrameSlot as i64,
-    );
+    // SAFETY: The destination describes this reference update. Any asserted header belongs to
+    // its live GC payload.
+    unsafe {
+        crate::gc::willow_gc_write_barrier(
+            frame.cast(),
+            std::ptr::null_mut(),
+            value,
+            crate::gc::GcStoreDestination::AsyncFrameSlot as i64,
+        )
+    };
+    // SAFETY: The scheduler pairs this poll with its live deferred-job frame. Frame slots are
+    // word-aligned by allocation and ABI stride.
     unsafe {
         frame
             .cast::<u8>()
             .add(crate::async_frame::ASYNC_FRAME_SLOT_COUNT_OFFSET)
             .cast::<i64>()
             .write(1);
+        // SAFETY: The scheduler pairs this poll with its live deferred-job frame. Frame slots are
+        // word-aligned by allocation and ABI stride.
         frame
             .cast::<u8>()
             .add(async_frame_slot_offset(0))
             .cast::<*mut u8>()
             .write(value);
     }
-    crate::scheduler::willow_sched_spawn_cooperative(
-        if receive { poll_receive } else { poll_send },
-        frame,
-    );
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe {
+        crate::scheduler::willow_sched_spawn_cooperative(
+            if receive { poll_receive } else { poll_send },
+            frame,
+        )
+    };
     channel_root.load().cast()
 }
 
@@ -89,6 +101,8 @@ pub(super) fn drive_for_test() -> usize {
             });
         });
         let before = CHANNEL_WAITER_VISITS.load(std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: The scheduler pairs this poll with its live deferred-job frame. Frame slots are
+        // word-aligned by allocation and ABI stride.
         let result = unsafe { poll(frame) };
         assert!(
             CHANNEL_WAITER_VISITS.load(std::sync::atomic::Ordering::Relaxed) - before
@@ -107,16 +121,22 @@ pub(super) fn drive_for_test() -> usize {
 
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_receive(frame: *mut c_void) -> i32 {
+    // SAFETY: The scheduler pairs this poll with its live deferred-job frame. Frame slots are
+    // word-aligned by allocation and ABI stride.
     unsafe { poll(frame, true) }
 }
 
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_send(frame: *mut c_void) -> i32 {
+    // SAFETY: The scheduler pairs this poll with its live deferred-job frame. Frame slots are
+    // word-aligned by allocation and ABI stride.
     unsafe { poll(frame, false) }
 }
 
 unsafe fn poll(frame: *mut c_void, receive: bool) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    // SAFETY: The scheduler pairs this poll with its live deferred-job frame. Frame slots are
+    // word-aligned by allocation and ABI stride.
     let raw = unsafe {
         frame
             .cast::<u8>()
@@ -124,6 +144,7 @@ unsafe fn poll(frame: *mut c_void, receive: bool) -> i32 {
             .cast::<*mut c_void>()
             .read()
     };
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let channel = unsafe { channel_from_raw(raw) }.expect("rooted channel job");
     // Borrow only the stable core across publication's GC stress points.
     let channel: &ChannelCore = channel;

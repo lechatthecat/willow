@@ -200,6 +200,8 @@ impl RuntimeRootSet {
         let mut values = Vec::with_capacity(shards.iter().map(|shard| shard.len()).sum());
         for shard in &shards {
             for address in shard.addresses() {
+                // SAFETY: Registered roots retain their aligned pointer slots until removal.
+                // Snapshot synchronization covers this load.
                 let value = unsafe { crate::gc::load_gc_reference(address as *mut *mut u8) };
                 if !value.is_null() {
                     values.push(value);

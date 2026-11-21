@@ -482,9 +482,14 @@ impl BarrierCallCounter {
 /// zero. No store and no fence: the caller then runs its generational filter
 /// on the now shared value. Never parks (generated store sites are not GC
 /// points), so nothing moves between this call and the store.
+///
+/// # Safety
+/// The caller must supply the payload start of a live managed object in the
+/// current runtime. The publishing mutator must own the unshared objects it
+/// will traverse, and their traced fields must contain valid references.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_gc_publish_stored_value(value: *mut u8) {
+pub unsafe extern "C" fn willow_gc_publish_stored_value(value: *mut u8) {
     super::publish::publish_in(
         crate::runtime::current(),
         value,
@@ -497,58 +502,103 @@ pub extern "C" fn willow_gc_publish_stored_value(value: *mut u8) {
 /// the new edge for the existing incremental marker, and remember old-to-young
 /// edges. The caller must capture `old_value` before overwriting, including
 /// removals/null stores. Only proven-null initialization passes null as old.
+///
+/// # Safety
+/// Each asserted OWNER_HAS_HEADER or VALUE_HAS_HEADER bit requires the corresponding
+/// non-null pointer to be the payload start of a live object with its GC header in the
+/// selected runtime. Supply the actual previous and incoming reference values for the
+/// destination.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_gc_write_barrier(
+pub unsafe extern "C" fn willow_gc_write_barrier(
     owner: *mut u8,
     old_value: *mut u8,
     value: *mut u8,
     destination_kind: i64,
 ) {
-    write_barrier(
-        owner,
-        std::ptr::null_mut(),
-        old_value,
-        value,
-        destination_kind,
-    );
+    // SAFETY: The enclosing store contract establishes the header proofs and identifies the
+    // reference slot when supplied.
+    unsafe {
+        write_barrier(
+            owner,
+            std::ptr::null_mut(),
+            old_value,
+            value,
+            destination_kind,
+        )
+    };
 }
 
 /// [`willow_gc_write_barrier`] for a store into element `slot` of the
 /// reference-array buffer whose payload starts at `buffer`. Large old buffers
 /// are remembered per slot card, so a minor scans only the written cards.
+///
+/// # Safety
+/// Each asserted OWNER_HAS_HEADER or VALUE_HAS_HEADER bit requires the corresponding
+/// non-null pointer to be the payload start of a live object with its GC header in the
+/// selected runtime. Supply the actual previous and incoming reference values for the
+/// destination. For an array store, a non-null slot must select the updated, aligned
+/// reference element in buffer. For an indirect store, slot addresses the updated reference
+/// word and buffer is its live managed payload base or null for native stack storage.
+///
+/// ```compile_fail,E0133
+/// let p = std::ptr::null_mut();
+/// willow_runtime::gc::willow_gc_array_write_barrier(p, p, p, p, 0);
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_gc_array_write_barrier(
+pub unsafe extern "C" fn willow_gc_array_write_barrier(
     buffer: *mut u8,
     slot: *mut u8,
     old_value: *mut u8,
     value: *mut u8,
     destination_kind: i64,
 ) {
-    write_barrier(buffer, slot, old_value, value, destination_kind);
+    // SAFETY: The enclosing store contract establishes the header proofs and identifies the
+    // reference slot when supplied.
+    unsafe { write_barrier(buffer, slot, old_value, value, destination_kind) };
 }
 
+/// # Safety
+/// Each asserted OWNER_HAS_HEADER or VALUE_HAS_HEADER bit requires the corresponding
+/// non-null pointer to be the payload start of a live object with its GC header in the
+/// selected runtime. Supply the actual previous and incoming reference values for the
+/// destination. For an indirect store with a slot, a non-null owner must be its live
+/// managed payload base. For array stores the slot is a numeric card candidate, never
+/// dereferenced here. Supply the updated element for card tracking; an address outside
+/// the elements is classified conservatively as a whole-buffer update.
 #[inline]
-fn write_barrier(
+unsafe fn write_barrier(
     owner: *mut u8,
     slot: *mut u8,
     old_value: *mut u8,
     value: *mut u8,
     destination_kind: i64,
 ) {
-    write_barrier_in(
-        crate::runtime::current(),
-        owner,
-        slot,
-        old_value,
-        value,
-        destination_kind,
-    );
+    // SAFETY: The enclosing store contract establishes the header proofs and identifies the
+    // reference slot when supplied.
+    unsafe {
+        write_barrier_in(
+            crate::runtime::current(),
+            owner,
+            slot,
+            old_value,
+            value,
+            destination_kind,
+        )
+    };
 }
 
+/// # Safety
+/// Each asserted OWNER_HAS_HEADER or VALUE_HAS_HEADER bit requires the corresponding
+/// non-null pointer to be the payload start of a live object with its GC header in the
+/// selected runtime. Supply the actual previous and incoming reference values for the
+/// destination. For an indirect store with a slot, a non-null owner must be its live
+/// managed payload base. For array stores the slot is a numeric card candidate, never
+/// dereferenced here. Supply the updated element for card tracking; an address outside
+/// the elements is classified conservatively as a whole-buffer update.
 #[inline]
-pub(crate) fn write_barrier_in(
+pub(crate) unsafe fn write_barrier_in(
     runtime_owner: &crate::runtime::Runtime,
     owner: *mut u8,
     slot: *mut u8,
@@ -588,7 +638,8 @@ pub(crate) fn write_barrier_in(
     // still applies. Barrier call sites are not GC points (generated code may
     // hold unrooted temporaries), so the publication never parks here.
     if !value.is_null()
-        && let Some(point) = publication_point(owner, slot, destination_kind, owner_has_header)
+        // SAFETY: The store contract proves a managed base for both forms of header access.
+        && let Some(point) = unsafe { publication_point(owner, slot, destination_kind, owner_has_header) }
     {
         super::publish::publish_in(runtime_owner, value, point, false);
     }
@@ -646,7 +697,9 @@ pub(crate) fn write_barrier_in(
     // unregistered thread takes the shared lock below.
     if young_edge_possible
         && (published || !marking_active)
-        && super::mutator_log::record_edge_in(
+        // SAFETY: The caller established the header bits. The generation check above
+        // excluded old values; indirect destinations do not assert a payload owner here.
+        && unsafe { super::mutator_log::record_edge_in(
             runtime_owner,
             owner,
             slot,
@@ -656,7 +709,7 @@ pub(crate) fn write_barrier_in(
             // `young_edge_possible` already rejected a header-proven old value.
             value_has_header,
             serves_thread(),
-        )
+        ) }
     {
         return;
     }
@@ -704,8 +757,12 @@ pub(crate) fn write_barrier_in(
 /// element or entry of a shared object. `owner` is read only when it is a
 /// proven payload start (header flag, or an `IndirectReference` whose caller
 /// passes the referenced storage's base with the slot).
+///
+/// # Safety
+/// A non-null owner must be a live managed payload start if the header bit is set
+/// or an indirect reference supplies a slot and base together.
 #[inline]
-fn publication_point(
+unsafe fn publication_point(
     owner: *mut u8,
     slot: *mut u8,
     destination_kind: i64,
@@ -740,29 +797,44 @@ fn publication_point(
 /// heap lock. Like the generated filter, the phase load and
 /// the caller's store contain no safepoint, and a stale unremembered byte
 /// only takes the conservative locked path.
-pub(crate) fn write_barrier_object_owner(
+///
+/// # Safety
+/// Non-null owner and incoming value must be current payload starts of live header-bearing
+/// objects in this runtime. Supply the actual previous reference for the store.
+pub(crate) unsafe fn write_barrier_object_owner(
     owner: *mut u8,
     old_value: *mut u8,
     value: *mut u8,
     destination_kind: i64,
 ) {
-    if !object_store_needs_barrier(owner, value) {
+    // SAFETY: The owner and non-null referent are live GC payloads with headers at the
+    // addresses used by this filter.
+    if !unsafe { object_store_needs_barrier(owner, value) } {
         return;
     }
-    willow_gc_write_barrier(
-        owner,
-        old_value,
-        value,
-        destination_kind
-            | willow_abi::GC_STORE_VALUE_HAS_HEADER
-            | willow_abi::GC_STORE_OWNER_HAS_HEADER,
-    );
+    // SAFETY: The enclosing store contract establishes the header proofs and identifies the
+    // reference slot when supplied.
+    unsafe {
+        willow_gc_write_barrier(
+            owner,
+            old_value,
+            value,
+            destination_kind
+                | willow_abi::GC_STORE_VALUE_HAS_HEADER
+                | willow_abi::GC_STORE_OWNER_HAS_HEADER,
+        )
+    };
 }
 
 /// [`write_barrier_object_owner`] for a store into element `slot` of the
 /// reference-array buffer `buffer`, so a large old buffer records only the
 /// slot's card.
-pub(crate) fn write_barrier_array_slot(
+///
+/// # Safety
+/// Non-null owner and incoming value must be current payload starts of live header-bearing
+/// objects in this runtime. Supply the actual previous reference for the store. A supplied
+/// array slot must be a word-aligned reference element inside that same live buffer.
+pub(crate) unsafe fn write_barrier_array_slot(
     buffer: *mut u8,
     slot: *mut u8,
     old_value: *mut u8,
@@ -790,22 +862,31 @@ pub(crate) fn write_barrier_array_slot(
         );
         return;
     }
-    if !object_store_needs_barrier(buffer, value) {
+    // SAFETY: The owner and non-null referent are live GC payloads with headers at the
+    // addresses used by this filter.
+    if !unsafe { object_store_needs_barrier(buffer, value) } {
         return;
     }
-    write_barrier(
-        buffer,
-        slot,
-        old_value,
-        value,
-        GcStoreDestination::ArrayElement as i64
-            | willow_abi::GC_STORE_VALUE_HAS_HEADER
-            | willow_abi::GC_STORE_OWNER_HAS_HEADER,
-    );
+    // SAFETY: The enclosing store contract establishes the header proofs and identifies the
+    // reference slot when supplied.
+    unsafe {
+        write_barrier(
+            buffer,
+            slot,
+            old_value,
+            value,
+            GcStoreDestination::ArrayElement as i64
+                | willow_abi::GC_STORE_VALUE_HAS_HEADER
+                | willow_abi::GC_STORE_OWNER_HAS_HEADER,
+        )
+    };
 }
 
+/// # Safety
+/// Non-null owner and incoming value must be current payload starts of live header-bearing
+/// objects in this runtime.
 #[inline]
-fn object_store_needs_barrier(owner: *mut u8, value: *mut u8) -> bool {
+unsafe fn object_store_needs_barrier(owner: *mut u8, value: *mut u8) -> bool {
     if crate::runtime::current()
         .mark_phase()
         .load(Ordering::Acquire)
@@ -839,8 +920,12 @@ fn object_store_needs_barrier(owner: *mut u8, value: *mut u8) -> bool {
 }
 
 // Frozen owner-first generational baseline for the feature-disabled benchmark.
+///
+/// # Safety
+/// Non-null owner and incoming value must be current payload starts of live header-bearing
+/// objects in this runtime.
 #[cfg(test)]
-fn may_create_young_edge(owner: *mut u8, value: *mut u8) -> bool {
+unsafe fn may_create_young_edge(owner: *mut u8, value: *mut u8) -> bool {
     let (Some(owner), Some(value)) = (GcPayload::from_raw(owner), GcPayload::from_raw(value))
     else {
         return false;
@@ -867,9 +952,13 @@ pub(super) unsafe fn reference_store_batch<const SATB: bool>(
         for (index, slot) in slots.iter_mut().enumerate() {
             let value = values[(index + pass) & 1];
             let needs_barrier = if SATB {
-                object_store_needs_barrier(owner, value)
+                // SAFETY: The owner and non-null referent are live GC payloads with headers
+                // at the addresses used by this filter.
+                unsafe { object_store_needs_barrier(owner, value) }
             } else {
-                may_create_young_edge(owner, value)
+                // SAFETY: The owner and non-null referent are live GC payloads with headers
+                // at the addresses used by this filter.
+                unsafe { may_create_young_edge(owner, value) }
             };
             if needs_barrier {
                 let old = if SATB {
@@ -877,12 +966,17 @@ pub(super) unsafe fn reference_store_batch<const SATB: bool>(
                 } else {
                     std::ptr::null_mut()
                 };
-                willow_gc_write_barrier(
-                    owner,
-                    old,
-                    value,
-                    GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_VALUE_HAS_HEADER,
-                );
+                // SAFETY: The store uses its heap fixture’s objects for proven payloads and
+                // the addressed element for a slot-specific barrier.
+                unsafe {
+                    willow_gc_write_barrier(
+                        owner,
+                        old,
+                        value,
+                        GcStoreDestination::ObjectField as i64
+                            | willow_abi::GC_STORE_VALUE_HAS_HEADER,
+                    )
+                };
             }
             slot.store(value, Ordering::Release);
         }
@@ -896,7 +990,9 @@ mod filter_tests {
     #[test]
     fn satb_child_first_filter_preserves_phase_and_generational_truth_table() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let owner = willow_alloc(8);
         let value = willow_alloc(8);
         let owner_object = HeapObject::from_payload(GcPayload::from_raw(owner).unwrap());
@@ -914,10 +1010,15 @@ mod filter_tests {
                             value_object.set_generation(value_generation);
                             for owner in [owner, std::ptr::null_mut()] {
                                 for value in [value, std::ptr::null_mut()] {
-                                    assert_eq!(
-                                        object_store_needs_barrier(owner, value),
-                                        phase != 0 || may_create_young_edge(owner, value)
-                                    );
+                                    // SAFETY: Both filters inspect the same pair of live
+                                    // heap objects or their supported null sentinels.
+                                    let (current, baseline) = unsafe {
+                                        (
+                                            object_store_needs_barrier(owner, value),
+                                            phase != 0 || may_create_young_edge(owner, value),
+                                        )
+                                    };
+                                    assert_eq!(current, baseline);
                                 }
                             }
                         }
@@ -925,10 +1026,14 @@ mod filter_tests {
                 }
                 if phase != 0 {
                     // Active marking bypasses generational header classification.
-                    assert!(object_store_needs_barrier(
-                        std::ptr::dangling_mut::<u8>(),
-                        std::ptr::dangling_mut::<u64>().cast::<u8>()
-                    ));
+                    // SAFETY: The owner and non-null referent are live GC payloads with
+                    // headers at the addresses used by this filter.
+                    assert!(unsafe {
+                        object_store_needs_barrier(
+                            std::ptr::dangling_mut::<u8>(),
+                            std::ptr::dangling_mut::<u64>().cast::<u8>(),
+                        )
+                    });
                 }
             });
         }
@@ -939,7 +1044,9 @@ mod filter_tests {
                 .mark_phase()
                 .store(0, Ordering::Release)
         });
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     /// The generated object store (`gc_codegen`, `OldValueSkips`) outside
@@ -960,7 +1067,9 @@ mod filter_tests {
     #[test]
     fn generated_and_runtime_filters_agree_on_every_shared_and_generation_state() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let owner = willow_alloc(8);
         let value = willow_alloc(8);
         let owner_object = HeapObject::from_payload(GcPayload::from_raw(owner).unwrap());
@@ -998,15 +1107,24 @@ mod filter_tests {
                     generated_calls(owner_old, remembered, owner_shared, value_old, value_shared);
                 // The runtime filter does both jobs in its one barrier call.
                 assert_eq!(
-                    object_store_needs_barrier(owner, value),
+                    // SAFETY: The owner and non-null referent are live GC payloads with
+                    // headers at the addresses used by this filter.
+                    unsafe { object_store_needs_barrier(owner, value) },
                     publishes || calls,
                     "{case}"
                 );
                 if publishes {
-                    willow_gc_publish_stored_value(value);
+                    // SAFETY: This mutator allocated the live test object; the
+                    // publication branch selects its private, unshared payload.
+                    unsafe { willow_gc_publish_stored_value(value) };
                     assert!(value_object.shared(), "{case}");
                     // Publication settled, only the generational edge is left.
-                    assert_eq!(object_store_needs_barrier(owner, value), calls, "{case}");
+                    assert_eq!(
+                        // SAFETY: Both managed payloads remain live after publication.
+                        unsafe { object_store_needs_barrier(owner, value) },
+                        calls,
+                        "{case}"
+                    );
                 }
                 cases += 1;
             }
@@ -1018,7 +1136,9 @@ mod filter_tests {
             (*value_object.as_ptr()).shared = 0;
         }
         owner_object.set_remembered(false);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 }
 
@@ -1037,20 +1157,29 @@ mod count_owner_tests {
                 scope.spawn(crate::runtime::serving(move || {
                     let mut tlab = GcTlabState::new();
                     let registration = MutatorRegistration::new_in(runtime_owner);
-                    let old = allocate_old_in(runtime_owner, 0, 0, 8, 0);
+                    // SAFETY: The allocation path forwards the validated payload extent, type
+                    // and tracing layout; its caller initializes native fields before
+                    // collection.
+                    let old = unsafe { allocate_old_in(runtime_owner, 0, 0, 8, 0) };
                     let young =
-                        tlab_alloc_slow_in(runtime_owner, &raw mut tlab as usize, 0, 0, 8, 0);
+                        // SAFETY: This mutator keeps its initialized TLAB at this address
+                        // until registration ends and uses its runtime’s allocation layout.
+                        unsafe { tlab_alloc_slow_in(runtime_owner, &raw mut tlab as usize, 0, 0, 8, 0) };
                     rendezvous.wait();
-                    write_barrier_in(
-                        runtime_owner,
-                        old,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        young,
-                        GcStoreDestination::ObjectField as i64
-                            | willow_abi::GC_STORE_VALUE_HAS_HEADER
-                            | willow_abi::GC_STORE_OWNER_HAS_HEADER,
-                    );
+                    // SAFETY: The store uses its heap fixture’s objects for proven payloads
+                    // and the addressed element for a slot-specific barrier.
+                    unsafe {
+                        write_barrier_in(
+                            runtime_owner,
+                            old,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            young,
+                            GcStoreDestination::ObjectField as i64
+                                | willow_abi::GC_STORE_VALUE_HAS_HEADER
+                                | willow_abi::GC_STORE_OWNER_HAS_HEADER,
+                        )
+                    };
                     // The registered mutator logs the edge privately.
                     assert!(
                         runtime_owner
@@ -1093,14 +1222,18 @@ mod count_owner_tests {
             first.gc.mark_phase().store(phase, Ordering::Release);
             let pending = LOCKED_SATB_PENDING.get();
             let old = std::ptr::without_provenance_mut(0x1000);
-            write_barrier_in(
-                &first,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                old,
-                std::ptr::null_mut(),
-                GcStoreDestination::GlobalStatic as i64,
-            );
+            // SAFETY: The store uses its heap fixture’s objects for proven payloads and the
+            // addressed element for a slot-specific barrier.
+            unsafe {
+                write_barrier_in(
+                    &first,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    old,
+                    std::ptr::null_mut(),
+                    GcStoreDestination::GlobalStatic as i64,
+                )
+            };
             assert_eq!(
                 cycle.unindexed.lock().unwrap().len(),
                 usize::from(phase != 0)
@@ -1295,7 +1428,9 @@ mod barrier_call_counter_tests {
     #[test]
     fn a_shared_card_entry_proves_only_the_recorded_card() {
         let _runtime = crate::runtime::isolated_runtime();
-        let owner = allocate_old_in(crate::runtime::current(), 0, 0, 8, 0) as usize;
+        // SAFETY: The allocation path forwards the validated payload extent, type and tracing
+        // layout; its caller initializes native fields before collection.
+        let owner = (unsafe { allocate_old_in(crate::runtime::current(), 0, 0, 8, 0) }) as usize;
         card_cache_fill(owner, 9);
         assert!(card_cache_hit(owner, 9).is_some(), "private: full proof");
         assert!(recorded_card_cache_hit(owner, 9).is_some());

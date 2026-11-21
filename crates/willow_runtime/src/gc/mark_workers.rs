@@ -516,7 +516,9 @@ mod termination_tests {
     #[test]
     fn shutdown_notification_drains_idle_and_used_pools() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         for count in [0, 1, 4, 16, 64] {
             for used in [false, true] {
                 let pool = Pool::new(count).unwrap();
@@ -546,7 +548,9 @@ mod termination_tests {
                 );
             }
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
@@ -619,7 +623,9 @@ mod termination_tests {
     #[test]
     fn termination_spurious_pool_wakes_do_not_duplicate_jobs_or_completion() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let cycle = Arc::new(ConcurrentCycle::new(
             [],
             IdSet::default(),
@@ -646,7 +652,9 @@ mod termination_tests {
         assert_eq!(pool.shared.0.lock().unwrap().generation, 16);
         assert_eq!(cycle.queue.snapshot().counter_underflows, 0);
         drop(pool);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 }
 

@@ -58,6 +58,8 @@ pub fn format_f64_6f(value: f64) -> String {
 
 fn c_double_format(format: &[u8], value: f64, capacity: usize) -> String {
     let mut buffer = vec![0 as c_char; capacity];
+    // SAFETY: The format is NUL-terminated and takes a double. The writable buffer length passed
+    // to snprintf matches its capacity.
     unsafe {
         libc::snprintf(
             buffer.as_mut_ptr(),
@@ -78,16 +80,25 @@ fn c_double_format(format: &[u8], value: f64, capacity: usize) -> String {
 /// keeps it recoverable like any other Willow panic. `file` is an optional
 /// WillowString pointer; a negative *literal* exponent is rejected at compile
 /// time (E0204), so only a negative value computed at runtime reaches here.
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_pow_negative_exponent(
+pub unsafe extern "C" fn willow_pow_negative_exponent(
     exponent: i64,
     file: *const u8,
     line: i32,
     col: i32,
 ) {
     let message = format!("negative exponent in integer `**`: {exponent}");
-    crate::panic_context::raise_language_message_at(&message, file, line.into(), col.into());
+    // SAFETY: The optional source file is null or a current Willow string and the panic path
+    // roots its string inputs before allocation.
+    unsafe {
+        crate::panic_context::raise_language_message_at(&message, file, line.into(), col.into())
+    };
 }
 
 /// Convert with IEEE round-to-nearest, ties-to-even; large integers may lose precision.
@@ -127,9 +138,15 @@ pub extern "C" fn willow_bool_to_string(value: u8) -> *mut u8 {
 }
 
 /// Returns `Result<f64, ParseFloatError>`.
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_f64_parse(text: *const u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_f64_parse(text: *const u8) -> *mut u8 {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let text = unsafe { willow_string_as_str(text) };
     alloc_parse_result(
         text.parse::<f64>()
@@ -141,9 +158,19 @@ pub extern "C" fn willow_f64_parse(text: *const u8) -> *mut u8 {
 /// Parses signed decimal ASCII digits, with an optional leading `+` or `-`.
 /// Whitespace, separators, radix prefixes and values outside i64 are rejected.
 /// Returns `Result<i64, ParseIntError>`; no input-sized copy is allocated.
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
+///
+/// ```compile_fail,E0133
+/// willow_runtime::math::willow_i64_parse(std::ptr::null());
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_i64_parse(text: *const u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_i64_parse(text: *const u8) -> *mut u8 {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let text = unsafe { willow_string_as_str(text) };
     alloc_parse_result(
         text.parse::<i64>()
@@ -158,29 +185,44 @@ pub extern "C" fn willow_i64_parse(text: *const u8) -> *mut u8 {
 // built object in a shadow-stack slot.
 fn alloc_parse_result(parsed: Result<i64, String>) -> *mut u8 {
     match parsed {
-        Ok(value) => alloc_enum_variant_from_generated(
-            0,
-            willow_abi::EnumVariantLayout::new(RESULT_OK_TAG as u32, &[willow_abi::SlotKind::Word]),
-            &[value],
-        ),
-        Err(err) => {
-            let message = crate::string::alloc_native_string(&err);
-            let parse_error = alloc_enum_variant_from_generated(
-                0,
-                willow_abi::EnumVariantLayout::new(
-                    PARSE_INVALID_TAG as u32,
-                    &[willow_abi::SlotKind::GcRef],
-                ),
-                &[message as i64],
-            );
+        // SAFETY: The variant layout selects its initialized word or reference payload,
+        // including the traced low word for a pair.
+        Ok(value) => unsafe {
             alloc_enum_variant_from_generated(
                 0,
                 willow_abi::EnumVariantLayout::new(
-                    RESULT_ERR_TAG as u32,
-                    &[willow_abi::SlotKind::GcRef],
+                    RESULT_OK_TAG as u32,
+                    &[willow_abi::SlotKind::Word],
                 ),
-                &[parse_error as i64],
+                &[value],
             )
+        },
+        Err(err) => {
+            let message = crate::string::alloc_native_string(&err);
+            // SAFETY: The variant layout selects its initialized word or reference payload,
+            // including the traced low word for a pair.
+            let parse_error = unsafe {
+                alloc_enum_variant_from_generated(
+                    0,
+                    willow_abi::EnumVariantLayout::new(
+                        PARSE_INVALID_TAG as u32,
+                        &[willow_abi::SlotKind::GcRef],
+                    ),
+                    &[message as i64],
+                )
+            };
+            // SAFETY: The variant layout selects its initialized word or reference payload,
+            // including the traced low word for a pair.
+            unsafe {
+                alloc_enum_variant_from_generated(
+                    0,
+                    willow_abi::EnumVariantLayout::new(
+                        RESULT_ERR_TAG as u32,
+                        &[willow_abi::SlotKind::GcRef],
+                    ),
+                    &[parse_error as i64],
+                )
+            }
         }
     }
 }
@@ -213,6 +255,7 @@ mod tests {
     use crate::string::{willow_string_as_str, willow_string_from_str};
 
     fn ws_text(ptr: *mut u8) -> String {
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         unsafe { willow_string_as_str(ptr) }.to_string()
     }
 
@@ -298,23 +341,33 @@ mod tests {
     #[test]
     fn math_unit_09_exported_to_string_returns_willow_string() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         assert_eq!(ws_text(willow_f64_to_string(3.14)), "3.14");
     }
 
     #[test]
     fn math_unit_10_format_17g_returns_willow_string() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         assert_eq!(ws_text(willow_format_f64_17g(3.14)), "3.1400000000000001");
     }
 
     #[test]
     fn math_unit_11_parse_ok_returns_result_ok_f64_bits() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let input = willow_string_from_str("3.5");
-        let result = willow_f64_parse(input);
+        // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+        // during this call.
+        let result = unsafe { willow_f64_parse(input) };
+        // SAFETY: The GC word-aligns these two-word enum allocations. The tag determines the type
+        // of the payload being read.
         unsafe {
             assert_eq!(*(result as *const i64), RESULT_OK_TAG);
             let bits = *((result as *const i64).add(1)) as u64;
@@ -325,9 +378,15 @@ mod tests {
     #[test]
     fn math_unit_12_parse_err_returns_parse_float_error() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let input = willow_string_from_str("not-a-number");
-        let result = willow_f64_parse(input);
+        // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+        // during this call.
+        let result = unsafe { willow_f64_parse(input) };
+        // SAFETY: The GC word-aligns these two-word enum allocations. The tag determines the type
+        // of the payload being read.
         unsafe {
             assert_eq!(*(result as *const i64), RESULT_ERR_TAG);
             let parse_error = *((result as *const i64).add(1)) as *mut u8;
@@ -339,9 +398,15 @@ mod tests {
     #[test]
     fn i64_parse_runtime_whitespace_and_payloads() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for input in ["\t1", "1\n", "\r1", "1\0", "1\t2", "\u{a0}1"] {
-            let result = willow_i64_parse(willow_string_from_str(input));
+            // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+            // during this call.
+            let result = unsafe { willow_i64_parse(willow_string_from_str(input)) };
+            // SAFETY: The GC word-aligns these two-word enum allocations. The tag determines the
+            // type of the payload being read.
             unsafe {
                 assert_eq!(*(result as *const i64), RESULT_ERR_TAG, "{input:?}");
                 let error = *((result as *const i64).add(1)) as *mut u8;
@@ -354,7 +419,11 @@ mod tests {
             ("-9223372036854775808", i64::MIN),
             ("9223372036854775807", i64::MAX),
         ] {
-            let result = willow_i64_parse(willow_string_from_str(input));
+            // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+            // during this call.
+            let result = unsafe { willow_i64_parse(willow_string_from_str(input)) };
+            // SAFETY: The GC word-aligns these two-word enum allocations. The tag determines the
+            // type of the payload being read.
             unsafe {
                 assert_eq!(*(result as *const i64), RESULT_OK_TAG);
                 assert_eq!(*((result as *const i64).add(1)), expected);
@@ -365,11 +434,17 @@ mod tests {
     #[test]
     fn i64_parse_long_leading_zeros() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         // Increasing lengths exercise full scans without overflowing early.
         for n in [32, 256, 2048, 16384] {
             let input = format!("{}42", "0".repeat(n));
-            let result = willow_i64_parse(willow_string_from_str(&input));
+            // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+            // during this call.
+            let result = unsafe { willow_i64_parse(willow_string_from_str(&input)) };
+            // SAFETY: The GC word-aligns these two-word enum allocations. The tag determines the
+            // type of the payload being read.
             unsafe {
                 assert_eq!(*(result as *const i64), RESULT_OK_TAG);
                 assert_eq!(*((result as *const i64).add(1)), 42);

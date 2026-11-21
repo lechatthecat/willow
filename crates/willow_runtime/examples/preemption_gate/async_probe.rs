@@ -5,6 +5,8 @@ use willow_runtime::{async_frame, gc, preempt, scheduler};
 // This exact workload is also compiled against the pinned historical runtime.
 // Two runnable tasks exercise poll, quantum setup, yield, requeue and completion.
 unsafe extern "C" fn poll(frame: *mut c_void) -> i32 {
+    // SAFETY: The GC word-aligns these allocated task frames and the ABI locates the reserved slot
+    // at a word offset.
     let remaining = unsafe {
         &mut *frame
             .cast::<u8>()
@@ -25,17 +27,29 @@ unsafe extern "C" fn poll(frame: *mut c_void) -> i32 {
 pub fn run(iterations: u64) -> u128 {
     let start = Instant::now();
     let mut left = async_frame::willow_async_frame_alloc(1, 0).cast::<u8>();
-    gc::willow_push_root(&raw mut left);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { gc::willow_push_root(&raw mut left) };
     let mut right = async_frame::willow_async_frame_alloc(1, 0).cast::<u8>();
-    gc::willow_push_root(&raw mut right);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { gc::willow_push_root(&raw mut right) };
     let offset = async_frame::async_frame_slot_offset(0);
+    // SAFETY: The GC word-aligns these allocated task frames and the ABI locates the reserved slot
+    // at a word offset.
     unsafe {
         *left.add(offset).cast::<u64>() = iterations;
         *right.add(offset).cast::<u64>() = iterations;
     }
-    scheduler::willow_sched_spawn_cooperative(poll, left.cast());
-    scheduler::willow_sched_spawn_cooperative(poll, right.cast());
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe { scheduler::willow_sched_spawn_cooperative(poll, left.cast()) };
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe { scheduler::willow_sched_spawn_cooperative(poll, right.cast()) };
     scheduler::willow_sched_run();
+    // SAFETY: The GC word-aligns these allocated task frames and the ABI locates the reserved slot
+    // at a word offset.
     unsafe {
         assert_eq!(
             (
@@ -45,7 +59,11 @@ pub fn run(iterations: u64) -> u128 {
             (0, 0)
         );
     }
-    gc::willow_pop_root();
-    gc::willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe {
+        gc::willow_pop_root();
+        gc::willow_pop_root();
+    }
     start.elapsed().as_nanos()
 }

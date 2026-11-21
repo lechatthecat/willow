@@ -359,7 +359,10 @@ mod tests {
                     let probes = loop {
                         attempts += 1;
                         assert!(attempts <= 100, "GC must not publish a scheduler event");
-                        crate::gc::reset_internal_for_test();
+                        // SAFETY: The test controls its isolated runtime at this reset
+                        // boundary; no other mutator or subsequent access relies on the
+                        // discarded heap.
+                        unsafe { crate::gc::reset_internal_for_test() };
                         let generation = waiters.generation();
                         let probes = AtomicUsize::new(0);
                         let parked = std::thread::scope(|scope| {
@@ -401,7 +404,9 @@ mod tests {
                 }
             }
         }
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
     }
 
     #[test]

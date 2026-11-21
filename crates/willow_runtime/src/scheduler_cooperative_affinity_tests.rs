@@ -199,7 +199,9 @@ fn cooperative_preemption_keeps_os_thread_across_worker_shrink() {
         let tasks: Vec<_> = (0..4)
             .map(|_| {
                 let frame = crate::async_frame::willow_async_frame_alloc(0, 0).cast();
-                willow_sched_spawn_cooperative(forced_preemption, frame) as u64
+                // SAFETY: The supplied callback matches this frame layout; the frame storage
+                // remains live across scheduling and callback execution.
+                (unsafe { willow_sched_spawn_cooperative(forced_preemption, frame) }) as u64
             })
             .collect();
         let mutator = crate::gc::MutatorRegistration::new();
@@ -208,7 +210,9 @@ fn cooperative_preemption_keeps_os_thread_across_worker_shrink() {
         assert_eq!(crate::worker_affinity::required_workers(), 4);
         if cancelled {
             for &task in &tasks {
-                willow_sched_set_cancel_fn_cooperative(task, affine_cancel, 0);
+                // SAFETY: This task was spawned with the frame layout expected by the
+                // cancellation callback.
+                unsafe { willow_sched_set_cancel_fn_cooperative(task, affine_cancel, 0) };
                 willow_sched_cancel(task);
             }
         }
@@ -234,7 +238,8 @@ fn cooperative_affinity_acquires_once_per_segment() {
     for polls in [16, 64, 256] {
         reset_global_scheduler_for_test();
         replace_global_scheduler_for_test(2);
-        let task = willow_sched_spawn_cooperative(ready, std::ptr::null_mut()) as u64;
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let task = (unsafe { willow_sched_spawn_cooperative(ready, std::ptr::null_mut()) }) as u64;
         let previous_worker = CURRENT_WORKER.with(|slot| slot.replace(1));
         let (_, before) = crate::worker_affinity::affinity_counts_for_test();
         for _ in 0..polls {

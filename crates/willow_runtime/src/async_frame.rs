@@ -100,7 +100,8 @@ pub const WILLOW_FRAME_STATUS_RESULT_HANDED_OVER: i64 =
 /// Pointer to the atomic status word, or null for a null frame.
 ///
 /// # Safety
-/// `frame` must be null or a live async frame from [`willow_async_frame_alloc`].
+/// A non-null frame must provide the initialized, naturally aligned atomic status word at
+/// the async-frame ABI offset. Keep the word live and exclude non-atomic concurrent access.
 /// The returned pointer must not be dereferenced after the frame is released.
 unsafe fn status_word(frame: *mut c_void) -> *const AtomicI64 {
     if frame.is_null() {
@@ -108,6 +109,8 @@ unsafe fn status_word(frame: *mut c_void) -> *const AtomicI64 {
     }
     // The word is naturally aligned (the payload is word-aligned and the
     // offset is a multiple of 8), so the atomic view is valid.
+    // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots. The
+    // frame owner retains them through this access.
     unsafe {
         (frame as *mut u8)
             .add(ASYNC_FRAME_STATUS_OFFSET)
@@ -116,20 +119,42 @@ unsafe fn status_word(frame: *mut c_void) -> *const AtomicI64 {
 }
 
 /// Read a frame's status word (0 when the frame is null).
-pub fn frame_status(frame: *mut c_void) -> i64 {
+///
+/// # Safety
+/// A non-null frame must remain live through the call and provide the initialized, naturally
+/// aligned async-frame status word for atomic access.
+///
+/// ```compile_fail,E0133
+/// willow_runtime::async_frame::frame_status(std::ptr::null_mut());
+/// ```
+pub unsafe fn frame_status(frame: *mut c_void) -> i64 {
+    // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots. The
+    // frame owner retains them through this access.
     unsafe { status_word(frame).as_ref() }.map_or(WILLOW_FRAME_STATUS_PENDING, |word| {
         word.load(Ordering::Acquire)
     })
 }
 
 /// The terminal code of `frame`, ignoring the cancel-requested bit.
-pub fn frame_terminal_status(frame: *mut c_void) -> i64 {
-    frame_status(frame) & WILLOW_FRAME_STATUS_TERMINAL_MASK
+///
+/// # Safety
+/// A non-null frame must remain live through the call and provide the initialized, naturally
+/// aligned async-frame status word for atomic access.
+pub unsafe fn frame_terminal_status(frame: *mut c_void) -> i64 {
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    (unsafe { frame_status(frame) }) & WILLOW_FRAME_STATUS_TERMINAL_MASK
 }
 
 /// True once `frame`'s task has finished, however it finished.
-pub fn frame_is_terminal(frame: *mut c_void) -> bool {
-    frame_terminal_status(frame) != WILLOW_FRAME_STATUS_PENDING
+///
+/// # Safety
+/// A non-null frame must remain live through the call and provide the initialized, naturally
+/// aligned async-frame status word for atomic access.
+pub unsafe fn frame_is_terminal(frame: *mut c_void) -> bool {
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    (unsafe { frame_terminal_status(frame) }) != WILLOW_FRAME_STATUS_PENDING
 }
 
 /// Publish `frame`'s terminal code. Called by the scheduler at the single
@@ -138,7 +163,13 @@ pub fn frame_is_terminal(frame: *mut c_void) -> bool {
 ///
 /// Idempotent: a frame that already carries a terminal code keeps it, so a
 /// repeated or racing transition cannot rewrite a published result.
-pub fn frame_publish_terminal(frame: *mut c_void, terminal: i64) {
+///
+/// # Safety
+/// A non-null frame must remain live through the call and provide the initialized, naturally
+/// aligned async-frame status word for atomic access.
+pub unsafe fn frame_publish_terminal(frame: *mut c_void, terminal: i64) {
+    // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots. The
+    // frame owner retains them through this access.
     let Some(word) = (unsafe { status_word(frame).as_ref() }) else {
         return;
     };
@@ -158,7 +189,13 @@ pub fn frame_publish_terminal(frame: *mut c_void, terminal: i64) {
 
 /// Set the cancel-requested bit (`Task::cancel()`), leaving any terminal code
 /// alone.
-pub fn frame_request_cancel(frame: *mut c_void) {
+///
+/// # Safety
+/// A non-null frame must remain live through the call and provide the initialized, naturally
+/// aligned async-frame status word for atomic access.
+pub unsafe fn frame_request_cancel(frame: *mut c_void) {
+    // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots. The
+    // frame owner retains them through this access.
     if let Some(word) = unsafe { status_word(frame).as_ref() } {
         word.fetch_or(WILLOW_FRAME_STATUS_CANCEL_REQUESTED, Ordering::Release);
     }
@@ -168,7 +205,13 @@ pub fn frame_request_cancel(frame: *mut c_void) {
 /// by other tasks. True when the task already finished and handed its result
 /// over unpublished: the caller must publish that result now. Exactly one
 /// caller sees true. O(1); one load once the handle has escaped.
-pub fn frame_mark_result_escaped(frame: *mut c_void) -> bool {
+///
+/// # Safety
+/// A non-null frame must remain live through the call and provide the initialized, naturally
+/// aligned async-frame status word for atomic access.
+pub unsafe fn frame_mark_result_escaped(frame: *mut c_void) -> bool {
+    // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots. The
+    // frame owner retains them through this access.
     let Some(word) = (unsafe { status_word(frame).as_ref() }) else {
         return false;
     };
@@ -186,7 +229,13 @@ pub fn frame_mark_result_escaped(frame: *mut c_void) -> bool {
 /// holder (a later escape publishes it, see [`frame_mark_result_escaped`]).
 /// False: the caller publishes the result. The single read-modify-write on
 /// the status word orders this against a racing escape.
-pub fn frame_hand_over_result(frame: *mut c_void) -> bool {
+///
+/// # Safety
+/// A non-null frame must remain live through the call and provide the initialized, naturally
+/// aligned async-frame status word for atomic access.
+pub unsafe fn frame_hand_over_result(frame: *mut c_void) -> bool {
+    // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots. The
+    // frame owner retains them through this access.
     let Some(word) = (unsafe { status_word(frame).as_ref() }) else {
         return false;
     };
@@ -201,18 +250,30 @@ pub fn frame_hand_over_result(frame: *mut c_void) -> bool {
 
 /// Raw status word of a task frame — the compiler emits this wherever it has
 /// the awaitee's frame pointer.
+///
+/// # Safety
+/// A non-null frame must remain live through the call and provide the initialized, naturally
+/// aligned async-frame status word for atomic access.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_frame_status(frame: *mut c_void) -> i64 {
-    frame_status(frame)
+pub unsafe extern "C" fn willow_frame_status(frame: *mut c_void) -> i64 {
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    unsafe { frame_status(frame) }
 }
 
 /// `Task::is_cancelled()`: 1 once cancellation was requested OR the task has
 /// already finished as Cancelled.
+///
+/// # Safety
+/// A non-null frame must remain live through the call and provide the initialized, naturally
+/// aligned async-frame status word for atomic access.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_frame_is_cancelled(frame: *mut c_void) -> i64 {
-    let status = frame_status(frame);
+pub unsafe extern "C" fn willow_frame_is_cancelled(frame: *mut c_void) -> i64 {
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    let status = unsafe { frame_status(frame) };
     let requested = status & WILLOW_FRAME_STATUS_CANCEL_REQUESTED != 0;
     let cancelled = status & WILLOW_FRAME_STATUS_TERMINAL_MASK == WILLOW_FRAME_STATUS_CANCELLED;
     i64::from(requested || cancelled)
@@ -252,12 +313,16 @@ pub extern "C" fn willow_async_frame_alloc(slot_count: i64, gc_slot_mask: u64) -
     // Data slot K maps to payload word (3 + K), i.e. bit (3 + K).
     let gc_ref_mask = gc_slot_mask << ASYNC_FRAME_HEADER_WORDS;
 
-    let frame = crate::gc::willow_alloc_with_layout(
-        crate::gc::GcObjectKind::AsyncFrame,
-        0,
-        payload_bytes as i64,
-        gc_ref_mask,
-    ) as *mut c_void;
+    // SAFETY: The requested layout describes the initialized words of this object and its
+    // type’s tracing or finalization contract.
+    let frame = (unsafe {
+        crate::gc::willow_alloc_with_layout(
+            crate::gc::GcObjectKind::AsyncFrame,
+            0,
+            payload_bytes as i64,
+            gc_ref_mask,
+        )
+    }) as *mut c_void;
     if !frame.is_null() {
         #[cfg(feature = "borrow-migration-probe")]
         crate::borrow_migration_probe::allocated(frame as usize, payload_bytes, gc_slot_mask);
@@ -286,7 +351,9 @@ mod tests {
     };
 
     fn reset() {
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     fn frame_payload_bytes(slots: usize) -> usize {
@@ -304,9 +371,13 @@ mod tests {
         let _guard = isolated_runtime();
         reset();
         let mut frame = willow_async_frame_alloc(1, 0) as *mut u8;
-        willow_push_root(&mut frame as *mut *mut u8);
+        // SAFETY: The callback frame retains this initialized reference slot until the
+        // callback pops it.
+        unsafe { willow_push_root(&raw mut frame) };
         let word = frame as usize;
         for _ in 0..20_000 {
+            // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared
+            // slots. The frame owner retains them through this access.
             unsafe { status_word(word as *mut c_void).as_ref() }
                 .unwrap()
                 .store(0, Ordering::Relaxed);
@@ -314,17 +385,28 @@ mod tests {
             let other = std::sync::Arc::clone(&barrier);
             let escaper = std::thread::spawn(move || {
                 other.wait();
-                frame_mark_result_escaped(word as *mut c_void)
+                // SAFETY: The frame owner retains the initialized ABI status word through
+                // this atomic access.
+                unsafe { frame_mark_result_escaped(word as *mut c_void) }
             });
             barrier.wait();
-            let handed_over = frame_hand_over_result(word as *mut c_void);
+            // SAFETY: The frame owner retains the initialized ABI status word through this
+            // atomic access.
+            let handed_over = unsafe { frame_hand_over_result(word as *mut c_void) };
             let escape_publishes = escaper.join().unwrap();
             // Handed over: the escape publishes. Not handed over: the
             // finishing task published, the escape must not.
             assert_eq!(handed_over, escape_publishes);
-            assert!(!frame_mark_result_escaped(word as *mut c_void), "once");
+            assert!(
+                // SAFETY: The frame owner retains the initialized ABI status word through this
+                // atomic access.
+                !unsafe { frame_mark_result_escaped(word as *mut c_void) },
+                "once"
+            );
         }
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         reset();
     }
 
@@ -333,16 +415,37 @@ mod tests {
         let _guard = isolated_runtime();
         reset();
         let mut frame = willow_async_frame_alloc(1, 0);
-        willow_push_root(&mut frame as *mut *mut c_void as *mut *mut u8);
-        assert!(frame_hand_over_result(frame));
-        assert!(frame_mark_result_escaped(frame));
-        assert!(!frame_is_terminal(frame));
-        assert_eq!(willow_frame_is_cancelled(frame), 0);
-        frame_publish_terminal(frame, WILLOW_FRAME_STATUS_COMPLETED);
-        assert_eq!(frame_terminal_status(frame), WILLOW_FRAME_STATUS_COMPLETED);
-        assert!(!frame_hand_over_result(std::ptr::null_mut()));
-        assert!(!frame_mark_result_escaped(std::ptr::null_mut()));
-        willow_pop_root();
+        // SAFETY: The callback frame retains this initialized reference slot until the
+        // callback pops it.
+        unsafe { willow_push_root((&raw mut frame).cast()) };
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert!(unsafe { frame_hand_over_result(frame) });
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert!(unsafe { frame_mark_result_escaped(frame) });
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert!(!unsafe { frame_is_terminal(frame) });
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert_eq!(unsafe { willow_frame_is_cancelled(frame) }, 0);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { frame_publish_terminal(frame, WILLOW_FRAME_STATUS_COMPLETED) };
+        assert_eq!(
+            // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+            // access.
+            unsafe { frame_terminal_status(frame) },
+            WILLOW_FRAME_STATUS_COMPLETED
+        );
+        // SAFETY: The null frame is explicitly accepted and has no status word to access.
+        assert!(!unsafe { frame_hand_over_result(std::ptr::null_mut()) });
+        // SAFETY: The null frame is explicitly accepted and has no status word to access.
+        assert!(!unsafe { frame_mark_result_escaped(std::ptr::null_mut()) });
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         reset();
     }
 
@@ -363,6 +466,8 @@ mod tests {
         let _guard = isolated_runtime();
         reset();
         let frame = willow_async_frame_alloc(2, 0);
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         let state = unsafe { *(frame as *const i64) };
         assert_eq!(state, 0);
         reset();
@@ -376,7 +481,11 @@ mod tests {
         let _guard = isolated_runtime();
         reset();
         let frame = willow_async_frame_alloc(2, 0);
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         unsafe { *(frame as *mut i64) = 7 };
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         assert_eq!(unsafe { *(frame as *const i64) }, 7);
         reset();
     }
@@ -431,12 +540,16 @@ mod tests {
         reset();
         let frame_raw = willow_async_frame_alloc(2, 0) as *mut u8;
         let mut root: *mut u8 = frame_raw;
-        willow_push_root(&mut root as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
 
         willow_gc_collect();
         assert!(willow_gc_allocated_bytes() > 0);
 
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         reset();
@@ -454,9 +567,13 @@ mod tests {
         reset();
 
         // Allocate the "local variable" the frame will keep alive.
-        let mut local_obj = willow_alloc_object(1, 16);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let mut local_obj = unsafe { willow_alloc_object(1, 16) };
         // Keep the setup object alive across frame allocation, including stress GC.
-        willow_push_root(&mut local_obj as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut local_obj) };
         assert!(!local_obj.is_null());
 
         // Allocate frame with 1 GC-pointer slot (gc_slot_mask bit 0 = slot 0).
@@ -464,18 +581,26 @@ mod tests {
         assert!(!frame_raw.is_null());
 
         // Write local_obj into slot 0 via direct memory access.
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         let slot0_ptr = unsafe {
             (frame_raw as *mut u8)
                 .add(async_frame_slot_offset(0))
                 .cast::<*mut u8>()
         };
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         unsafe { slot0_ptr.write(local_obj) };
         // From here on, only the frame may keep the object alive.
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
 
         // Root only the frame.
         let mut frame_root: *mut u8 = frame_raw;
-        willow_push_root(&mut frame_root as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut frame_root) };
 
         // GC must keep both frame and local object alive via gc_ref_mask tracing.
         willow_gc_collect();
@@ -489,7 +614,9 @@ mod tests {
         );
 
         // Remove root → both collected.
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         reset();
@@ -503,22 +630,34 @@ mod tests {
         let _guard = isolated_runtime();
         reset();
 
-        let mut obj = willow_alloc_object(1, 8);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let mut obj = unsafe { willow_alloc_object(1, 8) };
         // Keep the setup object alive across frame allocation, including stress GC.
-        willow_push_root(&mut obj as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut obj) };
         let frame_raw = willow_async_frame_alloc(1, 0b1) as *mut u8;
 
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         let slot0_ptr = unsafe {
             (frame_raw as *mut u8)
                 .add(async_frame_slot_offset(0))
                 .cast::<*mut u8>()
         };
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         unsafe { slot0_ptr.write(obj) };
         // From here on, only the frame may keep the object alive.
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
 
         let mut frame_root: *mut u8 = frame_raw;
-        willow_push_root(&mut frame_root as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut frame_root) };
 
         willow_gc_collect();
         assert_eq!(
@@ -528,8 +667,12 @@ mod tests {
         );
 
         // Clear the slot → set to null.
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         unsafe { slot0_ptr.write(std::ptr::null_mut()) };
         // Also mark frame state as done.
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         unsafe { *(frame_raw as *mut i64) = i64::MAX };
 
         willow_gc_collect();
@@ -541,7 +684,9 @@ mod tests {
             "obj freed after slot cleared"
         );
 
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         reset();
@@ -573,27 +718,41 @@ mod tests {
         let _guard = isolated_runtime();
         reset();
 
-        let mut obj = willow_alloc_object(1, 8);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let mut obj = unsafe { willow_alloc_object(1, 8) };
         // Keep the setup object alive across frame allocation, including stress GC.
-        willow_push_root(&mut obj as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut obj) };
         let frame_raw = willow_async_frame_alloc(1, 0b1) as *mut u8;
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         let slot0 = unsafe {
             (frame_raw as *mut u8)
                 .add(async_frame_slot_offset(0))
                 .cast::<*mut u8>()
         };
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         unsafe { slot0.write(obj) };
         // From here on, only the frame may keep the object alive.
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
 
         let mut root: *mut u8 = frame_raw;
-        willow_push_root(&mut root as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
         willow_gc_collect();
 
         // Both objects alive → gc_ref_mask tracing worked correctly.
         assert!(willow_gc_allocated_bytes() >= (header_size_for_test() + 8) as i64 * 2);
 
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         reset();
@@ -611,16 +770,26 @@ mod tests {
 
         let mut s = crate::string::willow_string_from_str("hello");
         // Keep the setup object alive across frame allocation, including stress GC.
-        willow_push_root(&mut s as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut s) };
         let frame_raw = willow_async_frame_alloc(1, 0b1) as *mut u8;
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         let slot0 = unsafe { frame_raw.add(async_frame_slot_offset(0)).cast::<*mut u8>() };
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         unsafe { slot0.write(s) };
         // From here on, only the frame may keep the object alive.
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
 
         let baseline = willow_gc_allocated_bytes();
         let mut root: *mut u8 = frame_raw;
-        willow_push_root(&mut root as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
 
         // The string is reachable only through the frame's GC slot; it must survive.
         willow_gc_collect();
@@ -630,7 +799,9 @@ mod tests {
             "string in a frame GC slot must survive while the frame is rooted"
         );
 
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         reset();
@@ -648,26 +819,44 @@ mod tests {
 
         let mut s = crate::string::willow_string_from_str("world");
         // Keep the setup object alive across frame allocation, including stress GC.
-        willow_push_root(&mut s as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut s) };
         // slot 0 = scalar (mask bit 0 clear), slot 1 = ref (mask bit 1 set).
         let frame_raw = willow_async_frame_alloc(2, 0b10) as *mut u8;
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         let slot0 = unsafe { frame_raw.add(async_frame_slot_offset(0)).cast::<i64>() };
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         let slot1 = unsafe { frame_raw.add(async_frame_slot_offset(1)).cast::<*mut u8>() };
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         unsafe { slot0.write(42) }; // a bare integer, NOT a pointer
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         unsafe { slot1.write(s) };
         // From here on, only the frame may keep the object alive.
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
 
         let baseline = willow_gc_allocated_bytes();
         let mut root: *mut u8 = frame_raw;
-        willow_push_root(&mut root as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
 
         // Must not crash on the scalar slot, and must keep the string alive.
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), baseline);
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         assert_eq!(unsafe { *slot0 }, 42, "scalar slot must be untouched");
 
         // Clearing the reference slot lets the string be collected.
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         unsafe { slot1.write(std::ptr::null_mut()) };
         willow_gc_collect();
         let frame_size = (header_size_for_test() + frame_payload_bytes(2)) as i64;
@@ -677,7 +866,9 @@ mod tests {
             "string freed once its frame slot is cleared"
         );
 
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         reset();
@@ -694,18 +885,29 @@ mod tests {
         reset();
 
         // A reference-element array (handle + buffer are GC objects).
-        let mut arr = crate::array::willow_array_new(2, 1);
+        // SAFETY: Flag 1 allocates full-width reference slots.
+        let mut arr = unsafe { crate::array::willow_array_new(2, 1) };
         // Keep the setup object alive across frame allocation, including stress GC.
-        willow_push_root(&mut arr as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut arr) };
         let frame_raw = willow_async_frame_alloc(1, 0b1) as *mut u8;
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         let slot0 = unsafe { frame_raw.add(async_frame_slot_offset(0)).cast::<*mut u8>() };
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         unsafe { slot0.write(arr) };
         // From here on, only the frame may keep the object alive.
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
 
         let baseline = willow_gc_allocated_bytes();
         let mut root: *mut u8 = frame_raw;
-        willow_push_root(&mut root as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
 
         willow_gc_collect();
         assert_eq!(
@@ -714,7 +916,9 @@ mod tests {
             "array in a frame GC slot must survive while the frame is rooted"
         );
 
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         reset();
@@ -764,69 +968,142 @@ mod tests {
     fn frame_fs1_fresh_frame_is_pending() {
         let mut storage = status_frame();
         let frame = as_frame(&mut storage);
-        assert_eq!(frame_status(frame), WILLOW_FRAME_STATUS_PENDING);
-        assert_eq!(frame_terminal_status(frame), WILLOW_FRAME_STATUS_PENDING);
-        assert!(!frame_is_terminal(frame));
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert_eq!(unsafe { frame_status(frame) }, WILLOW_FRAME_STATUS_PENDING);
+        assert_eq!(
+            // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+            // access.
+            unsafe { frame_terminal_status(frame) },
+            WILLOW_FRAME_STATUS_PENDING
+        );
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert!(!unsafe { frame_is_terminal(frame) });
     }
 
     #[test]
     fn frame_fs2_null_frame_is_safe() {
         let null = std::ptr::null_mut();
-        assert_eq!(frame_status(null), WILLOW_FRAME_STATUS_PENDING);
-        assert!(!frame_is_terminal(null));
-        assert_eq!(willow_frame_is_cancelled(null), 0);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert_eq!(unsafe { frame_status(null) }, WILLOW_FRAME_STATUS_PENDING);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert!(!unsafe { frame_is_terminal(null) });
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert_eq!(unsafe { willow_frame_is_cancelled(null) }, 0);
         // Neither writer may dereference a null frame.
-        frame_publish_terminal(null, WILLOW_FRAME_STATUS_COMPLETED);
-        frame_request_cancel(null);
-        assert_eq!(willow_frame_status(null), WILLOW_FRAME_STATUS_PENDING);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe {
+            frame_publish_terminal(null, WILLOW_FRAME_STATUS_COMPLETED);
+            frame_request_cancel(null);
+        }
+        assert_eq!(
+            // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+            // access.
+            unsafe { willow_frame_status(null) },
+            WILLOW_FRAME_STATUS_PENDING
+        );
     }
 
     #[test]
     fn frame_fs3_publish_completed() {
         let mut storage = status_frame();
         let frame = as_frame(&mut storage);
-        frame_publish_terminal(frame, WILLOW_FRAME_STATUS_COMPLETED);
-        assert_eq!(frame_terminal_status(frame), WILLOW_FRAME_STATUS_COMPLETED);
-        assert!(frame_is_terminal(frame));
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { frame_publish_terminal(frame, WILLOW_FRAME_STATUS_COMPLETED) };
+        assert_eq!(
+            // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+            // access.
+            unsafe { frame_terminal_status(frame) },
+            WILLOW_FRAME_STATUS_COMPLETED
+        );
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert!(unsafe { frame_is_terminal(frame) });
     }
 
     #[test]
     fn frame_fs4_publish_cancelled() {
         let mut storage = status_frame();
         let frame = as_frame(&mut storage);
-        frame_publish_terminal(frame, WILLOW_FRAME_STATUS_CANCELLED);
-        assert_eq!(frame_terminal_status(frame), WILLOW_FRAME_STATUS_CANCELLED);
-        assert!(frame_is_terminal(frame));
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { frame_publish_terminal(frame, WILLOW_FRAME_STATUS_CANCELLED) };
+        assert_eq!(
+            // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+            // access.
+            unsafe { frame_terminal_status(frame) },
+            WILLOW_FRAME_STATUS_CANCELLED
+        );
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert!(unsafe { frame_is_terminal(frame) });
     }
 
     #[test]
     fn frame_fs5_publish_panicked() {
         let mut storage = status_frame();
         let frame = as_frame(&mut storage);
-        frame_publish_terminal(frame, WILLOW_FRAME_STATUS_PANICKED);
-        assert_eq!(frame_terminal_status(frame), WILLOW_FRAME_STATUS_PANICKED);
-        assert!(frame_is_terminal(frame));
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { frame_publish_terminal(frame, WILLOW_FRAME_STATUS_PANICKED) };
+        assert_eq!(
+            // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+            // access.
+            unsafe { frame_terminal_status(frame) },
+            WILLOW_FRAME_STATUS_PANICKED
+        );
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert!(unsafe { frame_is_terminal(frame) });
     }
 
     #[test]
     fn frame_fs6_publication_is_idempotent() {
         let mut storage = status_frame();
         let frame = as_frame(&mut storage);
-        frame_publish_terminal(frame, WILLOW_FRAME_STATUS_COMPLETED);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { frame_publish_terminal(frame, WILLOW_FRAME_STATUS_COMPLETED) };
         // A second, later transition must not rewrite a published result.
-        frame_publish_terminal(frame, WILLOW_FRAME_STATUS_CANCELLED);
-        frame_publish_terminal(frame, WILLOW_FRAME_STATUS_COMPLETED);
-        assert_eq!(frame_terminal_status(frame), WILLOW_FRAME_STATUS_COMPLETED);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe {
+            frame_publish_terminal(frame, WILLOW_FRAME_STATUS_CANCELLED);
+            frame_publish_terminal(frame, WILLOW_FRAME_STATUS_COMPLETED);
+        }
+        assert_eq!(
+            // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+            // access.
+            unsafe { frame_terminal_status(frame) },
+            WILLOW_FRAME_STATUS_COMPLETED
+        );
     }
 
     #[test]
     fn frame_fs7_out_of_range_code_cannot_touch_flag_bits() {
         let mut storage = status_frame();
         let frame = as_frame(&mut storage);
-        frame_publish_terminal(frame, WILLOW_FRAME_STATUS_CANCELLED | (1 << 8) | (1 << 40));
-        assert_eq!(frame_terminal_status(frame), WILLOW_FRAME_STATUS_CANCELLED);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe {
+            frame_publish_terminal(frame, WILLOW_FRAME_STATUS_CANCELLED | (1 << 8) | (1 << 40))
+        };
         assert_eq!(
-            frame_status(frame) & WILLOW_FRAME_STATUS_CANCEL_REQUESTED,
+            // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+            // access.
+            unsafe { frame_terminal_status(frame) },
+            WILLOW_FRAME_STATUS_CANCELLED
+        );
+        assert_eq!(
+            // SAFETY: The frame owner retains the initialized ABI status word through this
+            // atomic access.
+            (unsafe { frame_status(frame) }) & WILLOW_FRAME_STATUS_CANCEL_REQUESTED,
             0,
             "a stray high bit in the terminal code must not set cancel-requested"
         );
@@ -836,10 +1113,19 @@ mod tests {
     fn frame_fs8_cancel_request_is_not_a_terminal_code() {
         let mut storage = status_frame();
         let frame = as_frame(&mut storage);
-        frame_request_cancel(frame);
-        assert_eq!(frame_terminal_status(frame), WILLOW_FRAME_STATUS_PENDING);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { frame_request_cancel(frame) };
+        assert_eq!(
+            // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+            // access.
+            unsafe { frame_terminal_status(frame) },
+            WILLOW_FRAME_STATUS_PENDING
+        );
         assert!(
-            !frame_is_terminal(frame),
+            // SAFETY: The frame owner retains the initialized ABI status word through this
+            // atomic access.
+            !unsafe { frame_is_terminal(frame) },
             "a requested cancel is not a finished task"
         );
     }
@@ -848,11 +1134,22 @@ mod tests {
     fn frame_fs9_cancel_request_survives_terminal_publication() {
         let mut storage = status_frame();
         let frame = as_frame(&mut storage);
-        frame_request_cancel(frame);
-        frame_publish_terminal(frame, WILLOW_FRAME_STATUS_CANCELLED);
-        assert_eq!(frame_terminal_status(frame), WILLOW_FRAME_STATUS_CANCELLED);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe {
+            frame_request_cancel(frame);
+            frame_publish_terminal(frame, WILLOW_FRAME_STATUS_CANCELLED);
+        }
+        assert_eq!(
+            // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+            // access.
+            unsafe { frame_terminal_status(frame) },
+            WILLOW_FRAME_STATUS_CANCELLED
+        );
         assert_ne!(
-            frame_status(frame) & WILLOW_FRAME_STATUS_CANCEL_REQUESTED,
+            // SAFETY: The frame owner retains the initialized ABI status word through this
+            // atomic access.
+            (unsafe { frame_status(frame) }) & WILLOW_FRAME_STATUS_CANCEL_REQUESTED,
             0
         );
     }
@@ -861,10 +1158,16 @@ mod tests {
     fn frame_fs10_cancel_request_after_completion_keeps_the_code() {
         let mut storage = status_frame();
         let frame = as_frame(&mut storage);
-        frame_publish_terminal(frame, WILLOW_FRAME_STATUS_COMPLETED);
-        frame_request_cancel(frame);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe {
+            frame_publish_terminal(frame, WILLOW_FRAME_STATUS_COMPLETED);
+            frame_request_cancel(frame);
+        }
         assert_eq!(
-            frame_terminal_status(frame),
+            // SAFETY: The frame owner retains the initialized ABI status word through this
+            // atomic access.
+            unsafe { frame_terminal_status(frame) },
             WILLOW_FRAME_STATUS_COMPLETED,
             "cancelling a task that already finished must not rewrite its result status"
         );
@@ -874,9 +1177,15 @@ mod tests {
     fn frame_fs11_is_cancelled_when_requested() {
         let mut storage = status_frame();
         let frame = as_frame(&mut storage);
-        assert_eq!(willow_frame_is_cancelled(frame), 0);
-        frame_request_cancel(frame);
-        assert_eq!(willow_frame_is_cancelled(frame), 1);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert_eq!(unsafe { willow_frame_is_cancelled(frame) }, 0);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { frame_request_cancel(frame) };
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert_eq!(unsafe { willow_frame_is_cancelled(frame) }, 1);
     }
 
     #[test]
@@ -885,16 +1194,24 @@ mod tests {
         let frame = as_frame(&mut storage);
         // Finalized as Cancelled without the request bit (e.g. cancelled while
         // the request was recorded on the task record only).
-        frame_publish_terminal(frame, WILLOW_FRAME_STATUS_CANCELLED);
-        assert_eq!(willow_frame_is_cancelled(frame), 1);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { frame_publish_terminal(frame, WILLOW_FRAME_STATUS_CANCELLED) };
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert_eq!(unsafe { willow_frame_is_cancelled(frame) }, 1);
     }
 
     #[test]
     fn frame_fs13_completed_is_not_cancelled() {
         let mut storage = status_frame();
         let frame = as_frame(&mut storage);
-        frame_publish_terminal(frame, WILLOW_FRAME_STATUS_COMPLETED);
-        assert_eq!(willow_frame_is_cancelled(frame), 0);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { frame_publish_terminal(frame, WILLOW_FRAME_STATUS_COMPLETED) };
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert_eq!(unsafe { willow_frame_is_cancelled(frame) }, 0);
     }
 
     #[test]
@@ -908,8 +1225,12 @@ mod tests {
         storage[4] = 44; // data slot 1 (task id)
         storage[5] = 55; // data slot 2 (first compiler slot)
 
-        frame_publish_terminal(frame, WILLOW_FRAME_STATUS_CANCELLED);
-        frame_request_cancel(frame);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe {
+            frame_publish_terminal(frame, WILLOW_FRAME_STATUS_CANCELLED);
+            frame_request_cancel(frame);
+        }
 
         assert_eq!(storage[0], 11, "state word must be untouched");
         assert_eq!(storage[1], 22, "slot_count word must be untouched");
@@ -959,12 +1280,16 @@ mod tests {
                 scope.spawn(crate::runtime::serving(move || {
                     let frame = addr as *mut c_void;
                     for _ in 0..1000 {
-                        frame_publish_terminal(frame, terminal);
+                        // SAFETY: The frame owner retains the initialized ABI status word
+                        // through this atomic access.
+                        unsafe { frame_publish_terminal(frame, terminal) };
                     }
                 }));
             }
         });
-        let terminal = frame_terminal_status(as_frame(&mut storage));
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        let terminal = unsafe { frame_terminal_status(as_frame(&mut storage)) };
         assert!(
             [
                 WILLOW_FRAME_STATUS_COMPLETED,
@@ -982,26 +1307,42 @@ mod tests {
         reset();
 
         // A GC-managed frame whose only GC slot is data slot 0.
-        let obj = willow_alloc_object(1, 8);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let obj = unsafe { willow_alloc_object(1, 8) };
         let frame_raw = willow_async_frame_alloc(1, 0b1) as *mut u8;
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         let slot0 = unsafe { frame_raw.add(async_frame_slot_offset(0)).cast::<*mut u8>() };
+        // SAFETY: Frame allocation reserves the word-aligned ABI header and the declared slots.
+        // The frame owner retains them through this access.
         unsafe { slot0.write(obj) };
 
         // A terminal status leaves a small non-pointer integer in header word 2;
         // marking must not follow it.
-        frame_publish_terminal(frame_raw as *mut c_void, WILLOW_FRAME_STATUS_PANICKED);
-        frame_request_cancel(frame_raw as *mut c_void);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe {
+            frame_publish_terminal(frame_raw as *mut c_void, WILLOW_FRAME_STATUS_PANICKED);
+            frame_request_cancel(frame_raw as *mut c_void);
+        }
 
         let mut root: *mut u8 = frame_raw;
-        willow_push_root(&mut root as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
         willow_gc_collect();
         assert_eq!(
-            frame_terminal_status(frame_raw as *mut c_void),
+            // SAFETY: The frame owner retains the initialized ABI status word through this
+            // atomic access.
+            unsafe { frame_terminal_status(frame_raw as *mut c_void) },
             WILLOW_FRAME_STATUS_PANICKED,
             "collection must not disturb the status word"
         );
 
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         reset();

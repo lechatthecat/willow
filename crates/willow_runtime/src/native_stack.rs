@@ -166,6 +166,7 @@ impl NativeStack {
         #[cfg(unix)]
         let guard = {
             let lower = storage.limit().get();
+            // SAFETY: sysconf reads the page-size selector without buffer arguments.
             let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
             (lower, lower + page)
         };
@@ -218,6 +219,8 @@ impl NativeStack {
     pub(crate) unsafe fn resume(stack: *mut Self) -> i32 {
         // Ensure per-thread overflow protection before entering a task stack.
         crate::stack_overflow::protect_current_thread();
+        // SAFETY: The scheduler owns the pinned stack exclusively for this resume and keeps it
+        // allocated until control returns.
         unsafe {
             assert_eq!(
                 (*stack).owner_thread,
@@ -304,14 +307,20 @@ fn trampoline(yielder: &Yielder<(), ()>) {
     loop {
         let stack = trampoline_current();
         assert!(!stack.is_null());
+        // SAFETY: Only the currently executing coroutine accesses its pinned stack state here. Its
+        // owner retains the allocation across yields.
         unsafe {
             (*stack).yielder = yielder;
         }
         // Do not keep an exclusive reference across the user poll: safepoints
         // access this same allocation through CURRENT while the poll is active.
         let (poll, cancel, frame) =
+            // SAFETY: Only the currently executing coroutine accesses its pinned stack state here.
+            // Its owner retains the allocation across yields.
             unsafe { ((*stack).poll, (*stack).cancel_entry, (*stack).frame) };
         let result = if let Some(cancel) = cancel {
+            // SAFETY: Only the currently executing coroutine accesses its pinned stack state here.
+            // Its owner retains the allocation across yields.
             unsafe {
                 crate::generated_context::invoke(cancel as *const (), frame);
                 (*stack).cleanup_depth = 0;
@@ -322,6 +331,8 @@ fn trampoline(yielder: &Yielder<(), ()>) {
                 crate::task::RUNTIME_POLL_READY
             }
         } else {
+            // SAFETY: Only the currently executing coroutine accesses its pinned stack state here.
+            // Its owner retains the allocation across yields.
             unsafe { crate::generated_context::invoke(poll as *const (), frame) }
         };
         // A completed helper can return to a cooperative poll on the worker
@@ -330,6 +341,8 @@ fn trampoline(yielder: &Yielder<(), ()>) {
         // another safepoint: charge only work already executed, and do not
         // suspend a callback that has finished its result/cleanup handling.
         settle_completed_quantum();
+        // SAFETY: Only the currently executing coroutine accesses its pinned stack state here. Its
+        // owner retains the allocation across yields.
         unsafe {
             (*stack).result = result;
             (*stack).suspended = false;
@@ -361,6 +374,8 @@ fn suspend_impl(result: i32) -> bool {
     if stack.is_null() {
         return false;
     }
+    // SAFETY: The owning thread parks its live shadow stack at a valid depth and keeps the slots
+    // alive until discharge.
     unsafe {
         (*stack).parked_roots = Some(crate::gc::park_current_roots((*stack).root_depth));
         (*stack).result = result;
@@ -378,6 +393,8 @@ impl NativeFrameGuard {
     pub(crate) fn enter() -> Self {
         let stack = CURRENT.with(Cell::get);
         if !stack.is_null() {
+            // SAFETY: Only the currently executing coroutine accesses its pinned stack state here.
+            // Its owner retains the allocation across yields.
             unsafe { (*stack).native_frames += 1 };
         }
         Self(stack)
@@ -387,6 +404,8 @@ impl NativeFrameGuard {
 impl Drop for NativeFrameGuard {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: Only the currently executing coroutine accesses its pinned stack state here.
+            // Its owner retains the allocation across yields.
             unsafe { (*self.0).native_frames -= 1 };
         }
     }
@@ -405,6 +424,8 @@ pub(crate) fn poll_counter() -> *mut i32 {
     if stack.is_null() {
         return std::ptr::null_mut();
     }
+    // SAFETY: The active task owns the countdown word. The pointer stays valid throughout the
+    // running stack's poll.
     unsafe { std::ptr::addr_of_mut!((*stack).poll_countdown) }
 }
 
@@ -423,6 +444,8 @@ pub(crate) fn poll_pending() -> u64 {
     if stack.is_null() {
         return 0;
     }
+    // SAFETY: The active task owns the countdown word. The pointer stays valid throughout the
+    // running stack's poll.
     unsafe {
         let consumed = i64::from((*stack).poll_granted) - i64::from((*stack).poll_countdown);
         consumed.max(0) as u64
@@ -433,6 +456,8 @@ pub(crate) fn poll_pending() -> u64 {
 pub(crate) fn poll_refill(grant: i32) {
     let stack = CURRENT.with(Cell::get);
     if !stack.is_null() {
+        // SAFETY: The active task owns the countdown word. The pointer stays valid throughout the
+        // running stack's poll.
         unsafe {
             (*stack).poll_granted = grant;
             (*stack).poll_countdown = grant;
@@ -445,6 +470,8 @@ pub(crate) fn poll_refill(grant: i32) {
 pub(crate) fn poll_no_preempt(enter: bool) {
     let stack = CURRENT.with(Cell::get);
     if !stack.is_null() {
+        // SAFETY: The active task owns the countdown word. The pointer stays valid throughout the
+        // running stack's poll.
         unsafe {
             if enter {
                 (*stack).poll_saved = ((*stack).poll_countdown, (*stack).poll_granted);
@@ -465,6 +492,8 @@ pub(crate) fn cancelled() -> i32 {
     if stack.is_null() {
         return 0;
     }
+    // SAFETY: Only the currently executing coroutine accesses its pinned stack state here. Its
+    // owner retains the allocation across yields.
     unsafe {
         if (*stack).cleanup_depth != 0 {
             return 0;
@@ -498,6 +527,8 @@ fn cancel_snapshot() -> crate::scheduler::CancelSnapshot {
 pub(crate) fn cleanup_enter() {
     let stack = CURRENT.with(Cell::get);
     if !stack.is_null() {
+        // SAFETY: Only the currently executing coroutine accesses its pinned stack state here. Its
+        // owner retains the allocation across yields.
         unsafe {
             (*stack).cleanup_depth += 1;
         }
@@ -507,6 +538,8 @@ pub(crate) fn cleanup_enter() {
 pub(crate) fn cleanup_leave() {
     let stack = CURRENT.with(Cell::get);
     if !stack.is_null() {
+        // SAFETY: Only the currently executing coroutine accesses its pinned stack state here. Its
+        // owner retains the allocation across yields.
         unsafe {
             (*stack).cleanup_depth = (*stack).cleanup_depth.saturating_sub(1);
         }
@@ -540,22 +573,30 @@ mod tests {
         let _guard = crate::gc::isolated_runtime();
         let mut stack = NativeStack::new(helper, std::ptr::null_mut());
         for expected_owner in [Some(stack.worker), Some(stack.worker)] {
-            begin_quantum(
-                PreemptConfig::from_env_values(Some("1"), Some("100000")),
-                std::ptr::null(),
-            );
+            // SAFETY: A null flag binds no storage and is explicitly supported.
+            unsafe {
+                begin_quantum(
+                    PreemptConfig::from_env_values(Some("1"), Some("100000")),
+                    std::ptr::null(),
+                )
+            };
             assert_eq!(
+                // SAFETY: The driver owns the pinned stack exclusively through this resume.
                 unsafe { NativeStack::resume(&mut *stack) },
                 RUNTIME_POLL_PREEMPTED
             );
             willow_preempt_end();
             assert_eq!(stack.required_worker(), expected_owner);
         }
-        begin_quantum(
-            PreemptConfig::from_env_values(Some("1"), Some("100000")),
-            std::ptr::null(),
-        );
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe {
+            begin_quantum(
+                PreemptConfig::from_env_values(Some("1"), Some("100000")),
+                std::ptr::null(),
+            )
+        };
         assert_eq!(
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) },
             RUNTIME_POLL_READY
         );
@@ -585,7 +626,8 @@ mod tests {
             COMPLETED.store(999, std::sync::atomic::Ordering::SeqCst);
             let (send, receive) = mpsc::channel();
             *GATE.lock().unwrap() = Some(receive);
-            let task = willow_sched_spawn(blocked, std::ptr::null_mut());
+            // SAFETY: The callback accepts a null frame and uses no frame storage.
+            let task = unsafe { willow_sched_spawn(blocked, std::ptr::null_mut()) };
             willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
             assert_eq!(willow_sched_task_state(task), 7);
             assert_eq!(COMPLETED.load(std::sync::atomic::Ordering::SeqCst), 999);
@@ -638,7 +680,8 @@ mod tests {
             let mut stalled = stall_pool_threads();
             stalled.fill_queue_gated(crate::blocking::willow_blocking_queue_capacity() as usize);
             let ids: Vec<_> = (0..count)
-                .map(|_| willow_sched_spawn(blocked, std::ptr::null_mut()))
+                // SAFETY: The callback accepts a null frame and uses no frame storage.
+                .map(|_| unsafe { willow_sched_spawn(blocked, std::ptr::null_mut()) })
                 .collect();
             willow_sched_run_until_deadline(willow_monotonic_millis() + 50);
             assert_eq!(crate::blocking::willow_blocking_slot_waiters(), count);
@@ -676,14 +719,17 @@ mod tests {
             RUNTIME_POLL_READY
         }
         unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
-            let result = willow_task_stack_enter(sleep, std::ptr::null_mut());
+            // SAFETY: The supplied callback matches this frame layout; the frame storage
+            // remains live across scheduling and callback execution.
+            let result = unsafe { willow_task_stack_enter(sleep, std::ptr::null_mut()) };
             willow_task_stack_leave();
             assert!(result == crate::task::RUNTIME_POLL_PENDING || result == RUNTIME_POLL_READY);
             result
         }
         let _guard = crate::gc::isolated_runtime();
         reset_global_scheduler_for_test();
-        let task = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let task = (unsafe { willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) }) as u64;
         willow_sched_run_until(task);
         reset_global_scheduler_for_test();
     }
@@ -701,7 +747,8 @@ mod tests {
         }
         let _guard = crate::gc::isolated_runtime();
         reset_global_scheduler_for_test();
-        let task = willow_sched_spawn(sleeper, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let task = unsafe { willow_sched_spawn(sleeper, std::ptr::null_mut()) };
         willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
         assert_eq!(willow_sched_task_state(task), 2);
         willow_sched_cancel(task);
@@ -720,7 +767,8 @@ mod tests {
         }
         let _guard = crate::gc::isolated_runtime();
         reset_global_scheduler_for_test();
-        let task = willow_sched_spawn(sleeper, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let task = unsafe { willow_sched_spawn(sleeper, std::ptr::null_mut()) };
         willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
         assert_eq!(willow_sched_task_state(task), 2);
         willow_sched_cancel(task);
@@ -766,11 +814,14 @@ mod tests {
                 recurse(depth - 1).wrapping_add(std::hint::black_box(padding[0]) as usize)
             }
             unsafe extern "C" fn overflow(_: *mut c_void) -> i32 {
-                crate::stack_overflow::willow_stack_helper_set(b"recurse".as_ptr(), 7);
+                // SAFETY: The nonempty diagnostic names are byte literals with process
+                // lifetime and the supplied lengths fit those literals.
+                unsafe { crate::stack_overflow::willow_stack_helper_set(b"recurse".as_ptr(), 7) };
                 std::hint::black_box(recurse(1_000_000));
                 RUNTIME_POLL_READY
             }
             let mut stack = NativeStack::new(overflow, std::ptr::null_mut());
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) };
             panic!("task stack exhaustion was not fatal");
         }
@@ -796,6 +847,8 @@ mod tests {
     fn recycled_stack_preserves_float_locals_and_uses_the_new_frame() {
         let _guard = crate::gc::isolated_runtime();
         unsafe extern "C" fn poll(frame: *mut c_void) -> i32 {
+            // SAFETY: The test passes its appropriately typed, aligned state as the callback frame
+            // and retains it through suspension.
             let initial = unsafe { *frame.cast::<f64>() };
             let locals = std::array::from_fn::<_, 32, _>(|i| initial + i as f64 * 0.25);
             for _ in 0..20 {
@@ -805,6 +858,8 @@ mod tests {
                     assert_eq!(*value, initial + i as f64 * 0.25);
                 }
             }
+            // SAFETY: The test passes its appropriately typed, aligned state as the callback frame
+            // and retains it through suspension.
             unsafe { *frame.cast::<f64>() = locals.iter().sum() };
             RUNTIME_POLL_READY
         }
@@ -816,11 +871,13 @@ mod tests {
             assert_eq!(*address.get_or_insert(current), current);
             for _ in 0..20 {
                 assert_eq!(
+                    // SAFETY: The driver owns the pinned stack exclusively through this resume.
                     unsafe { NativeStack::resume(&mut *stack) },
                     RUNTIME_POLL_PREEMPTED
                 );
             }
             assert_eq!(
+                // SAFETY: The driver owns the pinned stack exclusively through this resume.
                 unsafe { NativeStack::resume(&mut *stack) },
                 RUNTIME_POLL_READY
             );
@@ -841,6 +898,8 @@ mod tests {
         }
         fn bounds() -> (usize, usize) {
             let (mut low, mut high) = (0, 0);
+            // SAFETY: The Windows API writes the current thread's bounds to two live usize
+            // outputs.
             unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
             let marker = 0u8;
             let address = std::ptr::from_ref(&marker) as usize;
@@ -849,6 +908,8 @@ mod tests {
         }
         unsafe extern "C" fn poll(frame: *mut c_void) -> i32 {
             let task_bounds = bounds();
+            // SAFETY: The test passes its appropriately typed, aligned state as the callback frame
+            // and retains it through suspension.
             unsafe { *frame.cast::<(usize, usize)>() = task_bounds };
             assert!(suspend());
             // StackLimit may grow as pages are committed; StackBase is fixed.
@@ -860,12 +921,14 @@ mod tests {
         let mut task_bounds = (0usize, 0usize);
         let mut stack = NativeStack::new(poll, std::ptr::from_mut(&mut task_bounds).cast());
         assert_eq!(
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) },
             RUNTIME_POLL_PREEMPTED
         );
         assert_ne!(task_bounds.1, parent.1);
         assert_eq!(bounds().1, parent.1);
         assert_eq!(
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) },
             RUNTIME_POLL_READY
         );
@@ -873,10 +936,13 @@ mod tests {
     }
 
     fn quantum() {
-        begin_quantum(
-            PreemptConfig::from_env_values(Some("1"), Some("10000")),
-            std::ptr::null(),
-        );
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe {
+            begin_quantum(
+                PreemptConfig::from_env_values(Some("1"), Some("10000")),
+                std::ptr::null(),
+            )
+        };
     }
 
     unsafe extern "C" fn recursive_poll(frame: *mut c_void) -> i32 {
@@ -888,6 +954,8 @@ mod tests {
             assert_eq!(willow_sync_safepoint(), 0);
             std::hint::black_box(local) + recurse(depth - 1)
         }
+        // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
+        // retains it through suspension.
         unsafe {
             *frame.cast::<u64>() = recurse(100);
         }
@@ -902,6 +970,7 @@ mod tests {
         let mut yields = 0;
         loop {
             quantum();
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             let result = unsafe { NativeStack::resume(&mut *stack) };
             willow_preempt_end();
             if result == RUNTIME_POLL_READY {
@@ -929,6 +998,8 @@ mod tests {
         assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
         assert_eq!(stop, crate::gc::willow_gc_stop_flag());
         assert!(!counter.is_null());
+        // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
+        // retains it through suspension.
         unsafe {
             for index in 1..=(*state).safepoints {
                 *counter -= 1;
@@ -955,7 +1026,9 @@ mod tests {
         let config = PreemptConfig::from_env_values(Some(&budget.to_string()), Some("100000"));
         let mut stack = NativeStack::new(counted_poll, std::ptr::from_mut(&mut state).cast());
         loop {
-            begin_quantum(config, std::ptr::null());
+            // SAFETY: A null flag binds no storage and is explicitly supported.
+            unsafe { begin_quantum(config, std::ptr::null()) };
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             let result = unsafe { NativeStack::resume(&mut *stack) };
             willow_preempt_end();
             if result == RUNTIME_POLL_READY {
@@ -1006,6 +1079,8 @@ mod tests {
         let (counter, stop) = crate::generated_context::published_sync_gates();
         assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
         assert_eq!(stop, crate::gc::willow_gc_stop_flag());
+        // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
+        // retains it through suspension.
         unsafe {
             for _ in 0..(*state).polls_per_helper {
                 *counter -= 1;
@@ -1023,11 +1098,16 @@ mod tests {
         // Keep the real cooperative task/ABI boundary but use deterministic,
         // per-test configuration instead of changing process-global env.
         let config = PreemptConfig::from_env_values(
+            // SAFETY: The test passes its appropriately typed, aligned state as the callback frame
+            // and retains it through suspension.
             Some(&unsafe { (*state).budget }.to_string()),
             Some("100000"),
         );
-        begin_quantum(config, std::ptr::null());
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe { begin_quantum(config, std::ptr::null()) };
         assert!(crate::preempt::willow_sync_poll_counter().is_null());
+        // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
+        // retains it through suspension.
         unsafe {
             if (*state).poll_entries == 0 {
                 for _ in 0..(*state).async_prefix {
@@ -1090,10 +1170,14 @@ mod tests {
                 completed_helpers: 0,
                 async_checks_until_trip: 0,
             };
-            let id = willow_sched_spawn_cooperative(
-                boundary_budget_cooperative_poll,
-                std::ptr::from_mut(&mut state).cast(),
-            ) as u64;
+            // SAFETY: The supplied callback matches this frame layout; the frame storage
+            // remains live across scheduling and callback execution.
+            let id = (unsafe {
+                willow_sched_spawn_cooperative(
+                    boundary_budget_cooperative_poll,
+                    std::ptr::from_mut(&mut state).cast(),
+                )
+            }) as u64;
             willow_sched_run_until(id);
             assert_eq!(
                 state.async_checks_until_trip,
@@ -1119,6 +1203,8 @@ mod tests {
     // Mirrors the generated async fast path; the last point is charged by
     // the existing hook rather than decrementing it twice.
     unsafe fn batched_async_check(counter: *mut i32) -> i32 {
+        // SAFETY: The active task owns the countdown word. The pointer stays valid throughout the
+        // running stack's poll.
         unsafe {
             if *counter > 1 {
                 *counter -= 1;
@@ -1134,6 +1220,8 @@ mod tests {
         let (counter, stop) = crate::generated_context::published_sync_gates();
         assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
         assert_eq!(stop, crate::gc::willow_gc_stop_flag());
+        // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
+        // retains it through suspension.
         unsafe {
             for index in 1..=(*state).total {
                 let before = (*state).resumes;
@@ -1156,28 +1244,40 @@ mod tests {
     }
 
     unsafe extern "C" fn suppressed_batched_native_poll(frame: *mut c_void) -> i32 {
+        // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
+        // retains it through suspension.
         let (prefix, suppressed, nested) = unsafe { *frame.cast::<(u64, u64, bool)>() };
         let counter = crate::preempt::willow_async_poll_counter();
         for _ in 0..prefix {
+            // SAFETY: The active task owns the countdown word. The pointer stays valid throughout
+            // the running stack's poll.
             assert_eq!(unsafe { batched_async_check(counter) }, 0);
         }
         crate::preempt::willow_preempt_enter_no_preempt();
         for _ in 0..suppressed {
+            // SAFETY: The active task owns the countdown word. The pointer stays valid throughout
+            // the running stack's poll.
             assert_eq!(unsafe { batched_async_check(counter) }, 0);
         }
         if nested {
             crate::preempt::willow_preempt_enter_no_preempt();
             for _ in 0..130 {
+                // SAFETY: The active task owns the countdown word. The pointer stays valid
+                // throughout the running stack's poll.
                 assert_eq!(unsafe { batched_async_check(counter) }, 0);
             }
             crate::preempt::willow_preempt_leave_no_preempt();
             for _ in 0..suppressed {
+                // SAFETY: The active task owns the countdown word. The pointer stays valid
+                // throughout the running stack's poll.
                 assert_eq!(unsafe { batched_async_check(counter) }, 0);
             }
         }
         crate::preempt::willow_preempt_leave_no_preempt();
         for n in 1..=100 - prefix {
             assert_eq!(
+                // SAFETY: The active task owns the countdown word. The pointer stays valid
+                // throughout the running stack's poll.
                 unsafe { batched_async_check(counter) },
                 i32::from(n == 100 - prefix),
                 "prefix={prefix} suppressed={suppressed} nested={nested} remaining point={n}"
@@ -1197,11 +1297,16 @@ mod tests {
                         suppressed_batched_native_poll,
                         std::ptr::from_mut(&mut state).cast(),
                     );
-                    begin_quantum(
-                        PreemptConfig::from_env_values(Some("100"), Some("100000")),
-                        std::ptr::null(),
-                    );
+                    // SAFETY: A null flag binds no storage and is explicitly supported.
+                    unsafe {
+                        begin_quantum(
+                            PreemptConfig::from_env_values(Some("100"), Some("100000")),
+                            std::ptr::null(),
+                        )
+                    };
                     assert_eq!(
+                        // SAFETY: The driver owns the pinned stack exclusively through this
+                        // resume.
                         unsafe { NativeStack::resume(&mut *stack) },
                         RUNTIME_POLL_READY
                     );
@@ -1227,7 +1332,9 @@ mod tests {
                 let mut stack =
                     NativeStack::new(batched_mixed_poll, std::ptr::from_mut(&mut state).cast());
                 loop {
-                    begin_quantum(config, std::ptr::null());
+                    // SAFETY: A null flag binds no storage and is explicitly supported.
+                    unsafe { begin_quantum(config, std::ptr::null()) };
+                    // SAFETY: The driver owns the pinned stack exclusively through this resume.
                     let result = unsafe { NativeStack::resume(&mut *stack) };
                     willow_preempt_end();
                     if result == RUNTIME_POLL_READY {
@@ -1250,6 +1357,8 @@ mod tests {
         let (counter, stop) = crate::generated_context::published_sync_gates();
         assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
         assert_eq!(stop, crate::gc::willow_gc_stop_flag());
+        // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
+        // retains it through suspension.
         unsafe {
             for index in 1..=(*state).total {
                 let before = (*state).resumes;
@@ -1286,7 +1395,9 @@ mod tests {
                     PreemptConfig::from_env_values(Some(&budget.to_string()), Some("100000"));
                 let mut stack = NativeStack::new(mixed_poll, std::ptr::from_mut(&mut state).cast());
                 loop {
-                    begin_quantum(config, std::ptr::null());
+                    // SAFETY: A null flag binds no storage and is explicitly supported.
+                    unsafe { begin_quantum(config, std::ptr::null()) };
+                    // SAFETY: The driver owns the pinned stack exclusively through this resume.
                     let result = unsafe { NativeStack::resume(&mut *stack) };
                     willow_preempt_end();
                     if result == RUNTIME_POLL_READY {
@@ -1305,6 +1416,8 @@ mod tests {
         let (counter, stop) = crate::generated_context::published_sync_gates();
         assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
         assert_eq!(stop, crate::gc::willow_gc_stop_flag());
+        // SAFETY: The active task owns the countdown word. The pointer stays valid throughout the
+        // running stack's poll.
         unsafe {
             // Charge one, then consume only part of a 64-poll grant.
             *counter -= 1;
@@ -1330,16 +1443,21 @@ mod tests {
             partial_grant_across_wait,
             std::ptr::from_mut(&mut finished).cast(),
         );
-        begin_quantum(
-            PreemptConfig::from_env_values(Some("1024"), Some("100000")),
-            std::ptr::null(),
-        );
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe {
+            begin_quantum(
+                PreemptConfig::from_env_values(Some("1024"), Some("100000")),
+                std::ptr::null(),
+            )
+        };
         assert_eq!(
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) },
             crate::task::RUNTIME_POLL_PENDING
         );
         willow_preempt_end();
         quantum();
+        // SAFETY: The driver owns the pinned stack exclusively through this resume.
         let result = unsafe { NativeStack::resume(&mut *stack) };
         willow_preempt_end();
         // Drain the stack before asserting so a regression cannot panic in
@@ -1348,6 +1466,7 @@ mod tests {
         if result == RUNTIME_POLL_PREEMPTED {
             quantum();
             assert_eq!(
+                // SAFETY: The driver owns the pinned stack exclusively through this resume.
                 unsafe { NativeStack::resume(&mut *stack) },
                 RUNTIME_POLL_READY
             );
@@ -1362,6 +1481,8 @@ mod tests {
         let (counter, stop) = crate::generated_context::published_sync_gates();
         assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
         assert_eq!(stop, crate::gc::willow_gc_stop_flag());
+        // SAFETY: The active task owns the countdown word. The pointer stays valid throughout the
+        // running stack's poll.
         unsafe {
             *counter -= 1;
             willow_sync_safepoint();
@@ -1386,16 +1507,21 @@ mod tests {
             partial_grant_across_nested_quantum,
             std::ptr::from_mut(&mut finished).cast(),
         );
-        begin_quantum(
-            PreemptConfig::from_env_values(Some("1024"), Some("100000")),
-            std::ptr::null(),
-        );
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe {
+            begin_quantum(
+                PreemptConfig::from_env_values(Some("1024"), Some("100000")),
+                std::ptr::null(),
+            )
+        };
+        // SAFETY: The driver owns the pinned stack exclusively through this resume.
         let result = unsafe { NativeStack::resume(&mut *stack) };
         willow_preempt_end();
         let finished_before_resume = finished;
         if result == RUNTIME_POLL_PREEMPTED {
             quantum();
             assert_eq!(
+                // SAFETY: The driver owns the pinned stack exclusively through this resume.
                 unsafe { NativeStack::resume(&mut *stack) },
                 RUNTIME_POLL_READY
             );
@@ -1416,9 +1542,13 @@ mod tests {
         willow_preempt_enter_no_preempt();
         willow_preempt_enter_no_preempt();
         for _ in 0..100 {
+            // SAFETY: The active task owns the countdown word. The pointer stays valid throughout
+            // the running stack's poll.
             unsafe {
                 *counter -= 1;
             }
+            // SAFETY: The active task owns the countdown word. The pointer stays valid throughout
+            // the running stack's poll.
             if unsafe { *counter } <= 0 {
                 willow_sync_safepoint();
             }
@@ -1428,6 +1558,8 @@ mod tests {
         assert_eq!(willow_preempt_check(), 0);
         willow_preempt_leave_no_preempt();
         // The region did not consume either of the shared budget's two units.
+        // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
+        // retains it through suspension.
         unsafe {
             *frame.cast::<[i32; 2]>() = [willow_preempt_check(), willow_preempt_check()];
         }
@@ -1442,11 +1574,15 @@ mod tests {
             suppressed_mixed_poll,
             std::ptr::from_mut(&mut checks).cast(),
         );
-        begin_quantum(
-            PreemptConfig::from_env_values(Some("2"), Some("100000")),
-            std::ptr::null(),
-        );
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe {
+            begin_quantum(
+                PreemptConfig::from_env_values(Some("2"), Some("100000")),
+                std::ptr::null(),
+            )
+        };
         assert_eq!(
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) },
             RUNTIME_POLL_READY
         );
@@ -1461,17 +1597,23 @@ mod tests {
 
     unsafe extern "C" fn mixed_deadline_poll(frame: *mut c_void) -> i32 {
         let state = frame.cast::<MixedDeadline>();
+        // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
+        // retains it through suspension.
         if unsafe { (*state).sync_last } {
             crate::preempt::willow_preempt_check();
         } else {
             willow_sync_safepoint();
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
+        // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
+        // retains it through suspension.
         if unsafe { (*state).sync_last } {
             willow_sync_safepoint();
         } else if crate::preempt::willow_preempt_check() != 0 {
             suspend();
         }
+        // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
+        // retains it through suspension.
         unsafe {
             (*state).reached_end = true;
         }
@@ -1491,14 +1633,18 @@ mod tests {
                     PreemptConfig::from_env_values(Some("1000000000000"), Some(quantum_ms));
                 let mut stack =
                     NativeStack::new(mixed_deadline_poll, std::ptr::from_mut(&mut state).cast());
-                begin_quantum(config, std::ptr::null());
+                // SAFETY: A null flag binds no storage and is explicitly supported.
+                unsafe { begin_quantum(config, std::ptr::null()) };
+                // SAFETY: The driver owns the pinned stack exclusively through this resume.
                 let result = unsafe { NativeStack::resume(&mut *stack) };
                 willow_preempt_end();
                 let reached_end = state.reached_end;
                 // Drain even an unexpected early suspension before asserting.
                 let mut resumed = result;
                 while resumed != RUNTIME_POLL_READY {
-                    begin_quantum(config, std::ptr::null());
+                    // SAFETY: A null flag binds no storage and is explicitly supported.
+                    unsafe { begin_quantum(config, std::ptr::null()) };
+                    // SAFETY: The driver owns the pinned stack exclusively through this resume.
                     resumed = unsafe { NativeStack::resume(&mut *stack) };
                     willow_preempt_end();
                 }
@@ -1518,6 +1664,8 @@ mod tests {
         let (counter, stop) = crate::generated_context::published_sync_gates();
         assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
         assert_eq!(stop, crate::gc::willow_gc_stop_flag());
+        // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
+        // retains it through suspension.
         unsafe {
             while (*state).resumes == 0 {
                 (*state).safepoints += 1;
@@ -1545,13 +1693,17 @@ mod tests {
         let mut stack = NativeStack::new(timed_poll, std::ptr::from_mut(&mut state).cast());
         // A budget that cannot trip: only the 1ms time quantum preempts.
         let config = PreemptConfig::from_env_values(Some("1000000000000"), Some("1"));
-        begin_quantum(config, std::ptr::null());
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe { begin_quantum(config, std::ptr::null()) };
+        // SAFETY: The driver owns the pinned stack exclusively through this resume.
         let result = unsafe { NativeStack::resume(&mut *stack) };
         willow_preempt_end();
         assert_eq!(result, RUNTIME_POLL_PREEMPTED);
         state.resumes += 1;
-        begin_quantum(config, std::ptr::null());
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe { begin_quantum(config, std::ptr::null()) };
         assert_eq!(
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) },
             RUNTIME_POLL_READY
         );
@@ -1560,10 +1712,14 @@ mod tests {
     }
 
     fn set_reference(name: &str) {
-        let ptr = crate::string::willow_string_alloc(name.as_bytes().as_ptr(), name.len() as i64);
-        crate::reference_debug::willow_debug_reference_call(
-            ptr, 1, 1, ptr, ptr, ptr, ptr, ptr, ptr,
-        );
+        let ptr = crate::string::willow_string_from_str(name);
+        // SAFETY: The fixture supplies Willow strings allocated in the isolated heap and kept
+        // live through this call.
+        unsafe {
+            crate::reference_debug::willow_debug_reference_call(
+                ptr, 1, 1, ptr, ptr, ptr, ptr, ptr, ptr,
+            )
+        };
     }
 
     unsafe extern "C" fn reference_poll(_: *mut c_void) -> i32 {
@@ -1592,16 +1748,20 @@ mod tests {
     #[test]
     fn suspended_stack_keeps_nested_reference_context_private() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         let saved = crate::reference_debug::replace_current(Default::default());
         let mut stack = NativeStack::new(reference_poll, std::ptr::null_mut());
         assert_eq!(
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) },
             RUNTIME_POLL_PREEMPTED
         );
         assert!(crate::reference_debug::current_reference_call().is_none());
         set_reference("scheduler-context");
         assert_eq!(
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) },
             RUNTIME_POLL_READY
         );
@@ -1620,7 +1780,11 @@ mod tests {
         const NAMES: [&[u8]; 3] = [b"first", b"second_longer", b"third"];
         unsafe extern "C" fn poll(frame: *mut c_void) -> i32 {
             let name = NAMES[frame as usize % NAMES.len()];
-            crate::stack_overflow::willow_stack_helper_set(name.as_ptr(), name.len() as i64);
+            // SAFETY: The nonempty diagnostic names are byte literals with process lifetime
+            // and the supplied lengths fit those literals.
+            unsafe {
+                crate::stack_overflow::willow_stack_helper_set(name.as_ptr(), name.len() as i64)
+            };
             assert!(suspend());
             assert_eq!(
                 crate::stack_overflow::replace_task_helper(Some(name)),
@@ -1637,6 +1801,7 @@ mod tests {
                 .collect();
             for (index, stack) in stacks.iter_mut().enumerate() {
                 assert_eq!(
+                    // SAFETY: The driver owns the pinned stack exclusively through this resume.
                     unsafe { NativeStack::resume(&mut **stack) },
                     RUNTIME_POLL_PREEMPTED
                 );
@@ -1645,6 +1810,7 @@ mod tests {
             }
             for mut stack in stacks {
                 assert_eq!(
+                    // SAFETY: The driver owns the pinned stack exclusively through this resume.
                     unsafe { NativeStack::resume(&mut *stack) },
                     RUNTIME_POLL_READY
                 );
@@ -1653,6 +1819,7 @@ mod tests {
             let mut recycled = NativeStack::acquire(ready, std::ptr::null_mut());
             assert_eq!(recycled.overflow_helper, Some(&b"<unknown>"[..]));
             assert_eq!(
+                // SAFETY: The driver owns the pinned stack exclusively through this resume.
                 unsafe { NativeStack::resume(&mut *recycled) },
                 RUNTIME_POLL_READY
             );
@@ -1663,14 +1830,18 @@ mod tests {
 
     unsafe extern "C" fn trace_poll(_: *mut c_void) -> i32 {
         let name = b"native_helper";
-        crate::stack_trace::willow_callstack_push(
-            name.as_ptr(),
-            name.len() as i64,
-            std::ptr::null(),
-            0,
-            1,
-            1,
-        );
+        // SAFETY: The absent name is accepted and any nonempty byte range remains readable
+        // through the copy.
+        unsafe {
+            crate::stack_trace::willow_callstack_push(
+                name.as_ptr(),
+                name.len() as i64,
+                std::ptr::null(),
+                0,
+                1,
+                1,
+            )
+        };
         assert!(suspend());
         assert!(crate::stack_trace::current_call_stack_text().contains("native_helper"));
         crate::stack_trace::willow_callstack_pop();
@@ -1682,11 +1853,13 @@ mod tests {
         let _guard = crate::gc::isolated_runtime();
         let mut stack = NativeStack::new(trace_poll, std::ptr::null_mut());
         assert_eq!(
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) },
             RUNTIME_POLL_PREEMPTED
         );
         assert!(!crate::stack_trace::current_call_stack_text().contains("native_helper"));
         assert_eq!(
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) },
             RUNTIME_POLL_READY
         );
@@ -1695,13 +1868,19 @@ mod tests {
 
     unsafe extern "C" fn rooted_poll(_: *mut c_void) -> i32 {
         let mut object = crate::gc::willow_alloc(8);
+        // SAFETY: The rooted GC object reserves an aligned word for the value across suspension.
         unsafe {
             *object.cast::<u64>() = 0x1234_abcd;
         }
-        crate::gc::willow_push_root(&mut object);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { crate::gc::willow_push_root(&raw mut object) };
         assert!(suspend());
+        // SAFETY: The rooted GC object reserves an aligned word for the value across suspension.
         assert_eq!(unsafe { *object.cast::<u64>() }, 0x1234_abcd);
-        crate::gc::willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { crate::gc::willow_pop_root() };
         RUNTIME_POLL_READY
     }
 
@@ -1711,12 +1890,14 @@ mod tests {
         let depth = crate::gc::gc_thread_root_depth();
         let mut stack = NativeStack::new(rooted_poll, std::ptr::null_mut());
         assert_eq!(
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) },
             RUNTIME_POLL_PREEMPTED
         );
         assert_eq!(crate::gc::gc_thread_root_depth(), depth);
         crate::gc::willow_gc_collect();
         assert_eq!(
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) },
             RUNTIME_POLL_READY
         );
@@ -1727,7 +1908,9 @@ mod tests {
         use crate::panic_context::*;
         use willow_abi::unwind_reason::{CANCEL, NONE, PANIC};
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         let saved = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(901))));
         unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
             assert_eq!(willow_unwind_reason(), CANCEL);
@@ -1736,8 +1919,11 @@ mod tests {
             willow_panic_enter_defer();
             assert!(willow_panic_recover().is_null());
             willow_panic_leave_defer();
-            let message = crate::string::willow_string_alloc(b"cleanup".as_ptr(), 7);
-            willow_panic_raise(message, std::ptr::null(), 0, 0);
+
+            let message = crate::string::willow_string_from_str("cleanup");
+            // SAFETY: The optional source file is null or a current Willow string and the
+            // panic path roots its string inputs before allocation.
+            unsafe { willow_panic_raise(message, std::ptr::null(), 0, 0) };
             assert_eq!(willow_unwind_reason(), PANIC | CANCEL);
             assert_eq!(willow_panic_depth(), 1);
             cleanup_enter();
@@ -1758,6 +1944,7 @@ mod tests {
         let mut stack = NativeStack::new(poll, std::ptr::null_mut());
         stack.cancelled = true;
         assert_eq!(
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) },
             RUNTIME_POLL_READY
         );
@@ -1798,6 +1985,8 @@ mod tests {
         unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
             measure("task-clean");
             let stack = CURRENT.with(Cell::get);
+            // SAFETY: Only the currently executing coroutine accesses its pinned stack state here.
+            // Its owner retains the allocation across yields.
             unsafe {
                 (*stack).cancelled = true;
             }
@@ -1808,11 +1997,14 @@ mod tests {
             RUNTIME_POLL_READY
         }
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         let saved = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(902))));
         measure("sync-clean");
         let mut stack = NativeStack::new(poll, std::ptr::null_mut());
         assert_eq!(
+            // SAFETY: The driver owns the pinned stack exclusively through this resume.
             unsafe { NativeStack::resume(&mut *stack) },
             RUNTIME_POLL_READY
         );
@@ -1874,10 +2066,15 @@ mod tests {
         DEFER_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
         PEER_RAN.store(false, std::sync::atomic::Ordering::SeqCst);
         let frame = crate::async_frame::willow_async_frame_alloc(0, 0);
-        let target = crate::scheduler::willow_sched_spawn(cancellable_poll, frame);
-        crate::scheduler::willow_sched_set_cancel_fn(target, frame_cleanup);
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        let target = unsafe { crate::scheduler::willow_sched_spawn(cancellable_poll, frame) };
+        // SAFETY: This task was spawned with the frame layout expected by the cancellation
+        // callback.
+        unsafe { crate::scheduler::willow_sched_set_cancel_fn(target, frame_cleanup) };
         CANCEL_TARGET.store(target, std::sync::atomic::Ordering::SeqCst);
-        crate::scheduler::willow_sched_spawn(cancel_peer, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        unsafe { crate::scheduler::willow_sched_spawn(cancel_peer, std::ptr::null_mut()) };
         crate::scheduler::willow_sched_run();
         assert!(PEER_RAN.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(DEFER_COUNT.load(std::sync::atomic::Ordering::SeqCst), 34);
@@ -1906,8 +2103,12 @@ mod tests {
         let _single = crate::scheduler::single_worker_for_test();
         crate::scheduler::reset_global_scheduler_for_test();
         *AFFINITY_THREAD.lock().unwrap() = None;
-        let target = crate::scheduler::willow_sched_spawn(affinity_poll, std::ptr::null_mut());
-        let peer = crate::scheduler::willow_sched_spawn(ready_peer, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let target =
+            unsafe { crate::scheduler::willow_sched_spawn(affinity_poll, std::ptr::null_mut()) };
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let peer =
+            unsafe { crate::scheduler::willow_sched_spawn(ready_peer, std::ptr::null_mut()) };
         crate::scheduler::willow_sched_run_until(peer);
         assert!(AFFINITY_THREAD.lock().unwrap().is_some());
         crate::scheduler::willow_sched_cancel(target);
@@ -1919,10 +2120,13 @@ mod tests {
         // Production fairness is time-based: 10,000 fast safepoints need not
         // exhaust a quantum. Force the first yield without depending on CPU
         // speed or mutating the process-wide environment.
-        crate::preempt::begin_quantum(
-            crate::preempt::PreemptConfig::from_env_values(Some("1"), Some("100000")),
-            std::ptr::null(),
-        );
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe {
+            crate::preempt::begin_quantum(
+                crate::preempt::PreemptConfig::from_env_values(Some("1"), Some("100000")),
+                std::ptr::null(),
+            )
+        };
         for _ in 0..10_000 {
             assert_eq!(willow_sync_safepoint(), 0);
         }
@@ -1940,10 +2144,15 @@ mod tests {
         crate::scheduler::reset_global_scheduler_for_test();
         PEER_RAN.store(false, std::sync::atomic::Ordering::SeqCst);
         let frame = crate::async_frame::willow_async_frame_alloc(0, 0);
-        let target = crate::scheduler::willow_sched_spawn(ready_peer, frame);
-        crate::scheduler::willow_sched_set_cancel_fn(target, lengthy_async_cleanup);
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        let target = unsafe { crate::scheduler::willow_sched_spawn(ready_peer, frame) };
+        // SAFETY: This task was spawned with the frame layout expected by the cancellation
+        // callback.
+        unsafe { crate::scheduler::willow_sched_set_cancel_fn(target, lengthy_async_cleanup) };
         crate::scheduler::willow_sched_cancel(target);
-        crate::scheduler::willow_sched_spawn(mark_peer, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        unsafe { crate::scheduler::willow_sched_spawn(mark_peer, std::ptr::null_mut()) };
         crate::scheduler::willow_sched_run();
         crate::scheduler::reset_global_scheduler_for_test();
     }
@@ -1964,10 +2173,15 @@ mod tests {
         crate::scheduler::reset_global_scheduler_for_test();
         DEFER_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
         let frame = crate::async_frame::willow_async_frame_alloc(0, 0);
-        let target = crate::scheduler::willow_sched_spawn(runtime_mapper_poll, frame);
-        crate::scheduler::willow_sched_set_cancel_fn(target, runtime_mapper_cleanup);
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        let target = unsafe { crate::scheduler::willow_sched_spawn(runtime_mapper_poll, frame) };
+        // SAFETY: This task was spawned with the frame layout expected by the cancellation
+        // callback.
+        unsafe { crate::scheduler::willow_sched_set_cancel_fn(target, runtime_mapper_cleanup) };
         CANCEL_TARGET.store(target, std::sync::atomic::Ordering::SeqCst);
-        crate::scheduler::willow_sched_spawn(cancel_peer, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        unsafe { crate::scheduler::willow_sched_spawn(cancel_peer, std::ptr::null_mut()) };
         crate::scheduler::willow_sched_run();
         assert_eq!(DEFER_COUNT.load(std::sync::atomic::Ordering::SeqCst), 1);
         crate::scheduler::reset_global_scheduler_for_test();

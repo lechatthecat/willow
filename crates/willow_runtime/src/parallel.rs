@@ -53,10 +53,14 @@ impl NativeFrameSpec for CoordinatorFrame {
 }
 
 unsafe fn chunk_frame(frame: *mut c_void) -> NativeTaskFrame<ChunkFrame> {
+    // SAFETY: The scheduler passes the frame allocated for this native callback and retains it
+    // during the poll.
     unsafe { NativeTaskFrame::from_raw(frame) }
 }
 
 unsafe fn coordinator_frame(frame: *mut c_void) -> NativeTaskFrame<CoordinatorFrame> {
+    // SAFETY: The scheduler passes the frame allocated for this native callback and retains it
+    // during the poll.
     unsafe { NativeTaskFrame::from_raw(frame) }
 }
 // A native scalar loop has one safepoint per bounded batch, like the amortized
@@ -77,6 +81,7 @@ pub type I64Mapper = unsafe extern "C" fn(i64, *mut u8) -> i64;
 /// # Safety
 /// `mapper` must be a live Willow function value.
 unsafe fn mapper_code(mapper: *mut u8) -> *const () {
+    // SAFETY: The function value reserves a code word at the start of its word-aligned GC payload.
     let word = unsafe { (mapper as *const usize).read() };
     std::ptr::without_provenance(word & !willow_abi::FUNCTION_CODE_MAY_PANIC)
 }
@@ -115,8 +120,12 @@ fn chunk_ranges(len: i64, workers: usize) -> Vec<(i64, i64)> {
 
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_chunk(frame: *mut c_void) -> i32 {
+    // SAFETY: The coordinator or chunk task owns the matching native frame and state until
+    // completion or cancellation takes its slot.
     let frame_view = unsafe { chunk_frame(frame) };
     let state_ptr = frame_view.load_native::<ChunkState>(CHUNK_STATE_SLOT);
+    // SAFETY: The coordinator or chunk task owns the matching native frame and state until
+    // completion or cancellation takes its slot.
     let Some(state) = (unsafe { state_ptr.as_mut() }) else {
         return crate::task::RUNTIME_POLL_READY;
     };
@@ -132,6 +141,8 @@ unsafe extern "C" fn poll_chunk(frame: *mut c_void) -> i32 {
     while next < stop {
         // Chunk construction proves bounds and scalar element type. Reload
         // the rooted handles: a mapper may allocate and collect between reads.
+        // SAFETY: The chunk bounds are within the scalar array and next selects an initialized
+        // word in that range.
         let input_value = unsafe {
             crate::array::scalar_slot_unchecked(frame_view.load_gc(CHUNK_INPUT_SLOT), next).read()
         };
@@ -141,13 +152,19 @@ unsafe extern "C" fn poll_chunk(frame: *mut c_void) -> i32 {
         // scheduler entry installed one. Re-establish it at the mapper boundary.
         let mapper = frame_view.load_gc(CHUNK_MAPPER_SLOT);
         let mapped =
+            // SAFETY: The mapper is a live function value of the expected i64 signature and the
+            // bridge supplies its environment.
             unsafe { bridge.call_function_value(mapper_code(mapper), input_value, mapper) };
         // A mapper panic follows the ordinary Task policy. Stop immediately so
         // neutral ABI return values are never committed as successful output.
         if bridge.panicked() {
+            // SAFETY: The coordinator or chunk task owns the matching native frame and state until
+            // completion or cancellation takes its slot.
             unsafe { drop_chunk_state(frame) };
             return crate::task::RUNTIME_POLL_PANICKED;
         }
+        // SAFETY: The chunk bounds are within the scalar array and next selects an initialized
+        // word in that range.
         unsafe {
             crate::array::scalar_slot_unchecked(frame_view.load_gc(CHUNK_OUTPUT_SLOT), next)
                 .write(mapped);
@@ -169,11 +186,15 @@ unsafe extern "C" fn poll_chunk(frame: *mut c_void) -> i32 {
         return crate::task::RUNTIME_POLL_PREEMPTED;
     }
 
+    // SAFETY: The coordinator or chunk task owns the matching native frame and state until
+    // completion or cancellation takes its slot.
     unsafe { drop_chunk_state(frame) };
     crate::task::RUNTIME_POLL_READY
 }
 
 unsafe fn drop_chunk_state(frame: *mut c_void) {
+    // SAFETY: The coordinator or chunk task owns the matching native frame and state until
+    // completion or cancellation takes its slot.
     unsafe {
         let raw = chunk_frame(frame).take_native::<ChunkState>(CHUNK_STATE_SLOT);
         if !raw.is_null() {
@@ -184,6 +205,8 @@ unsafe fn drop_chunk_state(frame: *mut c_void) {
 
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn cancel_chunk(frame: *mut c_void) {
+    // SAFETY: The coordinator or chunk task owns the matching native frame and state until
+    // completion or cancellation takes its slot.
     unsafe { drop_chunk_state(frame) };
 }
 
@@ -206,18 +229,26 @@ fn spawn_chunk(
         Box::into_raw(Box::new(ChunkState { next: start, end })),
     );
     let raw = frame.as_raw();
-    crate::scheduler::spawn_global_task_initialized(
-        poll_chunk,
-        raw,
-        Some(cancel_chunk),
-        |task_id| frame.store_word(CHUNK_TASK_ID_SLOT, task_id as i64),
-    )
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe {
+        crate::scheduler::spawn_global_task_initialized(
+            poll_chunk,
+            raw,
+            Some(cancel_chunk),
+            |task_id| frame.store_word(CHUNK_TASK_ID_SLOT, task_id as i64),
+        )
+    }
 }
 
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_coordinator(frame: *mut c_void) -> i32 {
+    // SAFETY: The coordinator or chunk task owns the matching native frame and state until
+    // completion or cancellation takes its slot.
     let frame_view = unsafe { coordinator_frame(frame) };
     let state_ptr = frame_view.load_native::<CoordinatorState>(COORD_STATE_SLOT);
+    // SAFETY: The coordinator or chunk task owns the matching native frame and state until
+    // completion or cancellation takes its slot.
     let Some(state) = (unsafe { state_ptr.as_mut() }) else {
         return crate::task::RUNTIME_POLL_READY;
     };
@@ -244,6 +275,8 @@ unsafe extern "C" fn poll_coordinator(frame: *mut c_void) -> i32 {
     }
 
     let output = frame_view.load_gc(COORD_OUTPUT_SLOT);
+    // SAFETY: The coordinator or chunk task owns the matching native frame and state until
+    // completion or cancellation takes its slot.
     unsafe {
         frame_view.store_gc(COORD_RESULT_SLOT, output);
         frame_view.store_native::<CoordinatorState>(COORD_STATE_SLOT, std::ptr::null_mut());
@@ -254,6 +287,8 @@ unsafe extern "C" fn poll_coordinator(frame: *mut c_void) -> i32 {
 
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn cancel_coordinator(frame: *mut c_void) {
+    // SAFETY: The coordinator or chunk task owns the matching native frame and state until
+    // completion or cancellation takes its slot.
     unsafe {
         let raw = coordinator_frame(frame).take_native::<CoordinatorState>(COORD_STATE_SLOT);
         if !raw.is_null() {
@@ -271,16 +306,21 @@ unsafe extern "C" fn cancel_coordinator(frame: *mut c_void) {
 /// The input must be a `FrozenArray<i64>` at the language boundary. The mapper
 /// is a function value whose captures the compiler proved Send + Sync and
 /// immutable, so every chunk Task may call the one shared value.
+///
+/// # Safety
+/// For non-null inputs, supply a live frozen word array and a live Willow i64-to-i64
+/// function value. Its captures must support concurrent calls by the spawned workers.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_parallel_map_i64(input: *mut u8, mapper: *mut u8) -> *mut c_void {
+pub unsafe extern "C" fn willow_parallel_map_i64(input: *mut u8, mapper: *mut u8) -> *mut c_void {
     if mapper.is_null() || input.is_null() {
         crate::panic_context::raise_language_message(
             "parallel::map requires a FrozenArray<i64> and a valid mapper",
         );
         return std::ptr::null_mut();
     }
-    let len = crate::array::willow_array_len(input);
+    // SAFETY: The caller supplies a live frozen word array, and input passed the null check.
+    let len = unsafe { crate::array::willow_array_len(input) };
     if crate::panic_context::willow_panic_active() != 0 {
         return std::ptr::null_mut();
     }
@@ -330,12 +370,16 @@ pub extern "C" fn willow_parallel_map_i64(input: *mut u8, mapper: *mut u8) -> *m
         })),
     );
     let raw = frame.as_raw();
-    crate::scheduler::spawn_global_task_initialized(
-        poll_coordinator,
-        raw,
-        Some(cancel_coordinator),
-        |task_id| frame.store_word(COORD_TASK_ID_SLOT, task_id as i64),
-    );
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe {
+        crate::scheduler::spawn_global_task_initialized(
+            poll_coordinator,
+            raw,
+            Some(cancel_coordinator),
+            |task_id| frame.store_word(COORD_TASK_ID_SLOT, task_id as i64),
+        )
+    };
     raw
 }
 
@@ -392,7 +436,13 @@ mod tests {
     /// A capture-free function value whose code is `increment`, kept alive by
     /// the returned handle.
     fn increment_value() -> crate::gc::GcRootHandle {
-        let value = crate::gc::willow_alloc_with_layout(crate::gc::GcObjectKind::Closure, 0, 8, 0);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let value = unsafe {
+            crate::gc::willow_alloc_with_layout(crate::gc::GcObjectKind::Closure, 0, 8, 0)
+        };
+        // SAFETY: The function value reserves a code word at the start of its word-aligned GC
+        // payload.
         unsafe { (value as *mut usize).write(increment as I64Mapper as usize) };
         crate::gc::GcRootHandle::new(value)
     }
@@ -400,7 +450,9 @@ mod tests {
     #[test]
     fn parallel_06_scalar_loop_exact_work_and_poll_bounds() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
         // Growing, non-aligned lengths include both countdown and poll edges.
         for len in [
             0, 1, 2, 63, 64, 65, 255, 256, 257, 1023, 1024, 1025, 4097, 65535, 65536, 65537, 131073,
@@ -412,7 +464,9 @@ mod tests {
                 let output = crate::array::new_old_array(len, 0);
                 let _output_root = crate::gc::GcRootHandle::new(output);
                 for index in 0..len {
-                    crate::array::willow_array_set(input, index, index);
+                    // SAFETY: The test roots both old-space word arrays; this index belongs
+                    // to their allocated range.
+                    unsafe { crate::array::willow_array_set(input, index, index) };
                 }
                 let frame = NativeTaskFrame::<ChunkFrame>::allocate().unwrap();
                 frame.store_gc(CHUNK_INPUT_SLOT, input);
@@ -426,13 +480,18 @@ mod tests {
                 let mut processed = 0;
                 let mut polls = 0;
                 loop {
-                    crate::preempt::begin_quantum(
-                        crate::preempt::PreemptConfig::from_env_values(
-                            Some(&budget.to_string()),
-                            Some("100000"),
-                        ),
-                        std::ptr::null(),
-                    );
+                    // SAFETY: A null flag binds no storage and is explicitly supported.
+                    unsafe {
+                        crate::preempt::begin_quantum(
+                            crate::preempt::PreemptConfig::from_env_values(
+                                Some(&budget.to_string()),
+                                Some("100000"),
+                            ),
+                            std::ptr::null(),
+                        )
+                    };
+                    // SAFETY: The coordinator or chunk task owns the matching native frame and
+                    // state until completion or cancellation takes its slot.
                     let result = unsafe { poll_chunk(frame.as_raw()) };
                     crate::preempt::willow_preempt_end();
                     polls += 1;
@@ -441,6 +500,8 @@ mod tests {
                         break;
                     }
                     assert_eq!(result, crate::task::RUNTIME_POLL_PREEMPTED);
+                    // SAFETY: The coordinator or chunk task owns the matching native frame and
+                    // state until completion or cancellation takes its slot.
                     let next = unsafe { (*frame.load_native::<ChunkState>(CHUNK_STATE_SLOT)).next };
                     assert_eq!(
                         next - processed,
@@ -452,18 +513,27 @@ mod tests {
                 assert_eq!(polls, ((len + quantum - 1) / quantum).max(1));
                 assert_eq!(MAPPED_ELEMENTS.get(), len);
                 for index in 0..len {
-                    assert_eq!(crate::array::willow_array_get(output, index), index + 1);
+                    assert_eq!(
+                        // SAFETY: The test roots both old-space word arrays; this index belongs
+                        // to their allocated range.
+                        unsafe { crate::array::willow_array_get(output, index) },
+                        index + 1
+                    );
                 }
                 println!("len={len} budget={budget} mapped={len} polls={polls}");
             }
         }
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
     }
 
     #[test]
     fn parallel_07_pending_preemption_stops_within_one_batch() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
         MAPPED_ELEMENTS.set(0);
         let input = crate::array::new_old_array(1024, 0);
         let _input = crate::gc::GcRootHandle::new(input);
@@ -479,27 +549,39 @@ mod tests {
             Box::into_raw(Box::new(ChunkState { next: 0, end: 1024 })),
         );
         let flag = std::sync::atomic::AtomicBool::new(true);
-        crate::preempt::begin_quantum(
-            crate::preempt::PreemptConfig::from_env_values(Some("4096"), Some("100000")),
-            (&raw const flag).cast(),
-        );
+        // SAFETY: The fixture keeps the flag at its registered address throughout this
+        // quantum and unbinds it before release.
+        unsafe {
+            crate::preempt::begin_quantum(
+                crate::preempt::PreemptConfig::from_env_values(Some("4096"), Some("100000")),
+                (&raw const flag).cast(),
+            )
+        };
         // Beginning a quantum clears stale requests; simulate a request that
         // arrives after the scheduler has installed this quantum.
         flag.store(true, std::sync::atomic::Ordering::Release);
         assert_eq!(
+            // SAFETY: The coordinator or chunk task owns the matching native frame and state until
+            // completion or cancellation takes its slot.
             unsafe { poll_chunk(frame.as_raw()) },
             crate::task::RUNTIME_POLL_PREEMPTED
         );
         crate::preempt::willow_preempt_end();
         assert_eq!(MAPPED_ELEMENTS.get(), ELEMENTS_PER_SAFEPOINT);
+        // SAFETY: The coordinator or chunk task owns the matching native frame and state until
+        // completion or cancellation takes its slot.
         unsafe { cancel_chunk(frame.as_raw()) };
         assert!(frame.load_native::<ChunkState>(CHUNK_STATE_SLOT).is_null());
         // Cleanup is idempotent and cannot map another element or publish success.
+        // SAFETY: The coordinator or chunk task owns the matching native frame and state until
+        // completion or cancellation takes its slot.
         unsafe { cancel_chunk(frame.as_raw()) };
         assert_eq!(MAPPED_ELEMENTS.get(), ELEMENTS_PER_SAFEPOINT);
         drop(_input);
         drop(_output);
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
     }
 
     unsafe extern "C" fn pending_forever(_frame: *mut c_void) -> i32 {
@@ -509,11 +591,16 @@ mod tests {
     #[test]
     fn parallel_05_coordinator_registers_each_child_waiter_once() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
         crate::scheduler::reset_global_scheduler_for_test();
 
         let children = (0..4)
-            .map(|_| crate::scheduler::willow_sched_spawn(pending_forever, std::ptr::null_mut()))
+            // SAFETY: The callback accepts a null frame and uses no frame storage.
+            .map(|_| unsafe {
+                crate::scheduler::willow_sched_spawn(pending_forever, std::ptr::null_mut())
+            })
             .collect::<Vec<_>>();
         let frame = NativeTaskFrame::<CoordinatorFrame>::allocate().expect("coordinator frame");
         frame.store_native(
@@ -524,12 +611,16 @@ mod tests {
             })),
         );
         let raw = frame.as_raw();
-        let coordinator = crate::scheduler::spawn_global_task_initialized(
-            poll_coordinator,
-            raw,
-            Some(cancel_coordinator),
-            |task_id| frame.store_word(COORD_TASK_ID_SLOT, task_id as i64),
-        );
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        let coordinator = unsafe {
+            crate::scheduler::spawn_global_task_initialized(
+                poll_coordinator,
+                raw,
+                Some(cancel_coordinator),
+                |task_id| frame.store_word(COORD_TASK_ID_SLOT, task_id as i64),
+            )
+        };
 
         crate::scheduler::willow_sched_run();
         for child in &children {
@@ -546,6 +637,8 @@ mod tests {
         crate::scheduler::willow_sched_cancel(coordinator);
         crate::scheduler::willow_sched_run();
         crate::scheduler::reset_global_scheduler_for_test();
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
     }
 }

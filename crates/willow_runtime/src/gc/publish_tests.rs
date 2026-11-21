@@ -35,8 +35,12 @@ fn young(refs: usize, words: usize) -> *mut u8 {
     let state = unsafe { &*tls };
     let cursor = state.cursor.load(Ordering::Acquire);
     if cursor != 0 && cursor + bytes <= state.limit.load(Ordering::Acquire) {
-        initialize_generated_object_at_for_test(cursor as *mut u8, bytes, 0, layout_id, mask)
-            .unwrap();
+        // SAFETY: The allocation cursor reserves this aligned header and its complete
+        // payload. The supplied type and mask describe the initialized words.
+        unsafe {
+            initialize_generated_object_at_for_test(cursor as *mut u8, bytes, 0, layout_id, mask)
+        }
+        .unwrap();
         publish_tlab_start_for_test(state, cursor as *mut u8);
         state.cursor.store(cursor + bytes, Ordering::Release);
         let payload = (cursor + GC_HEADER_SIZE) as *mut u8;
@@ -44,7 +48,9 @@ fn young(refs: usize, words: usize) -> *mut u8 {
         unsafe { std::ptr::write_bytes(payload, 0, words * 8) };
         return payload;
     }
-    let payload = willow_gc_alloc_slow(tls, layout_id, 0, (words * 8) as i64, mask);
+    // SAFETY: The current mutator owns the runtime TLS block until retirement; this fixture
+    // uses its word layout and inline mask.
+    let payload = unsafe { willow_gc_alloc_slow(tls, layout_id, 0, (words * 8) as i64, mask) };
     assert!(!payload.is_null());
     payload
 }
@@ -52,18 +58,25 @@ fn young(refs: usize, words: usize) -> *mut u8 {
 /// A private (unshared) old object with `refs` reference words.
 fn old(refs: usize) -> *mut u8 {
     let mask = (1u64 << refs) - 1;
-    let payload = allocate_old(layout(refs.max(1), mask), 0, (refs.max(1) * 8) as i64, mask);
+    // SAFETY: This fixture selects the payload size and tracing layout for its object and
+    // initializes any native fields before collection.
+    let payload =
+        unsafe { allocate_old(layout(refs.max(1), mask), 0, (refs.max(1) * 8) as i64, mask) };
     assert!(!payload.is_null());
     payload
 }
 
 fn set(owner: *mut u8, index: usize, value: *mut u8) {
     // SAFETY: tests bound `index` by the allocation's reference words.
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     unsafe { owner.cast::<*mut u8>().add(index).write(value) };
 }
 
 fn get(owner: *mut u8, index: usize) -> *mut u8 {
     // SAFETY: as in `set`.
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     unsafe { owner.cast::<*mut u8>().add(index).read() }
 }
 
@@ -133,7 +146,9 @@ impl Fixture {
     }
 
     fn start(owner: &'static Runtime, arc: Option<&'static std::sync::Arc<Runtime>>) -> Self {
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
         willow_gc_register_mutator();
         run_as(owner, TASK_A);
         Self { owner, arc }
@@ -164,7 +179,9 @@ impl Drop for Fixture {
         *self.owner.diagnostics.stress_override.lock().unwrap() = None;
         switch_task_owner_in(self.owner, 0);
         willow_gc_unregister_mutator();
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
     }
 }
 
@@ -190,7 +207,9 @@ fn exercise(fixture: &Fixture, point: PublicationPoint, value: *mut u8) {
         PublicationPoint::ChannelSend => {
             let channel = crate::channel::willow_channel_new_bounded(1, 4);
             assert_eq!(
-                crate::channel::willow_channel_try_send_ptr(channel, value.cast()),
+                // SAFETY: The constructor selected this channel element representation and
+                // the channel remains live during the send.
+                unsafe { crate::channel::willow_channel_try_send_ptr(channel, value.cast()) },
                 1,
                 "sent"
             );
@@ -200,8 +219,12 @@ fn exercise(fixture: &Fixture, point: PublicationPoint, value: *mut u8) {
             let frame = crate::async_frame::willow_async_frame_alloc(1, 1).cast::<u8>();
             let offset = crate::async_frame::async_frame_slot_offset(0);
             // SAFETY: slot 0 of a one-slot frame.
+            // SAFETY: The fixture allocates these fields in word-aligned GC storage at whole-word
+            // offsets.
             unsafe { frame.add(offset).cast::<*mut u8>().write(value) };
-            crate::scheduler::willow_sched_spawn(never_polled, frame.cast());
+            // SAFETY: The supplied callback matches this frame layout; the frame storage
+            // remains live across scheduling and callback execution.
+            unsafe { crate::scheduler::willow_sched_spawn(never_polled, frame.cast()) };
             assert!(!shared(frame), "a spawned frame stays private");
         }
         PublicationPoint::TaskReturn => {
@@ -209,35 +232,47 @@ fn exercise(fixture: &Fixture, point: PublicationPoint, value: *mut u8) {
             for slot in 0..2 {
                 let offset = crate::async_frame::async_frame_slot_offset(slot);
                 // SAFETY: both slots of a two-slot frame.
+                // SAFETY: The fixture allocates these fields in word-aligned GC storage at
+                // whole-word offsets.
                 unsafe { frame.add(offset).cast::<*mut u8>().write(value) };
             }
             // The handle escaped (sent to another task) before the task
             // finished, so its result is published, not handed over.
-            assert!(!crate::async_frame::frame_mark_result_escaped(frame.cast()));
+            // SAFETY: The frame owner retains the initialized ABI status word through this
+            // atomic access.
+            assert!(!unsafe { crate::async_frame::frame_mark_result_escaped(frame.cast()) });
             finish_task_result_in(owner, TASK_A, frame);
             assert!(!shared(frame));
         }
         PublicationPoint::LockedState => {
             let cell = old(1);
-            barrier::write_barrier_in(
-                owner,
-                cell,
-                cell,
-                std::ptr::null_mut(),
-                value,
-                GcStoreDestination::AsyncMutexCell as i64,
-            );
+            // SAFETY: The destination describes this reference update. Any asserted header
+            // belongs to its live GC payload.
+            unsafe {
+                barrier::write_barrier_in(
+                    owner,
+                    cell,
+                    cell,
+                    std::ptr::null_mut(),
+                    value,
+                    GcStoreDestination::AsyncMutexCell as i64,
+                )
+            };
             set(cell, 0, value);
         }
         PublicationPoint::Global => {
-            barrier::write_barrier_in(
-                owner,
-                GLOBAL_CELL.as_ptr().cast(),
-                GLOBAL_CELL.as_ptr().cast(),
-                std::ptr::null_mut(),
-                value,
-                GcStoreDestination::GlobalStatic as i64,
-            );
+            // SAFETY: The destination describes this reference update. Any asserted header
+            // belongs to its live GC payload.
+            unsafe {
+                barrier::write_barrier_in(
+                    owner,
+                    GLOBAL_CELL.as_ptr().cast(),
+                    GLOBAL_CELL.as_ptr().cast(),
+                    std::ptr::null_mut(),
+                    value,
+                    GcStoreDestination::GlobalStatic as i64,
+                )
+            };
             GLOBAL_CELL.store(value, Ordering::Release);
         }
         PublicationPoint::RuntimeRoot => {
@@ -257,14 +292,18 @@ fn exercise(fixture: &Fixture, point: PublicationPoint, value: *mut u8) {
         PublicationPoint::SharedStore => {
             let target = old(1);
             publish_in(owner, target, PublicationPoint::Global, false);
-            barrier::write_barrier_in(
-                owner,
-                target,
-                target,
-                std::ptr::null_mut(),
-                value,
-                GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_OWNER_HAS_HEADER,
-            );
+            // SAFETY: The store uses its heap fixture’s objects for proven payloads and the
+            // addressed element for a slot-specific barrier.
+            unsafe {
+                barrier::write_barrier_in(
+                    owner,
+                    target,
+                    target,
+                    std::ptr::null_mut(),
+                    value,
+                    GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_OWNER_HAS_HEADER,
+                )
+            };
             set(target, 0, value);
         }
     }
@@ -405,14 +444,18 @@ fn first_publication_of_a_private_old_object_marks_its_successors() {
     let young_child = young(0, 1);
     let old_child = old(0);
     // A young value stored into a private old object: logged, not promoted.
-    barrier::write_barrier_in(
-        fixture.owner,
-        container,
-        container,
-        std::ptr::null_mut(),
-        young_child,
-        GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_OWNER_HAS_HEADER,
-    );
+    // SAFETY: The store uses its heap fixture’s objects for proven payloads and the addressed
+    // element for a slot-specific barrier.
+    unsafe {
+        barrier::write_barrier_in(
+            fixture.owner,
+            container,
+            container,
+            std::ptr::null_mut(),
+            young_child,
+            GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_OWNER_HAS_HEADER,
+        )
+    };
     set(container, 0, young_child);
     set(container, 1, old_child);
     assert!(!shared(young_child) && !is_old(young_child));
@@ -435,26 +478,53 @@ fn private_long_lived_container_promotes_nothing() {
     let before = fixture.stats();
     for round in 0..2000 {
         let value = young(0, 1);
-        barrier::write_barrier_in(
-            fixture.owner,
-            container,
-            get(container, 0).cast(),
-            get(container, round % 8),
-            value,
-            GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_OWNER_HAS_HEADER,
-        );
+        // SAFETY: The store uses its heap fixture’s objects for proven payloads and the
+        // addressed element for a slot-specific barrier.
+        unsafe {
+            barrier::write_barrier_in(
+                fixture.owner,
+                container,
+                get(container, 0).cast(),
+                get(container, round % 8),
+                value,
+                GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_OWNER_HAS_HEADER,
+            )
+        };
         set(container, round % 8, value);
         if round % 500 == 499 {
             let mut root = container;
-            willow_push_root(&mut root);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut root) };
             willow_gc_minor_collect();
-            willow_pop_root();
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
         }
     }
     let after = fixture.stats();
     assert_eq!(after.promoted_bytes, before.promoted_bytes);
     assert_eq!(after.calls, before.calls);
     assert!(!shared(container));
+}
+
+#[test]
+fn frame_classifier_caches_only_static_layout_addresses() {
+    let _fixture = Fixture::new();
+    let mut frames = FrameTest {
+        plain: [0; 2],
+        changed: false,
+    };
+    // With a TLAB installed, the next small allocation uses a static descriptor.
+    young(0, 1);
+    let generated = object(young(0, 1));
+    assert!(past_frames(generated, &mut frames).is_some());
+    let static_address = generated.descriptor_address();
+    assert_eq!(frames.plain, [static_address, 0]);
+
+    let interned = object(old(0));
+    assert!(past_frames(interned, &mut frames).is_some());
+    assert_eq!(frames.plain, [static_address, 0]);
 }
 
 #[test]
@@ -488,6 +558,8 @@ fn spawn_publishes_every_frame_slot_and_task_return_only_slot_zero() {
     let write = |slot: usize, value: *mut u8| {
         let offset = crate::async_frame::async_frame_slot_offset(slot);
         // SAFETY: both slots of a two-slot frame.
+        // SAFETY: The fixture allocates these fields in word-aligned GC storage at whole-word
+        // offsets.
         unsafe { frame.add(offset).cast::<*mut u8>().write(value) };
     };
     write(0, first);
@@ -505,25 +577,32 @@ fn store_into_shared_object_through_indirect_reference_publishes() {
     let target = old(1);
     publish_in(fixture.owner, target, PublicationPoint::Global, false);
     let value = young(0, 1);
-    barrier::write_barrier_in(
-        fixture.owner,
-        target,
-        target,
-        std::ptr::null_mut(),
-        value,
-        GcStoreDestination::IndirectReference as i64,
-    );
+    // SAFETY: target is the live managed base of the indirect reference at word zero.
+    unsafe {
+        barrier::write_barrier_in(
+            fixture.owner,
+            target,
+            target,
+            std::ptr::null_mut(),
+            value,
+            GcStoreDestination::IndirectReference as i64,
+        )
+    };
     assert!(shared(value));
     // Without a slot the owner is not a proven payload start: no publication.
     let private = young(0, 1);
-    barrier::write_barrier_in(
-        fixture.owner,
-        target,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        private,
-        GcStoreDestination::IndirectReference as i64,
-    );
+    // SAFETY: The destination describes this reference update. Any asserted header belongs to
+    // its live GC payload.
+    unsafe {
+        barrier::write_barrier_in(
+            fixture.owner,
+            target,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            private,
+            GcStoreDestination::IndirectReference as i64,
+        )
+    };
     assert!(!shared(private));
 }
 
@@ -538,14 +617,18 @@ fn every_lock_cell_destination_publishes() {
         let fixture = Fixture::new();
         let cell = old(1);
         let value = young(0, 1);
-        barrier::write_barrier_in(
-            fixture.owner,
-            cell,
-            cell,
-            std::ptr::null_mut(),
-            value,
-            destination as i64,
-        );
+        // SAFETY: The destination describes this reference update. Any asserted header
+        // belongs to its live GC payload.
+        unsafe {
+            barrier::write_barrier_in(
+                fixture.owner,
+                cell,
+                cell,
+                std::ptr::null_mut(),
+                value,
+                destination as i64,
+            )
+        };
         assert!(shared(value), "{destination:?}");
         assert!(
             !shared(cell),
@@ -562,26 +645,34 @@ fn stores_into_private_or_young_owners_never_publish() {
     let young_owner = young(1, 1);
     for owner in [private_old, young_owner] {
         let value = young(0, 1);
-        barrier::write_barrier_in(
-            fixture.owner,
-            owner,
-            owner,
-            std::ptr::null_mut(),
-            value,
-            GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_OWNER_HAS_HEADER,
-        );
+        // SAFETY: The store uses its heap fixture’s objects for proven payloads and the
+        // addressed element for a slot-specific barrier.
+        unsafe {
+            barrier::write_barrier_in(
+                fixture.owner,
+                owner,
+                owner,
+                std::ptr::null_mut(),
+                value,
+                GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_OWNER_HAS_HEADER,
+            )
+        };
         assert!(!shared(value));
     }
     // A null global owner (a static's initialization) is no publication.
     let value = young(0, 1);
-    barrier::write_barrier_in(
-        fixture.owner,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        value,
-        GcStoreDestination::GlobalStatic as i64,
-    );
+    // SAFETY: The store uses its heap fixture’s objects for proven payloads and the addressed
+    // element for a slot-specific barrier.
+    unsafe {
+        barrier::write_barrier_in(
+            fixture.owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            value,
+            GcStoreDestination::GlobalStatic as i64,
+        )
+    };
     assert!(!shared(value));
     assert_eq!(fixture.stats().calls, before);
 }
@@ -624,16 +715,24 @@ fn owner_survives_a_minor_copy_and_a_cross_task_edge_is_still_caught() {
     let mut b_value = young(0, 1);
     run_as(fixture.owner, TASK_A);
     let mut a_holder = young(1, 1);
-    willow_push_root(&mut b_value);
-    willow_push_root(&mut a_holder);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe {
+        willow_push_root(&raw mut b_value);
+        willow_push_root(&raw mut a_holder);
+    }
     willow_gc_minor_collect();
     assert!(!is_old(a_holder), "survivors stay young");
     set(a_holder, 0, b_value);
     let error = verify_now(fixture.owner).unwrap_err();
     assert!(error.contains("of task owner"), "{error}");
     set(a_holder, 0, std::ptr::null_mut());
-    willow_pop_root();
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe {
+        willow_pop_root();
+        willow_pop_root();
+    }
 }
 
 #[test]
@@ -693,7 +792,9 @@ fn minor_collection_runs_the_verifier_when_enabled() {
     let child = young(0, 1);
     set(value, 0, child);
     publish_in(fixture.owner, value, PublicationPoint::ChannelSend, false);
-    willow_push_root(&mut value);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut value) };
     // Live published young objects move like any young object; the copies
     // keep the SHARED mark and the rooted slot is rewritten.
     willow_gc_minor_collect();
@@ -701,7 +802,9 @@ fn minor_collection_runs_the_verifier_when_enabled() {
     assert!(shared(value) && shared(moved_child));
     assert_ne!(moved_child, child, "the child moved too");
     verify_now(fixture.owner).unwrap();
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
 }
 
 #[test]
@@ -709,17 +812,21 @@ fn publishing_a_card_capable_buffer_bumps_the_card_epoch() {
     let fixture = Fixture::new();
     let slots = 4096;
     let words = willow_abi::array_layout::BUFFER_HEADER_WORDS + slots;
-    let buffer = allocate_old(
-        willow_abi::gc_layout_id(
-            GcObjectKind::ArrayBuffer,
+    // SAFETY: This fixture selects the payload size and tracing layout for its object and
+    // initializes any native fields before collection.
+    let buffer = unsafe {
+        allocate_old(
+            willow_abi::gc_layout_id(
+                GcObjectKind::ArrayBuffer,
+                (words * 8) as i64,
+                willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID as i64,
+                0,
+            ),
+            willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID as u32,
             (words * 8) as i64,
-            willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID as i64,
             0,
-        ),
-        willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID as u32,
-        (words * 8) as i64,
-        0,
-    );
+        )
+    };
     assert!(remembered::card_array_capacity(object(buffer)).is_some());
     let epoch = fixture.owner.card_epoch().load(Ordering::Acquire);
     publish_in(fixture.owner, buffer, PublicationPoint::ChannelSend, false);
@@ -737,17 +844,21 @@ fn card_cache_proves_a_private_buffer_and_never_a_shared_one() {
     let slots = 4096;
     let words = willow_abi::array_layout::BUFFER_HEADER_WORDS + slots;
     let card_buffer = || {
-        allocate_old(
-            willow_abi::gc_layout_id(
-                GcObjectKind::ArrayBuffer,
+        // SAFETY: This fixture selects the payload size and tracing layout for its object and
+        // initializes any native fields before collection.
+        unsafe {
+            allocate_old(
+                willow_abi::gc_layout_id(
+                    GcObjectKind::ArrayBuffer,
+                    (words * 8) as i64,
+                    willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID as i64,
+                    0,
+                ),
+                willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID as u32,
                 (words * 8) as i64,
-                willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID as i64,
                 0,
-            ),
-            willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID as u32,
-            (words * 8) as i64,
-            0,
-        )
+            )
+        }
     };
     let private = card_buffer();
     barrier::card_cache_fill(private as usize, 3);
@@ -809,7 +920,9 @@ fn deep_list_publication_parks_mid_way_for_a_requested_stop() {
     let fixture = Fixture::new();
     fixture.verifier_on(true);
     let mut head = std::ptr::null_mut();
-    willow_push_root(&mut head);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut head) };
     build_list(&raw mut head, LENGTH);
     let collected = std::sync::Arc::new(AtomicBool::new(false));
     let collector = std::thread::spawn(crate::runtime::serving({
@@ -850,14 +963,171 @@ fn deep_list_publication_parks_mid_way_for_a_requested_stop() {
             .is_empty()
     );
     verify_now(fixture.owner).unwrap();
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+}
+
+#[test]
+fn blocking_reference_send_reloads_channel_moved_during_publication() {
+    // Model both kinds of callers. A live native stack root can defer the
+    // collection. A relocatable handle lets the minor run during the same park.
+    for keep_stack_root in [true, false] {
+        let fixture = Fixture::new();
+        let mut head = std::ptr::null_mut();
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut head) };
+        let length = 4 * PARK_POLL_OBJECTS as usize;
+        build_list(&raw mut head, length);
+        let message = GcRootHandle::new(head);
+        if !keep_stack_root {
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
+        }
+        let channel = GcRootHandle::new(crate::channel::young_channel_for_test(true));
+        let original = channel.load();
+        assert!(!is_old(original));
+        let roots_before = fixture.owner.gc.path_observation.current().1;
+        let before = fixture.stats();
+        let deferred = deferred_minor_collections_for_test();
+        let minors = willow_gc_minor_collections();
+        let collector = std::thread::spawn(crate::runtime::serving(|| willow_gc_minor_collect()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !fixture.owner.gc.stop_requested.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "stop never requested");
+            std::thread::yield_now();
+        }
+        // SAFETY: The constructor selected this channel element representation and the
+        // channel remains live during the send.
+        unsafe { crate::channel::willow_channel_send_ptr(original.cast(), message.load().cast()) };
+        collector.join().unwrap();
+        let after = fixture.stats();
+        assert_eq!(after.parks - before.parks, 1);
+        assert_eq!(
+            fixture.owner.gc.path_observation.current().1 - roots_before,
+            2
+        );
+        if keep_stack_root {
+            assert_eq!(deferred_minor_collections_for_test() - deferred, 1);
+            assert_eq!(willow_gc_minor_collections(), minors);
+            assert_eq!(channel.load(), original);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
+        } else {
+            assert_eq!(deferred_minor_collections_for_test(), deferred);
+            assert_eq!(willow_gc_minor_collections() - minors, 1);
+            assert_ne!(channel.load(), original);
+        }
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        let mut received =
+            unsafe { crate::channel::willow_channel_recv_ptr(channel.load().cast()) }.cast();
+        assert_eq!(received, message.load());
+        for _ in 0..length {
+            assert!(!received.is_null() && shared(received));
+            received = get(received, 0);
+        }
+        assert!(received.is_null());
+    }
+}
+
+#[test]
+fn ready_channel_operations_skip_temporary_roots() {
+    let fixture = Fixture::new();
+    let channel = GcRootHandle::new(crate::channel::young_channel_for_test(true));
+    for length in [1, 64, 1024] {
+        let mut head = std::ptr::null_mut();
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut head) };
+        build_list(&raw mut head, length);
+        let roots_before = fixture.owner.gc.path_observation.current().1;
+        let before = fixture.stats();
+        // SAFETY: The constructor selected this channel element representation and the
+        // channel remains live during the send.
+        unsafe { crate::channel::willow_channel_send_ptr(channel.load().cast(), head.cast()) };
+        assert_eq!(
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            unsafe { crate::channel::willow_channel_recv_ptr(channel.load().cast()) },
+            head.cast()
+        );
+        let published = fixture.stats();
+        assert_eq!(
+            published.marked_objects - before.marked_objects,
+            length as u64
+        );
+        assert_eq!(
+            published.scanned_slots - before.scanned_slots,
+            length as u64
+        );
+        // SAFETY: The constructor selected this channel element representation and the
+        // channel remains live during the send.
+        unsafe { crate::channel::willow_channel_send_ptr(channel.load().cast(), head.cast()) };
+        assert_eq!(
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            unsafe { crate::channel::willow_channel_recv_ptr(channel.load().cast()) },
+            head.cast()
+        );
+        let again = fixture.stats();
+        assert_eq!(again.scanned_slots, published.scanned_slots);
+        assert_eq!(again.parks, before.parks);
+        assert_eq!(fixture.owner.gc.path_observation.current().1, roots_before);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
+    }
+}
+
+#[test]
+fn blocking_receive_reloads_channel_moved_by_scheduled_sender() {
+    use crate::native_frame::{NativeFrameSpec, NativeTaskFrame};
+    use willow_abi::{NativeFrameLayout, SlotKind};
+
+    struct SenderFrame;
+    impl NativeFrameSpec for SenderFrame {
+        const NAME: &'static str = "relocating channel sender";
+        const LAYOUT: NativeFrameLayout<'static> = NativeFrameLayout::new(&[SlotKind::GcRef]);
+    }
+    unsafe extern "C" fn collect_and_send(frame: *mut c_void) -> i32 {
+        willow_gc_minor_collect();
+        // SAFETY: The scheduler retains the old-generation SenderFrame throughout this poll.
+        let sender = unsafe { NativeTaskFrame::<SenderFrame>::from_raw(frame) };
+        // SAFETY: The constructor selected this channel element representation and the
+        // channel remains live during the send.
+        unsafe { crate::channel::willow_channel_send_i64(sender.load_gc(0).cast(), 73) };
+        crate::task::RUNTIME_POLL_READY
+    }
+
+    let _guard = isolated_runtime();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal() };
+    crate::scheduler::reset_global_scheduler_for_test();
+    let frame = NativeTaskFrame::<SenderFrame>::allocate().unwrap();
+    let channel = GcRootHandle::new(crate::channel::young_channel_for_test(false));
+    frame.store_gc(0, channel.load());
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe { crate::scheduler::willow_sched_spawn(collect_and_send, frame.as_raw()) };
+    let original = channel.load();
+    assert!(!is_old(original));
+    assert_eq!(
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        unsafe { crate::channel::willow_channel_recv_i64(original.cast()) },
+        73
+    );
+    assert_ne!(channel.load(), original);
 }
 
 #[test]
 fn barrier_publication_never_parks() {
     let fixture = Fixture::new();
     let mut head = std::ptr::null_mut();
-    willow_push_root(&mut head);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut head) };
     build_list(&raw mut head, 4096);
     let target = old(1);
     publish_in(fixture.owner, target, PublicationPoint::Global, false);
@@ -866,14 +1136,18 @@ fn barrier_publication_never_parks() {
         .gc
         .stop_requested
         .store(true, Ordering::Release);
-    barrier::write_barrier_in(
-        fixture.owner,
-        target,
-        target,
-        std::ptr::null_mut(),
-        head,
-        GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_OWNER_HAS_HEADER,
-    );
+    // SAFETY: The store uses its heap fixture’s objects for proven payloads and the addressed
+    // element for a slot-specific barrier.
+    unsafe {
+        barrier::write_barrier_in(
+            fixture.owner,
+            target,
+            target,
+            std::ptr::null_mut(),
+            head,
+            GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_OWNER_HAS_HEADER,
+        )
+    };
     fixture
         .owner
         .gc
@@ -881,7 +1155,9 @@ fn barrier_publication_never_parks() {
         .store(false, Ordering::Release);
     assert_eq!(fixture.stats().parks, 0);
     assert!(shared(head));
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
 }
 
 #[test]
@@ -925,7 +1201,9 @@ fn tenured_published_objects_that_die_old_are_accounted_by_a_major_collection() 
     set(value, 0, child);
     publish_in(fixture.owner, value, PublicationPoint::ChannelSend, false);
     let before = fixture.stats();
-    willow_push_root(&mut value);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut value) };
     // Survivor copies stay counted as published-young until they tenure.
     let mut minors = 0;
     while !is_old(value) {
@@ -933,7 +1211,9 @@ fn tenured_published_objects_that_die_old_are_accounted_by_a_major_collection() 
         minors += 1;
         assert!(minors <= 8, "a rooted survivor tenures");
     }
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
     let child = get(value, 0);
     assert!(is_old(child) && shared(value) && shared(child));
     assert!(object(value).promoted_by_publication());
@@ -1005,14 +1285,18 @@ fn a_shared_young_value_stored_into_an_old_owner_is_remembered() {
         if owner_shared {
             publish_in(fixture.owner, owner, PublicationPoint::Global, false);
         }
-        barrier::write_barrier_in(
-            fixture.owner,
-            owner,
-            owner,
-            std::ptr::null_mut(),
-            value,
-            GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_OWNER_HAS_HEADER,
-        );
+        // SAFETY: The store uses its heap fixture’s objects for proven payloads and the
+        // addressed element for a slot-specific barrier.
+        unsafe {
+            barrier::write_barrier_in(
+                fixture.owner,
+                owner,
+                owner,
+                std::ptr::null_mut(),
+                value,
+                GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_OWNER_HAS_HEADER,
+            )
+        };
         set(owner, 0, value);
         assert!(
             object(owner).remembered(),
@@ -1020,9 +1304,13 @@ fn a_shared_young_value_stored_into_an_old_owner_is_remembered() {
         );
         // Only the owner roots the value: the minor finds it through the
         // remembered set and rewrites the owner's slot to the moved copy.
-        willow_push_root(&mut owner);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut owner) };
         willow_gc_minor_collect();
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         let moved = get(owner, 0);
         assert!(!moved.is_null() && shared(moved));
         assert_eq!(object(moved).size(), GC_HEADER_SIZE + 8);
@@ -1038,9 +1326,13 @@ fn a_published_survivor_that_dies_young_later_is_counted_once() {
     let mut value = young(0, 2);
     publish_in(fixture.owner, value, PublicationPoint::ChannelSend, false);
     let before = fixture.stats();
-    willow_push_root(&mut value);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut value) };
     willow_gc_minor_collect();
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
     assert!(
         shared(value) && !is_old(value),
         "copied to a young survivor"
@@ -1063,30 +1355,39 @@ fn a_published_survivor_that_dies_young_later_is_counted_once() {
 
 /// A private old object holding one data word.
 fn old_data(value: usize) -> *mut u8 {
-    let payload = allocate_old(layout(1, 0), 0, 8, 0);
+    // SAFETY: This fixture selects the payload size and tracing layout for its object and
+    // initializes any native fields before collection.
+    let payload = unsafe { allocate_old(layout(1, 0), 0, 8, 0) };
     assert!(!payload.is_null());
     // SAFETY: one data word.
+    // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
     unsafe { payload.cast::<usize>().write(value) };
     payload
 }
 
 fn data(payload: *mut u8, word: usize) -> usize {
     // SAFETY: tests read data words inside the allocation.
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     unsafe { payload.cast::<usize>().add(word).read() }
 }
 
 /// A generated store: barrier first, then the slot write.
 fn store(owner: &Runtime, target: *mut u8, index: usize, value: *mut u8) {
-    barrier::write_barrier_in(
-        owner,
-        target,
-        target,
-        get(target, index),
-        value,
-        GcStoreDestination::ObjectField as i64
-            | willow_abi::GC_STORE_OWNER_HAS_HEADER
-            | willow_abi::GC_STORE_VALUE_HAS_HEADER,
-    );
+    // SAFETY: The store uses its heap fixture’s objects for proven payloads and the addressed
+    // element for a slot-specific barrier.
+    unsafe {
+        barrier::write_barrier_in(
+            owner,
+            target,
+            target,
+            get(target, index),
+            value,
+            GcStoreDestination::ObjectField as i64
+                | willow_abi::GC_STORE_OWNER_HAS_HEADER
+                | willow_abi::GC_STORE_VALUE_HAS_HEADER,
+        )
+    };
     set(target, index, value);
 }
 
@@ -1115,25 +1416,35 @@ fn publication_during_concurrent_mark_close_and_sweep_loses_nothing() {
     set(holder, 0, tail);
     set(holder, 1, late);
     set(holder, 2, swept);
-    willow_push_root(&mut shared_owner);
-    willow_push_root(&mut holder);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe {
+        willow_push_root(&raw mut shared_owner);
+        willow_push_root(&raw mut holder);
+    }
     let elected = cycle_wait::CollectorGuard::try_acquire().unwrap();
     let (_, cycle) = root_handshake::begin().unwrap();
 
     // Marking: a young chain allocated after the snapshot ends at an old
     // object the snapshot reached only through `holder`; published, then
     // dropped from the holder.
-    let mut head = tail;
-    willow_push_root(&mut head);
+    let head = std::cell::Cell::new(tail);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(head.as_ptr()) };
     for index in 0..CHAIN {
         let node = young(1, 2);
-        set(node, 0, head);
+        set(node, 0, head.get());
         // SAFETY: word 1 of a two-word node is data.
+        // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+        // words.
         unsafe { node.cast::<usize>().add(1).write(index) };
-        head = node;
+        head.set(node);
     }
-    store(owner, shared_owner, 0, head);
-    willow_pop_root();
+    store(owner, shared_owner, 0, head.get());
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
     store(owner, holder, 0, std::ptr::null_mut());
     minor::collect_owned();
     while !cycle.queue.snapshot().is_drained() {
@@ -1144,6 +1455,7 @@ fn publication_during_concurrent_mark_close_and_sweep_loses_nothing() {
     cycle.close();
     let leaf = young(0, 1);
     // SAFETY: one data word.
+    // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
     unsafe { leaf.cast::<usize>().write(99) };
     store(owner, late, 0, leaf);
     store(owner, shared_owner, 1, late);
@@ -1158,6 +1470,7 @@ fn publication_during_concurrent_mark_close_and_sweep_loses_nothing() {
     store(owner, holder, 2, std::ptr::null_mut());
     let fresh = young(0, 1);
     // SAFETY: one data word.
+    // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
     unsafe { fresh.cast::<usize>().write(55) };
     store(owner, shared_owner, 3, fresh);
     sweep::concurrent(plan);
@@ -1195,7 +1508,9 @@ fn publication_during_concurrent_mark_close_and_sweep_loses_nothing() {
     willow_gc_collect();
     check("after full collection");
     verify_now(owner).unwrap();
-    willow_pop_roots(2);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_roots(2) };
 }
 
 /// A one-slot task frame (slot 0 a reference) holding `result`.
@@ -1203,6 +1518,7 @@ fn task_frame(result: *mut u8) -> *mut u8 {
     let frame = crate::async_frame::willow_async_frame_alloc(1, 1).cast::<u8>();
     let offset = crate::async_frame::async_frame_slot_offset(0);
     // SAFETY: slot 0 of a one-slot frame.
+    // SAFETY: The fixture allocates these fields in word-aligned GC storage at whole-word offsets.
     unsafe { frame.add(offset).cast::<*mut u8>().write(result) };
     frame
 }
@@ -1307,7 +1623,9 @@ fn chains_of_handed_over_handles_publish_iteratively() {
     }
     frames.shrink_to_fit();
     for frame in frames.iter_mut() {
-        willow_push_root(frame);
+        // SAFETY: The slot storage stays live and stationary through the matching pop,
+        // including during collection.
+        unsafe { willow_push_root(frame) };
     }
     // Directly and through a slot: both walk the chain without recursion.
     let message = young(1, 1);
@@ -1315,7 +1633,9 @@ fn chains_of_handed_over_handles_publish_iteratively() {
     publish_in(fixture.owner, message, PublicationPoint::ChannelSend, false);
     assert!(shared(value) && shared(child));
     assert!(frames.iter().all(|frame| !shared(*frame)));
-    willow_pop_roots(frames.len() as i32);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_roots(frames.len() as i32) };
 }
 
 #[test]
@@ -1341,7 +1661,9 @@ fn handed_over_owners_reset_at_the_next_minor() {
     let value = young(0, 1);
     let frame = task_frame(value);
     let mut root = frame;
-    willow_push_root(&mut root);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut root) };
     finish_task_result_in(fixture.owner, TASK_A, frame);
     assert!(
         fixture
@@ -1371,5 +1693,7 @@ fn handed_over_owners_reset_at_the_next_minor() {
     );
     read_from_task_b(&fixture, value);
     verify_now(fixture.owner).unwrap();
-    willow_pop_roots(1);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_roots(1) };
 }

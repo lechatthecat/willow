@@ -65,6 +65,7 @@ unsafe extern "C" fn poll_ready_now(_frame: *mut c_void) -> i32 {
 /// Stays runnable for a few turns before completing, so a drive has to make
 /// several scheduling decisions per task instead of one.
 unsafe extern "C" fn poll_yield_thrice(frame: *mut c_void) -> i32 {
+    // SAFETY: The allocated frame matches this poll's word-aligned state layout.
     let turns = unsafe { &mut *(frame as *mut i64) };
     *turns += 1;
     if *turns >= 4 {
@@ -76,7 +77,9 @@ unsafe extern "C" fn poll_yield_thrice(frame: *mut c_void) -> i32 {
 
 fn fresh_scheduler() -> crate::runtime::IsolatedRuntime {
     let guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     guard
 }
@@ -131,6 +134,7 @@ fn chain_frame(child: u64) -> *mut c_void {
 /// `frame` must come from [`chain_frame`] and its task must be terminal, so no
 /// poll can still be holding a reference to it.
 unsafe fn take_chain_frame(frame: *mut c_void) -> ChainFrame {
+    // SAFETY: The allocated frame matches this poll's word-aligned state layout.
     unsafe { std::ptr::read(frame as *const ChainFrame) }
 }
 
@@ -145,6 +149,7 @@ const CHAIN_WAITERS: usize = 2;
 /// when the wake re-polls it and the child is terminal. This is the shape the
 /// compiler emits for `await <task>`.
 unsafe extern "C" fn poll_await_child(frame: *mut c_void) -> i32 {
+    // SAFETY: The allocated frame matches this poll's word-aligned state layout.
     let node = unsafe { &mut *(frame as *mut ChainFrame) };
     node.polls += 1;
     if node.child != 0 && willow_sched_await(node.child) == 0 {
@@ -161,6 +166,7 @@ unsafe extern "C" fn poll_await_child(frame: *mut c_void) -> i32 {
 /// which the tail finished before the root ever registered. The turn ceiling is
 /// only there so a broken wake path fails the assertions instead of hanging.
 unsafe extern "C" fn poll_chain_tail(frame: *mut c_void) -> i32 {
+    // SAFETY: The allocated frame matches this poll's word-aligned state layout.
     let node = unsafe { &mut *(frame as *mut ChainFrame) };
     node.polls += 1;
     node.turns += 1;
@@ -191,6 +197,7 @@ static NESTED_RESUMED_PAUSED: crate::runtime::PerRuntime<AtomicUsize> =
 /// path that moves the outer poll out of `active_polls` and into `paused_polls`,
 /// which perspective 7 can only check by incrementing the counter by hand.
 unsafe extern "C" fn poll_nested_drive_child(frame: *mut c_void) -> i32 {
+    // SAFETY: The allocated frame matches this poll's word-aligned state layout.
     let node = unsafe { &mut *(frame as *mut ChainFrame) };
     node.polls += 1;
     if node.child != 0 {
@@ -213,6 +220,7 @@ unsafe extern "C" fn poll_nested_drive_child(frame: *mut c_void) -> i32 {
 /// pause has not been published yet: another worker can reach this poll in the
 /// window between the child's spawn and the parent's descent into the drive.
 unsafe extern "C" fn poll_observe_nested_state(frame: *mut c_void) -> i32 {
+    // SAFETY: The allocated frame matches this poll's word-aligned state layout.
     let node = unsafe { &mut *(frame as *mut ChainFrame) };
     node.polls += 1;
     let Some(state) = CURRENT_RUN_STATE.with(|slot| slot.borrow().clone()) else {
@@ -243,7 +251,8 @@ fn idle_01_empty_scheduler_is_idle() {
 fn idle_02_a_queued_task_is_not_idle() {
     let _guard = fresh_scheduler();
     let state = ParallelRunState::default();
-    willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     assert!(!is_idle(&state), "a queued ready task is work");
 }
 
@@ -251,7 +260,8 @@ fn idle_02_a_queued_task_is_not_idle() {
 fn idle_03_a_task_in_a_local_queue_is_not_idle() {
     let _guard = fresh_scheduler();
     let state = ParallelRunState::default();
-    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     let queues = global_run_queues();
     assert_eq!(queues.pop_for_worker(0), Some(id));
     queues.push_local(1, id);
@@ -265,7 +275,8 @@ fn idle_03_a_task_in_a_local_queue_is_not_idle() {
 fn idle_04_an_armed_timer_is_not_idle() {
     let _guard = fresh_scheduler();
     let state = ParallelRunState::default();
-    let id = willow_sched_spawn(poll_pending_forever, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_pending_forever, std::ptr::null_mut()) };
     assert_eq!(willow_sched_run(), 0);
     // The heap prunes entries lazily against the task's own wake-deadline, so
     // arm both halves the way `set_wake_after_millis_in` does.
@@ -283,7 +294,8 @@ fn idle_04_an_armed_timer_is_not_idle() {
 fn idle_05_a_blocked_syscall_task_is_not_idle() {
     let _guard = fresh_scheduler();
     let state = ParallelRunState::default();
-    let id = willow_sched_spawn(poll_pending_forever, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_pending_forever, std::ptr::null_mut()) };
     with_global_for_test(|sched| {
         sched.set_running(id);
         sched.finish_blocked_syscall_poll(id);
@@ -320,7 +332,8 @@ fn idle_07_a_paused_nested_poll_is_not_idle() {
 fn idle_08_a_claim_holding_the_last_task_is_not_idle() {
     let _guard = fresh_scheduler();
     let state = ParallelRunState::default();
-    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
 
     // Exactly the state of a worker that popped the last task and is now
     // waiting for `claim_gate`: nothing is queued, nothing is polling, and the
@@ -356,7 +369,8 @@ fn idle_09_a_claim_marker_alone_is_not_idle() {
 fn idle_10_the_requeue_after_a_stopped_claim_is_not_idle() {
     let _guard = fresh_scheduler();
     let state = ParallelRunState::default();
-    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     {
         let _in_flight = ClaimInFlight::enter();
         assert_eq!(global_run_queues().pop_for_worker(0), Some(id));
@@ -372,7 +386,8 @@ fn idle_10_the_requeue_after_a_stopped_claim_is_not_idle() {
 fn idle_11_idleness_returns_once_the_task_is_gone() {
     let _guard = fresh_scheduler();
     let state = ParallelRunState::default();
-    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     assert!(!is_idle(&state));
     assert_eq!(willow_sched_run(), 1);
     assert_eq!(willow_sched_task_state(id), -1);
@@ -383,7 +398,8 @@ fn idle_11_idleness_returns_once_the_task_is_gone() {
 fn idle_12_the_predicate_consumes_nothing() {
     let _guard = fresh_scheduler();
     let state = ParallelRunState::default();
-    willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     assert_eq!(is_idle(&state), is_idle(&state));
     assert!(!is_idle(&state));
 }
@@ -431,7 +447,8 @@ fn idle_13_the_declared_read_order_is_the_one_the_argument_needs() {
 #[test]
 fn idle_13b_a_claim_racing_the_stop_decision_is_never_missed() {
     let _guard = fresh_scheduler();
-    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
 
     // The task is always either queued, held by a claim, or being polled, so
     // no decision may ever stop. The claimer runs the real claim, including
@@ -475,7 +492,9 @@ fn idle_13b_a_claim_racing_the_stop_decision_is_never_missed() {
 fn idle_14_run_until_returns_only_once_its_target_is_terminal() {
     let _guard = fresh_scheduler();
     let frame = counter_frame();
-    let id = willow_sched_spawn(poll_yield_thrice, frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = unsafe { willow_sched_spawn(poll_yield_thrice, frame) };
     assert!(willow_sched_run_until(id) >= 1);
     assert_eq!(
         willow_sched_task_state(id),
@@ -487,7 +506,8 @@ fn idle_14_run_until_returns_only_once_its_target_is_terminal() {
 #[test]
 fn idle_15_run_until_on_an_unwakeable_target_still_returns() {
     let _guard = fresh_scheduler();
-    let id = willow_sched_spawn(poll_pending_forever, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_pending_forever, std::ptr::null_mut()) };
     // The re-drive that protects against an early stop is bounded by
     // `scheduler_has_wake_source`: a genuine deadlock must still return so the
     // awaiter can report it, not spin forever inside the runtime.
@@ -506,10 +526,13 @@ fn idle_16_run_until_on_an_unknown_id_returns_immediately() {
 fn idle_17_run_until_reports_every_completion_it_drove() {
     let _guard = fresh_scheduler();
     let others: Vec<u64> = (0..8)
-        .map(|_| willow_sched_spawn(poll_ready_now, std::ptr::null_mut()))
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        .map(|_| unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) })
         .collect();
     let frame = counter_frame();
-    let target = willow_sched_spawn(poll_yield_thrice, frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let target = unsafe { willow_sched_spawn(poll_yield_thrice, frame) };
     let completed = willow_sched_run_until(target);
     assert_eq!(willow_sched_task_state(target), -1);
     assert!(
@@ -527,7 +550,9 @@ fn idle_18_a_drive_strands_no_runnable_task_behind_its_own_stop() {
     let _guard = fresh_scheduler();
     let frames: Vec<*mut c_void> = (0..64).map(|_| counter_frame()).collect();
     for frame in &frames {
-        willow_sched_spawn(poll_yield_thrice, *frame);
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        unsafe { willow_sched_spawn(poll_yield_thrice, *frame) };
     }
     assert_eq!(willow_sched_run(), 64);
     assert_eq!(
@@ -545,7 +570,9 @@ fn idle_19_more_tasks_than_workers_all_complete_in_one_drive() {
     let frames: Vec<*mut c_void> = (0..count).map(|_| counter_frame()).collect();
     let ids: Vec<u64> = frames
         .iter()
-        .map(|frame| willow_sched_spawn(poll_yield_thrice, *frame))
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        .map(|frame| unsafe { willow_sched_spawn(poll_yield_thrice, *frame) })
         .collect();
     assert_eq!(willow_sched_run(), count as i64);
     for id in ids {
@@ -564,11 +591,17 @@ fn idle_20_an_await_chain_resolves_end_to_end_in_one_run_until() {
     CHAIN_PARKED.store(0, Ordering::Release);
 
     let tail_frame = chain_frame(0);
-    let tail = willow_sched_spawn(poll_chain_tail, tail_frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let tail = unsafe { willow_sched_spawn(poll_chain_tail, tail_frame) };
     let middle_frame = chain_frame(tail);
-    let middle = willow_sched_spawn(poll_await_child, middle_frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let middle = unsafe { willow_sched_spawn(poll_await_child, middle_frame) };
     let root_frame = chain_frame(middle);
-    let root = willow_sched_spawn(poll_await_child, root_frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let root = unsafe { willow_sched_spawn(poll_await_child, root_frame) };
 
     assert_eq!(
         willow_sched_run_until(root),
@@ -584,8 +617,11 @@ fn idle_20_an_await_chain_resolves_end_to_end_in_one_run_until() {
         CHAIN_WAITERS,
         "both chain nodes must have registered as waiters, not run straight through"
     );
+    // SAFETY: The allocated frame matches this poll's word-aligned state layout.
     let tail_node = unsafe { take_chain_frame(tail_frame) };
+    // SAFETY: The allocated frame matches this poll's word-aligned state layout.
     let middle_node = unsafe { take_chain_frame(middle_frame) };
+    // SAFETY: The allocated frame matches this poll's word-aligned state layout.
     let root_node = unsafe { take_chain_frame(root_frame) };
     assert!(
         tail_node.turns >= 4,
@@ -616,9 +652,13 @@ fn idle_21_a_nested_drive_keeps_its_paused_outer_poll_visible() {
     let workers = runtime_worker_config().active_workers();
 
     let child_frame = chain_frame(0);
-    let child = willow_sched_spawn(poll_observe_nested_state, child_frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let child = unsafe { willow_sched_spawn(poll_observe_nested_state, child_frame) };
     let parent_frame = chain_frame(child);
-    let parent = willow_sched_spawn(poll_nested_drive_child, parent_frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let parent = unsafe { willow_sched_spawn(poll_nested_drive_child, parent_frame) };
 
     assert_eq!(
         willow_sched_run_until(parent),
@@ -632,7 +672,9 @@ fn idle_21_a_nested_drive_keeps_its_paused_outer_poll_visible() {
         "parent must be terminal"
     );
 
+    // SAFETY: The allocated frame matches this poll's word-aligned state layout.
     let child_node = unsafe { take_chain_frame(child_frame) };
+    // SAFETY: The allocated frame matches this poll's word-aligned state layout.
     let parent_node = unsafe { take_chain_frame(parent_frame) };
     assert_eq!(parent_node.polls, 1, "the parent drives its child inline");
     assert!(child_node.polls >= 1, "the child must have been polled");
@@ -689,7 +731,8 @@ fn idle_23_a_claim_in_flight_refuses_the_stop() {
 #[test]
 fn idle_24_a_claim_that_resolves_mid_snapshot_refuses_the_stop() {
     let _guard = fresh_scheduler();
-    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     // Enter, pop, requeue and leave between two of the decision's reads, at
     // every position: the count is back to zero, but the epoch moved.
     for split in 0..=IDLE_READ_ORDER.len() {
@@ -750,7 +793,8 @@ fn idle_25_a_claim_that_popped_nothing_does_not_refuse_the_stop() {
 fn idle_26_a_claim_without_a_decision_never_waits_for_the_gate() {
     let _guard = fresh_scheduler();
     let state = Arc::new(ParallelRunState::default());
-    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     let held = state.claim_gate.lock().unwrap();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let claim_state = Arc::clone(&state);
@@ -801,7 +845,8 @@ fn claim_behind_a_decision(
 fn idle_27_a_claim_behind_a_decision_honours_its_stop() {
     let _guard = fresh_scheduler();
     let state = Arc::new(ParallelRunState::default());
-    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     let (held, done_rx, claimer) = claim_behind_a_decision(&state);
     assert!(
         claims_in_flight(),
@@ -830,7 +875,8 @@ fn idle_27_a_claim_behind_a_decision_honours_its_stop() {
 fn idle_28_a_claim_behind_a_refused_decision_proceeds() {
     let _guard = fresh_scheduler();
     let state = Arc::new(ParallelRunState::default());
-    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     let (held, done_rx, claimer) = claim_behind_a_decision(&state);
     state.stop_intent.store(false, Ordering::SeqCst);
     drop(held);
@@ -886,7 +932,8 @@ fn idle_with_event_at(state: &ParallelRunState, split: usize, between: impl FnOn
 #[test]
 fn idle_30_a_poll_that_requeues_and_ends_mid_snapshot_is_never_missed() {
     let _guard = fresh_scheduler();
-    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     for split in 0..=IDLE_READ_ORDER.len() {
         let state = ParallelRunState::default();
         // A claimed poll in progress: the task is in no queue, one poll active.

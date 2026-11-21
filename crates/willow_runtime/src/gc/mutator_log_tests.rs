@@ -13,7 +13,9 @@ use std::time::Duration;
 const OBJECT_FIELD: i64 = GcStoreDestination::ObjectField as i64;
 
 fn quiet_heap() {
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let mut state = runtime().heap.lock().unwrap();
     state.threshold_bytes = usize::MAX;
     state.pacer_trigger = u64::MAX;
@@ -27,19 +29,32 @@ fn owner() -> &'static crate::runtime::Runtime {
 
 /// An old object with one reference slot at payload offset 0.
 fn old_object() -> *mut u8 {
-    willow_gc_alloc_layout(0, 61, 8, 0b1)
+    // SAFETY: The requested layout describes the initialized words of this object and its
+    // type’s tracing or finalization contract.
+    unsafe { willow_gc_alloc_layout(0, 61, 8, 0b1) }
 }
 
-fn young_object(tls: &mut GcTlabState, value: u64) -> *mut u8 {
-    let object = willow_gc_alloc_slow(tls, 0, 62, 8, 0);
+fn young_object(tls: &TestTlab, value: u64) -> *mut u8 {
+    // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size and
+    // tracing metadata describe the object initialized here.
+    let object = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 0, 62, 8, 0) };
+    // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
     unsafe { *object.cast::<u64>() = value };
     object
 }
 
 /// Runtime object store: barrier, then the store, as runtime containers do.
 fn store(owner: *mut u8, value: *mut u8) {
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     let slot = owner.cast::<*mut u8>();
-    write_barrier_object_owner(owner, unsafe { *slot }, value, OBJECT_FIELD);
+    // SAFETY: The owner of this registered or traced slot keeps its pointer storage live for this
+    // read or write.
+    // SAFETY: The owner and non-null referent are live GC payloads with headers at the
+    // addresses used by this filter.
+    unsafe { write_barrier_object_owner(owner, *slot, value, OBJECT_FIELD) };
+    // SAFETY: The owner of this registered or traced slot keeps its pointer storage live for this
+    // read or write.
     unsafe { *slot = value };
 }
 
@@ -48,10 +63,12 @@ fn shared_locks() -> u64 {
 }
 
 fn pending_edges() -> usize {
+    // SAFETY: This mutator owns the log, with no concurrent collector drain during access.
     bound_in(&owner().gc).map_or(0, |log| unsafe { log.edges() }.len())
 }
 
 fn pending_roots() -> Vec<(usize, isize)> {
+    // SAFETY: This mutator owns the log, with no concurrent collector drain during access.
     bound_in(&owner().gc).map_or_else(Vec::new, |log| unsafe { log.roots() }.clone())
 }
 
@@ -92,9 +109,9 @@ fn logged_edge_is_private_until_the_next_stop() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let parent = old_object();
-    let child = young_object(&mut tls, 7);
+    let child = young_object(&tls, 7);
     let locks = shared_locks();
     store(parent, child);
     assert_eq!(shared_locks(), locks, "registered store took a shared lock");
@@ -110,7 +127,9 @@ fn logged_edge_is_private_until_the_next_stop() {
     assert_eq!(pending_edges(), 0);
     assert!(remembered(parent));
     verify().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -118,14 +137,17 @@ fn a_dropped_log_is_detected_by_verification() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let parent = old_object();
-    store(parent, young_object(&mut tls, 1));
+    store(parent, young_object(&tls, 1));
     // Simulate a drain that forgot this mutator.
+    // SAFETY: This mutator owns the log, with no concurrent collector drain during access.
     unsafe { bound_in(&owner().gc).unwrap().edges() }.clear();
     stop();
     assert!(verify().is_err(), "lost log entry went undetected");
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -133,35 +155,47 @@ fn unresolved_store_is_classified_when_applied() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let parent = old_object();
     let other = old_object();
-    let child = young_object(&mut tls, 3);
+    let child = young_object(&tls, 3);
     // No header proofs: the log keeps the raw store for later classification.
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     unsafe { *parent.cast::<*mut u8>() = child };
-    write_barrier_in(
-        owner(),
-        parent,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        child,
-        OBJECT_FIELD,
-    );
+    // SAFETY: The destination describes this reference update. Any asserted header belongs to
+    // its live GC payload.
+    unsafe {
+        write_barrier_in(
+            owner(),
+            parent,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            child,
+            OBJECT_FIELD,
+        )
+    };
     // Old value into an old owner: classified away, never remembered.
-    write_barrier_in(
-        owner(),
-        other,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        parent,
-        OBJECT_FIELD,
-    );
+    // SAFETY: The destination describes this reference update. Any asserted header belongs to
+    // its live GC payload.
+    unsafe {
+        write_barrier_in(
+            owner(),
+            other,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            parent,
+            OBJECT_FIELD,
+        )
+    };
     assert_eq!(pending_edges(), 2);
     stop();
     assert!(remembered(parent));
     assert!(!remembered(other));
     verify().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -169,17 +203,19 @@ fn repeated_stores_into_one_owner_log_once() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let parent = old_object();
     for value in 0..1000 {
-        store(parent, young_object(&mut tls, value));
+        store(parent, young_object(&tls, value));
     }
     // The claimed remembered byte filters every later store.
     assert_eq!(pending_edges(), 1);
     stop();
     assert_eq!(remembered_len(), 1);
     verify().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 /// Sends into an old channel are remembered through the channel's header:
@@ -190,19 +226,25 @@ fn channel_sends_into_an_old_channel_log_one_owner_edge() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let mut channel = crate::channel::willow_channel_new(1).cast::<u8>();
-    willow_push_root(&mut channel);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut channel) };
     let header = HeapObject::from_payload(GcPayload::from_raw(channel).unwrap());
     assert_eq!(header.generation(), GC_GENERATION_OLD, "channels start old");
     let sends = 4 * EDGE_LOG_CAPACITY as u64;
     let locks = shared_locks();
     for value in 0..sends {
         assert_eq!(
-            crate::channel::willow_channel_try_send_ptr(
-                channel.cast(),
-                young_object(&mut tls, value).cast()
-            ),
+            // SAFETY: The constructor selected this channel element representation and the
+            // channel remains live during the send.
+            unsafe {
+                crate::channel::willow_channel_try_send_ptr(
+                    channel.cast(),
+                    young_object(&tls, value).cast(),
+                )
+            },
             1
         );
     }
@@ -213,11 +255,19 @@ fn channel_sends_into_an_old_channel_log_one_owner_edge() {
     verify().unwrap();
     minor();
     for value in 0..sends {
-        let received = crate::channel::willow_channel_recv_ptr(channel.cast()).cast::<u64>();
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        let received =
+            unsafe { crate::channel::willow_channel_recv_ptr(channel.cast()) }.cast::<u64>();
+        // SAFETY: The fixture allocates these fields in word-aligned GC storage at whole-word
+        // offsets.
         assert_eq!(unsafe { *received }, value);
     }
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -226,17 +276,19 @@ fn write_lock_count_is_zero_for_any_number_of_stop_separated_batches() {
     for batches in [1usize, 10, 100] {
         quiet_heap();
         let registration = MutatorRegistration::new();
-        let mut tls = tlab_state_for_test();
+        let tls = tlab_state_for_test();
         let locks = shared_locks();
         for _ in 0..batches {
             for value in 0..EDGE_LOG_CAPACITY as u64 {
-                store(old_object(), young_object(&mut tls, value));
+                store(old_object(), young_object(&tls, value));
             }
             stop();
         }
         assert_eq!(shared_locks(), locks, "batches={batches}");
         drop(registration);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 }
 
@@ -245,11 +297,11 @@ fn full_edge_log_flushes_once_per_capacity() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let locks = shared_locks();
     let total = 3 * EDGE_LOG_CAPACITY + 1;
     for value in 0..total as u64 {
-        store(old_object(), young_object(&mut tls, value));
+        store(old_object(), young_object(&tls, value));
         assert!(
             pending_edges() <= EDGE_LOG_CAPACITY,
             "log exceeded its bound"
@@ -261,7 +313,9 @@ fn full_edge_log_flushes_once_per_capacity() {
     stop();
     assert_eq!(remembered_len(), total);
     verify().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -269,12 +323,17 @@ fn card_buffer_stores_log_one_card_and_hit_the_cache() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let mut array = crate::array::new_old_array(4096, 1);
-    willow_push_root(&mut array);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut array) };
+    // SAFETY: The fixture allocates these fields in word-aligned GC storage at whole-word offsets.
     let buffer = unsafe { *array.cast::<usize>().add(willow_abi::array_layout::H_BUF) };
     for index in 0..8 {
-        crate::array::willow_array_set(array, index, young_object(&mut tls, 5) as i64);
+        // SAFETY: The destination is the live fixture array; the element word matches its
+        // declared storage and tracing layout.
+        unsafe { crate::array::willow_array_set(array, index, young_object(&tls, 5) as i64) };
     }
     assert_eq!(pending_edges(), 1, "cache must deduplicate one card");
     stop();
@@ -287,8 +346,12 @@ fn card_buffer_stores_log_one_card_and_hit_the_cache() {
         .map(|cards| cards.iter().copied().collect::<Vec<_>>());
     assert_eq!(cards, Some(vec![0]));
     verify().unwrap();
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -296,15 +359,24 @@ fn minor_after_logged_edge_keeps_the_young_child() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let mut parent = old_object();
-    willow_push_root(&mut parent);
-    store(parent, young_object(&mut tls, 4242));
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut parent) };
+    store(parent, young_object(&tls, 4242));
     minor();
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     let child = unsafe { *parent.cast::<*mut u8>() };
+    // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
     assert_eq!(unsafe { *child.cast::<u64>() }, 4242);
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -312,18 +384,20 @@ fn second_thread_store_into_claimed_owner_logs_nothing() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let parent = old_object();
-    store(parent, young_object(&mut tls, 1));
+    store(parent, young_object(&tls, 1));
     let parent_address = parent as usize;
     // Idle, this thread's log is drained by the other thread's stop.
+    // SAFETY: This thread stops accessing movable data before entering idle and resumes only after
+    // rejoining the mutators.
     let idle = unsafe { safepoint::IdleMutator::enter() };
     std::thread::scope(|scope| {
         scope
             .spawn(crate::runtime::serving(move || {
                 let _registration = MutatorRegistration::new();
-                let mut tls = tlab_state_for_test();
-                let value = young_object(&mut tls, 2);
+                let tls = tlab_state_for_test();
+                let value = young_object(&tls, 2);
                 store(parent_address as *mut u8, value);
                 assert_eq!(pending_edges(), 0);
                 // Keep the other store's value reachable through the owner.
@@ -336,7 +410,9 @@ fn second_thread_store_into_claimed_owner_logs_nothing() {
     drop(idle);
     assert!(remembered(parent));
     verify().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -351,14 +427,18 @@ fn registered_paths_complete_while_shared_locks_are_held() {
     std::thread::scope(|scope| {
         scope.spawn(crate::runtime::serving(move || {
             let registration = MutatorRegistration::new();
-            let mut tls = tlab_state_for_test();
-            let value = young_object(&mut tls, 9);
+            let tls = tlab_state_for_test();
+            let value = young_object(&tls, 9);
             let mut slot: *mut u8 = std::ptr::null_mut();
             ready_tx.send(()).unwrap();
             start_rx.recv().unwrap();
             store(parent_address as *mut u8, value);
-            add_runtime_root_slot_in(owner(), &raw mut slot);
-            remove_runtime_root_slot_in(owner(), &raw mut slot);
+            // SAFETY: The registration and removal use the same initialized slot, whose
+            // storage spans both operations.
+            unsafe {
+                add_runtime_root_slot_in(owner(), &raw mut slot);
+                remove_runtime_root_slot_in(owner(), &raw mut slot);
+            }
             done_tx.send(()).unwrap();
             drop(registration);
         }));
@@ -377,25 +457,33 @@ fn registered_paths_complete_while_shared_locks_are_held() {
     // Unregistration flushed the worker's log.
     assert!(remembered(parent));
     assert!(root_slots().is_empty());
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn unregistered_thread_keeps_the_locked_paths() {
     let _guard = isolated_runtime();
     quiet_heap();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let parent = old_object();
     let mut slot: *mut u8 = std::ptr::null_mut();
     let locks = shared_locks();
-    store(parent, young_object(&mut tls, 1));
-    add_runtime_root_slot_in(owner(), &raw mut slot);
+    store(parent, young_object(&tls, 1));
+    // SAFETY: The registration and removal use the same initialized slot, whose storage spans
+    // both operations.
+    unsafe { add_runtime_root_slot_in(owner(), &raw mut slot) };
     assert_eq!(shared_locks() - locks, 2);
     assert!(remembered(parent));
     assert_eq!(root_slots(), vec![&raw mut slot]);
-    remove_runtime_root_slot_in(owner(), &raw mut slot);
+    // SAFETY: The registration and removal use the same initialized slot, whose storage spans
+    // both operations.
+    unsafe { remove_runtime_root_slot_in(owner(), &raw mut slot) };
     assert!(root_slots().is_empty());
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -408,22 +496,32 @@ fn root_pairs_take_no_lock_for_any_n() {
         let mut slots = [std::ptr::null_mut::<u8>(); 4];
         for index in 0..pairs {
             let slot = &raw mut slots[index % 4];
-            add_runtime_root_slot_in(owner(), slot);
-            remove_runtime_root_slot_in(owner(), slot);
+            // SAFETY: The registration and removal use the same initialized slot, whose
+            // storage spans both operations.
+            unsafe {
+                add_runtime_root_slot_in(owner(), slot);
+                remove_runtime_root_slot_in(owner(), slot);
+            }
         }
         // Nested LIFO and FIFO handle lifetimes cancel inside the window.
         for index in 0..pairs {
             let (first, second) = (&raw mut slots[0], &raw mut slots[1 + index % 3]);
-            add_runtime_root_slot_in(owner(), first);
-            add_runtime_root_slot_in(owner(), second);
-            remove_runtime_root_slot_in(owner(), first);
-            remove_runtime_root_slot_in(owner(), second);
+            // SAFETY: The registration and removal use the same initialized slot, whose
+            // storage spans both operations.
+            unsafe {
+                add_runtime_root_slot_in(owner(), first);
+                add_runtime_root_slot_in(owner(), second);
+                remove_runtime_root_slot_in(owner(), first);
+                remove_runtime_root_slot_in(owner(), second);
+            }
         }
         assert_eq!(shared_locks(), locks, "pairs={pairs}");
         assert!(pending_roots().is_empty());
         assert_eq!(super::super::root::runtime_root_count_in(&owner().gc), 0);
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -435,7 +533,9 @@ fn unpaired_root_adds_flush_once_per_capacity() {
     let mut slots = vec![std::ptr::null_mut::<u8>(); total];
     let locks = shared_locks();
     for slot in &mut slots {
-        add_runtime_root_slot_in(owner(), slot);
+        // SAFETY: The registration and removal use the same initialized slot, whose storage
+        // spans both operations.
+        unsafe { add_runtime_root_slot_in(owner(), slot) };
         assert!(pending_roots().len() <= ROOT_LOG_CAPACITY);
     }
     assert_eq!(shared_locks() - locks, 2);
@@ -447,11 +547,15 @@ fn unpaired_root_adds_flush_once_per_capacity() {
     stop();
     assert_eq!(root_slots().len(), total);
     for slot in &mut slots {
-        remove_runtime_root_slot_in(owner(), slot);
+        // SAFETY: The registration and removal use the same initialized slot, whose storage
+        // spans both operations.
+        unsafe { remove_runtime_root_slot_in(owner(), slot) };
     }
     stop();
     assert!(root_slots().is_empty());
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -462,15 +566,21 @@ fn root_removed_after_task_migration_is_exact_in_either_order() {
         let _registration = MutatorRegistration::new();
         let mut slot: *mut u8 = std::ptr::null_mut();
         let slot_address = &raw mut slot as usize;
-        add_runtime_root_slot_in(owner(), &raw mut slot);
+        // SAFETY: The registration and removal use the same initialized slot, whose storage
+        // spans both operations.
+        unsafe { add_runtime_root_slot_in(owner(), &raw mut slot) };
         // Idle, this thread's pending add is drained by the other's stop.
+        // SAFETY: This thread stops accessing movable data before entering idle and resumes only
+        // after rejoining the mutators.
         let idle = unsafe { safepoint::IdleMutator::enter() };
         std::thread::scope(|scope| {
             scope
                 .spawn(crate::runtime::serving(move || {
                     // The handle's task resumed on another worker.
                     let _registration = MutatorRegistration::new();
-                    remove_runtime_root_slot_in(owner(), slot_address as *mut *mut u8);
+                    // SAFETY: The registration and removal use the same initialized slot,
+                    // whose storage spans both operations.
+                    unsafe { remove_runtime_root_slot_in(owner(), slot_address as *mut *mut u8) };
                     assert_eq!(pending_roots(), vec![(slot_address, -1)]);
                     if remove_flushes_first {
                         flush_current_in(owner());
@@ -490,7 +600,9 @@ fn root_removed_after_task_migration_is_exact_in_either_order() {
             "flush first={remove_flushes_first}"
         );
         assert_eq!(runtime().runtime_root_slots.net(), 0);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 }
 
@@ -523,9 +635,11 @@ fn unregistration_flushes_pending_entries() {
         scope
             .spawn(crate::runtime::serving(move || {
                 let registration = MutatorRegistration::new();
-                let mut tls = tlab_state_for_test();
-                store(parent_address as *mut u8, young_object(&mut tls, 1));
-                add_runtime_root_slot_in(owner(), slot_address as *mut *mut u8);
+                let tls = tlab_state_for_test();
+                store(parent_address as *mut u8, young_object(&tls, 1));
+                // SAFETY: The registration and removal use the same initialized slot, whose
+                // storage spans both operations.
+                unsafe { add_runtime_root_slot_in(owner(), slot_address as *mut *mut u8) };
                 drop(registration);
                 assert!(bound_in(&owner().gc).is_none());
             }))
@@ -534,8 +648,12 @@ fn unregistration_flushes_pending_entries() {
     });
     assert!(remembered(parent));
     assert_eq!(root_slots(), vec![slot_address as *mut *mut u8]);
-    remove_runtime_root_slot_in(owner(), &raw mut slot);
-    reset_internal_for_test();
+    // SAFETY: The registration and removal use the same initialized slot, whose storage spans
+    // both operations.
+    unsafe { remove_runtime_root_slot_in(owner(), &raw mut slot) };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -553,7 +671,9 @@ fn log_storage_is_charged_while_registered() {
     drop(registration);
     assert_eq!(native(), before);
     const { assert!(MutatorLog::BYTES <= 8 * 1024, "per-mutator bound grew") };
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -564,7 +684,9 @@ fn reset_releases_log_storage() {
     let before = native();
     let registration = MutatorRegistration::new();
     assert_eq!(native(), before + MutatorLog::BYTES);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     assert_eq!(native(), before);
     assert!(owner().gc.coord.0.lock().unwrap().mutator_logs.is_empty());
     // The invalidated registration releases nothing twice.
@@ -577,7 +699,7 @@ fn drain_time_is_a_pause_component_and_counted() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let drained = || {
         owner()
             .gc
@@ -588,9 +710,11 @@ fn drain_time_is_a_pause_component_and_counted() {
     let pause_before = crate::gc_telemetry::pause::snapshot().by_reason
         [StopReason::Minor as usize - 1][Component::RememberedLog as usize]
         .count;
-    store(old_object(), young_object(&mut tls, 1));
+    store(old_object(), young_object(&tls, 1));
     let mut slot: *mut u8 = std::ptr::null_mut();
-    add_runtime_root_slot_in(owner(), &raw mut slot);
+    // SAFETY: The registration and removal use the same initialized slot, whose storage spans
+    // both operations.
+    unsafe { add_runtime_root_slot_in(owner(), &raw mut slot) };
     stop();
     assert_eq!(drained() - before, 2);
     let stats = crate::gc_telemetry::pause::snapshot();
@@ -598,8 +722,12 @@ fn drain_time_is_a_pause_component_and_counted() {
         stats.by_reason[StopReason::Minor as usize - 1][Component::RememberedLog as usize].count
             > pause_before
     );
-    remove_runtime_root_slot_in(owner(), &raw mut slot);
-    reset_internal_for_test();
+    // SAFETY: The registration and removal use the same initialized slot, whose storage spans
+    // both operations.
+    unsafe { remove_runtime_root_slot_in(owner(), &raw mut slot) };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -607,12 +735,14 @@ fn telemetry_readers_see_their_own_logged_edges() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
-    store(old_object(), young_object(&mut tls, 1));
+    let tls = tlab_state_for_test();
+    store(old_object(), young_object(&tls, 1));
     assert_eq!(willow_gc_remembered_set_size(), 1);
     assert_eq!(willow_gc_write_barrier_hits(), 1);
     assert_eq!(pending_edges(), 0);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -620,7 +750,7 @@ fn stores_during_marking_are_logged_and_drained_by_the_remark_stop() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let parent = old_object();
     let cycle = Arc::new(ConcurrentCycle::new(
         std::iter::empty(),
@@ -634,7 +764,7 @@ fn stores_during_marking_are_logged_and_drained_by_the_remark_stop() {
         Some(cycle.clone()),
     );
     owner().mark_phase().store(1, Ordering::Release);
-    store(parent, young_object(&mut tls, 1));
+    store(parent, young_object(&tls, 1));
     assert!(!remembered(parent));
     safepoint::with_stw(StopReason::Remark, |_, _| {
         owner().mark_phase().store(0, Ordering::Release)
@@ -642,7 +772,9 @@ fn stores_during_marking_are_logged_and_drained_by_the_remark_stop() {
     assert!(remembered(parent));
     verify().unwrap();
     marking::set_concurrent_cycle_in(&owner().gc, &mut runtime().heap.lock().unwrap(), None);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -650,42 +782,58 @@ fn global_static_and_null_owner_stores_never_log() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
-    let child = young_object(&mut tls, 1);
+    let tls = tlab_state_for_test();
+    let child = young_object(&tls, 1);
     let mut global: *mut u8 = std::ptr::null_mut();
     let locks = shared_locks();
-    write_barrier_in(
-        owner(),
-        (&raw mut global).cast(),
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        child,
-        GcStoreDestination::GlobalStatic as i64,
-    );
-    write_barrier_in(
-        owner(),
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        child,
-        OBJECT_FIELD,
-    );
+    // SAFETY: The destination describes this reference update. Any asserted header belongs to
+    // its live GC payload.
+    unsafe {
+        write_barrier_in(
+            owner(),
+            (&raw mut global).cast(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            child,
+            GcStoreDestination::GlobalStatic as i64,
+        )
+    };
+    // SAFETY: The destination describes this reference update. Any asserted header belongs to
+    // its live GC payload.
+    unsafe {
+        write_barrier_in(
+            owner(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            child,
+            OBJECT_FIELD,
+        )
+    };
     assert_eq!(pending_edges(), 0);
     assert_eq!(shared_locks(), locks);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 /// Generated frame-style store: the owner header is known, the value is not.
 fn store_unproven_value(owner_object: *mut u8, value: *mut u8) {
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     unsafe { *owner_object.cast::<*mut u8>() = value };
-    write_barrier_in(
-        owner(),
-        owner_object,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        value,
-        OBJECT_FIELD | willow_abi::GC_STORE_OWNER_HAS_HEADER,
-    );
+    // SAFETY: The store uses its heap fixture’s objects for proven payloads and the addressed
+    // element for a slot-specific barrier.
+    unsafe {
+        write_barrier_in(
+            owner(),
+            owner_object,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            value,
+            OBJECT_FIELD | willow_abi::GC_STORE_OWNER_HAS_HEADER,
+        )
+    };
 }
 
 #[test]
@@ -693,11 +841,11 @@ fn owner_proven_stores_with_unproven_values_log_once_per_owner() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let parent = old_object();
     let locks = shared_locks();
     for value in 0..(4 * EDGE_LOG_CAPACITY as u64) {
-        store_unproven_value(parent, young_object(&mut tls, value));
+        store_unproven_value(parent, young_object(&tls, value));
     }
     // The first store claims the owner's byte; later ones are filtered out.
     assert_eq!(pending_edges(), 1);
@@ -708,7 +856,9 @@ fn owner_proven_stores_with_unproven_values_log_once_per_owner() {
     minor();
     assert!(remembered(parent), "the young child must keep the owner");
     verify().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -716,9 +866,9 @@ fn owner_proven_store_of_an_old_value_remembers_no_owner() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     // A published nursery makes young edges possible at all.
-    young_object(&mut tls, 0);
+    young_object(&tls, 0);
     let parent = old_object();
     let other = old_object();
     store_unproven_value(parent, other);
@@ -733,7 +883,9 @@ fn owner_proven_store_of_an_old_value_remembers_no_owner() {
     minor();
     assert!(!remembered(parent));
     verify().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -741,28 +893,36 @@ fn unresolved_stores_of_distinct_values_into_one_owner_all_survive() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let parent = old_object();
     let old_value = old_object();
-    let child = young_object(&mut tls, 5);
+    let child = young_object(&tls, 5);
     // No slot and no header proofs, like an async frame slot: the old value
     // logged last must not hide the young value logged first.
     for value in [child, old_value] {
-        write_barrier_in(
-            owner(),
-            parent,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            value,
-            GcStoreDestination::AsyncFrameSlot as i64,
-        );
+        // SAFETY: The destination describes this reference update. Any asserted header
+        // belongs to its live GC payload.
+        unsafe {
+            write_barrier_in(
+                owner(),
+                parent,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                value,
+                GcStoreDestination::AsyncFrameSlot as i64,
+            )
+        };
     }
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     unsafe { *parent.cast::<*mut u8>() = child };
     assert_eq!(pending_edges(), 2);
     stop();
     assert!(remembered(parent));
     verify().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -770,20 +930,24 @@ fn exact_duplicate_unresolved_stores_log_once() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let parent = old_object();
-    let first = young_object(&mut tls, 1);
-    let second = young_object(&mut tls, 2);
+    let first = young_object(&tls, 1);
+    let second = young_object(&tls, 2);
     for _ in 0..10 {
         for value in [first, second] {
-            write_barrier_in(
-                owner(),
-                parent,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                value,
-                OBJECT_FIELD,
-            );
+            // SAFETY: The destination describes this reference update. Any asserted header
+            // belongs to its live GC payload.
+            unsafe {
+                write_barrier_in(
+                    owner(),
+                    parent,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    value,
+                    OBJECT_FIELD,
+                )
+            };
         }
     }
     assert_eq!(
@@ -791,11 +955,15 @@ fn exact_duplicate_unresolved_stores_log_once() {
         2,
         "alternating repeats are exact duplicates"
     );
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     unsafe { *parent.cast::<*mut u8>() = second };
     stop();
     assert!(remembered(parent));
     verify().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -822,7 +990,9 @@ fn root_count_is_a_consistent_snapshot_while_logs_flush() {
             let _registration = MutatorRegistration::new();
             for _ in 0..ROUNDS {
                 for &slot in addresses {
-                    add_runtime_root_slot_in(owner(), slot as *mut *mut u8);
+                    // SAFETY: The registration and removal use the same initialized slot,
+                    // whose storage spans both operations.
+                    unsafe { add_runtime_root_slot_in(owner(), slot as *mut *mut u8) };
                 }
                 added.wait();
                 removed.wait();
@@ -834,7 +1004,9 @@ fn root_count_is_a_consistent_snapshot_while_logs_flush() {
             for _ in 0..ROUNDS {
                 added.wait();
                 for &slot in addresses {
-                    remove_runtime_root_slot_in(owner(), slot as *mut *mut u8);
+                    // SAFETY: The registration and removal use the same initialized slot,
+                    // whose storage spans both operations.
+                    unsafe { remove_runtime_root_slot_in(owner(), slot as *mut *mut u8) };
                 }
                 removed.wait();
             }
@@ -859,7 +1031,9 @@ fn root_count_is_a_consistent_snapshot_while_logs_flush() {
     });
     assert_eq!(super::super::root::runtime_root_count_in(&owner().gc), 0);
     assert!(root_slots().is_empty());
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -885,7 +1059,9 @@ fn root_count_never_goes_negative_while_migrating_pairs_overlap_reads() {
             let _registration = MutatorRegistration::new();
             for round in 0..ROUNDS {
                 for &slot in addresses {
-                    add_runtime_root_slot_in(owner(), slot as *mut *mut u8);
+                    // SAFETY: The registration and removal use the same initialized slot,
+                    // whose storage spans both operations.
+                    unsafe { add_runtime_root_slot_in(owner(), slot as *mut *mut u8) };
                     added.fetch_add(1, Ordering::Release);
                 }
                 // A slot is re-added only after the previous round removed it.
@@ -901,7 +1077,11 @@ fn root_count_never_goes_negative_while_migrating_pairs_overlap_reads() {
                 while added.load(Ordering::Acquire) <= index {
                     std::hint::spin_loop();
                 }
-                remove_runtime_root_slot_in(owner(), addresses[index % SLOTS] as *mut *mut u8);
+                // SAFETY: The registration and removal use the same initialized slot, whose
+                // storage spans both operations.
+                unsafe {
+                    remove_runtime_root_slot_in(owner(), addresses[index % SLOTS] as *mut *mut u8)
+                };
                 removed.fetch_add(1, Ordering::Release);
             }
             flush_current_in(owner());
@@ -939,7 +1119,9 @@ fn root_count_never_goes_negative_while_migrating_pairs_overlap_reads() {
     // Quiescent: every log is flushed, so the count is exact again.
     assert_eq!(super::super::root::runtime_root_count_in(&owner().gc), 0);
     assert!(root_slots().is_empty());
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -957,8 +1139,12 @@ fn root_count_clamps_a_read_that_misses_a_migrated_add() {
                 .unwrap();
             while let Ok(delta) = commands.recv() {
                 match delta {
-                    1 => add_runtime_root_slot_in(owner(), slot as *mut *mut u8),
-                    -1 => remove_runtime_root_slot_in(owner(), slot as *mut *mut u8),
+                    // SAFETY: The registration and removal use the same initialized slot,
+                    // whose storage spans both operations.
+                    1 => unsafe { add_runtime_root_slot_in(owner(), slot as *mut *mut u8) },
+                    // SAFETY: The registration and removal use the same initialized slot,
+                    // whose storage spans both operations.
+                    -1 => unsafe { remove_runtime_root_slot_in(owner(), slot as *mut *mut u8) },
                     _ => flush_current_in(owner()),
                 }
                 acks.send(0).unwrap();
@@ -1013,7 +1199,9 @@ fn root_count_clamps_a_read_that_misses_a_migrated_add() {
         assert_eq!(flushed, 0);
         assert!(root_slots().is_empty());
     });
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     // SAFETY: allocated above; the workers have exited.
     drop(unsafe { Box::from_raw(slot as *mut *mut u8) });
 }
@@ -1023,9 +1211,9 @@ fn telemetry_snapshot_flushes_pending_edges_after_a_heap_poisoning_panic() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let parent = old_object();
-    store(parent, young_object(&mut tls, 9));
+    store(parent, young_object(&tls, 9));
     assert_eq!(pending_edges(), 1);
     let gc = &owner().gc;
     std::thread::scope(|scope| {
@@ -1045,7 +1233,9 @@ fn telemetry_snapshot_flushes_pending_edges_after_a_heap_poisoning_panic() {
     gc.heap.clear_poison();
     assert!(remembered(parent));
     verify().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 fn owner_claims() -> [u64; 2] {
@@ -1061,9 +1251,9 @@ fn unproven_old_value_stores_remember_no_owner_for_any_n() {
     for owners in [1usize, 10, 100] {
         quiet_heap();
         let registration = MutatorRegistration::new();
-        let mut tls = tlab_state_for_test();
+        let tls = tlab_state_for_test();
         // Any nursery makes old-to-young edges possible.
-        let _ = young_object(&mut tls, 0);
+        let _ = young_object(&tls, 0);
         let values: Vec<_> = (0..owners).map(|_| old_object()).collect();
         let parents: Vec<_> = (0..owners).map(|_| old_object()).collect();
         let claims = owner_claims();
@@ -1082,7 +1272,9 @@ fn unproven_old_value_stores_remember_no_owner_for_any_n() {
         assert_eq!(remembered_len(), 0, "owners={owners}");
         verify().unwrap();
         drop(registration);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 }
 
@@ -1094,13 +1286,15 @@ fn unproven_young_value_from_the_own_chunk_claims_the_owner() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let mut parent = old_object();
-    willow_push_root(&mut parent);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut parent) };
     let claims = owner_claims();
     let locks = shared_locks();
     for value in 0..1000 {
-        store_unproven_value(parent, young_object(&mut tls, value));
+        store_unproven_value(parent, young_object(&tls, value));
     }
     assert_eq!(shared_locks(), locks);
     let after = owner_claims();
@@ -1111,10 +1305,17 @@ fn unproven_young_value_from_the_own_chunk_claims_the_owner() {
     assert_eq!(remembered_len(), 1);
     verify().unwrap();
     minor();
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     let child = unsafe { *parent.cast::<*mut u8>() };
+    // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
     assert_eq!(unsafe { *child.cast::<u64>() }, 999);
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 /// Header-proven young values keep claiming through the header proof.
@@ -1123,15 +1324,17 @@ fn header_proven_young_value_claims_through_the_header() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let parent = old_object();
     let claims = owner_claims();
-    store(parent, young_object(&mut tls, 1));
+    store(parent, young_object(&tls, 1));
     let after = owner_claims();
     assert_eq!((after[0] - claims[0], after[1] - claims[1]), (1, 0));
     stop();
     assert!(remembered(parent));
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 /// A young value allocated before the last stop is no longer proven by its
@@ -1142,11 +1345,15 @@ fn unproven_young_value_from_before_a_stop_is_logged_exactly() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let mut parent = old_object();
-    willow_push_root(&mut parent);
-    let mut child = young_object(&mut tls, 31);
-    willow_push_root(&mut child);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut parent) };
+    let mut child = young_object(&tls, 31);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut child) };
     stop();
     let claims = owner_claims();
     store_unproven_value(parent, child);
@@ -1157,22 +1364,32 @@ fn unproven_young_value_from_before_a_stop_is_logged_exactly() {
     stop();
     assert!(remembered(parent));
     verify().unwrap();
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
     minor();
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     let moved = unsafe { *parent.cast::<*mut u8>() };
+    // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
     assert_eq!(unsafe { *moved.cast::<u64>() }, 31);
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 
     // Negative: dropping the exact entry loses the edge, and verification
     // detects it.
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let parent = old_object();
-    let child = young_object(&mut tls, 32);
+    let child = young_object(&tls, 32);
     stop();
     store_unproven_value(parent, child);
+    // SAFETY: This mutator owns the log, with no concurrent collector drain during access.
     unsafe { bound_in(&owner().gc).unwrap().edges() }.clear();
     stop();
     assert!(!remembered(parent));
@@ -1180,7 +1397,9 @@ fn unproven_young_value_from_before_a_stop_is_logged_exactly() {
         verify().is_err(),
         "lost unproven young edge went undetected"
     );
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 /// A young value from another mutator's chunk is not proven by this
@@ -1191,21 +1410,25 @@ fn unproven_young_value_from_another_mutators_chunk_is_logged_exactly() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let mut parent = old_object();
-    willow_push_root(&mut parent);
-    let child = young_object(&mut tls, 77);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut parent) };
+    let child = young_object(&tls, 77);
     let (parent_address, child_address) = (parent as usize, child as usize);
     // Idle, this thread's log is drained by the other thread's stop.
+    // SAFETY: This thread stops accessing movable data before entering idle and resumes only after
+    // rejoining the mutators.
     let idle = unsafe { safepoint::IdleMutator::enter() };
     std::thread::scope(|scope| {
         scope
             .spawn(crate::runtime::serving(move || {
                 let _registration = MutatorRegistration::new();
-                let mut tls = tlab_state_for_test();
+                let tls = tlab_state_for_test();
                 // This mutator has a chunk of its own; it proves nothing about
                 // the other mutator's value.
-                let _ = young_object(&mut tls, 1);
+                let _ = young_object(&tls, 1);
                 let claims = owner_claims();
                 store_unproven_value(parent_address as *mut u8, child_address as *mut u8);
                 assert_eq!(owner_claims(), claims);
@@ -1219,10 +1442,17 @@ fn unproven_young_value_from_another_mutators_chunk_is_logged_exactly() {
     drop(idle);
     verify().unwrap();
     minor();
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     let moved = unsafe { *parent.cast::<*mut u8>() };
+    // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
     assert_eq!(unsafe { *moved.cast::<u64>() }, 77);
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 /// Old and young unproven values into the same owners: only owners holding a
@@ -1232,12 +1462,12 @@ fn mixed_unproven_stores_remember_exactly_the_young_owners() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let young_first = old_object();
     let old_first = old_object();
     let old_only = old_object();
     let old_value = old_object();
-    let young_value = young_object(&mut tls, 5);
+    let young_value = young_object(&tls, 5);
     store_unproven_value(young_first, young_value);
     store_unproven_value(old_first, old_value);
     store_unproven_value(old_only, old_value);
@@ -1250,7 +1480,9 @@ fn mixed_unproven_stores_remember_exactly_the_young_owners() {
     assert!(!remembered(old_only));
     assert_eq!(remembered_len(), 2);
     verify().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 fn chunk_epoch() -> u64 {
@@ -1262,9 +1494,9 @@ fn repeated_unproven_stores_of_one_old_value_log_once_per_epoch() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     // A published nursery makes young edges possible at all.
-    young_object(&mut tls, 0);
+    young_object(&tls, 0);
     let shared = old_object();
     for n in [
         EDGE_LOG_CAPACITY + 1,
@@ -1274,7 +1506,7 @@ fn repeated_unproven_stores_of_one_old_value_log_once_per_epoch() {
         let owners: Vec<_> = (0..n).map(|_| old_object()).collect();
         stop();
         // A fresh TLAB installs a chunk, so the cache starts cold for each n.
-        young_object(&mut tlab_state_for_test(), 1);
+        young_object(&tlab_state_for_test(), 1);
         let (locks, drops) = (shared_locks(), old_value_drops_for_test());
         for &parent in &owners {
             store_unproven_value(parent, shared);
@@ -1294,7 +1526,9 @@ fn repeated_unproven_stores_of_one_old_value_log_once_per_epoch() {
     }
     minor();
     verify().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -1302,8 +1536,8 @@ fn a_chunk_install_invalidates_the_old_value_cache() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
-    young_object(&mut tls, 0);
+    let tls = tlab_state_for_test();
+    young_object(&tls, 0);
     let shared = old_object();
     note_old_value_for_test(owner(), shared as usize);
     let parent = old_object();
@@ -1313,8 +1547,8 @@ fn a_chunk_install_invalidates_the_old_value_cache() {
     assert_eq!(pending_edges(), 0);
     // Another TLAB installs a chunk: the epoch moves and the cache is void.
     let epoch = chunk_epoch();
-    let mut other = tlab_state_for_test();
-    young_object(&mut other, 1);
+    let other = tlab_state_for_test();
+    young_object(&other, 1);
     assert!(chunk_epoch() > epoch);
     store_unproven_value(old_object(), shared);
     assert_eq!(old_value_drops_for_test() - drops, 1);
@@ -1322,7 +1556,9 @@ fn a_chunk_install_invalidates_the_old_value_cache() {
     stop();
     assert_eq!(remembered_len(), 0);
     verify().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -1330,14 +1566,19 @@ fn a_survivor_destination_advances_the_chunk_epoch() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let mut parent = old_object();
-    willow_push_root(&mut parent);
-    store(parent, young_object(&mut tls, 41));
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut parent) };
+    store(parent, young_object(&tls, 41));
     stop();
     let epoch = chunk_epoch();
     minor();
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     let moved = unsafe { *parent.cast::<*mut u8>() };
+    // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
     assert_eq!(unsafe { *moved.cast::<u64>() }, 41);
     let state = runtime().heap.lock().unwrap();
     let survivor = crate::gc::find_tlab_chunk(&state, moved as usize).is_some();
@@ -1345,8 +1586,12 @@ fn a_survivor_destination_advances_the_chunk_epoch() {
     // The survivor copy lands in a chunk that joined the heap in this minor.
     assert!(survivor, "the child must be copied to a survivor chunk");
     assert!(chunk_epoch() > epoch);
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -1354,9 +1599,11 @@ fn young_values_are_never_cached_as_old() {
     let _guard = isolated_runtime();
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
-    let mut child = young_object(&mut tls, 51);
-    willow_push_root(&mut child);
+    let tls = tlab_state_for_test();
+    let mut child = young_object(&tls, 51);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut child) };
     // The stop ends the chunk proof: stores of `child` are logged exactly.
     stop();
     let owners: Vec<_> = (0..2 * EDGE_LOG_CAPACITY).map(|_| old_object()).collect();
@@ -1374,15 +1621,19 @@ fn young_values_are_never_cached_as_old() {
         assert!(remembered(parent));
     }
     verify().unwrap();
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 
     // Negative: a wrongly cached young value drops its edge, and verification
     // detects the loss.
     quiet_heap();
     let _registration = MutatorRegistration::new();
-    let mut tls = tlab_state_for_test();
-    let child = young_object(&mut tls, 52);
+    let tls = tlab_state_for_test();
+    let child = young_object(&tls, 52);
     stop();
     let parent = old_object();
     note_old_value_for_test(owner(), child as usize);
@@ -1394,5 +1645,7 @@ fn young_values_are_never_cached_as_old() {
         verify().is_err(),
         "a young edge dropped by the old-value cache went undetected"
     );
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }

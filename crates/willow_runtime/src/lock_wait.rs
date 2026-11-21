@@ -141,6 +141,8 @@ unsafe impl Send for LockWaitLink {}
 /// same-address-different-lock reuse into an observable `false` instead of a
 /// silent success.
 pub unsafe fn link_state_matches(link: &LockWaitLink) -> bool {
+    // SAFETY: The registration keeps the boxed lock state immobile and live while its ID is
+    // checked.
     unsafe { link.state.as_ref() }.lock_id == link.lock_id
 }
 
@@ -149,6 +151,8 @@ pub unsafe fn link_state_matches(link: &LockWaitLink) -> bool {
 /// # Safety
 /// Same contract as [`link_state_matches`].
 unsafe fn state_of(link: &LockWaitLink) -> &AsyncLockState {
+    // SAFETY: The registration keeps the boxed lock state immobile and live while its ID is
+    // checked.
     let state = unsafe { link.state.as_ref() };
     if state.lock_id != link.lock_id {
         fatal("lock wait link points at a state with a different LockId");
@@ -1121,6 +1125,8 @@ mod tests {
         // The same token pointed at a different lock is a different waiter, and
         // the identity check catches it.
         link.state = second.stable_ptr();
+        // SAFETY: The registration keeps the boxed lock state immobile and live while its ID is
+        // checked.
         assert!(!unsafe { link_state_matches(&link) });
     }
 
@@ -2168,7 +2174,9 @@ mod native_accounting_tests {
     #[test]
     fn boxed_lock_waiters_tokens_modes_readers_release_on_drop() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         let baseline = crate::gc_telemetry::external_bytes();
         for count in [1, 32, 1024] {
             let lock = AsyncLockState::new_rwlock();
@@ -2209,7 +2217,9 @@ mod native_accounting_tests {
             (2 * size_of::<AsyncLockState>()) as u64
         );
         // Native test owners can outlive a GC reset; their charge must persist.
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         assert_eq!(
             crate::gc_telemetry::external_bytes() - baseline,
             (2 * size_of::<AsyncLockState>()) as u64

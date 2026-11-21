@@ -666,9 +666,13 @@ pub fn snapshot() -> WillowGcStatsV1 {
 /// Write exactly V1's fixed layout. Returns 0, or -1 for null. The caller must
 /// provide aligned, writable storage for a full WillowGcStatsV1. Future layouts
 /// use a new symbol; V1 never grows. RSS is best-effort and outside GC locks.
+///
+/// # Safety
+/// A non-null output must exclusively address one aligned, writable WillowGcStatsV1. Its
+/// storage may be uninitialized.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_gc_stats_snapshot_v1(out: *mut WillowGcStatsV1) -> i32 {
+pub unsafe extern "C" fn willow_gc_stats_snapshot_v1(out: *mut WillowGcStatsV1) -> i32 {
     if out.is_null() {
         return -1;
     }
@@ -708,9 +712,18 @@ pub extern "C" fn willow_gc_stats_size(version: i64) -> i64 {
 /// Returns bytes written, 0 for insufficient length, or -1 for an unknown
 /// version or null output. Errors never write. On success the caller supplies
 /// writable storage for the required size; alignment is not required.
+///
+/// # Safety
+/// On a successful version and length check, a non-null output must exclusively address at
+/// least willow_gc_stats_size(version) writable bytes for the call. Byte alignment suffices
+/// and the storage may be uninitialized.
+///
+/// ```compile_fail,E0133
+/// willow_runtime::gc_telemetry::willow_gc_stats_snapshot(1, std::ptr::null_mut(), 0);
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_gc_stats_snapshot(version: i64, out: *mut u8, out_len: i64) -> i64 {
+pub unsafe extern "C" fn willow_gc_stats_snapshot(version: i64, out: *mut u8, out_len: i64) -> i64 {
     let size = willow_gc_stats_size(version);
     if size < 0 {
         return -1;
@@ -723,6 +736,8 @@ pub extern "C" fn willow_gc_stats_snapshot(version: i64, out: *mut u8, out_len: 
     }
     // SAFETY: the caller supplies writable storage of at least `size` bytes.
     if version == 1 {
+        // SAFETY: The negotiated size covers the selected record. Unaligned record access supports
+        // byte-aligned caller storage.
         unsafe {
             out.cast::<WillowGcStatsV1>()
                 .write_unaligned(snapshot_with_resident())
@@ -737,6 +752,8 @@ pub extern "C" fn willow_gc_stats_snapshot(version: i64, out: *mut u8, out_len: 
             workers: workers::snapshot(),
         };
         if version == 2 {
+            // SAFETY: The negotiated size covers the selected record. Unaligned record access
+            // supports byte-aligned caller storage.
             unsafe { out.cast::<WillowGcStatsV2>().write_unaligned(stats) };
         } else {
             let (memory, survivors) = crate::gc::telemetry_memory_snapshot();
@@ -756,6 +773,8 @@ pub extern "C" fn willow_gc_stats_snapshot(version: i64, out: *mut u8, out_len: 
                 barrier_variants_valid: u64::from(valid),
             };
             if version == 3 {
+                // SAFETY: The negotiated size covers the selected record. Unaligned record access
+                // supports byte-aligned caller storage.
                 unsafe { out.cast::<WillowGcStatsV3>().write_unaligned(stats) };
             } else {
                 let stats = WillowGcStatsV4 {
@@ -765,6 +784,8 @@ pub extern "C" fn willow_gc_stats_snapshot(version: i64, out: *mut u8, out_len: 
                     baseline: stats,
                     observations: observations::snapshot(),
                 };
+                // SAFETY: The negotiated size covers the selected record. Unaligned record access
+                // supports byte-aligned caller storage.
                 unsafe { out.cast::<WillowGcStatsV4>().write_unaligned(stats) };
             }
         }
@@ -1052,6 +1073,7 @@ fn macos_resident(peak: bool) -> Option<u64> {
     if result != libc::KERN_SUCCESS {
         return None;
     }
+    // SAFETY: A successful task_info call initialized the requested mach_task_basic_info fields.
     let info = unsafe { info.assume_init() };
     Some(if peak {
         info.resident_size_max

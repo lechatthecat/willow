@@ -32,10 +32,16 @@ unsafe extern "C" fn helper(_: *mut c_void) -> i32 {
         let mut roots = vec![std::ptr::null_mut(); count];
         let mut before = Vec::with_capacity(count);
         for (index, slot) in roots.iter_mut().enumerate() {
-            *slot = willow_gc_alloc_slow(willow_gc_current_tlab(), 21, 0, 8, 0);
+            // SAFETY: The current mutator owns the runtime TLS block until retirement; this
+            // fixture uses its word layout and inline mask.
+            *slot = unsafe { willow_gc_alloc_slow(willow_gc_current_tlab(), 21, 0, 8, 0) };
+            // SAFETY: The stack root protects a live GC payload with room and alignment for its
+            // u64 across migration.
             unsafe { *slot.cast::<u64>() = (depth * 1000 + index) as u64 };
             before.push(*slot as usize);
-            willow_push_root(slot);
+            // SAFETY: The slot storage stays live and stationary through the matching pop,
+            // including during collection.
+            unsafe { willow_push_root(slot) };
         }
         if depth != 0 {
             recurse(depth - 1);
@@ -43,20 +49,32 @@ unsafe extern "C" fn helper(_: *mut c_void) -> i32 {
             *ORIGINAL_THREAD.lock().unwrap() = Some(std::thread::current().id());
             assert_eq!(current_worker(), 1);
             let name = b"migrating_helper";
-            crate::stack_trace::willow_callstack_push(
-                name.as_ptr(),
-                name.len() as i64,
-                std::ptr::null(),
-                0,
-                1,
-                1,
-            );
-            crate::stack_overflow::willow_stack_helper_set(name.as_ptr(), name.len() as i64);
+            // SAFETY: The absent name is accepted and any nonempty byte range remains
+            // readable through the copy.
+            unsafe {
+                crate::stack_trace::willow_callstack_push(
+                    name.as_ptr(),
+                    name.len() as i64,
+                    std::ptr::null(),
+                    0,
+                    1,
+                    1,
+                )
+            };
+            // SAFETY: The nonempty diagnostic names are byte literals with process lifetime
+            // and the supplied lengths fit those literals.
+            unsafe {
+                crate::stack_overflow::willow_stack_helper_set(name.as_ptr(), name.len() as i64)
+            };
             crate::reference_debug::willow_debug_reference_call_scope_push();
             let label = crate::string::willow_string_from_str("migration-reference");
-            crate::reference_debug::willow_debug_reference_call(
-                label, 1, 1, label, label, label, label, label, label,
-            );
+            // SAFETY: The fixture supplies Willow strings allocated in the isolated heap and
+            // kept live through this call.
+            unsafe {
+                crate::reference_debug::willow_debug_reference_call(
+                    label, 1, 1, label, label, label, label, label, label,
+                )
+            };
             if MODE.load(Ordering::Relaxed) == 1 {
                 crate::panic_context::raise_language_message("migration unwind");
             }
@@ -93,8 +111,14 @@ unsafe extern "C" fn helper(_: *mut c_void) -> i32 {
             );
             crate::stack_trace::willow_callstack_pop();
             // Allocation after resumption must acquire the current TLAB.
-            let fresh = willow_gc_alloc_slow(willow_gc_current_tlab(), 21, 0, 8, 0);
+            // SAFETY: The current mutator owns the runtime TLS block until retirement; this
+            // fixture uses its word layout and inline mask.
+            let fresh = unsafe { willow_gc_alloc_slow(willow_gc_current_tlab(), 21, 0, 8, 0) };
+            // SAFETY: The stack root protects a live GC payload with room and alignment for its
+            // u64 across migration.
             unsafe { *fresh.cast::<u64>() = 123 };
+            // SAFETY: The stack root protects a live GC payload with room and alignment for its
+            // u64 across migration.
             assert_eq!(unsafe { *fresh.cast::<u64>() }, 123);
         }
         for (index, slot) in roots.iter().enumerate() {
@@ -103,13 +127,17 @@ unsafe extern "C" fn helper(_: *mut c_void) -> i32 {
                 "collector must rewrite the root"
             );
             assert_eq!(
+                // SAFETY: The stack root protects a live GC payload with room and alignment for
+                // its u64 across migration.
                 unsafe { *slot.cast::<u64>() },
                 (depth * 1000 + index) as u64
             );
             VISITED.fetch_add(1, Ordering::Relaxed);
         }
         // The saved depth belongs to the task, not either worker's prefix.
-        willow_pop_roots(willow_root_depth() - baseline);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(willow_root_depth() - baseline) };
         assert_eq!(willow_root_depth(), baseline);
     }
     assert_eq!(willow_root_depth(), 0);
@@ -124,7 +152,9 @@ unsafe extern "C" fn helper(_: *mut c_void) -> i32 {
 }
 
 unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
-    let result = willow_task_stack_enter_generated(helper, std::ptr::null_mut());
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let result = unsafe { willow_task_stack_enter_generated(helper, std::ptr::null_mut()) };
     willow_task_stack_leave();
     result
 }
@@ -141,7 +171,9 @@ unsafe extern "C" fn cached_helper(_: *mut c_void) -> i32 {
 }
 
 unsafe extern "C" fn cached_poll(_: *mut c_void) -> i32 {
-    let result = willow_task_stack_enter_generated(cached_helper, std::ptr::null_mut());
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let result = unsafe { willow_task_stack_enter_generated(cached_helper, std::ptr::null_mut()) };
     willow_task_stack_leave();
     result
 }
@@ -152,17 +184,25 @@ fn run_claim(id: u64, worker: usize, prefix: usize, terminal: bool) {
         let _registration = MutatorRegistration::new();
         let mut outer = vec![std::ptr::null_mut(); prefix];
         for slot in &mut outer {
-            willow_push_root(slot);
+            // SAFETY: The slot storage stays live and stationary through the matching pop,
+            // including during collection.
+            unsafe { willow_push_root(slot) };
         }
         let (claimed, work) =
             claim_global_ready_for_worker(worker, None).expect("owner must claim its pinned stack");
         assert_eq!(claimed, id);
         assert!(work.direct_poll);
         let (poll, frame, flag) = work.poll.unwrap();
-        crate::preempt::begin_quantum(
-            crate::preempt::PreemptConfig::from_env_values(Some("1"), Some("100000")),
-            flag,
-        );
+        // SAFETY: The fixture keeps the flag at its registered address throughout this
+        // quantum and unbinds it before release.
+        unsafe {
+            crate::preempt::begin_quantum(
+                crate::preempt::PreemptConfig::from_env_values(Some("1"), Some("100000")),
+                flag,
+            )
+        };
+        // SAFETY: The claimed task retains its frame and pairs it with the installed callback for
+        // this execution.
         let result = unsafe { poll(frame) };
         crate::preempt::willow_preempt_end();
         assert_eq!(gc_thread_root_depth(), prefix);
@@ -197,21 +237,32 @@ fn run_claim(id: u64, worker: usize, prefix: usize, terminal: bool) {
         set_current_task(None);
         if terminal {
             // Reuse the coroutine on its owning worker after completion.
-            let next = willow_sched_spawn_cooperative(cached_poll, std::ptr::null_mut()) as u64;
+            // SAFETY: The callback accepts a null frame and uses no frame storage.
+            let next =
+                (unsafe { willow_sched_spawn_cooperative(cached_poll, std::ptr::null_mut()) })
+                    as u64;
             let (claimed, work) = claim_global_ready_for_worker(worker, None).unwrap();
             assert_eq!(claimed, next);
             let (poll, frame, flag) = work.poll.unwrap();
-            crate::preempt::begin_quantum(
-                crate::preempt::PreemptConfig::from_env_values(Some("1"), Some("100000")),
-                flag,
-            );
+            // SAFETY: The fixture keeps the flag at its registered address throughout this
+            // quantum and unbinds it before release.
+            unsafe {
+                crate::preempt::begin_quantum(
+                    crate::preempt::PreemptConfig::from_env_values(Some("1"), Some("100000")),
+                    flag,
+                )
+            };
+            // SAFETY: The claimed task retains its frame and pairs it with the installed callback
+            // for this execution.
             assert_eq!(unsafe { poll(frame) }, RUNTIME_POLL_READY);
             crate::preempt::willow_preempt_end();
             with_global(|sched| sched.complete(next));
             set_current_task(None);
             assert_eq!(gc_thread_root_depth(), prefix);
         }
-        willow_pop_roots(prefix as i32);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(prefix as i32) };
         assert_eq!(willow_root_depth(), 0);
     }
 }
@@ -232,7 +283,9 @@ fn generated_stack_preserves_affinity_roots_and_context_after_moving_collection(
                     VISITED.store(0, Ordering::Relaxed);
                     let baseline = runtime_root_count();
                     let parked = parked_root_counts_for_test();
-                    let id = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
+                    // SAFETY: The callback accepts a null frame and uses no frame storage.
+                    let id = (unsafe { willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) })
+                        as u64;
                     run_claim(id, 1, 1, false);
                     assert_eq!(
                         parked_root_counts_for_test(),

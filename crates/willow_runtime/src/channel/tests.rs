@@ -10,6 +10,7 @@ impl GcTrace for TestRoot {
 }
 
 fn expected_test_ownership(task: u64, raw: *mut c_void) -> Vec<ChannelOwnershipToken> {
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let state = unsafe { channel_from_raw(raw) }
         .unwrap()
         .state
@@ -142,38 +143,54 @@ fn channel_unit_10_recv_after_close_drains_existing_value() {
 fn channel_unit_11_abi_i64_send_recv_fifo() {
     let _guard = crate::gc::isolated_runtime();
     let ch = willow_channel_new(0);
-    willow_channel_send_i64(ch, 10);
-    willow_channel_send_i64(ch, 20);
-    assert_eq!(willow_channel_recv_i64(ch), 10);
-    assert_eq!(willow_channel_recv_i64(ch), 20);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe {
+        willow_channel_send_i64(ch, 10);
+        willow_channel_send_i64(ch, 20);
+    }
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_i64(ch) }, 10);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_i64(ch) }, 20);
 }
 
 #[test]
 fn channel_unit_12_abi_bool_send_recv() {
     let _guard = crate::gc::isolated_runtime();
     let ch = willow_channel_new(0);
-    willow_channel_send_bool(ch, 1);
-    assert_eq!(willow_channel_recv_bool(ch), 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_send_bool(ch, 1) };
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_bool(ch) }, 1);
 }
 
 #[test]
 fn channel_unit_13_abi_f64_send_recv() {
     let _guard = crate::gc::isolated_runtime();
     let ch = willow_channel_new(0);
-    willow_channel_send_f64(ch, 2.5);
-    assert_eq!(willow_channel_recv_f64(ch), 2.5);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_send_f64(ch, 2.5) };
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_f64(ch) }, 2.5);
 }
 
 #[test]
 fn channel_unit_14_abi_recv_closed_empty_raises_and_returns_neutral_word() {
     let _heap = crate::gc::isolated_runtime();
-    crate::gc::willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::willow_gc_init() };
     let previous = crate::panic_context::replace_current_context(Some(std::sync::Arc::new(
         crate::panic_context::PanicContext::new(14),
     )));
     let ch = willow_channel_new(0);
-    willow_channel_close(ch);
-    assert_eq!(willow_channel_recv_i64(ch), 0);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    unsafe { willow_channel_close(ch) };
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_i64(ch) }, 0);
     assert_eq!(
         crate::panic_context::willow_panic_active(),
         1,
@@ -192,22 +209,41 @@ fn channel_unit_14_abi_recv_closed_empty_raises_and_returns_neutral_word() {
 #[test]
 fn channel_unit_15_abi_recv_opt_drains_then_reports_closed() {
     let _heap = crate::gc::isolated_runtime();
-    crate::gc::willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::willow_gc_init() };
     let previous = crate::panic_context::replace_current_context(Some(std::sync::Arc::new(
         crate::panic_context::PanicContext::new(15),
     )));
+    let mut empty = std::mem::MaybeUninit::<i64>::uninit();
+    // SAFETY: A null channel has no value. Even this path initializes one aligned output word.
+    let tag = unsafe { willow_channel_recv_opt_into(std::ptr::null_mut(), empty.as_mut_ptr()) };
+    assert_eq!(tag, 1);
+    // SAFETY: The receiver initialized the output before checking the channel.
+    assert_eq!(unsafe { empty.assume_init() }, 0);
     let ch = willow_channel_new(0);
-    willow_channel_send_i64(ch, 7);
-    willow_channel_send_i64(ch, -3);
-    willow_channel_close(ch);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe {
+        willow_channel_send_i64(ch, 7);
+        willow_channel_send_i64(ch, -3);
+    }
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    unsafe { willow_channel_close(ch) };
     let mut payload = 99;
-    assert_eq!(willow_channel_recv_opt_into(ch, &mut payload), 0);
+    // SAFETY: The channel handle is current and the payload output owns a disjoint writable
+    // i64 across the receive.
+    assert_eq!(unsafe { willow_channel_recv_opt_into(ch, &mut payload) }, 0);
     assert_eq!(payload, 7);
-    assert_eq!(willow_channel_recv_opt_into(ch, &mut payload), 0);
+    // SAFETY: The channel handle is current and the payload output owns a disjoint writable
+    // i64 across the receive.
+    assert_eq!(unsafe { willow_channel_recv_opt_into(ch, &mut payload) }, 0);
     assert_eq!(payload, -3);
     for _ in 0..2 {
         payload = 99;
-        assert_eq!(willow_channel_recv_opt_into(ch, &mut payload), 1);
+        // SAFETY: The channel handle is current and the payload output owns a disjoint
+        // writable i64 across the receive.
+        assert_eq!(unsafe { willow_channel_recv_opt_into(ch, &mut payload) }, 1);
         assert_eq!(payload, 0, "None leaves a neutral payload word");
     }
     assert_eq!(crate::panic_context::willow_panic_active(), 0);
@@ -220,15 +256,26 @@ fn channel_unit_15_abi_recv_opt_drains_then_reports_closed() {
 fn channel_unit_16_abi_recv_opt_bool_payload_is_a_full_word() {
     let _guard = crate::gc::isolated_runtime();
     let ch = willow_channel_new(0);
-    willow_channel_send_bool(ch, 1);
-    assert_eq!(willow_channel_try_send_bool(ch, 0), 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_send_bool(ch, 1) };
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_bool(ch, 0) }, 1);
     let mut payload = -1;
-    assert_eq!(willow_channel_recv_opt_into(ch, &mut payload), 0);
+    // SAFETY: The channel handle is current and the payload output owns a disjoint writable
+    // i64 across the receive.
+    assert_eq!(unsafe { willow_channel_recv_opt_into(ch, &mut payload) }, 0);
     assert_eq!(payload, 1);
-    assert_eq!(willow_channel_recv_opt_into(ch, &mut payload), 0);
+    // SAFETY: The channel handle is current and the payload output owns a disjoint writable
+    // i64 across the receive.
+    assert_eq!(unsafe { willow_channel_recv_opt_into(ch, &mut payload) }, 0);
     assert_eq!(payload, 0);
-    willow_channel_send_bool(ch, 1);
-    assert_eq!(willow_channel_recv_bool(ch), 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_send_bool(ch, 1) };
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_bool(ch) }, 1);
 }
 
 // send wakes EVERY parked waiter (a cancelled head waiter
@@ -243,11 +290,15 @@ fn send_reserves_one_value_and_wakes_one_receiver() {
     });
     for task in [first, second] {
         crate::scheduler::with_current_task_for_test(task, || {
-            assert_eq!(willow_channel_recv_ready(raw), 0)
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            assert_eq!(unsafe { willow_channel_recv_ready(raw) }, 0)
         });
     }
     CHANNEL_WAKE_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
-    willow_channel_send_i64(raw, 42);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_send_i64(raw, 42) };
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let mut state = unsafe { channel_from_raw(raw) }
         .unwrap()
         .state
@@ -259,6 +310,8 @@ fn send_reserves_one_value_and_wakes_one_receiver() {
     assert!(take_value(raw, &mut state, 0).is_none());
     assert!(take_value(raw, &mut state, second).is_none());
     assert_eq!(
+        // SAFETY: The channel element ABI supplies the initialized union representation read by
+        // this operation.
         unsafe { take_value(raw, &mut state, first).unwrap().i64_value },
         42
     );
@@ -273,7 +326,9 @@ fn send_reserves_one_value_and_wakes_one_receiver() {
 #[test]
 fn unreachable_channels_are_reclaimed() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let before = crate::gc::willow_gc_allocated_bytes();
     for _ in 0..1000 {
         let ch = willow_channel_new(0);
@@ -291,11 +346,14 @@ fn unreachable_channels_are_reclaimed() {
 #[test]
 fn gc_sweep_drops_channel_owned_queue_buffers() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let before = CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst);
     const CHANNELS: usize = 256;
     for _ in 0..CHANNELS {
         let raw = willow_channel_new(0);
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let channel = unsafe { channel_from_raw(raw) }.unwrap();
         let mut state = channel.state.lock().unwrap();
         for value in 0..64 {
@@ -319,12 +377,16 @@ fn gc_sweep_drops_channel_owned_queue_buffers() {
 fn gc_reset_drops_channel_native_owners_at_increasing_sizes() {
     let _guard = crate::gc::isolated_runtime();
     crate::scheduler::reset_global_scheduler_for_test();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     for count in [1usize, 32, 256] {
         for queued in [1usize, 64] {
             let before = CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst);
             for _ in 0..count {
                 let raw = willow_channel_new(0);
+                // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC
+                // storage.
                 let channel = unsafe { channel_from_raw(raw) }.unwrap();
                 let mut state = channel.state.lock().unwrap();
                 for value in 0..queued {
@@ -334,14 +396,18 @@ fn gc_reset_drops_channel_native_owners_at_increasing_sizes() {
                     state.waiters.register(value as u64 + 1);
                 }
             }
-            crate::gc::reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { crate::gc::reset_internal_for_test() };
             let dropped = CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst) - before;
             assert_eq!(
                 dropped, count,
                 "reset must destroy every native channel owner"
             );
             assert_eq!(crate::gc::willow_gc_allocated_bytes(), 0);
-            crate::gc::reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { crate::gc::reset_internal_for_test() };
             assert_eq!(
                 CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst) - before,
                 count,
@@ -357,7 +423,9 @@ fn gc_reset_drops_channel_native_owners_at_increasing_sizes() {
 #[test]
 fn channel_gc_hooks_register_once_per_registry_generation() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     ensure_channel_registered();
     let generation = crate::gc::registry_generation();
     let registrations = CHANNEL_REGISTRATION_COUNT.load(std::sync::atomic::Ordering::SeqCst);
@@ -371,7 +439,9 @@ fn channel_gc_hooks_register_once_per_registry_generation() {
         "same-generation channel creation must stay on the atomic fast path"
     );
 
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     assert_ne!(crate::gc::registry_generation(), generation);
     ensure_channel_registered();
     assert_eq!(
@@ -417,16 +487,20 @@ fn poisoned_channel_gc_hooks_visit_each_queued_reference() {
         poison_channel(&channel);
         let payload = (&mut channel as *mut WillowAbiChannel).cast();
         let mut slots = Vec::new();
+        // SAFETY: The test retains the channel and its populated trace slots through this scan.
         unsafe { trace_channel(payload, &mut slots) };
         assert_eq!(slots.len(), count);
         assert_eq!(
             slots
                 .iter()
+                // SAFETY: The test retains the channel and its populated trace slots through this
+                // scan.
                 .map(|&slot| unsafe { *slot })
                 .collect::<Vec<_>>(),
             expected
         );
         let mut children = vec![std::ptr::null_mut()];
+        // SAFETY: The test retains the channel and its populated trace slots through this scan.
         unsafe { snapshot_channel(payload, &mut children) };
         assert_eq!(&children[1..], expected);
         assert!(
@@ -439,6 +513,7 @@ fn poisoned_channel_gc_hooks_visit_each_queued_reference() {
         let payload = (&mut channel as *mut WillowAbiChannel).cast();
         slots.clear();
         children.clear();
+        // SAFETY: The test retains the channel and its populated trace slots through this scan.
         unsafe {
             trace_channel(payload, &mut slots);
             snapshot_channel(payload, &mut children);
@@ -451,11 +526,18 @@ fn poisoned_channel_gc_hooks_visit_each_queued_reference() {
 #[test]
 fn poisoned_channel_keeps_queued_child_alive_during_collection() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let mut root = willow_channel_new(1).cast::<u8>();
-    crate::gc::willow_push_root(&mut root);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { crate::gc::willow_push_root(&raw mut root) };
     let child = willow_channel_new(0);
-    willow_channel_send_value(root.cast(), WillowChannelValue { ptr_value: child });
+    // SAFETY: The typed send supplies the live channel and matching union member; after a
+    // collecting wait both the channel and any reference value are reloaded from roots.
+    unsafe { willow_channel_send_value(root.cast(), WillowChannelValue { ptr_value: child }) };
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     poison_channel(unsafe { &*root.cast::<WillowAbiChannel>() });
     let before = CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst);
     crate::gc::willow_gc_collect();
@@ -464,7 +546,9 @@ fn poisoned_channel_keeps_queued_child_alive_during_collection() {
         before,
         "rooted poisoned channel and its queued child must both survive"
     );
-    crate::gc::willow_pop_roots(1);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { crate::gc::willow_pop_roots(1) };
     crate::gc::willow_gc_collect();
     assert_eq!(
         CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst),
@@ -475,11 +559,18 @@ fn poisoned_channel_keeps_queued_child_alive_during_collection() {
 #[test]
 fn rooted_channel_survives_collection_with_values() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let mut slot = willow_channel_new(0) as *mut u8;
-    crate::gc::willow_push_root(&mut slot as *mut *mut u8);
-    willow_channel_send_value(slot as *mut c_void, WillowChannelValue { i64_value: 42 });
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { crate::gc::willow_push_root(&raw mut slot) };
+    // SAFETY: The typed send supplies the live channel and matching union member; after a
+    // collecting wait both the channel and any reference value are reloaded from roots.
+    unsafe { willow_channel_send_value(slot as *mut c_void, WillowChannelValue { i64_value: 42 }) };
     crate::gc::willow_gc_collect();
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let channel = unsafe { channel_from_raw(slot as *mut c_void) }.unwrap();
     let got = channel
         .state
@@ -487,8 +578,12 @@ fn rooted_channel_survives_collection_with_values() {
         .unwrap()
         .values
         .pop_front()
+        // SAFETY: The channel element ABI supplies the initialized union representation read by
+        // this operation.
         .map(|v| unsafe { v.i64_value });
-    crate::gc::willow_pop_roots(1);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { crate::gc::willow_pop_roots(1) };
     assert_eq!(got, Some(42), "rooted channel + queued value must survive");
 }
 
@@ -505,6 +600,7 @@ fn cancelled_task_is_purged_from_all_waiter_queues() {
     let first = willow_channel_new(0);
     let second = willow_channel_new(0);
     for raw in [first, second] {
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let channel = unsafe { channel_from_raw(raw) }.unwrap();
         let mut state = channel.state.lock().unwrap();
         // The duplicate registration must collapse: `register` is the only
@@ -519,6 +615,7 @@ fn cancelled_task_is_purged_from_all_waiter_queues() {
     purge_task(t7);
 
     for raw in [first, second] {
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let channel = unsafe { channel_from_raw(raw) }.unwrap();
         assert_eq!(channel.state.lock().unwrap().waiters.live(), vec![t9]);
     }
@@ -527,7 +624,9 @@ fn cancelled_task_is_purged_from_all_waiter_queues() {
 #[test]
 fn normal_waiter_removal_clears_task_reverse_references() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     crate::scheduler::reset_global_scheduler_for_test();
     let (unregister_task, send_task, close_task) =
         crate::scheduler::with_global_for_test(|sched| {
@@ -539,6 +638,7 @@ fn normal_waiter_removal_clears_task_reverse_references() {
         });
 
     let unregister_channel = willow_channel_new(0);
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     unsafe { channel_from_raw(unregister_channel) }
         .unwrap()
         .state
@@ -548,7 +648,8 @@ fn normal_waiter_removal_clears_task_reverse_references() {
         .register(unregister_task);
     register_existing_test_ownership(unregister_task, unregister_channel);
     crate::scheduler::with_global_for_test(|sched| sched.set_running(unregister_task));
-    willow_channel_unregister_waiter(unregister_channel);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    unsafe { willow_channel_unregister_waiter(unregister_channel) };
     crate::scheduler::with_global_for_test(|sched| sched.clear_running());
     assert!(
         crate::scheduler::take_channel_waits(unregister_task).is_empty(),
@@ -556,6 +657,7 @@ fn normal_waiter_removal_clears_task_reverse_references() {
     );
 
     let send_channel = willow_channel_new(0);
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     unsafe { channel_from_raw(send_channel) }
         .unwrap()
         .state
@@ -564,12 +666,15 @@ fn normal_waiter_removal_clears_task_reverse_references() {
         .waiters
         .register(send_task);
     register_existing_test_ownership(send_task, send_channel);
-    willow_channel_send_i64(send_channel, 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_send_i64(send_channel, 1) };
     let ownership = crate::scheduler::take_channel_waits(send_task);
     assert_eq!(ownership, expected_test_ownership(send_task, send_channel));
     assert_eq!(ownership[0].role, ChannelRole::RecvClaim);
 
     let close_channel = willow_channel_new(0);
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     unsafe { channel_from_raw(close_channel) }
         .unwrap()
         .state
@@ -578,7 +683,8 @@ fn normal_waiter_removal_clears_task_reverse_references() {
         .waiters
         .register(close_task);
     register_existing_test_ownership(close_task, close_channel);
-    willow_channel_close(close_channel);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    unsafe { willow_channel_close(close_channel) };
     assert!(
         crate::scheduler::take_channel_waits(close_task).is_empty(),
         "close wake must remove the task-side channel address"
@@ -590,6 +696,7 @@ fn normal_waiter_removal_clears_task_reverse_references() {
 // ── Bounded channels ───────────────────────────────────────
 
 fn capacity_of(raw: *mut c_void) -> Option<usize> {
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     unsafe { channel_from_raw(raw) }
         .unwrap()
         .state
@@ -599,6 +706,7 @@ fn capacity_of(raw: *mut c_void) -> Option<usize> {
 }
 
 fn queued(raw: *mut c_void) -> usize {
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     unsafe { channel_from_raw(raw) }
         .unwrap()
         .state
@@ -609,6 +717,7 @@ fn queued(raw: *mut c_void) -> usize {
 }
 
 fn send_waiter_ids(raw: *mut c_void) -> Vec<u64> {
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     unsafe { channel_from_raw(raw) }
         .unwrap()
         .state
@@ -621,7 +730,9 @@ fn send_waiter_ids(raw: *mut c_void) -> Vec<u64> {
 #[test]
 fn bounded_unit_01_new_is_unbounded_and_with_capacity_is_bounded() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     assert_eq!(capacity_of(willow_channel_new(0)), None);
     assert_eq!(capacity_of(willow_channel_new_bounded(0, 3)), Some(3));
 }
@@ -629,72 +740,117 @@ fn bounded_unit_01_new_is_unbounded_and_with_capacity_is_bounded() {
 #[test]
 fn bounded_unit_02_try_send_fills_then_reports_full() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let ch = willow_channel_new_bounded(0, 2);
-    assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
-    assert_eq!(willow_channel_try_send_i64(ch, 2), 1);
-    assert_eq!(willow_channel_try_send_i64(ch, 3), 0);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_i64(ch, 1) }, 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_i64(ch, 2) }, 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_i64(ch, 3) }, 0);
     assert_eq!(queued(ch), 2);
 }
 
 #[test]
 fn bounded_unit_03_recv_frees_a_slot_for_the_next_send() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let ch = willow_channel_new_bounded(0, 1);
-    assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
-    assert_eq!(willow_channel_try_send_i64(ch, 2), 0);
-    assert_eq!(willow_channel_recv_i64(ch), 1);
-    assert_eq!(willow_channel_try_send_i64(ch, 2), 1);
-    assert_eq!(willow_channel_recv_i64(ch), 2);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_i64(ch, 1) }, 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_i64(ch, 2) }, 0);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_i64(ch) }, 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_i64(ch, 2) }, 1);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_i64(ch) }, 2);
 }
 
 #[test]
 fn bounded_unit_04_send_ready_tracks_fullness() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let ch = willow_channel_new_bounded(0, 1);
-    assert_eq!(willow_channel_send_ready(ch), 1);
-    willow_channel_try_send_i64(ch, 1);
-    assert_eq!(willow_channel_send_ready(ch), 0);
-    willow_channel_recv_i64(ch);
-    assert_eq!(willow_channel_send_ready(ch), 1);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_send_ready(ch) }, 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_try_send_i64(ch, 1) };
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_send_ready(ch) }, 0);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    unsafe { willow_channel_recv_i64(ch) };
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_send_ready(ch) }, 1);
 }
 
 #[test]
 fn bounded_unit_05_unbounded_send_ready_is_always_one() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let ch = willow_channel_new(0);
     for value in 0..64 {
-        assert_eq!(willow_channel_send_ready(ch), 1);
-        assert_eq!(willow_channel_try_send_i64(ch, value), 1);
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        assert_eq!(unsafe { willow_channel_send_ready(ch) }, 1);
+        // SAFETY: The constructor selected this channel element representation and the
+        // channel remains live during the send.
+        assert_eq!(unsafe { willow_channel_try_send_i64(ch, value) }, 1);
     }
-    assert_eq!(willow_channel_send_ready(ch), 1);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_send_ready(ch) }, 1);
 }
 
 #[test]
 fn bounded_unit_06_closed_full_channel_accepts_sends_as_noops() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let ch = willow_channel_new_bounded(0, 1);
-    willow_channel_try_send_i64(ch, 1);
-    willow_channel_close(ch);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_try_send_i64(ch, 1) };
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    unsafe { willow_channel_close(ch) };
     // Send-on-closed is a documented no-op, so it must never report FULL:
     // that would park a producer nobody is going to wake.
-    assert_eq!(willow_channel_send_ready(ch), 1);
-    assert_eq!(willow_channel_try_send_i64(ch, 2), 1);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_send_ready(ch) }, 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_i64(ch, 2) }, 1);
     assert_eq!(queued(ch), 1);
 }
 
 #[test]
 fn bounded_unit_07_close_drains_send_waiters() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
     let ch = willow_channel_new_bounded(0, 1);
-    willow_channel_try_send_i64(ch, 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_try_send_i64(ch, 1) };
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     unsafe { channel_from_raw(ch) }
         .unwrap()
         .state
@@ -703,7 +859,8 @@ fn bounded_unit_07_close_drains_send_waiters() {
         .send_waiters
         .register(task);
     register_existing_test_ownership(task, ch);
-    willow_channel_close(ch);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    unsafe { willow_channel_close(ch) };
     assert!(
         send_waiter_ids(ch).is_empty(),
         "close must wake every parked producer"
@@ -714,7 +871,9 @@ fn bounded_unit_07_close_drains_send_waiters() {
 #[test]
 fn bounded_unit_08_recv_wakes_exactly_one_send_waiter() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     crate::scheduler::reset_global_scheduler_for_test();
     let (first, second) = crate::scheduler::with_global_for_test(|sched| {
         (
@@ -723,8 +882,11 @@ fn bounded_unit_08_recv_wakes_exactly_one_send_waiter() {
         )
     });
     let ch = willow_channel_new_bounded(0, 1);
-    willow_channel_try_send_i64(ch, 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_try_send_i64(ch, 1) };
     {
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let mut state = unsafe { channel_from_raw(ch) }
             .unwrap()
             .state
@@ -736,7 +898,8 @@ fn bounded_unit_08_recv_wakes_exactly_one_send_waiter() {
     register_existing_test_ownership(first, ch);
     register_existing_test_ownership(second, ch);
 
-    assert_eq!(willow_channel_recv_i64(ch), 1);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_i64(ch) }, 1);
     assert_eq!(
         send_waiter_ids(ch),
         vec![second],
@@ -767,7 +930,9 @@ fn bounded_unit_08_recv_wakes_exactly_one_send_waiter() {
 #[test]
 fn bounded_unit_09_select_defection_compensates_the_wake_one_handoff() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     crate::scheduler::reset_global_scheduler_for_test();
     let (first, second) = crate::scheduler::with_global_for_test(|sched| {
         (
@@ -776,14 +941,18 @@ fn bounded_unit_09_select_defection_compensates_the_wake_one_handoff() {
         )
     });
     let ch = willow_channel_new_bounded(0, 1);
-    assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_i64(ch, 1) }, 1);
     for task in [first, second] {
         crate::scheduler::with_current_task_for_test(task, || {
-            assert_eq!(willow_channel_send_ready(ch), 0);
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            assert_eq!(unsafe { willow_channel_send_ready(ch) }, 0);
         });
     }
 
-    assert_eq!(willow_channel_recv_i64(ch), 1);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_i64(ch) }, 1);
     crate::scheduler::with_global_for_test(|sched| {
         assert_eq!(
             sched.task_state(first),
@@ -798,7 +967,8 @@ fn bounded_unit_09_select_defection_compensates_the_wake_one_handoff() {
     // The first select re-probes, but another arm wins. Its unregister
     // must pass the still-empty slot to the second producer.
     crate::scheduler::with_current_task_for_test(first, || {
-        willow_channel_unregister_waiter(ch);
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        unsafe { willow_channel_unregister_waiter(ch) };
     });
     crate::scheduler::with_global_for_test(|sched| {
         assert_eq!(
@@ -822,7 +992,9 @@ fn bounded_unit_10_cancelled_handoff_wakes_the_next_producer() {
     // would race to claim and complete that placeholder before the run loop
     // notices its target is done.
     let _single_worker = crate::scheduler::single_worker_for_test();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     crate::scheduler::reset_global_scheduler_for_test();
     let (first, second) = crate::scheduler::with_global_for_test(|sched| {
         (
@@ -831,14 +1003,18 @@ fn bounded_unit_10_cancelled_handoff_wakes_the_next_producer() {
         )
     });
     let ch = willow_channel_new_bounded(0, 1);
-    assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_i64(ch, 1) }, 1);
     for task in [first, second] {
         crate::scheduler::with_current_task_for_test(task, || {
-            assert_eq!(willow_channel_send_ready(ch), 0);
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            assert_eq!(unsafe { willow_channel_send_ready(ch) }, 0);
         });
     }
 
-    assert_eq!(willow_channel_recv_i64(ch), 1);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_i64(ch) }, 1);
     crate::scheduler::willow_sched_cancel(first);
     assert_eq!(
         crate::scheduler::willow_sched_run_until(first),
@@ -863,34 +1039,48 @@ fn bounded_unit_10_cancelled_handoff_wakes_the_next_producer() {
 #[test]
 fn bounded_unit_11_successful_retry_consumes_the_handoff_reference() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_parked_placeholder());
     let ch = willow_channel_new_bounded(0, 1);
-    assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_i64(ch, 1) }, 1);
     crate::scheduler::with_current_task_for_test(task, || {
-        assert_eq!(willow_channel_send_ready(ch), 0);
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        assert_eq!(unsafe { willow_channel_send_ready(ch) }, 0);
     });
 
-    assert_eq!(willow_channel_recv_i64(ch), 1);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_i64(ch) }, 1);
     crate::scheduler::with_current_task_for_test(task, || {
-        assert_eq!(willow_channel_try_send_i64(ch, 2), 1);
+        // SAFETY: The constructor selected this channel element representation and the
+        // channel remains live during the send.
+        assert_eq!(unsafe { willow_channel_try_send_i64(ch, 2) }, 1);
     });
     assert!(
         crate::scheduler::take_channel_waits(task).is_empty(),
         "a successful retry consumed the send handoff"
     );
-    assert_eq!(willow_channel_recv_i64(ch), 2);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_i64(ch) }, 2);
 }
 
 #[test]
 fn bounded_unit_12_purge_clears_send_waiters_too() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
     let ch = willow_channel_new_bounded(0, 1);
-    willow_channel_try_send_i64(ch, 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_try_send_i64(ch, 1) };
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     unsafe { channel_from_raw(ch) }
         .unwrap()
         .state
@@ -909,11 +1099,16 @@ fn bounded_unit_12_purge_clears_send_waiters_too() {
 #[test]
 fn bounded_unit_13_unregister_waiter_clears_send_side() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
     let ch = willow_channel_new_bounded(0, 1);
-    willow_channel_try_send_i64(ch, 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_try_send_i64(ch, 1) };
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     unsafe { channel_from_raw(ch) }
         .unwrap()
         .state
@@ -923,7 +1118,8 @@ fn bounded_unit_13_unregister_waiter_clears_send_side() {
         .register(task);
     register_existing_test_ownership(task, ch);
     crate::scheduler::with_current_task_for_test(task, || {
-        willow_channel_unregister_waiter(ch);
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        unsafe { willow_channel_unregister_waiter(ch) };
     });
     assert!(
         send_waiter_ids(ch).is_empty(),
@@ -934,13 +1130,27 @@ fn bounded_unit_13_unregister_waiter_clears_send_side() {
 #[test]
 fn bounded_unit_14_ptr_elements_are_traced_while_buffer_is_full() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let ch = willow_channel_new_bounded(1, 1);
     let text = "queued";
-    let value = crate::string::willow_string_alloc(text.as_ptr(), text.len() as i64);
-    assert_eq!(willow_channel_try_send_ptr(ch, value as *mut c_void), 1);
-    assert_eq!(willow_channel_try_send_ptr(ch, value as *mut c_void), 0);
+
+    let value = crate::string::willow_string_from_str(text);
+    assert_eq!(
+        // SAFETY: The constructor selected this channel element representation and the channel
+        // remains live during the send.
+        unsafe { willow_channel_try_send_ptr(ch, value as *mut c_void) },
+        1
+    );
+    assert_eq!(
+        // SAFETY: The constructor selected this channel element representation and the channel
+        // remains live during the send.
+        unsafe { willow_channel_try_send_ptr(ch, value as *mut c_void) },
+        0
+    );
     let mut slots: Vec<*mut *mut u8> = Vec::new();
+    // SAFETY: The test retains the channel and its populated trace slots through this scan.
     unsafe { trace_channel(ch as *mut u8, &mut slots) };
     assert_eq!(slots.len(), 1, "the queued pointer must be a traced slot");
 }
@@ -948,22 +1158,36 @@ fn bounded_unit_14_ptr_elements_are_traced_while_buffer_is_full() {
 #[test]
 fn bounded_unit_15_bool_and_f64_elements_respect_capacity() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let flags = willow_channel_new_bounded(0, 1);
-    assert_eq!(willow_channel_try_send_bool(flags, 1), 1);
-    assert_eq!(willow_channel_try_send_bool(flags, 0), 0);
-    assert_eq!(willow_channel_recv_bool(flags), 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_bool(flags, 1) }, 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_bool(flags, 0) }, 0);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_bool(flags) }, 1);
 
     let reals = willow_channel_new_bounded(0, 1);
-    assert_eq!(willow_channel_try_send_f64(reals, 1.5), 1);
-    assert_eq!(willow_channel_try_send_f64(reals, 2.5), 0);
-    assert_eq!(willow_channel_recv_f64(reals), 1.5);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_f64(reals, 1.5) }, 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_f64(reals, 2.5) }, 0);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_f64(reals) }, 1.5);
 }
 
 #[test]
 fn bounded_unit_16_stale_head_does_not_swallow_the_single_wake() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     crate::scheduler::reset_global_scheduler_for_test();
     let (stale, live) = crate::scheduler::with_global_for_test(|sched| {
         let stale = sched.spawn_parked_placeholder();
@@ -972,8 +1196,11 @@ fn bounded_unit_16_stale_head_does_not_swallow_the_single_wake() {
         (stale, live)
     });
     let ch = willow_channel_new_bounded(0, 1);
-    assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_i64(ch, 1) }, 1);
     {
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let mut state = unsafe { channel_from_raw(ch) }
             .unwrap()
             .state
@@ -985,7 +1212,8 @@ fn bounded_unit_16_stale_head_does_not_swallow_the_single_wake() {
     // Terminal metadata refuses installation; queue entry deliberately remains stale.
     register_existing_test_ownership(live, ch);
 
-    assert_eq!(willow_channel_recv_i64(ch), 1);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_i64(ch) }, 1);
     while deferred::drive_for_test() != 0 {}
     assert!(
         send_waiter_ids(ch).is_empty(),
@@ -1165,15 +1393,19 @@ fn wq_10_compaction_preserves_live_waiters_and_order() {
 #[test]
 fn wq_11_recv_ready_registers_each_task_once() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
     crate::scheduler::with_global_for_test(|sched| sched.set_running(task));
 
     let raw = willow_channel_new(0);
     for _ in 0..1_000 {
-        assert_eq!(willow_channel_recv_ready(raw), 0);
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        assert_eq!(unsafe { willow_channel_recv_ready(raw) }, 0);
     }
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let state = unsafe { channel_from_raw(raw) }
         .unwrap()
         .state
@@ -1194,18 +1426,26 @@ fn wq_11_recv_ready_registers_each_task_once() {
 #[test]
 fn wq_12_send_ready_registers_each_producer_once() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
     crate::scheduler::with_global_for_test(|sched| sched.set_running(task));
 
     let raw = willow_channel_new_bounded(0, 1);
-    assert_eq!(willow_channel_try_send_i64(raw, 1), 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_i64(raw, 1) }, 1);
     for _ in 0..1_000 {
-        assert_eq!(willow_channel_send_ready(raw), 0);
-        assert_eq!(willow_channel_try_send_i64(raw, 2), 0);
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        assert_eq!(unsafe { willow_channel_send_ready(raw) }, 0);
+        // SAFETY: The constructor selected this channel element representation and the
+        // channel remains live during the send.
+        assert_eq!(unsafe { willow_channel_try_send_i64(raw, 2) }, 0);
     }
     assert_eq!(send_waiter_ids(raw), vec![task]);
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let state = unsafe { channel_from_raw(raw) }
         .unwrap()
         .state
@@ -1224,14 +1464,19 @@ fn wq_12_send_ready_registers_each_producer_once() {
 #[test]
 fn wq_13_purge_task_clears_both_queues() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     crate::scheduler::reset_global_scheduler_for_test();
     let (victim, other) = crate::scheduler::with_global_for_test(|sched| {
         (sched.spawn_placeholder(), sched.spawn_parked_placeholder())
     });
     let raw = willow_channel_new_bounded(0, 1);
-    assert_eq!(willow_channel_try_send_i64(raw, 1), 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    assert_eq!(unsafe { willow_channel_try_send_i64(raw, 1) }, 1);
     {
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let mut state = unsafe { channel_from_raw(raw) }
             .unwrap()
             .state
@@ -1247,6 +1492,7 @@ fn wq_13_purge_task_clears_both_queues() {
 
     purge_task(victim);
 
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let state = unsafe { channel_from_raw(raw) }
         .unwrap()
         .state
@@ -1262,11 +1508,14 @@ fn wq_13_purge_task_clears_both_queues() {
 #[test]
 fn wq_14_unregister_waiter_clears_both_queues_and_reverse_reference() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     crate::scheduler::reset_global_scheduler_for_test();
     let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
     let raw = willow_channel_new_bounded(0, 1);
     {
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let mut state = unsafe { channel_from_raw(raw) }
             .unwrap()
             .state
@@ -1278,9 +1527,11 @@ fn wq_14_unregister_waiter_clears_both_queues_and_reverse_reference() {
     register_existing_test_ownership(task, raw);
 
     crate::scheduler::with_global_for_test(|sched| sched.set_running(task));
-    willow_channel_unregister_waiter(raw);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    unsafe { willow_channel_unregister_waiter(raw) };
     crate::scheduler::with_global_for_test(|sched| sched.clear_running());
 
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let state = unsafe { channel_from_raw(raw) }
         .unwrap()
         .state
@@ -1295,7 +1546,9 @@ fn wq_14_unregister_waiter_clears_both_queues_and_reverse_reference() {
 #[test]
 fn wq_15_close_wakes_a_dual_registered_task_once() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     crate::scheduler::reset_global_scheduler_for_test();
     // A select with a recv case AND a send case on the same channel parks
     // the task on both queues; close must retain ownership on other channels.
@@ -1307,6 +1560,7 @@ fn wq_15_close_wakes_a_dual_registered_task_once() {
     let raw = willow_channel_new_bounded(0, 1);
     let other = willow_channel_new(0);
     {
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let mut state = unsafe { channel_from_raw(raw) }
             .unwrap()
             .state
@@ -1317,6 +1571,7 @@ fn wq_15_close_wakes_a_dual_registered_task_once() {
     }
     register_existing_test_ownership(task, raw);
     let other_owner = {
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let mut state = unsafe { channel_from_raw(other) }
             .unwrap()
             .state
@@ -1336,7 +1591,7 @@ fn wq_15_close_wakes_a_dual_registered_task_once() {
     };
     let before = crate::scheduler::with_global_for_test(|sched| {
         sched
-            .with_task_mut(task, |task| task.wait_channels().to_vec())
+            .with_task(task, |task| task.wait_channels().to_vec())
             .unwrap()
     });
     assert_eq!(
@@ -1349,7 +1604,8 @@ fn wq_15_close_wakes_a_dual_registered_task_once() {
         "other ownership must exist before close"
     );
 
-    willow_channel_close(raw);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    unsafe { willow_channel_close(raw) };
 
     assert_eq!(
         crate::scheduler::take_channel_waits(task),
@@ -1367,21 +1623,30 @@ fn ready_select_cleanup_does_not_relock_empty_wait_queues() {
     let owner = crate::scheduler::with_global_for_test(|s| s.spawn_parked_placeholder());
     let channels = std::array::from_fn::<_, 4, _>(|_| willow_channel_new_bounded(0, 1));
     for raw in channels {
-        willow_channel_send_i64(raw, 1);
+        // SAFETY: The constructor selected this channel element representation and the
+        // channel remains live during the send.
+        unsafe { willow_channel_send_i64(raw, 1) };
     }
     for messages in [1_000, 10_000, 100_000, 1_000_000] {
         CHANNEL_RESERVE_LOCKS.store(0, Ordering::Relaxed);
         crate::scheduler::with_current_task_for_test(owner, || {
             for message in 0..messages {
                 for raw in channels {
-                    assert_eq!(willow_channel_recv_ready(raw), 1);
+                    // SAFETY: The handle is null or the live channel retained for this
+                    // operation.
+                    assert_eq!(unsafe { willow_channel_recv_ready(raw) }, 1);
                 }
                 let winner = channels[message % channels.len()];
                 for raw in channels {
-                    willow_channel_select_cleanup(raw, winner, 0);
+                    // SAFETY: The handle is null or the live channel retained for this
+                    // operation.
+                    unsafe { willow_channel_select_cleanup(raw, winner, 0) };
                 }
-                assert_eq!(willow_channel_recv_i64(winner), 1);
-                willow_channel_send_i64(winner, 1);
+                // SAFETY: The handle is null or the live channel retained for this operation.
+                assert_eq!(unsafe { willow_channel_recv_i64(winner) }, 1);
+                // SAFETY: The constructor selected this channel element representation and
+                // the channel remains live during the send.
+                unsafe { willow_channel_send_i64(winner, 1) };
             }
         });
         let locks = CHANNEL_RESERVE_LOCKS.load(Ordering::Relaxed);
@@ -1402,24 +1667,35 @@ fn receive_select_retains_winner_and_compensates_losing_claim() {
     let b = willow_channel_new(0);
     for raw in [a, b] {
         crate::scheduler::with_current_task_for_test(owner, || {
-            assert_eq!(willow_channel_recv_ready(raw), 0)
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            assert_eq!(unsafe { willow_channel_recv_ready(raw) }, 0)
         });
     }
     crate::scheduler::with_current_task_for_test(peer, || {
-        assert_eq!(willow_channel_recv_ready(b), 0)
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        assert_eq!(unsafe { willow_channel_recv_ready(b) }, 0)
     });
-    willow_channel_send_i64(a, 1);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_send_i64(a, 1) };
     // A wake already made owner runnable: readiness claims B directly.
-    willow_channel_send_i64(b, 2);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_send_i64(b, 2) };
     crate::scheduler::with_current_task_for_test(owner, || {
         // If B's queued wait lost the wake race, the peer owns B instead.
-        willow_channel_select_cleanup(b, a, 0);
-        willow_channel_select_cleanup(a, a, 0);
-        assert_eq!(willow_channel_recv_i64(a), 1);
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        unsafe {
+            willow_channel_select_cleanup(b, a, 0);
+            willow_channel_select_cleanup(a, a, 0);
+        }
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        assert_eq!(unsafe { willow_channel_recv_i64(a) }, 1);
     });
     assert!(expected_test_ownership(owner, b).is_empty());
     crate::scheduler::with_current_task_for_test(peer, || {
-        assert_eq!(willow_channel_recv_i64(b), 2)
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        assert_eq!(unsafe { willow_channel_recv_i64(b) }, 2)
     });
 }
 
@@ -1433,12 +1709,17 @@ fn close_preserves_reserved_value_and_cancel_reoffers_it() {
     let raw = willow_channel_new(0);
     for task in [first, second] {
         crate::scheduler::with_current_task_for_test(task, || {
-            assert_eq!(willow_channel_recv_ready(raw), 0)
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            assert_eq!(unsafe { willow_channel_recv_ready(raw) }, 0)
         });
     }
-    willow_channel_send_i64(raw, 8);
-    willow_channel_close(raw);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_send_i64(raw, 8) };
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    unsafe { willow_channel_close(raw) };
     {
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let mut state = unsafe { channel_from_raw(raw) }
             .unwrap()
             .state
@@ -1449,7 +1730,8 @@ fn close_preserves_reserved_value_and_cancel_reoffers_it() {
     }
     purge_task(first);
     crate::scheduler::with_current_task_for_test(second, || {
-        assert_eq!(willow_channel_recv_i64(raw), 8)
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        assert_eq!(unsafe { willow_channel_recv_i64(raw) }, 8)
     });
 }
 
@@ -1461,6 +1743,7 @@ fn stale_cleanup_cannot_erase_new_registration_or_other_role() {
     let raw = willow_channel_new_bounded(0, 1);
     let old;
     {
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let mut state = unsafe { channel_from_raw(raw) }
             .unwrap()
             .state
@@ -1517,13 +1800,16 @@ fn shared_channel_ten_and_hundred_thousand_sends_have_linear_wakes() {
         });
         for &task in &tasks {
             crate::scheduler::with_current_task_for_test(task, || {
-                assert_eq!(willow_channel_recv_ready(raw), 0)
+                // SAFETY: The handle is null or the live channel retained for this operation.
+                assert_eq!(unsafe { willow_channel_recv_ready(raw) }, 0)
             });
         }
         CHANNEL_WAKE_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
         let started = std::time::Instant::now();
         for value in 0..count {
-            willow_channel_send_i64(raw, value as i64);
+            // SAFETY: The constructor selected this channel element representation and the
+            // channel remains live during the send.
+            unsafe { willow_channel_send_i64(raw, value as i64) };
         }
         let elapsed = started.elapsed();
         assert_eq!(
@@ -1536,7 +1822,8 @@ fn shared_channel_ten_and_hundred_thousand_sends_have_linear_wakes() {
         );
         for (value, &task) in tasks.iter().enumerate() {
             crate::scheduler::with_current_task_for_test(task, || {
-                assert_eq!(willow_channel_recv_i64(raw), value as i64)
+                // SAFETY: The handle is null or the live channel retained for this operation.
+                assert_eq!(unsafe { willow_channel_recv_i64(raw) }, value as i64)
             });
         }
         eprintln!("shared channel: {count} waiters/sends, {count} wake attempts, {elapsed:?}");
@@ -1550,25 +1837,34 @@ fn same_channel_select_keeps_only_winning_direction() {
         crate::scheduler::reset_global_scheduler_for_test();
         let task = crate::scheduler::with_global_for_test(|s| s.spawn_placeholder());
         let raw = willow_channel_new_bounded(0, 2);
-        willow_channel_send_i64(raw, 4);
+        // SAFETY: The constructor selected this channel element representation and the
+        // channel remains live during the send.
+        unsafe { willow_channel_send_i64(raw, 4) };
         crate::scheduler::with_current_task_for_test(task, || {
-            assert_eq!(willow_channel_recv_ready(raw), 1);
-            assert_eq!(willow_channel_send_ready(raw), 1);
-            willow_channel_select_cleanup(raw, raw, direction);
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            assert_eq!(unsafe { willow_channel_recv_ready(raw) }, 1);
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            assert_eq!(unsafe { willow_channel_send_ready(raw) }, 1);
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            unsafe { willow_channel_select_cleanup(raw, raw, direction) };
             // Duplicate/aliased cleanup must be harmless.
-            willow_channel_select_cleanup(raw, raw, direction);
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            unsafe { willow_channel_select_cleanup(raw, raw, direction) };
             let owners = expected_test_ownership(task, raw);
             if direction == 0 {
                 assert_eq!(owners.len(), 1);
                 assert_eq!(owners[0].role, ChannelRole::RecvClaim);
-                assert_eq!(willow_channel_recv_i64(raw), 4);
+                // SAFETY: The handle is null or the live channel retained for this operation.
+                assert_eq!(unsafe { willow_channel_recv_i64(raw) }, 4);
             } else {
                 assert!(
                     !owners
                         .iter()
                         .any(|t| matches!(t.role, ChannelRole::RecvWait | ChannelRole::RecvClaim))
                 );
-                assert_eq!(willow_channel_try_send_i64(raw, 5), 1);
+                // SAFETY: The constructor selected this channel element representation and
+                // the channel remains live during the send.
+                assert_eq!(unsafe { willow_channel_try_send_i64(raw, 5) }, 1);
             }
         });
     }
@@ -1581,11 +1877,17 @@ fn simultaneous_claims_release_only_losing_channel() {
     let owner = crate::scheduler::with_global_for_test(|s| s.spawn_placeholder());
     let a = willow_channel_new(0);
     let b = willow_channel_new(0);
-    willow_channel_send_i64(a, 11);
-    willow_channel_send_i64(b, 22);
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe {
+        willow_channel_send_i64(a, 11);
+        willow_channel_send_i64(b, 22);
+    }
     crate::scheduler::with_current_task_for_test(owner, || {
-        assert_eq!(willow_channel_recv_ready(a), 1);
-        assert_eq!(willow_channel_recv_ready(b), 1);
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        assert_eq!(unsafe { willow_channel_recv_ready(a) }, 1);
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        assert_eq!(unsafe { willow_channel_recv_ready(b) }, 1);
         assert_eq!(
             expected_test_ownership(owner, a)[0].role,
             ChannelRole::RecvClaim
@@ -1594,17 +1896,24 @@ fn simultaneous_claims_release_only_losing_channel() {
             expected_test_ownership(owner, b)[0].role,
             ChannelRole::RecvClaim
         );
-        willow_channel_select_cleanup(b, a, 0);
-        willow_channel_select_cleanup(a, a, 0);
-        assert_eq!(willow_channel_recv_i64(a), 11);
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        unsafe {
+            willow_channel_select_cleanup(b, a, 0);
+            willow_channel_select_cleanup(a, a, 0);
+        }
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        assert_eq!(unsafe { willow_channel_recv_i64(a) }, 11);
     });
-    assert_eq!(willow_channel_recv_i64(b), 22);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    assert_eq!(unsafe { willow_channel_recv_i64(b) }, 22);
 }
 #[test]
 fn cancellation_tokens_follow_native_core_when_gc_wrappers_move() {
     let _guard = crate::gc::isolated_runtime();
     for count in [1, 32, 256] {
-        crate::gc::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::reset_internal_for_test() };
         crate::scheduler::reset_global_scheduler_for_test();
         let mut cases = Vec::new();
         for _ in 0..count {
@@ -1612,6 +1921,8 @@ fn cancellation_tokens_follow_native_core_when_gc_wrappers_move() {
             let original = willow_channel_new(0);
             let destination = willow_channel_new(0);
             for raw in [original, destination] {
+                // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC
+                // storage.
                 let channel = unsafe { channel_from_raw(raw) }.unwrap();
                 let mut state = channel.state.lock().unwrap();
                 state.waiters.register(task);
@@ -1628,6 +1939,7 @@ fn cancellation_tokens_follow_native_core_when_gc_wrappers_move() {
             // Model relocation of the GC wrapper without implementing or
             // enabling an evacuation protocol. Swap preserves both owners
             // and exactly-once native destruction at the existing GC slots.
+            // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
             unsafe {
                 std::ptr::swap(
                     original.cast::<WillowAbiChannel>(),
@@ -1662,13 +1974,17 @@ fn cancellation_tokens_follow_native_core_when_gc_wrappers_move() {
         );
     }
     crate::scheduler::reset_global_scheduler_for_test();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
 }
 
 #[test]
 fn native_channel_storage_counts_boxes_buffers_waiters_and_handoffs() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::willow_gc_init() };
     let baseline = crate::gc_telemetry::external_bytes();
     for count in [1, 32, 1024] {
         let channel = WillowAbiChannel::new(false);
@@ -1711,16 +2027,22 @@ fn native_channel_storage_counts_boxes_buffers_waiters_and_handoffs() {
 #[test]
 fn native_channel_gc_finalizer_and_reset_release_storage() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::willow_gc_init() };
     let baseline = crate::gc_telemetry::external_bytes();
     for reset in [false, true] {
         let channel = willow_channel_new(0);
         for value in 0..128 {
-            willow_channel_send_i64(channel, value);
+            // SAFETY: The constructor selected this channel element representation and the
+            // channel remains live during the send.
+            unsafe { willow_channel_send_i64(channel, value) };
         }
         assert!(crate::gc_telemetry::external_bytes() > baseline);
         if reset {
-            crate::gc::willow_gc_init();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { crate::gc::willow_gc_init() };
         } else {
             crate::gc::willow_gc_collect();
         }
@@ -1731,7 +2053,9 @@ fn native_channel_gc_finalizer_and_reset_release_storage() {
 #[test]
 fn native_table_tombstones_do_not_hide_growth_in_another_buffer() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::willow_gc_init() };
     let baseline = crate::gc_telemetry::external_bytes();
     let channel = WillowAbiChannel::new(false);
     {

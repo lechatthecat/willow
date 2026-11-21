@@ -68,6 +68,7 @@ impl Backend {
             events: WSA_POLL_READ | WSA_POLL_WRITE,
             revents: 0,
         }];
+        // SAFETY: The socket slice contains one initialized WSAPOLLFD per counted entry.
         let rc = unsafe { WSAPoll(probe.as_mut_ptr(), 1, 0) };
         if rc < 0 || probe[0].revents & WSA_POLL_NVAL != 0 {
             -1
@@ -146,6 +147,7 @@ pub(super) fn wait_windows_events(
         None => -1,
         Some(duration) => duration.as_millis().min(i32::MAX as u128) as i32,
     };
+    // SAFETY: The socket slice contains one initialized WSAPOLLFD per counted entry.
     let n = unsafe { WSAPoll(sockets.as_mut_ptr(), sockets.len() as u32, timeout_ms) };
     if n <= 0 {
         return Vec::new();

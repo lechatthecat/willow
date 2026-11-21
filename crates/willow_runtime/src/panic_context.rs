@@ -25,7 +25,24 @@ use crate::string::{willow_string_alloc, willow_string_as_str};
 /// offset 24: line: i64
 /// offset 32: column: i64
 /// ```
-pub const PANIC_INFO_PAYLOAD_SIZE: i64 = 40;
+#[repr(C)]
+struct PanicInfoPayload {
+    type_id: i64,
+    message: *mut u8,
+    file: *mut u8,
+    line: i64,
+    column: i64,
+}
+
+pub const PANIC_INFO_PAYLOAD_SIZE: i64 = size_of::<PanicInfoPayload>() as i64;
+const _: () = {
+    assert!(PANIC_INFO_PAYLOAD_SIZE == 40);
+    assert!(align_of::<PanicInfoPayload>() <= align_of::<crate::gc::GcHeader>());
+    assert!(std::mem::offset_of!(PanicInfoPayload, message) == 8);
+    assert!(std::mem::offset_of!(PanicInfoPayload, file) == 16);
+    assert!(std::mem::offset_of!(PanicInfoPayload, line) == 24);
+    assert!(std::mem::offset_of!(PanicInfoPayload, column) == 32);
+};
 const PANIC_INFO_REF_MASK: u64 = (1 << 1) | (1 << 2);
 
 #[derive(Debug, Clone)]
@@ -105,8 +122,14 @@ impl PanicContext {
         let record = PanicRecord {
             info: info as usize,
             call_stack: crate::stack_trace::panic_call_stack_text(
+                // SAFETY: The retained PanicInfo keeps its initialized fields live through this
+                // read.
                 unsafe { panic_info_file(info) },
+                // SAFETY: The retained PanicInfo keeps its initialized fields live through this
+                // read.
                 unsafe { panic_info_line(info) } as usize,
+                // SAFETY: The retained PanicInfo keeps its initialized fields live through this
+                // read.
                 unsafe { panic_info_column(info) } as usize,
             ),
             async_stack: crate::scheduler::async_chain_text(),
@@ -167,7 +190,9 @@ impl PanicContext {
             true
         };
         if removed {
-            willow_gc_remove_runtime_root(info);
+            // SAFETY: The runtime keeps this nonmoving payload at its registered address
+            // through removal.
+            unsafe { willow_gc_remove_runtime_root(info) };
         }
         removed
     }
@@ -199,7 +224,9 @@ impl Drop for PanicContext {
             .map(|record| record.info)
             .chain(state.returned_roots.drain(..))
         {
-            willow_gc_remove_runtime_root(info as *mut u8);
+            // SAFETY: The runtime keeps this nonmoving payload at its registered address
+            // through removal.
+            unsafe { willow_gc_remove_runtime_root(info as *mut u8) };
         }
     }
 }
@@ -251,7 +278,8 @@ fn alloc_string_or_empty(input: *const u8, fallback: &str) -> *mut u8 {
     if !input.is_null() {
         return input as *mut u8;
     }
-    willow_string_alloc(fallback.as_ptr(), fallback.len() as i64)
+    // SAFETY: The native input remains readable for its full byte length through the copy.
+    unsafe { willow_string_alloc(fallback.as_ptr(), fallback.len() as i64) }
 }
 
 fn alloc_panic_info(message: *const u8, file: *const u8, line: i64, column: i64) -> *mut u8 {
@@ -269,31 +297,51 @@ fn alloc_panic_info(message: *const u8, file: *const u8, line: i64, column: i64)
     if info.is_null() {
         fatal_invariant("PanicInfo allocation failed");
     }
+    // SAFETY: this fresh GC allocation has the size and alignment of PanicInfoPayload.
+    // Initialize its scalar words directly and publish both traced fields via the barrier.
     unsafe {
-        *(info as *mut i64) = 0;
-        for (offset, value) in [(8, message.load()), (16, file.load())] {
+        let fields = info.cast::<PanicInfoPayload>();
+        (*fields).type_id = 0;
+        for (slot, value) in [
+            (&raw mut (*fields).message, message.load()),
+            (&raw mut (*fields).file, file.load()),
+        ] {
             crate::gc::willow_gc_write_barrier(
                 info,
                 std::ptr::null_mut(),
                 value,
                 crate::gc::GcStoreDestination::ObjectField as i64,
             );
-            crate::gc::store_gc_reference(info.add(offset).cast(), value);
+            crate::gc::store_gc_reference(slot, value);
         }
-        *(info.add(24) as *mut i64) = line.max(0);
-        *(info.add(32) as *mut i64) = column.max(0);
+        (*fields).line = line.max(0);
+        (*fields).column = column.max(0);
     }
-    willow_gc_add_runtime_root(info);
+    // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+    // removal.
+    unsafe { willow_gc_add_runtime_root(info) };
     info
 }
 
 /// Raise a recoverable user-visible language fault from a Rust runtime helper.
 /// The helper must return an ABI-neutral value immediately afterwards; it must
 /// never continue the failed operation. `file` is an optional Willow String.
-pub(crate) fn raise_language_message_at(message: &str, file: *const u8, line: i64, column: i64) {
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
+pub(crate) unsafe fn raise_language_message_at(
+    message: &str,
+    file: *const u8,
+    line: i64,
+    column: i64,
+) {
     let rooted_file = crate::gc::GcRootHandle::new(file as *mut u8);
     let message = crate::string::willow_string_from_str(message);
-    willow_panic_raise(message, rooted_file.load(), line, column);
+    // SAFETY: The optional source file is null or a current Willow string and the panic path
+    // roots its string inputs before allocation.
+    unsafe { willow_panic_raise(message, rooted_file.load(), line, column) };
 }
 
 /// Raise a runtime fault that has no location of its own (array bounds, a
@@ -303,12 +351,17 @@ pub(crate) fn raise_language_message_at(message: &str, file: *const u8, line: i6
 pub(crate) fn raise_language_message(message: &str) {
     let (file, line, column) = current_fault_site();
     if file.is_empty() {
-        raise_language_message_at(message, std::ptr::null(), line, column);
+        // SAFETY: The optional source file is null or a current Willow string and the panic
+        // path roots its string inputs before allocation.
+        unsafe { raise_language_message_at(message, std::ptr::null(), line, column) };
         return;
     }
     let file_string =
-        crate::gc::GcRootHandle::new(willow_string_alloc(file.as_ptr(), file.len() as i64));
-    raise_language_message_at(message, file_string.load(), line, column);
+        // SAFETY: The native input remains readable for its full byte length through the copy.
+        crate::gc::GcRootHandle::new(unsafe { willow_string_alloc(file.as_ptr(), file.len() as i64) });
+    // SAFETY: The optional source file is null or a current Willow string and the panic path
+    // roots its string inputs before allocation.
+    unsafe { raise_language_message_at(message, file_string.load(), line, column) };
 }
 
 /// File of the published fault site. Generated code publishes its static
@@ -358,12 +411,23 @@ pub(crate) fn set_static_fault_site(site: crate::stack_trace::TraceSite) {
 /// pointer to raw UTF-8 bytes (NOT a Willow String) with an explicit length,
 /// copied onto the Rust heap so the fault site never allocates on the GC heap.
 /// Generated code publishes through `willow_trace_site_set` instead.
+///
+/// # Safety
+/// For each non-null pointer with a positive length, its allocation must contain that many
+/// initialized, readable bytes, immutable through the synchronous copy.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_fault_site_set(file: *const u8, file_len: i64, line: i64, column: i64) {
+pub unsafe extern "C" fn willow_fault_site_set(
+    file: *const u8,
+    file_len: i64,
+    line: i64,
+    column: i64,
+) {
     let file = if file.is_null() || file_len <= 0 {
         String::new()
     } else {
+        // SAFETY: The generated fault-site ABI supplies file_len readable filename bytes for this
+        // call.
         String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(file, file_len as usize) })
             .into_owned()
     };
@@ -396,9 +460,19 @@ pub(crate) fn panic_unwind_cleanup_active() -> bool {
 /// Push a recoverable language panic onto the current execution context.
 /// Unlike the legacy `willow_panic` entry, this returns to compiler-generated
 /// propagation code and never invokes host unwinding.
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_panic_raise(message: *const u8, file: *const u8, line: i64, column: i64) {
+pub unsafe extern "C" fn willow_panic_raise(
+    message: *const u8,
+    file: *const u8,
+    line: i64,
+    column: i64,
+) {
     let context = require_current_context();
     let info = alloc_panic_info(message, file, line, column);
     context.push(info);
@@ -505,9 +579,13 @@ pub(crate) fn finish_unhandled_with_async_chain(async_chain: &str) -> ! {
         .unwrap_or(async_chain);
     for (index, record) in records.iter().rev().enumerate() {
         let info = record.info as *mut u8;
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         let message = unsafe { panic_info_message(info) };
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         let file = unsafe { panic_info_file(info) };
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         let line = unsafe { panic_info_line(info) };
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         let column = unsafe { panic_info_column(info) };
         if index == 0 {
             if file.is_empty() {
@@ -534,27 +612,37 @@ pub(crate) fn finish_unhandled_with_async_chain(async_chain: &str) -> ! {
 }
 
 /// # Safety
-/// `info` must be a live `PanicInfo` payload allocated by this module.
-pub unsafe fn panic_info_message(info: *mut u8) -> &'static str {
-    unsafe { willow_string_as_str(*(info.add(8) as *mut *mut u8)) }
+/// `info` must be a live `PanicInfo` allocated by this module. Its message
+/// string must stay alive and at the same address throughout the borrow.
+pub unsafe fn panic_info_message<'a>(info: *mut u8) -> &'a str {
+    // SAFETY: The caller retains this PanicInfo. Its GC allocation meets PanicInfoPayload's
+    // checked size and alignment.
+    unsafe { willow_string_as_str((*info.cast::<PanicInfoPayload>()).message) }
 }
 
 /// # Safety
-/// `info` must be a live `PanicInfo` payload allocated by this module.
-pub unsafe fn panic_info_file(info: *mut u8) -> &'static str {
-    unsafe { willow_string_as_str(*(info.add(16) as *mut *mut u8)) }
+/// `info` must be a live `PanicInfo` allocated by this module. Its file
+/// string must stay alive and at the same address throughout the borrow.
+pub unsafe fn panic_info_file<'a>(info: *mut u8) -> &'a str {
+    // SAFETY: The caller retains this PanicInfo. Its GC allocation meets PanicInfoPayload's
+    // checked size and alignment.
+    unsafe { willow_string_as_str((*info.cast::<PanicInfoPayload>()).file) }
 }
 
 /// # Safety
 /// `info` must be a live `PanicInfo` payload allocated by this module.
 pub unsafe fn panic_info_line(info: *mut u8) -> i64 {
-    unsafe { *(info.add(24) as *mut i64) }
+    // SAFETY: The caller retains this PanicInfo. Its GC allocation meets PanicInfoPayload's
+    // checked size and alignment.
+    unsafe { (*info.cast::<PanicInfoPayload>()).line }
 }
 
 /// # Safety
 /// `info` must be a live `PanicInfo` payload allocated by this module.
 pub unsafe fn panic_info_column(info: *mut u8) -> i64 {
-    unsafe { *(info.add(32) as *mut i64) }
+    // SAFETY: The caller retains this PanicInfo. Its GC allocation meets PanicInfoPayload's
+    // checked size and alignment.
+    unsafe { (*info.cast::<PanicInfoPayload>()).column }
 }
 
 #[cfg(test)]
@@ -607,7 +695,9 @@ mod tests {
             return;
         }
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         reset_global_scheduler_for_test();
         unsafe extern "C" fn poll(frame: *mut std::ffi::c_void) -> i32 {
             let id = willow_sched_current_task();
@@ -627,7 +717,12 @@ mod tests {
             };
             REPORT_OBSERVER.with(|observer| {
                 *observer.borrow_mut() = Some(Box::new(move || {
-                    assert_eq!(frame_terminal_status(frame), WILLOW_FRAME_STATUS_PANICKED);
+                    assert_eq!(
+                        // SAFETY: The frame owner retains the initialized ABI status word through
+                        // this atomic access.
+                        unsafe { frame_terminal_status(frame) },
+                        WILLOW_FRAME_STATUS_PANICKED
+                    );
                     assert_eq!(willow_sched_task_state(id), -1);
                     assert_eq!(willow_sched_heavy_task_count(), 0);
                     assert_eq!(willow_sched_queue_entry_count(), 0);
@@ -644,7 +739,9 @@ mod tests {
             crate::task::RUNTIME_POLL_PANICKED
         }
         let frame = willow_async_frame_alloc(0, 0);
-        let id = willow_sched_spawn_cooperative(poll, frame) as u64;
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        let id = (unsafe { willow_sched_spawn_cooperative(poll, frame) }) as u64;
         willow_sched_run_until(id);
         panic!("unhandled task panic returned");
     }
@@ -668,7 +765,8 @@ mod tests {
     }
 
     fn ws(value: &str) -> *mut u8 {
-        willow_string_alloc(value.as_ptr(), value.len() as i64)
+        // SAFETY: The native input remains readable for its full byte length through the copy.
+        unsafe { willow_string_alloc(value.as_ptr(), value.len() as i64) }
     }
 
     fn raise(message: &str, file: &str, line: i64, column: i64) {
@@ -676,10 +774,16 @@ mod tests {
         // WILLOW_GC_STRESS=alloc; model generated call-argument rooting rather
         // than leaving the first raw pointer unprotected in the fixture.
         let mut message = ws(message);
-        willow_push_root(&mut message);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut message) };
         let file = ws(file);
-        willow_panic_raise(message, file, line, column);
-        willow_pop_roots(1);
+        // SAFETY: The optional source file is null or a current Willow string and the panic
+        // path roots its string inputs before allocation.
+        unsafe { willow_panic_raise(message, file, line, column) };
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
     }
 
     fn recover_one() -> *mut u8 {
@@ -692,7 +796,9 @@ mod tests {
     #[test]
     fn panic_info_roots_supplied_file_before_message_fallback() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         struct RestoreStress;
         impl Drop for RestoreStress {
             fn drop(&mut self) {
@@ -705,15 +811,21 @@ mod tests {
         let depth = crate::gc::willow_root_depth();
         let info = alloc_panic_info(std::ptr::null(), file, 7, 9);
         assert_eq!(crate::gc::willow_root_depth(), depth);
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_message(info) }, "explicit panic");
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_file(info) }, "fallback.wi");
-        willow_gc_remove_runtime_root(info);
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { willow_gc_remove_runtime_root(info) };
     }
 
     #[test]
     fn depth_matches_nested_recovery_and_context_swaps() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _restore = ContextTestGuard::install(240);
         let first = current_context().unwrap();
         let second = Arc::new(PanicContext::new(241));
@@ -754,7 +866,9 @@ mod tests {
     #[test]
     fn generated_depth_tracks_active_context_lifetime_and_nested_recovery() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let generated = crate::generated_context::Context::new();
         generated.refresh();
         struct Restore(*const crate::generated_context::Context);
@@ -789,7 +903,9 @@ mod tests {
     #[test]
     fn shared_context_depth_tracks_another_threads_mutations() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _restore = ContextTestGuard::install(242);
         let context = current_context().unwrap();
         raise("shared", "", 0, 0);
@@ -823,13 +939,17 @@ mod tests {
     #[test]
     fn array_dynamic_lengths_preserve_recoverable_panics() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(30);
         for len in [-1, i64::MIN, i64::MAX] {
-            let array = crate::array::willow_array_new(std::hint::black_box(len), 0);
+            // SAFETY: Flag 0 selects untraced word storage.
+            let array = unsafe { crate::array::willow_array_new(std::hint::black_box(len), 0) };
             assert!(array.is_null());
             assert_eq!(willow_panic_depth(), 1);
             let info = recover_one();
+            // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
             let message = unsafe { panic_info_message(info) };
             assert!(
                 message.contains(if len < 0 {
@@ -843,8 +963,12 @@ mod tests {
             assert_eq!(willow_panic_depth(), 0);
         }
         for len in [0, 1, 64, 1000] {
-            let array = crate::array::willow_array_new(std::hint::black_box(len), 0);
-            assert_eq!(crate::array::willow_array_len(array), len);
+            // SAFETY: The constructor selects scalar word storage. This fixture uses the
+            // resulting handle before any collection.
+            unsafe {
+                let array = crate::array::willow_array_new(std::hint::black_box(len), 0);
+                assert_eq!(crate::array::willow_array_len(array), len);
+            }
             assert_eq!(willow_panic_depth(), 0);
         }
     }
@@ -852,7 +976,9 @@ mod tests {
     #[test]
     fn panic_context_01_normal_path_is_inactive_and_recover_is_null() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(1);
         let before = willow_gc_allocated_bytes();
         assert_eq!(willow_panic_active(), 0);
@@ -863,14 +989,20 @@ mod tests {
     #[test]
     fn panic_context_02_raise_records_all_fields() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(2);
         raise("boom", "main.wi", 7, 9);
         assert_eq!(willow_panic_active(), 1);
         let info = recover_one();
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_message(info) }, "boom");
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_file(info) }, "main.wi");
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_line(info) }, 7);
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_column(info) }, 9);
         willow_panic_release_recovered(info);
     }
@@ -878,7 +1010,9 @@ mod tests {
     #[test]
     fn panic_context_03_recover_requires_panic_defer_depth() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(3);
         raise("boom", "", 0, 0);
         assert!(willow_panic_recover().is_null());
@@ -891,7 +1025,9 @@ mod tests {
     #[test]
     fn panic_context_04_one_record_can_only_be_recovered_once() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(4);
         raise("once", "", 0, 0);
         let info = recover_one();
@@ -903,14 +1039,18 @@ mod tests {
     #[test]
     fn panic_context_05_nested_recover_pops_only_the_top_record() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(5);
         raise("outer", "", 0, 0);
         raise("inner", "", 0, 0);
         let inner = recover_one();
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_message(inner) }, "inner");
         assert_eq!(willow_panic_active(), 1);
         let outer = recover_one();
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_message(outer) }, "outer");
         assert_eq!(willow_panic_active(), 0);
         willow_panic_release_recovered(inner);
@@ -920,7 +1060,9 @@ mod tests {
     #[test]
     fn panic_context_06_defer_depth_is_checked_and_nested() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(6);
         willow_panic_enter_defer();
         willow_panic_enter_defer();
@@ -933,13 +1075,17 @@ mod tests {
     #[test]
     fn panic_context_07_active_info_survives_minor_and_major_gc() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(7);
         raise("rooted message", "rooted.wi", 11, 12);
         crate::gc::minor_collect_internal();
         willow_gc_collect();
         let info = recover_one();
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_message(info) }, "rooted message");
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_file(info) }, "rooted.wi");
         willow_panic_release_recovered(info);
     }
@@ -947,23 +1093,33 @@ mod tests {
     #[test]
     fn panic_context_08_recovered_transfer_root_survives_collection() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(8);
         raise("transferred", "", 0, 0);
         let mut info = recover_one();
         willow_gc_collect();
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_message(info) }, "transferred");
-        willow_push_root(&mut info);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut info) };
         willow_panic_release_recovered(info);
         willow_gc_collect();
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_message(info) }, "transferred");
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
     }
 
     #[test]
     fn panic_context_09_contexts_are_isolated_on_one_thread() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let first = Arc::new(PanicContext::new(91));
         let second = Arc::new(PanicContext::new(92));
         let previous = replace_current_context(Some(Arc::clone(&first)));
@@ -984,7 +1140,9 @@ mod tests {
     #[test]
     fn panic_context_10_owner_and_root_counts_are_observable() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(10);
         raise("a", "", 0, 0);
         raise("b", "", 0, 0);
@@ -1003,13 +1161,21 @@ mod tests {
     #[test]
     fn panic_context_11_null_inputs_receive_required_defaults() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(11);
-        willow_panic_raise(std::ptr::null(), std::ptr::null(), -1, -1);
+        // SAFETY: The optional source file is null or a current Willow string and the panic
+        // path roots its string inputs before allocation.
+        unsafe { willow_panic_raise(std::ptr::null(), std::ptr::null(), -1, -1) };
         let info = recover_one();
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_message(info) }, "explicit panic");
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_file(info) }, "");
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_line(info) }, 0);
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_column(info) }, 0);
         willow_panic_release_recovered(info);
     }
@@ -1019,7 +1185,9 @@ mod tests {
 
     unsafe extern "C" fn context_observer_poll(_frame: *mut std::ffi::c_void) -> i32 {
         let before = willow_panic_active() as usize;
-        willow_panic_raise(std::ptr::null(), std::ptr::null(), 0, 0);
+        // SAFETY: The optional source file is null or a current Willow string and the panic
+        // path roots its string inputs before allocation.
+        unsafe { willow_panic_raise(std::ptr::null(), std::ptr::null(), 0, 0) };
         let after = willow_panic_active() as usize;
         TASK_CONTEXT_OBSERVATION.store(before | (after << 1), Ordering::Release);
         crate::task::RUNTIME_POLL_READY
@@ -1029,11 +1197,16 @@ mod tests {
     fn panic_context_12_scheduler_installs_task_context_and_restores_sync_context() {
         let _heap = isolated_runtime();
         let _single = crate::scheduler::single_worker_for_test();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         crate::scheduler::reset_global_scheduler_for_test();
         let _sync = ContextTestGuard::install(120);
         TASK_CONTEXT_OBSERVATION.store(usize::MAX, Ordering::Release);
-        crate::scheduler::willow_sched_spawn(context_observer_poll, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        unsafe {
+            crate::scheduler::willow_sched_spawn(context_observer_poll, std::ptr::null_mut())
+        };
         crate::scheduler::willow_sched_run();
         assert_eq!(TASK_CONTEXT_OBSERVATION.load(Ordering::Acquire), 2);
         assert_eq!(willow_panic_active(), 0, "sync context must be restored");
@@ -1052,8 +1225,13 @@ mod tests {
     }
 
     unsafe extern "C" fn nested_outer_poll(_frame: *mut std::ffi::c_void) -> i32 {
-        willow_panic_raise(std::ptr::null(), std::ptr::null(), 0, 0);
-        let inner = crate::scheduler::willow_sched_spawn(nested_inner_poll, std::ptr::null_mut());
+        // SAFETY: The optional source file is null or a current Willow string and the panic
+        // path roots its string inputs before allocation.
+        unsafe { willow_panic_raise(std::ptr::null(), std::ptr::null(), 0, 0) };
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let inner = unsafe {
+            crate::scheduler::willow_sched_spawn(nested_inner_poll, std::ptr::null_mut())
+        };
         crate::scheduler::willow_sched_run_until(inner);
         if willow_panic_active() != 0 {
             NESTED_CONTEXT_OBSERVATION.fetch_or(2, Ordering::AcqRel);
@@ -1065,11 +1243,16 @@ mod tests {
     fn panic_context_13_nested_scheduler_drive_isolates_and_restores_outer_task() {
         let _heap = isolated_runtime();
         let _single = crate::scheduler::single_worker_for_test();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         crate::scheduler::reset_global_scheduler_for_test();
         let _sync = ContextTestGuard::install(130);
         NESTED_CONTEXT_OBSERVATION.store(0, Ordering::Release);
-        let outer = crate::scheduler::willow_sched_spawn(nested_outer_poll, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let outer = unsafe {
+            crate::scheduler::willow_sched_spawn(nested_outer_poll, std::ptr::null_mut())
+        };
         crate::scheduler::willow_sched_run_until(outer);
         assert_eq!(NESTED_CONTEXT_OBSERVATION.load(Ordering::Acquire), 3);
         assert_eq!(willow_panic_active(), 0);
@@ -1084,7 +1267,9 @@ mod tests {
             // This is an ABI/integration violation, not a recoverable language
             // fault. It must abort before allocating a PanicInfo.
             replace_current_context(None);
-            willow_panic_raise(std::ptr::null(), std::ptr::null(), 0, 0);
+            // SAFETY: The optional source file is null or a current Willow string and the
+            // panic path roots its string inputs before allocation.
+            unsafe { willow_panic_raise(std::ptr::null(), std::ptr::null(), 0, 0) };
             unreachable!("fatal panic ABI returned");
         }
 
@@ -1114,7 +1299,9 @@ mod tests {
     fn panic_context_15_scheduler_reentry_during_unwind_is_process_fatal() {
         const CHILD: &str = "WILLOW_TEST_FATAL_PANIC_REENTRY";
         if std::env::var_os(CHILD).is_some() {
-            willow_gc_init();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { willow_gc_init() };
             let _context = ContextTestGuard::install(15);
             raise("active", "", 0, 0);
             willow_panic_enter_defer();
@@ -1170,7 +1357,9 @@ mod tests {
     #[test]
     fn panic_context_16_full_cycle_returns_every_runtime_root() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(16);
         let baseline = runtime_root_count();
         for _ in 0..64 {
@@ -1192,7 +1381,9 @@ mod tests {
     #[test]
     fn panic_context_17_dropped_context_releases_unrecovered_roots() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let baseline = runtime_root_count();
         {
             let _context = ContextTestGuard::install(17);
@@ -1218,7 +1409,9 @@ mod tests {
     #[test]
     fn panic_context_18_nested_stack_survives_minor_and_major_collections() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(18);
         let baseline = runtime_root_count();
         for depth in 0..8 {
@@ -1230,9 +1423,12 @@ mod tests {
         for depth in (0..8).rev() {
             let info = recover_one();
             assert_eq!(
+                // SAFETY: The retained PanicInfo keeps its initialized fields live through this
+                // read.
                 unsafe { panic_info_message(info) },
                 format!("level-{depth}")
             );
+            // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
             assert_eq!(unsafe { panic_info_line(info) }, depth + 1);
             willow_gc_collect();
             willow_panic_release_recovered(info);
@@ -1246,7 +1442,9 @@ mod tests {
     #[test]
     fn panic_context_19_release_rejects_untransferred_pointers() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let context = Arc::new(PanicContext::new(19));
         let previous = replace_current_context(Some(Arc::clone(&context)));
         assert!(!context.release_recovered(std::ptr::null_mut()));
@@ -1265,7 +1463,9 @@ mod tests {
     #[test]
     fn panic_context_20_recover_window_closes_with_defer_scope() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(20);
         willow_panic_enter_defer();
         willow_panic_leave_defer();
@@ -1293,9 +1493,12 @@ mod tests {
         let owner_ok = current_snapshot().is_some_and(|snapshot| {
             snapshot.owner == crate::scheduler::willow_sched_current_task()
         });
-        willow_panic_raise(std::ptr::null(), std::ptr::null(), 0, 0);
+        // SAFETY: The optional source file is null or a current Willow string and the panic
+        // path roots its string inputs before allocation.
+        unsafe { willow_panic_raise(std::ptr::null(), std::ptr::null(), 0, 0) };
         crate::gc::minor_collect_internal();
         let info = recover_one();
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         let recovered = !info.is_null() && unsafe { panic_info_message(info) } == "explicit panic";
         if !info.is_null() {
             willow_panic_release_recovered(info);
@@ -1317,7 +1520,9 @@ mod tests {
     #[test]
     fn panic_context_21_pool_tasks_recover_independently_without_bleed() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         crate::scheduler::reset_global_scheduler_for_test();
         let _sync = ContextTestGuard::install(210);
         POOL_CLEAN_POLLS.store(0, Ordering::Release);
@@ -1330,7 +1535,10 @@ mod tests {
 
         const TASKS: usize = 48;
         for _ in 0..TASKS {
-            crate::scheduler::willow_sched_spawn(pool_recover_poll, std::ptr::null_mut());
+            // SAFETY: The callback accepts a null frame and uses no frame storage.
+            unsafe {
+                crate::scheduler::willow_sched_spawn(pool_recover_poll, std::ptr::null_mut())
+            };
         }
         crate::scheduler::willow_sched_run();
 
@@ -1343,7 +1551,9 @@ mod tests {
             "task panic roots outlived their tasks"
         );
         let info = recover_one();
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_message(info) }, "sync-owned");
+        // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
         assert_eq!(unsafe { panic_info_line(info) }, 5);
         willow_panic_release_recovered(info);
         assert_eq!(runtime_root_count(), baseline);
@@ -1361,7 +1571,9 @@ mod tests {
         {
             REUSE_OBSERVATIONS.fetch_add(1, Ordering::AcqRel);
         }
-        willow_panic_raise(std::ptr::null(), std::ptr::null(), 0, 0);
+        // SAFETY: The optional source file is null or a current Willow string and the panic
+        // path roots its string inputs before allocation.
+        unsafe { willow_panic_raise(std::ptr::null(), std::ptr::null(), 0, 0) };
         let info = recover_one();
         willow_panic_release_recovered(info);
         crate::task::RUNTIME_POLL_READY
@@ -1373,14 +1585,19 @@ mod tests {
     fn panic_context_22_single_worker_reuse_starts_every_task_clean() {
         let _heap = isolated_runtime();
         let _single = crate::scheduler::single_worker_for_test();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         crate::scheduler::reset_global_scheduler_for_test();
         let _sync = ContextTestGuard::install(220);
         REUSE_OBSERVATIONS.store(0, Ordering::Release);
         let baseline = runtime_root_count();
 
         for _ in 0..16 {
-            let id = crate::scheduler::willow_sched_spawn(reuse_probe_poll, std::ptr::null_mut());
+            // SAFETY: The callback accepts a null frame and uses no frame storage.
+            let id = unsafe {
+                crate::scheduler::willow_sched_spawn(reuse_probe_poll, std::ptr::null_mut())
+            };
             crate::scheduler::willow_sched_run_until(id);
         }
 
@@ -1397,18 +1614,28 @@ mod tests {
 
     unsafe extern "C" fn gc_stress_recover_poll(_frame: *mut std::ffi::c_void) -> i32 {
         let mut message = ws("stressed");
-        willow_push_root(&mut message);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut message) };
         let file = ws("stress.wi");
-        willow_panic_raise(message, file, 41, 42);
-        willow_pop_roots(1);
+        // SAFETY: The optional source file is null or a current Willow string and the panic
+        // path roots its string inputs before allocation.
+        unsafe { willow_panic_raise(message, file, 41, 42) };
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
         crate::gc::minor_collect_internal();
         willow_gc_collect();
         let info = recover_one();
         willow_gc_collect();
         let intact = !info.is_null()
+            // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
             && unsafe { panic_info_message(info) } == "stressed"
+            // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
             && unsafe { panic_info_file(info) } == "stress.wi"
+            // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
             && unsafe { panic_info_line(info) } == 41
+            // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
             && unsafe { panic_info_column(info) } == 42;
         if !intact {
             STRESS_FAILURES.fetch_add(1, Ordering::AcqRel);
@@ -1424,14 +1651,19 @@ mod tests {
     #[test]
     fn panic_context_23_task_payload_survives_collections_between_raise_and_recover() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         crate::scheduler::reset_global_scheduler_for_test();
         let _sync = ContextTestGuard::install(230);
         STRESS_FAILURES.store(0, Ordering::Release);
         let baseline = runtime_root_count();
 
         for _ in 0..24 {
-            crate::scheduler::willow_sched_spawn(gc_stress_recover_poll, std::ptr::null_mut());
+            // SAFETY: The callback accepts a null frame and uses no frame storage.
+            unsafe {
+                crate::scheduler::willow_sched_spawn(gc_stress_recover_poll, std::ptr::null_mut())
+            };
         }
         crate::scheduler::willow_sched_run();
 
@@ -1448,7 +1680,9 @@ mod tests {
     #[test]
     fn panic_context_24_unwind_cleanup_flag_tracks_the_cleanup_entry() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(24);
         assert!(!panic_unwind_cleanup_active());
 
@@ -1488,7 +1722,9 @@ mod tests {
     #[test]
     fn panic_context_25_migrated_context_resumes_with_its_own_records() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let baseline = runtime_root_count();
         let migrating = Arc::new(PanicContext::new(25));
         let other = Arc::new(PanicContext::new(26));
@@ -1511,6 +1747,8 @@ mod tests {
                 replace_current_context(Some(migrating));
                 let snapshot = current_snapshot().unwrap();
                 let info = willow_panic_recover();
+                // SAFETY: The retained PanicInfo keeps its initialized fields live through this
+                // read.
                 let message = unsafe { panic_info_message(info) }.to_string();
                 willow_panic_leave_defer();
                 willow_panic_release_recovered(info);
@@ -1541,7 +1779,8 @@ mod tests {
 
     /// Publish a fault site the way generated debug code does.
     fn set_fault_site(file: &str, line: i64, column: i64) {
-        willow_fault_site_set(file.as_ptr(), file.len() as i64, line, column);
+        // SAFETY: The source strings cover their byte counts through the synchronous copy.
+        unsafe { willow_fault_site_set(file.as_ptr(), file.len() as i64, line, column) };
     }
 
     /// Perspective: a published fault site becomes the location of the next
@@ -1550,7 +1789,9 @@ mod tests {
     #[test]
     fn panic_context_26_runtime_fault_adopts_the_published_site() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(26);
         willow_fault_site_clear();
 
@@ -1558,6 +1799,8 @@ mod tests {
         raise_language_message("index out of bounds");
         let info = recover_one();
         assert!(!info.is_null());
+        // SAFETY: The recovered or active PanicInfo is retained while its initialized fields are
+        // read.
         unsafe {
             assert_eq!(panic_info_message(info), "index out of bounds");
             assert_eq!(panic_info_file(info), "bounds.wi");
@@ -1575,12 +1818,16 @@ mod tests {
     #[test]
     fn panic_context_27_runtime_fault_without_a_site_still_raises() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(27);
         willow_fault_site_clear();
 
         raise_language_message("channel closed");
         let info = recover_one();
+        // SAFETY: The recovered or active PanicInfo is retained while its initialized fields are
+        // read.
         unsafe {
             assert_eq!(panic_info_message(info), "channel closed");
             assert_eq!(panic_info_file(info), "");
@@ -1596,7 +1843,9 @@ mod tests {
     #[test]
     fn panic_context_28_latest_fault_site_wins() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(28);
         willow_fault_site_clear();
 
@@ -1604,6 +1853,8 @@ mod tests {
         set_fault_site("second.wi", 40, 9);
         raise_language_message("boom");
         let info = recover_one();
+        // SAFETY: The recovered or active PanicInfo is retained while its initialized fields are
+        // read.
         unsafe {
             assert_eq!(panic_info_file(info), "second.wi");
             assert_eq!(panic_info_line(info), 40);
@@ -1620,13 +1871,17 @@ mod tests {
     #[test]
     fn panic_context_29_cleared_fault_site_is_not_inherited() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(29);
 
         set_fault_site("stale.wi", 7, 3);
         willow_fault_site_clear();
         raise_language_message("later fault");
         let info = recover_one();
+        // SAFETY: The recovered or active PanicInfo is retained while its initialized fields are
+        // read.
         unsafe {
             assert_eq!(panic_info_file(info), "", "stale location inherited");
             assert_eq!(panic_info_line(info), 0);
@@ -1641,7 +1896,9 @@ mod tests {
     #[test]
     fn panic_context_30_fault_site_is_per_thread() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(30);
         willow_fault_site_clear();
         set_fault_site("main-thread.wi", 11, 2);
@@ -1652,7 +1909,9 @@ mod tests {
             // This thread never published a site of its own.
             raise_language_message("worker fault");
             let info = recover_one();
+            // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
             let file = unsafe { panic_info_file(info) }.to_string();
+            // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
             let line = unsafe { panic_info_line(info) };
             willow_panic_release_recovered(info);
             replace_current_context(None);
@@ -1665,6 +1924,8 @@ mod tests {
         // The publishing thread still has its own site.
         raise_language_message("main fault");
         let info = recover_one();
+        // SAFETY: The recovered or active PanicInfo is retained while its initialized fields are
+        // read.
         unsafe {
             assert_eq!(panic_info_file(info), "main-thread.wi");
             assert_eq!(panic_info_line(info), 11);
@@ -1680,10 +1941,14 @@ mod tests {
     #[test]
     fn panic_context_31_fault_site_rejects_malformed_arguments() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(32);
 
-        willow_fault_site_set(std::ptr::null(), 12, 3, 4);
+        // SAFETY: The absent name is accepted and any nonempty byte range remains readable
+        // through the copy.
+        unsafe { willow_fault_site_set(std::ptr::null(), 12, 3, 4) };
         assert_eq!(current_fault_site(), (String::new(), 3, 4));
 
         set_fault_site("", 5, 6);
@@ -1694,9 +1959,13 @@ mod tests {
 
         // An empty file with a line still raises without allocating a file
         // String, and the panic remains recoverable.
-        willow_fault_site_set(std::ptr::null(), 0, 8, 2);
+        // SAFETY: The absent name is accepted and any nonempty byte range remains readable
+        // through the copy.
+        unsafe { willow_fault_site_set(std::ptr::null(), 0, 8, 2) };
         raise_language_message("degraded");
         let info = recover_one();
+        // SAFETY: The recovered or active PanicInfo is retained while its initialized fields are
+        // read.
         unsafe {
             assert_eq!(panic_info_message(info), "degraded");
             assert_eq!(panic_info_file(info), "");
@@ -1713,7 +1982,9 @@ mod tests {
     #[test]
     fn panic_context_32_repeated_runtime_faults_do_not_leak_roots() {
         let _heap = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let _context = ContextTestGuard::install(33);
         let baseline = runtime_root_count();
         set_fault_site("loop.wi", 3, 1);
@@ -1721,6 +1992,8 @@ mod tests {
         for _ in 0..64 {
             raise_language_message("repeat");
             let info = recover_one();
+            // SAFETY: The recovered or active PanicInfo is retained while its initialized fields
+            // are read.
             unsafe {
                 assert_eq!(panic_info_file(info), "loop.wi");
             }

@@ -7,15 +7,22 @@ use std::time::Duration;
 fn idle_roots_survive_minor_major_and_relocation() {
     let _test = isolated_runtime();
     for relocate in [false, true] {
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let (ready_tx, ready_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         let worker = std::thread::spawn(crate::runtime::serving(move || {
             let mutator = MutatorRegistration::new();
-            let mut tls = tlab_state_for_test();
-            let mut root = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+            let tls = tlab_state_for_test();
+            // SAFETY: The fixture owns the stable TLAB through unregistration. The requested
+            // size and tracing metadata describe the object initialized here.
+            let mut root = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 1, 0, 8, 0) };
+            // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
             unsafe { *root.cast::<u64>() = 123456 };
-            willow_push_root(&raw mut root);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut root) };
             let before = root as usize;
             let relocation = relocate.then(RelocationSafeScope::enter);
             // SAFETY: only native channels are touched until ownership resumes.
@@ -25,10 +32,13 @@ fn idle_roots_survive_minor_major_and_relocation() {
                 .unwrap();
             resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             drop(idle);
+            // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
             assert_eq!(unsafe { *root.cast::<u64>() }, 123456);
             assert_eq!(root as usize != before, relocate);
             drop(relocation);
-            willow_pop_roots(1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(1) };
             drop(mutator);
         }));
         let (id, before) = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -47,7 +57,9 @@ fn idle_roots_survive_minor_major_and_relocation() {
         worker.join().unwrap();
         assert!(runtime().coord.0.lock().unwrap().parked.is_empty());
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -55,21 +67,29 @@ fn idle_publication_is_reused_across_increasing_stop_counts_and_root_counts() {
     let _test = isolated_runtime();
     for roots in [0, 1, 64, 1024] {
         for cycles in [1, 8, 64] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             let (ready_tx, ready_rx) = mpsc::channel();
             let (resume_tx, resume_rx) = mpsc::channel();
             let worker = std::thread::spawn(crate::runtime::serving(move || {
                 let mutator = MutatorRegistration::new();
-                let mut slots = vec![willow_alloc_object(0, 8); roots];
+                // SAFETY: The requested layout describes the initialized words of this object
+                // and its type’s tracing or finalization contract.
+                let mut slots = vec![unsafe { willow_alloc_object(0, 8) }; roots];
                 for slot in &mut slots {
-                    willow_push_root(slot);
+                    // SAFETY: The slot storage stays live and stationary through the matching
+                    // pop, including during collection.
+                    unsafe { willow_push_root(slot) };
                 }
                 // SAFETY: slots and managed objects stay untouched during wait.
                 let idle = unsafe { IdleMutator::enter() };
                 ready_tx.send(std::thread::current().id()).unwrap();
                 resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 drop(idle);
-                willow_pop_roots(roots as i32);
+                // SAFETY: The removed shadow-stack entries belong to this operation and their
+                // slot storage is still live.
+                unsafe { willow_pop_roots(roots as i32) };
                 drop(mutator);
             }));
             let id = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -97,13 +117,17 @@ fn idle_publication_is_reused_across_increasing_stop_counts_and_root_counts() {
             );
         }
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn idle_resume_waits_for_active_stop() {
     let _test = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let (ready_tx, ready_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
     let (dropping_tx, dropping_rx) = mpsc::channel();
@@ -129,13 +153,17 @@ fn idle_resume_waits_for_active_stop() {
     });
     done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     worker.join().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn idle_entry_acknowledges_an_already_requested_stop() {
     let _test = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let (ready_tx, ready_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
     let worker = std::thread::spawn(crate::runtime::serving(move || {
@@ -157,13 +185,17 @@ fn idle_entry_acknowledges_an_already_requested_stop() {
     });
     resume_tx.send(()).unwrap();
     worker.join().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn idle_unregistered_and_unwind_paths_release_ownership() {
     let _test = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     // SAFETY: no managed access occurs in this empty interval.
     drop(unsafe { IdleMutator::enter() });
     assert!(runtime().coord.0.lock().unwrap().parked.is_empty());
@@ -182,14 +214,20 @@ fn idle_unregistered_and_unwind_paths_release_ownership() {
 fn idle_entry_reads_no_roots_at_any_depth_until_a_stop() {
     let _test = isolated_runtime();
     for roots in [0, 1, 64, 1024, 65536] {
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let (ready_tx, ready_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         let worker = std::thread::spawn(crate::runtime::serving(move || {
             let mutator = MutatorRegistration::new();
-            let mut slots = vec![willow_alloc_object(0, 8); roots];
+            // SAFETY: The requested layout describes the initialized words of this object and
+            // its type’s tracing or finalization contract.
+            let mut slots = vec![unsafe { willow_alloc_object(0, 8) }; roots];
             for slot in &mut slots {
-                willow_push_root(slot);
+                // SAFETY: The slot storage stays live and stationary through the matching
+                // pop, including during collection.
+                unsafe { willow_push_root(slot) };
             }
             // SAFETY: only native channels are touched until ownership resumes.
             let idle = unsafe { IdleMutator::enter() };
@@ -200,7 +238,9 @@ fn idle_entry_reads_no_roots_at_any_depth_until_a_stop() {
             let coord = runtime().coord.0.lock().unwrap();
             assert!(coord.mutators[&id].deferred.is_none());
             drop(coord);
-            willow_pop_roots(roots as i32);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(roots as i32) };
             drop(mutator);
         }));
         let id = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -217,7 +257,9 @@ fn idle_entry_reads_no_roots_at_any_depth_until_a_stop() {
         worker.join().unwrap();
         eprintln!("idle entry roots={roots} slots_read_at_entry=0 slots_read_at_stop={roots}");
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 fn wait_until_parked(id: std::thread::ThreadId) {
@@ -235,15 +277,22 @@ fn assert_blocked_call_leaves_collections_running(
     blocked: impl FnOnce() + Send + 'static,
     release: impl FnOnce(),
 ) {
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let (ready_tx, ready_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     let worker = std::thread::spawn(crate::runtime::serving(move || {
         let mutator = MutatorRegistration::new();
-        let mut tls = tlab_state_for_test();
-        let mut root = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+        let tls = tlab_state_for_test();
+        // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size
+        // and tracing metadata describe the object initialized here.
+        let mut root = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 1, 0, 8, 0) };
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         unsafe { *root.cast::<u64>() = 654321 };
-        willow_push_root(&raw mut root);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
         let before = root as usize;
         let relocation = relocate.then(RelocationSafeScope::enter);
         ready_tx
@@ -251,10 +300,13 @@ fn assert_blocked_call_leaves_collections_running(
             .unwrap();
         blocked();
         done_tx.send(()).unwrap();
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         assert_eq!(unsafe { *root.cast::<u64>() }, 654321);
         assert_eq!(root as usize != before, relocate);
         drop(relocation);
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
         drop(mutator);
     }));
     let (id, before) = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -274,7 +326,9 @@ fn assert_blocked_call_leaves_collections_running(
     done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     worker.join().unwrap();
     assert!(runtime().coord.0.lock().unwrap().parked.is_empty());
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -343,7 +397,9 @@ fn collection_requested_during_a_stop_keeps_the_foreign_region() {
         willow_gc_collect as extern "C" fn(),
         willow_gc_minor_collect as extern "C" fn(),
     ] {
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let (ready_tx, ready_rx) = mpsc::channel();
         let (collect_tx, collect_rx) = mpsc::channel::<()>();
         let (collected_tx, collected_rx) = mpsc::channel();
@@ -398,15 +454,23 @@ fn blocked_fifo_read_leaves_collections_running_and_parks_on_return() {
     let _ = std::fs::remove_file(&path);
     let text = path.to_str().unwrap().to_string();
     let name = std::ffi::CString::new(text.as_str()).unwrap();
+    // SAFETY: The CString supplies a NUL-terminated name for the duration of mkfifo.
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
     assert_blocked_call_leaves_collections_running(
         false,
         move || {
             let name = crate::string::willow_string_from_str(&text);
-            let result = crate::fs::willow_fs_read_to_string(name);
+            // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+            // during this call.
+            let result = unsafe { crate::fs::willow_fs_read_to_string(name) };
+            // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
             assert_eq!(unsafe { *result.cast::<i64>() }, 0);
+            // SAFETY: The fixture allocates these fields in word-aligned GC storage at whole-word
+            // offsets.
             let contents = unsafe { *result.add(8).cast::<*const u8>() };
             assert_eq!(
+                // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this
+                // borrow.
                 unsafe { crate::string::willow_string_as_str(contents) },
                 "payload"
             );
@@ -419,19 +483,31 @@ fn blocked_fifo_read_leaves_collections_running_and_parks_on_return() {
 #[test]
 fn deferred_publication_reads_parent_contexts_like_a_local_snapshot() {
     let _test = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let (ready_tx, ready_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
     let worker = std::thread::spawn(crate::runtime::serving(move || {
         let mutator = MutatorRegistration::new();
-        let mut outer = willow_alloc_object(0, 8);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let mut outer = unsafe { willow_alloc_object(0, 8) };
         let mut empty: *mut u8 = std::ptr::null_mut();
-        willow_push_root(&raw mut outer);
-        willow_push_root(&raw mut empty);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe {
+            willow_push_root(&raw mut outer);
+            willow_push_root(&raw mut empty);
+        }
         let child = Box::new(crate::generated_context::Context::new());
         let previous = crate::generated_context::replace(&raw const *child);
-        let mut inner = willow_alloc_object(0, 8);
-        willow_push_root(&raw mut inner);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let mut inner = unsafe { willow_alloc_object(0, 8) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut inner) };
         let expected = snapshot_local_root_slots();
         assert_eq!(expected.len(), 2);
         // SAFETY: only native channels are touched until ownership resumes.
@@ -441,9 +517,13 @@ fn deferred_publication_reads_parent_contexts_like_a_local_snapshot() {
             .unwrap();
         resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         drop(idle);
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
         crate::generated_context::replace(previous);
-        willow_pop_roots(2);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(2) };
         drop(mutator);
     }));
     let (id, expected) = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -452,7 +532,9 @@ fn deferred_publication_reads_parent_contexts_like_a_local_snapshot() {
     });
     resume_tx.send(()).unwrap();
     worker.join().unwrap();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]

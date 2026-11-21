@@ -78,6 +78,8 @@ impl std::ops::Deref for EntryBuffer {
         probe::entry_read();
         // Only the owner can append without this buffer's mutex. Foreign reads
         // require stopped ownership; the Vec allocation is stable while admitted.
+        // SAFETY: Only initialized entries count toward length, which never exceeds the reserved
+        // capacity.
         unsafe { std::slice::from_raw_parts(self.values.as_ptr(), self.length.get()) }
             .get(self.published..)
             .expect("published SATB prefix")
@@ -113,6 +115,8 @@ impl EntryBuffer {
     fn sync_length(&mut self) {
         assert!(self.length.get() <= self.values.capacity());
         // Generated stores initialize every word before publishing length.
+        // SAFETY: Only initialized entries count toward length, which never exceeds the reserved
+        // capacity.
         unsafe {
             self.values.set_len(self.length.get());
         }
@@ -718,6 +722,8 @@ mod tests {
     // Execute the same ABI accesses as generated code, with no Rust Vec borrow.
     unsafe fn inline_pair(address: usize, pair: [usize; 2]) -> bool {
         use willow_abi::barrier_buffer as abi;
+        // SAFETY: The test models the generated barrier on its own mutator. The ABI word offsets
+        // address the live aligned buffer, with the gate and capacity checked before append.
         unsafe {
             let field = |offset: i32| (address + offset as usize) as *mut usize;
             let length = field(abi::LENGTH_OFFSET).read();
@@ -749,6 +755,9 @@ mod tests {
                         .with_current(|| true, |buffer| buffer.admit_inline(&OPEN_EPOCH))
                         .unwrap();
                     let pair = [i * 2 + 1, i * 2 + 2];
+                    // SAFETY: The test models the generated barrier on its own mutator. The ABI
+                    // word offsets address the live aligned buffer, with the gate and capacity
+                    // checked before append.
                     if !unsafe { inline_pair(address, pair) } {
                         buffers
                             .with_current(
@@ -777,8 +786,12 @@ mod tests {
         let address = buffers
             .with_current(|| true, |buffer| buffer.admit_inline(&closing))
             .unwrap();
+        // SAFETY: The test models the generated barrier on its own mutator. The ABI word offsets
+        // address the live aligned buffer, with the gate and capacity checked before append.
         assert!(unsafe { inline_pair(address, [7, 9]) });
         closing.store(true, Ordering::Release);
+        // SAFETY: The test models the generated barrier on its own mutator. The ABI word offsets
+        // address the live aligned buffer, with the gate and capacity checked before append.
         assert!(!unsafe { inline_pair(address, [11, 13]) });
         let coord = super::super::GcCoord {
             stop_requested: true,
@@ -792,13 +805,18 @@ mod tests {
     #[test]
     fn inline_satb_bounded_seal_preserves_suffix_and_revokes_reused_storage() {
         let _guard = super::super::isolated_runtime();
-        super::super::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { super::super::reset_internal_for_test() };
         super::super::willow_gc_register_mutator();
         let buffers = SatbShards::new(256);
         let address = buffers
             .with_current(|| true, |buffer| buffer.admit_inline(&OPEN_EPOCH))
             .unwrap();
         for i in 0..64 {
+            // SAFETY: The test models the generated barrier on its own mutator. The ABI word
+            // offsets address the live aligned buffer, with the gate and capacity checked before
+            // append.
             assert!(unsafe { inline_pair(address, [i * 2, i * 2 + 1]) });
         }
         let coord = super::super::GcCoord {
@@ -819,22 +837,35 @@ mod tests {
                 break;
             }
             assert!(rounds < 200);
+            // SAFETY: The test models the generated barrier on its own mutator. The ABI word
+            // offsets address the live aligned buffer, with the gate and capacity checked before
+            // append.
             assert!(!unsafe { inline_pair(address, [999, 999]) });
         }
         assert_eq!(published, (0..128).collect::<Vec<_>>());
+        // SAFETY: The test models the generated barrier on its own mutator. The ABI word offsets
+        // address the live aligned buffer, with the gate and capacity checked before append.
         assert!(!unsafe { inline_pair(address, [999, 999]) });
         buffers.reopen_stopped(&coord);
+        // SAFETY: The test models the generated barrier on its own mutator. The ABI word offsets
+        // address the live aligned buffer, with the gate and capacity checked before append.
         assert!(!unsafe { inline_pair(address, [999, 999]) });
         let readmitted = buffers
             .with_current(|| true, |buffer| buffer.admit_inline(&OPEN_EPOCH))
             .unwrap();
         assert_eq!(address, readmitted);
+        // SAFETY: The test models the generated barrier on its own mutator. The ABI word offsets
+        // address the live aligned buffer, with the gate and capacity checked before append.
         assert!(unsafe { inline_pair(address, [129, 130]) });
         buffers.retire_current(|v| published.extend_from_slice(v));
         assert_eq!(&published[128..], &[129, 130]);
+        // SAFETY: The test models the generated barrier on its own mutator. The ABI word offsets
+        // address the live aligned buffer, with the gate and capacity checked before append.
         assert!(!unsafe { inline_pair(address, [999, 999]) });
         super::super::willow_gc_unregister_mutator();
-        super::super::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { super::super::reset_internal_for_test() };
     }
 
     #[test]

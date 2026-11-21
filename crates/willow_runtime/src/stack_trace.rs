@@ -34,7 +34,11 @@ impl TraceSite {
         col: i64,
     ) -> Self {
         Self {
+            // SAFETY: The generated call-site records supply process-lifetime byte strings with
+            // their lengths. The helper handles absent strings.
             function: unsafe { static_bytes(function, function_len) },
+            // SAFETY: The generated call-site records supply process-lifetime byte strings with
+            // their lengths. The helper handles absent strings.
             file: unsafe { static_bytes(file, file_len) },
             line: line.max(0) as usize,
             col: col.max(0) as usize,
@@ -89,6 +93,8 @@ unsafe fn static_bytes(ptr: *const u8, len: i64) -> &'static [u8] {
     if ptr.is_null() || len <= 0 {
         return &[];
     }
+    // SAFETY: The generated call-site records supply process-lifetime byte strings with their
+    // lengths. The helper handles absent strings.
     unsafe { std::slice::from_raw_parts(ptr, len as usize) }
 }
 
@@ -139,6 +145,8 @@ fn update_async_trace(task: crate::task::RuntimeTaskId, update: impl FnOnce(&mut
 /// # Safety
 /// `name` must reference `len` bytes of process-lifetime static data.
 pub(crate) unsafe fn tag_async_task(task: crate::task::RuntimeTaskId, name: *const u8, len: i64) {
+    // SAFETY: The generated call-site records supply process-lifetime byte strings with their
+    // lengths. The helper handles absent strings.
     let name = unsafe { static_bytes(name, len) };
     update_async_trace(task, |trace| trace.name = Some(name));
 }
@@ -203,6 +211,7 @@ unsafe fn raw_str(ptr: *const u8, len: i64) -> String {
     if ptr.is_null() || len <= 0 {
         return String::new();
     }
+    // SAFETY: The caller supplies len readable bytes for each non-null string through this call.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -211,9 +220,13 @@ unsafe fn raw_str(ptr: *const u8, len: i64) -> String {
 /// (NOT WillowStrings) with explicit lengths, copied onto the Rust heap so the
 /// debug call stack does not allocate on the Willow GC heap.
 /// Each frame names the caller and a location inside that caller.
+///
+/// # Safety
+/// For each non-null pointer with a positive length, its allocation must contain that many
+/// initialized, readable bytes, immutable through the synchronous copy.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_callstack_push(
+pub unsafe extern "C" fn willow_callstack_push(
     function: *const u8,
     function_len: i64,
     file: *const u8,
@@ -221,7 +234,9 @@ pub extern "C" fn willow_callstack_push(
     line: i32,
     col: i32,
 ) {
+    // SAFETY: The caller supplies len readable bytes for each non-null string through this call.
     let function = unsafe { raw_str(function, function_len) };
+    // SAFETY: The caller supplies len readable bytes for each non-null string through this call.
     let file = unsafe { raw_str(file, file_len) };
     CALL_STACK.with(|s| {
         s.borrow_mut().push(RuntimeFrame {
@@ -235,9 +250,13 @@ pub extern "C" fn willow_callstack_push(
 }
 
 /// Reserve a balanced shadow-stack slot without claiming the call has started.
+///
+/// # Safety
+/// For each non-null pointer with a positive length, its allocation must contain that many
+/// initialized, readable bytes, immutable through the synchronous copy.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_callstack_push_pending(
+pub unsafe extern "C" fn willow_callstack_push_pending(
     function: *const u8,
     function_len: i64,
     file: *const u8,
@@ -245,7 +264,9 @@ pub extern "C" fn willow_callstack_push_pending(
     line: i32,
     col: i32,
 ) {
-    willow_callstack_push(function, function_len, file, file_len, line, col);
+    // SAFETY: The caller lends both byte ranges through the immediate copy into the pending
+    // frame.
+    unsafe { willow_callstack_push(function, function_len, file, file_len, line, col) };
     CALL_STACK.with(|slot| slot.borrow_mut().frames.last_mut().unwrap().active = false);
 }
 
@@ -265,9 +286,19 @@ pub extern "C" fn willow_callstack_activate() {
 /// bit 2 marks a call into generated code. Release builds publish no fault
 /// location for such a call: an async callee publishes its own, and a
 /// synchronous callee's faults stay location-free.
+///
+/// # Safety
+/// For each non-null pointer with a positive length, provide that many initialized immutable
+/// bytes in a single allocation at a stable address for the lifetime of the process.
+/// Diagnostics retain the address.
+///
+/// ```compile_fail,E0133
+/// let name = b"f";
+/// willow_runtime::stack_trace::willow_trace_site_set(name.as_ptr(), 1, name.as_ptr(), 1, 1, 1, 0);
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_trace_site_set(
+pub unsafe extern "C" fn willow_trace_site_set(
     function: *const u8,
     function_len: i64,
     file: *const u8,
@@ -411,9 +442,15 @@ mod tests {
     #[test]
     fn panic_frames_skip_unentered_calls_and_survive_stack_exchange() {
         let previous = replace_current(Default::default());
-        willow_callstack_push(b"main".as_ptr(), 4, b"main.wi".as_ptr(), 7, 8, 5);
-        willow_callstack_push_pending(b"helper".as_ptr(), 6, b"helper.wi".as_ptr(), 9, 3, 5);
-        willow_trace_site_set(b"argument".as_ptr(), 8, b"arg.wi".as_ptr(), 6, 4, 2, 2);
+        // SAFETY: The source strings cover their byte counts through the synchronous copy.
+        unsafe { willow_callstack_push(b"main".as_ptr(), 4, b"main.wi".as_ptr(), 7, 8, 5) };
+        // SAFETY: The source strings cover their byte counts through the synchronous copy.
+        unsafe {
+            willow_callstack_push_pending(b"helper".as_ptr(), 6, b"helper.wi".as_ptr(), 9, 3, 5)
+        };
+        // SAFETY: The nonempty diagnostic names are byte literals with process lifetime and
+        // the supplied lengths fit those literals.
+        unsafe { willow_trace_site_set(b"argument".as_ptr(), 8, b"arg.wi".as_ptr(), 6, 4, 2, 2) };
         let trace = replace_current(Default::default());
         assert_eq!(panic_call_stack_text("", 0, 0), "");
         replace_current(trace);
@@ -433,9 +470,15 @@ mod tests {
         let previous = replace_current(Default::default());
         for depth in [1, 16, 128] {
             for _ in 0..depth {
-                willow_callstack_push(b"recur".as_ptr(), 5, b"deep.wi".as_ptr(), 7, 3, 1);
+                // SAFETY: The source strings cover their byte counts through the synchronous
+                // copy.
+                unsafe {
+                    willow_callstack_push(b"recur".as_ptr(), 5, b"deep.wi".as_ptr(), 7, 3, 1)
+                };
             }
-            willow_trace_site_set(b"recur".as_ptr(), 5, b"deep.wi".as_ptr(), 7, 2, 1, 2);
+            // SAFETY: The nonempty diagnostic names are byte literals with process lifetime
+            // and the supplied lengths fit those literals.
+            unsafe { willow_trace_site_set(b"recur".as_ptr(), 5, b"deep.wi".as_ptr(), 7, 2, 1, 2) };
             assert_eq!(snapshot_current().frames.len(), depth);
             assert_eq!(
                 panic_call_stack_text("deep.wi", 2, 1).lines().count(),
@@ -452,8 +495,12 @@ mod tests {
     #[test]
     fn release_site_does_not_inherit_a_previous_debug_leaf() {
         let previous = replace_current(Default::default());
-        willow_trace_site_set(b"debug".as_ptr(), 5, b"old.wi".as_ptr(), 6, 2, 1, 2);
-        willow_trace_site_set(b"release".as_ptr(), 7, b"new.wi".as_ptr(), 6, 4, 1, 0);
+        // SAFETY: The nonempty diagnostic names are byte literals with process lifetime and
+        // the supplied lengths fit those literals.
+        unsafe { willow_trace_site_set(b"debug".as_ptr(), 5, b"old.wi".as_ptr(), 6, 2, 1, 2) };
+        // SAFETY: The nonempty diagnostic names are byte literals with process lifetime and
+        // the supplied lengths fit those literals.
+        unsafe { willow_trace_site_set(b"release".as_ptr(), 7, b"new.wi".as_ptr(), 6, 4, 1, 0) };
         assert_eq!(panic_call_stack_text("new.wi", 4, 1), "");
         replace_current(previous);
     }
@@ -465,17 +512,29 @@ mod tests {
     fn release_async_willow_call_drops_only_the_fault_location() {
         use crate::panic_context::current_fault_site;
         let previous = replace_current(Default::default());
-        willow_trace_site_set(b"stale".as_ptr(), 5, b"old.wi".as_ptr(), 6, 2, 1, 2);
+        // SAFETY: The nonempty diagnostic names are byte literals with process lifetime and
+        // the supplied lengths fit those literals.
+        unsafe { willow_trace_site_set(b"stale".as_ptr(), 5, b"old.wi".as_ptr(), 6, 2, 1, 2) };
         assert_eq!(current_fault_site(), ("old.wi".to_string(), 2, 1));
         crate::scheduler::with_current_task_for_test(41, || {
             assert_eq!(current_fault_site(), (String::new(), 0, 0));
-            willow_trace_site_set(b"caller".as_ptr(), 6, b"a.wi".as_ptr(), 4, 7, 3, 1);
+            // SAFETY: The nonempty diagnostic names are byte literals with process lifetime
+            // and the supplied lengths fit those literals.
+            unsafe { willow_trace_site_set(b"caller".as_ptr(), 6, b"a.wi".as_ptr(), 4, 7, 3, 1) };
             assert_eq!(current_fault_site(), ("a.wi".to_string(), 7, 3));
-            willow_trace_site_set(b"caller".as_ptr(), 6, b"a.wi".as_ptr(), 4, 8, 5, 1 | 4);
+            // SAFETY: The nonempty diagnostic names are byte literals with process lifetime
+            // and the supplied lengths fit those literals.
+            unsafe {
+                willow_trace_site_set(b"caller".as_ptr(), 6, b"a.wi".as_ptr(), 4, 8, 5, 1 | 4)
+            };
             assert_eq!(current_fault_site(), (String::new(), 0, 0));
             let site = async_trace_of(41).1.expect("task site kept");
             assert_eq!((site.line(), site.col()), (8, 5));
-            willow_trace_site_set(b"caller".as_ptr(), 6, b"d.wi".as_ptr(), 4, 9, 2, 1 | 2 | 4);
+            // SAFETY: The nonempty diagnostic names are byte literals with process lifetime
+            // and the supplied lengths fit those literals.
+            unsafe {
+                willow_trace_site_set(b"caller".as_ptr(), 6, b"d.wi".as_ptr(), 4, 9, 2, 1 | 2 | 4)
+            };
             assert_eq!(current_fault_site(), ("d.wi".to_string(), 9, 2));
         });
         assert_eq!(current_fault_site(), (String::new(), 0, 0));
@@ -484,20 +543,29 @@ mod tests {
 
     #[test]
     fn async_trace_is_owned_by_the_last_publishing_task() {
+        // SAFETY: The generated call-site records supply process-lifetime byte strings with their
+        // lengths. The helper handles absent strings.
         let site = unsafe { TraceSite::from_static(b"f".as_ptr(), 1, b"a.wi".as_ptr(), 4, 3, 2) };
+        // SAFETY: The generated call-site records supply process-lifetime byte strings with their
+        // lengths. The helper handles absent strings.
         unsafe { tag_async_task(7, b"seven".as_ptr(), 5) };
         update_async_trace(7, |trace| trace.site = Some(site));
         let (name, published) = async_trace_of(7);
         assert_eq!(name.as_deref(), Some("seven"));
         assert_eq!(published, Some(site));
         // Re-tagging the same task keeps its site; another task resets both.
+        // SAFETY: The generated call-site records supply process-lifetime byte strings with their
+        // lengths. The helper handles absent strings.
         unsafe { tag_async_task(7, b"seven".as_ptr(), 5) };
         assert_eq!(async_trace_of(7).1, Some(site));
+        // SAFETY: The generated call-site records supply process-lifetime byte strings with their
+        // lengths. The helper handles absent strings.
         unsafe { tag_async_task(8, b"eight".as_ptr(), 5) };
         assert_eq!(async_trace_of(7), (None, None));
         assert_eq!(async_trace_of(8).0.as_deref(), Some("eight"));
         assert_eq!(async_trace_of(8).1, None);
         // Empty or null names never become a dangling slice.
+        // SAFETY: The helper accepts a null name and returns an empty byte slice.
         unsafe { tag_async_task(9, std::ptr::null(), 4) };
         assert_eq!(async_trace_of(9).0.as_deref(), Some(""));
     }
@@ -506,8 +574,10 @@ mod tests {
     fn current_call_site_tracks_innermost_frame_and_empty_stack() {
         let previous = replace_current(Default::default());
         assert_eq!(current_call_site(), None);
-        willow_callstack_push(b"outer".as_ptr(), 5, b"outer.wi".as_ptr(), 8, 12, 1);
-        willow_callstack_push(b"inner".as_ptr(), 5, b"inner.wi".as_ptr(), 8, 34, 1);
+        // SAFETY: The source strings cover their byte counts through the synchronous copy.
+        unsafe { willow_callstack_push(b"outer".as_ptr(), 5, b"outer.wi".as_ptr(), 8, 12, 1) };
+        // SAFETY: The source strings cover their byte counts through the synchronous copy.
+        unsafe { willow_callstack_push(b"inner".as_ptr(), 5, b"inner.wi".as_ptr(), 8, 34, 1) };
         let inner = current_call_site();
         willow_callstack_pop();
         let outer = current_call_site();
@@ -536,14 +606,18 @@ mod tests {
     #[test]
     fn callstack_text_orders_most_recent_first() {
         fn push(name: &str, file: &str, line: i32, col: i32) {
-            willow_callstack_push(
-                name.as_ptr(),
-                name.len() as i64,
-                file.as_ptr(),
-                file.len() as i64,
-                line,
-                col,
-            );
+            // SAFETY: The source strings cover their byte counts through the synchronous
+            // copy.
+            unsafe {
+                willow_callstack_push(
+                    name.as_ptr(),
+                    name.len() as i64,
+                    file.as_ptr(),
+                    file.len() as i64,
+                    line,
+                    col,
+                )
+            };
         }
         // main called helper (line 8), helper called deeper (line 5).
         push("helper", "main.wi", 8, 5);

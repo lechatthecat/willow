@@ -142,15 +142,21 @@ fn v4_abi_negotiation_preserves_v1_v2_v3() {
     let size = willow_gc_stats_size(4) as usize;
     let mut bytes = vec![0xa5; size + 2];
     assert_eq!(
-        willow_gc_stats_snapshot(4, bytes[1..].as_mut_ptr(), size as i64 - 1),
+        // SAFETY: The backing buffer covers the selected record on success; rejected requests
+        // write nothing.
+        unsafe { willow_gc_stats_snapshot(4, bytes[1..].as_mut_ptr(), size as i64 - 1) },
         0
     );
     assert!(bytes.iter().all(|b| *b == 0xa5));
     assert_eq!(
-        willow_gc_stats_snapshot(4, bytes[1..].as_mut_ptr(), size as i64),
+        // SAFETY: The backing buffer covers the selected record on success; rejected requests
+        // write nothing.
+        unsafe { willow_gc_stats_snapshot(4, bytes[1..].as_mut_ptr(), size as i64) },
         size as i64
     );
     assert_eq!((bytes[0], bytes[size + 1]), (0xa5, 0xa5));
+    // SAFETY: The negotiated size covers the selected record. Unaligned record access supports
+    // byte-aligned caller storage.
     let v = unsafe {
         bytes[1..]
             .as_ptr()
@@ -368,7 +374,9 @@ fn cycle_wait_events_do_not_grow_or_pollute_histogram_abi() {
 fn nested_cycle_restores_parent_epoch_on_completion_and_unwind() {
     use crate::gc_telemetry::{Cycle, CycleKind};
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let before = default_owner().epoch.load(Ordering::Relaxed);
     {
         let outer = Cycle::begin(CycleKind::Major);

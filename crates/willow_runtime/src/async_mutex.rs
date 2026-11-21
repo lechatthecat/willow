@@ -410,7 +410,10 @@ impl AsyncMutex {
 
     /// Write the protected value back. Same ownership proof as [`Self::load`];
     /// a stale generation cannot commit over the current owner's work.
-    pub fn commit(&self, task: RuntimeTaskId, token: RegistrationToken, value: i64) -> bool {
+    /// # Safety
+    /// For a reference lock, self must be its live, nonmoving GC payload and value must be
+    /// null or the current address of a live managed referent for the store barrier.
+    pub unsafe fn commit(&self, task: RuntimeTaskId, token: RegistrationToken, value: i64) -> bool {
         if !self.is_owner(task, token) {
             return false;
         }
@@ -421,12 +424,16 @@ impl AsyncMutex {
     #[inline]
     fn store_owned(&self, value: i64) {
         if self.is_ref {
-            crate::gc::willow_gc_write_barrier(
-                self as *const Self as *mut u8,
-                self.value.load(Ordering::Acquire) as *mut u8,
-                value as *mut u8,
-                crate::gc::GcStoreDestination::AsyncMutexCell as i64,
-            );
+            // SAFETY: The reference cell supplies its previous word and incoming value. This
+            // destination asserts no header bits.
+            unsafe {
+                crate::gc::willow_gc_write_barrier(
+                    self as *const Self as *mut u8,
+                    self.value.load(Ordering::Acquire) as *mut u8,
+                    value as *mut u8,
+                    crate::gc::GcStoreDestination::AsyncMutexCell as i64,
+                )
+            };
         }
         self.value.store(value, Ordering::Release);
     }

@@ -206,6 +206,8 @@ impl Drop for StaleStorage {
 pub(super) unsafe fn free_region_storage(base: *mut u8, capacity: usize) {
     let layout = Layout::from_size_align(capacity, std::mem::align_of::<GcHeader>())
         .expect("old-region allocation layout remains valid");
+    // SAFETY: The owner releases this block once with the same base and Layout used to allocate
+    // it.
     unsafe { dealloc(base, layout) };
 }
 

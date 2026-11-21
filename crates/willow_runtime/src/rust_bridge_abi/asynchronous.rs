@@ -38,16 +38,22 @@ impl NativeFrameSpec for ReferenceFrame {
 
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll<S: NativeFrameSpec>(raw: *mut c_void) -> i32 {
+    // SAFETY: spawn::<S> allocates this frame with S::LAYOUT and registers poll::<S> and
+    // cancel::<S> for it. The scheduler keeps the frame live throughout this poll's slot accesses.
     let frame = unsafe { NativeTaskFrame::<S>::from_raw(raw) };
     let operation = frame.load_native::<Operation>(3);
     let mut value = WillowBridgeValue::default();
     // The callback uses try_lock: a future polling on the bridge executor
     // must never block a scheduler worker. Completion carries its own wake.
+    // SAFETY: this poll has exclusive access to the operation in slot 3. Its registered
+    // finish callback receives the matching live context and a writable result.
     let ready = unsafe { ((*operation).finish)((*operation).context, &mut value) };
     if ready == 0 {
         return crate::task::RUNTIME_POLL_BLOCKED_SYSCALL;
     }
     // finish consumes the bridge context on every terminal outcome.
+    // SAFETY: spawn stored Box::into_raw in slot 3. The scheduler serializes poll and
+    // cancel, so take_native clears the slot and returns that box once on completion.
     unsafe { drop(Box::from_raw(frame.take_native::<Operation>(3))) };
     if ready != 1 {
         crate::failure::fatal_invariant("RustPanic: async Rust future panicked");
@@ -64,13 +70,19 @@ unsafe extern "C" fn poll<S: NativeFrameSpec>(raw: *mut c_void) -> i32 {
 
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn cancel<S: NativeFrameSpec>(raw: *mut c_void) {
+    // SAFETY: spawn::<S> allocates this frame with S::LAYOUT and registers poll::<S> and
+    // cancel::<S> for it. The scheduler keeps the frame live while cancellation takes slot 3.
     let frame = unsafe { NativeTaskFrame::<S>::from_raw(raw) };
     let operation = frame.take_native::<Operation>(3);
     if !operation.is_null() {
+        // SAFETY: this is the Box::into_raw pointer stored by spawn. The exclusive cancel
+        // callback cleared its slot with take_native, transferring ownership here.
         let operation = unsafe { Box::from_raw(operation) };
         // The frame's native slot is cleared before suspension. Only owned
         // native state survives; moving GC may rewrite every managed root.
         let _relocation = crate::gc::RelocationSafeScope::enter();
+        // SAFETY: cancel is registered for this context. A pending result keeps the context
+        // live for the next call, and a terminal result ends the loop.
         while unsafe { (operation.cancel)(operation.context) } == 0 {
             suspend_cancel();
         }
@@ -105,15 +117,22 @@ fn spawn<S: NativeFrameSpec>(operation: Operation, start: Start) -> *mut c_void 
     };
     let context = operation.context;
     frame.store_native(3, Box::into_raw(Box::new(operation)));
-    crate::scheduler::spawn_global_task_initialized(
-        poll::<S>,
-        frame.as_raw(),
-        Some(cancel::<S>),
-        |id| {
-            frame.store_word(1, id as i64);
-            unsafe { start(context, id) };
-        },
-    );
+    let initialize = |id| {
+        frame.store_word(1, id as i64);
+        // SAFETY: start is registered for this context. Task initialization invokes it
+        // with the assigned ID before the scheduler can poll or cancel the operation.
+        unsafe { start(context, id) };
+    };
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe {
+        crate::scheduler::spawn_global_task_initialized(
+            poll::<S>,
+            frame.as_raw(),
+            Some(cancel::<S>),
+            initialize,
+        )
+    };
     frame.as_raw()
 }
 

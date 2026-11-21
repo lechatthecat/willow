@@ -1,8 +1,11 @@
 //! GC-02 regressions. Included beneath gc::tests to share its isolated fixtures.
 use super::*;
 
-fn young_word(tls: &mut GcTlabState, word: i64) -> *mut u8 {
-    let value = willow_gc_alloc_slow(tls, 901, 0, 8, 0);
+fn young_word(tls: &TestTlab, word: i64) -> *mut u8 {
+    // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size and
+    // tracing metadata describe the object initialized here.
+    let value = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 901, 0, 8, 0) };
+    // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
     unsafe { value.cast::<i64>().write(word) };
     value
 }
@@ -12,28 +15,39 @@ fn normal_handle_move_park_resume_cancel_and_unwind() {
     let _guard = isolated_runtime();
     for exit in ["resume", "cancel", "panic"] {
         reset_gc();
-        let mut tls = new_tlab_state();
+        let tls = new_tlab_state();
         let before = runtime_root_count();
-        let original = young_word(&mut tls, 73);
+        let original = young_word(&tls, 73);
         let root = GcRootHandle::new(original);
         assert_eq!(runtime_root_count(), before + 1);
         let mut empty_slot = std::ptr::null_mut();
-        willow_push_root(&mut empty_slot);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut empty_slot) };
         let scope = RelocationSafeScope::enter();
+        // SAFETY: The owning thread parks its live shadow stack at a valid depth and keeps the
+        // slots alive until discharge.
         let token = unsafe { park_current_roots(0) };
         drop(scope);
         minor_collect_internal();
         assert_ne!(root.load(), original, "handle must reload after movement");
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         assert_eq!(unsafe { root.load().cast::<i64>().read() }, 73);
         assert_eq!(deferred_minor_collections_for_test(), 0);
         assert_eq!(willow_gc_pinned_promotions(), 0);
         if exit == "resume" {
+            // SAFETY: The matching park token still owns these live slots and is resumed by their
+            // owner.
             unsafe { resume_parked_roots(token) };
-            willow_pop_root();
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
             // Restoring the parked flag is tested separately from its guard.
             safepoint::set_relocation_safe(false);
             drop(root);
         } else {
+            // SAFETY: This token belongs to the parked stack and its slots have finished serving
+            // as roots.
             unsafe { discard_parked_roots(token) };
             if exit == "panic" {
                 assert!(
@@ -58,9 +72,9 @@ fn normal_handle_move_park_resume_cancel_and_unwind() {
 fn normal_handle_aliases_null_store_release_and_arena_drop() {
     let _guard = isolated_runtime();
     reset_gc();
-    let mut tls = new_tlab_state();
+    let tls = new_tlab_state();
     let before = runtime_root_count();
-    let original = young_word(&mut tls, 19);
+    let original = young_word(&tls, 19);
     let first = GcRootHandle::new(original);
     let second = GcRootHandle::new(std::ptr::null_mut());
     second.store(original);
@@ -75,17 +89,22 @@ fn normal_handle_aliases_null_store_release_and_arena_drop() {
     assert_eq!(runtime_root_count(), before + 1);
     minor_collect_internal();
     assert_eq!(
+        // SAFETY: The current GC payload follows its aligned header; its owner keeps it live here.
         unsafe { (*payload_to_header(second.load())).generation },
         GC_GENERATION_OLD
     );
     drop(second);
     let owner = willow_alloc(8);
     let arena = GcRootArena::default();
-    let root = arena.insert(owner, owner);
+    // SAFETY: This test allocated the non-null arena inputs as managed objects and retains
+    // them through insertion.
+    let root = unsafe { arena.insert(owner, owner) };
     let mut slots = Vec::new();
     arena.trace_slots(&mut slots);
     assert_eq!(slots.len(), 1);
     drop(root);
+    // SAFETY: The owner of this registered or traced slot keeps its pointer storage live for this
+    // read or write.
     assert!(unsafe { (*slots[0]).is_null() });
     assert_eq!(runtime_root_count(), before);
     willow_gc_collect();
@@ -99,11 +118,15 @@ fn scoped_loan_park_resume_cancel_panic_and_stack_alias() {
     for exit in ["resume", "cancel", "panic"] {
         for kind in ["interior", "ffi"] {
             reset_gc();
-            let mut tls = new_tlab_state();
-            let original = young_word(&mut tls, 37);
+            let tls = new_tlab_state();
+            let original = young_word(&tls, 37);
             let before = runtime_root_count();
             let mut stack_alias = original;
-            willow_push_root(&mut stack_alias);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut stack_alias) };
+            // SAFETY: The owning thread parks its live shadow stack at a valid depth and keeps the
+            // slots alive until discharge.
             let token = unsafe { park_current_roots(0) };
             // Both loans pin their young owner in place; a foreign (native
             // boundary) loan also publishes it first.
@@ -112,6 +135,8 @@ fn scoped_loan_park_resume_cancel_panic_and_stack_alias() {
                 minor_collect_internal();
                 assert_eq!(loan_address, original);
                 assert_eq!(stack_alias, original);
+                // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar
+                // value.
                 assert_eq!(unsafe { original.cast::<i64>().read() }, 37);
                 let object = HeapObject::from_payload(GcPayload::from_raw(original).unwrap());
                 assert_eq!(object.shared(), foreign);
@@ -128,6 +153,8 @@ fn scoped_loan_park_resume_cancel_panic_and_stack_alias() {
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if kind == "interior" {
+                    // SAFETY: The byte offset lies within the live allocation, including its
+                    // one-past address when forming a pointer.
                     let loan = PinLease::<InteriorPointer>::for_address(unsafe { original.add(3) })
                         .unwrap();
                     assert_eq!(runtime().pin_lease_slots.len(), 1);
@@ -141,9 +168,15 @@ fn scoped_loan_park_resume_cancel_panic_and_stack_alias() {
             assert_eq!(runtime().pin_lease_slots.len(), 0);
             assert_eq!(runtime_root_count(), before);
             if exit == "resume" {
+                // SAFETY: The matching park token still owns these live slots and is resumed by
+                // their owner.
                 unsafe { resume_parked_roots(token) };
-                willow_pop_root();
+                // SAFETY: The removed shadow-stack entries belong to this operation and their
+                // slot storage is still live.
+                unsafe { willow_pop_root() };
             } else {
+                // SAFETY: This token belongs to the parked stack and its slots have finished
+                // serving as roots.
                 unsafe { discard_parked_roots(token) };
             }
             willow_gc_collect();
@@ -164,9 +197,11 @@ fn scoped_loan_native_old_retired_and_nested_lifetimes() {
     let native = [1u8; 16];
     assert!(PinLease::<InteriorPointer>::for_address(native.as_ptr()).is_none());
     assert!(PinLease::<InteriorPointer>::for_address(std::ptr::null()).is_none());
-    let mut tls = new_tlab_state();
-    let original = young_word(&mut tls, 23);
+    let tls = new_tlab_state();
+    let original = young_word(&tls, 23);
     retire_tlabs_for_thread(std::thread::current().id());
+    // SAFETY: The byte offset lies within the live allocation, including its one-past address when
+    // forming a pointer.
     let first = PinLease::<InteriorPointer>::for_address(unsafe { original.add(1) }).unwrap();
     minor_collect_internal();
     assert_eq!(first.load(), original);
@@ -182,11 +217,14 @@ fn scoped_loan_native_old_retired_and_nested_lifetimes() {
     drop(first);
     assert_eq!(runtime().pin_lease_slots.len(), 1);
     willow_gc_collect();
+    // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
     assert_eq!(unsafe { second.load().cast::<i64>().read() }, 23);
     drop(second);
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), 0);
     let old = willow_alloc(16);
+    // SAFETY: The byte offset lies within the live allocation, including its one-past address when
+    // forming a pointer.
     let loan = PinLease::<InteriorPointer>::for_address(unsafe { old.add(8) }).unwrap();
     assert_eq!(loan.load(), old);
     minor_collect_internal();
@@ -201,15 +239,21 @@ fn scoped_loan_bridge_deduplicates_and_preserves_foreign_string_data() {
     use crate::rust_bridge_abi::aggregate::*;
     let _guard = isolated_runtime();
     reset_gc();
-    let mut tls = new_tlab_state();
-    let string = willow_gc_alloc_slow(&mut tls, 902, 0, 16, 0);
+    let tls = new_tlab_state();
+    // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size and
+    // tracing metadata describe the object initialized here.
+    let string = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 902, 0, 16, 0) };
+    // SAFETY: The test allocated a young string with space for this length, the copied bytes and
+    // the NUL.
     unsafe {
-        string.cast::<i64>().write(3);
+        crate::string::initialize_length(string, 3);
         std::ptr::copy_nonoverlapping(c"abc".as_ptr().cast(), string.add(8), 4);
     }
     let frame = willow_rust_bridge_frame_new();
     for _ in 0..256 {
-        willow_rust_bridge_root(frame, string as u64);
+        // SAFETY: The adapter retains exclusive ownership of the frame and passes the current
+        // payload for pinning.
+        unsafe { willow_rust_bridge_root(frame, string as u64) };
     }
     assert_eq!(runtime_root_count(), 1);
     assert_eq!(runtime().pin_lease_slots.len(), 1);
@@ -217,18 +261,26 @@ fn scoped_loan_bridge_deduplicates_and_preserves_foreign_string_data() {
         ptr: std::ptr::null(),
         len: 0,
     };
-    willow_rust_bridge_string_data(string as u64, &mut data);
+    // SAFETY: The test pins the live string in its bridge frame and supplies a writable local slice
+    // descriptor.
+    unsafe { willow_rust_bridge_string_data(string as u64, &mut data) };
     willow_gc_minor_collect();
     assert_eq!(
+        // SAFETY: The bridge frame pins the source and the returned length bounds the borrowed
+        // bytes.
         unsafe { std::slice::from_raw_parts(data.ptr, data.len) },
         b"abc"
     );
     willow_gc_collect();
     assert_eq!(
+        // SAFETY: The bridge frame pins the source and the returned length bounds the borrowed
+        // bytes.
         unsafe { std::slice::from_raw_parts(data.ptr, data.len) },
         b"abc"
     );
-    willow_rust_bridge_frame_drop(frame);
+    // SAFETY: The fixture owns the original frame and has finished using every borrowed
+    // payload.
+    unsafe { willow_rust_bridge_frame_drop(frame) };
     assert_eq!(runtime_root_count(), 0);
     assert_eq!(runtime().pin_lease_slots.len(), 0);
     willow_gc_collect();
@@ -242,7 +294,7 @@ fn during_minor<R>(operation: impl FnOnce() -> R) -> R {
     let _registration = MutatorRegistration::new();
     let collector = std::thread::spawn(crate::runtime::serving(|| willow_gc_minor_collect()));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while unsafe { *willow_gc_stop_flag() } == 0 {
+    while !runtime().poll_requested.load(Ordering::Acquire) {
         assert!(
             std::time::Instant::now() < deadline,
             "collector did not request a stop"
@@ -262,28 +314,48 @@ fn normal_handle_runtime_string_and_enum_paths_move_without_pin() {
     for operation in ["concat", "substring", "trim", "repeat", "split", "enum"] {
         reset_gc();
         set_gc_stress_for_test(Some(""));
-        let mut tls = new_tlab_state();
-        let original = willow_gc_alloc_slow(&mut tls, 903, 0, 24, 0);
+        let tls = new_tlab_state();
+        // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size
+        // and tracing metadata describe the object initialized here.
+        let original = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 903, 0, 24, 0) };
+        // SAFETY: The test allocated a young string with space for this length, the copied bytes
+        // and the NUL.
         unsafe {
-            original.cast::<i64>().write(5);
+            crate::string::initialize_length(original, 5);
             std::ptr::copy_nonoverlapping(c" a,b ".as_ptr().cast(), original.add(8), 6);
         }
         let source = GcRootHandle::new(original);
         let result = during_minor(|| match operation {
-            "concat" => crate::string::willow_string_concat(source.load(), source.load()),
-            "substring" => crate::string::willow_string_substring(source.load(), 1, 4),
-            "trim" => crate::string::willow_string_trim(source.load()),
-            "repeat" => crate::string::willow_string_repeat(source.load(), 2),
+            // SAFETY: The handle is reloaded on entry; the fixture initialized the length, text and
+            // terminator.
+            "concat" => unsafe {
+                crate::string::willow_string_concat(source.load(), source.load())
+            },
+            // SAFETY: The handle is reloaded on entry; the fixture initialized the length, text and
+            // terminator.
+            "substring" => unsafe { crate::string::willow_string_substring(source.load(), 1, 4) },
+            // SAFETY: The handle is reloaded on entry; the fixture initialized the length, text and
+            // terminator.
+            "trim" => unsafe { crate::string::willow_string_trim(source.load()) },
+            // SAFETY: The handle is reloaded on entry; the fixture initialized the length, text and
+            // terminator.
+            "repeat" => unsafe { crate::string::willow_string_repeat(source.load(), 2) },
             "split" => {
                 // Separator is native/runtime-old; allocate before the pending
                 // stop so only the operation itself consumes the handshake.
-                crate::string::willow_string_split(source.load(), std::ptr::null())
+                // SAFETY: The handle is reloaded on entry; the fixture initialized the length, text
+                // and terminator.
+                unsafe { crate::string::willow_string_split(source.load(), std::ptr::null()) }
             }
-            _ => willow_alloc_enum_variant(
-                0,
-                willow_abi::EnumVariantLayout::new(0, &[willow_abi::SlotKind::GcRef]),
-                &[source.load() as i64],
-            ),
+            // SAFETY: The variant layout selects its initialized word or reference payload,
+            // including the traced low word for a pair.
+            _ => unsafe {
+                willow_alloc_enum_variant(
+                    0,
+                    willow_abi::EnumVariantLayout::new(0, &[willow_abi::SlotKind::GcRef]),
+                    &[source.load() as i64],
+                )
+            },
         });
         let result = GcRootHandle::new(result);
         assert_ne!(
@@ -294,9 +366,12 @@ fn normal_handle_runtime_string_and_enum_paths_move_without_pin() {
         assert_eq!(willow_gc_pinned_promotions(), 0, "{operation}");
         assert_eq!(deferred_minor_collections_for_test(), 0, "{operation}");
         if operation == "split" {
-            assert_eq!(crate::array::willow_array_len(result.load()), 7);
+            // SAFETY: The root supplies the current live array for this access.
+            assert_eq!(unsafe { crate::array::willow_array_len(result.load()) }, 7);
         } else if operation == "enum" {
             assert_eq!(
+                // SAFETY: The fixture allocates these fields in word-aligned GC storage at
+                // whole-word offsets.
                 unsafe { result.load().add(8).cast::<*mut u8>().read() },
                 source.load()
             );
@@ -307,6 +382,8 @@ fn normal_handle_runtime_string_and_enum_paths_move_without_pin() {
                 _ => " a,b  a,b ",
             };
             assert_eq!(
+                // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this
+                // borrow.
                 unsafe { crate::string::willow_string_as_str(result.load()) },
                 expected
             );
@@ -336,14 +413,20 @@ fn normal_handle_panic_inputs_move_and_remain_remembered_after_transfer() {
         PanicContext::new(909),
     ))));
     set_gc_stress_for_test(Some(""));
-    let mut tls = new_tlab_state();
-    let original = willow_gc_alloc_slow(&mut tls, 905, 0, 16, 0);
+    let tls = new_tlab_state();
+    // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size and
+    // tracing metadata describe the object initialized here.
+    let original = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 905, 0, 16, 0) };
+    // SAFETY: The test allocated a young string with space for this length, the copied bytes and
+    // the NUL.
     unsafe {
-        original.cast::<i64>().write(3);
+        crate::string::initialize_length(original, 3);
         std::ptr::copy_nonoverlapping(c"abc".as_ptr().cast(), original.add(8), 4);
     }
     let source = GcRootHandle::new(original);
-    during_minor(|| willow_panic_raise(source.load(), source.load(), 7, 9));
+    // SAFETY: The optional source file is null or a current Willow string and the panic path
+    // roots its string inputs before allocation.
+    during_minor(|| unsafe { willow_panic_raise(source.load(), source.load(), 7, 9) });
     assert_ne!(source.load(), original);
     assert_eq!(willow_gc_pinned_promotions(), 0);
     assert_eq!(deferred_minor_collections_for_test(), 0);
@@ -355,13 +438,18 @@ fn normal_handle_panic_inputs_move_and_remain_remembered_after_transfer() {
     willow_panic_leave_defer();
     drop(source);
     let parent = willow_alloc_typed(8, 1);
+    // SAFETY: The live object's trace layout reserves these aligned pointer slots.
     unsafe { store_gc_reference(parent.cast(), info) };
     let parent_root = GcRootHandle::new(parent);
     drop(info_root);
     minor_collect_internal();
+    // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
     assert_eq!(unsafe { panic_info_message(info) }, "abc");
+    // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
     assert_eq!(unsafe { panic_info_file(info) }, "abc");
+    // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
     assert_eq!(unsafe { panic_info_line(info) }, 7);
+    // SAFETY: The retained PanicInfo keeps its initialized fields live through this read.
     assert_eq!(unsafe { panic_info_column(info) }, 9);
     drop(parent_root);
     assert_eq!(runtime_root_count(), 0);
@@ -382,20 +470,34 @@ fn normal_handle_lock_constructors_reload_reference_arguments() {
     ] {
         reset_gc();
         set_gc_stress_for_test(Some(""));
-        let mut tls = new_tlab_state();
-        let original = young_word(&mut tls, 91);
+        let tls = new_tlab_state();
+        let original = young_word(&tls, 91);
         let source = GcRootHandle::new(original);
         let payload = during_minor(|| match kind {
-            "blocking_mutex" => crate::lock::willow_blocking_cell_new(source.load() as i64, 1),
-            "blocking_rwlock" => crate::lock::willow_blocking_rw_cell_new(source.load() as i64, 1),
-            "async_mutex" => crate::async_mutex::willow_async_mutex_new(source.load() as i64, 1),
-            _ => crate::async_rwlock::willow_async_rwlock_new(source.load() as i64, 1),
+            // SAFETY: The initial reference comes from a live managed allocation and is
+            // current on entry.
+            "blocking_mutex" => unsafe {
+                crate::lock::willow_blocking_cell_new(source.load() as i64, 1)
+            },
+            // SAFETY: The initial reference comes from a live managed allocation and is
+            // current on entry.
+            "blocking_rwlock" => unsafe {
+                crate::lock::willow_blocking_rw_cell_new(source.load() as i64, 1)
+            },
+            // SAFETY: The initial word matches the constructor’s reference flag.
+            "async_mutex" => unsafe {
+                crate::async_mutex::willow_async_mutex_new(source.load() as i64, 1)
+            },
+            // SAFETY: The initial word matches the constructor’s reference flag.
+            _ => unsafe { crate::async_rwlock::willow_async_rwlock_new(source.load() as i64, 1) },
         });
         assert_ne!(source.load(), original, "{kind} did not move the source");
         let object = HeapObject::from_payload(GcPayload::from_raw(payload.cast()).unwrap());
         let slots = object_reference_slots(object, &type_registry().lock().unwrap());
         assert_eq!(slots.len(), 1);
         assert_eq!(
+            // SAFETY: The owner of this registered or traced slot keeps its pointer storage live
+            // for this read or write.
             unsafe { *slots[0] },
             source.load(),
             "{kind} stored a stale value"
@@ -416,14 +518,23 @@ fn scoped_loan_string_interior_copy_survives_a_pending_minor() {
     let _guard = isolated_runtime();
     reset_gc();
     set_gc_stress_for_test(Some(""));
-    let mut tls = new_tlab_state();
-    let original = willow_gc_alloc_slow(&mut tls, 904, 0, 16, 0);
+    let tls = new_tlab_state();
+    // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size and
+    // tracing metadata describe the object initialized here.
+    let original = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 904, 0, 16, 0) };
+    // SAFETY: The test allocated a young string with space for this length, the copied bytes and
+    // the NUL.
     unsafe {
-        original.cast::<i64>().write(3);
+        crate::string::initialize_length(original, 3);
         std::ptr::copy_nonoverlapping(c"abc".as_ptr().cast(), original.add(8), 4);
     }
-    let result = during_minor(|| crate::string::willow_string_alloc(unsafe { original.add(8) }, 3));
+    // SAFETY: The byte offset lies within the live allocation, including its one-past address when
+    // forming a pointer.
+    // SAFETY: The initialized payload covers the three bytes at offset eight; the allocator pins
+    // them for the copy.
+    let result = during_minor(|| unsafe { crate::string::willow_string_alloc(original.add(8), 3) });
     assert_eq!(
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         unsafe { crate::string::willow_string_as_str(result) },
         "abc"
     );
@@ -459,8 +570,8 @@ fn verify_no_pin_rejects_an_actual_scoped_young_loan() {
     }
     let _guard = isolated_runtime();
     reset_gc();
-    let mut tls = new_tlab_state();
-    let _loan = PinLease::<ForeignReference>::new(young_word(&mut tls, 1));
+    let tls = new_tlab_state();
+    let _loan = PinLease::<ForeignReference>::new(young_word(&tls, 1));
     minor_collect_internal();
 }
 
@@ -469,7 +580,9 @@ fn normal_handle_concurrent_snapshot_churn_uses_live_atomic_slots() {
     let owner = Arc::new(crate::runtime::Runtime::new(
         crate::scheduler::environment_worker_config,
     ));
-    let old = allocate_old_in(&owner, 0, 0, 8, 0);
+    // SAFETY: This fixture selects the payload size and tracing layout for its object and
+    // initializes any native fields before collection.
+    let old = unsafe { allocate_old_in(&owner, 0, 0, 8, 0) };
     root::add_task_frame_root_in(&owner, old);
     let address = old as usize;
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
@@ -516,8 +629,8 @@ fn normal_handle_concurrent_snapshot_churn_uses_live_atomic_slots() {
 fn scoped_handle_emergency_tenure_budget_keeps_the_slot_valid() {
     let _guard = isolated_runtime();
     reset_gc();
-    let mut tls = new_tlab_state();
-    let root = GcRootHandle::new(young_word(&mut tls, 53));
+    let tls = new_tlab_state();
+    let root = GcRootHandle::new(young_word(&tls, 53));
     minor_collect_internal();
     let survivor = root.load();
     {
@@ -527,8 +640,10 @@ fn scoped_handle_emergency_tenure_budget_keeps_the_slot_valid() {
     }
     minor_collect_internal();
     assert_eq!(root.load(), survivor);
+    // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
     assert_eq!(unsafe { survivor.cast::<i64>().read() }, 53);
     assert_eq!(
+        // SAFETY: The current GC payload follows its aligned header; its owner keeps it live here.
         unsafe { (*payload_to_header(survivor)).generation },
         GC_GENERATION_OLD
     );
@@ -553,11 +668,15 @@ fn normal_handle_overhead_and_fragmented_registration_scaling() {
         let legacy_allocations = counter::thread_allocations();
         let legacy_started = std::time::Instant::now();
         for slot in &mut legacy_slots {
-            willow_push_root(slot);
+            // SAFETY: The slot storage stays live and stationary through the matching pop,
+            // including during collection.
+            unsafe { willow_push_root(slot) };
         }
         let legacy_ns = legacy_started.elapsed().as_nanos();
         let legacy_allocated = counter::thread_allocations() - legacy_allocations;
-        willow_pop_roots(count as i32);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(count as i32) };
         let mut handles = Vec::with_capacity(count);
         let allocations = counter::thread_allocations();
         let bytes = counter::thread_bytes();
@@ -611,7 +730,10 @@ fn private_scoped_handles_keep_their_heap_alive_through_release_and_unwind() {
             crate::scheduler::environment_worker_config,
         ));
         let weak = Arc::downgrade(&owner);
-        let old = allocate_old_in(&owner, 0, 0, 8, 0);
+        // SAFETY: This fixture selects the payload size and tracing layout for its object and
+        // initializes any native fields before collection.
+        let old = unsafe { allocate_old_in(&owner, 0, 0, 8, 0) };
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         unsafe { old.cast::<u64>().write(73) };
         let root = GcRootHandle::new_in(Arc::clone(&owner), old);
         let alias = GcRootHandle::new_in(Arc::clone(&owner), std::ptr::null_mut());
@@ -626,6 +748,7 @@ fn private_scoped_handles_keep_their_heap_alive_through_release_and_unwind() {
             try_collect_internal_in(&owner),
             CollectionAttempt::Completed
         );
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         assert_eq!(unsafe { alias.load().cast::<u64>().read() }, 73);
         drop(owner);
         assert!(weak.upgrade().is_some());

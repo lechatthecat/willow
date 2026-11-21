@@ -20,6 +20,8 @@ impl Backend {
         if self.kqueue_fd.is_some() {
             return 0;
         }
+        // SAFETY: This descriptor constructor takes only scalar arguments and reports failure with
+        // a negative result.
         let kqueue_fd = unsafe { libc::kqueue() };
         if kqueue_fd < 0 {
             return -1;
@@ -30,6 +32,8 @@ impl Backend {
             libc::EV_ADD | libc::EV_CLEAR,
             0,
         );
+        // SAFETY: The kqueue is open and each count bounds the corresponding change or event
+        // array.
         let added = unsafe {
             libc::kevent(
                 kqueue_fd,
@@ -41,6 +45,8 @@ impl Backend {
             )
         };
         if added != 0 {
+            // SAFETY: This backend owns the successfully opened descriptor and closes it once
+            // after use.
             unsafe { libc::close(kqueue_fd) };
             return -1;
         }
@@ -72,6 +78,8 @@ impl Backend {
                 libc::EV_DELETE
             };
             let change = apple_kevent(fd as usize, filter, flags, 0);
+            // SAFETY: The kqueue is open and each count bounds the corresponding change or event
+            // array.
             let rc = unsafe {
                 libc::kevent(
                     kqueue_fd,
@@ -98,6 +106,8 @@ impl Backend {
             return;
         };
         let trigger = apple_kevent(WAKE_TOKEN, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER);
+        // SAFETY: The kqueue is open and each count bounds the corresponding change or event
+        // array.
         unsafe {
             libc::kevent(
                 kqueue_fd,
@@ -112,6 +122,8 @@ impl Backend {
 
     pub(super) fn close_platform(&mut self) {
         if let Some(kqueue_fd) = self.kqueue_fd.take() {
+            // SAFETY: This backend owns the successfully opened descriptor and closes it once
+            // after use.
             unsafe { libc::close(kqueue_fd) };
         }
     }
@@ -165,6 +177,7 @@ fn wait_apple_events(kqueue_fd: i32, timeout: Option<Duration>) -> Vec<ReadyEven
         .as_ref()
         .map_or(std::ptr::null(), |value| value as *const libc::timespec);
     let mut events: Vec<libc::kevent> = (0..64).map(|_| apple_kevent(0, 0, 0, 0)).collect();
+    // SAFETY: The kqueue is open and each count bounds the corresponding change or event array.
     let n = unsafe {
         libc::kevent(
             kqueue_fd,

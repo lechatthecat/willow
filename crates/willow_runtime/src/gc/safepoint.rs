@@ -683,6 +683,8 @@ impl IdleMutator<'static> {
     /// managed code. It may only wait on native synchronization or OS calls. Relocation safety
     /// is inherited from the caller; raw runtime references remain pinned.
     pub(crate) unsafe fn enter() -> Self {
+        // SAFETY: The blocking region leaves no live unregistered movable reference and resumes
+        // mutator access only after reentry.
         unsafe { Self::enter_in(crate::runtime::current()) }
     }
 }
@@ -764,6 +766,8 @@ impl Drop for IdleMutator<'_> {
 /// `work` must meet the [`IdleMutator::enter`] contract. Callers must not read
 /// a raw managed pointer after this returns unless a pin keeps it in place.
 pub(crate) unsafe fn run_blocking<T>(work: impl FnOnce() -> T) -> T {
+    // SAFETY: The blocking region leaves no live unregistered movable reference and resumes
+    // mutator access only after reentry.
     let _idle = unsafe { IdleMutator::enter() };
     work()
 }

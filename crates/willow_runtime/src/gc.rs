@@ -50,8 +50,8 @@ mod mutator_log;
 mod publish;
 pub use barrier::*;
 pub(crate) use publish::{
-    PublicationPoint, finish_task_result_in, publish_frame_slots_in, publish_in,
-    report_publication_stats_if_requested, switch_task_owner, task_owner,
+    PublicationPoint, finish_task_result_in, publish_channel_send, publish_frame_slots_in,
+    publish_in, report_publication_stats_if_requested, switch_task_owner, task_owner,
 };
 mod progress;
 pub use progress::{GcProgressV1, GcSkipReason, gc_progress, willow_gc_progress_v1};
@@ -143,14 +143,24 @@ pub fn gc_layout_id(
 ///
 /// Runtime containers use this instead of choosing between legacy
 /// `willow_alloc_typed`/`willow_alloc_object` calls themselves.
-pub fn willow_alloc_with_layout(
+///
+/// # Safety
+/// The effective u32 type ID, payload size, alignment, tracing metadata and layout ID must
+/// describe the same object. For the bitmap type the mask is the address of an aligned
+/// immutable [count, bits...] descriptor covering all payload words, live through reclamation
+/// and any collector snapshots. For native types, install compatible hooks and initialize
+/// their full payload before any safepoint, publication, or possible finalization. Maintain
+/// initialized managed references in traced slots.
+pub unsafe fn willow_alloc_with_layout(
     kind: GcObjectKind,
     type_id: u32,
     payload_size: i64,
     gc_ref_mask: u64,
 ) -> *mut u8 {
     let layout_id = gc_layout_id(kind, payload_size, type_id as i64, gc_ref_mask);
-    willow_gc_alloc_layout(layout_id, type_id as i64, payload_size, gc_ref_mask)
+    // SAFETY: The caller supplies the matching payload layout and initialization protocol for
+    // the effective type ID.
+    unsafe { willow_gc_alloc_layout(layout_id, type_id as i64, payload_size, gc_ref_mask) }
 }
 
 /// Allocate and initialize one boxed enum variant from the shared,
@@ -162,7 +172,13 @@ pub fn willow_alloc_with_layout(
 /// caller variable while passing its pre-collection pointer value by value.
 /// The helper also owns tag/offset/mask interpretation and applies the barrier
 /// for the first word of every slot whose layout marks it as traced.
-pub(crate) fn willow_alloc_enum_variant(
+///
+/// # Safety
+/// The type ID must admit this enum's tag and inline reference mask, excluding the
+/// reserved bitmap ID. Supply one initialized word per layout word. Each traced
+/// low word must be null or a current managed reference. Any registered hooks
+/// must accept the initialized representation of every variant with this ID.
+pub(crate) unsafe fn willow_alloc_enum_variant(
     type_id: u32,
     layout: willow_abi::EnumVariantLayout<'_>,
     payload_words: &[i64],
@@ -184,12 +200,16 @@ pub(crate) fn willow_alloc_enum_variant(
 
     let pointer_bytes = std::mem::size_of::<usize>() as u32;
     let payload_bytes = layout.payload_bytes(pointer_bytes) as i64;
-    let value = willow_alloc_with_layout(
-        GcObjectKind::Enum,
-        type_id,
-        payload_bytes,
-        layout.gc_ref_mask(),
-    );
+    // SAFETY: The requested layout describes the initialized words of this object and its
+    // type’s tracing or finalization contract.
+    let value = unsafe {
+        willow_alloc_with_layout(
+            GcObjectKind::Enum,
+            type_id,
+            payload_bytes,
+            layout.gc_ref_mask(),
+        )
+    };
     for (offset, root) in &roots {
         words[*offset] = root.load() as i64;
     }
@@ -199,12 +219,16 @@ pub(crate) fn willow_alloc_enum_variant(
     // SAFETY: the allocation has exactly the tag plus payload word count
     // described by `layout`; all writes are within that initialized payload.
     unsafe {
+        // SAFETY: The enum layout reserves a tag and aligned payload words in word-aligned GC
+        // storage. Slot offsets come from that layout.
         *value.cast::<i64>() = i64::from(layout.tag);
         let mut offset = 0;
         for kind in layout.payload.slots {
             let count = kind.word_count() as usize;
             for index in 0..count {
                 let word = words[offset + index];
+                // SAFETY: The enum layout reserves a tag and aligned payload words in word-aligned
+                // GC storage. Slot offsets come from that layout.
                 let destination = value.cast::<i64>().add(1 + offset + index);
                 if index == 0 && kind.traces_first_word() {
                     willow_gc_write_barrier(
@@ -230,7 +254,13 @@ pub(crate) fn willow_alloc_enum_variant(
 /// root registration or old-region work; only a TLAB miss reaches the
 /// collecting slow path, rooting a traced word in a shadow-stack slot. Other
 /// shapes, and threads without a runtime TLAB, use the general helper.
-pub(crate) fn alloc_enum_variant_from_generated(
+///
+/// # Safety
+/// The type ID must admit this enum's tag and inline reference mask, excluding the
+/// reserved bitmap ID. Supply one initialized word per layout word. Each traced
+/// low word must be null or a current managed reference. Any registered hooks
+/// must accept the initialized representation of every variant with this ID.
+pub(crate) unsafe fn alloc_enum_variant_from_generated(
     type_id: u32,
     layout: willow_abi::EnumVariantLayout<'_>,
     payload_words: &[i64],
@@ -244,7 +274,9 @@ pub(crate) fn alloc_enum_variant_from_generated(
         .then(|| enum_pair_layout(mask))
         .flatten();
     let Some(young) = young else {
-        return willow_alloc_enum_variant(type_id, layout, payload_words);
+        // SAFETY: The variant layout selects its initialized word or reference payload,
+        // including the traced low word for a pair.
+        return unsafe { willow_alloc_enum_variant(type_id, layout, payload_words) };
     };
     let mut word = payload_words[0] as *mut u8;
     let value = match try_alloc_young([young]) {
@@ -252,11 +284,15 @@ pub(crate) fn alloc_enum_variant_from_generated(
         None => {
             let traced = mask != 0;
             if traced {
-                willow_push_root(&mut word);
+                // SAFETY: The initialized slot stays at this address until its registration
+                // is popped; collection may rewrite it there.
+                unsafe { willow_push_root(&raw mut word) };
             }
             let value = alloc_young_layout_slow(young);
             if traced {
-                willow_pop_roots(1);
+                // SAFETY: The removed shadow-stack entries belong to this operation and their
+                // slot storage is still live.
+                unsafe { willow_pop_roots(1) };
             }
             value
         }
@@ -267,7 +303,11 @@ pub(crate) fn alloc_enum_variant_from_generated(
     // SAFETY: the object holds the tag word and one payload word; the
     // payload is fresh zeroed storage, so the barrier sees no deleted edge.
     unsafe {
+        // SAFETY: The enum layout reserves a tag and aligned payload words in word-aligned GC
+        // storage. Slot offsets come from that layout.
         *value.cast::<i64>() = i64::from(layout.tag);
+        // SAFETY: The enum layout reserves a tag and aligned payload words in word-aligned GC
+        // storage. Slot offsets come from that layout.
         let destination = value.cast::<i64>().add(1);
         if mask != 0 {
             willow_gc_write_barrier(
@@ -331,7 +371,7 @@ pub struct GcTlabState {
 }
 
 impl GcTlabState {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             cursor: AtomicUsize::new(0),
             limit: AtomicUsize::new(0),
@@ -353,9 +393,8 @@ mod runtime_tlab;
 use runtime_tlab::enum_pair_layout;
 pub use runtime_tlab::willow_gc_current_tlab;
 pub(crate) use runtime_tlab::{
-    RuntimeTlabOwner, YoungLayout, alloc_string_payload_slow, alloc_young_layout_slow,
-    array_buffer_layout, array_handle_layout, array_pair_layout, try_alloc_young,
-    try_alloc_young_string_payload,
+    RuntimeTlabOwner, alloc_string_payload_slow, alloc_young_layout_slow, array_buffer_layout,
+    array_handle_layout, array_pair_layout, try_alloc_young, try_alloc_young_string_payload,
 };
 
 /// Raw allocation and pointer arithmetic boundary for the collector. The rest
@@ -1449,6 +1488,8 @@ impl Drop for GcRuntime {
             if let Some(drop_fn) = drops.get(&object.type_id()) {
                 // Native destructors are leaf operations; this owner is
                 // quiescent and still retains the payload and its descriptor.
+                // SAFETY: The registered hook matches the allocation's type and runs while the
+                // collector retains its payload.
                 unsafe {
                     run_drop_hook(
                         self,
@@ -1463,6 +1504,8 @@ impl Drop for GcRuntime {
         old_lab::finalize_unindexed(&state, finalize);
         for region in &state.old_regions {
             for &offset in region.allocations.keys() {
+                // SAFETY: Allocation metadata identifies a header-aligned object start within this
+                // live region or chunk.
                 finalize(HeapObject::from_raw(unsafe { region.base.add(offset) }.cast()).unwrap());
             }
         }
@@ -1473,6 +1516,8 @@ impl Drop for GcRuntime {
                 chunk.mark_bitmap.bits.for_each_set(|index| {
                     finalize(
                         HeapObject::from_raw(
+                            // SAFETY: Allocation metadata identifies a header-aligned object start
+                            // within this live region or chunk.
                             unsafe { chunk.base.add(index * GC_REGION_MARK_GRANULE) }.cast(),
                         )
                         .unwrap(),
@@ -1481,6 +1526,8 @@ impl Drop for GcRuntime {
             } else {
                 for &offset in &chunk.header_offsets {
                     finalize(
+                        // SAFETY: Allocation metadata identifies a header-aligned object start
+                        // within this live region or chunk.
                         HeapObject::from_raw(unsafe { chunk.base.add(usize::from(offset)) }.cast())
                             .unwrap(),
                     );
@@ -1488,12 +1535,16 @@ impl Drop for GcRuntime {
             }
             let layout =
                 Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>()).unwrap();
+            // SAFETY: The owner releases this block once with the same base and Layout used to
+            // allocate it.
             unsafe { dealloc(chunk.base, layout) };
         }
         // Unused survivor reserves contain no initialized payloads.
         for chunk in state.survivor_reserve.drain(..) {
             let layout =
                 Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>()).unwrap();
+            // SAFETY: The owner releases this block once with the same base and Layout used to
+            // allocate it.
             unsafe { dealloc(chunk.base, layout) };
         }
     }
@@ -1506,7 +1557,12 @@ fn runtime() -> &'static GcRuntime {
 /// Model the generated bump path in tests, including its static descriptor
 /// lifetime. Runtime slow-path interning is intentionally a different contract.
 #[cfg(test)]
-fn initialize_generated_object_at_for_test(
+/// # Safety
+/// A non-null address must be exclusive header-aligned space for the complete header and
+/// payload. The type, payload extent and tracing mask must agree, including any required
+/// bitmap descriptor or native hooks. Initialize native fields before the object can be
+/// traced or finalized.
+unsafe fn initialize_generated_object_at_for_test(
     raw: *mut u8,
     size: usize,
     type_id: u32,
@@ -1528,6 +1584,8 @@ fn initialize_generated_object_at_for_test(
         .entry(shape)
         .or_insert_with(|| Box::leak(Box::new(shape)));
     let object = HeapObject::from_raw(raw.cast())?;
+    // SAFETY: The test allocator reserves space aligned for GcHeader. This write initializes the
+    // new header before publication.
     unsafe {
         object.as_ptr().write(GcHeader {
             marked: false,
@@ -1543,21 +1601,30 @@ fn initialize_generated_object_at_for_test(
     Some(object)
 }
 
-fn initialize_object_at(
+/// # Safety
+/// A non-null address must be exclusive header-aligned space for the complete header and
+/// payload. The type, payload extent and tracing mask must agree, including any required
+/// bitmap descriptor or native hooks. Initialize native fields before the object can be
+/// traced or finalized.
+unsafe fn initialize_object_at(
     header: *mut u8,
     total_size: usize,
     type_id: u32,
     layout_id: u64,
     gc_ref_mask: u64,
 ) -> Option<HeapObject> {
-    HeapObject::initialize_at(
-        header,
-        total_size,
-        type_id,
-        layout_id,
-        gc_ref_mask,
-        GC_GENERATION_YOUNG,
-    )
+    // SAFETY: The allocation cursor reserves this aligned header and its complete payload.
+    // The supplied type and mask describe the initialized words.
+    unsafe {
+        HeapObject::initialize_at(
+            header,
+            total_size,
+            type_id,
+            layout_id,
+            gc_ref_mask,
+            GC_GENERATION_YOUNG,
+        )
+    }
 }
 
 /// Reservation occupancy can remain high even when few objects are live. A
@@ -1740,10 +1807,21 @@ pub extern "C" fn willow_gc_set_memory_limit(bytes: u64) -> u64 {
 /// existing GC pointers, so it is not a general-purpose runtime reset API.
 /// Unit tests may intentionally reset the heap of the runtime their thread
 /// serves; `isolated_runtime()` gives each test thread its own runtime.
+///
+/// # Safety
+/// The caller must have exclusive lifecycle access to this runtime. Stop other mutators and
+/// exclude allocations, initializers, borrows and all other heap users throughout reset.
+/// Release outstanding roots and leases or otherwise guarantee no stale pointers, slots or
+/// handles are later used. Registered TLAB storage must still be live during retirement.
+///
+/// ```compile_fail,E0133
+/// willow_runtime::gc::willow_gc_init();
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_gc_init() {
-    reset_internal();
+pub unsafe extern "C" fn willow_gc_init() {
+    // SAFETY: The caller has quiesced this runtime and relinquished access to its old heap.
+    unsafe { reset_internal() };
     // Generated array fast paths can allocate a reference buffer before any
     // runtime array call. Re-register after every heap/registry reset.
     crate::array::ensure_trace_registered();
@@ -1757,16 +1835,31 @@ pub extern "C" fn willow_gc_init() {
 /// null on allocation failure.
 ///
 /// This function may trigger a collection if the heap threshold is exceeded.
+///
+/// # Safety
+/// The effective u32 type ID must admit this payload size and a zero inline mask. The bitmap
+/// type is invalid here because this API has no descriptor argument. For a native type,
+/// register matching hooks and initialize the complete native representation before any
+/// safepoint, publication, or finalization.
+///
+/// ```compile_fail,E0133
+/// use willow_runtime::gc::willow_alloc_object;
+/// willow_alloc_object(i64::from(willow_abi::GC_BITMAP_TYPE_ID), 8);
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_alloc_object(type_id: i64, payload_size: i64) -> *mut u8 {
-    allocate_object(0, type_id as u32, payload_size, 0)
+pub unsafe extern "C" fn willow_alloc_object(type_id: i64, payload_size: i64) -> *mut u8 {
+    // SAFETY: The caller supplies the matching payload layout and initialization protocol for
+    // the effective type ID.
+    unsafe { allocate_object(0, type_id as u32, payload_size, 0) }
 }
 
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_alloc_typed(payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
-    allocate_object(0, 0, payload_size, gc_ref_mask)
+    // SAFETY: Type zero is the ordinary zero-initialized payload. Its inline mask is bounded
+    // by the payload word count during tracing.
+    unsafe { allocate_object(0, 0, payload_size, gc_ref_mask) }
 }
 
 #[unsafe(no_mangle)]
@@ -1784,37 +1877,58 @@ pub extern "C" fn willow_alloc(payload_size: i64) -> *mut u8 {
 /// immutable, aligned static u64 data `[count, bits...]`, alive until all such
 /// objects have been reclaimed. Payload and bitmap sizes must agree.
 /// `layout_id` is the address-independent fingerprint computed by the compiler.
+///
+/// # Safety
+/// Null is rejected before any read. For a non-null descriptor,
+/// the aligned immutable bitmap must contain the count followed by that many u64 tracing
+/// words covering the payload, with exactly its reference slots set. Keep it live for all GC
+/// uses and supply the matching layout fingerprint.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_gc_alloc_bitmap(
+pub unsafe extern "C" fn willow_gc_alloc_bitmap(
     layout_id: i64,
     payload_size: i64,
     descriptor: *const u64,
 ) -> *mut u8 {
     assert!(!descriptor.is_null());
     assert!(payload_size >= 0 && payload_size % GC_STORAGE_WORD_BYTES as i64 == 0);
+    // SAFETY: The bitmap ABI supplies an immutable u64-aligned descriptor beginning with its word
+    // count.
     let count = unsafe { *descriptor } as usize;
     assert_eq!(
         count,
         (payload_size as usize / GC_STORAGE_WORD_BYTES).div_ceil(64)
     );
-    allocate_object(
-        layout_id as u64,
-        willow_abi::GC_BITMAP_TYPE_ID,
-        payload_size,
-        descriptor as u64,
-    )
+    // SAFETY: The count matches the payload width and the caller retains the aligned
+    // descriptor through all tracing.
+    unsafe {
+        allocate_object(
+            layout_id as u64,
+            willow_abi::GC_BITMAP_TYPE_ID,
+            payload_size,
+            descriptor as u64,
+        )
+    }
 }
 
+/// # Safety
+/// The effective u32 type ID, payload size, alignment, tracing metadata and layout ID must
+/// describe the same object. For the bitmap type the mask is the address of an aligned
+/// immutable [count, bits...] descriptor covering all payload words, live through reclamation
+/// and any collector snapshots. For native types, install compatible hooks and initialize
+/// their full payload before any safepoint, publication, or possible finalization. Maintain
+/// initialized managed references in traced slots.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_gc_alloc_layout(
+pub unsafe extern "C" fn willow_gc_alloc_layout(
     layout_id: u64,
     type_id: i64,
     payload_size: i64,
     gc_ref_mask: u64,
 ) -> *mut u8 {
-    allocate_object(layout_id, type_id as u32, payload_size, gc_ref_mask)
+    // SAFETY: The caller supplies the matching payload layout and initialization protocol for
+    // the effective type ID.
+    unsafe { allocate_object(layout_id, type_id as u32, payload_size, gc_ref_mask) }
 }
 
 /// Allocation slow path for compiler-generated TLAB lowering.
@@ -1823,9 +1937,26 @@ pub extern "C" fn willow_gc_alloc_layout(
 /// retire an exhausted chunk, coordinate collection/threshold checks, refill,
 /// initialize the first object, and return its payload. Large and stress-mode
 /// allocations stay on the old/large-region path.
+///
+/// # Safety
+/// A non-null TLAB must be the initialized, naturally aligned allocation block of this mutator
+/// in the selected runtime (initially zeroed). Keep its address and storage valid until
+/// retirement AND removal from the registry, including during stops and teardown; only the
+/// owning mutator may bump it, following the collector stop protocol. The effective u32 type
+/// ID, payload size, alignment, tracing metadata and layout ID must describe the same object.
+/// For the bitmap type the mask is the address of an aligned immutable [count, bits...]
+/// descriptor covering all payload words, live through reclamation and any collector
+/// snapshots. For native types, install compatible hooks and initialize their full payload
+/// before any safepoint, publication, or possible finalization. Maintain initialized managed
+/// references in traced slots.
+///
+/// ```compile_fail,E0133
+/// use willow_runtime::gc::{willow_gc_alloc_slow, willow_gc_current_tlab};
+/// willow_gc_alloc_slow(willow_gc_current_tlab(), 0, 0, 8, 0);
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_gc_alloc_slow(
+pub unsafe extern "C" fn willow_gc_alloc_slow(
     tlab_state: *mut GcTlabState,
     layout_id: u64,
     type_id: i64,
@@ -1836,37 +1967,68 @@ pub extern "C" fn willow_gc_alloc_slow(
     if tlab_state.is_null() || payload_size < 0 {
         crate::failure::fatal_invariant("invalid TLAB allocation arguments");
     }
-    tlab_alloc_slow_in(
-        crate::runtime::current(),
-        tlab_state as usize,
-        layout_id,
-        type_id,
-        payload_size,
-        gc_ref_mask,
-    )
+    // SAFETY: The caller retains this owner-thread TLAB through unregistration and supplies
+    // the matching type and tracing layout.
+    unsafe {
+        tlab_alloc_slow_in(
+            crate::runtime::current(),
+            tlab_state as usize,
+            layout_id,
+            type_id,
+            payload_size,
+            gc_ref_mask,
+        )
+    }
 }
 
 /// Shared TLAB miss handling for generated code and the runtime's own TLAB
 /// ([`runtime_tlab`]). The caller decides whether this thread's root slots are
 /// relocatable for any collection started here.
-fn tlab_alloc_slow(
+///
+/// # Safety
+/// A non-null TLAB must be the initialized, naturally aligned allocation block of this mutator
+/// in the selected runtime (initially zeroed). Keep its address and storage valid until
+/// retirement AND removal from the registry, including during stops and teardown; only the
+/// owning mutator may bump it, following the collector stop protocol. The effective u32 type
+/// ID, payload size, alignment, tracing metadata and layout ID must describe the same object.
+/// For the bitmap type the mask is the address of an aligned immutable [count, bits...]
+/// descriptor covering all payload words, live through reclamation and any collector
+/// snapshots. For native types, install compatible hooks and initialize their full payload
+/// before any safepoint, publication, or possible finalization. Maintain initialized managed
+/// references in traced slots.
+unsafe fn tlab_alloc_slow(
     state_address: usize,
     layout_id: u64,
     type_id: i64,
     payload_size: i64,
     gc_ref_mask: u64,
 ) -> *mut u8 {
-    tlab_alloc_slow_in(
-        crate::runtime::current(),
-        state_address,
-        layout_id,
-        type_id,
-        payload_size,
-        gc_ref_mask,
-    )
+    // SAFETY: The caller retains this owner-thread TLAB through unregistration and supplies
+    // the matching type and tracing layout.
+    unsafe {
+        tlab_alloc_slow_in(
+            crate::runtime::current(),
+            state_address,
+            layout_id,
+            type_id,
+            payload_size,
+            gc_ref_mask,
+        )
+    }
 }
 
-fn tlab_alloc_slow_in(
+/// # Safety
+/// A non-null TLAB must be the initialized, naturally aligned allocation block of this mutator
+/// in the selected runtime (initially zeroed). Keep its address and storage valid until
+/// retirement AND removal from the registry, including during stops and teardown; only the
+/// owning mutator may bump it, following the collector stop protocol. The effective u32 type
+/// ID, payload size, alignment, tracing metadata and layout ID must describe the same object.
+/// For the bitmap type the mask is the address of an aligned immutable [count, bits...]
+/// descriptor covering all payload words, live through reclamation and any collector
+/// snapshots. For native types, install compatible hooks and initialize their full payload
+/// before any safepoint, publication, or possible finalization. Maintain initialized managed
+/// references in traced slots.
+unsafe fn tlab_alloc_slow_in(
     owner: &crate::runtime::Runtime,
     state_address: usize,
     layout_id: u64,
@@ -1884,7 +2046,9 @@ fn tlab_alloc_slow_in(
     let small = total_size <= GC_TLAB_MAX_OBJECT_SIZE;
     let (fast_bytes, minor_due, cached, major_due, storage_allocator) = {
         let mut state = owner.gc.heap.lock().unwrap();
-        tlab::register_tlab_state_in(&owner.gc, &mut state, state_address);
+        // SAFETY: The mutator owns this initialized block at a stable address through
+        // retirement and removal from this runtime.
+        unsafe { tlab::register_tlab_state_in(&owner.gc, &mut state, state_address) };
         let record = state.tlab_states.get_mut(&state_address).unwrap();
         let fast = fast_bytes_total(record);
         let fast_bytes = fast.saturating_sub(record.assist_observed_fast_bytes);
@@ -1949,12 +2113,18 @@ fn tlab_alloc_slow_in(
     }
 
     if stress || !small {
-        return allocate_old_in(owner, layout_id, type_id as u32, payload_size, gc_ref_mask);
+        // SAFETY: The allocation path forwards the validated payload extent, type and tracing
+        // layout; its caller initializes native fields before collection.
+        return unsafe {
+            allocate_old_in(owner, layout_id, type_id as u32, payload_size, gc_ref_mask)
+        };
     }
 
     let mut storage = cached_storage.or_else(|| tlab::ChunkStorage::allocate(&storage_allocator));
     let mut state = owner.gc.heap.lock().unwrap();
-    tlab::register_tlab_state_in(&owner.gc, &mut state, state_address);
+    // SAFETY: The mutator owns this initialized block at a stable address through retirement
+    // and removal from this runtime.
+    unsafe { tlab::register_tlab_state_in(&owner.gc, &mut state, state_address) };
     let mut base = tlab::install_tlab_chunk(owner, &mut state, state_address, &mut storage);
     for _ in 0..BUDGET_COLLECTION_RETRIES {
         if base.is_some() || (state.memory_limit_bytes.is_none() && !state.soft_memory.enabled()) {
@@ -1967,7 +2137,9 @@ fn tlab_alloc_slow_in(
             storage = tlab::ChunkStorage::allocate(&storage_allocator);
         }
         state = owner.gc.heap.lock().unwrap();
-        tlab::register_tlab_state_in(&owner.gc, &mut state, state_address);
+        // SAFETY: The mutator owns this initialized block at a stable address through
+        // retirement and removal from this runtime.
+        unsafe { tlab::register_tlab_state_in(&owner.gc, &mut state, state_address) };
         base = tlab::install_tlab_chunk(owner, &mut state, state_address, &mut storage);
         if state.released_bytes == released {
             break;
@@ -1977,7 +2149,9 @@ fn tlab_alloc_slow_in(
         return allocation_failure_in(&owner.gc, &state);
     };
     let Some(header) =
-        initialize_object_at(base, total_size, type_id as u32, layout_id, gc_ref_mask)
+        // SAFETY: The allocation cursor reserves this aligned header and its complete
+        // payload. The supplied type and mask describe the initialized words.
+        (unsafe { initialize_object_at(base, total_size, type_id as u32, layout_id, gc_ref_mask) })
     else {
         crate::failure::fatal_invariant("fresh TLAB could not initialize a validated object");
     };
@@ -2116,7 +2290,19 @@ fn find_tlab_chunk(state: &GcState, address: usize) -> Option<&BumpChunk> {
     (address >= start + GC_HEADER_SIZE && address <= end).then_some(chunk)
 }
 
-fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
+/// # Safety
+/// The effective u32 type ID, payload size, alignment, tracing metadata and layout ID must
+/// describe the same object. For the bitmap type the mask is the address of an aligned
+/// immutable [count, bits...] descriptor covering all payload words, live through reclamation
+/// and any collector snapshots. For native types, install compatible hooks and initialize
+/// their full payload before any safepoint, publication, or possible finalization. Maintain
+/// initialized managed references in traced slots.
+unsafe fn allocate_object(
+    layout_id: u64,
+    type_id: u32,
+    payload_size: i64,
+    gc_ref_mask: u64,
+) -> *mut u8 {
     if payload_size < 0 {
         crate::failure::fatal_invariant("negative managed allocation size");
     }
@@ -2134,7 +2320,9 @@ fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask:
     {
         automatic_collect(stress);
     }
-    allocate_old(layout_id, type_id, payload_size, gc_ref_mask)
+    // SAFETY: The allocation path forwards the validated payload extent, type and tracing
+    // layout; its caller initializes native fields before collection.
+    unsafe { allocate_old(layout_id, type_id, payload_size, gc_ref_mask) }
 }
 
 // Process-wide identity allocation prevents a reused owner address or equal
@@ -2216,7 +2404,10 @@ fn index_old_region(state: &mut GcState, index: usize) {
     }
 }
 
-fn allocate_old_region_object_locked(
+/// # Safety
+/// The type, tracing metadata and payload size must satisfy the allocation contract of
+/// willow_gc_alloc_layout, including reserved bitmap descriptors and native initialization.
+unsafe fn allocate_old_region_object_locked(
     state: &mut GcState,
     layout_id: u64,
     type_id: u32,
@@ -2224,18 +2415,25 @@ fn allocate_old_region_object_locked(
     gc_ref_mask: u64,
     count_logical_allocation: bool,
 ) -> Option<HeapObject> {
-    allocate_old_region_object_locked_in(
-        crate::runtime::current(),
-        state,
-        layout_id,
-        type_id,
-        payload_size,
-        gc_ref_mask,
-        count_logical_allocation,
-    )
+    // SAFETY: The allocation path forwards the validated payload extent, type and tracing
+    // layout; its caller initializes native fields before collection.
+    unsafe {
+        allocate_old_region_object_locked_in(
+            crate::runtime::current(),
+            state,
+            layout_id,
+            type_id,
+            payload_size,
+            gc_ref_mask,
+            count_logical_allocation,
+        )
+    }
 }
 
-fn allocate_old_region_object_locked_in(
+/// # Safety
+/// The type, tracing metadata and payload size must satisfy the allocation contract of
+/// willow_gc_alloc_layout, including reserved bitmap descriptors and native initialization.
+unsafe fn allocate_old_region_object_locked_in(
     owner: &crate::runtime::Runtime,
     state: &mut GcState,
     layout_id: u64,
@@ -2284,12 +2482,16 @@ fn allocate_old_region_object_for_move_in(
         .copied()
         .filter(|(available, _)| !large && *available >= span_size);
     let (object, reused) = if let Some((_, index)) = candidate {
-        let allocated = state.old_regions[index].allocate_object_for_move_buffered(
-            owner.gc.mark_phase(),
-            metadata,
-            source,
-            None,
-        )?;
+        // SAFETY: The caller establishes the type and layout and exclusive access to any
+        // evacuation source. The region owns the destination storage.
+        let allocated = unsafe {
+            state.old_regions[index].allocate_object_for_move_buffered(
+                owner.gc.mark_phase(),
+                metadata,
+                source,
+                None,
+            )
+        }?;
         let available = state.old_regions[index].available_span();
         state.old_region_candidates.pop_last();
         if available >= GC_HEADER_SIZE {
@@ -2304,12 +2506,11 @@ fn allocate_old_region_object_for_move_in(
             RegionKind::Old
         };
         let mut region = reserve_old_region_in(&owner.gc, state, kind, capacity)?;
-        let allocated = region.allocate_object_for_move_buffered(
-            owner.gc.mark_phase(),
-            metadata,
-            source,
-            None,
-        )?;
+        // SAFETY: The caller establishes the type and layout and exclusive access to any
+        // evacuation source. The region owns the destination storage.
+        let allocated = unsafe {
+            region.allocate_object_for_move_buffered(owner.gc.mark_phase(), metadata, source, None)
+        }?;
         state
             .old_addresses
             .insert(region.base as usize, state.old_regions.len());
@@ -2360,17 +2561,32 @@ fn account_old_region_allocation_in(
     }
 }
 
-fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
-    allocate_old_in(
-        crate::runtime::current(),
-        layout_id,
-        type_id,
-        payload_size,
-        gc_ref_mask,
-    )
+/// # Safety
+/// The type, tracing metadata and payload size must satisfy the allocation contract of
+/// willow_gc_alloc_layout, including reserved bitmap descriptors and native initialization.
+unsafe fn allocate_old(
+    layout_id: u64,
+    type_id: u32,
+    payload_size: i64,
+    gc_ref_mask: u64,
+) -> *mut u8 {
+    // SAFETY: The allocation path forwards the validated payload extent, type and tracing
+    // layout; its caller initializes native fields before collection.
+    unsafe {
+        allocate_old_in(
+            crate::runtime::current(),
+            layout_id,
+            type_id,
+            payload_size,
+            gc_ref_mask,
+        )
+    }
 }
 
-fn allocate_old_in(
+/// # Safety
+/// The type, tracing metadata and payload size must satisfy the allocation contract of
+/// willow_gc_alloc_layout, including reserved bitmap descriptors and native initialization.
+unsafe fn allocate_old_in(
     owner: &crate::runtime::Runtime,
     layout_id: u64,
     type_id: u32,
@@ -2398,21 +2614,29 @@ fn allocate_old_in(
         // Small runtime objects bump-allocate in this thread's old buffer and
         // take the heap mutex only to refill it.
         if let Some(object) =
-            old_lab::try_allocate_in(owner, type_id, layout_id, gc_ref_mask, total, span)
+            // SAFETY: The allocation path forwards the validated payload extent, type and
+            // tracing layout; its caller initializes native fields before collection.
+            unsafe {
+                old_lab::try_allocate_in(owner, type_id, layout_id, gc_ref_mask, total, span)
+            }
         {
             return object.payload().as_ptr();
         }
         let mut state = owner.gc.heap.lock().unwrap();
         let refill = |state: &mut GcState| {
-            old_lab::refill_and_allocate_in(
-                owner,
-                state,
-                type_id,
-                layout_id,
-                gc_ref_mask,
-                total,
-                span,
-            )
+            // SAFETY: The allocation path forwards the validated payload extent, type and
+            // tracing layout; its caller initializes native fields before collection.
+            unsafe {
+                old_lab::refill_and_allocate_in(
+                    owner,
+                    state,
+                    type_id,
+                    layout_id,
+                    gc_ref_mask,
+                    total,
+                    span,
+                )
+            }
         };
         let mut object = refill(&mut state);
         for _ in 0..BUDGET_COLLECTION_RETRIES {
@@ -2467,15 +2691,19 @@ fn allocate_old_in(
         }
         state = owner.gc.heap.lock().unwrap();
     }
-    let mut header = allocate_old_region_object_locked_in(
-        owner,
-        &mut state,
-        layout_id,
-        type_id,
-        payload_size,
-        gc_ref_mask,
-        true,
-    );
+    // SAFETY: The allocation path forwards the validated payload extent, type and tracing
+    // layout; its caller initializes native fields before collection.
+    let mut header = unsafe {
+        allocate_old_region_object_locked_in(
+            owner,
+            &mut state,
+            layout_id,
+            type_id,
+            payload_size,
+            gc_ref_mask,
+            true,
+        )
+    };
     for _ in 0..BUDGET_COLLECTION_RETRIES {
         if header.is_some() || (state.memory_limit_bytes.is_none() && !state.soft_memory.enabled())
         {
@@ -2485,15 +2713,19 @@ fn allocate_old_in(
         drop(state);
         collect_for_budget_in(owner);
         state = owner.gc.heap.lock().unwrap();
-        header = allocate_old_region_object_locked_in(
-            owner,
-            &mut state,
-            layout_id,
-            type_id,
-            payload_size,
-            gc_ref_mask,
-            true,
-        );
+        // SAFETY: The allocation path forwards the validated payload extent, type and tracing
+        // layout; its caller initializes native fields before collection.
+        header = unsafe {
+            allocate_old_region_object_locked_in(
+                owner,
+                &mut state,
+                layout_id,
+                type_id,
+                payload_size,
+                gc_ref_mask,
+                true,
+            )
+        };
         if state.released_bytes == released {
             break;
         }
@@ -2660,6 +2892,8 @@ fn bitmap_reference_slots(
     // SAFETY: only bitmap objects interpret the mask as an immutable,
     // process-lifetime compiler descriptor. Other types have no extra words.
     let count = if metadata.type_id == willow_abi::GC_BITMAP_TYPE_ID {
+        // SAFETY: The bitmap ABI supplies an immutable u64-aligned descriptor beginning with its
+        // word count.
         unsafe { *descriptor as usize }
     } else {
         0
@@ -2737,6 +2971,13 @@ fn automatic_collect_in(owner: &crate::runtime::Runtime, stress: bool) {
     if stress || !coordinator::request_in(owner) {
         let _ = try_collect_internal_in(owner);
     }
+}
+
+#[cfg(all(test, debug_assertions))]
+pub(crate) fn inject_invalid_runtime_root_for_test() {
+    // Seed the registry directly to exercise validation of corrupt GC state. The
+    // debug collector checks heap membership before accessing the payload.
+    runtime().runtime_roots.add(std::ptr::dangling_mut());
 }
 
 #[cfg(all(test, debug_assertions))]
@@ -3066,6 +3307,8 @@ fn validate_payload_pointer_locked(
             // Acquire of the start bit observes completed header initialization,
             // even for a concurrently advancing generated TLAB. Never walk an
             // active prefix: its cursor can precede initialization of that tail.
+            // SAFETY: Allocation metadata identifies a header-aligned object start within this
+            // live region or chunk.
             let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast()).unwrap();
             let size = object.size();
             if object.allocated() && size >= GC_HEADER_SIZE && size <= chunk.capacity - offset {
@@ -3094,7 +3337,12 @@ fn reset_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     guard
 }
 
-fn reset_internal() {
+/// # Safety
+/// The caller must have exclusive lifecycle access to this runtime. Stop other mutators and
+/// exclude allocations, initializers, borrows and all other heap users throughout reset.
+/// Release outstanding roots and leases or otherwise guarantee no stale pointers, slots or
+/// handles are later used. Registered TLAB storage must still be live during retirement.
+unsafe fn reset_internal() {
     // Coordinator shutdown waits on `coord`; recover it before that wait.
     drop(reset_lock(&runtime().coord.0));
     coordinator::shutdown();
@@ -3139,6 +3387,8 @@ fn reset_internal() {
     // Drain the index so OldRegion::drop does not revisit reclaimed headers.
     for region in &mut state.old_regions {
         for (offset, _) in std::mem::take(&mut region.allocations) {
+            // SAFETY: Allocation metadata identifies a header-aligned object start within this
+            // live region or chunk.
             let object = HeapObject::from_raw(unsafe { region.base.add(offset) }.cast()).unwrap();
             if let Some(drop_fn) = lookup_drop(object.type_id()) {
                 // SAFETY: reset is quiescent and this indexed payload is live.
@@ -3176,6 +3426,8 @@ fn reset_internal() {
     for chunk in state.tlab_chunks.drain(..) {
         let mut offset = 0;
         while offset < chunk.used {
+            // SAFETY: Allocation metadata identifies a header-aligned object start within this
+            // live region or chunk.
             let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast()).unwrap();
             offset += object.size();
             // Moved or previously swept objects no longer own their payloads.
@@ -3307,9 +3559,16 @@ pub fn header_size_for_test() -> usize {
 
 /// Reset the GC heap/root/registry state. Exposed for tests in sibling modules
 /// so they can isolate from one another on the shared global heap.
+///
+/// # Safety
+/// The caller must have exclusive lifecycle access to this runtime. Stop other mutators and
+/// exclude allocations, initializers, borrows and all other heap users throughout reset.
+/// Release outstanding roots and leases or otherwise guarantee no stale pointers, slots or
+/// handles are later used. Registered TLAB storage must still be live during retirement.
 #[cfg(test)]
-pub fn reset_internal_for_test() {
-    reset_internal();
+pub unsafe fn reset_internal_for_test() {
+    // SAFETY: The caller has quiesced this runtime and relinquished access to its old heap.
+    unsafe { reset_internal() };
     crate::runtime::current()
         .diagnostic_ready
         .store(true, Ordering::Release);
@@ -3342,8 +3601,41 @@ pub(crate) fn preemption_tolerant_remark_budget_for_test() {
 /// generation. Container tests use it to give a container young children that a
 /// minor collection will move.
 #[cfg(test)]
-pub(crate) fn tlab_state_for_test() -> GcTlabState {
-    GcTlabState::new()
+pub(crate) fn tlab_state_for_test() -> TestTlab {
+    TestTlab {
+        state: std::rc::Rc::new(GcTlabState::new()),
+        owner: crate::runtime::current(),
+    }
+}
+
+/// Test-owned equivalent of the runtime TLS allocation block. Moving a fixture
+/// never moves the registered block, including when a vector of fixtures grows.
+#[cfg(test)]
+pub(crate) struct TestTlab {
+    state: std::rc::Rc<GcTlabState>,
+    owner: &'static crate::runtime::Runtime,
+}
+
+#[cfg(test)]
+impl TestTlab {
+    pub(crate) fn as_ptr(&self) -> *mut GcTlabState {
+        std::rc::Rc::as_ptr(&self.state).cast_mut()
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestTlab {
+    type Target = GcTlabState;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestTlab {
+    fn drop(&mut self) {
+        tlab::unregister_tlab_state_in(self.owner, self.as_ptr() as usize);
+    }
 }
 
 /// Allocate one young object of `type_id` in `owner`'s heap with `drop_fn` as
@@ -3354,10 +3646,19 @@ pub(crate) fn tlab_state_for_test() -> GcTlabState {
 /// The allocation registers `tlab`'s address in `owner`'s heap state, so the
 /// caller must keep `tlab` alive and unmoved until `owner` is dropped (later
 /// refills, collections and resets read it through that registration).
+///
+/// # Safety
+/// The effective u32 type ID, payload size, alignment, tracing metadata and layout ID must
+/// describe the same object. For the bitmap type the mask is the address of an aligned
+/// immutable [count, bits...] descriptor covering all payload words, live through reclamation
+/// and any collector snapshots. For native types, install compatible hooks and initialize
+/// their full payload before any safepoint, publication, or possible finalization. Maintain
+/// initialized managed references in traced slots. The hook must finalize every object of this
+/// ID and the caller must keep the TLAB stable while registered.
 #[cfg(test)]
-pub(crate) fn allocate_finalized_for_test(
+pub(crate) unsafe fn allocate_finalized_for_test(
     owner: &crate::runtime::Runtime,
-    tlab: &mut GcTlabState,
+    tlab: *mut GcTlabState,
     type_id: u32,
     drop_fn: DropFn,
     payload_size: usize,
@@ -3368,14 +3669,18 @@ pub(crate) fn allocate_finalized_for_test(
         .lock()
         .unwrap()
         .insert(type_id, drop_fn);
-    let payload = tlab_alloc_slow_in(
-        owner,
-        std::ptr::from_mut(tlab) as usize,
-        0,
-        i64::from(type_id),
-        payload_size as i64,
-        0,
-    );
+    // SAFETY: The caller retains this owner-thread TLAB through unregistration and supplies
+    // the matching type and tracing layout.
+    let payload = unsafe {
+        tlab_alloc_slow_in(
+            owner,
+            tlab as usize,
+            0,
+            i64::from(type_id),
+            payload_size as i64,
+            0,
+        )
+    };
     assert!(!payload.is_null());
     payload
 }

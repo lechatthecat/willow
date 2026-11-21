@@ -201,7 +201,23 @@ pub(super) fn trace_mode(concurrent: bool, slice: bool) -> TraceMode {
 /// unsupported. All hooks must avoid GC allocation, safepoints and GC reentry;
 /// concurrent hooks require synchronized value snapshots and short critical
 /// sections. Slices additionally require bounded work and stable finite cursors.
-pub fn willow_register_type_capability(
+///
+/// # Safety
+/// Use a type ID dedicated to this layout, excluding the untyped and bitmap IDs. Every
+/// instance these callbacks may receive must be aligned, live and initialized. Previously captured
+/// hooks must remain valid through their last collector epoch. Callbacks must not allocate GC
+/// memory, enter the collector or safepoint. The stopped tracer must report exactly the
+/// initialized managed edges of each such payload. Concurrent hooks must provide synchronized
+/// snapshots without racing mutation or reclamation. A sliced hook must bound its work, use
+/// valid stable cursors and eventually finish or request a retry.
+///
+/// ```compile_fail,E0133
+/// use willow_runtime::gc::{willow_register_type_capability, NativeTraceCapability, TraceFn};
+/// fn install(trace: TraceFn) {
+///     willow_register_type_capability(1, trace, NativeTraceCapability::StopOnly);
+/// }
+/// ```
+pub unsafe fn willow_register_type_capability(
     type_id: u32,
     stopped: TraceFn,
     capability: NativeTraceCapability,
@@ -211,10 +227,20 @@ pub fn willow_register_type_capability(
         NativeTraceCapability::ConcurrentSafe(trace) => (Some(trace), None),
         NativeTraceCapability::SliceConcurrentSafe(slice) => (None, Some(slice)),
     };
-    register_hooks_in(runtime(), type_id, stopped, trace, slice);
+    // SAFETY: The registration contract couples these callbacks and execution modes to every
+    // instance of the selected type.
+    unsafe { register_hooks_in(runtime(), type_id, stopped, trace, slice) };
 }
 
-fn register_hooks_in(
+/// # Safety
+/// Use a type ID dedicated to this layout, excluding the untyped and bitmap IDs. Every
+/// instance these callbacks may receive must be aligned, live and initialized. Previously captured
+/// hooks must remain valid through their last collector epoch. Callbacks must not allocate GC
+/// memory, enter the collector or safepoint. The stopped tracer must report exactly the
+/// initialized managed edges of each such payload. Concurrent hooks must provide synchronized
+/// snapshots without racing mutation or reclamation. A sliced hook must bound its work, use
+/// valid stable cursors and eventually finish or request a retry.
+unsafe fn register_hooks_in(
     gc: &GcRuntime,
     type_id: u32,
     stopped: TraceFn,
@@ -310,6 +336,8 @@ pub(super) fn trace_registry_snapshot_in(
 /// # Safety
 /// The aligned slot must stay allocated; all concurrent writes must be atomic.
 pub(crate) unsafe fn load_gc_reference(slot: *mut *mut u8) -> *mut u8 {
+    // SAFETY: The traced slot is live and pointer-aligned. Concurrent readers and writers use
+    // atomic pointer operations.
     unsafe { std::sync::atomic::AtomicPtr::from_ptr(slot).load(Ordering::Acquire) }
 }
 
@@ -318,6 +346,8 @@ pub(crate) unsafe fn load_gc_reference(slot: *mut *mut u8) -> *mut u8 {
 /// # Safety
 /// The aligned slot must stay allocated and contain a reference-sized word.
 pub(crate) unsafe fn store_gc_reference(slot: *mut *mut u8, value: *mut u8) {
+    // SAFETY: The traced slot is live and pointer-aligned. Concurrent readers and writers use
+    // atomic pointer operations.
     unsafe { std::sync::atomic::AtomicPtr::from_ptr(slot).store(value, Ordering::Release) }
 }
 
@@ -326,16 +356,32 @@ pub(super) fn type_registry() -> &'static Mutex<HashMap<u32, TraceFn>> {
 }
 
 /// Register a trace function for `type_id`.  Call once per class at startup.
-pub fn willow_register_type(type_id: u32, trace: TraceFn) {
-    willow_register_type_capability(type_id, trace, NativeTraceCapability::StopOnly);
+///
+/// # Safety
+/// Use a type ID dedicated to this layout, excluding the untyped and bitmap IDs. Every
+/// instance these callbacks may receive must be aligned, live and initialized. Previously captured
+/// hooks must remain valid through their last collector epoch. Callbacks must not allocate GC
+/// memory, enter the collector or safepoint. The stopped tracer must report exactly the
+/// initialized managed edges of each such payload.
+pub unsafe fn willow_register_type(type_id: u32, trace: TraceFn) {
+    // SAFETY: The registration contract couples these callbacks and execution modes to every
+    // instance of the selected type.
+    unsafe { willow_register_type_capability(type_id, trace, NativeTraceCapability::StopOnly) };
 }
 
 /// Unregister all trace capabilities for `type_id`.
-pub fn willow_unregister_type(type_id: u32) {
-    unregister_type_in(runtime(), type_id);
+///
+/// # Safety
+/// Retire all instances that still need these trace hooks or retain a compatible tracing path.
+/// Coordinate replacement with mutators and outstanding collector snapshots.
+pub unsafe fn willow_unregister_type(type_id: u32) {
+    // SAFETY: The caller has coordinated retirement of this type in the selected runtime.
+    unsafe { unregister_type_in(runtime(), type_id) };
 }
 
-fn unregister_type_in(gc: &GcRuntime, type_id: u32) {
+/// # Safety
+/// All affected objects and collector epochs must satisfy [willow_unregister_type].
+unsafe fn unregister_type_in(gc: &GcRuntime, type_id: u32) {
     let mut cache = gc.minor_registry_cache.lock().unwrap();
     let mut legacy = gc.trace_registry.lock().unwrap();
     let mut traces = gc.concurrent_trace_registry.lock().unwrap();
@@ -368,7 +414,20 @@ pub struct NativeGcType {
 }
 
 impl NativeGcType {
-    pub const fn new(type_id: u32, trace: Option<TraceFn>, drop_fn: Option<DropFn>) -> Self {
+    /// # Safety
+    /// The chosen ID must be reserved for this exact native representation. Every matching
+    /// instance must satisfy the selected stopped trace and finalizer callbacks whenever the
+    /// collector can invoke them. The stopped tracer must report exactly the initialized
+    /// managed edges of each such payload. A finalizer must accept exclusive access to each
+    /// dead initialized payload and release its owned resources exactly once.
+    ///
+    /// ```compile_fail,E0133
+    /// use willow_runtime::gc::{NativeGcType, DropFn};
+    /// fn descriptor(type_id: u32, drop_fn: DropFn) {
+    ///     NativeGcType::new(type_id, None, Some(drop_fn));
+    /// }
+    /// ```
+    pub const unsafe fn new(type_id: u32, trace: Option<TraceFn>, drop_fn: Option<DropFn>) -> Self {
         let Some(contract) = willow_abi::runtime_type_ids::runtime_type(type_id) else {
             panic!("native GC type is absent from the ABI schema");
         };
@@ -384,7 +443,11 @@ impl NativeGcType {
             concurrent_slice: None,
         }
     }
-    pub const fn with_concurrent_trace(mut self, trace: ConcurrentTraceFn) -> Self {
+    /// # Safety
+    /// The callback must trace the same edges as the stopped tracer for every payload of this
+    /// type, using synchronized reads that are safe alongside mutators and without GC reentry
+    /// or safepoints.
+    pub const unsafe fn with_concurrent_trace(mut self, trace: ConcurrentTraceFn) -> Self {
         assert!(
             self.trace.is_some(),
             "concurrent tracing requires a stopped hook"
@@ -392,7 +455,11 @@ impl NativeGcType {
         self.concurrent_trace = Some(trace);
         self
     }
-    pub const fn with_concurrent_slice(mut self, trace: ConcurrentTraceSliceFn) -> Self {
+    /// # Safety
+    /// The callback must traverse the same edges as the stopped tracer under concurrent
+    /// mutation without GC reentry. It must respect the work budget, snapshot consistently and
+    /// preserve a finite, valid cursor across calls or request a retry.
+    pub const unsafe fn with_concurrent_slice(mut self, trace: ConcurrentTraceSliceFn) -> Self {
         assert!(
             self.trace.is_some(),
             "sliced tracing requires a stopped hook"
@@ -456,11 +523,19 @@ impl NativeGcRegistrationState {
 impl NativeGcRegistration {
     /// Ensure every descriptor is installed. Returns `true` only to the caller
     /// that performed registration for this generation.
-    pub fn ensure(&self, types: &[NativeGcType]) -> bool {
-        self.ensure_in(runtime(), types)
+    ///
+    /// # Safety
+    /// Supply this group’s complete designated descriptor set, with callback layouts
+    /// compatible with all live instances and collector snapshots.
+    pub unsafe fn ensure(&self, types: &[NativeGcType]) -> bool {
+        // SAFETY: The caller supplies the designated set for this runtime and group.
+        unsafe { self.ensure_in(runtime(), types) }
     }
 
-    fn ensure_in(&self, gc: &GcRuntime, types: &[NativeGcType]) -> bool {
+    /// # Safety
+    /// In this collector every group consumer must agree on its complete descriptor set.
+    /// All installed callbacks must be compatible with every payload they may receive.
+    unsafe fn ensure_in(&self, gc: &GcRuntime, types: &[NativeGcType]) -> bool {
         let state = &gc.native_registrations.states[*self as usize];
         let generation = gc.registry_generation.load(Ordering::Acquire);
         if state.registered_generation.load(Ordering::Acquire) == generation {
@@ -476,16 +551,22 @@ impl NativeGcRegistration {
         }
         for native in types {
             if let Some(trace) = native.trace {
-                register_hooks_in(
-                    gc,
-                    native.type_id,
-                    trace,
-                    native.concurrent_trace,
-                    native.concurrent_slice,
-                );
+                // SAFETY: The registration contract couples these callbacks and execution
+                // modes to every instance of the selected type.
+                unsafe {
+                    register_hooks_in(
+                        gc,
+                        native.type_id,
+                        trace,
+                        native.concurrent_trace,
+                        native.concurrent_slice,
+                    )
+                };
             }
             if let Some(drop_fn) = native.drop_fn {
-                register_drop_in(gc, native.type_id, drop_fn);
+                // SAFETY: The registration contract couples these callbacks and execution
+                // modes to every instance of the selected type.
+                unsafe { register_drop_in(gc, native.type_id, drop_fn) };
             }
         }
         state
@@ -501,11 +582,26 @@ pub(super) fn drop_registry() -> &'static Mutex<HashMap<u32, DropFn>> {
 
 /// Register a finalizer for `type_id`, run by the sweep phase before an object
 /// of that type is deallocated.
-pub fn willow_register_drop(type_id: u32, drop_fn: DropFn) {
-    register_drop_in(runtime(), type_id, drop_fn);
+///
+/// # Safety
+/// Use a type ID dedicated to this layout, excluding the untyped and bitmap IDs. Every
+/// instance these callbacks may receive must be aligned, live and initialized. Previously captured
+/// hooks must remain valid through their last collector epoch. Callbacks must not allocate GC
+/// memory, enter the collector or safepoint. A finalizer must accept exclusive access to each
+/// dead initialized payload and release its owned resources exactly once.
+pub unsafe fn willow_register_drop(type_id: u32, drop_fn: DropFn) {
+    // SAFETY: The registration contract couples these callbacks and execution modes to every
+    // instance of the selected type.
+    unsafe { register_drop_in(runtime(), type_id, drop_fn) };
 }
 
-fn register_drop_in(gc: &GcRuntime, type_id: u32, drop_fn: DropFn) {
+/// # Safety
+/// Use a type ID dedicated to this layout, excluding the untyped and bitmap IDs. Every
+/// instance these callbacks may receive must be aligned, live and initialized. Previously captured
+/// hooks must remain valid through their last collector epoch. Callbacks must not allocate GC
+/// memory, enter the collector or safepoint. A finalizer must accept exclusive access to each
+/// dead initialized payload and release its owned resources exactly once.
+unsafe fn register_drop_in(gc: &GcRuntime, type_id: u32, drop_fn: DropFn) {
     let mut cache = gc.minor_registry_cache.lock().unwrap();
     gc.drop_registry.lock().unwrap().insert(type_id, drop_fn);
     cache.changed();

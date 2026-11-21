@@ -29,7 +29,9 @@ fn endpoint() -> String {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_user_main() {
-    gc::willow_gc_init();
+    // SAFETY: The standalone driver exclusively controls this heap between workloads; no
+    // mutator or borrowed payload crosses reset.
+    unsafe { gc::willow_gc_init() };
     let before = endpoint();
     let mut counter_ns = 0;
     let mut allocation_ns = 0;
@@ -60,7 +62,11 @@ pub extern "C" fn willow_user_main() {
                 if sample < 5 {
                     let start = Instant::now();
                     assert_eq!(
-                        telemetry::willow_gc_stats_snapshot(4, v4.as_mut_ptr().cast(), v4_size),
+                        // SAFETY: The backing buffer covers the selected record on success;
+                        // rejected requests write nothing.
+                        unsafe {
+                            telemetry::willow_gc_stats_snapshot(4, v4.as_mut_ptr().cast(), v4_size)
+                        },
                         v4_size
                     );
                     v4_samples.push(start.elapsed().as_nanos());

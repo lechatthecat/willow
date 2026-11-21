@@ -15,10 +15,14 @@ pub(super) struct Native {
     pub callbacks: VecDeque<Vec<u8>>,
 }
 fn snapshot(bytes: &[u8]) -> Result<File, Error> {
+    // SAFETY: memfd_create receives a terminated name. A successful descriptor transfers once into
+    // its File owner.
     let fd = unsafe { libc::memfd_create(c"willow-plugin".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(Error::IsolationUnavailable);
     }
+    // SAFETY: memfd_create receives a terminated name. A successful descriptor transfers once into
+    // its File owner.
     let mut file = unsafe { File::from_raw_fd(fd) };
     file.write_all(bytes)
         .map_err(|_| Error::IsolationUnavailable)?;
@@ -100,7 +104,11 @@ fn filter() -> Vec<u8> {
     bytes
 }
 fn nonblocking(fd: i32) -> Result<(), Error> {
+    // SAFETY: The owner retains the descriptor through the call. Poll receives one writable
+    // pollfd.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    // SAFETY: The owner retains the descriptor through the call. Poll receives one writable
+    // pollfd.
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(Error::IsolationUnavailable);
     }
@@ -113,6 +121,8 @@ fn wait(fd: i32, events: i16, cancel: &Cancellation, deadline: Instant) -> Resul
         events,
         revents: 0,
     };
+    // SAFETY: The owner retains the descriptor through the call. Poll receives one writable
+    // pollfd.
     let result = unsafe { libc::poll(&mut pfd, 1, 2) };
     if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
         return Err(Error::Crash);
@@ -175,6 +185,8 @@ impl Native {
         let fds: Vec<_> = files.iter().map(AsRawFd::as_raw_fd).collect();
         let memory = manifest.budgets.memory_bytes as libc::rlim_t;
         let cpu = (u64::from(manifest.budgets.deadline_ms).div_ceil(1000) + 1) as libc::rlim_t;
+        // SAFETY: The child hook uses only async-signal-safe descriptor operations between fork
+        // and exec.
         unsafe {
             command.pre_exec(move || {
                 // Do not trust bwrap to close descriptors inherited from the
@@ -273,6 +285,8 @@ impl Native {
             cancel.check(deadline)?;
             // The runtime has a C entrypoint and cannot assume Rust's normal
             // SIGPIPE setup. Suppress the signal on this operation only.
+            // SAFETY: The transport retains its socket and the slice supplies the exact byte range
+            // to send.
             let written = unsafe {
                 libc::send(
                     self.transport.as_raw_fd(),

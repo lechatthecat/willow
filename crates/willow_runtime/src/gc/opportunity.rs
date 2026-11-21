@@ -195,14 +195,18 @@ mod tests {
     #[test]
     fn m3_mandatory_collection_ignores_missing_utilization() {
         let _guard = super::super::isolated_runtime();
-        super::super::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { super::super::reset_internal_for_test() };
         super::super::willow_alloc(128);
         assert!(request(Priority::Required, None));
         assert_eq!(super::super::willow_gc_allocated_bytes(), 0);
         super::super::willow_alloc(128);
         assert!(request(Priority::Emergency, None));
         assert_eq!(super::super::willow_gc_allocated_bytes(), 0);
-        super::super::reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { super::super::reset_internal_for_test() };
     }
 }
 
@@ -213,7 +217,9 @@ mod saturation_test {
     #[test]
     fn m3_saturated_mutators_preserve_mandatory_progress_and_hard_budget() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         const LIMIT: usize = 8 * GC_OLD_REGION_SIZE;
         runtime().heap.lock().unwrap().memory_limit_bytes = Some(LIMIT);
         let _main = MutatorRegistration::new();
@@ -280,6 +286,8 @@ mod saturation_test {
             progress.load(Ordering::Relaxed)
         );
         drop(_main);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 }

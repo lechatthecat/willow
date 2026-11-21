@@ -552,8 +552,12 @@ fn wasm_host_copy_work_is_bounded_separately_from_instructions() {
 fn native_closes_ungranted_inherited_descriptors() {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let file = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+    // SAFETY: The file stays open for duplication. A successful duplicate is owned independently
+    // and moved once into OwnedFd.
     let raw = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };
     assert!(raw >= 200);
+    // SAFETY: The file stays open for duplication. A successful duplicate is owned independently
+    // and moved once into OwnedFd.
     let inherited = unsafe { OwnedFd::from_raw_fd(raw) };
     let Some(mut s) = native() else {
         return;
@@ -576,6 +580,8 @@ fn native_broken_transport_never_signals_host() {
             native.wait_for_exit();
         }
         // Only change the disposition inside this dedicated test subprocess.
+        // SAFETY: The isolated probe installs the default disposition for SIGPIPE in its own
+        // process.
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }

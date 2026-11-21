@@ -3,7 +3,9 @@ use super::*;
 const SMALL_OBJECT_SIZE: usize = GC_HEADER_SIZE + 8;
 
 fn reset_gc() {
-    reset_internal();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal() };
 }
 
 fn assert_global_regions_valid() {
@@ -13,12 +15,8 @@ fn assert_global_regions_valid() {
     }
 }
 
-fn new_tlab_state() -> GcTlabState {
-    GcTlabState {
-        cursor: AtomicUsize::new(0),
-        limit: AtomicUsize::new(0),
-        start_bits: AtomicUsize::new(0),
-    }
+fn new_tlab_state() -> TestTlab {
+    tlab_state_for_test()
 }
 
 // Allocation stress runs a full collection inside every allocation. Fixtures
@@ -62,7 +60,11 @@ fn skip_filled_tlab_fixture(test_name: &str) -> bool {
     false
 }
 
-fn tlab_fast_alloc(
+/// # Safety
+/// The caller must own this mutator block. The type, payload extent and tracing mask must
+/// agree, including any required bitmap descriptor or native hooks. Initialize native fields
+/// before the object can be traced or finalized.
+unsafe fn tlab_fast_alloc(
     tls: &GcTlabState,
     layout_id: u64,
     type_id: u32,
@@ -75,13 +77,17 @@ fn tlab_fast_alloc(
     let cursor = tls.cursor.load(Ordering::Acquire);
     let limit = tls.limit.load(Ordering::Acquire);
     assert!(cursor + total_size <= limit);
-    let object = initialize_object_at(
-        cursor as *mut u8,
-        total_size,
-        type_id,
-        layout_id,
-        gc_ref_mask,
-    )
+    // SAFETY: The allocation cursor reserves this aligned header and its complete payload.
+    // The supplied type and mask describe the initialized words.
+    let object = unsafe {
+        initialize_object_at(
+            cursor as *mut u8,
+            total_size,
+            type_id,
+            layout_id,
+            gc_ref_mask,
+        )
+    }
     .unwrap();
     publish_tlab_start_for_test(tls, cursor as *mut u8);
     tls.cursor.store(cursor + total_size, Ordering::Release);
@@ -97,6 +103,8 @@ fn assert_local_region_valid(region: &OldRegion) {
         assert!(size.is_multiple_of(GC_REGION_MARK_GRANULE));
         assert!(offset + size <= region.used);
         let object =
+            // SAFETY: Allocation metadata identifies a header-aligned object start within this
+            // live region or chunk.
             HeapObject::from_raw(unsafe { region.base.add(offset) }.cast()).expect("live header");
         assert!(object.allocated());
         assert_eq!(object.generation(), GC_GENERATION_OLD);
@@ -122,13 +130,23 @@ fn assert_local_region_valid(region: &OldRegion) {
 fn stress_region_01_middle_hole_churn_reuses_one_region() {
     let _guard = isolated_runtime();
     reset_gc();
-    let mut left = willow_alloc_object(1, 8);
-    willow_push_root(&mut left);
+    // SAFETY: The requested layout describes the initialized words of this object and its
+    // type’s tracing or finalization contract.
+    let mut left = unsafe { willow_alloc_object(1, 8) };
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut left) };
     for _ in 0..1000 {
-        let _garbage = willow_alloc_object(2, 8);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let _garbage = unsafe { willow_alloc_object(2, 8) };
     }
-    let mut right = willow_alloc_object(3, 8);
-    willow_push_root(&mut right);
+    // SAFETY: The requested layout describes the initialized words of this object and its
+    // type’s tracing or finalization contract.
+    let mut right = unsafe { willow_alloc_object(3, 8) };
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut right) };
     willow_gc_collect();
     assert_eq!(willow_gc_old_region_count(), 1);
 
@@ -139,7 +157,10 @@ fn stress_region_01_middle_hole_churn_reuses_one_region() {
     let initial_allocations = willow_gc_old_region_allocations();
     for round in 0..200 {
         for value in 0..1000i64 {
-            let object = willow_alloc_object(4, 8);
+            // SAFETY: The requested layout describes the initialized words of this object and
+            // its type’s tracing or finalization contract.
+            let object = unsafe { willow_alloc_object(4, 8) };
+            // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
             unsafe { *(object as *mut i64) = value ^ round };
         }
         willow_gc_collect();
@@ -164,7 +185,9 @@ fn stress_region_01_middle_hole_churn_reuses_one_region() {
         assert!(willow_gc_old_region_reuses() >= initial_reuses + 200_000);
     }
 
-    willow_pop_roots(2);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_roots(2) };
     willow_gc_collect();
     assert_eq!(willow_gc_old_region_count(), 0);
     reset_gc();
@@ -190,7 +213,11 @@ fn stress_region_02_randomized_free_span_allocator_preserves_invariants() {
         let allocate = live.is_empty() || seed & 3 != 0;
         if allocate {
             let size = payload_sizes[(seed as usize >> 8) % payload_sizes.len()];
-            if let Some((object, reused)) = region.allocate_object(step as u32, seed, 0, size) {
+            if let Some((object, reused)) =
+                // SAFETY: The requested layout describes the initialized words of this object and
+                // its type’s tracing or finalization contract.
+                unsafe { region.allocate_object(step as u32, seed, 0, size) }
+            {
                 reuse_count += usize::from(reused);
                 live.push(object);
             } else {
@@ -235,17 +262,26 @@ fn stress_region_03_sparse_survivors_across_many_regions_stay_stable() {
     const ROOT_STRIDE: usize = 5_000;
     let mut objects = Vec::with_capacity(OBJECTS);
     for value in 0..OBJECTS {
-        let object = willow_alloc_object(value as i64 + 1, 8);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let object = unsafe { willow_alloc_object(value as i64 + 1, 8) };
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         unsafe { *(object as *mut i64) = value as i64 };
         objects.push(object);
         // Capacity is fixed before any root slot is registered.
-        willow_push_root(objects.last_mut().unwrap());
+        // SAFETY: The slot storage stays live and stationary through the matching pop,
+        // including during collection.
+        unsafe { willow_push_root(objects.as_mut_ptr().add(objects.len() - 1)) };
     }
     let mut roots: Vec<*mut u8> = objects.iter().step_by(ROOT_STRIDE).copied().collect();
     let original = roots.clone();
-    willow_pop_roots(OBJECTS as i32);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_roots(OBJECTS as i32) };
     for root in &mut roots {
-        willow_push_root(root);
+        // SAFETY: The slot storage stays live and stationary through the matching pop,
+        // including during collection.
+        unsafe { willow_push_root(root) };
     }
 
     willow_gc_collect();
@@ -257,11 +293,14 @@ fn stress_region_03_sparse_survivors_across_many_regions_stay_stable() {
     );
     for (index, (&root, &address)) in roots.iter().zip(&original).enumerate() {
         assert_eq!(root, address);
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         assert_eq!(unsafe { *(root as *mut i64) }, (index * ROOT_STRIDE) as i64);
     }
     assert_global_regions_valid();
 
-    willow_pop_roots(roots.len() as i32);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_roots(roots.len() as i32) };
     willow_gc_collect();
     assert_eq!(willow_gc_old_region_count(), 0);
     reset_gc();
@@ -274,26 +313,42 @@ fn stress_region_04_large_and_regular_cycles_release_every_region() {
     reset_gc();
     for round in 0..100 {
         for _ in 0..64 {
-            let _garbage = willow_alloc_object(1, 8);
+            // SAFETY: The requested layout describes the initialized words of this object and
+            // its type’s tracing or finalization contract.
+            let _garbage = unsafe { willow_alloc_object(1, 8) };
         }
         for _ in 0..3 {
-            let _garbage = willow_alloc_object(2, GC_LARGE_OBJECT_THRESHOLD as i64);
+            // SAFETY: The requested layout describes the initialized words of this object and
+            // its type’s tracing or finalization contract.
+            let _garbage = unsafe { willow_alloc_object(2, GC_LARGE_OBJECT_THRESHOLD as i64) };
         }
-        let mut large = willow_alloc_object(3, GC_LARGE_OBJECT_THRESHOLD as i64);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let mut large = unsafe { willow_alloc_object(3, GC_LARGE_OBJECT_THRESHOLD as i64) };
         // The parent allocation can now trigger paced collection. Native test
         // locals need the same explicit rooting as generated live references.
-        willow_push_root(&mut large);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut large) };
         let mut parent = willow_alloc_typed(8, 0b1);
+        // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+        // words.
         unsafe { *(parent as *mut *mut u8) = large };
-        willow_push_root(&mut parent);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut parent) };
 
         willow_gc_collect();
 
         assert_eq!(willow_gc_large_object_region_count(), 1);
+        // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+        // words.
         assert_eq!(unsafe { *(parent as *mut *mut u8) }, large);
         assert_global_regions_valid();
 
-        willow_pop_roots(2);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(2) };
         willow_gc_collect();
         assert_eq!(
             willow_gc_old_region_count(),
@@ -314,30 +369,46 @@ fn stress_region_05_minor_major_and_remembered_set_interleave() {
         return;
     }
     let mut parent = willow_alloc_typed(8, 0b1);
-    willow_push_root(&mut parent);
-    let mut tls = new_tlab_state();
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut parent) };
+    let tls = new_tlab_state();
 
     for round in 0..1000i64 {
         // Every cycle here has full survival; pin the default two-step tenure
         // instead of letting adaptive tenuring skip the survivor copy.
         runtime().heap.lock().unwrap().tenuring = Default::default();
-        let young = willow_gc_alloc_slow(&mut tls, 2, 2, 8, 0);
+        // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size
+        // and tracing metadata describe the object initialized here.
+        let young = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 2, 2, 8, 0) };
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         unsafe { *(young as *mut i64) = round };
-        willow_gc_write_barrier(
-            parent,
-            std::ptr::null_mut(),
-            young,
-            GcStoreDestination::ObjectField as i64,
-        );
+        // SAFETY: The destination describes this reference update. Any asserted header
+        // belongs to its live GC payload.
+        unsafe {
+            willow_gc_write_barrier(
+                parent,
+                std::ptr::null_mut(),
+                young,
+                GcStoreDestination::ObjectField as i64,
+            )
+        };
+        // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+        // words.
         unsafe { *(parent as *mut *mut u8) = young };
         assert_eq!(willow_gc_remembered_set_size(), 1);
 
         crate::gc::minor_collect_internal();
 
+        // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+        // words.
         let survivor = unsafe { *(parent as *mut *mut u8) };
         assert_ne!(survivor, young);
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         assert_eq!(unsafe { *(survivor as *mut i64) }, round);
         assert_eq!(
+            // SAFETY: The current GC payload follows its aligned header; its owner keeps it live
+            // here.
             unsafe { (*payload_to_header(survivor)).generation },
             GC_GENERATION_YOUNG
         );
@@ -346,10 +417,15 @@ fn stress_region_05_minor_major_and_remembered_set_interleave() {
         // No intervening store: the remembered owner must retain the survivor
         // until the second minor collection tenures it.
         crate::gc::minor_collect_internal();
+        // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+        // words.
         let promoted = unsafe { *(parent as *mut *mut u8) };
         assert_ne!(promoted, survivor);
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         assert_eq!(unsafe { *(promoted as *mut i64) }, round);
         assert_eq!(
+            // SAFETY: The current GC payload follows its aligned header; its owner keeps it live
+            // here.
             unsafe { (*payload_to_header(promoted)).generation },
             GC_GENERATION_OLD
         );
@@ -362,7 +438,9 @@ fn stress_region_05_minor_major_and_remembered_set_interleave() {
 
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), (SMALL_OBJECT_SIZE * 2) as i64);
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), 0);
     reset_gc();
@@ -396,21 +474,28 @@ fn stress_region_06_many_sparse_survivor_chunks_relocate_and_release() {
     }
     const CHUNKS: usize = 64;
     const OBJECTS_PER_CHUNK: usize = 64;
-    let mut states: Vec<Box<GcTlabState>> =
-        (0..CHUNKS).map(|_| Box::new(new_tlab_state())).collect();
+    let mut states: Vec<TestTlab> = (0..CHUNKS).map(|_| new_tlab_state()).collect();
     let mut survivors = Vec::with_capacity(CHUNKS);
     let mut originals = Vec::with_capacity(CHUNKS);
 
     for (index, tls) in states.iter_mut().enumerate() {
-        let survivor = willow_gc_alloc_slow(&mut **tls, 1, index as i64 + 1, 8, 0);
+        // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size
+        // and tracing metadata describe the object initialized here.
+        let survivor = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 1, index as i64 + 1, 8, 0) };
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         unsafe { *(survivor as *mut i64) = index as i64 };
         survivors.push(survivor);
         // Relocatable slots: a collection inside the slow path may already
         // move earlier survivors, and every later read reloads the slot.
-        willow_push_root(survivors.last_mut().unwrap());
+        // SAFETY: The slot storage stays live and stationary through the matching pop,
+        // including during collection.
+        unsafe { willow_push_root(survivors.as_mut_ptr().add(survivors.len() - 1)) };
         originals.push(survivor);
         for object_index in 1..OBJECTS_PER_CHUNK {
-            let dead = tlab_fast_alloc(tls, 2, object_index as u32, 8, 0);
+            // SAFETY: The fixture exclusively controls this initialized mutator block and
+            // supplies the tracing layout for the words it uses.
+            let dead = unsafe { tlab_fast_alloc(tls, 2, object_index as u32, 8, 0) };
+            // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
             unsafe { *(dead as *mut i64) = object_index as i64 };
         }
     }
@@ -432,11 +517,14 @@ fn stress_region_06_many_sparse_survivor_chunks_relocate_and_release() {
     );
     for (index, (survivor, original)) in survivors.iter().zip(&originals).enumerate() {
         assert_ne!(survivor, original, "survivor {index} was evacuated");
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         assert_eq!(unsafe { *(*survivor as *mut i64) }, index as i64);
     }
     assert_global_regions_valid();
 
-    willow_pop_roots(CHUNKS as i32);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_roots(CHUNKS as i32) };
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), 0);
     assert_eq!(willow_gc_old_region_reserved_bytes(), 0);
@@ -457,22 +545,27 @@ fn stress_region_07_deterministic_random_graph_matches_reachability_model() {
     };
     let mut objects = Vec::with_capacity(objects_count);
     for index in 0..objects_count {
-        objects.push(willow_gc_alloc_layout(
-            index as u64 + 1,
-            index as i64 + 1,
-            8,
-            0b1,
-        ));
-        willow_push_root(objects.last_mut().unwrap());
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        objects.push(unsafe { willow_gc_alloc_layout(index as u64 + 1, index as i64 + 1, 8, 0b1) });
+        // SAFETY: The slot storage stays live and stationary through the matching pop,
+        // including during collection.
+        unsafe { willow_push_root(objects.as_mut_ptr().add(objects.len() - 1)) };
     }
     for index in 0..objects_count {
         let target = (index.wrapping_mul(1103515245).wrapping_add(12345)) % objects_count;
+        // SAFETY: The fixture allocates these fields in word-aligned GC storage at whole-word
+        // offsets.
         unsafe { *(objects[index] as *mut *mut u8) = objects[target] };
     }
     let mut roots: Vec<*mut u8> = objects.iter().step_by(997).copied().collect();
-    willow_pop_roots(objects_count as i32);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_roots(objects_count as i32) };
     for root in &mut roots {
-        willow_push_root(root);
+        // SAFETY: The slot storage stays live and stationary through the matching pop,
+        // including during collection.
+        unsafe { willow_push_root(root) };
     }
 
     let mut expected = HashSet::new();
@@ -496,7 +589,9 @@ fn stress_region_07_deterministic_random_graph_matches_reachability_model() {
     assert_eq!(verify_old_region_metadata(&state), Ok(()));
     drop(state);
 
-    willow_pop_roots(roots.len() as i32);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_roots(roots.len() as i32) };
     willow_gc_collect();
     assert_eq!(willow_gc_old_region_count(), 0);
     reset_gc();
@@ -527,49 +622,78 @@ fn stress_region_11_generated_graph_preserves_edges_through_moving_collection() 
                     [index, index]
                 });
             }
-            let mut parent = willow_gc_alloc_layout(1, 0, 8, 1);
-            willow_push_root(&mut parent);
-            let mut tls = new_tlab_state();
+            // SAFETY: The requested layout describes the initialized words of this object and
+            // its type’s tracing or finalization contract.
+            let mut parent = unsafe { willow_gc_alloc_layout(1, 0, 8, 1) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut parent) };
+            let tls = new_tlab_state();
             let mut objects = Vec::with_capacity(count);
             for index in 0..count {
                 let object = if index == 0 {
-                    willow_gc_alloc_slow(&mut tls, 2, 0, 24, 0b11)
+                    // SAFETY: The fixture owns the stable TLAB through unregistration. The
+                    // requested size and tracing metadata describe the object initialized
+                    // here.
+                    unsafe { willow_gc_alloc_slow(tls.as_ptr(), 2, 0, 24, 0b11) }
                 } else {
-                    tlab_fast_alloc(&tls, 2, 0, 24, 0b11)
+                    // SAFETY: The fixture exclusively controls this initialized mutator block
+                    // and supplies the tracing layout for the words it uses.
+                    unsafe { tlab_fast_alloc(&tls, 2, 0, 24, 0b11) }
                 };
                 assert!(!object.is_null());
+                // SAFETY: both TLAB paths reserve 24 word-aligned bytes. The final u64
+                // holds the node ID after its two traced pointer slots.
                 unsafe { *object.add(16).cast::<u64>() = index as u64 };
                 objects.push(object);
             }
             for (index, targets) in edges.iter().enumerate() {
                 for (slot, &target) in targets.iter().enumerate() {
+                    // SAFETY: The fixture allocates these fields in word-aligned GC storage at
+                    // whole-word offsets.
                     unsafe { *objects[index].cast::<*mut u8>().add(slot) = objects[target] };
                 }
             }
-            willow_gc_write_barrier(
-                parent,
-                std::ptr::null_mut(),
-                objects[0],
-                GcStoreDestination::ObjectField as i64,
-            );
+            // SAFETY: The destination describes this reference update. Any asserted header
+            // belongs to its live GC payload.
+            unsafe {
+                willow_gc_write_barrier(
+                    parent,
+                    std::ptr::null_mut(),
+                    objects[0],
+                    GcStoreDestination::ObjectField as i64,
+                )
+            };
+            // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the
+            // accessed words.
             unsafe { *parent.cast::<*mut u8>() = objects[0] };
 
             let mut relocated = Vec::with_capacity(live);
             for round in 0..3 {
                 crate::gc::minor_collect_internal();
+                // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the
+                // accessed words.
                 let mut current = unsafe { *parent.cast::<*mut u8>() };
                 relocated.clear();
                 for (index, &original) in objects.iter().take(live).enumerate() {
+                    // SAFETY: The fixture allocates these fields in word-aligned GC storage at
+                    // whole-word offsets.
                     assert_eq!(unsafe { *current.add(16).cast::<u64>() }, index as u64);
                     if round == 0 {
                         assert_ne!(current, original, "seed={initial_seed} count={count}");
                     }
                     relocated.push(current);
+                    // SAFETY: The fixture allocates these fields in word-aligned GC storage at
+                    // whole-word offsets.
                     current = unsafe { *current.cast::<*mut u8>() };
                 }
+                // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the
+                // accessed words.
                 assert_eq!(current, unsafe { *parent.cast::<*mut u8>() });
                 for (index, targets) in edges.iter().take(live).enumerate() {
                     for (slot, &target) in targets.iter().enumerate() {
+                        // SAFETY: The fixture allocates these fields in word-aligned GC storage at
+                        // whole-word offsets.
                         let child = unsafe { *relocated[index].cast::<*mut u8>().add(slot) };
                         assert_eq!(child, relocated[target]);
                     }
@@ -581,7 +705,9 @@ fn stress_region_11_generated_graph_preserves_edges_through_moving_collection() 
                 );
             }
             assert!(willow_gc_moved_objects() >= live as i64);
-            willow_pop_root();
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
             willow_gc_collect();
             assert_eq!(willow_gc_allocated_bytes(), 0);
             assert_global_regions_valid();
@@ -604,7 +730,11 @@ fn stress_region_08_five_mutators_allocate_and_collect_concurrently() {
             std::thread::spawn(crate::runtime::serving(move || {
                 let mutator = crate::gc::MutatorRegistration::new();
                 for iteration in 0..500 {
-                    let object = willow_alloc_object(worker + 1, 8);
+                    // SAFETY: The requested layout describes the initialized words of this
+                    // object and its type’s tracing or finalization contract.
+                    let object = unsafe { willow_alloc_object(worker + 1, 8) };
+                    // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar
+                    // value.
                     unsafe { *(object as *mut i64) = iteration };
                     if iteration % 7 == 0 {
                         willow_gc_collect();
@@ -644,29 +774,44 @@ fn stress_region_09_sparse_survivor_waves_do_not_retain_source_capacity() {
     assert_eq!(SURVIVOR_SIZE, 64);
     assert_eq!(GC_TLAB_CHUNK_SIZE % SURVIVOR_SIZE, 0);
 
-    let mut states = Vec::<Box<GcTlabState>>::with_capacity(TOTAL_CHUNKS);
+    let mut states = Vec::<TestTlab>::with_capacity(TOTAL_CHUNKS);
     let mut survivors = Vec::<*mut u8>::with_capacity(TOTAL_CHUNKS);
     let mut max_reserved = 0;
     for wave in 1..=WAVES {
         for chunk_index in 0..CHUNKS_PER_WAVE {
-            let mut tls = Box::new(new_tlab_state());
-            let survivor = willow_gc_alloc_slow(
-                &mut *tls,
-                1,
-                chunk_index as i64 + 1,
-                SURVIVOR_PAYLOAD_SIZE as i64,
-                0,
-            );
+            let tls = new_tlab_state();
+            // SAFETY: The fixture owns the stable TLAB through unregistration. The requested
+            // size and tracing metadata describe the object initialized here.
+            let survivor = unsafe {
+                willow_gc_alloc_slow(
+                    tls.as_ptr(),
+                    1,
+                    chunk_index as i64 + 1,
+                    SURVIVOR_PAYLOAD_SIZE as i64,
+                    0,
+                )
+            };
+            // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
             unsafe { *(survivor as *mut i64) = (wave * CHUNKS_PER_WAVE + chunk_index) as i64 };
             survivors.push(survivor);
-            willow_push_root(
-                survivors
-                    .last_mut()
-                    .expect("the newly pushed survivor has a stable root slot"),
-            );
+            // SAFETY: The slot storage stays live and stationary through the matching pop,
+            // including during collection.
+            unsafe {
+                willow_push_root(
+                    survivors
+                        .last_mut()
+                        .expect("the newly pushed survivor has a stable root slot"),
+                )
+            };
 
             for object_index in 1..OBJECTS_PER_CHUNK {
-                let dead = tlab_fast_alloc(&tls, 2, object_index as u32, SURVIVOR_PAYLOAD_SIZE, 0);
+                // SAFETY: The fixture exclusively controls this initialized mutator block and
+                // supplies the tracing layout for the words it uses.
+                let dead = unsafe {
+                    tlab_fast_alloc(&tls, 2, object_index as u32, SURVIVOR_PAYLOAD_SIZE, 0)
+                };
+                // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar
+                // value.
                 unsafe { *(dead as *mut i64) = object_index as i64 };
             }
             states.push(tls);
@@ -685,6 +830,7 @@ fn stress_region_09_sparse_survivor_waves_do_not_retain_source_capacity() {
         );
         for (index, survivor) in survivors.iter().enumerate() {
             let expected = CHUNKS_PER_WAVE + index;
+            // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
             assert_eq!(unsafe { *(*survivor as *mut i64) }, expected as i64);
         }
         assert_global_regions_valid();
@@ -698,7 +844,9 @@ fn stress_region_09_sparse_survivor_waves_do_not_retain_source_capacity() {
     );
 
     for remaining_waves in (0..WAVES).rev() {
-        willow_pop_roots(CHUNKS_PER_WAVE as i32);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(CHUNKS_PER_WAVE as i32) };
         willow_gc_collect();
         assert_no_pinned_retention(&format!("{remaining_waves} waves remain"));
         let remaining_live = remaining_waves * CHUNKS_PER_WAVE * SURVIVOR_SIZE;
@@ -725,28 +873,41 @@ fn stress_region_10_runtime_root_slots_relocate_bounded_lifetimes() {
     const SURVIVOR_PAYLOAD_SIZE: usize = SURVIVOR_SIZE - GC_HEADER_SIZE;
 
     assert_eq!(SURVIVOR_SIZE, 64);
-    let mut states = Vec::<Box<GcTlabState>>::with_capacity(WAVES * CHUNKS_PER_WAVE);
+    let mut states = Vec::<TestTlab>::with_capacity(WAVES * CHUNKS_PER_WAVE);
     // Each batch's buffer is allocated once at full capacity, so its slots stay
     // put while the batch moves through the queue.
     let mut live_batches = std::collections::VecDeque::<Vec<*mut u8>>::new();
 
-    eprintln!("phase,wave,live_slots,reserved_bytes,live_bytes,moved_objects");
+    eprintln!("phase,wave,live_slots,reserved_bytive_bytes,moved_objects");
     for wave in 1..=WAVES {
         let mut batch = Vec::with_capacity(CHUNKS_PER_WAVE);
         for chunk_index in 0..CHUNKS_PER_WAVE {
-            let mut tls = Box::new(new_tlab_state());
-            let survivor = willow_gc_alloc_slow(
-                &mut *tls,
-                1,
-                chunk_index as i64 + 1,
-                SURVIVOR_PAYLOAD_SIZE as i64,
-                0,
-            );
+            let tls = new_tlab_state();
+            // SAFETY: The fixture owns the stable TLAB through unregistration. The requested
+            // size and tracing metadata describe the object initialized here.
+            let survivor = unsafe {
+                willow_gc_alloc_slow(
+                    tls.as_ptr(),
+                    1,
+                    chunk_index as i64 + 1,
+                    SURVIVOR_PAYLOAD_SIZE as i64,
+                    0,
+                )
+            };
+            // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
             unsafe { *(survivor as *mut i64) = (wave * CHUNKS_PER_WAVE + chunk_index) as i64 };
             batch.push(survivor);
-            willow_gc_add_runtime_root_slot(batch.last_mut().unwrap());
+            // SAFETY: The registration and removal use the same initialized slot, whose
+            // storage spans both operations.
+            unsafe { willow_gc_add_runtime_root_slot(batch.last_mut().unwrap()) };
             for object_index in 1..OBJECTS_PER_CHUNK {
-                let dead = tlab_fast_alloc(&tls, 2, object_index as u32, SURVIVOR_PAYLOAD_SIZE, 0);
+                // SAFETY: The fixture exclusively controls this initialized mutator block and
+                // supplies the tracing layout for the words it uses.
+                let dead = unsafe {
+                    tlab_fast_alloc(&tls, 2, object_index as u32, SURVIVOR_PAYLOAD_SIZE, 0)
+                };
+                // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar
+                // value.
                 unsafe { *(dead as *mut i64) = object_index as i64 };
             }
             states.push(tls);
@@ -761,7 +922,9 @@ fn stress_region_10_runtime_root_slots_relocate_bounded_lifetimes() {
                 .pop_front()
                 .expect("the oldest runtime-root batch exists");
             for slot in &mut expired {
-                willow_gc_remove_runtime_root_slot(slot);
+                // SAFETY: The registration and removal use the same initialized slot, whose
+                // storage spans both operations.
+                unsafe { willow_gc_remove_runtime_root_slot(slot) };
             }
             willow_gc_collect();
         }
@@ -771,6 +934,8 @@ fn stress_region_10_runtime_root_slots_relocate_bounded_lifetimes() {
             let batch_wave = wave + 1 + offset - live_batches.len();
             for (chunk_index, survivor) in batch.iter().enumerate() {
                 let expected = batch_wave * CHUNKS_PER_WAVE + chunk_index;
+                // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar
+                // value.
                 assert_eq!(unsafe { *(*survivor as *mut i64) }, expected as i64);
             }
         }
@@ -794,7 +959,9 @@ fn stress_region_10_runtime_root_slots_relocate_bounded_lifetimes() {
 
     while let Some(mut expired) = live_batches.pop_front() {
         for slot in &mut expired {
-            willow_gc_remove_runtime_root_slot(slot);
+            // SAFETY: The registration and removal use the same initialized slot, whose
+            // storage spans both operations.
+            unsafe { willow_gc_remove_runtime_root_slot(slot) };
         }
         willow_gc_collect();
         assert_no_pinned_retention("draining runtime root slots");

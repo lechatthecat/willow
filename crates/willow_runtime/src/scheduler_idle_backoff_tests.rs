@@ -68,6 +68,7 @@ unsafe extern "C" fn consumer(frame: *mut c_void) -> i32 {
     // SAFETY: setup allocates one i64 frame slot and writes its sample index;
     // the task keeps that frame rooted until this poll completes.
     let index = unsafe {
+        // SAFETY: The allocated frame matches this poll's word-aligned state layout.
         *frame
             .cast::<u8>()
             .add(crate::async_frame::async_frame_slot_offset(0))
@@ -165,7 +166,9 @@ unsafe extern "C" fn producer(_: *mut c_void) -> i32 {
 }
 
 fn run_probe(workers: usize, count: usize, burst: usize, forced: bool) {
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     reset_global_scheduler_for_test();
     replace_global_scheduler_for_test(workers);
     let mut ids = Vec::with_capacity(count);
@@ -174,12 +177,15 @@ fn run_probe(workers: usize, count: usize, burst: usize, forced: bool) {
         // SAFETY: this is the single allocated i64 slot, initialized before
         // the task is made runnable on another worker.
         unsafe {
+            // SAFETY: The allocated frame matches this poll's word-aligned state layout.
             *frame
                 .cast::<u8>()
                 .add(crate::async_frame::async_frame_slot_offset(0))
                 .cast::<i64>() = index as i64;
         }
-        let id = willow_sched_spawn_cooperative(consumer, frame.cast()) as u64;
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        let id = (unsafe { willow_sched_spawn_cooperative(consumer, frame.cast()) }) as u64;
         assert_eq!(
             claim_global_ready_for_worker(0, None).map(|p| p.0),
             Some(id)
@@ -211,7 +217,8 @@ fn run_probe(workers: usize, count: usize, burst: usize, forced: bool) {
         .scheduler_hooks
         .set_idle([Some(record_failed_probe), Some(record_stale_retry)]);
     ACTIVE.store(true, Ordering::Release);
-    willow_sched_spawn_cooperative(producer, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    unsafe { willow_sched_spawn_cooperative(producer, std::ptr::null_mut()) };
     let state = Arc::new(ParallelRunState::default());
     let deadline = Instant::now() + Duration::from_secs(30);
     std::thread::scope(|scope| {
@@ -257,7 +264,9 @@ fn run_probe(workers: usize, count: usize, burst: usize, forced: bool) {
     }
     assert_eq!(global_run_queues().len(), 0);
     reset_global_scheduler_for_test();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
 }
 
 #[test]

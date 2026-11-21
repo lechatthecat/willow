@@ -236,6 +236,8 @@ fn batch_keeps_blocked_count_until_queue_publication() {
 
 #[test]
 fn ffi_empty_batch_accepts_null() {
+    // SAFETY: The slice supplies exactly the indicated number of task IDs and remains live for the
+    // call.
     unsafe {
         willow_sched_wake_many(std::ptr::null(), 0);
     }
@@ -278,13 +280,16 @@ fn global_batch_publishes_notification_and_ffi_wakes_tasks() {
     let wake_count = || {
         let mut snapshot = crate::observability::WillowRuntimeMetricsV1::default();
         assert_eq!(
-            crate::observability::willow_runtime_metrics_snapshot_v1(&mut snapshot),
+            // SAFETY: The typed output owns one aligned, writable record for the call.
+            unsafe { crate::observability::willow_runtime_metrics_snapshot_v1(&mut snapshot) },
             0
         );
         snapshot.task_wakes
     };
     let before_wakes = wake_count();
     let ids = (1..=64).collect::<Vec<_>>();
+    // SAFETY: The slice supplies exactly the indicated number of task IDs and remains live for the
+    // call.
     unsafe {
         willow_sched_wake_many(ids.as_ptr(), ids.len());
     }

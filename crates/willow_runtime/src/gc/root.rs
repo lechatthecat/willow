@@ -36,9 +36,19 @@ pub extern "C" fn willow_reserve_roots(count: usize) {
 /// a GC-managed pointer.  The slot must remain valid until the matching pop.
 /// Generated code reloads the slot after every GC point, so a minor
 /// collection may move its referent and rewrite the slot.
+///
+/// # Safety
+/// Supply an initialized, pointer-aligned slot containing null or a current managed payload
+/// in this runtime. Keep the slot writable at the same address through its matching pop,
+/// including while parked. Permit collector rewrites at safepoints and reload afterward.
+///
+/// ```compile_fail,E0133
+/// let mut slot = std::ptr::null_mut::<u8>();
+/// willow_runtime::gc::willow_push_root(&raw mut slot);
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_push_root(slot: *mut *mut u8) {
+pub unsafe extern "C" fn willow_push_root(slot: *mut *mut u8) {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     claim_root_stack_owner();
     ROOT_STACK.with(|rs| {
@@ -48,9 +58,13 @@ pub extern "C" fn willow_push_root(slot: *mut *mut u8) {
 }
 
 /// Unregister the most recently pushed root slot.
+///
+/// # Safety
+/// Every slot removed must belong to the caller. Preserve any roots still needed by
+/// enclosing frames or guards. The slot storage must remain live through this call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_pop_root() {
+pub unsafe extern "C" fn willow_pop_root() {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     ROOT_STACK.with(|rs| {
         let mut stack = rs.borrow_mut();
@@ -60,17 +74,29 @@ pub extern "C" fn willow_pop_root() {
 }
 
 /// Unregister `count` root slots from the top of the root stack.
+///
+/// # Safety
+/// Every slot removed must belong to the caller. Preserve any roots still needed by
+/// enclosing frames or guards. The slot storage must remain live through this call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_pop_roots(count: i32) {
+pub unsafe extern "C" fn willow_pop_roots(count: i32) {
+    pop_roots(count as usize);
+}
+
+/// Runtime guards count slots at the native width of the shadow stack.
+pub(crate) fn pop_roots(count: usize) {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     ROOT_STACK.with(|rs| {
         let mut stack = rs.borrow_mut();
-        let remove = (count as usize).min(stack.len());
-        let new_len = stack.len() - remove;
+        let new_len = depth_after_pop(stack.len(), count);
         stack.truncate(new_len);
     });
     release_root_stack_owner_if_empty();
+}
+
+fn depth_after_pop(depth: usize, count: usize) -> usize {
+    depth.saturating_sub(count)
 }
 
 /// Current generated-code root depth relative to the active task stack (or
@@ -198,9 +224,14 @@ pub(crate) unsafe fn discard_parked_roots(token: u64) {
 /// than enumerating persistent address roots. Registering a young object is fatal. A holder of a
 /// possibly young object registers its storage with
 /// [`willow_gc_add_runtime_root_slot`] instead.
+///
+/// # Safety
+/// A non-null object must be a live managed payload in the current runtime. A detected young
+/// allocation triggers the fatal invariant before registration. Keep each accepted, nonmoving
+/// address registered until its owner releases it exactly once.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
+pub unsafe extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
     if object.is_null() {
         return;
     }
@@ -276,9 +307,13 @@ fn add_address_root_in(
 
 /// Remove a persistent runtime root when the owning runtime structure no
 /// longer needs to retain the object.
+///
+/// # Safety
+/// A non-null object must be a live, nonmoving managed payload in the owning runtime. Pair
+/// each registration with one removal while the address is still valid.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_gc_remove_runtime_root(object: *mut u8) {
+pub unsafe extern "C" fn willow_gc_remove_runtime_root(object: *mut u8) {
     remove_runtime_root_in(crate::runtime::current(), object);
 }
 
@@ -300,15 +335,28 @@ pub(crate) fn remove_runtime_root_in(owner: &crate::runtime::Runtime, object: *m
 /// evacuates a young referent and stores its new address in `*slot`; the
 /// holder must reload the slot after any GC point instead of keeping a copy.
 /// `slot` must stay valid and pointer-aligned until the matching
-/// [`willow_gc_remove_runtime_root_slot`]. While registered, only the
-/// collector writes `*slot`. Registration is counted per slot address.
+/// [`willow_gc_remove_runtime_root_slot`]. While registered, mutator replacements must
+/// synchronize with collection and apply the root write barrier. Registration is counted per slot address.
+///
+/// # Safety
+/// A non-null slot must be initialized to null or a live managed payload in the owning
+/// runtime. Keep its aligned storage live at a stable address through matching removal for
+/// every registration. Synchronize access with relocation; mutator replacements must use the root
+/// write barrier.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_gc_add_runtime_root_slot(slot: *mut *mut u8) {
-    add_runtime_root_slot_in(crate::runtime::current(), slot);
+pub unsafe extern "C" fn willow_gc_add_runtime_root_slot(slot: *mut *mut u8) {
+    // SAFETY: The ABI caller retains this registered slot in the current runtime through
+    // removal.
+    unsafe { add_runtime_root_slot_in(crate::runtime::current(), slot) };
 }
 
-pub(crate) fn add_runtime_root_slot_in(owner: &crate::runtime::Runtime, slot: *mut *mut u8) {
+/// # Safety
+/// A non-null slot must be initialized to null or a live managed payload in the owning
+/// runtime. Keep its aligned storage live at a stable address through matching removal for
+/// every registration. Synchronize access with relocation; mutator replacements must use the root
+/// write barrier.
+pub(crate) unsafe fn add_runtime_root_slot_in(owner: &crate::runtime::Runtime, slot: *mut *mut u8) {
     if slot.is_null() {
         return;
     }
@@ -336,13 +384,29 @@ pub(crate) fn add_runtime_root_slot_in(owner: &crate::runtime::Runtime, slot: *m
 
 /// Stop retaining the referent of a slot registered with
 /// [`willow_gc_add_runtime_root_slot`].
+///
+/// # Safety
+/// A non-null slot must be initialized to null or a live managed payload in the owning
+/// runtime. Keep its aligned storage live at a stable address through matching removal for
+/// every registration. Synchronize access with relocation; mutator replacements must use the root
+/// write barrier.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_gc_remove_runtime_root_slot(slot: *mut *mut u8) {
-    remove_runtime_root_slot_in(crate::runtime::current(), slot);
+pub unsafe extern "C" fn willow_gc_remove_runtime_root_slot(slot: *mut *mut u8) {
+    // SAFETY: The ABI caller retains this registered slot in the current runtime through
+    // removal.
+    unsafe { remove_runtime_root_slot_in(crate::runtime::current(), slot) };
 }
 
-pub(crate) fn remove_runtime_root_slot_in(owner: &crate::runtime::Runtime, slot: *mut *mut u8) {
+/// # Safety
+/// A non-null slot must be initialized to null or a live managed payload in the owning
+/// runtime. Keep its aligned storage live at a stable address through matching removal for
+/// every registration. Synchronize access with relocation; mutator replacements must use the root
+/// write barrier.
+pub(crate) unsafe fn remove_runtime_root_slot_in(
+    owner: &crate::runtime::Runtime,
+    slot: *mut *mut u8,
+) {
     if slot.is_null() {
         return;
     }
@@ -560,10 +624,50 @@ mod inline_root_tests {
     use super::*;
 
     #[test]
+    fn native_root_pop_preserves_prefix_at_wide_counts() {
+        let signed_limit = i32::MAX as usize;
+        let largest_part_count = isize::MAX as usize / size_of::<[u64; 2]>();
+        for count in [
+            0,
+            1,
+            signed_limit,
+            signed_limit + 1,
+            1 << 32,
+            largest_part_count,
+        ] {
+            for caller_depth in [0, 1, 13] {
+                assert_eq!(depth_after_pop(caller_depth + count, count), caller_depth);
+            }
+        }
+    }
+
+    #[test]
     fn private_root_slot_publication_and_removal_use_selected_cycle() {
         for phase in [0, 1, 2] {
             let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
             let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
+            let mut shared = std::ptr::null_mut();
+            let shared_slot = &raw mut shared;
+            // SAFETY: Both runtimes may retain this stable null slot. Neither can relocate null.
+            unsafe {
+                add_runtime_root_slot_in(&first, shared_slot);
+                add_runtime_root_slot_in(&second, shared_slot);
+                remove_runtime_root_slot_in(&first, shared_slot);
+            }
+            assert!(runtime_root_slots(&first.gc).is_empty());
+            assert_eq!(runtime_root_slots(&second.gc), vec![shared_slot]);
+
+            // SAFETY: The allocation path forwards the validated payload extent, type and
+            // tracing layout; its caller initializes native fields before collection.
+            let mut inserted = unsafe { allocate_old_in(&first, 0, 0, 8, 0) };
+            // SAFETY: The allocation path forwards the validated payload extent, type and
+            // tracing layout; its caller initializes native fields before collection.
+            let mut deleted = unsafe { allocate_old_in(&first, 0, 0, 8, 0) };
+            let insertion_slot = &raw mut inserted;
+            let deletion_slot = &raw mut deleted;
+            // SAFETY: These slots hold distinct live objects of first. Register the deletion
+            // edge before marking so only its removal can publish it to the cycle.
+            unsafe { add_runtime_root_slot_in(&first, deletion_slot) };
             let cycle = Arc::new(ConcurrentCycle::new(
                 std::iter::empty(),
                 Default::default(),
@@ -577,27 +681,25 @@ mod inline_root_tests {
                 Some(cycle.clone()),
             );
             first.gc.mark_phase().store(phase, Ordering::Release);
-            let mut value = std::ptr::without_provenance_mut(0x1000);
-            let slot = &raw mut value;
-            add_runtime_root_slot_in(&first, slot);
-            add_runtime_root_slot_in(&second, slot);
-            assert_eq!(runtime_root_slots(&first.gc), vec![slot]);
-            assert_eq!(runtime_root_slots(&second.gc), vec![slot]);
+            // SAFETY: Both local slots stay live in first until their respective removals.
+            unsafe { add_runtime_root_slot_in(&first, insertion_slot) };
             assert_eq!(
                 cycle.unindexed.lock().unwrap().len(),
                 usize::from(phase != 0)
             );
-            // Distinct deletion proves removal publishes, rather than merely
-            // observing the edge already queued at registration.
-            unsafe { *slot = std::ptr::without_provenance_mut(0x2000) };
-            remove_runtime_root_slot_in(&first, slot);
-            assert!(runtime_root_slots(&first.gc).is_empty());
-            assert_eq!(runtime_root_slots(&second.gc), vec![slot]);
+            // SAFETY: Remove the root that was registered before the cycle began.
+            unsafe { remove_runtime_root_slot_in(&first, deletion_slot) };
             assert_eq!(
                 cycle.unindexed.lock().unwrap().len(),
                 2 * usize::from(phase != 0)
             );
-            remove_runtime_root_slot_in(&second, slot);
+            // SAFETY: Each owner releases its own remaining slot before storage leaves scope.
+            unsafe {
+                remove_runtime_root_slot_in(&first, insertion_slot);
+                remove_runtime_root_slot_in(&second, shared_slot);
+            }
+            assert!(runtime_root_slots(&first.gc).is_empty());
+            assert!(runtime_root_slots(&second.gc).is_empty());
             first.gc.mark_phase().store(0, Ordering::Release);
             marking::set_concurrent_cycle_in(&first.gc, &mut first.gc.heap.lock().unwrap(), None);
         }
@@ -666,7 +768,9 @@ mod inline_root_tests {
     #[test]
     fn runtime_root_registration_publishes_during_marking() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let object = willow_alloc_typed(8, 0);
         let index = epoch_index::RegionIndex::capture(&runtime().heap.lock().unwrap());
         let cycle = Arc::new(ConcurrentCycle::with_index(
@@ -680,23 +784,33 @@ mod inline_root_tests {
             .mark_phase()
             .store(1, Ordering::Release);
         assert!(!cycle.is_marked(object as usize));
-        willow_gc_add_runtime_root(object);
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { willow_gc_add_runtime_root(object) };
         cycle.drain(usize::MAX);
         assert!(cycle.is_marked(object as usize));
-        willow_gc_remove_runtime_root(object);
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { willow_gc_remove_runtime_root(object) };
         crate::runtime::current()
             .mark_phase()
             .store(0, Ordering::Release);
         marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn runtime_root_registration_with_nursery_does_not_lock_heap() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
-        let mut tls = Box::new(GcTlabState::new());
-        willow_gc_alloc_slow(&mut *tls, 0, 0, 8, 0);
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
+        let tls = tlab_state_for_test();
+        // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size
+        // and tracing metadata describe the object initialized here.
+        unsafe { willow_gc_alloc_slow(tls.as_ptr(), 0, 0, 8, 0) };
         let object = willow_alloc_typed(8, 0);
         assert_eq!(
             crate::runtime::current()
@@ -708,26 +822,36 @@ mod inline_root_tests {
         // must finish while this caller already owns the mutex.
         let state = runtime().heap.lock().unwrap();
         for _ in 0..1024 {
-            willow_gc_add_runtime_root(object);
+            // SAFETY: The runtime keeps this nonmoving payload at its registered address
+            // through removal.
+            unsafe { willow_gc_add_runtime_root(object) };
         }
         assert_eq!(runtime_root_count(), 1);
         for _ in 0..1024 {
-            willow_gc_remove_runtime_root(object);
+            // SAFETY: The runtime keeps this nonmoving payload at its registered address
+            // through removal.
+            unsafe { willow_gc_remove_runtime_root(object) };
         }
         assert_eq!(runtime_root_count(), 0);
         drop(state);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn owner_cached_push_pop_has_two_slow_paths_per_live_stack() {
         let _guard = isolated_runtime();
         for count in [1, 16, 256, 4096] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             runtime().path_observation.set_root_owner_slow_paths(0);
             let mut slots = vec![std::ptr::null_mut(); count];
             for slot in &mut slots {
-                willow_push_root(slot);
+                // SAFETY: The slot storage stays live and stationary through the matching
+                // pop, including during collection.
+                unsafe { willow_push_root(slot) };
             }
             assert_eq!(
                 runtime().path_observation.root_owner_slow_paths(),
@@ -735,28 +859,38 @@ mod inline_root_tests {
                 "first claim only: {count}"
             );
             for _ in 1..count {
-                willow_pop_root();
+                // SAFETY: The removed shadow-stack entries belong to this operation and their
+                // slot storage is still live.
+                unsafe { willow_pop_root() };
             }
             assert_eq!(
                 runtime().path_observation.root_owner_slow_paths(),
                 1,
                 "nonfinal pops: {count}"
             );
-            willow_pop_root();
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
             assert_eq!(
                 runtime().path_observation.root_owner_slow_paths(),
                 2,
                 "final release: {count}"
             );
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     unsafe extern "C" fn empty_scope_loop(_: *mut std::ffi::c_void) -> i32 {
         let mut slot = std::ptr::null_mut();
         for _ in 0..4096 {
-            willow_push_root(&mut slot);
-            willow_pop_root();
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut slot) };
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
             assert_eq!(runtime().path_observation.root_owner_slow_paths(), 1);
         }
         1
@@ -765,9 +899,12 @@ mod inline_root_tests {
     #[test]
     fn owner_bridge_retains_one_claim_across_empty_scopes() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().path_observation.set_root_owner_slow_paths(0);
         assert_eq!(
+            // SAFETY: The test entry has the bridge callback signature and ignores its null frame.
             unsafe {
                 crate::generated_context::invoke(
                     empty_scope_loop as *const (),
@@ -778,19 +915,27 @@ mod inline_root_tests {
         );
         assert_eq!(runtime().path_observation.root_owner_slow_paths(), 2);
         assert!(!generated_roots_admitted());
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn owner_registered_push_pop_never_enters_owner_slow_path() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let _registration = MutatorRegistration::new();
         runtime().path_observation.set_root_owner_slow_paths(0);
         let mut slot = std::ptr::null_mut();
         for _ in 0..4096 {
-            willow_push_root(&mut slot);
-            willow_pop_root();
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut slot) };
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
         }
         assert_eq!(runtime().path_observation.root_owner_slow_paths(), 0);
     }

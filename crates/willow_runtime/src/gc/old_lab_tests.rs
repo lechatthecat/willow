@@ -30,7 +30,9 @@ fn indexed(state: &GcState, payload: *mut u8) -> bool {
 #[test]
 fn pending_objects_are_found_by_exact_and_interior_lookup_until_flushed() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let _labs = LabsOn::new();
     let objects: Vec<_> = [8i64, 40, 200]
         .iter()
@@ -78,7 +80,9 @@ fn pending_objects_are_found_by_exact_and_interior_lookup_until_flushed() {
     assert_eq!(next as usize, objects[2] as usize + last_span);
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), 0);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -86,7 +90,9 @@ fn buffer_allocations_survive_mark_closure_and_a_pending_sweep() {
     let _guard = isolated_runtime();
     for paced in [false, true] {
         for limit_kind in [0, 1, 2] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             let _labs = LabsOn::new();
             {
                 let mut state = runtime().heap.lock().unwrap();
@@ -101,7 +107,9 @@ fn buffer_allocations_survive_mark_closure_and_a_pending_sweep() {
                 }
             }
             let mut rooted = willow_alloc(16);
-            willow_push_root(&mut rooted);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut rooted) };
             let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
             // Publish region flags while the old cached LAB flag is still clear.
             sweep::publish_regions_concurrently(&cycle);
@@ -160,10 +168,14 @@ fn buffer_allocations_survive_mark_closure_and_a_pending_sweep() {
             // The next cycle frees the two unrooted objects without accounting drift.
             willow_gc_collect();
             assert_eq!(willow_gc_allocated_bytes() as usize, 16 + GC_HEADER_SIZE);
-            willow_pop_root();
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
             willow_gc_collect();
             assert_eq!(willow_gc_allocated_bytes(), 0);
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
         }
     }
 }
@@ -171,7 +183,9 @@ fn buffer_allocations_survive_mark_closure_and_a_pending_sweep() {
 #[test]
 fn exited_thread_buffers_are_indexed_and_pruned() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let _labs = LabsOn::new();
     let mine = willow_alloc(8);
     let theirs = std::thread::spawn(crate::runtime::serving(|| willow_alloc(48) as usize))
@@ -196,7 +210,9 @@ fn exited_thread_buffers_are_indexed_and_pruned() {
     );
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), 0);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 /// Clear environment overrides in a child without mutating process-wide env
@@ -230,7 +246,9 @@ fn default_budgets_complete_small_allocations_and_cap_full_buffer_recovery() {
     }
     let _guard = isolated_runtime();
     for count in [1, 128, 4096, OLD_LAB_BYTES / GC_HEADER_SIZE] {
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let _labs = LabsOn::new();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         let payload = if count == OLD_LAB_BYTES / GC_HEADER_SIZE {
@@ -247,13 +265,16 @@ fn default_budgets_complete_small_allocations_and_cap_full_buffer_recovery() {
                 }
             } else {
                 let object = willow_alloc_typed(payload, 1);
+                // SAFETY: The live object's trace layout reserves these aligned pointer slots.
                 unsafe {
                     store_gc_reference(object.cast(), root);
                 }
                 root = object;
             }
         }
-        willow_push_root(&mut root);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
         assert_eq!(local_pending_for_test(), count);
         willow_gc_collect();
         let stops = crate::gc_telemetry::stops::snapshot_stops();
@@ -314,17 +335,23 @@ fn default_budgets_complete_small_allocations_and_cap_full_buffer_recovery() {
             stops.by_reason[1].requests,
             stops.by_reason[3].requests
         );
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
         willow_gc_collect(); // Includes empty retired owner records.
         assert_eq!(willow_gc_allocated_bytes(), 0);
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn bounded_retirement_fake_clock_keeps_prefix_and_indexes_each_entry_once() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let _labs = LabsOn::new();
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
     let objects: Vec<_> = [1, 8, 17, 40, 200]
@@ -333,11 +360,7 @@ fn bounded_retirement_fake_clock_keeps_prefix_and_indexes_each_entry_once() {
         .collect();
     let total: usize = objects
         .iter()
-        .map(|&value| {
-            HeapObject::from_raw(unsafe { value.sub(GC_HEADER_SIZE) }.cast())
-                .unwrap()
-                .size()
-        })
+        .map(|&value| HeapObject::from_payload(GcPayload::from_raw(value).unwrap()).size())
         .sum();
     let mut state = runtime().heap.lock().unwrap();
     let mut work = crate::gc_telemetry::stops::StopWorkV2::default();
@@ -401,13 +424,17 @@ fn bounded_retirement_fake_clock_keeps_prefix_and_indexes_each_entry_once() {
         "partial_retirement entries=5 fake_time_yield_after=2 slot_chunk_entries=1 indexed_visits=5 prefix_moves=0 duplicates=0"
     );
     drop(state);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn partial_retirement_refill_flushes_only_remaining_suffix_without_double_accounting() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let _labs = LabsOn::new();
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
     let objects: Vec<_> = [1, 8, 17, 40, 200]
@@ -463,7 +490,9 @@ fn partial_retirement_refill_flushes_only_remaining_suffix_without_double_accoun
         6
     );
     drop(state);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -472,7 +501,9 @@ fn threshold_policy_old_lab_pressure_matrix() {
     for paced in [false, true] {
         for limit_kind in [0, 1, 2] {
             for count in [1usize, 128, 4096] {
-                reset_internal_for_test();
+                // SAFETY: The test controls its isolated runtime at this reset boundary; no
+                // other mutator or subsequent access relies on the discarded heap.
+                unsafe { reset_internal_for_test() };
                 let _labs = LabsOn::new();
                 {
                     let mut state = runtime().heap.lock().unwrap();
@@ -515,14 +546,18 @@ fn threshold_policy_old_lab_pressure_matrix() {
             }
         }
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn foreign_owner_progress_sampling_does_not_index_pending_objects() {
     let _guard = isolated_runtime();
     for count in [1, 16, 256] {
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let _labs = LabsOn::new();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         for _ in 0..count {
@@ -545,14 +580,18 @@ fn foreign_owner_progress_sampling_does_not_index_pending_objects() {
             "objects={count} snapshots=17 additional_indexed_objects=0 allocation_bytes={}",
             first.allocation_bytes_since_success
         );
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 }
 
 #[test]
 fn cumulative_allocation_bytes_merge_old_lab_without_indexing() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let _labs = LabsOn::new();
     for count in [1, 8, 64, 512] {
         let before = willow_gc_total_allocated_bytes();
@@ -576,7 +615,9 @@ fn cumulative_allocation_bytes_merge_old_lab_without_indexing() {
         assert_eq!(willow_gc_allocated_bytes(), 0);
         assert_eq!(willow_gc_total_allocated_bytes(), expected);
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -584,7 +625,9 @@ fn bounded_retirement_registry_resume_scales_without_prefix_visits() {
     let _guard = isolated_runtime();
     let _labs = LabsOn::new();
     for count in [1, 16, 257] {
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         let owners: Vec<_> = (0..count)
             .map(|_| {
@@ -632,13 +675,17 @@ fn bounded_retirement_registry_resume_scales_without_prefix_visits() {
         drop(state);
         drop(owners);
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn bounded_retirement_fifo_keeps_refilled_prefix_behind_pending_owner() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let _labs = LabsOn::new();
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
     let first = willow_alloc(8);
@@ -684,13 +731,17 @@ fn bounded_retirement_fifo_keeps_refilled_prefix_behind_pending_owner() {
     assert!(indexed(&state, third));
     assert_eq!(work.metadata_objects, 3);
     drop(state);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn bounded_retirement_pending_key_follows_pruned_record_swap() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let _labs = LabsOn::new();
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
     let owner = std::thread::spawn(crate::runtime::serving(|| {
@@ -724,7 +775,9 @@ fn bounded_retirement_pending_key_follows_pruned_record_swap() {
     assert!(indexed(&state, local));
     assert_eq!(work.metadata_objects, 2);
     drop(state);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]

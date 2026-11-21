@@ -506,12 +506,13 @@ impl<'a> MinorCollector<'a> {
             self.survivor_destination = Some(index);
         }
         let chunk = &mut self.state.tlab_chunks[self.survivor_destination.unwrap()];
-        // SAFETY: this exclusive collector cursor owns sufficient aligned space.
-        let target = HeapObject::initialize_moved_at(
-            unsafe { chunk.base.add(chunk.used) },
-            source,
-            GC_GENERATION_YOUNG,
-        )?;
+        // SAFETY: The stopped collector owns the live source and a distinct aligned span of
+        // its full size. It transfers descriptor ownership to this destination.
+        let target = unsafe {
+            HeapObject::initialize_moved_at(chunk.base.add(chunk.used), source, GC_GENERATION_YOUNG)
+        }?;
+        // SAFETY: The stopped collector exclusively initializes this live survivor's header before
+        // publishing it.
         unsafe {
             (*target.as_ptr()).age = age;
         }
@@ -557,21 +558,28 @@ impl<'a> MinorCollector<'a> {
         let size = GC_HEADER_SIZE + metadata.payload_size;
         if let Some(index) = self.promotion_destination {
             let allocated = if self.buffer_promotion_entries {
-                self.state.old_regions[index]
-                    .allocate_fresh_promotion(
+                // SAFETY: The stopped evacuation uses metadata and size from the live source
+                // and transfers it once into a distinct region span.
+                unsafe {
+                    self.state.old_regions[index].allocate_fresh_promotion(
                         self.owner.gc.mark_phase(),
                         source,
                         size,
                         &mut self.promotion_entries,
                     )
-                    .map(|object| (object, false))
+                }
+                .map(|object| (object, false))
             } else {
-                self.state.old_regions[index].allocate_object_for_move_buffered(
-                    self.owner.gc.mark_phase(),
-                    metadata,
-                    Some(source),
-                    None,
-                )
+                // SAFETY: The stopped evacuation uses metadata and size from the live source
+                // and transfers it once into a distinct region span.
+                unsafe {
+                    self.state.old_regions[index].allocate_object_for_move_buffered(
+                        self.owner.gc.mark_phase(),
+                        metadata,
+                        Some(source),
+                        None,
+                    )
+                }
             };
             if let Some((object, reused)) = allocated {
                 super::account_old_region_allocation_in(
@@ -768,6 +776,8 @@ impl<'a> MinorCollector<'a> {
             let updated = self.evacuate_source(source, value);
             // SAFETY: the published root slot is writable under this stop.
             if updated != value {
+                // SAFETY: During stopped evacuation the owner keeps these traced slots live and
+                // writable. The published range bounds the scan.
                 unsafe { *slot = updated };
             }
             return;
@@ -840,6 +850,8 @@ impl<'a> MinorCollector<'a> {
                 );
             }
         } else if let Some((first, count)) = (metadata.gc_ref_mask == 0)
+            // SAFETY: This scan runs on the retained object at its final address
+            // for this minor. Mutators stay stopped while we rewrite its initialized slots.
             .then(|| unsafe {
                 crate::array::minor_reference_range(
                     metadata.type_id,
@@ -862,6 +874,8 @@ impl<'a> MinorCollector<'a> {
             for index in 0..count {
                 // Built-in buffer length bounds this contiguous slot range.
                 has_young_child |=
+                    // SAFETY: During stopped evacuation the owner keeps these traced slots live
+                    // and writable. The published range bounds the scan.
                     self.scan_reference_slot(unsafe { first.add(index) }, false, old_owner);
             }
         } else {
@@ -913,6 +927,8 @@ impl<'a> MinorCollector<'a> {
         let object = HeapObject::from_payload(GcPayload::from_raw(owner as *mut u8).unwrap());
         let metadata = object.trace_metadata();
         let range = (metadata.gc_ref_mask == 0)
+            // SAFETY: The remembered old buffer cannot move during a minor. Stopped
+            // mutators give the collector exclusive access through the last card scan.
             .then(|| unsafe {
                 crate::array::minor_reference_range(
                     metadata.type_id,
@@ -944,6 +960,8 @@ impl<'a> MinorCollector<'a> {
         if scanned_for_major {
             // Record old children before evacuation; newly promoted children
             // are credited and published by this stopped minor itself.
+            // SAFETY: During stopped evacuation the owner keeps these traced slots live and
+            // writable. The published range bounds the scan.
             let child = unsafe { *slot };
             if let Some(payload) = GcPayload::from_raw(child)
                 && HeapObject::from_payload(payload).generation() == GC_GENERATION_OLD
@@ -953,6 +971,8 @@ impl<'a> MinorCollector<'a> {
         }
         self.scan_slot(slot);
         if old_owner {
+            // SAFETY: During stopped evacuation the owner keeps these traced slots live and
+            // writable. The published range bounds the scan.
             let child = unsafe { *slot };
             if let Some(payload) = GcPayload::from_raw(child) {
                 return HeapObject::from_payload(payload).generation() == GC_GENERATION_YOUNG;
@@ -1487,6 +1507,8 @@ impl<'a> MinorCollector<'a> {
         if let Some(chunk) = unsafe { self.state.region_cache.retain_survivor(chunk, budget) } {
             let layout =
                 Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>()).unwrap();
+            // SAFETY: The owner releases this block once with the same base and Layout used to
+            // allocate it.
             unsafe { dealloc(chunk.base, layout) };
         }
     }
@@ -2031,6 +2053,8 @@ pub(super) fn release_survivor_reserve(state: &mut GcState) {
         if let Some(chunk) = unsafe { state.region_cache.retain_survivor(chunk, budget) } {
             let layout =
                 Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>()).unwrap();
+            // SAFETY: The owner releases this block once with the same base and Layout used to
+            // allocate it.
             unsafe { dealloc(chunk.base, layout) };
         }
     }

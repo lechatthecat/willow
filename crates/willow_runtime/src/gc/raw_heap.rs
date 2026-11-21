@@ -1,3 +1,4 @@
+use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -5,6 +6,36 @@ use super::{GC_STORAGE_WORD_BYTES, GcHeader};
 
 #[derive(Clone, Copy)]
 pub(super) struct Payload(NonNull<u8>);
+
+impl GcHeader {
+    /// The payload must begin immediately after its GC header.
+    #[inline]
+    unsafe fn preceding(payload: *const u8) -> *const Self {
+        // SAFETY: region and TLAB allocators align each object for GcHeader.
+        // Subtracting one header recovers the original allocation address.
+        unsafe { payload.cast::<Self>().sub(1) }
+    }
+
+    /// Mutator-side metadata for a live, unforwarded payload. Only read the
+    /// descriptor field, since marking can update other header bytes.
+    #[inline]
+    pub(crate) unsafe fn live_descriptor<'a>(
+        payload: *const u8,
+    ) -> &'a willow_abi::GcLayoutDescriptor {
+        // SAFETY: the caller retains the live allocation during this borrow.
+        // Its untagged descriptor points to interned or compiler-static storage.
+        unsafe {
+            &*((*Self::preceding(payload)).descriptor as *const willow_abi::GcLayoutDescriptor)
+        }
+    }
+
+    /// Read the generation of a live, unforwarded payload outside a moving collection.
+    #[inline]
+    pub(crate) unsafe fn live_generation(payload: *const u8) -> u8 {
+        // SAFETY: the caller retains this live payload; generation changes only under STW.
+        unsafe { (*Self::preceding(payload)).generation }
+    }
+}
 
 impl Payload {
     pub(super) fn from_raw(raw: *mut u8) -> Option<Self> {
@@ -52,13 +83,17 @@ impl Object {
     }
 
     pub(super) fn from_payload(payload: Payload) -> Self {
-        let header_size = std::mem::size_of::<GcHeader>();
-        // SAFETY: GC payloads are returned immediately after their header.
-        let header = unsafe { payload.as_ptr().sub(header_size) as *mut GcHeader };
+        // SAFETY: Payload denotes the start of the GC object's data.
+        let header = unsafe { GcHeader::preceding(payload.as_ptr()) }.cast_mut();
         Self(NonNull::new(header).expect("non-null payload has a header address"))
     }
 
-    pub(super) fn initialize_at(
+    /// # Safety
+    /// A non-null address must be exclusive header-aligned space for the complete header and
+    /// payload. The type, payload extent and tracing mask must agree, including any required
+    /// bitmap descriptor or native hooks. Initialize native fields before the object can be
+    /// traced or finalized.
+    pub(super) unsafe fn initialize_at(
         raw: *mut u8,
         size: usize,
         type_id: u32,
@@ -66,33 +101,44 @@ impl Object {
         gc_ref_mask: u64,
         generation: u8,
     ) -> Option<Self> {
-        let mut header = NonNull::new(raw.cast::<GcHeader>())?;
-        // SAFETY: the allocation is writable, aligned, and large enough for
-        // one header followed by its zeroed payload.
-        unsafe {
-            let header = header.as_mut();
-            header.marked = false;
-            header.allocated = true;
-            header.generation = generation;
-            header.age = 0;
-            header.remembered = 0;
-            header.shared = 0;
-            header.descriptor = super::layouts::acquire(willow_abi::GcLayoutDescriptor {
-                type_id: u64::from(type_id),
-                layout_id,
-                gc_ref_mask,
-                size: size as u64,
-            });
-            header.descriptor_owned = true;
-        }
-        Some(Self(header))
+        // SAFETY: a non-null raw address is exclusive, GcHeader-aligned storage from
+        // the allocator. MaybeUninit permits the slot to contain arbitrary bytes.
+        let slot = unsafe { raw.cast::<MaybeUninit<GcHeader>>().as_mut()? };
+        let header = slot.write(GcHeader {
+            marked: false,
+            allocated: true,
+            generation,
+            age: 0,
+            descriptor_owned: false,
+            remembered: 0,
+            shared: 0,
+            descriptor: 0,
+        });
+        header.descriptor = super::layouts::acquire(willow_abi::GcLayoutDescriptor {
+            type_id: u64::from(type_id),
+            layout_id,
+            gc_ref_mask,
+            size: size as u64,
+        });
+        header.descriptor_owned = true;
+        Some(Self(NonNull::from(header)))
     }
 
     /// Initialize an evacuation destination, transferring the descriptor reference.
     /// The collector keeps the destination alive until source metadata is no
     /// longer read, and reclaims the source without releasing that reference.
     /// No interning or reference-count operation is needed for a move.
-    pub(super) fn initialize_moved_at(raw: *mut u8, source: Self, generation: u8) -> Option<Self> {
+    /// # Safety
+    /// Supply a distinct, exclusive, header-aligned destination spanning the source object.
+    /// For evacuation, the mutators must be stopped, the source must be live and match the
+    /// metadata, and ownership of its descriptor must transfer exactly once.
+    pub(super) unsafe fn initialize_moved_at(
+        raw: *mut u8,
+        source: Self,
+        generation: u8,
+    ) -> Option<Self> {
+        // SAFETY: Allocation metadata identifies a header-aligned object start within this live
+        // region or chunk.
         let target = NonNull::new(raw.cast::<GcHeader>())?;
         // SAFETY: under STW, raw is a distinct, aligned, writable destination
         // with source.size() bytes. Source remains readable until minor sweep;
@@ -160,6 +206,8 @@ impl Object {
     pub(super) fn payload_word(self, index: usize) -> Option<Payload> {
         // SAFETY: the caller bounds `index` by the payload size.
         let child = unsafe {
+            // SAFETY: GC payloads are word-aligned and the bounded word index preserves pointer
+            // alignment.
             *self
                 .payload()
                 .as_ptr()
@@ -172,6 +220,8 @@ impl Object {
     pub(super) fn payload_slot(self, index: usize) -> *mut *mut u8 {
         // SAFETY: callers bound `index` by the payload word count.
         unsafe {
+            // SAFETY: GC payloads are word-aligned and the bounded word index preserves pointer
+            // alignment.
             self.payload()
                 .as_ptr()
                 .add(index * GC_STORAGE_WORD_BYTES)
@@ -193,20 +243,23 @@ impl Object {
         is_async_frame_layout(&self.descriptor())
     }
 
-    /// The descriptor of a live object that is not a forwarded minor source,
-    /// in place, and whether it is static generated data (never released, so
-    /// its address identifies one layout for the process lifetime).
+    /// Inspect an unforwarded object's descriptor while the object is live.
+    /// Only generated descriptors have a process-lifetime address.
     #[inline(always)]
-    pub(super) fn live_layout(self) -> (&'static willow_abi::GcLayoutDescriptor, bool) {
-        // SAFETY: a live header owns a registry reference to its descriptor
-        // or points to static generated data; it is not forwarded.
-        unsafe {
-            let header = &*self.as_ptr();
-            (
-                &*(header.descriptor as *const willow_abi::GcLayoutDescriptor),
-                !header.descriptor_owned,
-            )
-        }
+    pub(super) fn with_live_layout<R>(
+        self,
+        inspect: impl FnOnce(&willow_abi::GcLayoutDescriptor, bool) -> R,
+    ) -> R {
+        let header = self.as_ptr();
+        // SAFETY: publication keeps the object live through this inspection.
+        // Its descriptor is static or retained by the header's registry reference.
+        // These two fields are stable even while sweep writes the mark byte.
+        let (layout, owned) = unsafe {
+            let address = (&raw const (*header).descriptor).read();
+            let owned = (&raw const (*header).descriptor_owned).read();
+            (&*(address as *const willow_abi::GcLayoutDescriptor), owned)
+        };
+        inspect(layout, !owned)
     }
 
     /// This object's layout descriptor, read once.
@@ -217,7 +270,9 @@ impl Object {
     /// No state changes on contention. A successful permit pins an interned
     /// descriptor through the liveness bookkeeping and header conversion.
     pub(super) fn try_reclaim_permit(self) -> Option<ReclaimPermit> {
+        // SAFETY: The collector owns this live header through the metadata access.
         if unsafe { (*self.as_ptr()).descriptor_owned } && self.allocated() {
+            // SAFETY: The collector owns this live header through the metadata access.
             super::layouts::try_release_guard(unsafe { (*self.as_ptr()).descriptor })
                 .map(|guard| ReclaimPermit(Some(guard)))
         } else {
@@ -279,7 +334,9 @@ impl Object {
     pub(super) fn forwarded_to(self) -> Option<Payload> {
         // Read only the stable fields: other old-header flags may be updated
         // by concurrent collection, so do not borrow the complete header.
+        // SAFETY: The collector owns this live header through the metadata access.
         let allocated = unsafe { (*self.as_ptr()).allocated };
+        // SAFETY: The collector owns this live header through the metadata access.
         let descriptor = unsafe { (*self.as_ptr()).descriptor };
         (allocated && descriptor & 1 != 0)
             .then(|| Payload::from_raw((descriptor & !1) as *mut u8).unwrap())
@@ -290,6 +347,7 @@ impl Object {
         debug_assert!(target.forwarded_to().is_none());
         // Ownership was transferred during destination initialization. Its
         // descriptor remains alive until all source metadata reads finish.
+        // SAFETY: The collector owns this live header through the metadata access.
         unsafe {
             debug_assert!(!(*self.as_ptr()).descriptor_owned);
             (*self.as_ptr()).descriptor = target.payload().as_ptr() as usize | 1;
@@ -302,8 +360,10 @@ impl Object {
             // Destinations are never sources in the same minor cycle. No
             // forwarding-chain traversal or additional registry reference.
             debug_assert!(target.forwarded_to().is_none());
+            // SAFETY: The collector owns this live header through the metadata access.
             unsafe { (*target.as_ptr()).descriptor }
         } else {
+            // SAFETY: The collector owns this live header through the metadata access.
             unsafe { (*self.as_ptr()).descriptor }
         }
     }
@@ -395,9 +455,9 @@ impl Object {
         unsafe {
             (*self.as_ptr()).generation = generation;
             (*self.as_ptr()).age = 0;
-            // Generated TLAB headers leave this byte unwritten. A young
-            // object is never remembered, so an in-place promotion starts
-            // unremembered rather than inheriting stale chunk contents.
+            // The generated TLAB flag word initializes remembered to zero.
+            // In-place promotion starts with no entry in the old generation's
+            // remembered set, so establish the matching flag here as well.
             (*self.as_ptr()).remembered = 0;
         }
     }
@@ -462,25 +522,35 @@ mod move_tests {
         };
         for count in [1, 100, 10000] {
             let before = crate::gc::layouts::references(key);
-            let mut source_storage = std::mem::MaybeUninit::<GcHeader>::uninit();
-            let source = Object::initialize_at(
-                source_storage.as_mut_ptr().cast(),
-                GC_HEADER_SIZE,
-                key.type_id as u32,
-                key.layout_id,
-                0,
-                GC_GENERATION_YOUNG,
-            )
+            let mut source_storage = MaybeUninit::<GcHeader>::uninit();
+            // SAFETY: The fixture owns fresh, correctly sized and aligned header storage for
+            // this descriptor.
+            let source = unsafe {
+                Object::initialize_at(
+                    source_storage.as_mut_ptr().cast(),
+                    GC_HEADER_SIZE,
+                    key.type_id as u32,
+                    key.layout_id,
+                    0,
+                    GC_GENERATION_YOUNG,
+                )
+            }
             .unwrap();
             assert_eq!(crate::gc::layouts::references(key), before + 1);
             assert!(
-                Object::initialize_moved_at(std::ptr::null_mut(), source, GC_GENERATION_YOUNG)
-                    .is_none()
+                // SAFETY: The fixture owns distinct aligned header storage and transfers the
+                // live source descriptor to the destination before reclaiming the source.
+                unsafe {
+                    Object::initialize_moved_at(std::ptr::null_mut(), source, GC_GENERATION_YOUNG)
+                }
+                .is_none()
             );
+            // SAFETY: The collector owns this live header through the metadata access.
             assert!(unsafe { (*source.as_ptr()).descriptor_owned });
+            // SAFETY: The collector owns this live header through the metadata access.
             let descriptor = unsafe { (*source.as_ptr()).descriptor };
-            let mut a = std::mem::MaybeUninit::<GcHeader>::uninit();
-            let mut b = std::mem::MaybeUninit::<GcHeader>::uninit();
+            let mut a = MaybeUninit::<GcHeader>::uninit();
+            let mut b = MaybeUninit::<GcHeader>::uninit();
             let mut current = source;
             // Holding the registry exclusively proves moves and moved-source
             // reclamation never consult it. The one live owner remains intact.
@@ -497,9 +567,15 @@ mod move_tests {
                         GC_GENERATION_YOUNG
                     };
                     let next =
-                        Object::initialize_moved_at(raw.cast(), current, generation).unwrap();
+                        // SAFETY: The fixture owns distinct aligned header storage and
+                        // transfers the live source descriptor to the destination before
+                        // reclaiming the source.
+                        unsafe { Object::initialize_moved_at(raw.cast(), current, generation) }.unwrap();
+                    // SAFETY: The collector owns this live header through the metadata access.
                     assert_eq!(unsafe { (*next.as_ptr()).descriptor }, descriptor);
+                    // SAFETY: The collector owns this live header through the metadata access.
                     assert!(unsafe { (*next.as_ptr()).descriptor_owned });
+                    // SAFETY: The collector owns this live header through the metadata access.
                     assert!(!unsafe { (*current.as_ptr()).descriptor_owned });
                     current.forward_to(next);
                     assert_eq!(
@@ -540,13 +616,17 @@ mod move_tests {
             descriptor: (&descriptor as *const _) as usize,
         };
         let source = Object::from_raw(&mut header).unwrap();
-        let mut target = std::mem::MaybeUninit::<GcHeader>::uninit();
+        let mut target = MaybeUninit::<GcHeader>::uninit();
         let moved =
-            Object::initialize_moved_at(target.as_mut_ptr().cast(), source, GC_GENERATION_OLD)
+            // SAFETY: The fixture owns distinct aligned header storage and transfers the live
+            // source descriptor to the destination before reclaiming the source.
+            unsafe { Object::initialize_moved_at(target.as_mut_ptr().cast(), source, GC_GENERATION_OLD) }
                 .unwrap();
         assert!(!moved.marked());
         assert!(!moved.remembered());
+        // SAFETY: The collector owns this live header through the metadata access.
         assert_eq!(unsafe { (*moved.as_ptr()).age }, 0);
+        // SAFETY: The collector owns this live header through the metadata access.
         assert!(!unsafe { (*moved.as_ptr()).descriptor_owned });
         source.forward_to(moved);
         assert_eq!(source.trace_metadata().layout_id, 7);
@@ -586,11 +666,16 @@ mod move_tests {
                 }
                 assert_eq!(header.shared, shared);
                 let source = Object::from_raw(&mut header).unwrap();
-                // Stale bytes of a previous object in the destination.
-                let mut target = [0xffu8; std::mem::size_of::<GcHeader>()];
+                let mut target = MaybeUninit::<GcHeader>::uninit();
+                let raw_target = target.as_mut_ptr().cast::<u8>();
+                // SAFETY: target owns exactly GC_HEADER_SIZE bytes with GcHeader alignment.
+                // Keep the stale bytes untyped until initialize_moved_at initializes the header.
+                unsafe { raw_target.write_bytes(0xff, GC_HEADER_SIZE) };
+                // SAFETY: The fixture owns distinct aligned header storage and transfers the
+                // live source descriptor to the destination before reclaiming the source.
                 let moved =
-                    Object::initialize_moved_at(target.as_mut_ptr().cast(), source, generation)
-                        .unwrap();
+                    unsafe { Object::initialize_moved_at(raw_target, source, generation) }.unwrap();
+                // SAFETY: The collector owns this live header through the metadata access.
                 let raw = unsafe { &*moved.as_ptr() };
                 assert!(!raw.marked);
                 assert!(raw.allocated);

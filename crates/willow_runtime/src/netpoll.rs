@@ -899,6 +899,8 @@ mod tests {
         fn cpu_ns() -> u64 {
             let (mut creation, mut exit, mut kernel, mut user) = (0, 0, 0, 0);
             assert_ne!(
+                // SAFETY: The current-process handle is valid and each time output points to
+                // writable FILETIME storage.
                 unsafe {
                     GetProcessTimes(
                         GetCurrentProcess(),
@@ -1276,7 +1278,11 @@ mod tests {
 
     #[cfg(unix)]
     unsafe extern "C" fn poll_netpoll_manual_wake(frame: *mut c_void) -> i32 {
+        // SAFETY: The poll owns the matching live task frame. Its state and descriptor slots are
+        // at word-aligned ABI offsets.
         let state = unsafe { &mut *(frame as *mut i64) };
+        // SAFETY: The poll owns the matching live task frame. Its state and descriptor slots are
+        // at word-aligned ABI offsets.
         let fd = unsafe { *((frame as *mut u8).add(async_frame_slot_offset(0)) as *const i32) };
         *state += 1;
         if *state >= 2 {
@@ -1296,21 +1302,28 @@ mod tests {
     #[test]
     fn netpoll_wake_resumes_parked_task() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         reset_global_scheduler_for_test();
         reset_global_netpoll_for_test();
         NETPOLL_TEST_LAST_REGISTER.store(i32::MIN, Ordering::SeqCst);
 
         let mut fds = [0_i32; 2];
+        // SAFETY: fds provides two writable int slots for the new pipe descriptors.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let read_fd = fds[0];
         let write_fd = fds[1];
 
         let frame = willow_async_frame_alloc(1, 0) as *mut u8;
+        // SAFETY: The poll owns the matching live task frame. Its state and descriptor slots are
+        // at word-aligned ABI offsets.
         unsafe {
             *((frame.add(async_frame_slot_offset(0))) as *mut i32) = read_fd;
         }
-        let id = willow_sched_spawn(poll_netpoll_manual_wake, frame as *mut c_void);
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        let id = unsafe { willow_sched_spawn(poll_netpoll_manual_wake, frame as *mut c_void) };
         let token = read_fd as i64;
         let waker = std::thread::spawn(crate::runtime::serving(move || {
             while NETPOLL_TEST_LAST_REGISTER.load(Ordering::SeqCst) == i32::MIN {
@@ -1324,22 +1337,32 @@ mod tests {
         assert_eq!(willow_sched_task_state(id), -1); // terminal record reaped
         waker.join().unwrap();
 
+        // SAFETY: This backend owns the successfully opened descriptor and closes it once after
+        // use.
         unsafe {
             libc::close(read_fd);
             libc::close(write_fd);
         }
         reset_global_netpoll_for_test();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
     unsafe extern "C" fn poll_pipe_readable(frame: *mut c_void) -> i32 {
+        // SAFETY: The poll owns the matching live task frame. Its state and descriptor slots are
+        // at word-aligned ABI offsets.
         let state = unsafe { &mut *(frame as *mut i64) };
+        // SAFETY: The poll owns the matching live task frame. Its state and descriptor slots are
+        // at word-aligned ABI offsets.
         let fd = unsafe { *((frame as *mut u8).add(async_frame_slot_offset(0)) as *const i32) };
         *state += 1;
         if *state >= 2 {
             willow_netpoll_deregister(fd.into());
             let mut byte = 0_u8;
+            // SAFETY: The descriptor is live and the call's counts match the readable or writable
+            // event or byte buffers passed here.
             unsafe {
                 libc::read(fd, (&mut byte as *mut u8).cast::<libc::c_void>(), 1);
             }
@@ -1358,24 +1381,33 @@ mod tests {
     #[test]
     fn netpoll_unix_readiness_wakes_scheduler_idle_task() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         reset_global_scheduler_for_test();
         reset_global_netpoll_for_test();
         NETPOLL_TEST_LAST_REGISTER.store(i32::MIN, Ordering::SeqCst);
 
         let mut fds = [0_i32; 2];
+        // SAFETY: fds provides two writable int slots for the new pipe descriptors.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let read_fd = fds[0];
         let write_fd = fds[1];
 
         let frame = willow_async_frame_alloc(1, 0) as *mut u8;
+        // SAFETY: The poll owns the matching live task frame. Its state and descriptor slots are
+        // at word-aligned ABI offsets.
         unsafe {
             *((frame.add(async_frame_slot_offset(0))) as *mut i32) = read_fd;
         }
-        let id = willow_sched_spawn(poll_pipe_readable, frame as *mut c_void);
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        let id = unsafe { willow_sched_spawn(poll_pipe_readable, frame as *mut c_void) };
         let writer = std::thread::spawn(crate::runtime::serving(move || {
             std::thread::sleep(Duration::from_millis(10));
             let byte = [b'x'];
+            // SAFETY: This backend owns the successfully opened descriptor and closes it once
+            // after use.
             unsafe {
                 libc::write(write_fd, byte.as_ptr().cast::<libc::c_void>(), 1);
                 libc::close(write_fd);
@@ -1387,16 +1419,24 @@ mod tests {
         assert_eq!(willow_sched_task_state(id), -1); // terminal record reaped
 
         writer.join().unwrap();
+        // SAFETY: This backend owns the successfully opened descriptor and closes it once after
+        // use.
         unsafe {
             libc::close(read_fd);
         }
         reset_global_netpoll_for_test();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[cfg(windows)]
     unsafe extern "C" fn poll_socket_readable(frame: *mut c_void) -> i32 {
+        // SAFETY: The poll owns the matching live task frame. Its state and descriptor slots are
+        // at word-aligned ABI offsets.
         let state = unsafe { &mut *(frame as *mut i64) };
+        // SAFETY: The poll owns the matching live task frame. Its state and descriptor slots are
+        // at word-aligned ABI offsets.
         let socket = unsafe { *((frame as *mut u8).add(async_frame_slot_offset(0)) as *const i64) };
         *state += 1;
         if *state >= 2 {
@@ -1418,7 +1458,8 @@ mod tests {
         use std::os::windows::io::AsRawSocket;
 
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The isolated runtime has no other mutators before this task starts.
+        unsafe { reset_internal_for_test() };
         reset_global_scheduler_for_test();
         reset_global_netpoll_for_test();
         NETPOLL_TEST_LAST_REGISTER.store(i32::MIN, Ordering::SeqCst);
@@ -1428,11 +1469,15 @@ mod tests {
         sender.connect(receiver.local_addr().unwrap()).unwrap();
 
         let frame = willow_async_frame_alloc(1, 0) as *mut u8;
+        // SAFETY: The poll owns the matching live task frame. Its state and descriptor slots are
+        // at word-aligned ABI offsets.
         unsafe {
             *((frame.add(async_frame_slot_offset(0))) as *mut i64) =
                 receiver.as_raw_socket() as i64;
         }
-        let id = willow_sched_spawn(poll_socket_readable, frame as *mut c_void);
+        // SAFETY: The frame has the initialized socket slot read by this poll. The scheduler
+        // roots it before dispatch and the receiver stays open through task completion.
+        let id = unsafe { willow_sched_spawn(poll_socket_readable, frame.cast()) };
         let writer = std::thread::spawn(crate::runtime::serving(move || {
             while NETPOLL_TEST_LAST_REGISTER.load(Ordering::SeqCst) == i32::MIN {
                 std::thread::sleep(Duration::from_millis(1));
@@ -1446,7 +1491,8 @@ mod tests {
         writer.join().unwrap();
 
         reset_global_netpoll_for_test();
-        reset_internal_for_test();
+        // SAFETY: The task was reaped, the writer joined, and netpoll was cleared.
+        unsafe { reset_internal_for_test() };
     }
 
     // a cancelled task's registrations are purged.

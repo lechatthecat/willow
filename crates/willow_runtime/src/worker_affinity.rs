@@ -309,9 +309,9 @@ impl<O: AffinityObservation> Drop for RegistryLease<'_, O> {
     }
 }
 
-// Counter buckets remain at stable addresses until the borrowed/shared registry
-// dies. The lease retains that registry, and only atomic operations access count.
+// SAFETY: the lease retains the stable counter bucket when moved to another worker.
 unsafe impl<O: AffinityObservation + Send + Sync> Send for WorkerAffinity<'_, O> {}
+// SAFETY: shared bucket access is atomic and the observation sink is Sync.
 unsafe impl<O: AffinityObservation + Send + Sync> Sync for WorkerAffinity<'_, O> {}
 
 /// A scheduler retains private registries without adding reference-count work

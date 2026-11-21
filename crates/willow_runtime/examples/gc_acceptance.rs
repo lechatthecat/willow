@@ -1,5 +1,6 @@
 //! Isolated graph probe for benches/gc_acceptance. Never a universal GC gate.
 #![no_main]
+use std::cell::Cell;
 use std::time::Instant;
 #[path = "gc_acceptance/transport.rs"]
 mod transport;
@@ -11,7 +12,11 @@ fn snapshot() -> t::WillowGcStatsV4 {
     let mut value = t::WillowGcStatsV4::default();
     let size = std::mem::size_of_val(&value) as i64;
     assert_eq!(
-        t::willow_gc_stats_snapshot(4, (&mut value as *mut t::WillowGcStatsV4).cast(), size),
+        // SAFETY: The backing buffer covers the selected record on success; rejected requests
+        // write nothing.
+        unsafe {
+            t::willow_gc_stats_snapshot(4, (&mut value as *mut t::WillowGcStatsV4).cast(), size)
+        },
         size
     );
     value
@@ -147,8 +152,10 @@ pub extern "C" fn willow_user_main() {
     };
     let id_offset = if shape == "overload" { 1016 } else { 128 };
     let count = bytes.div_ceil(payload).max(roots_count);
-    let mut roots = vec![std::ptr::null_mut(); roots_count];
-    gc::willow_gc_init();
+    let roots = vec![Cell::new(std::ptr::null_mut()); roots_count];
+    // SAFETY: The standalone driver exclusively controls this heap between workloads; no
+    // mutator or borrowed payload crosses reset.
+    unsafe { gc::willow_gc_init() };
     endpoint("before");
     // Only the V4 drainer consumes observations; without it the runtime sink
     // keeps flushing even when a spool path is configured.
@@ -161,8 +168,10 @@ pub extern "C" fn willow_user_main() {
     let drainer = std::thread::spawn(move || transport::drain(drain_flag));
     {
         let _registration = gc::MutatorRegistration::new();
-        for root in &mut roots {
-            gc::willow_push_root(root);
+        for root in &roots {
+            // SAFETY: The initialized cell provides a stable writable slot through the
+            // matching pop.
+            unsafe { gc::willow_push_root(root.as_ptr()) };
         }
         // Each fixed root owns an independent chain. Root count and heap bytes
         // vary independently. No unrooted raw pointer survives an allocation.
@@ -182,18 +191,24 @@ pub extern "C" fn willow_user_main() {
                 let child = if shape == "cyclic" && edge == 1 {
                     node
                 } else {
-                    roots[(slot + edge) % roots_count]
+                    roots[(slot + edge) % roots_count].get()
                 };
-                gc::willow_gc_write_barrier(node, std::ptr::null_mut(), child, 1);
+                // SAFETY: The destination describes this reference update. Any asserted
+                // header belongs to its live GC payload.
+                unsafe { gc::willow_gc_write_barrier(node, std::ptr::null_mut(), child, 1) };
                 // SAFETY: pointer-aligned, initialized allocation and mask above.
                 unsafe {
+                    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves
+                    // the accessed words.
                     *node.cast::<*mut u8>().add(edge) = child;
                 }
             }
+            // SAFETY: The fixture allocates these fields in word-aligned GC storage at whole-word
+            // offsets.
             unsafe {
                 *node.add(id_offset).cast::<u64>() = i as u64;
             }
-            roots[slot] = node;
+            roots[slot].set(node);
             gc::willow_gc_safepoint();
             if i % 64 == 0 {
                 t::flush_observations();
@@ -249,36 +264,44 @@ pub extern "C" fn willow_user_main() {
             gc::willow_gc_collect();
             let mut checksum = 0u64;
             let mut visited = 0;
-            let mut cursor = std::ptr::null_mut();
-            gc::willow_push_root(&mut cursor);
-            // Do not hold a slice iterator over root slots across a poll: a
-            // relocating collection may rewrite those slots through registration.
-            let mut root_index = 0;
-            while root_index < roots.len() {
-                cursor = roots[root_index];
-                while !cursor.is_null() {
+            let cursor = Cell::new(std::ptr::null_mut());
+            // SAFETY: The initialized cell provides a stable writable slot through the
+            // matching pop.
+            unsafe { gc::willow_push_root(cursor.as_ptr()) };
+            for root in &roots {
+                cursor.set(root.get());
+                while !cursor.get().is_null() {
+                    let node = cursor.get();
                     // The cursor is rooted across bounded verification polls.
+                    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves
+                    // the accessed words.
                     unsafe {
-                        checksum = checksum.wrapping_add(*cursor.add(id_offset).cast::<u64>());
-                        let child = *cursor.cast::<*mut u8>();
+                        // SAFETY: The fixture allocates these fields in word-aligned GC storage at
+                        // whole-word offsets.
+                        checksum = checksum.wrapping_add(*node.add(id_offset).cast::<u64>());
+                        let child = *node.cast::<*mut u8>();
                         for edge in 1..fanout {
-                            let target = *cursor.cast::<*mut u8>().add(edge);
+                            let target = *node.cast::<*mut u8>().add(edge);
                             if shape == "cyclic" {
-                                assert_eq!(target, cursor);
+                                assert_eq!(target, node);
                             } else {
-                                let id = *cursor.add(id_offset).cast::<u64>() as usize;
+                                // SAFETY: The fixture allocates these fields in word-aligned GC
+                                // storage at whole-word offsets.
+                                let id = *node.add(id_offset).cast::<u64>() as usize;
                                 let residue = (id % roots_count + edge) % roots_count;
                                 if id <= residue {
                                     assert!(target.is_null());
                                 } else {
                                     assert_eq!(
+                                        // SAFETY: The fixture allocates these fields in word-aligned
+                                        // GC storage at whole-word offsets.
                                         *target.add(id_offset).cast::<u64>() as usize,
                                         id - 1 - (id - 1 - residue) % roots_count
                                     );
                                 }
                             }
                         }
-                        cursor = child;
+                        cursor.set(child);
                     }
                     visited += 1;
                     assert!(visited <= count, "corrupt/cyclic chain");
@@ -286,9 +309,10 @@ pub extern "C" fn willow_user_main() {
                         gc::willow_gc_safepoint();
                     }
                 }
-                root_index += 1;
             }
-            gc::willow_pop_roots(1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { gc::willow_pop_roots(1) };
             assert_eq!(visited, count);
             assert_eq!(checksum, (count as u64).wrapping_mul(count as u64 - 1) / 2);
             let elapsed = start.elapsed().as_nanos();
@@ -320,7 +344,9 @@ pub extern "C" fn willow_user_main() {
                 workload_checksum,
             );
         }
-        gc::willow_pop_roots(roots_count as i32);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { gc::willow_pop_roots(roots_count as i32) };
         gc::willow_gc_collect();
         gc::willow_gc_safepoint();
     }

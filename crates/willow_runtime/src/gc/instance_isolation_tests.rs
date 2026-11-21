@@ -35,34 +35,48 @@ fn gates() -> Gates {
 /// and collects while the other one is doing the same.
 fn drive(live: usize, garbage: usize, stores: usize, rendezvous: &Barrier) -> Gates {
     let _runtime = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
     invalidate_runtime_policy_budgets();
     let _mutator = MutatorRegistration::new();
     let mut parent = willow_alloc_typed(8, 1);
-    willow_push_root(&mut parent);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut parent) };
     let mut roots = Vec::with_capacity(live);
     for _ in 0..live {
-        roots.push(willow_gc_alloc_layout(KEY.layout_id, 0, 8, 0));
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        roots.push(unsafe { willow_gc_alloc_layout(KEY.layout_id, 0, 8, 0) });
     }
     for slot in &mut roots {
-        willow_push_root(slot);
+        // SAFETY: The slot storage stays live and stationary through the matching pop,
+        // including during collection.
+        unsafe { willow_push_root(slot) };
     }
     rendezvous.wait();
     for round in 1..=ROUNDS {
         for _ in 0..garbage {
-            willow_gc_alloc_layout(KEY.layout_id, 0, 8, 0);
+            // SAFETY: The requested layout describes the initialized words of this object and
+            // its type’s tracing or finalization contract.
+            unsafe { willow_gc_alloc_layout(KEY.layout_id, 0, 8, 0) };
         }
         let barrier_calls = runtime().write_barrier_calls.load(Ordering::Relaxed);
         rendezvous.wait();
         for index in 0..stores {
             let value = roots[index % live];
-            willow_gc_write_barrier(
-                parent,
-                std::ptr::null_mut(),
-                value,
-                GcStoreDestination::ObjectField as i64,
-            );
+            // SAFETY: The destination describes this reference update. Any asserted header
+            // belongs to its live GC payload.
+            unsafe {
+                willow_gc_write_barrier(
+                    parent,
+                    std::ptr::null_mut(),
+                    value,
+                    GcStoreDestination::ObjectField as i64,
+                )
+            };
         }
         // Both collections overlap; a shared stop would wait forever for the
         // other runtime's mutator, which is blocked in this barrier.
@@ -87,9 +101,13 @@ fn drive(live: usize, garbage: usize, stores: usize, rendezvous: &Barrier) -> Ga
         rendezvous.wait();
     }
     let observed = gates();
-    willow_pop_roots(live as i32 + 1);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_roots(live as i32 + 1) };
     drop(_mutator);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     assert_eq!(layouts::references(KEY), 0);
     observed
 }

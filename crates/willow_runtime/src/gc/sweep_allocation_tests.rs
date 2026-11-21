@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 #[test]
 fn sweep_allocation_runway_boundaries_and_saturating_clock() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let mut state = runtime().heap.lock().unwrap();
     for start in [0, 17, u64::MAX - sweep::ALLOCATION_RUNWAY] {
         state.sweep_allocation_start = start;
@@ -21,14 +23,18 @@ fn sweep_allocation_runway_boundaries_and_saturating_clock() {
     }
     state.sweeping = None;
     drop(state);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn sweep_allocation_waits_cooperatively_and_collector_is_reentrant() {
     let _guard = isolated_runtime();
     for count in [1, 4, 16] {
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime()
             .wait_observation
             .sleeps
@@ -45,7 +51,9 @@ fn sweep_allocation_waits_cooperatively_and_collector_is_reentrant() {
             state.total_allocated_bytes = sweep::ALLOCATION_RUNWAY;
         }
         // Native collector callbacks retain the non-waiting allocation path.
-        assert!(!allocate_old(0, 0, 8192, 0).is_null());
+        // SAFETY: This fixture selects the payload size and tracing layout for its object and
+        // initializes any native fields before collection.
+        assert!(!unsafe { allocate_old(0, 0, 8192, 0) }.is_null());
         let workers: Vec<_> = (0..count)
             .map(|i| {
                 std::thread::spawn(crate::runtime::serving(move || {
@@ -55,8 +63,12 @@ fn sweep_allocation_waits_cooperatively_and_collector_is_reentrant() {
                     } else {
                         GC_LARGE_OBJECT_THRESHOLD + 1
                     };
-                    let object = allocate_old(0, 0, size as i64, 0);
+                    // SAFETY: This fixture selects the payload size and tracing layout for
+                    // its object and initializes any native fields before collection.
+                    let object = unsafe { allocate_old(0, 0, size as i64, 0) };
                     assert!(!object.is_null());
+                    // SAFETY: The test retains this nonempty allocation and accesses a byte within
+                    // its requested size.
                     unsafe {
                         *object = 42;
                     }
@@ -86,13 +98,17 @@ fn sweep_allocation_waits_cooperatively_and_collector_is_reentrant() {
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn large_runtime_allocations_service_initial_handshake_without_loop_polls() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker = {
@@ -100,17 +116,27 @@ fn large_runtime_allocations_service_initial_handshake_without_loop_polls() {
         let done = done.clone();
         std::thread::spawn(crate::runtime::serving(move || {
             let _registration = MutatorRegistration::new();
-            let mut object = std::ptr::null_mut();
-            willow_push_root(&mut object);
+            let object = std::cell::Cell::new(std::ptr::null_mut());
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(object.as_ptr()) };
             ready.store(true, Ordering::Release);
             while !done.load(Ordering::Acquire) {
-                object = allocate_old(0, 0, 8192, 0);
+                // SAFETY: This fixture selects the payload size and tracing layout for its
+                // object and initializes any native fields before collection.
+                object.set(unsafe { allocate_old(0, 0, 8192, 0) });
+                // SAFETY: The test retains this nonempty allocation and accesses a byte within its
+                // requested size.
                 unsafe {
-                    *object = 42;
+                    *object.get() = 42;
                 }
             }
-            assert_eq!(unsafe { *object }, 42);
-            willow_pop_root();
+            // SAFETY: The test retains this nonempty allocation and accesses a byte within its
+            // requested size.
+            assert_eq!(unsafe { *object.get() }, 42);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
         }))
     };
     while !ready.load(Ordering::Acquire) {
@@ -124,7 +150,9 @@ fn large_runtime_allocations_service_initial_handshake_without_loop_polls() {
     worker.join().unwrap();
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), 0);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -132,7 +160,9 @@ fn sweep_allocation_shared_runway_scales_with_bytes_not_waiter_count() {
     let _guard = isolated_runtime();
     for size in [8192, 65536, 262144, 2 * 1024 * 1024] {
         for count in [1, 4, 16] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             runtime()
                 .wait_observation
                 .sleeps
@@ -150,7 +180,10 @@ fn sweep_allocation_shared_runway_scales_with_bytes_not_waiter_count() {
                     std::thread::spawn(crate::runtime::serving(move || {
                         let _registration = MutatorRegistration::new();
                         while !done.load(Ordering::Acquire) {
-                            assert!(!allocate_old(0, 0, size as i64, 0).is_null());
+                            // SAFETY: This fixture selects the payload size and tracing
+                            // layout for its object and initializes any native fields before
+                            // collection.
+                            assert!(!unsafe { allocate_old(0, 0, size as i64, 0) }.is_null());
                         }
                     }))
                 })
@@ -174,13 +207,17 @@ fn sweep_allocation_shared_runway_scales_with_bytes_not_waiter_count() {
             }
         }
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn large_allocation_bounds_unelected_request_runway() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     // Model a delayed coordinator without depending on OS scheduling timing.
     // The allocation slow path must start a collector without another request.
     let size = 65536;
@@ -189,19 +226,25 @@ fn large_allocation_bounds_unelected_request_runway() {
         let mut state = runtime().heap.lock().unwrap();
         state.threshold_bytes = usize::MAX;
         drop(state);
-        assert!(!allocate_old(0, 0, size, 0).is_null());
+        // SAFETY: This fixture selects the payload size and tracing layout for its object and
+        // initializes any native fields before collection.
+        assert!(!unsafe { allocate_old(0, 0, size, 0) }.is_null());
     }
     runtime().heap.lock().unwrap().threshold_bytes = budget;
     let before = runtime().heap.lock().unwrap().major_collections;
     let _registration = MutatorRegistration::new();
-    assert!(!allocate_old(0, 0, size, 0).is_null());
+    // SAFETY: This fixture selects the payload size and tracing layout for its object and
+    // initializes any native fields before collection.
+    assert!(!unsafe { allocate_old(0, 0, size, 0) }.is_null());
     // Initial publication is sufficient to return; collection may still be
     // marking or sweeping. Cooperatively finish before checking reclamation.
     coordinator::shutdown();
     assert!(runtime().heap.lock().unwrap().major_collections > before);
     assert!(willow_gc_allocated_bytes() < size * 2);
     drop(_registration);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 static ALLOCATION_RELEASED_TRACE: crate::runtime::PerRuntime<std::sync::atomic::AtomicBool> =
@@ -229,6 +272,8 @@ unsafe fn allocation_retry_slice(
         ALLOCATION_TRACE_RETRIES.fetch_add(1, Ordering::Relaxed);
         return TraceSliceProgress::Retry;
     }
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     children.push(unsafe { *(payload as *mut *mut u8) });
     TraceSliceProgress::Done
 }
@@ -254,7 +299,9 @@ fn hold_election_until_allocation_joins() {
 
 fn allocation_retry_before_initial_handshake(elected: bool) {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     ALLOCATION_RELEASED_TRACE.store(false, Ordering::Relaxed);
     ALLOCATION_TRACE_RETRIES.store(0, Ordering::Relaxed);
     ELECTED_BEFORE_HANDSHAKE.store(false, Ordering::Relaxed);
@@ -267,21 +314,35 @@ fn allocation_retry_before_initial_handshake(elected: bool) {
         .sleeps
         .store(0, Ordering::Relaxed);
     const TYPE: u32 = 0xFA9B;
-    willow_register_type_capability(
-        TYPE,
-        allocation_retry_legacy,
-        NativeTraceCapability::SliceConcurrentSafe(allocation_retry_slice),
-    );
+    // SAFETY: The fixture controls every instance of this ID and installs the matching
+    // stopped tracer and synchronized snapshot capability, if present.
+    unsafe {
+        willow_register_type_capability(
+            TYPE,
+            allocation_retry_legacy,
+            NativeTraceCapability::SliceConcurrentSafe(allocation_retry_slice),
+        )
+    };
     let registration = MutatorRegistration::new();
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
-    let mut parent = allocate_old(0, TYPE, 8, 0);
-    willow_push_root(&mut parent);
-    let child = allocate_old(0, 0, 8, 0);
+    // SAFETY: This fixture selects the payload size and tracing layout for its object and
+    // initializes any native fields before collection.
+    let mut parent = unsafe { allocate_old(0, TYPE, 8, 0) };
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut parent) };
+    // SAFETY: This fixture selects the payload size and tracing layout for its object and
+    // initializes any native fields before collection.
+    let child = unsafe { allocate_old(0, 0, 8, 0) };
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     unsafe {
         *child = 42;
         *(parent as *mut *mut u8) = child;
     }
-    assert!(!allocate_old(0, 0, 3 * 1024 * 1024, 0).is_null());
+    // SAFETY: This fixture selects the payload size and tracing layout for its object and
+    // initializes any native fields before collection.
+    assert!(!unsafe { allocate_old(0, 0, 3 * 1024 * 1024, 0) }.is_null());
     runtime().heap.lock().unwrap().threshold_bytes = 1024 * 1024;
     let collector = elected.then(|| {
         std::thread::spawn(crate::runtime::serving(|| {
@@ -305,7 +366,9 @@ fn allocation_retry_before_initial_handshake(elected: bool) {
     assert!(runtime().heap.lock().unwrap().concurrent_cycle.is_none());
     // This would self-elect or join whole-cycle completion in the buggy
     // implementation. Trace progress is impossible until it returns.
-    let object = allocate_old(0, 0, 65536, 0);
+    // SAFETY: This fixture selects the payload size and tracing layout for its object and
+    // initializes any native fields before collection.
+    let object = unsafe { allocate_old(0, 0, 65536, 0) };
     assert!(!object.is_null());
     assert!(ALLOCATION_TRACE_RETRIES.load(Ordering::Acquire) > 0);
     assert!(!ALLOCATION_RELEASED_TRACE.swap(true, Ordering::AcqRel));
@@ -321,16 +384,22 @@ fn allocation_retry_before_initial_handshake(elected: bool) {
         coordinator::shutdown();
     }
     assert!(runtime().heap.lock().unwrap().major_collections > 0);
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     assert_eq!(unsafe { **(parent as *mut *mut u8) }, 42);
     println!(
         "initial_retry elected={elected} retries={} allocation_returned_before_release=true",
         ALLOCATION_TRACE_RETRIES.load(Ordering::Relaxed)
     );
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
     drop(registration);
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), 0);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -346,7 +415,9 @@ fn large_allocation_retry_progress_joining_elected_before_initial_handshake() {
 #[test]
 fn stale_sweep_budget_does_not_join_a_later_mark() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let old = cycle_wait::CollectorGuard::try_acquire().unwrap();
     {
         let mut state = runtime().heap.lock().unwrap();
@@ -371,5 +442,7 @@ fn stale_sweep_budget_does_not_join_a_later_mark() {
         !result.unwrap(),
         "stale sweep observation joined a new collector"
     );
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }

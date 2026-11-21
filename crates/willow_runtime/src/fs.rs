@@ -22,11 +22,15 @@ pub(crate) fn alloc_ok(payload_word: i64, payload_is_ref: bool) -> *mut u8 {
     const WORD: &[willow_abi::SlotKind] = &[willow_abi::SlotKind::Word];
     const REF: &[willow_abi::SlotKind] = &[willow_abi::SlotKind::GcRef];
     let slots = if payload_is_ref { REF } else { WORD };
-    willow_alloc_enum_variant(
-        0,
-        willow_abi::EnumVariantLayout::new(0, slots),
-        &[payload_word],
-    )
+    // SAFETY: The variant layout selects its initialized word or reference payload, including
+    // the traced low word for a pair.
+    unsafe {
+        willow_alloc_enum_variant(
+            0,
+            willow_abi::EnumVariantLayout::new(0, slots),
+            &[payload_word],
+        )
+    }
 }
 
 /// Build `Err(IoError::Failed(message))`.
@@ -34,25 +38,41 @@ pub(crate) fn alloc_io_err(message: &str) -> *mut u8 {
     let msg = willow_string_from_str(message);
     // Root the message across the IoError allocation.
     let mut msg_slot = msg;
-    willow_push_root(&mut msg_slot as *mut *mut u8);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut msg_slot) };
     const REF: &[willow_abi::SlotKind] = &[willow_abi::SlotKind::GcRef];
-    let ioerr = willow_alloc_enum_variant(
-        0,
-        willow_abi::EnumVariantLayout::new(0, REF),
-        &[msg_slot as i64],
-    );
-    willow_pop_roots(1);
+    // SAFETY: The variant layout selects its initialized word or reference payload, including
+    // the traced low word for a pair.
+    let ioerr = unsafe {
+        willow_alloc_enum_variant(
+            0,
+            willow_abi::EnumVariantLayout::new(0, REF),
+            &[msg_slot as i64],
+        )
+    };
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_roots(1) };
     if ioerr.is_null() {
         return std::ptr::null_mut();
     }
     let mut ioerr_slot = ioerr;
-    willow_push_root(&mut ioerr_slot as *mut *mut u8);
-    let err = willow_alloc_enum_variant(
-        0,
-        willow_abi::EnumVariantLayout::new(1, REF),
-        &[ioerr_slot as i64],
-    );
-    willow_pop_roots(1);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut ioerr_slot) };
+    // SAFETY: The variant layout selects its initialized word or reference payload, including
+    // the traced low word for a pair.
+    let err = unsafe {
+        willow_alloc_enum_variant(
+            0,
+            willow_abi::EnumVariantLayout::new(1, REF),
+            &[ioerr_slot as i64],
+        )
+    };
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_roots(1) };
     err
 }
 
@@ -60,11 +80,17 @@ pub(crate) fn alloc_io_err(message: &str) -> *mut u8 {
 /// temp directory (`<tmp>/<prefix>_<pid>_<counter>`). Uniqueness across
 /// processes comes from the pid, within the process from the counter — so
 /// parallel test/example runs cannot collide.
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_fs_temp_path(prefix: *const u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_fs_temp_path(prefix: *const u8) -> *mut u8 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let prefix = unsafe { willow_string_as_str(prefix) };
     // SANITIZE to a single file-name component: an absolute prefix would
     // REPLACE the temp dir in `join`, and `..` would escape it — both break
@@ -102,9 +128,15 @@ fn unit_result(result: Option<Result<(), String>>) -> *mut u8 {
 }
 
 /// `fs::read_to_string(path) -> Result<String, IoError>`.
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_fs_read_to_string(path: *const u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_fs_read_to_string(path: *const u8) -> *mut u8 {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let path = unsafe { willow_string_as_str(path) }.to_string();
     let result = crate::blocking::run_sync_call(move || {
         std::fs::read_to_string(&path).map_err(|error| format!("{path}: {error}"))
@@ -113,9 +145,13 @@ pub extern "C" fn willow_fs_read_to_string(path: *const u8) -> *mut u8 {
         Some(Ok(contents)) => {
             let s = willow_string_from_str(&contents);
             let mut slot = s;
-            willow_push_root(&mut slot as *mut *mut u8);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut slot) };
             let out = alloc_ok(slot as i64, true);
-            willow_pop_roots(1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(1) };
             out
         }
         Some(Err(message)) => alloc_io_err(&message),
@@ -124,10 +160,17 @@ pub extern "C" fn willow_fs_read_to_string(path: *const u8) -> *mut u8 {
 }
 
 /// `fs::write_string(path, contents) -> Result<void, IoError>`.
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_fs_write_string(path: *const u8, contents: *const u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_fs_write_string(path: *const u8, contents: *const u8) -> *mut u8 {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let path = unsafe { willow_string_as_str(path) }.to_string();
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let contents = unsafe { willow_string_as_str(contents) }.to_string();
     unit_result(crate::blocking::run_sync_call(move || {
         std::fs::write(&path, contents).map_err(|error| format!("{path}: {error}"))
@@ -135,18 +178,34 @@ pub extern "C" fn willow_fs_write_string(path: *const u8, contents: *const u8) -
 }
 
 /// `fs::exists(path) -> bool` (1/0).
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
+///
+/// ```compile_fail,E0133
+/// willow_runtime::fs::willow_fs_exists(std::ptr::null());
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_fs_exists(path: *const u8) -> i64 {
+pub unsafe extern "C" fn willow_fs_exists(path: *const u8) -> i64 {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let path = unsafe { willow_string_as_str(path) }.to_string();
     let exists = crate::blocking::run_sync_call(move || std::path::Path::new(&path).exists());
     i64::from(exists.unwrap_or(false))
 }
 
 /// `fs::remove_file(path) -> Result<void, IoError>`.
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_fs_remove_file(path: *const u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_fs_remove_file(path: *const u8) -> *mut u8 {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let path = unsafe { willow_string_as_str(path) }.to_string();
     unit_result(crate::blocking::run_sync_call(move || {
         std::fs::remove_file(&path).map_err(|error| format!("{path}: {error}"))
@@ -231,19 +290,24 @@ impl NativeFrameSpec for FsReferenceFrame {
 }
 
 unsafe fn fs_frame(frame: *mut c_void) -> NativeTaskFrame<FsScalarFrame> {
-    // Both filesystem layouts differ only at result slot 0. Native state and
-    // task-id access use the common slots 1/2 through this view.
+    // SAFETY: The caller supplies a live filesystem frame. Both layouts have the
+    // same ID and native slots. Only the scalar layout uses this view for the result.
     unsafe { NativeTaskFrame::from_raw(frame) }
 }
 
 unsafe fn blocking_state(frame: *mut c_void) -> Option<Arc<BlockingFsState>> {
+    // SAFETY: The caller retains the filesystem frame while reading its native job slot.
     let raw = unsafe { fs_frame(frame) }.load_native::<Arc<BlockingFsState>>(FS_TASK_JOB_SLOT);
     // The frame may release its boxed Arc when this poll completes.
+    // SAFETY: A non-null slot holds a Box::into_raw pointer to an Arc<BlockingFsState>.
+    // The caller has exclusive callback access while cloning that Arc.
     unsafe { raw.as_ref() }.cloned()
 }
 
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_blocking_fs(frame: *mut c_void) -> i32 {
+    // SAFETY: The scheduler retains the filesystem frame and excludes cancellation
+    // while this poll clones the state from its job slot.
     let Some(state) = (unsafe { blocking_state(frame) }) else {
         return crate::task::RUNTIME_POLL_READY;
     };
@@ -269,9 +333,13 @@ unsafe extern "C" fn poll_blocking_fs(frame: *mut c_void) -> i32 {
         BlockingFsResult::Read(Ok(contents)) => {
             let string = willow_string_from_str(&contents);
             let mut root = string;
-            willow_push_root(&mut root as *mut *mut u8);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut root) };
             let result = alloc_ok(root as i64, true);
-            willow_pop_roots(1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(1) };
             (result as i64, true)
         }
         BlockingFsResult::Read(Err(error)) | BlockingFsResult::Unit(Err(error)) => {
@@ -280,6 +348,10 @@ unsafe extern "C" fn poll_blocking_fs(frame: *mut c_void) -> i32 {
         BlockingFsResult::Unit(Ok(())) => (alloc_ok(0, false) as i64, true),
         BlockingFsResult::Exists(exists) => (i64::from(exists), false),
     };
+    // SAFETY: The result variant selects the layout used at spawn. blocking_state
+    // already read a non-null Box::into_raw pointer from this frame. The cloned Arc
+    // leaves the slot intact, and the scheduler excludes other polls and cancellation.
+    // take_native therefore clears and returns that same pointer exactly once.
     unsafe {
         if result_is_ref {
             NativeTaskFrame::<FsReferenceFrame>::from_raw(frame)
@@ -295,6 +367,9 @@ unsafe extern "C" fn poll_blocking_fs(frame: *mut c_void) -> i32 {
 
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn cancel_blocking_fs(frame: *mut c_void) {
+    // SAFETY: The scheduler retains this frame and serializes cancel with poll.
+    // take_native clears the job slot and transfers its Box::into_raw pointer, if
+    // present, to this callback. The pool job holds its own Arc to the state.
     unsafe {
         let raw = fs_frame(frame).take_native::<Arc<BlockingFsState>>(FS_TASK_JOB_SLOT);
         if !raw.is_null() {
@@ -332,10 +407,11 @@ fn spawn_blocking_fs_after_publication(
     };
     let state = Arc::new(BlockingFsState::new());
     let state_for_work = Arc::clone(&state);
-    // The task may finish on another worker as soon as it is published.
-    // Keep the caller's Arc alive through the completion recheck; the poll or
-    // cancel callback owns and may already have freed the boxed frame copy.
+    // Keep the caller's Arc through the completion recheck. After publication,
+    // another worker can run poll or cancel and reclaim the frame's boxed Arc.
     let state_box = Box::into_raw(Box::new(Arc::clone(&state)));
+    // SAFETY: The newly allocated frame has a native job slot in either layout.
+    // It receives the boxed Arc before any poll or cancellation can run.
     unsafe { fs_frame(frame) }.store_native(FS_TASK_JOB_SLOT, state_box);
     if let Err(job) = crate::blocking::try_submit(Box::new(move || {
         let result = work();
@@ -346,15 +422,22 @@ fn spawn_blocking_fs_after_publication(
         // Nothing is refused, so the caller still gets a real Task.
         state.keep_pending(job);
     }
-    let task_id = crate::scheduler::spawn_global_task_initialized(
-        poll_blocking_fs,
-        frame,
-        Some(cancel_blocking_fs),
-        |task_id| unsafe {
-            fs_frame(frame).store_word(FS_TASK_ID_SLOT, task_id as i64);
-            state.task_id.store(task_id, Ordering::Release);
-        },
-    );
+    // SAFETY: The scheduler roots the frame and calls this initializer before
+    // publishing the task. Both filesystem layouts have a word at FS_TASK_ID_SLOT.
+    let initialize = |task_id| unsafe {
+        fs_frame(frame).store_word(FS_TASK_ID_SLOT, task_id as i64);
+        state.task_id.store(task_id, Ordering::Release);
+    };
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let task_id = unsafe {
+        crate::scheduler::spawn_global_task_initialized(
+            poll_blocking_fs,
+            frame,
+            Some(cancel_blocking_fs),
+            initialize,
+        )
+    };
     // The callback is normally a no-op; tests force task cleanup here before
     // the actual completion recheck to exercise this publication boundary.
     after_publication(task_id, frame, &state);
@@ -378,9 +461,15 @@ fn spawn_blocking_fs_after_publication(
 
 /// Non-blocking file read. The returned Task parks in `BlockedSyscall` while a
 /// bounded blocking-pool thread performs the OS operation.
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_fs_read_to_string_async(path: *const u8) -> *mut c_void {
+pub unsafe extern "C" fn willow_fs_read_to_string_async(path: *const u8) -> *mut c_void {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let path = unsafe { willow_string_as_str(path) }.to_string();
     spawn_blocking_fs(
         move || {
@@ -392,13 +481,19 @@ pub extern "C" fn willow_fs_read_to_string_async(path: *const u8) -> *mut c_void
     )
 }
 
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_fs_write_string_async(
+pub unsafe extern "C" fn willow_fs_write_string_async(
     path: *const u8,
     contents: *const u8,
 ) -> *mut c_void {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let path = unsafe { willow_string_as_str(path) }.to_string();
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let contents = unsafe { willow_string_as_str(contents) }.to_string();
     spawn_blocking_fs(
         move || {
@@ -410,9 +505,14 @@ pub extern "C" fn willow_fs_write_string_async(
     )
 }
 
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_fs_exists_async(path: *const u8) -> *mut c_void {
+pub unsafe extern "C" fn willow_fs_exists_async(path: *const u8) -> *mut c_void {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let path = unsafe { willow_string_as_str(path) }.to_string();
     spawn_blocking_fs(
         move || BlockingFsResult::Exists(std::path::Path::new(&path).exists()),
@@ -420,9 +520,14 @@ pub extern "C" fn willow_fs_exists_async(path: *const u8) -> *mut c_void {
     )
 }
 
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_fs_remove_file_async(path: *const u8) -> *mut c_void {
+pub unsafe extern "C" fn willow_fs_remove_file_async(path: *const u8) -> *mut c_void {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let path = unsafe { willow_string_as_str(path) }.to_string();
     spawn_blocking_fs(
         move || {
@@ -437,9 +542,10 @@ pub extern "C" fn willow_fs_remove_file_async(path: *const u8) -> *mut c_void {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::{isolated_runtime, reset_internal_for_test};
+    use crate::gc::{GcRootHandle, isolated_runtime, reset_internal_for_test};
 
     fn read_tag(ptr: *mut u8) -> i64 {
+        // SAFETY: The Result constructor reserves word-aligned GC storage for its tag and payload.
         unsafe { *(ptr as *const i64) }
     }
 
@@ -462,7 +568,9 @@ mod tests {
         static TAG: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
         unsafe extern "C" fn blocked(_: *mut c_void) -> i32 {
             let path = PATH.lock().unwrap().clone();
-            let result = willow_fs_read_to_string(willow_string_from_str(&path));
+            // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+            // during this call.
+            let result = unsafe { willow_fs_read_to_string(willow_string_from_str(&path)) };
             TAG.store(read_tag(result), Ordering::SeqCst);
             RUNTIME_POLL_READY
         }
@@ -473,10 +581,12 @@ mod tests {
                 .join(format!("willow_sync_read_{}_{cancel}", std::process::id()));
             let _ = std::fs::remove_file(&path);
             let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            // SAFETY: The CString supplies a live NUL-terminated pathname for mkfifo.
             assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
             *PATH.lock().unwrap() = path.to_str().unwrap().to_string();
             TAG.store(-1, Ordering::SeqCst);
-            let task = willow_sched_spawn(blocked, std::ptr::null_mut());
+            // SAFETY: The callback accepts a null frame and uses no frame storage.
+            let task = unsafe { willow_sched_spawn(blocked, std::ptr::null_mut()) };
             willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
             assert_eq!(willow_sched_task_state(task), 7);
             if cancel {
@@ -502,12 +612,18 @@ mod tests {
     #[test]
     fn poll_state_remains_owned_after_frame_cleanup() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let frame = NativeTaskFrame::<FsScalarFrame>::allocate().unwrap();
         let core = Arc::new(BlockingFsState::new());
         let weak = Arc::downgrade(&core);
         frame.store_native(FS_TASK_JOB_SLOT, Box::into_raw(Box::new(core)));
+        // SAFETY: This test just populated the scalar frame with a boxed Arc and has
+        // exclusive access while blocking_state clones it.
         let state = unsafe { blocking_state(frame.as_raw()) }.unwrap();
+        // SAFETY: The test invokes cleanup synchronously on the same live frame.
+        // The retained state is a separate Arc from the one in the slot.
         unsafe { cancel_blocking_fs(frame.as_raw()) };
         assert!(
             frame
@@ -518,8 +634,11 @@ mod tests {
         drop(state);
         assert!(weak.upgrade().is_none());
         // Repeated cleanup must leave the cleared slot alone.
+        // SAFETY: The same test frame is still live and its job slot is now null.
         unsafe { cancel_blocking_fs(frame.as_raw()) };
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
@@ -527,7 +646,10 @@ mod tests {
         let _guard = isolated_runtime();
         let tmp = std::env::temp_dir();
         for evil in ["/etc/passwd", "../../escape", "a/b", "", "日本語"] {
-            let p = willow_fs_temp_path(willow_string_from_str(evil));
+            // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+            // during this call.
+            let p = unsafe { willow_fs_temp_path(willow_string_from_str(evil)) };
+            // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
             let path = unsafe { willow_string_as_str(p) };
             let path = std::path::Path::new(path);
             assert!(
@@ -548,33 +670,54 @@ mod tests {
     #[test]
     fn fs_roundtrip_ok_and_err_tags() {
         let _guard = isolated_runtime();
-        let unique = willow_fs_temp_path(willow_string_from_str("willow_fs_test"));
+        // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+        // during this call.
+        let unique = unsafe { willow_fs_temp_path(willow_string_from_str("willow_fs_test")) };
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         let dir = std::path::PathBuf::from(unsafe { willow_string_as_str(unique) });
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("t.txt");
         // Every Ok/Err result allocates, and an allocation may collect
         // (WILLOW_GC_STRESS=alloc); root the path for as long as it is reused.
         let mut path = willow_string_from_str(file.to_str().unwrap());
-        willow_push_root(&mut path as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut path) };
 
         let contents = willow_string_from_str("hello");
-        let w = willow_fs_write_string(path, contents);
+        // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+        // during this call.
+        let w = unsafe { willow_fs_write_string(path, contents) };
         assert_eq!(read_tag(w), 0, "write must be Ok");
 
-        assert_eq!(willow_fs_exists(path), 1);
+        // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+        // during this call.
+        assert_eq!(unsafe { willow_fs_exists(path) }, 1);
 
-        let r = willow_fs_read_to_string(path);
+        // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+        // during this call.
+        let r = unsafe { willow_fs_read_to_string(path) };
         assert_eq!(read_tag(r), 0, "read must be Ok");
+        // SAFETY: The Result constructor reserves word-aligned GC storage for its tag and payload.
         let payload = unsafe { *((r as *const i64).add(1)) } as *const u8;
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { willow_string_as_str(payload) }, "hello");
 
-        let rm = willow_fs_remove_file(path);
+        // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+        // during this call.
+        let rm = unsafe { willow_fs_remove_file(path) };
         assert_eq!(read_tag(rm), 0);
-        assert_eq!(willow_fs_exists(path), 0);
+        // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+        // during this call.
+        assert_eq!(unsafe { willow_fs_exists(path) }, 0);
 
-        let missing = willow_fs_read_to_string(path);
+        // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+        // during this call.
+        let missing = unsafe { willow_fs_read_to_string(path) };
         assert_eq!(read_tag(missing), 1, "read of removed file must be Err");
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -587,27 +730,38 @@ mod tests {
 
         let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
-        let unique = willow_fs_temp_path(willow_string_from_str("willow_async_fs_test"));
+        // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+        // during this call.
+        let unique = unsafe { willow_fs_temp_path(willow_string_from_str("willow_async_fs_test")) };
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         let path = unsafe { willow_string_as_str(unique) }.to_string();
         std::fs::write(&path, "from-pool").unwrap();
 
-        let frame = willow_fs_read_to_string_async(unique);
-        let task_id = unsafe {
-            *(frame as *const u8)
-                .add(async_frame_slot_offset(1))
-                .cast::<u64>()
-        };
+        // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+        // during this call.
+        let frame = unsafe { willow_fs_read_to_string_async(unique) };
+        assert!(!frame.is_null());
+        let frame = GcRootHandle::new(frame.cast());
+        // SAFETY: The rooted read frame stores the published task ID in word slot 1.
+        // The frame allocator and word-stride offset align the u64 load.
+        let task_id = unsafe { *frame.load().add(async_frame_slot_offset(1)).cast::<u64>() };
         assert!(task_id > 0);
         assert_eq!(willow_sched_run_until(task_id), 1);
         assert_eq!(willow_sched_task_state(task_id), -1);
 
+        crate::gc::willow_gc_collect();
+        // SAFETY: run_until completed the read and the test root retains the frame.
+        // Reference slot 0 is pointer-aligned and now contains the Result.
         let result = unsafe {
-            *(frame as *const u8)
+            *frame
+                .load()
                 .add(async_frame_slot_offset(0))
                 .cast::<*mut u8>()
         };
         assert_eq!(read_tag(result), 0);
+        // SAFETY: The Result constructor reserves word-aligned GC storage for its tag and payload.
         let string = unsafe { *((result as *const i64).add(1)) } as *const u8;
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { willow_string_as_str(string) }, "from-pool");
         std::fs::remove_file(path).ok();
     }
@@ -623,6 +777,7 @@ mod tests {
             || BlockingFsResult::Exists(true),
             false,
             |task_id, frame, state| {
+                let frame = GcRootHandle::new(frame.cast());
                 // Wait until this job has published its result and the pool
                 // has dropped its closure's Arc. No scheduler drive has
                 // started yet, so exactly caller and frame ownership remain.
@@ -647,7 +802,10 @@ mod tests {
                 // recheck. Drive the real published task to completion first,
                 // allowing its poll callback to free the frame's boxed Arc.
                 assert_eq!(willow_sched_run_until(task_id), 1);
-                let frame = unsafe { fs_frame(frame) };
+                crate::gc::willow_gc_collect();
+                // SAFETY: The test root retains the scalar frame across completion and collection.
+                // The poll cleared the native slot before freeing its boxed Arc.
+                let frame = unsafe { fs_frame(frame.load().cast()) };
                 assert!(
                     frame
                         .load_native::<Arc<BlockingFsState>>(FS_TASK_JOB_SLOT)
@@ -688,6 +846,8 @@ mod tests {
         };
 
         fn task_id_of(frame: *mut c_void) -> u64 {
+            // SAFETY: The test passes a rooted filesystem frame. Its ID is stored at this
+            // word-stride offset from the word-aligned frame base.
             unsafe {
                 *(frame as *const u8)
                     .add(async_frame_slot_offset(FS_TASK_ID_SLOT))
@@ -712,21 +872,28 @@ mod tests {
         assert_eq!(willow_blocking_queued_jobs() as usize, capacity);
 
         // Over capacity: every call still yields a Task, no null, no error.
-        let unique = willow_fs_temp_path(willow_string_from_str("willow_fs_queue_full"));
+        // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+        // during this call.
+        let unique = unsafe { willow_fs_temp_path(willow_string_from_str("willow_fs_queue_full")) };
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         let path = unsafe { willow_string_as_str(unique) }.to_string();
         std::fs::write(&path, "x").unwrap();
         const OVERFLOW: usize = 5;
         // Spawning may collect (GC stress) and `unique` is unrooted, so hand
         // each call its own fresh path string.
         let mut frames: Vec<*mut c_void> = (0..OVERFLOW)
-            .map(|_| willow_fs_exists_async(willow_string_from_str(&path)))
+            // SAFETY: Each input is null or a live Willow string whose bytes remain immutable
+            // during this call.
+            .map(|_| unsafe { willow_fs_exists_async(willow_string_from_str(&path)) })
             .collect();
         assert!(frames.iter().all(|frame| !frame.is_null()));
         // A completed Task unroots its frame; an awaiter would hold the Task
         // handle as a root, so root the frames here until their results are
         // read (the Vec never reallocates, so the slots stay put).
         for frame in frames.iter_mut() {
-            willow_push_root((frame as *mut *mut c_void).cast::<*mut u8>());
+            // SAFETY: The Vec is fully populated. Each slot remains at its address until
+            // all frame results are read and the roots are popped.
+            unsafe { willow_push_root((frame as *mut *mut c_void).cast::<*mut u8>()) };
         }
         let ids: Vec<u64> = frames.iter().map(|frame| task_id_of(*frame)).collect();
         assert_eq!(
@@ -766,6 +933,8 @@ mod tests {
             // is not per target; the terminal state is.
             willow_sched_run_until(*id);
             assert_eq!(willow_sched_task_state(*id), -1, "task {index} completes");
+            // SAFETY: The registered root in frames[index] retains the completed exists
+            // frame. Its word-aligned scalar result slot now holds the answer.
             let exists = unsafe {
                 *(frames[index] as *const u8)
                     .add(async_frame_slot_offset(FS_TASK_RESULT_SLOT))
@@ -773,7 +942,9 @@ mod tests {
             };
             assert_eq!(exists, 1, "task {index} must observe the file");
         }
-        willow_pop_roots(OVERFLOW as i32);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(OVERFLOW as i32) };
         assert_eq!(willow_blocking_slot_waiters(), 0);
         wait_until("queue to drain", || willow_blocking_queued_jobs() == 0);
         wait_until("jobs to finish", || {
@@ -796,6 +967,8 @@ mod tests {
         };
 
         unsafe extern "C" fn ready_after_blocked(frame: *mut c_void) -> i32 {
+            // SAFETY: The scheduler retains the one-slot frame during this poll. The test
+            // wrote blocked_id into its word-aligned slot 0 before spawning the task.
             let blocked_id = unsafe {
                 *(frame
                     .cast::<u8>()
@@ -823,6 +996,9 @@ mod tests {
             },
             false,
         );
+        assert!(!blocked_frame.is_null());
+        // SAFETY: Spawn initialized the live filesystem frame's ID slot before publication.
+        // The allocator aligns the base and the slot offset is a multiple of a word.
         let blocked_id = unsafe {
             *(blocked_frame as *const u8)
                 .add(crate::async_frame::async_frame_slot_offset(FS_TASK_ID_SLOT))
@@ -833,13 +1009,19 @@ mod tests {
             .expect("blocking pool job did not start");
 
         let quick_frame = crate::async_frame::willow_async_frame_alloc(1, 0);
+        assert!(!quick_frame.is_null());
+        // SAFETY: This newly allocated frame has one word-aligned scalar slot. The test
+        // has exclusive access until it publishes quick_frame to the scheduler.
         unsafe {
             *quick_frame
                 .cast::<u8>()
                 .add(async_frame_slot_offset(0))
                 .cast::<u64>() = blocked_id;
         }
-        let quick_id = crate::scheduler::willow_sched_spawn(ready_after_blocked, quick_frame);
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        let quick_id =
+            unsafe { crate::scheduler::willow_sched_spawn(ready_after_blocked, quick_frame) };
         assert_eq!(
             willow_sched_run_until(quick_id),
             1,

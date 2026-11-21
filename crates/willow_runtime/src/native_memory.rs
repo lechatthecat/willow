@@ -248,7 +248,9 @@ mod tests {
     #[test]
     fn accounting_visits_once_per_guard_independent_of_buffer_length() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         let baseline = crate::gc_telemetry::external_bytes();
         for count in [1, 32, 1024] {
             let visits = Arc::new(AtomicUsize::new(0));
@@ -279,7 +281,9 @@ mod tests {
     #[test]
     fn poisoned_guard_accounts_growth_and_drop_releases_it() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         let baseline = crate::gc_telemetry::external_bytes();
         let buffer = Mutex::new(Buffer {
             values: Vec::new(),
@@ -302,7 +306,9 @@ mod tests {
     #[test]
     fn parallel_owners_reconcile_without_lost_updates() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         let baseline = crate::gc_telemetry::external_bytes();
         let owners: Vec<_> = (0..8)
             .map(|_| {
@@ -360,7 +366,9 @@ mod tests {
     #[test]
     fn shrink_and_unwind_release_only_freed_capacity() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         let baseline = crate::gc_telemetry::external_bytes();
         let buffer = Mutex::with_base(
             Buffer {
@@ -382,7 +390,9 @@ mod tests {
         );
         assert_eq!(crate::gc_telemetry::external_bytes(), baseline + 24);
         // A live native owner is not zeroed by GC reset; its later Drop balances.
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         assert_eq!(crate::gc_telemetry::external_bytes(), baseline + 24);
         drop(buffer);
         assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
@@ -393,7 +403,9 @@ mod tests {
         let _guard = crate::gc::isolated_runtime();
         for reset in [false, true] {
             for count in [1, 32, 1024] {
-                crate::gc::willow_gc_init();
+                // SAFETY: The test controls its isolated runtime at this reset boundary; no
+                // other mutator or subsequent access relies on the discarded heap.
+                unsafe { crate::gc::willow_gc_init() };
                 let baseline = crate::gc_telemetry::external_bytes();
                 crate::gc::native_reconciliation_observation().store(0, Ordering::Relaxed);
                 let mut roots = Vec::new();
@@ -401,7 +413,9 @@ mod tests {
                 for _ in 0..count {
                     let channel = crate::channel::willow_channel_new(0);
                     roots.push(crate::gc::GcRootHandle::new(channel.cast()));
-                    crate::channel::willow_channel_send_i64(channel, 42);
+                    // SAFETY: The constructor selected this channel element representation
+                    // and the channel remains live during the send.
+                    unsafe { crate::channel::willow_channel_send_i64(channel, 42) };
                     if per_channel == 0 {
                         per_channel = crate::gc_telemetry::external_bytes() - baseline;
                     }
@@ -424,7 +438,9 @@ mod tests {
                 );
                 drop(roots);
                 if reset {
-                    crate::gc::willow_gc_init();
+                    // SAFETY: The test controls its isolated runtime at this reset boundary;
+                    // no other mutator or subsequent access relies on the discarded heap.
+                    unsafe { crate::gc::willow_gc_init() };
                 } else {
                     crate::gc::willow_gc_collect();
                 }
@@ -437,16 +453,21 @@ mod tests {
     fn native_growth_enforces_hard_limit_without_managed_allocation() {
         const KEY: &str = "WILLOW_NATIVE_LIMIT_TEST";
         if let Ok(kind) = std::env::var(KEY) {
-            crate::gc::willow_gc_init();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { crate::gc::willow_gc_init() };
             if kind == "map" {
                 let map = crate::map::willow_map_new(0, 0, 0);
                 for key in 0..100_000 {
-                    crate::map::willow_map_insert(map, key, 0, key, 0);
+                    // SAFETY: This live map was constructed with scalar key and value slots.
+                    unsafe { crate::map::willow_map_insert(map, key, 0, key, 0) };
                 }
             } else {
                 let channel = crate::channel::willow_channel_new(0);
                 for value in 0..100_000 {
-                    crate::channel::willow_channel_send_i64(channel, value);
+                    // SAFETY: The constructor selected this channel element representation
+                    // and the channel remains live during the send.
+                    unsafe { crate::channel::willow_channel_send_i64(channel, value) };
                 }
             }
             panic!("native growth bypassed memory limit");

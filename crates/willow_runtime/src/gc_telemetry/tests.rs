@@ -75,7 +75,9 @@ fn histogram_and_cycle_work_saturate_without_wrapping() {
 #[test]
 fn fixed_v1_header_and_symbol_write_one_struct() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     assert_eq!(std::mem::offset_of!(WillowGcStatsV1, version), 0);
     assert_eq!(std::mem::offset_of!(WillowGcStatsV1, struct_size), 4);
     assert_eq!(std::mem::offset_of!(WillowGcStatsV1, timestamp_ns), 8);
@@ -94,8 +96,16 @@ fn fixed_v1_header_and_symbol_write_one_struct() {
         stats: Default::default(),
         after: 0x5678,
     };
-    assert_eq!(willow_gc_stats_snapshot_v1(std::ptr::null_mut()), -1);
-    assert_eq!(willow_gc_stats_snapshot_v1(&mut guarded.stats), 0);
+    assert_eq!(
+        // SAFETY: The snapshot API accepts null and returns before writing.
+        unsafe { willow_gc_stats_snapshot_v1(std::ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(
+        // SAFETY: The typed output owns one aligned, writable record for the call.
+        unsafe { willow_gc_stats_snapshot_v1(&mut guarded.stats) },
+        0
+    );
     assert_eq!(guarded.before, 0x1234);
     assert_eq!(guarded.after, 0x5678);
     assert_eq!(
@@ -108,30 +118,52 @@ fn fixed_v1_header_and_symbol_write_one_struct() {
 #[test]
 fn negotiated_snapshot_validates_before_writing_and_accepts_byte_buffers() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let size = std::mem::size_of::<WillowGcStatsV1>();
     assert_eq!(willow_gc_stats_size(1), size as i64);
     let mut bytes = vec![0xa5u8; size + 17];
+    // SAFETY: The test buffer includes a spare leading byte and room for the entire record after
+    // it.
     let out = unsafe { bytes.as_mut_ptr().add(1) };
     for version in [i64::MIN, -1, 0, 5, i64::MAX] {
         assert_eq!(willow_gc_stats_size(version), -1);
-        assert_eq!(willow_gc_stats_snapshot(version, out, size as i64), -1);
         assert_eq!(
-            willow_gc_stats_snapshot(version, std::ptr::null_mut(), 0),
+            // SAFETY: The backing buffer covers the selected record on success; rejected requests
+            // write nothing.
+            unsafe { willow_gc_stats_snapshot(version, out, size as i64) },
+            -1
+        );
+        assert_eq!(
+            // SAFETY: The snapshot API accepts null and returns before writing.
+            unsafe { willow_gc_stats_snapshot(version, std::ptr::null_mut(), 0) },
             -1
         );
     }
     for len in [i64::MIN, -1, 0, size as i64 - 1] {
-        assert_eq!(willow_gc_stats_snapshot(1, out, len), 0);
-        assert_eq!(willow_gc_stats_snapshot(1, std::ptr::null_mut(), len), 0);
+        // SAFETY: The backing buffer covers the selected record on success; rejected requests
+        // write nothing.
+        assert_eq!(unsafe { willow_gc_stats_snapshot(1, out, len) }, 0);
+        assert_eq!(
+            // SAFETY: The snapshot API accepts null and returns before writing.
+            unsafe { willow_gc_stats_snapshot(1, std::ptr::null_mut(), len) },
+            0
+        );
     }
     assert_eq!(
-        willow_gc_stats_snapshot(1, std::ptr::null_mut(), size as i64),
+        // SAFETY: The snapshot API accepts null and returns before writing.
+        unsafe { willow_gc_stats_snapshot(1, std::ptr::null_mut(), size as i64) },
         -1
     );
     assert!(bytes.iter().all(|&byte| byte == 0xa5));
     for len in [size as i64, size as i64 + 16] {
-        assert_eq!(willow_gc_stats_snapshot(1, out, len), size as i64);
+        assert_eq!(
+            // SAFETY: The backing buffer covers the selected record on success; rejected requests
+            // write nothing.
+            unsafe { willow_gc_stats_snapshot(1, out, len) },
+            size as i64
+        );
         // SAFETY: the successful call initialized one V1 at this byte address.
         let stats = unsafe { out.cast::<WillowGcStatsV1>().read_unaligned() };
         assert_eq!(stats.version, 1);
@@ -145,15 +177,23 @@ fn negotiated_snapshot_validates_before_writing_and_accepts_byte_buffers() {
 #[test]
 fn major_cycle_reports_live_graph_null_slots_and_duplicate_roots() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let mut parent = willow_alloc_typed(16, 3);
-    willow_push_root(&mut parent);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut parent) };
     let child = willow_alloc(8);
     // SAFETY: parent owns two initialized reference slots; second stays null.
     unsafe {
+        // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+        // words.
         *parent.cast::<*mut u8>() = child;
     }
-    willow_gc_add_runtime_root(parent); // duplicate root is traced once
+    // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+    // removal.
+    unsafe { willow_gc_add_runtime_root(parent) }; // duplicate root is traced once
     willow_alloc(24); // unreachable
     let before = snapshot();
     willow_gc_collect();
@@ -181,8 +221,12 @@ fn major_cycle_reports_live_graph_null_slots_and_duplicate_roots() {
         before.counters.allocation_bytes
     );
     assert_eq!(after.counters.freed_objects, 1);
-    willow_gc_remove_runtime_root(parent);
-    willow_pop_root();
+    // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+    // removal.
+    unsafe { willow_gc_remove_runtime_root(parent) };
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
     willow_gc_collect();
     let empty = snapshot();
     assert_eq!(empty.heap.occupied_bytes, 0);
@@ -193,7 +237,9 @@ fn major_cycle_reports_live_graph_null_slots_and_duplicate_roots() {
 #[test]
 fn registered_trace_callbacks_contribute_reference_scan_bytes() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     unsafe fn trace(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
         slots.push(payload.cast());
     }
@@ -203,17 +249,28 @@ fn registered_trace_callbacks_contribute_reference_scan_bytes() {
         _: usize,
         children: &mut Vec<*mut u8>,
     ) -> TraceSliceProgress {
+        // SAFETY: The live object's trace layout reserves these aligned pointer slots.
         children.push(unsafe { load_gc_reference(payload.cast()) });
         TraceSliceProgress::Done
     }
-    willow_register_type_capability(
-        901,
-        trace,
-        NativeTraceCapability::SliceConcurrentSafe(slice),
-    );
-    let mut parent = willow_alloc_object(901, 8);
-    willow_push_root(&mut parent);
+    // SAFETY: The fixture controls every instance of this ID and installs the matching
+    // stopped tracer and synchronized snapshot capability, if present.
+    unsafe {
+        willow_register_type_capability(
+            901,
+            trace,
+            NativeTraceCapability::SliceConcurrentSafe(slice),
+        )
+    };
+    // SAFETY: The requested layout describes the initialized words of this object and its
+    // type’s tracing or finalization contract.
+    let mut parent = unsafe { willow_alloc_object(901, 8) };
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut parent) };
     let child = willow_alloc(8);
+    // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+    // words.
     unsafe {
         *parent.cast::<*mut u8>() = child;
     }
@@ -224,15 +281,21 @@ fn registered_trace_callbacks_contribute_reference_scan_bytes() {
         stats.last_cycle.marked_bytes,
         2 * (GC_HEADER_SIZE as u64 + 8)
     );
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
 }
 
 #[test]
 fn minor_cycles_do_not_overwrite_the_last_major_live_measurement() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let mut live = willow_alloc(8);
-    willow_push_root(&mut live);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut live) };
     willow_gc_collect();
     let major = snapshot().last_major_cycle;
     crate::gc::minor_collect_internal();
@@ -247,16 +310,22 @@ fn minor_cycles_do_not_overwrite_the_last_major_live_measurement() {
         major.heap_after_bytes
     );
     assert!(stats.last_cycle.epoch > major.epoch);
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
 }
 
 #[test]
 fn reset_clears_cumulative_counts_without_reusing_cycle_identity() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     willow_gc_collect();
     let epoch = snapshot().epoch;
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     assert_eq!(snapshot().pauses.count, 0);
     willow_gc_collect();
     assert!(snapshot().epoch > epoch);
@@ -347,7 +416,9 @@ fn broken_trace_writer_is_disabled_and_gc_still_completes() {
         trace_owner.telemetry.trace_errors.load(Ordering::Relaxed),
         before + 1
     );
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     willow_alloc(8);
     willow_gc_collect();
     assert_eq!(snapshot().heap.occupied_bytes, 0);
@@ -356,7 +427,9 @@ fn broken_trace_writer_is_disabled_and_gc_still_completes() {
 #[test]
 fn concurrent_allocation_registration_collection_and_100k_snapshots() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     willow_gc_register_mutator();
     let start = Arc::new(std::sync::Barrier::new(41));
     let done = Arc::new(AtomicBool::new(false));
@@ -459,7 +532,9 @@ fn trace_subprocess_child() {
     let Ok(expected_errors) = std::env::var("WILLOW_GC_TELEMETRY_TEST_CHILD") else {
         return;
     };
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     willow_alloc(8);
     willow_gc_collect();
     willow_gc_collect();
@@ -577,7 +652,9 @@ fn stop_trace_probe() {
         return;
     };
     let dir = std::path::PathBuf::from(dir);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     fn endpoint() -> String {
         let baseline = snapshot();
         let s = stops::snapshot_stops();
@@ -672,7 +749,9 @@ fn trace_file_write_failure_preserves_collection() {
 #[test]
 fn aborted_cycles_restore_idle_without_publishing_partial_work() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     willow_gc_collect();
     let completed = snapshot();
     let mut epoch = completed.epoch;
@@ -712,7 +791,9 @@ fn aborted_cycles_restore_idle_without_publishing_partial_work() {
 #[test]
 fn nested_minor_preserves_major_phase_and_monotonic_epoch() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let major = Cycle::begin(CycleKind::Major);
     let minor = Cycle::begin(CycleKind::Minor);
     assert_eq!(snapshot().phase, CycleKind::Minor as u32);
@@ -755,7 +836,9 @@ fn platform_provider_fakes_preserve_scope_and_clear_stale_validity() {
 #[test]
 fn cycle_aggregate_completion_and_abort_follow_the_borrowed_owner() {
     let _guard = crate::gc::isolated_runtime();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
     let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
     let before = pacing_cycle_snapshot();
@@ -818,7 +901,9 @@ fn cycle_aggregate_completion_and_abort_follow_the_borrowed_owner() {
     assert_eq!(pacing_cycle_snapshot().epoch, before.epoch);
     assert!(std::sync::LazyLock::get(&first.gc).is_none());
     assert!(std::sync::LazyLock::get(&second.gc).is_none());
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
 }
 
 #[test]

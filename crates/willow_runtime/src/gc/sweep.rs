@@ -595,6 +595,8 @@ fn sweep_chunk(
         // SAFETY: `offset` is advanced only by validated aligned header
         // sizes within this registered chunk.
         let raw = unsafe { base.add(offset) };
+        // SAFETY: Allocation metadata identifies a header-aligned object start within this live
+        // region or chunk.
         let object = HeapObject::from_raw(raw.cast::<GcHeader>())
             .expect("TLAB object header address is non-null");
         let size = object.size();
@@ -706,6 +708,8 @@ fn finish(owner: &crate::runtime::Runtime, state: &mut GcState, dead_chunks: &[b
     for (base, capacity) in released_storage {
         // SAFETY: the released region handed over its unindexed storage.
         if let Some(base) = unsafe { state.region_cache.retain(base, capacity, budget) } {
+            // SAFETY: The owner releases this block once with the same base and Layout used to
+            // allocate it.
             unsafe { region_cache::free_region_storage(base, capacity) };
         }
     }
@@ -788,7 +792,9 @@ fn note_dead_frame_in(
         owner.metadata_removed(
             object.payload().as_ptr() as usize,
             object.size(),
-            crate::async_frame::frame_is_terminal(object.payload().as_ptr().cast()),
+            // SAFETY: Sweep classified this payload as a task frame and has not yet reclaimed
+            // its header.
+            unsafe { crate::async_frame::frame_is_terminal(object.payload().as_ptr().cast()) },
             sweep_epoch,
         );
     }

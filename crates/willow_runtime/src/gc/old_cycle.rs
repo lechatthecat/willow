@@ -391,18 +391,25 @@ mod integration_tests {
         }
         let _guard = isolated_runtime();
         for mib in [64, 256, 1024] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
             let payload = 64 * 1024;
             let count = mib * 1024 * 1024 / payload;
-            let mut root = std::ptr::null_mut();
-            willow_push_root(&mut root);
+            let root = std::cell::Cell::new(std::ptr::null_mut());
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(root.as_ptr()) };
             for _ in 0..count {
-                let next = willow_gc_alloc_layout(0, 0, payload as i64, 1);
+                // SAFETY: The requested layout describes the initialized words of this object
+                // and its type’s tracing or finalization contract.
+                let next = unsafe { willow_gc_alloc_layout(0, 0, payload as i64, 1) };
+                // SAFETY: The live object's trace layout reserves these aligned pointer slots.
                 unsafe {
-                    store_gc_reference(next.cast(), root);
+                    store_gc_reference(next.cast(), root.get());
                 }
-                root = next;
+                root.set(next);
             }
             if mib == 1024 {
                 assert!(runtime().heap.lock().unwrap().old_regions.len() > 4096);
@@ -497,11 +504,15 @@ mod integration_tests {
             );
             // A second cycle must reset stale colors before publication, then
             // reclaim all objects after deleting the sole root.
-            willow_pop_roots(1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(1) };
             willow_gc_collect();
             assert_eq!(willow_gc_allocated_bytes(), 0);
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
@@ -533,11 +544,15 @@ mod integration_tests {
     fn old_cycle_root_count_scaling_is_separate_from_heap_scaling() {
         let _guard = isolated_runtime();
         for count in [1, 16, 257, 4096] {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
             let mut roots: Vec<_> = (0..count).map(|_| willow_alloc(8)).collect();
             for root in &mut roots {
-                willow_push_root(root);
+                // SAFETY: The slot storage stays live and stationary through the matching
+                // pop, including during collection.
+                unsafe { willow_push_root(root) };
             }
             willow_gc_collect();
             let stop = crate::gc_telemetry::stops::snapshot_stops();
@@ -549,9 +564,13 @@ mod integration_tests {
                 stop.by_reason[0].rendezvous.total_ns,
                 stop.by_reason[0].stopped.total_ns
             );
-            willow_pop_roots(count as i32);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(count as i32) };
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
@@ -573,9 +592,13 @@ mod integration_tests {
             return;
         }
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let mut root = willow_alloc(8);
-        willow_push_root(&mut root);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
         let before = willow_gc_allocated_bytes();
         willow_gc_collect();
         let stops = crate::gc_telemetry::stops::snapshot_stops();
@@ -584,10 +607,14 @@ mod integration_tests {
         assert_eq!(stops.by_reason[3].requests, 1);
         assert!(runtime().remark_observation.yields.load(Ordering::Relaxed) > 0);
         assert_eq!(willow_gc_allocated_bytes(), before);
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
@@ -612,13 +639,18 @@ mod integration_tests {
             return;
         }
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let mut root = willow_alloc_typed(8, 1);
         let child = willow_alloc(8);
+        // SAFETY: The live object's trace layout reserves these aligned pointer slots.
         unsafe {
             store_gc_reference(root.cast(), child);
         }
-        willow_push_root(&mut root);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut root) };
         willow_gc_collect();
         assert_eq!(
             willow_gc_allocated_bytes(),
@@ -633,24 +665,34 @@ mod integration_tests {
                 .load(Ordering::Acquire),
             0
         );
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn old_cycle_tlab_initial_snapshot_does_not_index_headers() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
-        let mut tls = tlab_state_for_test();
-        let mut root = std::ptr::null_mut();
-        willow_push_root(&mut root);
+        let tls = tlab_state_for_test();
+        let root = std::cell::Cell::new(std::ptr::null_mut());
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(root.as_ptr()) };
         for _ in 0..128 {
-            root = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+            // SAFETY: The fixture owns the stable TLAB through unregistration. The requested
+            // size and tracing metadata describe the object initialized here.
+            root.set(unsafe { willow_gc_alloc_slow(tls.as_ptr(), 0, 0, 8, 0) });
         }
-        assert!(!root.is_null());
+        assert!(!root.get().is_null());
         let (_, cycle) = root_handshake::begin().unwrap();
         let stops = crate::gc_telemetry::stops::snapshot_stops();
         assert_eq!(stops.by_reason[0].work.metadata_objects, 0);
@@ -665,8 +707,12 @@ mod integration_tests {
         );
         let (_, plan, _) = mark_closure::finish_stopped(&cycle, std::time::Instant::now());
         sweep::concurrent(plan.expect("recovery publishes a sweep plan"));
-        willow_pop_roots(1);
-        reset_internal_for_test();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 }
 

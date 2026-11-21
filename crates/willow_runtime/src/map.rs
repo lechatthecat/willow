@@ -164,11 +164,15 @@ struct WordGuard<'a> {
 impl Deref for WordGuard<'_> {
     type Target = WordMap;
     fn deref(&self) -> &WordMap {
+        // SAFETY: The live WordGuard holds the storage lock and releases it only after this borrow
+        // ends.
         unsafe { &*self.storage.data.get() }
     }
 }
 impl DerefMut for WordGuard<'_> {
     fn deref_mut(&mut self) -> &mut WordMap {
+        // SAFETY: The live WordGuard holds the storage lock and releases it only after this borrow
+        // ends.
         unsafe { &mut *self.storage.data.get() }
     }
 }
@@ -249,8 +253,15 @@ impl Drop for WordMap {
 }
 
 /// The immutable discriminant/layout may be read by GC concurrently. Access to
-/// Words contents is restricted to mutators holding the storage access gate. No GC allocation/safepoint may occur while contents are borrowed.
+/// Words contents is restricted to mutators holding the storage access gate.
+///
+/// # Safety
+/// `map` must denote an initialized, aligned MapStorage from the map constructor.
+/// Keep the payload live throughout the borrow and observe local-map confinement.
+/// Finish accessing the guarded contents before a GC point.
 unsafe fn storage<'a>(map: *mut u8) -> &'a MapStorage {
+    // SAFETY: The map constructor allocates word-aligned GC storage sized for MapStorage. Its
+    // layout selects the matching finalizer.
     unsafe { &*map.cast::<MapStorage>() }
 }
 
@@ -312,12 +323,16 @@ impl MapData {
             crate::observation::record(crate::observation::Event::CompactMoves, 1);
             let value = self.values[*index];
             if self.layout.value_is_ref {
-                write_barrier_object_owner(
-                    owner,
-                    std::ptr::null_mut(),
-                    value as *mut u8,
-                    GcStoreDestination::MapValue as i64,
-                );
+                // SAFETY: The owner and non-null referent are live GC payloads with headers
+                // at the addresses used by this filter.
+                unsafe {
+                    write_barrier_object_owner(
+                        owner,
+                        std::ptr::null_mut(),
+                        value as *mut u8,
+                        GcStoreDestination::MapValue as i64,
+                    )
+                };
             }
             *index = values.len();
             values.push(value);
@@ -386,11 +401,14 @@ impl hashbrown::Equivalent<MapKey> for KeyRef<'_> {
 /// Borrow a key only during the lookup; no Willow pointer is retained in the map.
 ///
 /// # Safety
-/// When `key_kind` is 3, `word` must be a valid WillowString pointer
-/// for the returned borrow's lifetime. Do not allocate in the GC while borrowed.
+/// For a string key, zero denotes the empty string. Otherwise the key must be
+/// a current WillowString whose bytes stay live and stationary throughout the
+/// borrow. Finish using the borrowed key before a GC point.
 /// Returns None for NaN; callers must release the map lock before raising.
 unsafe fn key_from_word<'a>(word: i64, key_kind: i64) -> Option<KeyRef<'a>> {
     if key_kind == 3 {
+        // SAFETY: The operand is null or a live string, and no safepoint intervenes in this
+        // borrow.
         Some(KeyRef::Str(unsafe {
             willow_string_as_bytes(word as *const u8)
         }))
@@ -434,6 +452,8 @@ impl DerefMut for MapGuard<'_> {
 /// `map` must be a live map payload with MapData (not Words) storage.
 #[inline]
 unsafe fn map_data<'a>(map: *mut u8) -> MapGuard<'a> {
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     match &unsafe { storage(map) }.state {
         MapState::Traced(data) => MapGuard::Shared(data.lock().unwrap()),
         MapState::Local(data) => {
@@ -447,11 +467,15 @@ unsafe fn map_data<'a>(map: *mut u8) -> MapGuard<'a> {
 /// Trace hook: report reference-typed values as GC children.
 unsafe fn trace_map(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     if matches!(
+        // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+        // constructor.
         unsafe { storage(payload) }.state,
         MapState::Words(_) | MapState::Local(_)
     ) {
         return;
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let mut data = unsafe { map_data(payload) };
     if data.layout.value_is_ref {
         for value in &mut data.values {
@@ -462,11 +486,15 @@ unsafe fn trace_map(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
 
 unsafe fn snapshot_map(payload: *mut u8, children: &mut Vec<*mut u8>) {
     if matches!(
+        // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+        // constructor.
         unsafe { storage(payload) }.state,
         MapState::Words(_) | MapState::Local(_)
     ) {
         return;
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let data = unsafe { map_data(payload) };
     if data.layout.value_is_ref {
         children.extend(data.values.iter().map(|value| *value as *mut u8));
@@ -480,6 +508,8 @@ unsafe fn snapshot_map_slice(
     children: &mut Vec<*mut u8>,
 ) -> crate::gc::TraceSliceProgress {
     use crate::gc::TraceSliceProgress;
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let MapState::Traced(mutex) = &unsafe { storage(payload) }.state else {
         return TraceSliceProgress::Done;
     };
@@ -509,6 +539,8 @@ unsafe fn snapshot_map_slice(
 
 /// Finalizer hook: release the hash table and owned keys when the map is swept.
 unsafe fn drop_map(payload: *mut u8) {
+    // SAFETY: The map constructor allocates word-aligned GC storage sized for MapStorage. Its
+    // layout selects the matching finalizer.
     unsafe { std::ptr::drop_in_place(payload.cast::<MapStorage>()) };
 }
 
@@ -517,15 +549,21 @@ unsafe fn drop_map(payload: *mut u8) {
 /// `Once` would fail to re-register after the first reset (e.g. in multi-init
 /// test runs). Real programs init once, so the repeated insert is harmless.
 const MAP_REGISTRATION: crate::gc::NativeGcRegistration = crate::gc::NativeGcRegistration::Map;
-const MAP_GC_TYPES: &[crate::gc::NativeGcType] =
-    &[
+const MAP_GC_TYPES: &[crate::gc::NativeGcType] = &[
+    // SAFETY: The map constructor installs MapStorage for this ID. Stopped tracing visits
+    // its root cells, and concurrent tracing reads synchronized entry snapshots in bounded
+    // slices.
+    unsafe {
         crate::gc::NativeGcType::new(MAP_TYPE_ID, Some(trace_map), Some(drop_map))
             .with_concurrent_trace(snapshot_map)
-            .with_concurrent_slice(snapshot_map_slice),
-    ];
+            .with_concurrent_slice(snapshot_map_slice)
+    },
+];
 
 fn ensure_registered() {
-    MAP_REGISTRATION.ensure(MAP_GC_TYPES);
+    // SAFETY: This is the complete descriptor set for the MapStorage registration group and
+    // its constructors.
+    unsafe { MAP_REGISTRATION.ensure(MAP_GC_TYPES) };
 }
 
 /// Allocate an empty map with inline state. `gc_ref_mask` is zero because
@@ -557,12 +595,16 @@ fn map_new(key_kind: i64, value_kind: i64, value_is_ref: i64, confined: bool) ->
     // must also satisfy the inline mutex on every supported target.
     const { assert!(align_of::<MapStorage>() <= align_of::<crate::gc::GcHeader>()) };
     ensure_registered();
-    let map = willow_alloc_with_layout(
-        GcObjectKind::Map,
-        MAP_TYPE_ID,
-        size_of::<MapStorage>() as i64,
-        0,
-    );
+    // SAFETY: The constructor selects the matching payload layout and initializes its fields
+    // before exposing it or reaching a GC point.
+    let map = unsafe {
+        willow_alloc_with_layout(
+            GcObjectKind::Map,
+            MAP_TYPE_ID,
+            size_of::<MapStorage>() as i64,
+            0,
+        )
+    };
     if map.is_null() {
         return std::ptr::null_mut();
     }
@@ -594,6 +636,8 @@ fn map_new(key_kind: i64, value_kind: i64, value_is_ref: i64, confined: bool) ->
         }
     };
     // No GC allocation occurs between reserving the payload and initializing it.
+    // SAFETY: The map constructor allocates word-aligned GC storage sized for MapStorage. Its
+    // layout selects the matching finalizer.
     unsafe {
         map.cast::<MapStorage>().write(MapStorage { layout, state });
     }
@@ -603,9 +647,16 @@ fn map_new(key_kind: i64, value_kind: i64, value_is_ref: i64, confined: bool) ->
 
 /// Insert or update `key -> value`. `key_is_ref`/`val_is_ref` describe whether
 /// the words are WillowString/GC pointers.
+///
+/// # Safety
+/// A non-null `map` must be a live, aligned payload from a Willow map constructor,
+/// kept reachable through the call. A local map must stay with its owning invocation.
+/// The key flag and word must match the map layout. A string key must be null or
+/// point to a live immutable WillowString through the lookup. The value flag and word must
+/// match the declared value type, including a current GC payload or null for references.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_map_insert(
+pub unsafe extern "C" fn willow_map_insert(
     map: *mut u8,
     key_word: i64,
     key_is_ref: i64,
@@ -615,6 +666,8 @@ pub extern "C" fn willow_map_insert(
     if map.is_null() {
         return;
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let storage = unsafe { storage(map) };
     if let MapState::Words(words) = &storage.state {
         debug_assert_eq!(key_is_ref, 0);
@@ -628,9 +681,13 @@ pub extern "C" fn willow_map_insert(
         words.reconcile();
         return;
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let mut data = unsafe { map_data(map) };
     debug_assert_eq!(data.layout.value_is_ref, val_is_ref != 0);
     debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
+    // SAFETY: The map's declared key kind determines whether the word contains a retained string
+    // or a scalar.
     let Some(key) = (unsafe { key_from_word(key_word, data.layout.key_kind) }) else {
         drop(data);
         raise_nan_key();
@@ -650,12 +707,16 @@ pub extern "C" fn willow_map_insert(
         hashbrown::hash_map::EntryRef::Occupied(slot) => {
             let index = *slot.get();
             if is_ref {
-                write_barrier_object_owner(
-                    map,
-                    values[index] as *mut u8,
-                    val_word as *mut u8,
-                    GcStoreDestination::MapValue as i64,
-                );
+                // SAFETY: The owner and non-null referent are live GC payloads with headers
+                // at the addresses used by this filter.
+                unsafe {
+                    write_barrier_object_owner(
+                        map,
+                        values[index] as *mut u8,
+                        val_word as *mut u8,
+                        GcStoreDestination::MapValue as i64,
+                    )
+                };
             }
             values[index] = val_word;
         }
@@ -671,12 +732,16 @@ pub extern "C" fn willow_map_insert(
                 }
             };
             if is_ref {
-                write_barrier_object_owner(
-                    map,
-                    std::ptr::null_mut(),
-                    val_word as *mut u8,
-                    GcStoreDestination::MapValue as i64,
-                );
+                // SAFETY: The owner and non-null referent are live GC payloads with headers
+                // at the addresses used by this filter.
+                unsafe {
+                    write_barrier_object_owner(
+                        map,
+                        std::ptr::null_mut(),
+                        val_word as *mut u8,
+                        GcStoreDestination::MapValue as i64,
+                    )
+                };
             }
             let index = if let Some(index) = free.pop() {
                 values[index] = val_word;
@@ -696,9 +761,15 @@ pub extern "C" fn willow_map_insert(
 /// `V` is a guaranteed-non-null GC reference and the result is the value word
 /// itself for `Some`, or zero for `None`. Other payloads use the boxed tagged
 /// enum layout below.
+///
+/// # Safety
+/// A non-null `map` must be a live, aligned payload from a Willow map constructor,
+/// kept reachable through the call. A local map must stay with its owning invocation.
+/// The key flag and word must match the map layout. A string key must be null or
+/// point to a live immutable WillowString through the lookup. For a successful lookup, niche representation requires a non-null reference value type.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_map_get(
+pub unsafe extern "C" fn willow_map_get(
     map: *mut u8,
     key_word: i64,
     key_is_ref: i64,
@@ -711,6 +782,8 @@ pub extern "C" fn willow_map_get(
             alloc_none()
         };
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let storage = unsafe { storage(map) };
     if let MapState::Words(words) = &storage.state {
         debug_assert_eq!(key_is_ref, 0);
@@ -726,8 +799,12 @@ pub extern "C" fn willow_map_get(
             None => alloc_none(),
         };
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let data = unsafe { map_data(map) };
     debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
+    // SAFETY: The map's declared key kind determines whether the word contains a retained string
+    // or a scalar.
     let Some(key) = (unsafe { key_from_word(key_word, data.layout.key_kind) }) else {
         drop(data);
         raise_nan_key();
@@ -749,18 +826,29 @@ pub extern "C" fn willow_map_get(
 ///
 /// `out_payload` must be valid, aligned writable storage for one `i64` for the
 /// duration of this call. Missing keys and rejected NaN keys leave it zeroed.
+///
+/// # Safety
+/// A non-null `map` must be a live, aligned payload from a Willow map constructor,
+/// kept reachable through the call. A local map must stay with its owning invocation.
+/// The key flag and word must match the map layout. A string key must be null or
+/// point to a live immutable WillowString through the lookup.
+/// Even for null maps, the caller must exclusively lend one aligned writable i64 at
+/// `out_payload`, disjoint from the map and key.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_map_get_into(
+pub unsafe extern "C" fn willow_map_get_into(
     map: *mut u8,
     key_word: i64,
     key_is_ref: i64,
     out_payload: *mut i64,
 ) -> i64 {
+    // SAFETY: The ABI caller provides a live, aligned, writable output slot for this result.
     unsafe { out_payload.write(0) };
     if map.is_null() {
         return 1;
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let storage = unsafe { storage(map) };
     if let MapState::Words(words) = &storage.state {
         debug_assert_eq!(key_is_ref, 0);
@@ -770,14 +858,20 @@ pub extern "C" fn willow_map_get_into(
         };
         return match words.access().entries.get(&key) {
             Some(&value) => {
+                // SAFETY: The ABI caller provides a live, aligned, writable output slot for this
+                // result.
                 unsafe { out_payload.write(value) };
                 0
             }
             None => 1,
         };
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let data = unsafe { map_data(map) };
     debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
+    // SAFETY: The map's declared key kind determines whether the word contains a retained string
+    // or a scalar.
     let Some(key) = (unsafe { key_from_word(key_word, data.layout.key_kind) }) else {
         drop(data);
         raise_nan_key();
@@ -787,6 +881,8 @@ pub extern "C" fn willow_map_get_into(
     drop(data);
     match value {
         Some(value) => {
+            // SAFETY: The ABI caller provides a live, aligned, writable output slot for this
+            // result.
             unsafe { out_payload.write(value) };
             0
         }
@@ -796,18 +892,29 @@ pub extern "C" fn willow_map_get_into(
 
 /// Remove a key, returning the Option tag and storage word without GC allocation.
 /// Deleted reference slots are cleared with the collector's deletion barrier.
+///
+/// # Safety
+/// A non-null `map` must be a live, aligned payload from a Willow map constructor,
+/// kept reachable through the call. A local map must stay with its owning invocation.
+/// The key flag and word must match the map layout. A string key must be null or
+/// point to a live immutable WillowString through the lookup.
+/// Even for null maps, the caller must exclusively lend one aligned writable i64 at
+/// `out_payload`, disjoint from the map and key.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_map_remove_into(
+pub unsafe extern "C" fn willow_map_remove_into(
     map: *mut u8,
     key_word: i64,
     key_is_ref: i64,
     out_payload: *mut i64,
 ) -> i64 {
+    // SAFETY: The ABI caller provides a live, aligned, writable output slot for this result.
     unsafe { out_payload.write(0) };
     if map.is_null() {
         return 1;
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let storage = unsafe { storage(map) };
     let value = if let MapState::Words(words) = &storage.state {
         let Some(key) = word_key(key_word, storage.layout.key_kind) else {
@@ -822,8 +929,12 @@ pub extern "C" fn willow_map_remove_into(
         }
         value
     } else {
+        // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+        // constructor.
         let mut data = unsafe { map_data(map) };
         debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
+        // SAFETY: The map's declared key kind determines whether the word contains a retained
+        // string or a scalar.
         let Some(key) = (unsafe { key_from_word(key_word, data.layout.key_kind) }) else {
             drop(data);
             raise_nan_key();
@@ -835,12 +946,16 @@ pub extern "C" fn willow_map_remove_into(
             }
             let value = data.values[index];
             if data.layout.value_is_ref {
-                write_barrier_object_owner(
-                    map,
-                    value as *mut u8,
-                    std::ptr::null_mut(),
-                    GcStoreDestination::MapValue as i64,
-                );
+                // SAFETY: The owner and non-null referent are live GC payloads with headers
+                // at the addresses used by this filter.
+                unsafe {
+                    write_barrier_object_owner(
+                        map,
+                        value as *mut u8,
+                        std::ptr::null_mut(),
+                        GcStoreDestination::MapValue as i64,
+                    )
+                };
             }
             data.values[index] = 0;
             data.free.push(index);
@@ -850,6 +965,8 @@ pub extern "C" fn willow_map_remove_into(
     };
     match value {
         Some(value) => {
+            // SAFETY: The ABI caller provides a live, aligned, writable output slot for this
+            // result.
             unsafe { out_payload.write(value) };
             0
         }
@@ -860,19 +977,30 @@ pub extern "C" fn willow_map_remove_into(
 /// Produce an independent snapshot in ascending key order: numeric order for
 /// scalars (false before true), UTF-8 byte order for strings. Mode 0 yields
 /// keys, 1 values, and 2 `(key, value)` tuples. Later mutations are invisible.
+///
+/// # Safety
+/// A non-null `map` must be a live, aligned payload from a Willow map constructor,
+/// kept reachable through the call. A local map must stay with its owning invocation.
+/// The requested mode and value representation must agree with the map type. For pair
+/// values, each value must point to a live aligned two-word box with two initialized
+/// words and the selected scalar or interface tracing layout.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_map_snapshot(map: *mut u8, mode: i64, value_pair: i64) -> *mut u8 {
+pub unsafe extern "C" fn willow_map_snapshot(map: *mut u8, mode: i64, value_pair: i64) -> *mut u8 {
     use crate::array::{willow_array_new, willow_array_set};
     use crate::gc::GcRootHandle;
     if map.is_null() {
         crate::panic_context::raise_language_message("cannot iterate a null Map");
         return std::ptr::null_mut();
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let layout = unsafe { storage(map) }.layout;
     // Root copied reference values before the first GC allocation. Native key
     // copies are independent of the source; no map borrow survives allocation.
     let mut entries: Vec<(MapKey, i64, Option<GcRootHandle>)> =
+        // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+        // constructor.
         if let MapState::Words(words) = &unsafe { storage(map) }.state {
             words
                 .access()
@@ -881,6 +1009,8 @@ pub extern "C" fn willow_map_snapshot(map: *mut u8, mode: i64, value_pair: i64) 
                 .map(|(&key, &value)| (MapKey::Word(key), value, None))
                 .collect()
         } else {
+            // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+            // constructor.
             let data = unsafe { map_data(map) };
             data.entries
                 .iter()
@@ -922,7 +1052,8 @@ pub extern "C" fn willow_map_snapshot(map: *mut u8, mode: i64, value_pair: i64) 
         _ => willow_abi::collection_element::OBJECT,
     };
     let flags = willow_abi::collection_element::storage_flags(element_kind, is_ref);
-    let array = GcRootHandle::new(willow_array_new(entries.len() as i64, flags));
+    // SAFETY: storage_flags derives a full-width slot for every traced element.
+    let array = GcRootHandle::new(unsafe { willow_array_new(entries.len() as i64, flags) });
     for (index, (key, value, root)) in entries.into_iter().enumerate() {
         let key = if mode == 1 {
             0
@@ -936,6 +1067,8 @@ pub extern "C" fn willow_map_snapshot(map: *mut u8, mode: i64, value_pair: i64) 
         let word = match mode {
             0 => key,
             1 if value_pair != 0 => {
+                // SAFETY: The map value kind identifies a retained GC pair containing two aligned
+                // words.
                 (unsafe { crate::array::copy_scalar_pair(value as *const i64) }) as i64
             }
             1 => value,
@@ -955,20 +1088,28 @@ pub extern "C" fn willow_map_snapshot(map: *mut u8, mode: i64, value_pair: i64) 
                     2
                 } else {
                     let pair = value as *const i64;
+                    // SAFETY: The map value kind identifies a retained GC pair containing two
+                    // aligned words.
                     unsafe {
                         words[1] = pair.read();
                         words[2] = pair.add(1).read();
                     }
                     3
                 };
-                crate::gc::willow_alloc_enum_variant(
-                    0,
-                    willow_abi::EnumVariantLayout::new(0, &slots),
-                    &words[..width],
-                ) as i64
+                // SAFETY: The variant layout selects its initialized word or reference
+                // payload, including the traced low word for a pair.
+                (unsafe {
+                    crate::gc::willow_alloc_enum_variant(
+                        0,
+                        willow_abi::EnumVariantLayout::new(0, &slots),
+                        &words[..width],
+                    )
+                }) as i64
             }
         };
-        willow_array_set(array.load(), index as i64, word);
+        // SAFETY: The result root is reloaded after constructing the element. Its layout
+        // matches the snapshot mode and the index is within the allocated count.
+        unsafe { willow_array_set(array.load(), index as i64, word) };
     }
     array.load()
 }
@@ -976,12 +1117,18 @@ pub extern "C" fn willow_map_snapshot(map: *mut u8, mode: i64, value_pair: i64) 
 /// Allocate an independent copy of `map` (same entries + value ref-ness). Backs
 /// `Map<K,V>::freeze()` -> `FrozenMap<K,V>`: the copy shares no
 /// `MapData` with the original, so it is safe to treat as immutable / Sync.
+///
+/// # Safety
+/// A non-null `map` must be a live, aligned payload from a Willow map constructor,
+/// kept reachable through the call. A local map must stay with its owning invocation.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
     if map.is_null() {
         return willow_map_new(0, 0, 0);
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let layout = unsafe { storage(map) }.layout;
     // Allocate the destination BEFORE reading any value word out of the source.
     // `willow_map_new` can collect, and a moving minor
@@ -1000,7 +1147,11 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
     if copy.is_null() {
         return std::ptr::null_mut();
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     if let MapState::Words(source) = &unsafe { storage(map) }.state {
+        // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+        // constructor.
         let MapState::Words(destination) = &unsafe { storage(copy) }.state else {
             unreachable!()
         };
@@ -1010,19 +1161,27 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
         dst.reconcile();
         return copy;
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let src = unsafe { map_data(map) };
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let mut dst = unsafe { map_data(copy) };
     dst.entries.reserve(src.entries.len());
     dst.values.reserve(src.values.len());
     dst.free.clone_from(&src.free);
     for &v in &src.values {
         if layout.value_is_ref {
-            write_barrier_object_owner(
-                copy,
-                std::ptr::null_mut(),
-                v as *mut u8,
-                GcStoreDestination::MapValue as i64,
-            );
+            // SAFETY: The owner and non-null referent are live GC payloads with headers at
+            // the addresses used by this filter.
+            unsafe {
+                write_barrier_object_owner(
+                    copy,
+                    std::ptr::null_mut(),
+                    v as *mut u8,
+                    GcStoreDestination::MapValue as i64,
+                )
+            };
         }
         dst.values.push(v);
     }
@@ -1037,25 +1196,45 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
 }
 
 /// Number of entries.
+///
+/// # Safety
+/// A non-null `map` must be a live, aligned payload from a Willow map constructor,
+/// kept reachable through the call. A local map must stay with its owning invocation.
+///
+/// ```compile_fail,E0133
+/// willow_runtime::map::willow_map_len(std::ptr::null_mut());
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_map_len(map: *mut u8) -> i64 {
+pub unsafe extern "C" fn willow_map_len(map: *mut u8) -> i64 {
     if map.is_null() {
         return 0;
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     match &unsafe { storage(map) }.state {
         MapState::Words(words) => words.access().entries.len() as i64,
+        // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+        // constructor.
         MapState::Traced(_) | MapState::Local(_) => unsafe { map_data(map) }.entries.len() as i64,
     }
 }
 
 /// Whether `key` is present (1) or not (0).
+///
+/// # Safety
+/// A non-null `map` must be a live, aligned payload from a Willow map constructor,
+/// kept reachable through the call. A local map must stay with its owning invocation.
+/// The key flag and word must match the map layout. A string key must be null or
+/// point to a live immutable WillowString through the lookup.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_map_contains(map: *mut u8, key_word: i64, key_is_ref: i64) -> i64 {
+pub unsafe extern "C" fn willow_map_contains(map: *mut u8, key_word: i64, key_is_ref: i64) -> i64 {
     if map.is_null() {
         return 0;
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let storage = unsafe { storage(map) };
     if let MapState::Words(words) = &storage.state {
         debug_assert_eq!(key_is_ref, 0);
@@ -1065,8 +1244,12 @@ pub extern "C" fn willow_map_contains(map: *mut u8, key_word: i64, key_is_ref: i
         };
         return i64::from(words.access().entries.contains_key(&key));
     }
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     let data = unsafe { map_data(map) };
     debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
+    // SAFETY: The map's declared key kind determines whether the word contains a retained string
+    // or a scalar.
     let Some(key) = (unsafe { key_from_word(key_word, data.layout.key_kind) }) else {
         drop(data);
         raise_nan_key();
@@ -1083,15 +1266,23 @@ pub extern "C" fn willow_map_contains(map: *mut u8, key_word: i64, key_is_ref: i
 fn alloc_some(value_word: i64, val_is_ref: bool) -> *mut u8 {
     const WORD: &[willow_abi::SlotKind] = &[willow_abi::SlotKind::Word];
     const REF: &[willow_abi::SlotKind] = &[willow_abi::SlotKind::GcRef];
-    crate::gc::willow_alloc_enum_variant(
-        0,
-        willow_abi::EnumVariantLayout::new(0, if val_is_ref { REF } else { WORD }),
-        &[value_word],
-    )
+    // SAFETY: The variant layout selects its initialized word or reference payload, including
+    // the traced low word for a pair.
+    unsafe {
+        crate::gc::willow_alloc_enum_variant(
+            0,
+            willow_abi::EnumVariantLayout::new(0, if val_is_ref { REF } else { WORD }),
+            &[value_word],
+        )
+    }
 }
 
 fn alloc_none() -> *mut u8 {
-    crate::gc::willow_alloc_enum_variant(0, willow_abi::EnumVariantLayout::new(1, &[]), &[])
+    // SAFETY: The variant layout selects its initialized word or reference payload, including
+    // the traced low word for a pair.
+    unsafe {
+        crate::gc::willow_alloc_enum_variant(0, willow_abi::EnumVariantLayout::new(1, &[]), &[])
+    }
 }
 
 /// Debug display of a whole map: `{a: 1, b: 2}` — entries sorted by rendered key
@@ -1101,31 +1292,52 @@ fn alloc_none() -> *mut u8 {
 /// tells a word key apart from the `f64` and
 /// `bool` that share its representation, so `Map<f64, V>` prints `1.5` and not
 /// the bit pattern. Returns a newly allocated WillowString.
+///
+/// # Safety
+/// A non-null `map` must be a live, aligned payload from a Willow map constructor,
+/// kept reachable through the call. A local map must stay with its owning invocation.
+/// The stored kind tags must describe the entries, including live or null WillowStrings
+/// where the layout selects string formatting.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_map_to_string(map: *mut u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_map_to_string(map: *mut u8) -> *mut u8 {
     let (key_kind, val_kind) = if map.is_null() {
         (0, 0)
     } else {
+        // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+        // constructor.
         let layout = unsafe { storage(map) }.layout;
         (layout.key_kind, layout.value_kind)
     };
     let mut entries: Vec<(String, i64)> = if map.is_null() {
         Vec::new()
+    // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+    // constructor.
     } else if let MapState::Words(words) = &unsafe { storage(map) }.state {
         words
             .access()
             .entries
             .iter()
-            .map(|(&key, &value)| (crate::array::element_word_to_string(key, key_kind), value))
+            .map(|(&key, &value)| {
+                (
+                    // SAFETY: Word keys are scalar; the map owns string keys as native text.
+                    unsafe { crate::array::element_word_to_string(key, key_kind) },
+                    value,
+                )
+            })
             .collect()
     } else {
+        // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+        // constructor.
         let data = unsafe { map_data(map) };
         data.entries
             .iter()
             .map(|(k, &index)| {
                 let key = match k {
-                    MapKey::Word(n) => crate::array::element_word_to_string(*n, key_kind),
+                    // SAFETY: Word keys are scalar; the map owns string keys as native text.
+                    MapKey::Word(n) => unsafe {
+                        crate::array::element_word_to_string(*n, key_kind)
+                    },
                     MapKey::Str(s) => s.clone(),
                 };
                 (key, data.values[index])
@@ -1140,7 +1352,9 @@ pub extern "C" fn willow_map_to_string(map: *mut u8) -> *mut u8 {
         }
         out.push_str(key);
         out.push_str(": ");
-        out.push_str(&crate::array::element_word_to_string(*word, val_kind));
+        // SAFETY: The declared value kind matches each word. No GC point intervenes between
+        // copying and formatting them.
+        out.push_str(&unsafe { crate::array::element_word_to_string(*word, val_kind) });
     }
     out.push('}');
     crate::string::willow_string_from_str(&out)
@@ -1226,17 +1440,28 @@ mod tests {
         let _guard = crate::gc::isolated_runtime();
         for count in [16, 128, 1024, 8192] {
             for length in [20, 128] {
-                willow_gc_init();
+                // SAFETY: The test controls its isolated runtime at this reset boundary; no
+                // other mutator or subsequent access relies on the discarded heap.
+                unsafe { willow_gc_init() };
                 let baseline = crate::gc_telemetry::external_bytes();
+                // SAFETY: Only the creating test task accesses this local map while it is live.
                 let mut map = unsafe { willow_map_new_local(3, 0, 0) };
-                willow_push_root(&mut map);
+                // SAFETY: The initialized slot stays at this address until its registration
+                // is popped; collection may rewrite it there.
+                unsafe { willow_push_root(&raw mut map) };
+                // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by
+                // the constructor.
                 assert!(matches!(unsafe { &storage(map).state }, MapState::Local(_)));
                 let mut keys = vec![std::ptr::null_mut(); count];
                 STRING_HASH_BYTES.set(0);
                 for (i, key) in keys.iter_mut().enumerate() {
                     *key = willow_string_from_str(&format!("{i:0length$}"));
-                    willow_push_root(key);
-                    willow_map_insert(map, *key as i64, 1, i as i64, 0);
+                    // SAFETY: The slot storage stays live and stationary through the matching
+                    // pop, including during collection.
+                    unsafe { willow_push_root(key) };
+                    // SAFETY: The constructor and reference flags agree. Each pointer word
+                    // comes from a live fixture object at the call.
+                    unsafe { willow_map_insert(map, *key as i64, 1, i as i64, 0) };
                 }
                 let insertion_bytes = STRING_HASH_BYTES.get();
                 assert!(insertion_bytes <= 6 * count * length);
@@ -1246,23 +1471,36 @@ mod tests {
                 STRING_HASH_BYTES.set(0);
                 for (i, &key) in keys.iter().enumerate() {
                     let mut payload = -1;
-                    assert_eq!(willow_map_get_into(map, key as i64, 1, &mut payload), 0);
+                    assert_eq!(
+                        // SAFETY: The fixture supplies the live map and a key of its declared
+                        // kind; the output borrows a disjoint local i64.
+                        unsafe { willow_map_get_into(map, key as i64, 1, &mut payload) },
+                        0
+                    );
                     assert_eq!(payload, i as i64);
-                    willow_map_insert(map, key as i64, 1, !payload, 0);
+                    // SAFETY: The constructor and reference flags agree. Each pointer word
+                    // comes from a live fixture object at the call.
+                    unsafe { willow_map_insert(map, key as i64, 1, !payload, 0) };
                 }
                 assert_eq!(STRING_HASH_BYTES.get(), 2 * count * length);
                 assert_eq!(counter::thread_allocations(), allocated);
                 assert_eq!(crate::gc::willow_gc_allocated_bytes(), gc_bytes);
                 assert_eq!(crate::gc_telemetry::external_bytes(), retained);
                 // A concurrent tracer must not borrow confined scalar-value state.
+                // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by
+                // the constructor.
                 let borrowed = unsafe { map_data(map) };
                 let mut slots = Vec::new();
                 let mut children = Vec::new();
+                // SAFETY: The callback receives the live map payload selected by its registered
+                // layout.
                 unsafe {
                     trace_map(map, &mut slots);
                     snapshot_map(map, &mut children);
                 }
                 assert!(matches!(
+                    // SAFETY: The callback receives the live map payload selected by its
+                    // registered layout.
                     unsafe { snapshot_map_slice(map, 0, 1, &mut children) },
                     crate::gc::TraceSliceProgress::Done
                 ));
@@ -1272,15 +1510,28 @@ mod tests {
                     "strings count={count} length={length} insertion_bytes={insertion_bytes} lookup_update_bytes={} allocations=0",
                     2 * count * length
                 );
-                willow_pop_roots(count as i32);
+                // SAFETY: The removed shadow-stack entries belong to this operation and their
+                // slot storage is still live.
+                unsafe { willow_pop_roots(count as i32) };
                 willow_gc_collect();
-                let mut copy = willow_map_copy(map);
-                willow_push_root(&mut copy);
+                // SAFETY: The source is a live map from the constructor and remains reachable
+                // while copied.
+                let mut copy = unsafe { willow_map_copy(map) };
+                // SAFETY: The initialized slot stays at this address until its registration
+                // is popped; collection may rewrite it there.
+                unsafe { willow_push_root(&raw mut copy) };
                 let key = willow_string_from_str(&format!("{:0length$}", count - 1));
                 let mut payload = 0;
-                assert_eq!(willow_map_get_into(copy, key as i64, 1, &mut payload), 0);
+                assert_eq!(
+                    // SAFETY: The fixture supplies the live map and a key of its declared kind;
+                    // the output borrows a disjoint local i64.
+                    unsafe { willow_map_get_into(copy, key as i64, 1, &mut payload) },
+                    0
+                );
                 assert_eq!(payload, !((count - 1) as i64));
-                willow_pop_roots(2);
+                // SAFETY: The removed shadow-stack entries belong to this operation and their
+                // slot storage is still live.
+                unsafe { willow_pop_roots(2) };
                 willow_gc_collect();
                 assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
             }
@@ -1290,60 +1541,104 @@ mod tests {
     #[test]
     fn confined_constructor_keeps_reference_values_synchronized() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: Only the creating test task accesses this local map while it is live.
         let mut map = unsafe { willow_map_new_local(3, 3, 1) };
-        willow_push_root(&mut map);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut map) };
         assert!(matches!(
+            // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+            // constructor.
             unsafe { &storage(map).state },
             MapState::Traced(_)
         ));
         let mut key = willow_string_from_str("key");
-        willow_push_root(&mut key);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut key) };
         let value = willow_string_from_str("value");
-        willow_map_insert(map, key as i64, 1, value as i64, 1);
+        // SAFETY: The constructor and reference flags agree. Each pointer word comes from a
+        // live fixture object at the call.
+        unsafe { willow_map_insert(map, key as i64, 1, value as i64, 1) };
         willow_gc_collect();
-        let found = willow_map_get(map, key as i64, 1, 1);
+        // SAFETY: The key matches the live map layout; any string key is current through the
+        // lookup.
+        let found = unsafe { willow_map_get(map, key as i64, 1, 1) };
         assert_eq!(
+            // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
             unsafe { crate::string::willow_string_as_str(found) },
             "value"
         );
-        willow_pop_roots(2);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(2) };
     }
 
     #[test]
     fn confined_scalar_accesses_never_acquire_mutual_exclusion() {
         let _guard = crate::gc::isolated_runtime();
         for count in [16, 128, 1024, 8192] {
-            crate::gc::willow_gc_init();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { crate::gc::willow_gc_init() };
+            // SAFETY: Only the creating test task accesses this local map while it is live.
             let mut map = unsafe { willow_map_new_local(0, 0, 0) };
-            crate::gc::willow_push_root(&mut map);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { crate::gc::willow_push_root(&raw mut map) };
             assert!(matches!(
+                // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by
+                // the constructor.
                 &unsafe { storage(map) }.state,
                 MapState::Words(ScalarStorage::Local(_))
             ));
             WORD_SHARED_ACQUIRES.with(|count| count.set(0));
             for key in 0..count {
-                willow_map_insert(map, key, 0, !key, 0);
+                // SAFETY: This live map was constructed with scalar key and value slots.
+                unsafe { willow_map_insert(map, key, 0, !key, 0) };
                 let mut payload = 0;
-                assert_eq!(willow_map_get_into(map, key, 0, &mut payload), 0);
+                // SAFETY: The fixture supplies the live map and a key of its declared kind;
+                // the output borrows a disjoint local i64.
+                assert_eq!(unsafe { willow_map_get_into(map, key, 0, &mut payload) }, 0);
                 assert_eq!(payload, !key);
-                assert_eq!(willow_map_get_into(map, key + count, 0, &mut payload), 1);
-                assert_eq!(willow_map_contains(map, key, 0), 1);
-                assert_eq!(willow_map_len(map), key + 1);
+                assert_eq!(
+                    // SAFETY: The fixture supplies the live map and a key of its declared kind;
+                    // the output borrows a disjoint local i64.
+                    unsafe { willow_map_get_into(map, key + count, 0, &mut payload) },
+                    1
+                );
+                // SAFETY: The live map has scalar keys and this lookup borrows no pointer-
+                // valued key. The handle is a live map from this fixture or its frozen copy.
+                unsafe {
+                    assert_eq!(willow_map_contains(map, key, 0), 1);
+                    assert_eq!(willow_map_len(map), key + 1);
+                }
             }
             assert_eq!(WORD_SHARED_ACQUIRES.with(|count| count.get()), 0);
             eprintln!(
                 "confined operations={} mutual_exclusion_acquisitions=0",
                 count * 5
             );
-            let mut copy = willow_map_copy(map);
-            crate::gc::willow_push_root(&mut copy);
+            // SAFETY: The source is a live map from the constructor and remains reachable
+            // while copied.
+            let mut copy = unsafe { willow_map_copy(map) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { crate::gc::willow_push_root(&raw mut copy) };
             assert!(matches!(
+                // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by
+                // the constructor.
                 &unsafe { storage(copy) }.state,
                 MapState::Words(ScalarStorage::Shared(_))
             ));
-            assert_eq!(willow_map_len(copy), count);
-            crate::gc::willow_pop_roots(2);
+            // SAFETY: The handle is a live map from this fixture or its frozen copy.
+            assert_eq!(unsafe { willow_map_len(copy) }, count);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { crate::gc::willow_pop_roots(2) };
             crate::gc::willow_gc_collect();
         }
     }
@@ -1366,7 +1661,9 @@ mod tests {
     #[test]
     fn scalar_storage_gate_serializes_retained_aliases_and_releases_on_unwind() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         let storage = WordStorage::default();
         storage.lock().entries.insert(0, 0);
         let start = std::sync::Barrier::new(4);
@@ -1402,9 +1699,13 @@ mod tests {
     #[test]
     fn scalar_map_aliases_share_one_gate_across_all_accessors() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         let mut map = willow_map_new(0, 0, 0);
-        crate::gc::willow_push_root(&mut map);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { crate::gc::willow_push_root(&raw mut map) };
         let address = map as usize;
         let start = std::sync::Barrier::new(4);
         std::thread::scope(|scope| {
@@ -1417,23 +1718,37 @@ mod tests {
                     start.wait();
                     for i in 0..4096 {
                         let key = writer * 4096 + i;
-                        willow_map_insert(map, key, 0, !key, 0);
+                        // SAFETY: This live map was constructed with scalar key and value
+                        // slots.
+                        unsafe { willow_map_insert(map, key, 0, !key, 0) };
                         let mut value = 0;
-                        assert_eq!(willow_map_get_into(map, key, 0, &mut value), 0);
+                        // SAFETY: The fixture supplies the live map and a key of its declared
+                        // kind; the output borrows a disjoint local i64.
+                        assert_eq!(unsafe { willow_map_get_into(map, key, 0, &mut value) }, 0);
                         assert_eq!(value, !key);
-                        assert_eq!(willow_map_contains(map, key, 0), 1);
-                        assert!(willow_map_len(map) > i);
+                        // SAFETY: The live map has scalar keys and this lookup borrows no
+                        // pointer-valued key. The handle is a live map from this fixture or
+                        // its frozen copy.
+                        unsafe {
+                            assert_eq!(willow_map_contains(map, key, 0), 1);
+                            assert!(willow_map_len(map) > i);
+                        }
                     }
                 }));
             }
         });
-        assert_eq!(willow_map_len(map), 16384);
+        // SAFETY: The handle is a live map from this fixture or its frozen copy.
+        assert_eq!(unsafe { willow_map_len(map) }, 16384);
         for key in 0..16384 {
             let mut value = 0;
-            assert_eq!(willow_map_get_into(map, key, 0, &mut value), 0);
+            // SAFETY: The fixture supplies the live map and a key of its declared kind; the
+            // output borrows a disjoint local i64.
+            assert_eq!(unsafe { willow_map_get_into(map, key, 0, &mut value) }, 0);
             assert_eq!(value, !key);
         }
-        crate::gc::willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { crate::gc::willow_pop_root() };
         crate::gc::willow_gc_collect();
     }
 
@@ -1443,13 +1758,18 @@ mod tests {
         let _guard = crate::gc::isolated_runtime();
         for count in [16_i64, 128, 1024, 8192] {
             for stride in [1_i64, 2654435761, 1 << 32, -1] {
-                crate::gc::willow_gc_init();
+                // SAFETY: The test controls its isolated runtime at this reset boundary; no
+                // other mutator or subsequent access relies on the discarded heap.
+                unsafe { crate::gc::willow_gc_init() };
                 let baseline = crate::gc_telemetry::external_bytes();
                 let mut map = willow_map_new(0, 0, 0);
-                crate::gc::willow_push_root(&mut map);
+                // SAFETY: The initialized slot stays at this address until its registration
+                // is popped; collection may rewrite it there.
+                unsafe { crate::gc::willow_push_root(&raw mut map) };
                 WORD_HASH_CALLS.with(|calls| calls.set(0));
                 for i in 0..count {
-                    willow_map_insert(map, i.wrapping_mul(stride), 0, i, 0);
+                    // SAFETY: This live map was constructed with scalar key and value slots.
+                    unsafe { willow_map_insert(map, i.wrapping_mul(stride), 0, i, 0) };
                 }
                 let insert_hashes = WORD_HASH_CALLS.with(|calls| calls.get());
                 // Geometric table growth rehashes old keys, but total hashes
@@ -1462,15 +1782,29 @@ mod tests {
                 for i in 0..count {
                     let key = i.wrapping_mul(stride);
                     let mut payload = -1;
-                    assert_eq!(willow_map_get_into(map, key, 0, &mut payload), 0);
+                    // SAFETY: The fixture supplies the live map and a key of its declared
+                    // kind; the output borrows a disjoint local i64.
+                    assert_eq!(unsafe { willow_map_get_into(map, key, 0, &mut payload) }, 0);
                     assert_eq!(payload, i);
-                    assert_eq!(willow_map_contains(map, key, 0), 1);
+                    // SAFETY: The live map has scalar keys and this lookup borrows no
+                    // pointer-valued key.
+                    assert_eq!(unsafe { willow_map_contains(map, key, 0) }, 1);
                     assert_eq!(
-                        willow_map_get_into(map, (i + count).wrapping_mul(stride), 0, &mut payload),
+                        // SAFETY: The fixture supplies the live map and a key of its declared
+                        // kind; the output borrows a disjoint local i64.
+                        unsafe {
+                            willow_map_get_into(
+                                map,
+                                (i + count).wrapping_mul(stride),
+                                0,
+                                &mut payload,
+                            )
+                        },
                         1
                     );
                     assert_eq!(payload, 0);
-                    willow_map_insert(map, key, 0, !i, 0);
+                    // SAFETY: This live map was constructed with scalar key and value slots.
+                    unsafe { willow_map_insert(map, key, 0, !i, 0) };
                 }
                 assert_eq!(
                     WORD_HASH_CALLS.with(|calls| calls.get()),
@@ -1479,12 +1813,15 @@ mod tests {
                 assert_eq!(counter::thread_allocations(), allocated);
                 assert_eq!(crate::gc::willow_gc_allocated_bytes(), gc_bytes);
                 assert_eq!(crate::gc_telemetry::external_bytes(), retained);
-                assert_eq!(willow_map_len(map), count);
+                // SAFETY: The handle is a live map from this fixture or its frozen copy.
+                assert_eq!(unsafe { willow_map_len(map) }, count);
                 eprintln!(
                     "scalar count={count} stride={stride} insert_hashes={insert_hashes} lookup_update_hashes={} allocations=0",
                     4 * count
                 );
-                crate::gc::willow_pop_root();
+                // SAFETY: The removed shadow-stack entries belong to this operation and their
+                // slot storage is still live.
+                unsafe { crate::gc::willow_pop_root() };
                 crate::gc::willow_gc_collect();
                 assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
             }
@@ -1494,9 +1831,13 @@ mod tests {
     #[test]
     fn scalar_gc_hooks_do_not_borrow_mutating_storage() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         let mut map = willow_map_new(0, 0, 0);
-        crate::gc::willow_push_root(&mut map);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { crate::gc::willow_push_root(&raw mut map) };
         let address = map as usize;
         std::thread::scope(|scope| {
             scope.spawn(crate::runtime::serving(move || {
@@ -1505,6 +1846,8 @@ mod tests {
                 let mut children = Vec::new();
                 for _ in 0..8192 {
                     // Exercise all hooks while the mutator may resize its table.
+                    // SAFETY: The callback receives the live map payload selected by its
+                    // registered layout.
                     unsafe {
                         trace_map(map, &mut slots);
                         snapshot_map(map, &mut children);
@@ -1518,26 +1861,39 @@ mod tests {
                 assert!(children.is_empty());
             }));
             for key in 0..8192 {
-                willow_map_insert(map, key, 0, key, 0);
+                // SAFETY: This live map was constructed with scalar key and value slots.
+                unsafe { willow_map_insert(map, key, 0, key, 0) };
             }
         });
-        crate::gc::willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { crate::gc::willow_pop_root() };
         crate::gc::willow_gc_collect();
     }
 
     #[test]
     fn scalar_frozen_copy_supports_parallel_reads_and_independent_updates() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         let baseline = crate::gc_telemetry::external_bytes();
         let mut map = willow_map_new(0, 0, 0);
-        crate::gc::willow_push_root(&mut map);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { crate::gc::willow_push_root(&raw mut map) };
         for key in 0..1024 {
-            willow_map_insert(map, key, 0, !key, 0);
+            // SAFETY: This live map was constructed with scalar key and value slots.
+            unsafe { willow_map_insert(map, key, 0, !key, 0) };
         }
-        let mut copy = willow_map_copy(map);
-        crate::gc::willow_push_root(&mut copy);
-        willow_map_insert(map, 0, 0, 42, 0);
+        // SAFETY: The source is a live map from the constructor and remains reachable while
+        // copied.
+        let mut copy = unsafe { willow_map_copy(map) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { crate::gc::willow_push_root(&raw mut copy) };
+        // SAFETY: This live map was constructed with scalar key and value slots.
+        unsafe { willow_map_insert(map, 0, 0, 42, 0) };
         let address = copy as usize;
         std::thread::scope(|scope| {
             for _ in 0..4 {
@@ -1545,7 +1901,9 @@ mod tests {
                     let map = address as *mut u8;
                     for key in 0..1024 {
                         let mut payload = 0;
-                        assert_eq!(willow_map_get_into(map, key, 0, &mut payload), 0);
+                        // SAFETY: The fixture supplies the live map and a key of its declared
+                        // kind; the output borrows a disjoint local i64.
+                        assert_eq!(unsafe { willow_map_get_into(map, key, 0, &mut payload) }, 0);
                         assert_eq!(payload, !key);
                     }
                 }));
@@ -1553,9 +1911,13 @@ mod tests {
         });
         crate::gc::willow_gc_collect();
         let mut payload = 0;
-        assert_eq!(willow_map_get_into(copy, 0, 0, &mut payload), 0);
+        // SAFETY: The fixture supplies the live map and a key of its declared kind; the
+        // output borrows a disjoint local i64.
+        assert_eq!(unsafe { willow_map_get_into(copy, 0, 0, &mut payload) }, 0);
         assert_eq!(payload, -1);
-        crate::gc::willow_pop_roots(2);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { crate::gc::willow_pop_roots(2) };
         crate::gc::willow_gc_collect();
         assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
     }
@@ -1563,25 +1925,39 @@ mod tests {
     #[test]
     fn concurrent_slice_retries_a_busy_map_without_waiting_or_partial_children() {
         let _guard = crate::gc::isolated_runtime();
-        crate::gc::willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { crate::gc::willow_gc_init() };
         let mut map = willow_map_new(0, 0, 1);
-        crate::gc::willow_push_root(&mut map);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { crate::gc::willow_push_root(&raw mut map) };
         let child = crate::gc::willow_alloc(8);
-        willow_map_insert(map, 0, 0, child as i64, 1);
+        // SAFETY: The constructor and reference flags agree. Each pointer word comes from a
+        // live fixture object at the call.
+        unsafe { willow_map_insert(map, 0, 0, child as i64, 1) };
+        // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+        // constructor.
         let guard = unsafe { map_data(map) };
         let mut children = Vec::new();
         assert!(matches!(
+            // SAFETY: The callback receives the live map payload selected by its registered
+            // layout.
             unsafe { snapshot_map_slice(map, 0, 512, &mut children) },
             crate::gc::TraceSliceProgress::Retry
         ));
         assert!(children.is_empty());
         drop(guard);
         assert!(matches!(
+            // SAFETY: The callback receives the live map payload selected by its registered
+            // layout.
             unsafe { snapshot_map_slice(map, 0, 512, &mut children) },
             crate::gc::TraceSliceProgress::Done
         ));
         assert_eq!(children, [child]);
-        crate::gc::willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { crate::gc::willow_pop_root() };
         crate::gc::willow_gc_collect();
     }
     use crate::gc::{
@@ -1590,19 +1966,26 @@ mod tests {
     use crate::string::{willow_string_as_str, willow_string_from_str};
 
     fn opt_tag(opt: *mut u8) -> i64 {
+        // SAFETY: The Option result is a GC word-aligned allocation containing the tag and its
+        // payload.
         unsafe { *(opt as *const i64) }
     }
     fn opt_payload(opt: *mut u8) -> i64 {
+        // SAFETY: The Option result is a GC word-aligned allocation containing the tag and its
+        // payload.
         unsafe { *((opt as *const i64).add(1)) }
     }
 
     #[test]
     fn map_unit_01_new_is_empty() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let m = willow_map_new(0, 0, 0);
         assert!(!m.is_null());
-        assert_eq!(willow_map_len(m), 0);
+        // SAFETY: The handle is a live map from this fixture or its frozen copy.
+        assert_eq!(unsafe { willow_map_len(m) }, 0);
     }
 
     #[test]
@@ -1611,14 +1994,18 @@ mod tests {
 
         let _guard = isolated_runtime();
         for count in [1, 16, 128] {
-            willow_gc_init();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { willow_gc_init() };
             // Reserve every root slot before registering its address.
             let mut maps = vec![std::ptr::null_mut(); count];
             for slot in &mut maps {
                 *slot = willow_map_new(3, 3, 1);
                 assert!(!slot.is_null());
                 assert!((*slot as usize).is_multiple_of(align_of::<MapStorage>()));
-                willow_push_root(slot);
+                // SAFETY: The slot storage stays live and stationary through the matching
+                // pop, including during collection.
+                unsafe { willow_push_root(slot) };
             }
             let payload_bytes = size_of::<MapStorage>();
             assert_eq!(
@@ -1628,19 +2015,31 @@ mod tests {
             let addresses = maps.clone();
             for &map in &maps {
                 let mut key = willow_string_from_str("owned-key");
-                willow_push_root(&mut key);
+                // SAFETY: The initialized slot stays at this address until its registration
+                // is popped; collection may rewrite it there.
+                unsafe { willow_push_root(&raw mut key) };
                 let value = willow_string_from_str("traced-value");
-                willow_map_insert(map, key as i64, 1, value as i64, 1);
-                willow_pop_roots(1);
+                // SAFETY: The constructor and reference flags agree. Each pointer word comes
+                // from a live fixture object at the call.
+                unsafe { willow_map_insert(map, key as i64, 1, value as i64, 1) };
+                // SAFETY: The removed shadow-stack entries belong to this operation and their
+                // slot storage is still live.
+                unsafe { willow_pop_roots(1) };
             }
             willow_gc_collect();
             assert_eq!(maps, addresses, "inline mutexes must never move");
             for &map in &maps {
                 let key = willow_string_from_str("owned-key");
-                let value = willow_map_get(map, key as i64, 1, 1);
+                // SAFETY: The key matches the live map layout; any string key is current
+                // through the lookup.
+                let value = unsafe { willow_map_get(map, key as i64, 1, 1) };
+                // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this
+                // borrow.
                 assert_eq!(unsafe { willow_string_as_str(value) }, "traced-value");
             }
-            willow_pop_roots(count as i32);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(count as i32) };
             willow_gc_collect();
             assert_eq!(willow_gc_allocated_bytes(), 0);
         }
@@ -1649,47 +2048,71 @@ mod tests {
     #[test]
     fn map_unit_02_int_key_insert_get() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let m = willow_map_new(0, 0, 0);
-        willow_map_insert(m, 7, 0, 100, 0);
-        willow_map_insert(m, 8, 0, 200, 0);
-        assert_eq!(willow_map_len(m), 2);
-        let g = willow_map_get(m, 7, 0, 0);
+        let _keep_m = crate::gc::GcRootHandle::new(m);
+        // SAFETY: This live map was constructed with scalar key and value slots. The handle is
+        // a live map from this fixture or its frozen copy.
+        unsafe {
+            willow_map_insert(m, 7, 0, 100, 0);
+            willow_map_insert(m, 8, 0, 200, 0);
+            assert_eq!(willow_map_len(m), 2);
+        }
+        // SAFETY: The live map has scalar keys and this lookup borrows no pointer-valued key.
+        let g = unsafe { willow_map_get(m, 7, 0, 0) };
         assert_eq!(opt_tag(g), 0); // Some
         assert_eq!(opt_payload(g), 100);
-        assert_eq!(opt_tag(willow_map_get(m, 99, 0, 0)), 1); // None
+        // SAFETY: The live map has scalar keys and this lookup borrows no pointer-valued key.
+        assert_eq!(opt_tag(unsafe { willow_map_get(m, 99, 0, 0) }), 1); // None
     }
 
     #[test]
     fn map_get_into_preserves_payload_bits_without_allocating_wrappers() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for kind in [0, 1, 2] {
             let mut map = willow_map_new(0, kind, 0);
-            willow_push_root(&mut map);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut map) };
             let words = [0, 1, -1, i64::MIN, i64::MAX, f64::NAN.to_bits() as i64];
             for (key, word) in words.iter().enumerate() {
-                willow_map_insert(map, key as i64, 0, *word, 0);
+                // SAFETY: This live map was constructed with scalar key and value slots.
+                unsafe { willow_map_insert(map, key as i64, 0, *word, 0) };
             }
             let bytes = crate::gc::willow_gc_allocated_bytes();
             for count in [1, 16, 128] {
                 for _ in 0..count {
                     for (key, word) in words.iter().enumerate() {
                         let mut payload = 123;
-                        assert_eq!(willow_map_get_into(map, key as i64, 0, &mut payload), 0);
+                        assert_eq!(
+                            // SAFETY: The fixture supplies the live map and a key of its declared
+                            // kind; the output borrows a disjoint local i64.
+                            unsafe { willow_map_get_into(map, key as i64, 0, &mut payload) },
+                            0
+                        );
                         assert_eq!(payload, *word);
                     }
                     let mut payload = 123;
-                    assert_eq!(willow_map_get_into(map, 999, 0, &mut payload), 1);
+                    // SAFETY: The fixture supplies the live map and a key of its declared
+                    // kind; the output borrows a disjoint local i64.
+                    assert_eq!(unsafe { willow_map_get_into(map, 999, 0, &mut payload) }, 1);
                     assert_eq!(payload, 0);
                 }
                 assert_eq!(crate::gc::willow_gc_allocated_bytes(), bytes);
             }
-            willow_pop_roots(1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(1) };
         }
         let mut payload = 123;
         assert_eq!(
-            willow_map_get_into(std::ptr::null_mut(), 0, 0, &mut payload),
+            // SAFETY: The null-map path writes the local output word and returns a miss.
+            unsafe { willow_map_get_into(std::ptr::null_mut(), 0, 0, &mut payload) },
             1
         );
         assert_eq!(payload, 0);
@@ -1698,75 +2121,153 @@ mod tests {
     #[test]
     fn map_unit_03_insert_overwrites() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let m = willow_map_new(0, 0, 0);
-        willow_map_insert(m, 1, 0, 10, 0);
-        willow_map_insert(m, 1, 0, 20, 0);
-        assert_eq!(willow_map_len(m), 1);
-        assert_eq!(opt_payload(willow_map_get(m, 1, 0, 0)), 20);
+        // SAFETY: This live map was constructed with scalar key and value slots. The handle is
+        // a live map from this fixture or its frozen copy. The live map has scalar keys and
+        // this lookup borrows no pointer-valued key.
+        unsafe {
+            willow_map_insert(m, 1, 0, 10, 0);
+            willow_map_insert(m, 1, 0, 20, 0);
+            assert_eq!(willow_map_len(m), 1);
+            assert_eq!(opt_payload(willow_map_get(m, 1, 0, 0)), 20);
+        }
     }
 
     #[test]
     fn map_unit_04_string_keys_compare_by_content() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let m = willow_map_new(3, 0, 0);
+        let _keep_m = crate::gc::GcRootHandle::new(m);
         let alice = willow_string_from_str("Alice");
-        willow_map_insert(m, alice as i64, 1, 30, 0);
+        // SAFETY: The constructor and reference flags agree. Each pointer word comes from a
+        // live fixture object at the call.
+        unsafe { willow_map_insert(m, alice as i64, 1, 30, 0) };
         // A *different* string object with the same content must hit.
         let alice2 = willow_string_from_str("Alice");
-        let g = willow_map_get(m, alice2 as i64, 1, 0);
+        // SAFETY: The key matches the live map layout; any string key is current through the
+        // lookup.
+        let g = unsafe { willow_map_get(m, alice2 as i64, 1, 0) };
         assert_eq!(opt_tag(g), 0);
         assert_eq!(opt_payload(g), 30);
         let bob = willow_string_from_str("Bob");
-        assert_eq!(opt_tag(willow_map_get(m, bob as i64, 1, 0)), 1); // None
+        // SAFETY: The key matches the live map layout; any string key is current through the
+        // lookup.
+        assert_eq!(opt_tag(unsafe { willow_map_get(m, bob as i64, 1, 0) }), 1); // None
+    }
+
+    #[test]
+    fn null_string_key_matches_empty_and_fills_one_output_word() {
+        let _guard = isolated_runtime();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        let map = crate::gc::GcRootHandle::new(willow_map_new(3, 0, 0));
+        let empty = willow_string_from_str("");
+        let mut output = [-11_i64, -1, -22];
+        // SAFETY: The rooted map uses string keys and scalar values. Zero denotes
+        // the empty key. The fresh string stays current through these non-allocating
+        // lookups and the middle output word is exclusively borrowed for each call.
+        unsafe {
+            willow_map_insert(map.load(), 0, 1, 73, 0);
+            assert_eq!(willow_map_contains(map.load(), empty as i64, 1), 1);
+            assert_eq!(
+                willow_map_get_into(map.load(), empty as i64, 1, &mut output[1]),
+                0
+            );
+            assert_eq!(output, [-11, 73, -22]);
+            assert_eq!(willow_map_remove_into(map.load(), 0, 1, &mut output[1]), 0);
+            assert_eq!(output, [-11, 73, -22]);
+            assert_eq!(willow_map_get_into(map.load(), 0, 1, &mut output[1]), 1);
+        }
+        assert_eq!(output, [-11, 0, -22]);
     }
 
     #[test]
     fn map_unit_05_contains() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let m = willow_map_new(0, 0, 0);
-        willow_map_insert(m, 5, 0, 50, 0);
-        assert_eq!(willow_map_contains(m, 5, 0), 1);
-        assert_eq!(willow_map_contains(m, 6, 0), 0);
+        // SAFETY: This live map was constructed with scalar key and value slots. The live map
+        // has scalar keys and this lookup borrows no pointer-valued key.
+        unsafe {
+            willow_map_insert(m, 5, 0, 50, 0);
+            assert_eq!(willow_map_contains(m, 5, 0), 1);
+            assert_eq!(willow_map_contains(m, 6, 0), 0);
+        }
     }
 
     #[test]
     fn map_unit_06_reference_values_survive_collection() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let mut m = willow_map_new(0, 3, 1);
-        willow_push_root(&mut m as *mut *mut u8);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut m) };
         let v = willow_string_from_str("kept-value");
-        willow_map_insert(m, 1, 0, v as i64, 1);
+        // SAFETY: The constructor and reference flags agree. Each pointer word comes from a
+        // live fixture object at the call.
+        unsafe { willow_map_insert(m, 1, 0, v as i64, 1) };
         willow_gc_collect();
-        let g = willow_map_get(m, 1, 0, 0);
+        // SAFETY: The live map has scalar keys and this lookup borrows no pointer-valued key.
+        let g = unsafe { willow_map_get(m, 1, 0, 0) };
         assert_eq!(opt_tag(g), 0);
         let got = opt_payload(g) as *mut u8;
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { willow_string_as_str(got) }, "kept-value");
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
     }
 
     #[test]
     fn map_unit_07_reference_option_uses_nullable_pointer_niche() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let m = willow_map_new(0, 3, 1);
+        let _keep_m = crate::gc::GcRootHandle::new(m);
         let value = willow_string_from_str("niche-value");
-        willow_map_insert(m, 1, 0, value as i64, 1);
-        assert_eq!(willow_map_get(m, 1, 0, 1), value);
-        assert!(willow_map_get(m, 2, 0, 1).is_null());
+        // SAFETY: The constructor and reference flags agree. Each pointer word comes from a
+        // live fixture object at the call. The live map has scalar keys and this lookup
+        // borrows no pointer-valued key.
+        unsafe {
+            willow_map_insert(m, 1, 0, value as i64, 1);
+            assert_eq!(willow_map_get(m, 1, 0, 1), value);
+            assert!(willow_map_get(m, 2, 0, 1).is_null());
+        }
     }
     #[test]
     fn map_layout_survives_freeze_and_drives_word_display() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let map = willow_map_new(1, 2, 0);
-        willow_map_insert(map, 1.5f64.to_bits() as i64, 0, 1, 0);
-        let copy = willow_map_copy(map);
-        let text = willow_map_to_string(copy);
+        let _keep_map = crate::gc::GcRootHandle::new(map);
+        // SAFETY: This live map was constructed with scalar key and value slots.
+        unsafe { willow_map_insert(map, 1.5f64.to_bits() as i64, 0, 1, 0) };
+        // SAFETY: The source is a live map from the constructor and remains reachable while
+        // copied.
+        let copy = unsafe { willow_map_copy(map) };
+        let _keep_copy = crate::gc::GcRootHandle::new(copy);
+        // SAFETY: The map copy retains the declared key and value representations.
+        let text = unsafe { willow_map_to_string(copy) };
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { willow_string_as_str(text) }, "{1.5: true}");
+        // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+        // constructor.
         let layout = unsafe { storage(copy) }.layout;
         assert_eq!(
             (layout.key_kind, layout.value_kind, layout.value_is_ref),
@@ -1777,22 +2278,33 @@ mod tests {
     fn borrowed_string_keys_survive_copy_update_and_collection() {
         let _guard = isolated_runtime();
         for local in [false, true] {
-            willow_gc_init();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { willow_gc_init() };
             let mut map = if local {
+                // SAFETY: Only the creating test task accesses this local map while it is live.
                 unsafe { willow_map_new_local(3, 0, 0) }
             } else {
                 willow_map_new(3, 0, 0)
             };
-            willow_push_root(&mut map);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut map) };
             for (i, text) in ["", "日本語🦀", "ordinary", "embedded\0nul"]
                 .into_iter()
                 .enumerate()
             {
                 let key = willow_string_from_str(text);
-                willow_map_insert(map, key as i64, 1, i as i64, 0);
+                // SAFETY: The constructor and reference flags agree. Each pointer word comes
+                // from a live fixture object at the call.
+                unsafe { willow_map_insert(map, key as i64, 1, i as i64, 0) };
             }
-            let mut copy = willow_map_copy(map);
-            willow_push_root(&mut copy);
+            // SAFETY: The source is a live map from the constructor and remains reachable
+            // while copied.
+            let mut copy = unsafe { willow_map_copy(map) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut copy) };
             // No source key is rooted: map keys own their bytes independently.
             willow_gc_collect();
             for (i, text) in ["", "日本語🦀", "ordinary", "embedded\0nul"]
@@ -1800,30 +2312,53 @@ mod tests {
                 .enumerate()
             {
                 let mut key = willow_string_from_str(text);
-                willow_push_root(&mut key);
-                assert_eq!(willow_map_contains(map, key as i64, 1), 1);
+                // SAFETY: The initialized slot stays at this address until its registration
+                // is popped; collection may rewrite it there.
+                unsafe { willow_push_root(&raw mut key) };
+                // SAFETY: The key matches the live map layout; any string key is current
+                // through the lookup.
+                assert_eq!(unsafe { willow_map_contains(map, key as i64, 1) }, 1);
                 assert_eq!(
-                    opt_payload(willow_map_get(copy, key as i64, 1, 0)),
+                    // SAFETY: The key matches the live map layout; any string key is current
+                    // through the lookup.
+                    opt_payload(unsafe { willow_map_get(copy, key as i64, 1, 0) }),
                     i as i64
                 );
-                willow_map_insert(map, key as i64, 1, 99, 0);
+                // SAFETY: The constructor and reference flags agree. Each pointer word comes
+                // from a live fixture object at the call.
+                unsafe { willow_map_insert(map, key as i64, 1, 99, 0) };
                 assert_eq!(
-                    opt_payload(willow_map_get(copy, key as i64, 1, 0)),
+                    // SAFETY: The key matches the live map layout; any string key is current
+                    // through the lookup.
+                    opt_payload(unsafe { willow_map_get(copy, key as i64, 1, 0) }),
                     i as i64
                 );
-                assert_eq!(opt_payload(willow_map_get(map, key as i64, 1, 0)), 99);
-                willow_pop_roots(1);
+                assert_eq!(
+                    // SAFETY: The key matches the live map layout; any string key is current
+                    // through the lookup.
+                    opt_payload(unsafe { willow_map_get(map, key as i64, 1, 0) }),
+                    99
+                );
+                // SAFETY: The removed shadow-stack entries belong to this operation and their
+                // slot storage is still live.
+                unsafe { willow_pop_roots(1) };
             }
-            assert_eq!(willow_map_len(map), 4);
-            willow_pop_roots(2);
+            // SAFETY: The handle is a live map from this fixture or its frozen copy.
+            assert_eq!(unsafe { willow_map_len(map) }, 4);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(2) };
         }
     }
 
     #[test]
     fn borrowed_word_keys_preserve_all_bits() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let map = willow_map_new(0, 0, 0);
+        let _keep_map = crate::gc::GcRootHandle::new(map);
         let words = [
             0,
             i64::MIN,
@@ -1832,31 +2367,56 @@ mod tests {
             -1,
         ];
         for (i, word) in words.into_iter().enumerate() {
-            willow_map_insert(map, word, 0, i as i64, 0);
+            // SAFETY: This live map was constructed with scalar key and value slots.
+            unsafe { willow_map_insert(map, word, 0, i as i64, 0) };
         }
         for (i, word) in words.into_iter().enumerate() {
-            assert_eq!(willow_map_contains(map, word, 0), 1);
-            assert_eq!(opt_payload(willow_map_get(map, word, 0, 0)), i as i64);
+            // SAFETY: The live map has scalar keys and this lookup borrows no pointer-valued
+            // key.
+            assert_eq!(unsafe { willow_map_contains(map, word, 0) }, 1);
+            assert_eq!(
+                // SAFETY: The live map has scalar keys and this lookup borrows no pointer-valued
+                // key.
+                opt_payload(unsafe { willow_map_get(map, word, 0, 0) }),
+                i as i64
+            );
         }
-        assert_eq!(willow_map_contains(map, 1, 0), 0);
-        assert_eq!(willow_map_len(map), words.len() as i64);
+        // SAFETY: The live map has scalar keys and this lookup borrows no pointer-valued key.
+        // The handle is a live map from this fixture or its frozen copy.
+        unsafe {
+            assert_eq!(willow_map_contains(map, 1, 0), 0);
+            assert_eq!(willow_map_len(map), words.len() as i64);
+        }
     }
 
     #[test]
     fn float_keys_normalize_zero_preserve_numbers_and_copy() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let mut map = willow_map_new(1, 0, 0);
-        willow_push_root(&mut map);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut map) };
         for zeros in [[0.0_f64, -0.0], [-0.0_f64, 0.0]] {
             for (index, key) in zeros.into_iter().enumerate() {
-                willow_map_insert(map, key.to_bits() as i64, 0, index as i64 + 10, 0);
+                // SAFETY: This live map was constructed with scalar key and value slots.
+                unsafe { willow_map_insert(map, key.to_bits() as i64, 0, index as i64 + 10, 0) };
             }
-            assert_eq!(willow_map_len(map), 1);
+            // SAFETY: The handle is a live map from this fixture or its frozen copy.
+            assert_eq!(unsafe { willow_map_len(map) }, 1);
             for key in zeros {
-                assert_eq!(willow_map_contains(map, key.to_bits() as i64, 0), 1);
                 assert_eq!(
-                    opt_payload(willow_map_get(map, key.to_bits() as i64, 0, 0)),
+                    // SAFETY: The live map has scalar keys and this lookup borrows no pointer-
+                    // valued key.
+                    unsafe { willow_map_contains(map, key.to_bits() as i64, 0) },
+                    1
+                );
+                assert_eq!(
+                    // SAFETY: The live map has scalar keys and this lookup borrows no
+                    // pointer-valued key.
+                    opt_payload(unsafe { willow_map_get(map, key.to_bits() as i64, 0, 0) }),
                     11
                 );
             }
@@ -1872,31 +2432,51 @@ mod tests {
             -1.5,
         ];
         for (index, value) in values.into_iter().enumerate() {
-            willow_map_insert(map, value.to_bits() as i64, 0, index as i64, 0);
+            // SAFETY: This live map was constructed with scalar key and value slots.
+            unsafe { willow_map_insert(map, value.to_bits() as i64, 0, index as i64, 0) };
         }
-        let mut copy = willow_map_copy(map);
-        willow_push_root(&mut copy);
-        assert_eq!(willow_map_len(copy), 9);
+        // SAFETY: The source is a live map from the constructor and remains reachable while
+        // copied.
+        let mut copy = unsafe { willow_map_copy(map) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut copy) };
+        // SAFETY: The handle is a live map from this fixture or its frozen copy.
+        assert_eq!(unsafe { willow_map_len(copy) }, 9);
         for (index, value) in values.into_iter().enumerate() {
             assert_eq!(
-                opt_payload(willow_map_get(copy, value.to_bits() as i64, 0, 0)),
+                // SAFETY: The live map has scalar keys and this lookup borrows no pointer-
+                // valued key.
+                opt_payload(unsafe { willow_map_get(copy, value.to_bits() as i64, 0, 0) }),
                 index as i64
             );
         }
-        assert_eq!(opt_payload(willow_map_get(copy, i64::MIN, 0, 0)), 11);
+        assert_eq!(
+            // SAFETY: The live map has scalar keys and this lookup borrows no pointer-valued key.
+            opt_payload(unsafe { willow_map_get(copy, i64::MIN, 0, 0) }),
+            11
+        );
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert!(!unsafe { willow_string_as_str(willow_map_to_string(copy)) }.contains("-0:"));
-        willow_pop_roots(2);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(2) };
     }
 
     #[test]
     fn float_keys_reject_all_nan_forms_without_mutating_or_holding_lock() {
         use crate::panic_context::*;
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(903))));
         let mut map = willow_map_new(1, 0, 0);
-        willow_push_root(&mut map);
-        willow_map_insert(map, 0, 0, 42, 0);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut map) };
+        // SAFETY: This live map was constructed with scalar key and value slots.
+        unsafe { willow_map_insert(map, 0, 0, 42, 0) };
         for bits in [
             0x7ff0_0000_0000_0001u64,
             0x7ff8_0000_0000_0000,
@@ -1906,30 +2486,52 @@ mod tests {
                 for operation in 0..5 {
                     let word = (bits | sign) as i64;
                     match operation {
-                        0 => willow_map_insert(map, word, 0, 99, 0),
-                        1 => assert_eq!(willow_map_contains(map, word, 0), 0),
+                        // SAFETY: This live map was constructed with scalar key and value
+                        // slots.
+                        0 => unsafe { willow_map_insert(map, word, 0, 99, 0) },
+                        // SAFETY: The live map has scalar keys and this lookup borrows no
+                        // pointer-valued key.
+                        1 => assert_eq!(unsafe { willow_map_contains(map, word, 0) }, 0),
                         4 => {
                             let mut payload = 123;
-                            assert_eq!(willow_map_get_into(map, word, 0, &mut payload), 1);
+                            assert_eq!(
+                                // SAFETY: The fixture supplies the live map and a key of its
+                                // declared kind; the output borrows a disjoint local i64.
+                                unsafe { willow_map_get_into(map, word, 0, &mut payload) },
+                                1
+                            );
                             assert_eq!(payload, 0);
                         }
-                        _ => assert!(willow_map_get(map, word, 0, operation - 2).is_null()),
+                        _ => assert!(
+                            // SAFETY: The live map has scalar keys and this lookup borrows no
+                            // pointer-valued key.
+                            unsafe { willow_map_get(map, word, 0, operation - 2) }.is_null()
+                        ),
                     }
                     assert_eq!(willow_panic_depth(), 1);
                     willow_panic_enter_defer();
                     let info = willow_panic_recover();
                     willow_panic_leave_defer();
                     assert_eq!(
+                        // SAFETY: The retained PanicInfo keeps its initialized fields live through
+                        // this read.
                         unsafe { panic_info_message(info) },
                         "NaN cannot be used as a Map key"
                     );
                     willow_panic_release_recovered(info);
-                    assert_eq!(willow_map_len(map), 1);
-                    assert_eq!(opt_payload(willow_map_get(map, 0, 0, 0)), 42);
+                    // SAFETY: The handle is a live map from this fixture or its frozen copy.
+                    // The live map has scalar keys and this lookup borrows no pointer-valued
+                    // key.
+                    unsafe {
+                        assert_eq!(willow_map_len(map), 1);
+                        assert_eq!(opt_payload(willow_map_get(map, 0, 0, 0)), 42);
+                    }
                 }
             }
         }
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
         replace_current_context(previous);
     }
 
@@ -1941,14 +2543,20 @@ mod tests {
             for index in 0..count {
                 let word = (index as f64).to_bits() as i64;
                 assert!(
+                    // SAFETY: The map's declared key kind determines whether the word contains a
+                    // retained string or a scalar.
                     matches!(unsafe { key_from_word(word, 1) }, Some(KeyRef::Word(got)) if got == word)
                 );
                 // Integer keys that happen to encode NaN or -0.0 remain integers.
                 assert!(matches!(
+                    // SAFETY: The map's declared key kind determines whether the word contains a
+                    // retained string or a scalar.
                     unsafe { key_from_word(i64::MIN, 0) },
                     Some(KeyRef::Word(i64::MIN))
                 ));
                 assert!(matches!(
+                    // SAFETY: The map's declared key kind determines whether the word contains a
+                    // retained string or a scalar.
                     unsafe { key_from_word(f64::NAN.to_bits() as i64, 0) },
                     Some(KeyRef::Word(_))
                 ));
@@ -1979,20 +2587,30 @@ mod tests {
         const VALUES: i64 = 8;
 
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         crate::gc::willow_gc_register_mutator();
         // Environment stress must not promote the values before the copy: the
         // point is that they are still young when the collection runs.
         crate::gc::set_gc_stress_for_test(Some(""));
-        let mut tls = crate::gc::tlab_state_for_test();
+        let tls = crate::gc::tlab_state_for_test();
         let mut map = willow_map_new(0, 4, 1);
-        willow_push_root(&mut map);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut map) };
         let mut young = Vec::new();
         for i in 0..VALUES {
-            let value = crate::gc::willow_gc_alloc_slow(&mut tls, 42, 0, 8, 0);
+            // SAFETY: The fixture owns the stable TLAB through unregistration. The requested
+            // size and tracing metadata describe the object initialized here.
+            let value = unsafe { crate::gc::willow_gc_alloc_slow(tls.as_ptr(), 42, 0, 8, 0) };
             assert!(!value.is_null());
+            // SAFETY: The test allocates a full i64 in word-aligned GC storage and reads the live
+            // value through the map or root.
             unsafe { *(value as *mut i64) = 1000 + i };
-            willow_map_insert(map, i, 0, value as i64, 1);
+            // SAFETY: The constructor and reference flags agree. Each pointer word comes from
+            // a live fixture object at the call.
+            unsafe { willow_map_insert(map, i, 0, value as i64, 1) };
             young.push(value);
         }
         let moved_before = crate::gc::willow_gc_moved_objects();
@@ -2011,10 +2629,14 @@ mod tests {
             std::thread::yield_now();
         }
         crate::gc::set_gc_stress_for_test(Some("alloc"));
-        let mut copy = willow_map_copy(map);
+        // SAFETY: The source is a live map from the constructor and remains reachable while
+        // copied.
+        let mut copy = unsafe { willow_map_copy(map) };
         crate::gc::set_gc_stress_for_test(None);
         collector.join().unwrap();
-        willow_push_root(&mut copy);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut copy) };
 
         assert_eq!(
             crate::gc::willow_gc_moved_objects() - moved_before,
@@ -2022,14 +2644,23 @@ mod tests {
             "every value was evacuated while the copy was in progress"
         );
         for i in 0..VALUES {
-            let source = willow_map_get(map, i, 0, 1);
-            let copied = willow_map_get(copy, i, 0, 1);
+            // SAFETY: The live map has scalar keys and this lookup borrows no pointer-valued
+            // key.
+            let source = unsafe { willow_map_get(map, i, 0, 1) };
+            // SAFETY: The live map has scalar keys and this lookup borrows no pointer-valued
+            // key.
+            let copied = unsafe { willow_map_get(copy, i, 0, 1) };
             assert_ne!(source, young[i as usize], "value {i} moved");
             assert_eq!(copied, source, "copy holds the relocated value {i}");
+            // SAFETY: The test allocates a full i64 in word-aligned GC storage and reads the live
+            // value through the map or root.
             assert_eq!(unsafe { *(copied as *const i64) }, 1000 + i);
         }
-        assert_eq!(willow_map_len(copy), VALUES);
-        willow_pop_roots(2);
+        // SAFETY: The handle is a live map from this fixture or its frozen copy.
+        assert_eq!(unsafe { willow_map_len(copy) }, VALUES);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(2) };
         crate::gc::willow_gc_unregister_mutator();
     }
 
@@ -2041,19 +2672,34 @@ mod tests {
     #[test]
     fn copy_of_young_values_is_updated_by_the_next_minor_collection() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         crate::gc::set_gc_stress_for_test(Some(""));
-        let mut tls = crate::gc::tlab_state_for_test();
+        let tls = crate::gc::tlab_state_for_test();
         let mut map = willow_map_new(0, 4, 1);
-        willow_push_root(&mut map);
-        let young = crate::gc::willow_gc_alloc_slow(&mut tls, 42, 0, 8, 0);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut map) };
+        // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size
+        // and tracing metadata describe the object initialized here.
+        let young = unsafe { crate::gc::willow_gc_alloc_slow(tls.as_ptr(), 42, 0, 8, 0) };
+        // SAFETY: The test allocates a full i64 in word-aligned GC storage and reads the live
+        // value through the map or root.
         unsafe { *(young as *mut i64) = 77 };
-        willow_map_insert(map, 1, 0, young as i64, 1);
+        // SAFETY: The constructor and reference flags agree. Each pointer word comes from a
+        // live fixture object at the call.
+        unsafe { willow_map_insert(map, 1, 0, young as i64, 1) };
         let remembered = crate::gc::willow_gc_remembered_set_size();
-        let mut copy = willow_map_copy(map);
-        willow_push_root(&mut copy);
+        // SAFETY: The source is a live map from the constructor and remains reachable while
+        // copied.
+        let mut copy = unsafe { willow_map_copy(map) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut copy) };
         crate::gc::set_gc_stress_for_test(None);
-        assert_eq!(willow_map_get(copy, 1, 0, 1), young);
+        // SAFETY: The live map has scalar keys and this lookup borrows no pointer-valued key.
+        assert_eq!(unsafe { willow_map_get(copy, 1, 0, 1) }, young);
         assert_eq!(
             crate::gc::willow_gc_remembered_set_size(),
             remembered + 1,
@@ -2062,23 +2708,37 @@ mod tests {
 
         crate::gc::minor_collect_internal();
 
-        let moved = willow_map_get(map, 1, 0, 1);
+        // SAFETY: The live map has scalar keys and this lookup borrows no pointer-valued key.
+        let moved = unsafe { willow_map_get(map, 1, 0, 1) };
         assert_ne!(moved, young, "the young value was evacuated");
-        assert_eq!(willow_map_get(copy, 1, 0, 1), moved);
+        // SAFETY: The live map has scalar keys and this lookup borrows no pointer-valued key.
+        assert_eq!(unsafe { willow_map_get(copy, 1, 0, 1) }, moved);
+        // SAFETY: The test allocates a full i64 in word-aligned GC storage and reads the live
+        // value through the map or root.
         assert_eq!(unsafe { *(moved as *const i64) }, 77);
         // The copy is independent: dropping the source keeps the value alive
         // through the copy alone.
-        willow_pop_roots(2);
-        willow_push_root(&mut copy);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(2) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut copy) };
         crate::gc::willow_gc_collect();
         assert_eq!(
+            // SAFETY: The test allocates a full i64 in word-aligned GC storage and reads the live
+            // value through the map or root.
             unsafe { *(willow_map_get(copy, 1, 0, 1) as *const i64) },
             77
         );
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
         // `tls` lives on this stack and is registered with the heap; drop the
         // registration before it goes out of scope.
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
     }
 
     /// A full collection inside the copy's allocation (non-moving) keeps every
@@ -2087,34 +2747,62 @@ mod tests {
     #[test]
     fn copy_keeps_string_values_across_a_full_collection_in_its_allocation() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let mut map = willow_map_new(3, 3, 1);
-        willow_push_root(&mut map);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut map) };
         for (key, value) in [("a", "alpha"), ("b", "beta"), ("c", "gamma")] {
             let mut key = willow_string_from_str(key);
-            willow_push_root(&mut key);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut key) };
             let value = willow_string_from_str(value);
-            willow_map_insert(map, key as i64, 1, value as i64, 1);
-            willow_pop_roots(1);
+            // SAFETY: The constructor and reference flags agree. Each pointer word comes from
+            // a live fixture object at the call.
+            unsafe { willow_map_insert(map, key as i64, 1, value as i64, 1) };
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(1) };
         }
         let majors = crate::gc::willow_gc_major_collections();
         crate::gc::set_gc_stress_for_test(Some("alloc"));
-        let mut copy = willow_map_copy(map);
+        // SAFETY: The source is a live map from the constructor and remains reachable while
+        // copied.
+        let mut copy = unsafe { willow_map_copy(map) };
         crate::gc::set_gc_stress_for_test(None);
-        willow_push_root(&mut copy);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut copy) };
         assert!(crate::gc::willow_gc_major_collections() > majors);
-        willow_pop_roots(2);
-        willow_push_root(&mut copy);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(2) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut copy) };
         crate::gc::willow_gc_collect();
         for (key, value) in [("a", "alpha"), ("b", "beta"), ("c", "gamma")] {
             let mut key = willow_string_from_str(key);
-            willow_push_root(&mut key);
-            let got = willow_map_get(copy, key as i64, 1, 1);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut key) };
+            // SAFETY: The key matches the live map layout; any string key is current through
+            // the lookup.
+            let got = unsafe { willow_map_get(copy, key as i64, 1, 1) };
+            // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
             assert_eq!(unsafe { willow_string_as_str(got) }, value);
-            willow_pop_roots(1);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(1) };
         }
-        assert_eq!(willow_map_len(copy), 3);
-        willow_pop_roots(1);
+        // SAFETY: The handle is a live map from this fixture or its frozen copy.
+        assert_eq!(unsafe { willow_map_len(copy) }, 3);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
     }
 
     /// a read-only lookup must not copy the key. Counted per
@@ -2126,24 +2814,38 @@ mod tests {
         use crate::scheduler::scaling_measurements::counting_allocator as counter;
         const CALLS: usize = 1_000;
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let mut map = willow_map_new(3, 0, 0);
-        willow_push_root(&mut map);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut map) };
         let mut get_bytes_by_len: Vec<(usize, usize)> = Vec::new();
         for len in [8usize, 64, 1024] {
             let mut hit = willow_string_from_str(&"k".repeat(len));
-            willow_push_root(&mut hit);
-            willow_map_insert(map, hit as i64, 1, len as i64, 0);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut hit) };
+            // SAFETY: The constructor and reference flags agree. Each pointer word comes from
+            // a live fixture object at the call.
+            unsafe { willow_map_insert(map, hit as i64, 1, len as i64, 0) };
             let mut miss = willow_string_from_str(&"m".repeat(len));
-            willow_push_root(&mut miss);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut miss) };
 
             // `contains` returns a scalar, so the whole call is the lookup:
             // hits and misses alike must allocate nothing at any key length.
             let allocs = counter::thread_allocations();
             let bytes = counter::thread_bytes();
             for _ in 0..CALLS {
-                assert_eq!(willow_map_contains(map, hit as i64, 1), 1);
-                assert_eq!(willow_map_contains(map, miss as i64, 1), 0);
+                // SAFETY: The key matches the live map layout; any string key is current
+                // through the lookup.
+                unsafe {
+                    assert_eq!(willow_map_contains(map, hit as i64, 1), 1);
+                    assert_eq!(willow_map_contains(map, miss as i64, 1), 0);
+                }
             }
             assert_eq!(
                 (
@@ -2156,12 +2858,18 @@ mod tests {
 
             // The same for `get`'s key lookup with its required `Option`
             // output excluded: borrow the key, probe the table, drop it.
+            // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+            // constructor.
             let data = unsafe { map_data(map) };
             let allocs = counter::thread_allocations();
             let bytes = counter::thread_bytes();
             for _ in 0..CALLS {
+                // SAFETY: The map's declared key kind determines whether the word contains a
+                // retained string or a scalar.
                 let key = unsafe { key_from_word(hit as i64, 3) }.unwrap();
                 assert_eq!(data.get(&key), Some(len as i64));
+                // SAFETY: The map's declared key kind determines whether the word contains a
+                // retained string or a scalar.
                 let key = unsafe { key_from_word(miss as i64, 3) }.unwrap();
                 assert_eq!(data.get(&key), None);
             }
@@ -2182,10 +2890,17 @@ mod tests {
             let bytes = counter::thread_bytes();
             for _ in 0..CALLS {
                 assert_eq!(
-                    opt_payload(willow_map_get(map, hit as i64, 1, 0)),
+                    // SAFETY: The key matches the live map layout; any string key is current
+                    // through the lookup.
+                    opt_payload(unsafe { willow_map_get(map, hit as i64, 1, 0) }),
                     len as i64
                 );
-                assert_eq!(opt_tag(willow_map_get(map, miss as i64, 1, 0)), 1);
+                assert_eq!(
+                    // SAFETY: The key matches the live map layout; any string key is current
+                    // through the lookup.
+                    opt_tag(unsafe { willow_map_get(map, miss as i64, 1, 0) }),
+                    1
+                );
             }
             let get_allocs = counter::thread_allocations() - allocs;
             let get_bytes = counter::thread_bytes() - bytes;
@@ -2195,7 +2910,9 @@ mod tests {
                 2 * CALLS
             );
             get_bytes_by_len.push((len, get_bytes));
-            willow_pop_roots(2);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(2) };
         }
         // Copying each looked-up key would put `calls * len` bytes through the
         // allocator; the GC's own bookkeeping grows with the live heap instead,
@@ -2214,7 +2931,9 @@ mod tests {
             long_bytes < short_bytes + CALLS * (long_len - short_len),
             "get bytes went {short_bytes} -> {long_bytes} from key length {short_len} to {long_len}"
         );
-        willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(1) };
     }
 }
 
@@ -2227,10 +2946,14 @@ mod native_accounting_tests {
     fn string_keys_growth_updates_copy_telemetry_and_finalizers() {
         let _guard = isolated_runtime();
         for count in [1, 32, 1024] {
-            willow_gc_init();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { willow_gc_init() };
             let baseline = crate::gc_telemetry::external_bytes();
             let mut map = willow_map_new(3, 0, 0);
-            willow_push_root(&mut map);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut map) };
             assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
             let before = crate::gc_telemetry::snapshot();
             let mut key_bytes = 0;
@@ -2238,16 +2961,24 @@ mod native_accounting_tests {
                 let text = format!("{index:08}-{}", "x".repeat(256));
                 key_bytes += text.len() as u64;
                 let mut key = crate::string::willow_string_from_str(&text);
-                willow_push_root(&mut key);
-                willow_map_insert(map, key as i64, 1, index, 0);
+                // SAFETY: The initialized slot stays at this address until its registration
+                // is popped; collection may rewrite it there.
+                unsafe { willow_push_root(&raw mut key) };
+                // SAFETY: The constructor and reference flags agree. Each pointer word comes
+                // from a live fixture object at the call.
+                unsafe { willow_map_insert(map, key as i64, 1, index, 0) };
                 let charged = crate::gc_telemetry::external_bytes();
-                willow_map_insert(map, key as i64, 1, index + 1, 0);
+                // SAFETY: The constructor and reference flags agree. Each pointer word comes
+                // from a live fixture object at the call.
+                unsafe { willow_map_insert(map, key as i64, 1, index + 1, 0) };
                 assert_eq!(
                     crate::gc_telemetry::external_bytes(),
                     charged,
                     "replacement grew native storage"
                 );
-                willow_pop_root();
+                // SAFETY: The removed shadow-stack entries belong to this operation and their
+                // slot storage is still live.
+                unsafe { willow_pop_root() };
             }
             let bytes = crate::gc_telemetry::external_bytes() - baseline;
             assert!(bytes >= key_bytes);
@@ -2263,11 +2994,18 @@ mod native_accounting_tests {
             );
             willow_gc_collect();
             assert_eq!(crate::gc_telemetry::external_bytes(), baseline + bytes);
-            let mut copy = willow_map_copy(map);
-            willow_push_root(&mut copy);
+            // SAFETY: The source is a live map from the constructor and remains reachable
+            // while copied.
+            let mut copy = unsafe { willow_map_copy(map) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut copy) };
             assert!(crate::gc_telemetry::external_bytes() >= baseline + bytes + key_bytes);
-            assert_eq!(willow_map_len(copy), count);
-            willow_pop_roots(2);
+            // SAFETY: The handle is a live map from this fixture or its frozen copy.
+            assert_eq!(unsafe { willow_map_len(copy) }, count);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(2) };
             willow_gc_collect();
             assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
             println!(
@@ -2279,14 +3017,19 @@ mod native_accounting_tests {
     #[test]
     fn reset_releases_native_map_storage() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let baseline = crate::gc_telemetry::external_bytes();
         let map = willow_map_new(0, 0, 0);
         for key in 0..128 {
-            willow_map_insert(map, key, 0, key, 0);
+            // SAFETY: This live map was constructed with scalar key and value slots.
+            unsafe { willow_map_insert(map, key, 0, key, 0) };
         }
         assert!(crate::gc_telemetry::external_bytes() > baseline);
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
     }
 }
@@ -2299,7 +3042,9 @@ mod iteration_tests {
     #[test]
     fn remove_reuses_slots_and_snapshots_sort_all_storage_paths() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for confined in [false, true] {
             for string_key in [false, true] {
                 let map =
@@ -2312,11 +3057,23 @@ mod iteration_tests {
                             } else {
                                 key
                             };
-                            willow_map_insert(map.load(), word, i64::from(string_key), key, 0);
+                            // SAFETY: The constructor and reference flags agree. Each pointer
+                            // word comes from a live fixture object at the call.
+                            unsafe {
+                                willow_map_insert(map.load(), word, i64::from(string_key), key, 0)
+                            };
                         }
-                        let snapshot = GcRootHandle::new(willow_map_snapshot(map.load(), 1, 0));
+                        // SAFETY: The root supplies the current map; this snapshot selects
+                        // ordinary single-word values.
+                        let snapshot =
+                            GcRootHandle::new(unsafe { willow_map_snapshot(map.load(), 1, 0) });
                         for key in 0..count {
-                            assert_eq!(crate::array::willow_array_get(snapshot.load(), key), key);
+                            assert_eq!(
+                                // SAFETY: The root supplies the current live array for this
+                                // access.
+                                unsafe { crate::array::willow_array_get(snapshot.load(), key) },
+                                key
+                            );
                             let word = if string_key {
                                 crate::string::willow_string_from_str(&format!("{key:04}")) as i64
                             } else {
@@ -2324,28 +3081,40 @@ mod iteration_tests {
                             };
                             let mut out = -1;
                             assert_eq!(
-                                willow_map_remove_into(
-                                    map.load(),
-                                    word,
-                                    i64::from(string_key),
-                                    &mut out
-                                ),
+                                // SAFETY: The fixture supplies the live map and a key of its
+                                // declared kind; the output borrows a disjoint local i64.
+                                unsafe {
+                                    willow_map_remove_into(
+                                        map.load(),
+                                        word,
+                                        i64::from(string_key),
+                                        &mut out,
+                                    )
+                                },
                                 0
                             );
                             assert_eq!(out, key);
                             assert_eq!(
-                                willow_map_remove_into(
-                                    map.load(),
-                                    word,
-                                    i64::from(string_key),
-                                    &mut out
-                                ),
+                                // SAFETY: The fixture supplies the live map and a key of its
+                                // declared kind; the output borrows a disjoint local i64.
+                                unsafe {
+                                    willow_map_remove_into(
+                                        map.load(),
+                                        word,
+                                        i64::from(string_key),
+                                        &mut out,
+                                    )
+                                },
                                 1
                             );
                             assert_eq!(out, 0);
                         }
-                        assert_eq!(willow_map_len(map.load()), 0);
+                        // SAFETY: The handle is a live map from this fixture or its frozen
+                        // copy.
+                        assert_eq!(unsafe { willow_map_len(map.load()) }, 0);
                         if string_key {
+                            // SAFETY: The handle identifies a live, GC word-aligned MapStorage
+                            // initialized by the constructor.
                             let data = unsafe { map_data(map.load()) };
                             assert!(data.values.is_empty(), "round {round}");
                             assert_eq!(data.key_bytes, 0);
@@ -2360,20 +3129,37 @@ mod iteration_tests {
     #[test]
     fn removed_holes_copy_and_reinsert_are_independent() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let map = GcRootHandle::new(willow_map_new(3, 0, 0));
         for text in ["a", "b", "c"] {
             let key = crate::string::willow_string_from_str(text);
-            willow_map_insert(map.load(), key as i64, 1, 7, 0);
+            // SAFETY: The constructor and reference flags agree. Each pointer word comes from
+            // a live fixture object at the call.
+            unsafe { willow_map_insert(map.load(), key as i64, 1, 7, 0) };
         }
         let key = GcRootHandle::new(crate::string::willow_string_from_str("b"));
         let mut out = 0;
-        willow_map_remove_into(map.load(), key.load() as i64, 1, &mut out);
-        let copy = GcRootHandle::new(willow_map_copy(map.load()));
-        willow_map_insert(copy.load(), key.load() as i64, 1, 9, 0);
-        assert_eq!(willow_map_contains(map.load(), key.load() as i64, 1), 0);
+        // SAFETY: The fixture supplies the live map and a key of its declared kind; the
+        // output borrows a disjoint local i64.
+        unsafe { willow_map_remove_into(map.load(), key.load() as i64, 1, &mut out) };
+        // SAFETY: The source is a live map from the constructor and remains reachable while
+        // copied.
+        let copy = GcRootHandle::new(unsafe { willow_map_copy(map.load()) });
+        // SAFETY: The constructor and reference flags agree. Each pointer word comes from a
+        // live fixture object at the call.
+        unsafe { willow_map_insert(copy.load(), key.load() as i64, 1, 9, 0) };
         assert_eq!(
-            willow_map_get_into(copy.load(), key.load() as i64, 1, &mut out),
+            // SAFETY: The key matches the live map layout; any string key is current through the
+            // lookup.
+            unsafe { willow_map_contains(map.load(), key.load() as i64, 1) },
+            0
+        );
+        assert_eq!(
+            // SAFETY: The fixture supplies the live map and a key of its declared kind; the
+            // output borrows a disjoint local i64.
+            unsafe { willow_map_get_into(copy.load(), key.load() as i64, 1, &mut out) },
             0
         );
         assert_eq!(out, 9);
@@ -2382,25 +3168,39 @@ mod iteration_tests {
     #[test]
     fn snapshot_comparison_and_compaction_counts_scale() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         for count in [64_i64, 256, 1024, 4096] {
             let map = GcRootHandle::new(willow_map_new(0, 3, 1));
             let value = GcRootHandle::new(crate::string::willow_string_from_str("live"));
             for key in 0..count {
-                willow_map_insert(map.load(), key, 0, value.load() as i64, 1);
+                // SAFETY: The constructor and reference flags agree. Each pointer word comes
+                // from a live fixture object at the call.
+                unsafe { willow_map_insert(map.load(), key, 0, value.load() as i64, 1) };
             }
             SNAPSHOT_COMPARISONS.with(|n| n.set(0));
-            let snapshot = GcRootHandle::new(willow_map_snapshot(map.load(), 0, 0));
-            assert_eq!(crate::array::willow_array_len(snapshot.load()), count);
+            // SAFETY: The root supplies the current map; this snapshot selects ordinary
+            // single-word values.
+            let snapshot = GcRootHandle::new(unsafe { willow_map_snapshot(map.load(), 0, 0) });
+            assert_eq!(
+                // SAFETY: The root supplies the current live array for this access.
+                unsafe { crate::array::willow_array_len(snapshot.load()) },
+                count
+            );
             let comparisons = SNAPSHOT_COMPARISONS.with(|n| n.get());
             assert!(comparisons < 4 * count as usize * count.ilog2() as usize);
             COMPACT_MOVES.with(|n| n.set(0));
             for key in 0..count {
                 let mut out = 0;
-                willow_map_remove_into(map.load(), key, 0, &mut out);
+                // SAFETY: The fixture supplies the live map and a key of its declared kind;
+                // the output borrows a disjoint local i64.
+                unsafe { willow_map_remove_into(map.load(), key, 0, &mut out) };
             }
             let moved = COMPACT_MOVES.with(|n| n.get());
             assert!(moved < count as usize);
+            // SAFETY: The handle identifies a live, GC word-aligned MapStorage initialized by the
+            // constructor.
             assert!(unsafe { map_data(map.load()) }.values.is_empty());
             println!("entries={count} comparisons={comparisons} compact_moves={moved}");
         }
@@ -2409,26 +3209,41 @@ mod iteration_tests {
     #[test]
     fn remove_barrier_clears_reference_slots_and_snapshot_roots_survive_gc() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         let map = GcRootHandle::new(willow_map_new(0, 3, 1));
         for key in 0..128 {
             let value = crate::string::willow_string_from_str(&format!("value-{key}"));
-            willow_map_insert(map.load(), key, 0, value as i64, 1);
+            // SAFETY: The constructor and reference flags agree. Each pointer word comes from
+            // a live fixture object at the call.
+            unsafe { willow_map_insert(map.load(), key, 0, value as i64, 1) };
         }
-        let array = GcRootHandle::new(willow_map_snapshot(map.load(), 1, 0));
+        // SAFETY: The root supplies the current map; this snapshot selects ordinary single-
+        // word values.
+        let array = GcRootHandle::new(unsafe { willow_map_snapshot(map.load(), 1, 0) });
         for key in 0..128 {
             let mut out = 0;
-            assert_eq!(willow_map_remove_into(map.load(), key, 0, &mut out), 0);
+            assert_eq!(
+                // SAFETY: The fixture supplies the live map and a key of its declared kind; the
+                // output borrows a disjoint local i64.
+                unsafe { willow_map_remove_into(map.load(), key, 0, &mut out) },
+                0
+            );
         }
         let mut children = Vec::new();
+        // SAFETY: The callback receives the live map payload selected by its registered layout.
         unsafe {
             snapshot_map(map.load(), &mut children);
         }
         assert!(children.iter().all(|child| child.is_null()));
         willow_gc_collect();
         for key in 0..128 {
-            let value = crate::array::willow_array_get(array.load(), key);
+            // SAFETY: The root supplies the current live array for this access.
+            let value = unsafe { crate::array::willow_array_get(array.load(), key) };
             assert_eq!(
+                // SAFETY: The operand is null or a live string, and no safepoint intervenes in
+                // this borrow.
                 unsafe { willow_string_as_bytes(value as *const u8) },
                 format!("value-{key}").as_bytes()
             );

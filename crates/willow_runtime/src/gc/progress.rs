@@ -97,6 +97,7 @@ pub unsafe extern "C" fn willow_gc_progress_v1(output: *mut GcProgressV1) -> boo
     if output.is_null() {
         return false;
     }
+    // SAFETY: The caller supplies a live, writable, properly aligned progress record.
     unsafe {
         output.write(gc_progress());
     }

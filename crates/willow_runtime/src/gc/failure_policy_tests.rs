@@ -4,8 +4,10 @@ use super::*;
 fn allocation_failures_terminate_before_returning_to_callers() {
     const KEY: &str = "WILLOW_TEST_FAILURE_POLICY_CASE";
     if let Ok(case) = std::env::var(KEY) {
-        willow_gc_init();
-        let mut tls = tlab_state_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        let tls = tlab_state_for_test();
         if case.starts_with("storage") || case.starts_with("retry") {
             runtime().storage_allocator.set_failures(2);
         }
@@ -20,19 +22,26 @@ fn allocation_failures_terminate_before_returning_to_callers() {
                 willow_alloc(GC_LARGE_OBJECT_THRESHOLD as i64);
             }
             "storage-tlab" | "retry-tlab" | "limit-tlab" => {
-                willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+                // SAFETY: The fixture owns the stable TLAB through unregistration. The
+                // requested size and tracing metadata describe the object initialized here.
+                unsafe { willow_gc_alloc_slow(tls.as_ptr(), 0, 0, 8, 0) };
             }
             "negative-old" => {
                 willow_alloc(-1);
             }
             "negative-tlab" => {
-                willow_gc_alloc_slow(&mut tls, 0, 0, -1, 0);
+                // SAFETY: The fixture owns the stable TLAB through unregistration. The
+                // requested size and tracing metadata describe the object initialized here.
+                unsafe { willow_gc_alloc_slow(tls.as_ptr(), 0, 0, -1, 0) };
             }
             "null-tlab" => {
-                willow_gc_alloc_slow(std::ptr::null_mut(), 0, 0, 8, 0);
+                // SAFETY: Null TLAB storage takes the fatal argument path before registration
+                // or dereference.
+                unsafe { willow_gc_alloc_slow(std::ptr::null_mut(), 0, 0, 8, 0) };
             }
             "null-bitmap" => {
-                willow_gc_alloc_bitmap(1, 8, std::ptr::null());
+                // SAFETY: Null is rejected before any bitmap read.
+                unsafe { willow_gc_alloc_bitmap(1, 8, std::ptr::null()) };
             }
             "oversize" => {
                 willow_alloc(i64::MAX);

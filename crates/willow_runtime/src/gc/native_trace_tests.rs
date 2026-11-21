@@ -12,6 +12,7 @@ unsafe fn stopped(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     slots.push(payload.cast());
 }
 unsafe fn snapshot(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    // SAFETY: The live object's trace layout reserves these aligned pointer slots.
     children.push(unsafe { load_gc_reference(payload.cast()) });
 }
 unsafe fn slice(
@@ -20,6 +21,8 @@ unsafe fn slice(
     _: usize,
     children: &mut Vec<*mut u8>,
 ) -> TraceSliceProgress {
+    // SAFETY: The registered test callback forwards the live payload and cursor within the
+    // selected trace layout.
     unsafe { snapshot(payload, children) };
     TraceSliceProgress::Done
 }
@@ -27,7 +30,9 @@ unsafe fn slice(
 #[test]
 fn native_capability_registration_replacement_and_reset() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     const ID: u32 = 0xFA90;
     assert!(native_trace_modes().is_empty());
     for (capability, mode) in [
@@ -41,7 +46,9 @@ fn native_capability_registration_replacement_and_reset() {
             TraceMode::SliceConcurrentSafe,
         ),
     ] {
-        willow_register_type_capability(ID, stopped, capability);
+        // SAFETY: The fixture controls every instance of this ID and installs the matching
+        // stopped tracer and synchronized snapshot capability, if present.
+        unsafe { willow_register_type_capability(ID, stopped, capability) };
         assert_eq!(native_trace_modes(), [(ID, mode)]);
         let (legacy, traces, slices) = trace_registry_snapshot();
         assert!(legacy.contains(&ID));
@@ -49,7 +56,9 @@ fn native_capability_registration_replacement_and_reset() {
             trace_mode(traces.contains_key(&ID), slices.contains_key(&ID)),
             mode
         );
-        willow_register_type(ID, stopped);
+        // SAFETY: The fixture controls every instance of this ID and installs the matching
+        // stopped tracer and synchronized snapshot capability, if present.
+        unsafe { willow_register_type(ID, stopped) };
         assert_eq!(native_trace_modes(), [(ID, TraceMode::StopOnly)]);
         // Snapshot capability remains unchanged by replacement.
         assert_eq!(
@@ -57,10 +66,14 @@ fn native_capability_registration_replacement_and_reset() {
             mode
         );
     }
-    willow_unregister_type(ID);
+    // SAFETY: The fixture controls this ID and its remaining objects and collector epochs
+    // across the change.
+    unsafe { willow_unregister_type(ID) };
     assert!(native_trace_modes().is_empty());
     assert_eq!(trace_mode(true, true), TraceMode::SliceConcurrentSafe);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     assert!(native_trace::snapshot().is_empty());
 }
 
@@ -68,25 +81,36 @@ fn native_capability_registration_replacement_and_reset() {
 fn native_capability_sliced_graph_deduplicates_and_avoids_stopped_hooks() {
     let _guard = isolated_runtime();
     for count in [1, 16, 257] {
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         for id in [0xFA91, 0xFA92, 0xFA93] {
-            willow_register_type_capability(
-                id,
-                stopped,
-                NativeTraceCapability::SliceConcurrentSafe(slice),
-            );
+            // SAFETY: The fixture controls every instance of this ID and installs the
+            // matching stopped tracer and synchronized snapshot capability, if present.
+            unsafe {
+                willow_register_type_capability(
+                    id,
+                    stopped,
+                    NativeTraceCapability::SliceConcurrentSafe(slice),
+                )
+            };
         }
         let mut roots = Vec::with_capacity(count * 3);
         for id in [0xFA91, 0xFA92, 0xFA93] {
             for _ in 0..count {
-                let object = willow_alloc_object(id, 8);
+                // SAFETY: The requested layout describes the initialized words of this object
+                // and its type’s tracing or finalization contract.
+                let object = unsafe { willow_alloc_object(id, 8) };
+                // SAFETY: The live object's trace layout reserves these aligned pointer slots.
                 unsafe { store_gc_reference(object.cast(), object) };
                 roots.push(object);
             }
         }
         for root in &mut roots {
-            willow_push_root(root);
+            // SAFETY: The slot storage stays live and stationary through the matching pop,
+            // including during collection.
+            unsafe { willow_push_root(root) };
         }
         willow_gc_register_mutator();
         willow_gc_collect();
@@ -99,32 +123,49 @@ fn native_capability_sliced_graph_deduplicates_and_avoids_stopped_hooks() {
             "sliced graph never invokes stopped hooks"
         );
         for _ in &roots {
-            willow_pop_root();
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
         }
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         willow_gc_unregister_mutator();
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn native_capability_transitive_sliced_types_preserve_reachability() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     for id in [0xFA94, 0xFA95] {
-        willow_register_type_capability(
-            id,
-            stopped,
-            NativeTraceCapability::SliceConcurrentSafe(slice),
-        );
+        // SAFETY: The fixture controls every instance of this ID and installs the matching
+        // stopped tracer and synchronized snapshot capability, if present.
+        unsafe {
+            willow_register_type_capability(
+                id,
+                stopped,
+                NativeTraceCapability::SliceConcurrentSafe(slice),
+            )
+        };
     }
-    let mut parent = willow_alloc_object(0xFA94, 8);
-    let child = willow_alloc_object(0xFA95, 8);
+    // SAFETY: The requested layout describes the initialized words of this object and its
+    // type’s tracing or finalization contract.
+    let mut parent = unsafe { willow_alloc_object(0xFA94, 8) };
+    // SAFETY: The requested layout describes the initialized words of this object and its
+    // type’s tracing or finalization contract.
+    let child = unsafe { willow_alloc_object(0xFA95, 8) };
+    // SAFETY: The live object's trace layout reserves these aligned pointer slots.
     unsafe {
         store_gc_reference(parent.cast(), child);
     }
-    willow_push_root(&mut parent);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut parent) };
     willow_gc_register_mutator();
     willow_gc_collect();
     assert_eq!(
@@ -132,15 +173,21 @@ fn native_capability_transitive_sliced_types_preserve_reachability() {
         (2 * (GC_HEADER_SIZE + 8)) as i64
     );
     assert!(native_trace::snapshot().is_empty());
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
     willow_gc_unregister_mutator();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn native_capability_telemetry_unwind_and_reset() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let _ = std::panic::catch_unwind(|| {
         let mut counts = native_trace::Counts::default();
         counts.deferred(123);
@@ -158,7 +205,9 @@ fn native_capability_telemetry_unwind_and_reset() {
     );
     let mut stale = native_trace::Counts::default();
     stale.deferred(123);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     drop(stale);
     assert!(native_trace::snapshot().is_empty());
 }
@@ -168,26 +217,38 @@ fn native_capability_telemetry_unwind_and_reset() {
 fn native_capability_array_remark_measurement() {
     let _guard = isolated_runtime();
     for size in [4096, 32768, 262144] {
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
-        let mut array = crate::array::willow_array_new(size, 1);
-        willow_push_root(&mut array);
+        // SAFETY: Flag 1 allocates full-width reference slots.
+        let mut array = unsafe { crate::array::willow_array_new(size, 1) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut array) };
         let child = willow_alloc(8);
         for index in 0..size {
-            crate::array::willow_array_set(array, index, child as i64);
+            // SAFETY: The destination is the live fixture array; the element word matches its
+            // declared storage and tracing layout.
+            unsafe { crate::array::willow_array_set(array, index, child as i64) };
         }
         willow_gc_register_mutator();
         willow_gc_collect();
         assert!(native_trace::snapshot().is_empty());
         assert_eq!(
-            crate::array::willow_array_get(array, size - 1),
+            // SAFETY: The fixture retains the array allocated for these accesses.
+            unsafe { crate::array::willow_array_get(array, size - 1) },
             child as i64
         );
         assert!(willow_gc_allocated_bytes() > 0);
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
         willow_gc_unregister_mutator();
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 static SNAPSHOT_READY: crate::runtime::PerRuntime<std::sync::atomic::AtomicBool> =
@@ -212,27 +273,46 @@ unsafe fn wait_for_mutation(
 #[test]
 fn native_capability_sliced_slot_mutation_during_marking() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     SNAPSHOT_READY.store(false, Ordering::Relaxed);
     MUTATION_DONE.store(false, Ordering::Relaxed);
-    willow_register_type_capability(
-        0xFA96,
-        stopped,
-        NativeTraceCapability::SliceConcurrentSafe(wait_for_mutation),
-    );
-    willow_register_type_capability(
-        0xFA97,
-        stopped,
-        NativeTraceCapability::SliceConcurrentSafe(slice),
-    );
-    let mut control = willow_alloc_object(0xFA96, 8);
-    let mut source = willow_alloc_object(0xFA97, 8);
+    // SAFETY: The fixture controls every instance of this ID and installs the matching
+    // stopped tracer and synchronized snapshot capability, if present.
+    unsafe {
+        willow_register_type_capability(
+            0xFA96,
+            stopped,
+            NativeTraceCapability::SliceConcurrentSafe(wait_for_mutation),
+        )
+    };
+    // SAFETY: The fixture controls every instance of this ID and installs the matching
+    // stopped tracer and synchronized snapshot capability, if present.
+    unsafe {
+        willow_register_type_capability(
+            0xFA97,
+            stopped,
+            NativeTraceCapability::SliceConcurrentSafe(slice),
+        )
+    };
+    // SAFETY: The requested layout describes the initialized words of this object and its
+    // type’s tracing or finalization contract.
+    let mut control = unsafe { willow_alloc_object(0xFA96, 8) };
+    // SAFETY: The requested layout describes the initialized words of this object and its
+    // type’s tracing or finalization contract.
+    let mut source = unsafe { willow_alloc_object(0xFA97, 8) };
     let child = willow_alloc(8);
+    // SAFETY: The live object's trace layout reserves these aligned pointer slots.
     unsafe {
         store_gc_reference(source.cast(), child);
     }
-    willow_push_root(&mut control);
-    willow_push_root(&mut source);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe {
+        willow_push_root(&raw mut control);
+        willow_push_root(&raw mut source);
+    }
     willow_gc_register_mutator();
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let finish = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -247,13 +327,18 @@ fn native_capability_sliced_slot_mutation_during_marking() {
                 std::thread::yield_now();
             }
             let source = source as *mut u8;
-            willow_gc_write_barrier(
-                source,
-                child as *mut u8,
-                std::ptr::null_mut(),
-                GcStoreDestination::ObjectField as i64,
-            );
+            // SAFETY: The destination describes this reference update. Any asserted header
+            // belongs to its live GC payload.
+            unsafe {
+                willow_gc_write_barrier(
+                    source,
+                    child as *mut u8,
+                    std::ptr::null_mut(),
+                    GcStoreDestination::ObjectField as i64,
+                )
+            };
             // Atomic slot publication permits bounded concurrent snapshots.
+            // SAFETY: The live object's trace layout reserves these aligned pointer slots.
             unsafe {
                 store_gc_reference(source.cast(), std::ptr::null_mut());
             }
@@ -277,17 +362,25 @@ fn native_capability_sliced_slot_mutation_during_marking() {
         (3 * (GC_HEADER_SIZE + 8)) as i64
     );
     assert!(native_trace::snapshot().is_empty());
-    willow_pop_root();
-    willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe {
+        willow_pop_root();
+        willow_pop_root();
+    }
     willow_gc_unregister_mutator();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn native_capability_parallel_telemetry_aggregates_per_type() {
     let _guard = isolated_runtime();
     for types in [1, 16, 257] {
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(crate::runtime::serving(|| {
@@ -309,7 +402,9 @@ fn native_capability_parallel_telemetry_aggregates_per_type() {
             rows.len()
         );
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -317,20 +412,29 @@ fn native_capability_standard_container_inventory_survives_reset() {
     use willow_abi::runtime_type_ids::*;
     let _guard = isolated_runtime();
     for _ in 0..2 {
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         let mut roots = [
-            crate::array::willow_array_new(1, 1),
+            // SAFETY: Flag 1 allocates full-width reference slots.
+            unsafe { crate::array::willow_array_new(1, 1) },
             crate::map::willow_map_new(0, 0, 1),
             crate::channel::willow_channel_new(1).cast(),
-            crate::async_mutex::willow_async_mutex_new(0, 1).cast(),
-            crate::async_rwlock::willow_async_rwlock_new(0, 1).cast(),
-            crate::lock::willow_blocking_cell_new(0, 1).cast(),
-            crate::lock::willow_blocking_rw_cell_new(0, 1).cast(),
+            // SAFETY: The initial word matches the constructor’s reference flag.
+            unsafe { crate::async_mutex::willow_async_mutex_new(0, 1) }.cast(),
+            // SAFETY: The initial word matches the constructor’s reference flag.
+            unsafe { crate::async_rwlock::willow_async_rwlock_new(0, 1) }.cast(),
+            // SAFETY: Zero initializes an empty reference slot.
+            unsafe { crate::lock::willow_blocking_cell_new(0, 1) }.cast(),
+            // SAFETY: Zero initializes an empty reference slot.
+            unsafe { crate::lock::willow_blocking_rw_cell_new(0, 1) }.cast(),
             crate::cancellation::willow_task_scope_new(),
         ];
         for root in &mut roots {
-            willow_push_root(root);
+            // SAFETY: The slot storage stays live and stationary through the matching pop,
+            // including during collection.
+            unsafe { willow_push_root(root) };
         }
         let modes: IdMap<_, _> = native_trace_modes().into_iter().collect();
         assert_eq!(modes.len(), 8);
@@ -358,33 +462,51 @@ fn native_capability_standard_container_inventory_survives_reset() {
             "standard containers must not fall back"
         );
         for _ in &roots {
-            willow_pop_root();
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_root() };
         }
         willow_gc_unregister_mutator();
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn native_capability_registration_snapshot_is_coherent() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     const ID: u32 = 0xFA98;
-    willow_register_type(ID, stopped);
+    // SAFETY: The fixture controls every instance of this ID and installs the matching
+    // stopped tracer and synchronized snapshot capability, if present.
+    unsafe { willow_register_type(ID, stopped) };
     std::thread::scope(|scope| {
         scope.spawn(crate::runtime::serving(|| {
             for _ in 0..1024 {
-                willow_register_type_capability(
-                    ID,
-                    stopped,
-                    NativeTraceCapability::ConcurrentSafe(snapshot),
-                );
-                willow_register_type_capability(
-                    ID,
-                    stopped,
-                    NativeTraceCapability::SliceConcurrentSafe(slice),
-                );
-                willow_register_type(ID, stopped);
+                // SAFETY: The fixture controls every instance of this ID and installs the
+                // matching stopped tracer and synchronized snapshot capability, if present.
+                unsafe {
+                    willow_register_type_capability(
+                        ID,
+                        stopped,
+                        NativeTraceCapability::ConcurrentSafe(snapshot),
+                    )
+                };
+                // SAFETY: The fixture controls every instance of this ID and installs the
+                // matching stopped tracer and synchronized snapshot capability, if present.
+                unsafe {
+                    willow_register_type_capability(
+                        ID,
+                        stopped,
+                        NativeTraceCapability::SliceConcurrentSafe(slice),
+                    )
+                };
+                // SAFETY: The fixture controls every instance of this ID and installs the
+                // matching stopped tracer and synchronized snapshot capability, if present.
+                unsafe { willow_register_type(ID, stopped) };
             }
         }));
         for _ in 0..1024 {
@@ -393,5 +515,7 @@ fn native_capability_registration_snapshot_is_coherent() {
             assert!(!(traces.contains_key(&ID) && slices.contains_key(&ID)));
         }
     });
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }

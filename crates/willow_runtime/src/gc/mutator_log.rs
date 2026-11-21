@@ -300,6 +300,8 @@ impl MutatorLog {
         reason = "only the bound owner thread, or a stopper while it is parked, reaches the log"
     )]
     unsafe fn edges(&self) -> &mut Vec<Edge> {
+        // SAFETY: The registered mutator owns its log exclusively while running. Collector-side
+        // access is restricted to stopped owners.
         unsafe { &mut *self.edges.get() }
     }
 
@@ -310,6 +312,8 @@ impl MutatorLog {
         reason = "only the bound owner thread, or a stopper while it is parked, reaches the log"
     )]
     unsafe fn roots(&self) -> &mut Vec<(usize, isize)> {
+        // SAFETY: The registered mutator owns its log exclusively while running. Collector-side
+        // access is restricted to stopped owners.
         unsafe { &mut *self.roots.get() }
     }
 
@@ -320,6 +324,8 @@ impl MutatorLog {
         reason = "only the bound owner thread, or a stopper while it is parked, reaches the log"
     )]
     pub(super) unsafe fn publication(&self) -> &mut PublicationLog {
+        // SAFETY: The registered mutator owns its log exclusively while running. Collector-side
+        // access is restricted to stopped owners.
         unsafe { &mut *self.publication.get() }
     }
 
@@ -330,6 +336,8 @@ impl MutatorLog {
         reason = "only the bound owner thread, or a stopper while it is parked, reaches the log"
     )]
     unsafe fn young_chunks(&self) -> &mut YoungChunks {
+        // SAFETY: The registered mutator owns its log exclusively while running. Collector-side
+        // access is restricted to stopped owners.
         unsafe { &mut *self.young_chunks.get() }
     }
 
@@ -340,6 +348,8 @@ impl MutatorLog {
         reason = "only the bound owner thread, or a stopper while it is parked, reaches the log"
     )]
     unsafe fn old_values(&self) -> &mut OldValues {
+        // SAFETY: The registered mutator owns its log exclusively while running. Collector-side
+        // access is restricted to stopped owners.
         unsafe { &mut *self.old_values.get() }
     }
 
@@ -348,6 +358,8 @@ impl MutatorLog {
     /// # Safety
     /// As for [`Self::edges`].
     pub(super) unsafe fn note_young_chunk(&self, base: usize) {
+        // SAFETY: The registered mutator owns its log exclusively while running. Collector-side
+        // access is restricted to stopped owners.
         unsafe { self.young_chunks() }.note(base);
     }
 
@@ -358,6 +370,8 @@ impl MutatorLog {
     /// # Safety
     /// As for [`Self::edges`].
     unsafe fn is_empty(&self) -> bool {
+        // SAFETY: The registered mutator owns its log exclusively while running. Collector-side
+        // access is restricted to stopped owners.
         unsafe {
             self.edges().is_empty() && self.roots().is_empty() && self.publication().is_empty()
         }
@@ -425,11 +439,16 @@ fn try_claim_remembered(owner: usize) -> bool {
 /// `owner_proven` means the inline-filter facts hold for `owner`: it is an
 /// old, unremembered payload start and `slot` is not an interior reference.
 /// `value_proven` means the value's header proved it is not old.
+///
+/// # Safety
+/// A proven owner must be the current managed payload start in runtime_owner. A proven
+/// value must be a live young payload in that runtime. A non-null slot identifies the
+/// updated word, or a numeric candidate rejected by the checked card lookup.
 #[allow(
     clippy::too_many_arguments,
     reason = "the barrier's store facts are passed through unpacked on the store path"
 )]
-pub(super) fn record_edge_in(
+pub(super) unsafe fn record_edge_in(
     runtime_owner: &crate::runtime::Runtime,
     owner: *mut u8,
     slot: *mut u8,
@@ -680,10 +699,14 @@ pub(super) fn flush_current_in(owner: &crate::runtime::Runtime) {
         // SAFETY: as above; a different cell from `edges`.
         flush_edges(owner, edges, unsafe { log.old_values() }, serves_thread);
     }
+    // SAFETY: The registered mutator owns its log exclusively while running. Collector-side access
+    // is restricted to stopped owners.
     let roots = unsafe { log.roots() };
     if !roots.is_empty() {
         flush_roots(&owner.gc, log, roots);
     }
+    // SAFETY: The registered mutator owns its log exclusively while running. Collector-side access
+    // is restricted to stopped owners.
     let publication = unsafe { log.publication() };
     if !publication.is_empty() {
         flush_publication(owner, publication);
@@ -718,8 +741,12 @@ pub(super) fn drain_stopped(owner: &crate::runtime::Runtime, coord: &GcCoord) {
     // This stop may change generations or reuse chunk storage, so no chunk
     // installed before it proves an address young any more.
     for log in logs() {
+        // SAFETY: The registered mutator owns its log exclusively while running. Collector-side
+        // access is restricted to stopped owners.
         *unsafe { log.young_chunks() } = YoungChunks::default();
     }
+    // SAFETY: The registered mutator owns its log exclusively while running. Collector-side access
+    // is restricted to stopped owners.
     if logs().all(|log| unsafe { log.is_empty() }) {
         return;
     }
@@ -731,18 +758,24 @@ pub(super) fn drain_stopped(owner: &crate::runtime::Runtime, coord: &GcCoord) {
     {
         let mut state = owner.gc.heap.lock().unwrap();
         for log in logs() {
+            // SAFETY: The registered mutator owns its log exclusively while running.
+            // Collector-side access is restricted to stopped owners.
             let edges = unsafe { log.edges() };
             entries += edges.len() as u64;
             // Another thread's card cache is not ours to fill.
             // A collection may follow in this stop and add survivor chunks
             // after the drain, so nothing is cached here.
             apply_edges(&mut state, edges, |_, _| {}, |_| {});
+            // SAFETY: The registered mutator owns its log exclusively while running.
+            // Collector-side access is restricted to stopped owners.
             let publication = unsafe { log.publication() };
             entries += publication.owners.len() as u64;
             publication.apply(&mut state, &owner.gc.publication);
         }
     }
     for log in logs() {
+        // SAFETY: The registered mutator owns its log exclusively while running. Collector-side
+        // access is restricted to stopped owners.
         let roots = unsafe { log.roots() };
         entries += roots.len() as u64;
         apply_roots(&owner.gc, log, roots);
@@ -873,6 +906,8 @@ pub(super) fn old_value_drops_for_test() -> u64 {
 pub(super) fn note_old_value_for_test(owner: &crate::runtime::Runtime, value: usize) {
     let epoch = owner.gc.chunk_epoch.load(Ordering::Relaxed);
     let log = bound_in(&owner.gc).unwrap();
+    // SAFETY: The registered mutator owns its log exclusively while running. Collector-side access
+    // is restricted to stopped owners.
     unsafe { log.old_values() }.note(value, epoch);
 }
 

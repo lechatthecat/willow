@@ -962,6 +962,81 @@ fn aggregate_bridge_panics_and_invalid_bytes_are_diagnostics() {
     }
 }
 
+// Link the observer into the test executable. The reviewed Rust bridge keeps the
+// addresses and counters, while the host allocator observes actual frees on every path.
+fn run_byte_lifetime_probe(f: &Fixture) -> Output {
+    use willow_compiler::toolchain::{HostToolchain, Toolchain};
+
+    f.successful(&["build", "--offline", "-o", "byte-lifetime"]);
+    let object = f.root.join(if cfg!(target_env = "msvc") {
+        "byte-lifetime.obj"
+    } else {
+        "byte-lifetime.o"
+    });
+    // Each fixture has a private build cache and builds exactly one bridge archive.
+    let archive_name = if cfg!(target_env = "msvc") {
+        "willow_generated_bridge.lib"
+    } else {
+        "libwillow_generated_bridge.a"
+    };
+    let archives: Vec<_> = fs::read_dir(f.temp.join("home/.willow/build"))
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .join("rust-bridge/target")
+                .join(target_lexicon::HOST.to_string())
+                .join("debug")
+                .join(archive_name)
+        })
+        .filter(|archive| archive.is_file())
+        .collect();
+    let [archive] = archives.as_slice() else {
+        panic!("expected one bridge archive: {archives:?}")
+    };
+    let toolchain = HostToolchain::new(&willow_compiler::CompilerOptions::debug().target);
+    let runtime = toolchain.resolve_runtime_library().unwrap();
+    let executable = f
+        .temp
+        .join(format!("observed{}", std::env::consts::EXE_SUFFIX));
+    let mut compiler = Command::new("rustc");
+    compiler
+        .arg("--edition=2024")
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/rust_bridge/byte_lifetime_allocator.rs"),
+        )
+        .arg("-o")
+        .arg(&executable);
+    if cfg!(target_os = "linux") {
+        // Willow emits non-PIE objects on Linux.
+        compiler.args(["-C", "relocation-model=static"]);
+    }
+    for input in [&object, archive, &runtime] {
+        let mut arg = std::ffi::OsString::from("link-arg=");
+        arg.push(input);
+        compiler.arg("-C").arg(arg);
+    }
+    if cfg!(target_env = "msvc") {
+        compiler.args(["-l", "psapi", "-l", "dbghelp", "-l", "ws2_32"]);
+    }
+    if cfg!(target_os = "macos") {
+        compiler.args(["-l", "iconv"]);
+    }
+    let link = compiler.output().unwrap();
+    assert!(
+        link.status.success(),
+        "{}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    Command::new(executable)
+        .current_dir(&f.root)
+        .env("WILLOW_GC_STRESS", "alloc,relocate")
+        .output()
+        .unwrap()
+}
+
 #[test]
 fn packed_byte_bridge_gc_task_and_panic_release_exactly_once() {
     let rust = include_str!("fixtures/rust_bridge/byte_lifetime.rs");
@@ -1004,10 +1079,7 @@ fn packed_byte_bridge_gc_task_and_panic_release_exactly_once() {
             } else {
                 f.sources(&willow, &rust);
             }
-            let output = f.command_env(
-                &["run", "--offline"],
-                &[("WILLOW_GC_STRESS", "alloc,relocate")],
-            );
+            let output = run_byte_lifetime_probe(&f);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert_eq!(output.status.success(), !fail, "{stderr}");
             assert_eq!(stderr.matches("BYTE_INPUT_RELEASED").count(), 1, "{stderr}");

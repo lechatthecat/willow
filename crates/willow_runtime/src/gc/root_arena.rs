@@ -60,7 +60,9 @@ impl GcRootHandle {
     /// This operation does not safepoint. Reload after every GC point.
     pub(crate) fn new(value: *mut u8) -> Self {
         let cell = Arc::new(GcRootCell(std::sync::atomic::AtomicPtr::new(value)));
-        willow_gc_add_runtime_root_slot(cell.0.as_ptr());
+        // SAFETY: The handle owns the initialized Arc-backed atomic slot until registration
+        // is removed in Drop.
+        unsafe { willow_gc_add_runtime_root_slot(cell.0.as_ptr()) };
         Self {
             cell: CellOwner::Registered(cell),
             owner: None,
@@ -75,7 +77,9 @@ impl GcRootHandle {
     pub(crate) fn new_in(owner: Arc<crate::runtime::Runtime>, value: *mut u8) -> Self {
         super::publish::publish_in(&owner, value, super::PublicationPoint::RuntimeRoot, false);
         let cell = Arc::new(GcRootCell(std::sync::atomic::AtomicPtr::new(value)));
-        root::add_runtime_root_slot_in(&owner, cell.0.as_ptr());
+        // SAFETY: The handle owns the initialized Arc-backed atomic slot until registration
+        // is removed in Drop.
+        unsafe { root::add_runtime_root_slot_in(&owner, cell.0.as_ptr()) };
         Self {
             cell: CellOwner::Registered(cell),
             owner: Some(owner),
@@ -103,14 +107,18 @@ impl GcRootHandle {
             super::publish::publish_in(owner, value, super::PublicationPoint::RuntimeRoot, false);
         }
         self.cell.cell().replace(value, |old| {
-            barrier::write_barrier_in(
-                self.owner(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                old,
-                value,
-                GcStoreDestination::GlobalStatic as i64,
-            );
+            // SAFETY: The cell supplies its previous and incoming references without
+            // asserting either header proof.
+            unsafe {
+                barrier::write_barrier_in(
+                    self.owner(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    old,
+                    value,
+                    GcStoreDestination::GlobalStatic as i64,
+                )
+            };
         });
     }
 
@@ -125,7 +133,9 @@ impl Drop for GcRootHandle {
     fn drop(&mut self) {
         self.release();
         if matches!(self.cell, CellOwner::Registered(_)) {
-            root::remove_runtime_root_slot_in(self.owner(), self.slot());
+            // SAFETY: The handle owns the initialized Arc-backed atomic slot until
+            // registration is removed in Drop.
+            unsafe { root::remove_runtime_root_slot_in(self.owner(), self.slot()) };
         }
     }
 }
@@ -161,6 +171,8 @@ impl PinLease<InteriorPointer> {
                         // The caller borrows an already published allocation;
                         // start bits only select headers at/before that address.
                         let object =
+                            // SAFETY: Allocation metadata identifies a header-aligned object start
+                            // within this live region or chunk.
                             HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())?;
                         (object.allocated()
                             && address as usize >= object.payload().as_ptr() as usize
@@ -263,23 +275,34 @@ impl Default for GcRootArena {
 }
 
 impl GcRootArena {
-    pub(crate) fn insert(&self, owner: *mut u8, value: *mut u8) -> GcRootHandle {
+    /// # Safety
+    /// A non-null owner and value must be current, live GC payload starts with headers in this
+    /// runtime. The arena registers the incoming reference for tracing.
+    pub(crate) unsafe fn insert(&self, owner: *mut u8, value: *mut u8) -> GcRootHandle {
         if owner.is_null() {
-            willow_gc_write_barrier(
-                owner,
-                std::ptr::null_mut(),
-                value,
-                GcStoreDestination::ContainerInternal as i64,
-            );
+            // SAFETY: The cell supplies its previous and incoming references without
+            // asserting either header proof.
+            unsafe {
+                willow_gc_write_barrier(
+                    owner,
+                    std::ptr::null_mut(),
+                    value,
+                    GcStoreDestination::ContainerInternal as i64,
+                )
+            };
         } else {
             // Owners are object payload starts and so are their values, which
             // lets an old value skip the heap lock while marking is inactive.
-            write_barrier_object_owner(
-                owner,
-                std::ptr::null_mut(),
-                value,
-                GcStoreDestination::ContainerInternal as i64,
-            );
+            // SAFETY: The arena caller supplies the managed owner and its incoming managed
+            // reference for the new cell.
+            unsafe {
+                write_barrier_object_owner(
+                    owner,
+                    std::ptr::null_mut(),
+                    value,
+                    GcStoreDestination::ContainerInternal as i64,
+                )
+            };
         }
         let mut cells = self
             .cells

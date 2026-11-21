@@ -52,6 +52,8 @@ impl EpochData {
     }
     pub(super) unsafe fn claimed_metadata(&self, address: usize) -> raw_heap::TraceMetadata {
         match self {
+            // SAFETY: Only the worker that claimed this live epoch entry reads its metadata,
+            // before the epoch is retired.
             Self::Regions(index) => unsafe { index.claimed_metadata(address) },
             Self::Synthetic { objects, .. } => {
                 objects.get(&address).expect("claimed test object exists").0

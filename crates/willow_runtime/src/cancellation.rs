@@ -41,6 +41,7 @@ impl NativeFrameSpec for ScopeFinishFrame {
 }
 
 unsafe fn scope_finish_frame(frame: *mut c_void) -> NativeTaskFrame<ScopeFinishFrame> {
+    // SAFETY: The caller supplies a live frame allocated with ScopeFinishFrame's layout.
     unsafe { NativeTaskFrame::from_raw(frame) }
 }
 
@@ -229,7 +230,10 @@ struct TaskScopeHandle {
 }
 
 impl ScopeCore {
-    fn add(&self, id: u64, frame: *mut u8) {
+    /// # Safety
+    /// A non-null frame must be the current payload of the live task frame identified by id
+    /// and remain reachable through registration.
+    unsafe fn add(&self, id: u64, frame: *mut u8) {
         let cancel_now = {
             let mut state = self
                 .state
@@ -247,9 +251,12 @@ impl ScopeCore {
                 if state.task_ids.insert(id) {
                     state.tasks.push(ScopedTask {
                         id,
-                        frame: self
-                            .roots
-                            .insert(self.gc_handle.load(Ordering::Acquire), frame),
+                        // SAFETY: The scope retains its managed owner and attaches a current
+                        // live task frame; both non-null addresses are GC payload starts.
+                        frame: unsafe {
+                            self.roots
+                                .insert(self.gc_handle.load(Ordering::Acquire), frame)
+                        },
                     });
                 }
                 false
@@ -389,25 +396,22 @@ impl ScopeCore {
     }
 
     fn finish_local(&self) -> bool {
-        let (task_frames, children, already_finished) = {
+        let (terminal_cancelled, children) = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.closing = true;
-            (
-                state
-                    .tasks
-                    .iter()
-                    .map(|task| task.frame.load())
-                    .collect::<Vec<_>>(),
-                state.children.clone(),
-                state.finished.then_some(state.saw_cancelled),
-            )
+            if state.finished {
+                return state.saw_cancelled;
+            }
+            let terminal_cancelled = state.tasks.iter().any(|task| {
+                // SAFETY: The scope retains this frame and the state lock excludes its release.
+                (unsafe { crate::async_frame::frame_terminal_status(task.frame.load().cast()) })
+                    == crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED
+            });
+            (terminal_cancelled, state.children.clone())
         };
-        if let Some(cancelled) = already_finished {
-            return cancelled;
-        }
         let child_cancelled = children.iter().any(|child| {
             child
                 .state
@@ -415,11 +419,6 @@ impl ScopeCore {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .saw_cancelled
         });
-        let terminal_cancelled = task_frames.iter().any(|frame| {
-            crate::async_frame::frame_terminal_status((*frame).cast())
-                == crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED
-        });
-
         let mut state = self
             .state
             .lock()
@@ -478,6 +477,7 @@ impl ScopeCore {
 }
 
 unsafe fn trace_task_scope(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+    // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
     let handle = unsafe { &*payload.cast::<TaskScopeHandle>() };
     handle.core.roots.trace_slots(slots);
     let state = handle
@@ -495,6 +495,7 @@ unsafe fn snapshot_task_scope_slice(
     children: &mut Vec<*mut u8>,
 ) -> crate::gc::TraceSliceProgress {
     use crate::gc::TraceSliceProgress;
+    // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
     let handle = unsafe { &*payload.cast::<TaskScopeHandle>() };
     let mut state = match handle.core.state.try_lock() {
         Ok(state) => state,
@@ -543,42 +544,63 @@ unsafe fn snapshot_task_scope_slice(
 }
 
 unsafe fn drop_cancellation_token(payload: *mut u8) {
+    // SAFETY: Sweep calls the registered finalizer once on the initialized handle in word-aligned
+    // GC storage.
     unsafe { std::ptr::drop_in_place(payload.cast::<CancellationTokenHandle>()) };
 }
 
 unsafe fn drop_task_scope(payload: *mut u8) {
+    // SAFETY: Sweep calls the registered finalizer once on the initialized handle in word-aligned
+    // GC storage.
     unsafe { std::ptr::drop_in_place(payload.cast::<TaskScopeHandle>()) };
 }
 
 const CANCELLATION_REGISTRATION: crate::gc::NativeGcRegistration =
     crate::gc::NativeGcRegistration::Cancellation;
 const CANCELLATION_GC_TYPES: &[crate::gc::NativeGcType] = &[
-    crate::gc::NativeGcType::new(
-        CANCELLATION_TOKEN_TYPE_ID,
-        None,
-        Some(drop_cancellation_token),
-    ),
-    crate::gc::NativeGcType::new(
-        TASK_SCOPE_TYPE_ID,
-        Some(trace_task_scope),
-        Some(drop_task_scope),
-    )
-    .with_concurrent_slice(snapshot_task_scope_slice),
+    // SAFETY: The token or task scope constructor installs this ID only on its matching
+    // initialized representation. The callbacks use that same layout.
+    unsafe {
+        crate::gc::NativeGcType::new(
+            CANCELLATION_TOKEN_TYPE_ID,
+            None,
+            Some(drop_cancellation_token),
+        )
+    },
+    // SAFETY: The scope constructor initializes its Arc-backed scope handle. Stopped
+    // tracing visits its arena cells and the concurrent slice reads a bounded, synchronized
+    // range.
+    unsafe {
+        crate::gc::NativeGcType::new(
+            TASK_SCOPE_TYPE_ID,
+            Some(trace_task_scope),
+            Some(drop_task_scope),
+        )
+        .with_concurrent_slice(snapshot_task_scope_slice)
+    },
 ];
 
 fn ensure_registered() {
-    CANCELLATION_REGISTRATION.ensure(CANCELLATION_GC_TYPES);
+    // SAFETY: This is the complete descriptor set for the token or task scope registration
+    // group and its constructors.
+    unsafe { CANCELLATION_REGISTRATION.ensure(CANCELLATION_GC_TYPES) };
 }
 
 fn alloc_token(core: Arc<CancellationCore>) -> *mut u8 {
     ensure_registered();
-    let payload = crate::gc::willow_alloc_with_layout(
-        GcObjectKind::Class,
-        CANCELLATION_TOKEN_TYPE_ID,
-        std::mem::size_of::<CancellationTokenHandle>() as i64,
-        0,
-    );
+    const { assert!(align_of::<CancellationTokenHandle>() <= align_of::<crate::gc::GcHeader>()) };
+    // SAFETY: The constructor selects the matching payload layout and initializes its fields
+    // before exposing it or reaching a GC point.
+    let payload = unsafe {
+        crate::gc::willow_alloc_with_layout(
+            GcObjectKind::Class,
+            CANCELLATION_TOKEN_TYPE_ID,
+            std::mem::size_of::<CancellationTokenHandle>() as i64,
+            0,
+        )
+    };
     if !payload.is_null() {
+        // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
         unsafe {
             payload
                 .cast::<CancellationTokenHandle>()
@@ -590,13 +612,19 @@ fn alloc_token(core: Arc<CancellationCore>) -> *mut u8 {
 
 fn alloc_scope(core: Arc<ScopeCore>) -> *mut u8 {
     ensure_registered();
-    let payload = crate::gc::willow_alloc_with_layout(
-        GcObjectKind::Class,
-        TASK_SCOPE_TYPE_ID,
-        std::mem::size_of::<TaskScopeHandle>() as i64,
-        0,
-    );
+    const { assert!(align_of::<TaskScopeHandle>() <= align_of::<crate::gc::GcHeader>()) };
+    // SAFETY: The constructor selects the matching payload layout and initializes its fields
+    // before exposing it or reaching a GC point.
+    let payload = unsafe {
+        crate::gc::willow_alloc_with_layout(
+            GcObjectKind::Class,
+            TASK_SCOPE_TYPE_ID,
+            std::mem::size_of::<TaskScopeHandle>() as i64,
+            0,
+        )
+    };
     if !payload.is_null() {
+        // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
         unsafe {
             payload.cast::<TaskScopeHandle>().write(TaskScopeHandle {
                 core: Arc::clone(&core),
@@ -612,14 +640,18 @@ fn alloc_scope(core: Arc<ScopeCore>) -> *mut u8 {
 }
 
 unsafe fn token<'a>(payload: *mut u8) -> Option<&'a CancellationTokenHandle> {
+    // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
     unsafe { payload.cast::<CancellationTokenHandle>().as_ref() }
 }
 
 unsafe fn scope<'a>(payload: *mut u8) -> Option<&'a TaskScopeHandle> {
+    // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
     unsafe { payload.cast::<TaskScopeHandle>().as_ref() }
 }
 
 unsafe fn frame_slot<T>(frame: *mut c_void, slot: usize) -> *mut T {
+    // SAFETY: The frame allocator provides the word-aligned task header and the ABI slot lies
+    // within it.
     unsafe {
         (frame as *mut u8)
             .add(crate::async_frame::async_frame_slot_offset(slot))
@@ -627,10 +659,15 @@ unsafe fn frame_slot<T>(frame: *mut c_void, slot: usize) -> *mut T {
     }
 }
 
-fn task_id(frame: *mut u8) -> u64 {
+/// # Safety
+/// A non-null frame must remain live with its aligned task-ID slot initialized for this
+/// read.
+unsafe fn task_id(frame: *mut u8) -> u64 {
     if frame.is_null() {
         return 0;
     }
+    // SAFETY: The frame allocator provides the word-aligned task header and the ABI slot lies
+    // within it.
     unsafe { *frame_slot::<u64>(frame.cast(), TASK_ID_SLOT) }
 }
 
@@ -640,38 +677,58 @@ pub extern "C" fn willow_cancellation_token_new() -> *mut u8 {
     alloc_token(Arc::new(CancellationCore::default()))
 }
 
+/// # Safety
+/// Each non-null cancellation token handle must be a live, aligned payload from the matching
+/// constructor in this runtime and remain reachable throughout the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_cancellation_token_child(parent: *mut u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_cancellation_token_child(parent: *mut u8) -> *mut u8 {
+    // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
     let Some(parent) = (unsafe { token(parent) }) else {
         return std::ptr::null_mut();
     };
     alloc_token(parent.core.child())
 }
 
+/// # Safety
+/// Each non-null cancellation token handle must be a live, aligned payload from the matching
+/// constructor in this runtime and remain reachable throughout the call. A non-null
+/// task_frame must be a live scheduled async frame with its aligned task-ID slot
+/// initialized; keep it live through the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_cancellation_token_attach(
+pub unsafe extern "C" fn willow_cancellation_token_attach(
     token_handle: *mut u8,
     task_frame: *mut u8,
 ) -> *mut u8 {
+    // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
     if let Some(token) = unsafe { token(token_handle) } {
-        token.core.attach(task_id(task_frame));
+        // SAFETY: The caller supplies the matching live task frame with its initialized task-
+        // ID slot.
+        token.core.attach(unsafe { task_id(task_frame) });
     }
     task_frame
 }
 
+/// # Safety
+/// Each non-null cancellation token handle must be a live, aligned payload from the matching
+/// constructor in this runtime and remain reachable throughout the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_cancellation_token_cancel(token_handle: *mut u8) {
+pub unsafe extern "C" fn willow_cancellation_token_cancel(token_handle: *mut u8) {
+    // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
     if let Some(token) = unsafe { token(token_handle) } {
         token.core.cancel();
     }
 }
 
+/// # Safety
+/// Each non-null cancellation token handle must be a live, aligned payload from the matching
+/// constructor in this runtime and remain reachable throughout the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_cancellation_token_is_cancelled(token_handle: *mut u8) -> i64 {
+pub unsafe extern "C" fn willow_cancellation_token_is_cancelled(token_handle: *mut u8) -> i64 {
+    // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
     unsafe { token(token_handle) }
         .is_some_and(|token| token.core.cancelled.load(Ordering::Acquire))
         .into()
@@ -683,46 +740,78 @@ pub extern "C" fn willow_task_scope_new() -> *mut u8 {
     alloc_scope(Arc::new(ScopeCore::default()))
 }
 
+/// # Safety
+/// Each non-null task scope handle must be a live, aligned payload from the matching
+/// constructor in this runtime and remain reachable throughout the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_task_scope_child(parent: *mut u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_task_scope_child(parent: *mut u8) -> *mut u8 {
+    // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
     let Some(parent) = (unsafe { scope(parent) }) else {
         return std::ptr::null_mut();
     };
     alloc_scope(parent.core.child())
 }
 
+/// # Safety
+/// Each non-null task scope handle must be a live, aligned payload from the matching
+/// constructor in this runtime and remain reachable throughout the call. A non-null
+/// task_frame must be a live scheduled async frame with its aligned task-ID slot
+/// initialized; keep it live through the call.
+///
+/// ```compile_fail,E0133
+/// willow_runtime::cancellation::willow_task_scope_add(std::ptr::null_mut(), std::ptr::null_mut());
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_task_scope_add(scope_handle: *mut u8, task_frame: *mut u8) -> *mut u8 {
+pub unsafe extern "C" fn willow_task_scope_add(
+    scope_handle: *mut u8,
+    task_frame: *mut u8,
+) -> *mut u8 {
+    // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
     if let Some(scope) = unsafe { scope(scope_handle) } {
-        scope.core.add(task_id(task_frame), task_frame);
+        // SAFETY: The caller supplies the matching live task frame with its initialized task-
+        // ID slot.
+        // SAFETY: The caller attaches this current frame to its matching task ID.
+        unsafe { scope.core.add(task_id(task_frame), task_frame) };
     }
     task_frame
 }
 
+/// # Safety
+/// Each non-null task scope handle must be a live, aligned payload from the matching
+/// constructor in this runtime and remain reachable throughout the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_task_scope_cancel(scope_handle: *mut u8) {
+pub unsafe extern "C" fn willow_task_scope_cancel(scope_handle: *mut u8) {
+    // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
     if let Some(scope) = unsafe { scope(scope_handle) } {
         scope.core.cancel();
     }
 }
 
+/// # Safety
+/// Each non-null task scope handle must be a live, aligned payload from the matching
+/// constructor in this runtime and remain reachable throughout the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_task_scope_is_cancelled(scope_handle: *mut u8) -> i64 {
+pub unsafe extern "C" fn willow_task_scope_is_cancelled(scope_handle: *mut u8) -> i64 {
+    // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
     unsafe { scope(scope_handle) }
         .is_some_and(|scope| scope.core.cancelled.load(Ordering::Acquire))
         .into()
 }
 
 fn alloc_cancelled_result() -> *mut u8 {
-    crate::gc::willow_alloc_enum_variant(
-        0,
-        willow_abi::EnumVariantLayout::new(1, &[willow_abi::SlotKind::Word]),
-        &[0], // fieldless Cancelled is the immediate tag 0
-    )
+    // SAFETY: The variant layout selects its initialized word or reference payload, including
+    // the traced low word for a pair.
+    unsafe {
+        crate::gc::willow_alloc_enum_variant(
+            0,
+            willow_abi::EnumVariantLayout::new(1, &[willow_abi::SlotKind::Word]),
+            &[0], // fieldless Cancelled is the immediate tag 0
+        )
+    }
 }
 
 // Retain traversal positions, never loaded managed pointers, across polls.
@@ -779,7 +868,9 @@ impl ScopeFinishTraversal {
                 if let Some(task) = state.tasks.get(cursor.next_task) {
                     self.counts.observe_mut(|counts| counts[1] += 1);
                     let status =
-                        crate::async_frame::frame_terminal_status(task.frame.load().cast());
+                        // SAFETY: The frame owner retains the initialized ABI status word
+                        // through this atomic access.
+                        unsafe { crate::async_frame::frame_terminal_status(task.frame.load().cast()) };
                     if status == crate::async_frame::WILLOW_FRAME_STATUS_PENDING {
                         let id = task.id;
                         drop(state);
@@ -818,13 +909,19 @@ impl ScopeFinishTraversal {
 }
 
 unsafe fn finish_state(frame: *mut c_void) -> Option<Arc<ScopeFinishState>> {
+    // SAFETY: The caller retains the scope-finish frame while loading its native state slot.
     let raw = unsafe { scope_finish_frame(frame) }
         .load_native::<Arc<ScopeFinishState>>(SCOPE_FINISH_STATE_SLOT);
     // Own a strong reference across polling and frame-slot cleanup.
+    // SAFETY: A non-null slot points into the frame's Box<Arc<ScopeFinishState>>.
+    // The exclusive callback clones the Arc before cleanup can free the box.
     unsafe { raw.as_ref() }.cloned()
 }
 
 unsafe fn finish_scope_task(frame: *mut c_void, result: *mut u8) -> i32 {
+    // SAFETY: The scheduler retains this scope-finish frame and serializes completion
+    // with cancellation. willow_task_scope_finish stored a Box::into_raw pointer in the
+    // state slot. take_native clears the slot, giving this poll the non-null box exactly once.
     unsafe {
         let frame = scope_finish_frame(frame);
         frame.store_gc(SCOPE_FINISH_RESULT_SLOT, result);
@@ -838,6 +935,8 @@ unsafe fn finish_scope_task(frame: *mut c_void, result: *mut u8) -> i32 {
 
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_scope_finish(frame: *mut c_void) -> i32 {
+    // SAFETY: The scheduler supplies the live scope-finish frame and holds the poll
+    // claim while finish_state clones the Arc.
     let Some(state) = (unsafe { finish_state(frame) }) else {
         return crate::task::RUNTIME_POLL_READY;
     };
@@ -856,11 +955,16 @@ unsafe extern "C" fn poll_scope_finish(frame: *mut c_void) -> i32 {
     } else {
         crate::fs::alloc_ok(0, false)
     };
+    // SAFETY: This poll still has exclusive callback access to the frame, and the
+    // result is ready for its GC-reference slot.
     unsafe { finish_scope_task(frame, result) }
 }
 
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn cancel_scope_finish(frame: *mut c_void) {
+    // SAFETY: The scheduler retains the scope-finish frame and excludes a concurrent
+    // completion poll. take_native clears the slot initialized by willow_task_scope_finish
+    // with Box::into_raw. Only the callback that takes a non-null pointer can drop the box.
     unsafe {
         let raw =
             scope_finish_frame(frame).take_native::<Arc<ScopeFinishState>>(SCOPE_FINISH_STATE_SLOT);
@@ -870,9 +974,13 @@ unsafe extern "C" fn cancel_scope_finish(frame: *mut c_void) {
     }
 }
 
+/// # Safety
+/// Each non-null task scope handle must be a live, aligned payload from the matching
+/// constructor in this runtime and remain reachable throughout the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_task_scope_finish(scope_handle: *mut u8) -> *mut c_void {
+pub unsafe extern "C" fn willow_task_scope_finish(scope_handle: *mut u8) -> *mut c_void {
+    // SAFETY: The handle constructor reserves word-aligned GC storage for this payload type.
     let Some(scope) = (unsafe { scope(scope_handle) }) else {
         return std::ptr::null_mut();
     };
@@ -888,12 +996,16 @@ pub extern "C" fn willow_task_scope_finish(scope_handle: *mut u8) -> *mut c_void
         ))))),
     );
     let raw = frame.as_raw();
-    crate::scheduler::spawn_global_task_initialized(
-        poll_scope_finish,
-        raw,
-        Some(cancel_scope_finish),
-        |task_id| frame.store_word(SCOPE_FINISH_TASK_ID_SLOT, task_id as i64),
-    );
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe {
+        crate::scheduler::spawn_global_task_initialized(
+            poll_scope_finish,
+            raw,
+            Some(cancel_scope_finish),
+            |task_id| frame.store_word(SCOPE_FINISH_TASK_ID_SLOT, task_id as i64),
+        )
+    };
     raw
 }
 
@@ -925,11 +1037,22 @@ mod tests {
     #[test]
     fn scope_membership_scales_and_duplicates_preserve_first_frame_and_order() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         for n in [64u64, 256, 1024, 4096] {
             let core = ScopeCore::default();
-            for id in 1..=n {
-                core.add(id, (0x1000 + id as usize * 16) as *mut u8);
+            let frames: Vec<_> = (0..n)
+                .map(|_| {
+                    crate::gc::GcRootHandle::new(
+                        crate::async_frame::willow_async_frame_alloc(2, 0).cast(),
+                    )
+                })
+                .collect();
+            for (index, frame) in frames.iter().enumerate() {
+                // SAFETY: The fixture retains its task frame through attachment or supplies
+                // the supported null placeholder.
+                unsafe { core.add(index as u64 + 1, frame.load()) };
             }
             let distinct_hashes = core
                 .state
@@ -943,7 +1066,9 @@ mod tests {
             // Reverse order defeats a first-element-only duplicate shortcut.
             for _ in 0..4 {
                 for id in (1..=n).rev() {
-                    core.add(id, std::ptr::null_mut());
+                    // SAFETY: The fixture retains its task frame through attachment or
+                    // supplies the supported null placeholder.
+                    unsafe { core.add(id, std::ptr::null_mut()) };
                 }
             }
             let state = core.state.lock().unwrap();
@@ -953,7 +1078,7 @@ mod tests {
             assert_eq!(state.task_ids.len(), n as usize);
             for (i, task) in state.tasks.iter().enumerate() {
                 assert_eq!(task.id, i as u64 + 1);
-                assert_eq!(task.frame.load(), (0x1000 + (i + 1) * 16) as *mut u8);
+                assert_eq!(task.frame.load(), frames[i].load());
             }
             drop(state);
             assert_eq!(core.roots.slot_count(), n as usize);
@@ -969,7 +1094,9 @@ mod tests {
                     .all(|(i, (id, _))| *id == i as u64 + 1)
             );
             core.begin_finish();
-            core.add(n + 1, std::ptr::null_mut());
+            // SAFETY: The fixture retains its task frame through attachment or supplies the
+            // supported null placeholder.
+            unsafe { core.add(n + 1, std::ptr::null_mut()) };
             let state = core.state.lock().unwrap();
             assert_eq!(state.task_ids.len(), n as usize);
             assert_eq!(
@@ -981,14 +1108,18 @@ mod tests {
                 total_hashes - distinct_hashes
             );
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn scope_finish_staggered_completion_scales_with_multiple_handles() {
         use crate::scheduler::{with_current_task_for_test, with_global_for_test};
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         for shape in ["flat", "deep", "fanout"] {
             for n in [64, 256, 1024] {
                 reset_global_scheduler_for_test();
@@ -1006,10 +1137,15 @@ mod tests {
                     let frame = crate::async_frame::willow_async_frame_alloc(1, 0);
                     let id = with_global_for_test(|scheduler| {
                         let id = scheduler.spawn_placeholder();
-                        scheduler.with_task_mut(id, |task| task.frame = frame);
+                        // SAFETY: This placeholder has no callbacks or owned GC root. The
+                        // fixture retains the initialized frame through its last scheduler
+                        // access.
+                        unsafe { scheduler.with_task_mut(id, |task| task.frame = frame) };
                         id
                     });
-                    owner.add(id, frame.cast());
+                    // SAFETY: The fixture retains its task frame through attachment or
+                    // supplies the supported null placeholder.
+                    unsafe { owner.add(id, frame.cast()) };
                 }
                 root.begin_finish();
                 let mut ordered = Vec::new();
@@ -1063,17 +1199,23 @@ mod tests {
                 reset_global_scheduler_for_test();
             }
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn scope_finish_reloads_roots_and_tolerates_another_handle_releasing_them() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let root = Arc::new(ScopeCore::default());
         let pending = crate::async_frame::willow_async_frame_alloc(1, 0);
         let moved = crate::async_frame::willow_async_frame_alloc(1, 0);
-        root.add(1, pending.cast());
+        // SAFETY: The fixture retains its task frame through attachment or supplies the
+        // supported null placeholder.
+        unsafe { root.add(1, pending.cast()) };
         root.begin_finish();
         let first = ScopeFinishState::new(Arc::clone(&root));
         let second = ScopeFinishState::new(Arc::clone(&root));
@@ -1083,13 +1225,19 @@ mod tests {
         // Model collector relocation through the actual stable root slot.
         let mut slots = Vec::new();
         root.trace_frames(&mut slots);
+        // SAFETY: The trace callback returned a slot in the live scope's frame storage. The test
+        // controls mutation during this access.
         unsafe {
             *slots[0] = moved.cast();
         }
-        crate::async_frame::frame_publish_terminal(
-            moved,
-            crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED,
-        );
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe {
+            crate::async_frame::frame_publish_terminal(
+                moved,
+                crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED,
+            )
+        };
         assert!(
             first
                 .traversal
@@ -1098,6 +1246,8 @@ mod tests {
                 .poll(|_| panic!("must reload moved root"))
         );
         assert!(root.finish_and_release());
+        // SAFETY: The trace callback returned a slot in the live scope's frame storage. The test
+        // controls mutation during this access.
         assert!(unsafe { *slots[0] }.is_null());
         assert!(
             second
@@ -1107,63 +1257,89 @@ mod tests {
                 .poll(|_| panic!("roots already released"))
         );
         assert!(root.finish_and_release());
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn scope_finish_out_of_order_completion_and_spurious_polls_only_revisit_frontier() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let root = Arc::new(ScopeCore::default());
         let mut frames = Vec::new();
         for id in 1..=64 {
             let frame = crate::async_frame::willow_async_frame_alloc(1, 0);
-            root.add(id, frame.cast());
+            // SAFETY: The fixture retains its task frame through attachment or supplies the
+            // supported null placeholder.
+            unsafe { root.add(id, frame.cast()) };
             frames.push(frame);
         }
         root.begin_finish();
         let finish = ScopeFinishState::new(Arc::clone(&root));
         let mut traversal = finish.traversal.lock().unwrap();
         for &frame in frames[1..].iter().rev() {
-            crate::async_frame::frame_publish_terminal(
-                frame,
-                crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED,
-            );
+            // SAFETY: The frame owner retains the initialized ABI status word through this
+            // atomic access.
+            unsafe {
+                crate::async_frame::frame_publish_terminal(
+                    frame,
+                    crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED,
+                )
+            };
             assert!(!traversal.poll(|id| {
                 assert_eq!(id, 1);
                 0
             }));
         }
         assert_eq!(traversal.counts, [1, 63, 63]);
-        crate::async_frame::frame_publish_terminal(
-            frames[0],
-            crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED,
-        );
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe {
+            crate::async_frame::frame_publish_terminal(
+                frames[0],
+                crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED,
+            )
+        };
         assert!(traversal.poll(|_| panic!("all tasks completed")));
         assert_eq!(traversal.counts, [1, 63 + 64, 63]);
         assert!(!root.finish_and_release());
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn scope_finish_handles_completion_during_waiter_registration() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let root = Arc::new(ScopeCore::default());
         let frame = crate::async_frame::willow_async_frame_alloc(1, 0);
-        root.add(1, frame.cast());
+        // SAFETY: The fixture retains its task frame through attachment or supplies the
+        // supported null placeholder.
+        unsafe { root.add(1, frame.cast()) };
         root.begin_finish();
         let finish = ScopeFinishState::new(Arc::clone(&root));
         assert!(finish.traversal.lock().unwrap().poll(|id| {
             assert_eq!(id, 1);
-            crate::async_frame::frame_publish_terminal(
-                frame,
-                crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED,
-            );
+            // SAFETY: The frame owner retains the initialized ABI status word through this
+            // atomic access.
+            unsafe {
+                crate::async_frame::frame_publish_terminal(
+                    frame,
+                    crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED,
+                )
+            };
             1
         }));
         assert!(root.finish_and_release());
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     unsafe extern "C" fn pending_forever(_frame: *mut c_void) -> i32 {
@@ -1173,7 +1349,9 @@ mod tests {
     #[test]
     fn poll_state_remains_owned_after_frame_cleanup() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let frame = NativeTaskFrame::<ScopeFinishFrame>::allocate().unwrap();
         let core = Arc::new(ScopeCore::default());
         let weak = Arc::downgrade(&core);
@@ -1181,7 +1359,11 @@ mod tests {
             SCOPE_FINISH_STATE_SLOT,
             Box::into_raw(Box::new(Arc::new(ScopeFinishState::new(core)))),
         );
+        // SAFETY: The test just installed a boxed Arc in the live scope-finish frame
+        // and is its sole accessor while cloning the state.
         let state = unsafe { finish_state(frame.as_raw()) }.unwrap();
+        // SAFETY: The test invokes cancellation synchronously with exclusive access to
+        // the same frame. The cloned Arc stays live across cleanup.
         unsafe { cancel_scope_finish(frame.as_raw()) };
         assert!(
             frame
@@ -1192,42 +1374,67 @@ mod tests {
         drop(state);
         assert!(weak.upgrade().is_none());
         // Repeated cleanup must leave the cleared slot alone.
+        // SAFETY: The test still has exclusive access to the live frame, now with a null state slot.
         unsafe { cancel_scope_finish(frame.as_raw()) };
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn cancelled_token_immediately_cancels_late_attachment() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         reset_global_scheduler_for_test();
         let token = willow_cancellation_token_new();
-        willow_cancellation_token_cancel(token);
-        assert_eq!(willow_cancellation_token_is_cancelled(token), 1);
+        // SAFETY: The handles come from their matching constructors; attached frames carry
+        // the initialized task ID.
+        unsafe { willow_cancellation_token_cancel(token) };
+        // SAFETY: The handles come from their matching constructors; attached frames carry
+        // the initialized task ID.
+        assert_eq!(unsafe { willow_cancellation_token_is_cancelled(token) }, 1);
         let frame = crate::async_frame::willow_async_frame_alloc(2, 0);
-        let id = crate::scheduler::willow_sched_spawn(pending_forever, frame);
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        let id = unsafe { crate::scheduler::willow_sched_spawn(pending_forever, frame) };
+        // SAFETY: The frame allocator provides the word-aligned task header and the ABI slot lies
+        // within it.
         unsafe { *frame_slot::<u64>(frame, TASK_ID_SLOT) = id };
-        willow_cancellation_token_attach(token, frame.cast());
+        // SAFETY: The handles come from their matching constructors; attached frames carry
+        // the initialized task ID.
+        unsafe { willow_cancellation_token_attach(token, frame.cast()) };
         willow_sched_run_until(id);
         assert_eq!(
-            crate::async_frame::frame_terminal_status(frame),
+            // SAFETY: The frame owner retains the initialized ABI status word through this
+            // atomic access.
+            unsafe { crate::async_frame::frame_terminal_status(frame) },
             crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED
         );
         reset_global_scheduler_for_test();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn attach_cancel_race_cannot_miss_a_participant() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         reset_global_scheduler_for_test();
         let core = Arc::new(CancellationCore::default());
         let mut frames = Vec::new();
         let mut ids = Vec::new();
         for _ in 0..64 {
             let frame = crate::async_frame::willow_async_frame_alloc(2, 0);
-            let id = crate::scheduler::willow_sched_spawn(pending_forever, frame);
+            // SAFETY: The supplied callback matches this frame layout; the frame storage
+            // remains live across scheduling and callback execution.
+            let id = unsafe { crate::scheduler::willow_sched_spawn(pending_forever, frame) };
+            // SAFETY: The frame allocator provides the word-aligned task header and the ABI slot
+            // lies within it.
             unsafe { *frame_slot::<u64>(frame, TASK_ID_SLOT) = id };
             frames.push(frame);
             ids.push(id);
@@ -1251,12 +1458,16 @@ mod tests {
         willow_sched_run();
         for frame in frames {
             assert_eq!(
-                crate::async_frame::frame_terminal_status(frame),
+                // SAFETY: The frame owner retains the initialized ABI status word through
+                // this atomic access.
+                unsafe { crate::async_frame::frame_terminal_status(frame) },
                 crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED
             );
         }
         reset_global_scheduler_for_test();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
@@ -1264,15 +1475,22 @@ mod tests {
         use crate::gc::TraceSliceProgress;
         use crate::scheduler::scaling_measurements::counting_allocator as counter;
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         for roots in [0usize, 513, 4097, 65_537] {
             let core = Arc::new(ScopeCore::default());
-            let value = 0x1000usize as *mut u8;
+            let frame = crate::gc::GcRootHandle::new(
+                crate::async_frame::willow_async_frame_alloc(2, 0).cast(),
+            );
+            let value = frame.load();
             // Dropping a root handle clears its slot; keep the test roots
             // alive for the complete multi-slice scan and its appended edge.
             let mut handles = Vec::with_capacity(roots + 1);
             for _ in 0..roots {
-                handles.push(core.roots.insert(std::ptr::null_mut(), value));
+                // SAFETY: The scope retains its managed owner and attaches a current live
+                // task frame; both non-null addresses are GC payload starts.
+                handles.push(unsafe { core.roots.insert(std::ptr::null_mut(), value) });
             }
             for _ in 0..65 {
                 core.child().gc_handle.store(value, Ordering::Release);
@@ -1284,6 +1502,8 @@ mod tests {
             let mut children = Vec::with_capacity(512);
             let guard = core.state.lock().unwrap();
             assert!(matches!(
+                // SAFETY: The handle constructor reserves word-aligned GC storage for this payload
+                // type.
                 unsafe { snapshot_task_scope_slice(payload, 0, 512, &mut children) },
                 TraceSliceProgress::Retry
             ));
@@ -1295,6 +1515,8 @@ mod tests {
                 children.clear();
                 let allocations = counter::thread_allocations();
                 let progress =
+                    // SAFETY: The handle constructor reserves word-aligned GC storage for this
+                    // payload type.
                     unsafe { snapshot_task_scope_slice(payload, cursor, 512, &mut children) };
                 assert_eq!(counter::thread_allocations() - allocations, 0);
                 assert!(children.len() <= 512);
@@ -1303,7 +1525,9 @@ mod tests {
                 if cursor == 0 {
                     // Neither appended arena cells nor new child scopes extend
                     // the extent captured by the first successful slice.
-                    handles.push(core.roots.insert(std::ptr::null_mut(), value));
+                    // SAFETY: The scope retains its managed owner and attaches a current live
+                    // task frame; both non-null addresses are GC payload starts.
+                    handles.push(unsafe { core.roots.insert(std::ptr::null_mut(), value) });
                     core.child().gc_handle.store(value, Ordering::Release);
                 }
                 match progress {
@@ -1325,10 +1549,16 @@ mod tests {
     #[test]
     fn scope_trace_slots_survive_task_vector_growth() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let core = ScopeCore::default();
-        let first_frame = 0x1000usize as *mut u8;
-        core.add(1, first_frame);
+        let frame =
+            crate::gc::GcRootHandle::new(crate::async_frame::willow_async_frame_alloc(2, 0).cast());
+        let first_frame = frame.load();
+        // SAFETY: The fixture retains its task frame through attachment or supplies the
+        // supported null placeholder.
+        unsafe { core.add(1, first_frame) };
 
         let mut slots = Vec::new();
         core.trace_frames(&mut slots);
@@ -1339,20 +1569,28 @@ mod tests {
         // received the first slot address. Arc-owned cells stay at the same
         // address independently of the arena's storage growth.
         for id in 2..=4096 {
-            core.add(id, (0x1000usize + id as usize * 16) as *mut u8);
+            // SAFETY: The fixture retains its task frame through attachment or supplies the
+            // supported null placeholder.
+            unsafe { core.add(id, first_frame) };
         }
         assert_eq!(slots[0], first_slot);
+        // SAFETY: The trace callback returned a slot in the live scope's frame storage. The test
+        // controls mutation during this access.
         assert_eq!(unsafe { *first_slot }, first_frame);
     }
 
     #[test]
     fn scope_finish_releases_task_metadata_without_invalidating_trace_slots() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
 
         let core = ScopeCore::default();
         let frame = crate::async_frame::willow_async_frame_alloc(1, 0);
         assert!(!frame.is_null());
+        // SAFETY: The frame allocator provides the word-aligned task header and the ABI slot lies
+        // within it.
         unsafe {
             *((frame as *mut u8)
                 .add(crate::async_frame::ASYNC_FRAME_SLOT_COUNT_OFFSET)
@@ -1362,12 +1600,16 @@ mod tests {
                 crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED,
             );
         }
-        core.add(1, frame.cast());
+        // SAFETY: The fixture retains its task frame through attachment or supplies the
+        // supported null placeholder.
+        unsafe { core.add(1, frame.cast()) };
 
         let mut slots = Vec::new();
         core.trace_frames(&mut slots);
         assert_eq!(slots.len(), 1);
         let traced_slot = slots[0];
+        // SAFETY: The trace callback returned a slot in the live scope's frame storage. The test
+        // controls mutation during this access.
         assert_eq!(unsafe { *traced_slot }, frame.cast());
 
         core.begin_finish();
@@ -1385,19 +1627,27 @@ mod tests {
         drop(state);
         assert_eq!(core.roots.slot_count(), 1);
         assert!(
+            // SAFETY: The trace callback returned a slot in the live scope's frame storage. The
+            // test controls mutation during this access.
             unsafe { *traced_slot }.is_null(),
             "released stable slot remains addressable but no longer roots a frame"
         );
 
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn cancelled_result_uses_the_fieldless_enum_immediate_payload() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let mut result = alloc_cancelled_result();
         assert!(!result.is_null());
+        // SAFETY: The GC word-aligns the two-word Result allocation. The discriminant and payload
+        // occupy its first and second words.
         unsafe {
             assert_eq!(*result.cast::<i64>(), 1, "outer Result tag is Err");
             assert_eq!(
@@ -1406,14 +1656,22 @@ mod tests {
                 "fieldless Cancelled is immediate variant tag 0, not a GC pointer"
             );
         }
-        crate::gc::willow_push_root(&mut result);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { crate::gc::willow_push_root(&raw mut result) };
         crate::gc::willow_gc_collect();
-        crate::gc::willow_pop_roots(1);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { crate::gc::willow_pop_roots(1) };
+        // SAFETY: The GC word-aligns the two-word Result allocation. The discriminant and payload
+        // occupy its first and second words.
         unsafe {
             assert_eq!(*result.cast::<i64>(), 1);
             assert_eq!(*result.cast::<i64>().add(1), 0);
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]

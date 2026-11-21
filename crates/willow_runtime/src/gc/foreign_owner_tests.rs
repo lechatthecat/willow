@@ -11,12 +11,18 @@ fn registered_then_unregistered_roots_defer_and_report_progress() {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let owner = std::thread::spawn(crate::runtime::serving(move || {
         willow_gc_register_mutator();
-        let mut slot = willow_alloc_object(2, 32);
-        willow_push_root(&mut slot);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let mut slot = unsafe { willow_alloc_object(2, 32) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut slot) };
         willow_gc_unregister_mutator();
         ready_tx.send(()).unwrap();
         done_rx.recv().unwrap();
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
     }));
     ready_rx.recv().unwrap();
     willow_gc_collect();
@@ -41,8 +47,12 @@ fn registered_then_unregistered_roots_defer_and_report_progress() {
     assert!(recovered.successful_collections > deferred.successful_collections);
     assert_eq!(willow_gc_allocated_bytes(), 0);
     let mut ffi = GcProgressV1::default();
+    // SAFETY: The progress API accepts either a writable aligned record or null for its rejection
+    // case.
     assert!(unsafe { willow_gc_progress_v1(&mut ffi) });
     assert_eq!(ffi.successful_collections, recovered.successful_collections);
+    // SAFETY: The progress API accepts either a writable aligned record or null for its rejection
+    // case.
     assert!(!unsafe { willow_gc_progress_v1(std::ptr::null_mut()) });
     reset_gc();
 }
@@ -54,13 +64,19 @@ fn native_scope_nested_return_cancel_and_panic_release_roots() {
         for panic in [false, true] {
             reset_gc();
             let outer = NativeGcScope::enter();
-            let mut prefix = willow_alloc_object(2, 8);
-            willow_push_root(&mut prefix);
+            // SAFETY: The requested layout describes the initialized words of this object and
+            // its type’s tracing or finalization contract.
+            let mut prefix = unsafe { willow_alloc_object(2, 8) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut prefix) };
             let result = std::panic::catch_unwind(|| {
                 let _scope = NativeGcScope::enter();
                 let mut slots = vec![std::ptr::null_mut(); count];
                 for slot in &mut slots {
-                    willow_push_root(slot);
+                    // SAFETY: The slot storage stays live and stationary through the matching
+                    // pop, including during collection.
+                    unsafe { willow_push_root(slot) };
                 }
                 assert!(current_thread_is_registered());
                 if panic {
@@ -95,8 +111,12 @@ fn native_registration_and_gc_start_race_has_no_skips_or_stranded_roots() {
         for _ in 0..64 {
             worker_barrier.wait();
             let _scope = NativeGcScope::enter();
-            let mut slot = willow_alloc_object(2, 8);
-            willow_push_root(&mut slot);
+            // SAFETY: The requested layout describes the initialized words of this object and
+            // its type’s tracing or finalization contract.
+            let mut slot = unsafe { willow_alloc_object(2, 8) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut slot) };
             willow_gc_safepoint();
             // Drop removes roots before unregistering, even during election.
         }
@@ -120,7 +140,9 @@ fn legacy_admission_during_foreign_election_fails_safely() {
         let _collector = cycle_wait::CollectorGuard::try_acquire().unwrap();
         std::thread::spawn(crate::runtime::serving(|| {
             let mut slot = std::ptr::null_mut();
-            willow_push_root(&mut slot);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut slot) };
         }))
         .join()
         .unwrap();
@@ -158,12 +180,18 @@ fn registered_unregister_with_roots_waits_for_foreign_epoch() {
     let (pop_tx, pop_rx) = std::sync::mpsc::channel::<()>();
     let worker = std::thread::spawn(crate::runtime::serving(move || {
         willow_gc_register_mutator();
-        let mut slot = willow_alloc_object(2, 8);
-        willow_push_root(&mut slot);
+        // SAFETY: The requested layout describes the initialized words of this object and its
+        // type’s tracing or finalization contract.
+        let mut slot = unsafe { willow_alloc_object(2, 8) };
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut slot) };
         willow_gc_unregister_mutator();
         done_tx.send(()).unwrap();
         pop_rx.recv().unwrap();
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
     }));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while runtime().wait_observation.sleeps.load(Ordering::Acquire) == 0 {
@@ -198,14 +226,20 @@ fn existing_legacy_owner_can_extend_roots_during_election() {
     let (pushed_tx, pushed_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(crate::runtime::serving(move || {
         let mut first = std::ptr::null_mut();
-        willow_push_root(&mut first);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut first) };
         ready_tx.send(()).unwrap();
         go_rx.recv().unwrap();
         let mut second = std::ptr::null_mut();
-        willow_push_root(&mut second);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut second) };
         pushed_tx.send(()).unwrap();
         go_rx.recv().unwrap();
-        willow_pop_roots(2);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_roots(2) };
     }));
     ready_rx.recv().unwrap();
     let collector = cycle_wait::CollectorGuard::try_acquire().unwrap();

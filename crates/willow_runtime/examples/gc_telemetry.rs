@@ -8,22 +8,32 @@ use willow_runtime::{
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_user_main() {
-    gc::willow_gc_init();
+    // SAFETY: The standalone driver exclusively controls this heap between workloads; no
+    // mutator or borrowed payload crosses reset.
+    unsafe { gc::willow_gc_init() };
     let before = snapshot();
-    let mut root = gc::willow_alloc_typed(8, 1);
-    gc::willow_push_root(&mut root);
+    let root = std::cell::Cell::new(gc::willow_alloc_typed(8, 1));
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { gc::willow_push_root(root.as_ptr()) };
     for _ in 0..10_000 {
         let next = gc::willow_alloc_typed(8, 1);
         // The previous head remains rooted during the allocation.
+        // SAFETY: The GC allocator word-aligns this payload and the fixture reserves the accessed
+        // words.
         unsafe {
-            *next.cast::<*mut u8>() = root;
+            *next.cast::<*mut u8>() = root.get();
         }
-        gc::willow_gc_write_barrier(next, std::ptr::null_mut(), root, 1);
-        root = next;
+        // SAFETY: The destination describes this reference update. Any asserted header
+        // belongs to its live GC payload.
+        unsafe { gc::willow_gc_write_barrier(next, std::ptr::null_mut(), root.get(), 1) };
+        root.set(next);
     }
     gc::willow_gc_collect();
     let live = snapshot();
-    gc::willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { gc::willow_pop_root() };
     gc::willow_gc_collect();
     let after = snapshot();
     let rates = GcRates::between(&before, &after).unwrap();

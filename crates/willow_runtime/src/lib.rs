@@ -24,10 +24,17 @@
 //! violation. Raw-pointer ABI calls retain their valid-pointer preconditions;
 //! this policy is not a validator for arbitrary foreign pointers.
 //!
+//! Region and TLAB allocators align object starts for `GcHeader`. Its size
+//! is a multiple of its alignment, so the following payload is also word-aligned.
+//! A field cast additionally needs an offset aligned for that field and a live
+//! allocation containing it. Native handles created by Box retain their original
+//! type alignment when erased to a byte pointer.
+//!
 //! Every ordinary C function uses `ffi_boundary`, including callbacks. Native
 //! signal/exception handlers instead obey their audited no-panic discipline:
 //! unwinding, allocation and Rust stderr locks are not signal-safe.
 
+#![deny(clippy::undocumented_unsafe_blocks)]
 #![allow(
     dead_code,
     reason = "Runtime entry points and helpers are consumed by generated code"
@@ -164,12 +171,22 @@ pub extern "C" fn willow_runtime_check_abi(expected: u64) {
     }
 }
 
+/// # Safety
+/// For positive argc and non-null argv, provide an aligned array of argc initialized
+/// pointers. Each non-null entry must address a NUL-terminated C string. Keep the array and
+/// strings readable, immutable and at stable addresses through their last runtime use,
+/// including any readers still in flight after replacement. Startup must own the runtime
+/// exclusively, before any other mutator or outstanding heap borrow, because it resets the heap.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn runtime_start(argc: i32, argv: *mut *mut c_char) {
+pub unsafe extern "C" fn runtime_start(argc: i32, argv: *mut *mut c_char) {
     stack_overflow::protect_current_thread();
-    args::willow_runtime_store_args(argc, argv);
-    gc::willow_gc_init();
+    // SAFETY: The startup caller retains the argv array and its C strings through all runtime
+    // argument reads.
+    unsafe { args::willow_runtime_store_args(argc, argv) };
+    // SAFETY: The entry contract gives startup sole access to this runtime before user code
+    // or other mutators start.
+    unsafe { gc::willow_gc_init() };
     // Synchronous top-level code owns a standalone execution context. Task
     // polls temporarily replace this TLS cache with their task-owned context;
     // the scheduler restores it when a nested/outer drive returns.
@@ -180,7 +197,11 @@ pub extern "C" fn runtime_start(argc: i32, argv: *mut *mut c_char) {
     let runtime_tlab = gc::RuntimeTlabOwner::enter();
     // Static properties are initialized once, after the GC is ready and before
     // user `main` runs (static member support §11).
+    // SAFETY: The compiler emits this entry with the bridge's startup calling convention and no
+    // frame argument.
     unsafe { generated_context::invoke(__willow_static_init as *const (), std::ptr::null_mut()) };
+    // SAFETY: The compiler emits this entry with the bridge's startup calling convention and no
+    // frame argument.
     unsafe { generated_context::invoke(willow_user_main as *const (), std::ptr::null_mut()) };
     drop(runtime_tlab);
     gc::report_publication_stats_if_requested();
@@ -189,11 +210,19 @@ pub extern "C" fn runtime_start(argc: i32, argv: *mut *mut c_char) {
     panic_context::replace_current_context(previous_panic_context);
 }
 
+/// # Safety
+/// For positive argc and non-null argv, provide an aligned array of argc initialized
+/// pointers. Each non-null entry must address a NUL-terminated C string. Keep the array and
+/// strings readable, immutable and at stable addresses through their last runtime use,
+/// including any readers still in flight after replacement. Startup must own the runtime
+/// exclusively, before any other mutator or outstanding heap borrow, because it resets the heap.
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn main(argc: i32, argv: *mut *mut c_char) -> i32 {
-    runtime_start(argc, argv);
+pub unsafe extern "C" fn main(argc: i32, argv: *mut *mut c_char) -> i32 {
+    // SAFETY: Native process entry has sole access to the runtime before startup and
+    // retains the argument vector and strings through all runtime argument reads.
+    unsafe { runtime_start(argc, argv) };
     // Returning here would hand the exit to the CRT, which terminates every
     // still-running runtime thread and then takes teardown locks those
     // threads may have been holding — a deadlock that stranded two Windows CI
@@ -217,12 +246,16 @@ mod tests {
             second.as_ptr() as *mut c_char,
         ];
 
-        runtime_start(argv.len() as i32, argv.as_mut_ptr());
+        // SAFETY: The pointer array and its C strings remain in this fixture until every
+        // argument read has completed. The isolated runtime has no other heap users.
+        unsafe { runtime_start(argv.len() as i32, argv.as_mut_ptr()) };
 
         assert_eq!(args::willow_runtime_args_len(), 2);
         let arg0 = args::willow_runtime_arg(0);
         assert!(!arg0.is_null());
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         assert_eq!(unsafe { string::willow_string_as_str(arg0) }, "one");
+        args::reset_for_tests();
     }
 }
 

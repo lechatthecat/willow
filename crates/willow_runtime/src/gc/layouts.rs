@@ -73,6 +73,8 @@ fn address_of(entry: &Entry) -> usize {
 /// SAFETY: `address` came from `acquire` and its reference is unreleased, so
 /// the entry is not purged.
 unsafe fn entry_at<'a>(address: usize) -> &'a Entry {
+    // SAFETY: The descriptor registry retains the typed, aligned allocation while its address is
+    // borrowed.
     unsafe { &*(address as *const Entry) }
 }
 
@@ -199,6 +201,8 @@ mod tests {
             size: u64::from(u32::MAX) + 1,
         };
         let address = registry.acquire(owner, key);
+        // SAFETY: The descriptor registry retains the typed, aligned allocation while its address
+        // is borrowed.
         assert_eq!(unsafe { *(address as *const GcLayoutDescriptor) }, key);
         registry.release(address);
         assert_eq!(registry.live_entries(), 0);
@@ -226,6 +230,8 @@ mod tests {
             for address in addresses {
                 registry.release(address);
                 assert_eq!(
+                    // SAFETY: The descriptor registry retains the typed, aligned allocation while
+                    // its address is borrowed.
                     unsafe { (*(address as *const GcLayoutDescriptor)).type_id },
                     7
                 );

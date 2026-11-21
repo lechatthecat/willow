@@ -10,6 +10,7 @@ fn fixture(count: usize, receive: bool) -> (*mut c_void, Vec<u64>) {
             .map(|_| s.spawn_parked_placeholder())
             .collect::<Vec<_>>()
     });
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let channel = unsafe { channel_from_raw(raw) }.unwrap();
     let mut state = channel.state.lock().unwrap();
     for &task in &tasks {
@@ -35,6 +36,7 @@ fn fanout_batches_have_linear_counts_and_preserve_values() {
     for receive in [true, false] {
         for count in [1usize, 32, 33, 1024, 4096] {
             let (raw, tasks) = fixture(count, receive);
+            // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
             let channel = unsafe { channel_from_raw(raw) }.unwrap();
             CHANNEL_WAKE_ATTEMPTS.store(0, Ordering::Relaxed);
             CHANNEL_WAKE_BATCHES.store(0, Ordering::Relaxed);
@@ -61,6 +63,8 @@ fn fanout_batches_have_linear_counts_and_preserve_values() {
                 assert_eq!(state.recv_claims.len(), count);
                 for (value, &task) in tasks.iter().enumerate() {
                     assert_eq!(
+                        // SAFETY: The channel element ABI supplies the initialized union
+                        // representation read by this operation.
                         unsafe { take_value(raw, &mut state, task).unwrap().i64_value },
                         value as i64
                     );
@@ -83,6 +87,7 @@ fn stale_waiters_spanning_a_batch_do_not_hide_live_waiters() {
     let _guard = crate::gc::isolated_runtime();
     for receive in [true, false] {
         let (raw, tasks) = fixture(CHANNEL_WAKE_BATCH * 2 + 1, receive);
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let channel = unsafe { channel_from_raw(raw) }.unwrap();
         crate::scheduler::with_global_for_test(|s| {
             for &task in &tasks[..CHANNEL_WAKE_BATCH + 1] {
@@ -114,6 +119,7 @@ fn cancellation_in_middle_between_reservation_and_publication_cleans_up() {
     let _single_worker = crate::scheduler::single_worker_for_test();
     for receive in [true, false] {
         let (raw, tasks) = fixture(CHANNEL_WAKE_BATCH, receive);
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let channel = unsafe { channel_from_raw(raw) }.unwrap();
         let mut candidates =
             [(0, core_token(channel, ChannelRole::RecvClaim, 0)); CHANNEL_WAKE_BATCH];
@@ -155,11 +161,13 @@ fn close_between_reservation_and_publication_preserves_only_live_claims() {
     let _guard = crate::gc::isolated_runtime();
     for receive in [true, false] {
         let (raw, tasks) = fixture(CHANNEL_WAKE_BATCH + 1, receive);
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let channel = unsafe { channel_from_raw(raw) }.unwrap();
         let mut candidates =
             [(0, core_token(channel, ChannelRole::RecvClaim, 0)); CHANNEL_WAKE_BATCH];
         let (count, _, _) = reserve_waiter_batch(channel, receive, &mut candidates);
-        willow_channel_close(raw);
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        unsafe { willow_channel_close(raw) };
         assert!(!publish_waiter_batch(
             channel,
             &candidates[..count],
@@ -172,6 +180,8 @@ fn close_between_reservation_and_publication_preserves_only_live_claims() {
         if receive {
             for (value, &task) in tasks.iter().enumerate() {
                 assert_eq!(
+                    // SAFETY: The channel element ABI supplies the initialized union
+                    // representation read by this operation.
                     unsafe { take_value(raw, &mut state, task).unwrap().i64_value },
                     value as i64
                 );
@@ -189,6 +199,7 @@ fn terminal_batch_cleanup_removes_exact_generations_without_task_purge() {
     let _guard = crate::gc::isolated_runtime();
     for receive in [true, false] {
         let (raw, tasks) = fixture(7, receive);
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let channel = unsafe { channel_from_raw(raw) }.unwrap();
         let mut candidates =
             [(0, core_token(channel, ChannelRole::RecvClaim, 0)); CHANNEL_WAKE_BATCH];
@@ -232,6 +243,7 @@ fn closed_empty_fanout_wakes_every_waiter_and_deduplicates_roles() {
     let _guard = crate::gc::isolated_runtime();
     for close_via_abi in [true, false] {
         let (raw, tasks) = fixture(CHANNEL_WAKE_BATCH * 2 + 1, false);
+        // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
         let channel = unsafe { channel_from_raw(raw) }.unwrap();
         {
             let mut state = channel.state.lock().unwrap();
@@ -251,7 +263,8 @@ fn closed_empty_fanout_wakes_every_waiter_and_deduplicates_roles() {
             }
         }
         if close_via_abi {
-            willow_channel_close(raw);
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            unsafe { willow_channel_close(raw) };
         } else {
             wake_recv_waiters(channel);
         }

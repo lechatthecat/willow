@@ -242,6 +242,8 @@ mod tests {
     }
 
     fn await_and_release(raw: *mut std::ffi::c_void) -> u8 {
+        // SAFETY: Every caller passes a fresh sleep or yield constructor result directly here.
+        // No borrower sees the token before this sole ownership transfer.
         let owner = unsafe { future::LegacyFutureOwner::<future::WillowFutureVoid>::from_abi(raw) };
         owner.get().block_until_ready();
         0

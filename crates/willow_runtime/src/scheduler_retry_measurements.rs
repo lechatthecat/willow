@@ -63,6 +63,8 @@ fn thread_cpu_ns() -> u64 {
     };
     // SAFETY: clock_gettime writes to a valid timespec; no shared pointer.
     assert_eq!(
+        // SAFETY: clock_gettime receives the supported thread CPU clock and writable timespec
+        // storage.
         unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) },
         0
     );

@@ -220,7 +220,8 @@ pub(crate) fn report_publication_stats_if_requested() {
     }
     let p = stats_in(owner);
     let mut gc = crate::gc_telemetry::WillowGcStatsV1::default();
-    crate::gc_telemetry::willow_gc_stats_snapshot_v1(&mut gc);
+    // SAFETY: The typed output owns one aligned, writable record for the call.
+    unsafe { crate::gc_telemetry::willow_gc_stats_snapshot_v1(&mut gc) };
     let per_point = PublicationPoint::ALL
         .iter()
         .zip(p.per_point)
@@ -287,11 +288,7 @@ impl FrameTest {
     }
 
     #[inline(always)]
-    fn is_frame(
-        &mut self,
-        layout: &'static willow_abi::GcLayoutDescriptor,
-        static_layout: bool,
-    ) -> bool {
+    fn is_frame(&mut self, layout: &willow_abi::GcLayoutDescriptor, static_layout: bool) -> bool {
         let address = std::ptr::from_ref(layout) as usize;
         layout.type_id as u32 == root::ASYNC_FRAME_TYPE_ID
             && address != self.plain[0]
@@ -302,7 +299,7 @@ impl FrameTest {
     #[inline(never)]
     fn fingerprint(
         &mut self,
-        layout: &'static willow_abi::GcLayoutDescriptor,
+        layout: &willow_abi::GcLayoutDescriptor,
         static_layout: bool,
     ) -> bool {
         if raw_heap::is_async_frame_layout(layout) {
@@ -576,6 +573,8 @@ pub(super) fn is_frame(object: HeapObject) -> bool {
 /// requested stop mid-way; only callers whose own call site is a GC point
 /// pass true (generated barrier call sites are not: they may hold unrooted
 /// temporaries). O(1) for a null or already shared value.
+/// A non-null value must start a live managed payload in `owner`. The mutator
+/// publishing it owns the private portion of the reachable graph until it is shared.
 #[inline]
 pub(crate) fn publish_in(
     owner: &crate::runtime::Runtime,
@@ -583,15 +582,47 @@ pub(crate) fn publish_in(
     point: PublicationPoint,
     may_park: bool,
 ) {
-    let Some(payload) = GcPayload::from_raw(value) else {
-        return;
-    };
-    let object = HeapObject::from_payload(payload);
+    if let Some(object) = unshared_object(owner, value) {
+        let park = if may_park {
+            Park::Allowed
+        } else {
+            Park::Disabled
+        };
+        publish_unshared(owner, object, point, park);
+    }
+}
+
+enum Park<'a> {
+    Disabled,
+    Allowed,
+    WithSendOperands(&'a mut [*mut u8; 2]),
+}
+
+/// A blocking send still needs both ABI arguments after publication. Register
+/// them only if traversal actually parks, then return their current addresses.
+#[inline]
+pub(crate) fn publish_channel_send(channel: *mut u8, value: *mut u8) -> [*mut u8; 2] {
+    let owner = crate::runtime::current();
+    let mut operands = [channel, value];
+    if let Some(object) = unshared_object(owner, value) {
+        publish_unshared(
+            owner,
+            object,
+            PublicationPoint::ChannelSend,
+            Park::WithSendOperands(&mut operands),
+        );
+    }
+    operands
+}
+
+#[inline]
+fn unshared_object(owner: &crate::runtime::Runtime, value: *mut u8) -> Option<HeapObject> {
+    let object = HeapObject::from_payload(GcPayload::from_raw(value)?);
     if object.shared() {
         count_republished(owner);
-        return;
+        return None;
     }
-    publish_unshared(owner, object, point, may_park);
+    Some(object)
 }
 
 /// O(1) and uncontended: the bound mutator's private log, merged later.
@@ -645,8 +676,8 @@ const FRAME_RESULT_WORD: usize =
 
 /// The result slot of the async frame `frame` when it holds a reference.
 fn frame_result_slot(frame: HeapObject) -> Option<*mut *mut u8> {
-    let (layout, _) = frame.live_layout();
-    (layout.gc_ref_mask & (1 << FRAME_RESULT_WORD) != 0)
+    frame
+        .with_live_layout(|layout, _| layout.gc_ref_mask & (1 << FRAME_RESULT_WORD) != 0)
         .then(|| frame.payload_slot(FRAME_RESULT_WORD))
 }
 
@@ -657,7 +688,9 @@ fn frame_result_slot(frame: HeapObject) -> Option<*mut *mut u8> {
 /// published first. A later escape of a handed-over handle publishes the
 /// result then ([`escape_frame`]). A GC point: the frame stays rooted.
 pub(crate) fn finish_task_result_in(owner: &crate::runtime::Runtime, task_id: u64, frame: *mut u8) {
-    if crate::async_frame::frame_hand_over_result(frame.cast()) {
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    if unsafe { crate::async_frame::frame_hand_over_result(frame.cast()) } {
         note_result_handed_over(owner, task_id);
     } else {
         publish_task_result_in(owner, frame);
@@ -713,7 +746,9 @@ fn note_result_handed_over(owner: &crate::runtime::Runtime, task_id: u64) {
 #[cold]
 #[inline(never)]
 fn escape_frame(frame: HeapObject) -> Option<HeapObject> {
-    if !crate::async_frame::frame_mark_result_escaped(frame.payload().as_ptr().cast()) {
+    // SAFETY: The descriptor identifies this still-live payload as an async frame during
+    // publication.
+    if !unsafe { crate::async_frame::frame_mark_result_escaped(frame.payload().as_ptr().cast()) } {
         return None;
     }
     let slot = frame_result_slot(frame)?;
@@ -731,8 +766,7 @@ fn past_frames(mut object: HeapObject, frames: &mut FrameTest) -> Option<HeapObj
         if object.shared() {
             return None;
         }
-        let (layout, static_layout) = object.live_layout();
-        if !frames.is_frame(layout, static_layout) {
+        if !object.with_live_layout(|layout, is_static| frames.is_frame(layout, is_static)) {
             return Some(object);
         }
         object = escape_frame(object)?;
@@ -744,7 +778,7 @@ fn publish_unshared(
     owner: &crate::runtime::Runtime,
     object: HeapObject,
     point: PublicationPoint,
-    may_park: bool,
+    park_mode: Park<'_>,
 ) {
     let gc = &*owner.gc;
     #[cfg(test)]
@@ -765,7 +799,7 @@ fn publish_unshared(
     let card_owner = if has_no_slots(object, &hooks) {
         mark(object, &mut counts)
     } else {
-        traverse(owner, object, &mut hooks, may_park, &mut counts)
+        traverse(owner, object, &mut hooks, park_mode, &mut counts)
     };
     // SAFETY: the bound thread owns its log while running; the traversal
     // (and any park in it) holds no borrow of it.
@@ -792,7 +826,7 @@ fn publish_unregistered(
     };
     let mut counts = TraversalCounts::default();
     let mut state = gc.heap.lock().unwrap();
-    let card_owner = traverse(owner, object, &mut hooks, false, &mut counts);
+    let card_owner = traverse(owner, object, &mut hooks, Park::Disabled, &mut counts);
     drop(hooks);
     let mut log = mutator_log::PublicationLog::default();
     add_counts(&mut log.counts, &counts, point);
@@ -869,7 +903,7 @@ fn traverse(
     owner: &crate::runtime::Runtime,
     root: HeapObject,
     hooks: &mut TraceHooks<'_>,
-    may_park: bool,
+    mut park_mode: Park<'_>,
     total: &mut TraversalCounts,
 ) -> bool {
     // Counted locally (in registers) and added to `total` at the end or
@@ -885,7 +919,7 @@ fn traverse(
         let object = HeapObject::from_payload(
             GcPayload::from_raw(address as *mut u8).expect("queued payload is non-null"),
         );
-        let (layout, _) = object.live_layout();
+        let layout = object.with_live_layout(|layout, _| *layout);
         let type_id = layout.type_id as u32;
         let payload_words =
             (layout.size as usize - std::mem::size_of::<GcHeader>()) / GC_STORAGE_WORD_BYTES;
@@ -925,8 +959,10 @@ fn traverse(
         // Only a runtime trace hook needs the slot buffer; the built-in
         // array's contiguous slots are visited in place, as by a minor.
         if let Some(trace) = hooks.get(type_id) {
-            // SAFETY: `object` is a live object of `type_id`, mutated only by
-            // the publishing task, which is running this traversal.
+            // SAFETY: The publishing task owns this live buffer. visit_slot loads
+            // its initialized references atomically. A registered mutator can
+            // next park only after the entire range is consumed below. Unregistered
+            // publication holds the heap lock across traversal, preventing relocation.
             if let Some((first, len)) = unsafe {
                 crate::array::minor_reference_range(type_id, Some(trace), object.payload().as_ptr())
             } {
@@ -949,7 +985,7 @@ fn traverse(
                 }
             }
         }
-        if may_park && counts.marked >= next_poll {
+        if !matches!(park_mode, Park::Disabled) && counts.marked >= next_poll {
             next_poll = counts.marked + PARK_POLL_OBJECTS;
             if owner.gc.stop_requested.load(Ordering::Acquire) && !work.is_empty() {
                 // The minor of this stop accounts every published young
@@ -967,7 +1003,7 @@ fn traverse(
                         + std::mem::take(&mut total.promoted_bytes);
                     next_poll = PARK_POLL_OBJECTS;
                 }
-                let pending = park(owner, root_address, work.take_all());
+                let pending = park(owner, root_address, work.take_all(), &mut park_mode);
                 work.restore(pending);
             }
         }
@@ -1086,8 +1122,9 @@ fn visit_slot(
     if child.shared() {
         return false;
     }
-    let (mut layout, static_layout) = child.live_layout();
-    if hooks.frames.is_frame(layout, static_layout) {
+    let (is_frame, mut layout) = child
+        .with_live_layout(|layout, is_static| (hooks.frames.is_frame(layout, is_static), *layout));
+    if is_frame {
         // A task handle: the frame stays private; a handed-over result is
         // part of the published graph now.
         let Some(result) =
@@ -1096,7 +1133,7 @@ fn visit_slot(
             return false;
         };
         child = result;
-        layout = child.live_layout().0;
+        layout = child.with_live_layout(|layout, _| *layout);
     }
     let type_id = layout.type_id as u32;
     counts.marked += 1;
@@ -1129,7 +1166,12 @@ pub(super) struct Parked {
 /// traversal holds their addresses); their young children move with updated
 /// slots, which the traversal then reads.
 #[cold]
-fn park(owner: &crate::runtime::Runtime, root: usize, pending: Vec<usize>) -> Vec<usize> {
+fn park(
+    owner: &crate::runtime::Runtime,
+    root: usize,
+    pending: Vec<usize>,
+    mode: &mut Park<'_>,
+) -> Vec<usize> {
     let gc = &*owner.gc;
     let me = std::thread::current().id();
     gc.publication
@@ -1138,7 +1180,14 @@ fn park(owner: &crate::runtime::Runtime, root: usize, pending: Vec<usize>) -> Ve
         .unwrap()
         .insert(me, Parked { root, pending });
     gc.publication.parks.fetch_add(1, Ordering::Relaxed);
-    safepoint::safepoint_in(owner);
+    if let Park::WithSendOperands(operands) = mode {
+        let channel = GcRootHandle::new(operands[0]);
+        let message = GcRootHandle::new(operands[1]);
+        safepoint::safepoint_in(owner);
+        **operands = [channel.load(), message.load()];
+    } else {
+        safepoint::safepoint_in(owner);
+    }
     gc.publication
         .parked
         .lock()

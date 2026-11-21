@@ -187,10 +187,14 @@ fn into_raw<T: 'static>(future: RuntimeFuture<T>) -> *mut c_void {
     register(future)
 }
 
-/// The caller must have ended all borrows; lookup rejects stale/wrong-type tokens.
+/// # Safety
+/// On a successful lookup the caller must own the future exclusively, with
+/// all borrows ended. Removing the entry consumes that ownership exactly once.
 unsafe fn release_raw<T: 'static>(raw: *mut c_void) {
     let address = checked_address::<T>(raw, true);
     // Drop outside the registry lock: destructors may create/release futures.
+    // SAFETY: The caller ended all borrows. Removal transfers the original typed Box
+    // to this sole owner and prevents a second successful removal.
     unsafe { drop(Box::from_raw(address)) };
 }
 
@@ -219,10 +223,13 @@ impl<T: 'static> LegacyFutureOwner<T> {
     /// the token. The allocation is reclaimed without waiting for completion.
     ///
     /// # Safety
-    /// All borrowers and aliases of the handle must have ended. The caller
-    /// transfers its sole ownership and must never use the token again.
+    /// For a matching live token in the current runtime the caller must own
+    /// the allocation exclusively, with all borrows ended. Adoption consumes
+    /// that token. Invalid tokens terminate at lookup before ownership moves.
     pub unsafe fn from_abi(raw: *mut c_void) -> Self {
         let address = checked_address::<T>(raw, true);
+        // SAFETY: Removal transferred the original typed Box to its sole owner after all
+        // borrows ended. The registry can no longer reclaim this allocation.
         Self::new(unsafe { *Box::from_raw(address) })
     }
 }
@@ -232,13 +239,15 @@ macro_rules! release_abi {
         /// Release an owned legacy future and its native storage.
         ///
         /// # Safety
-        /// The handle must come from the matching typed constructor, remain
-        /// live, and have no remaining borrowers or concurrent users. This
-        /// consumes it; using or releasing it again is invalid. A null handle
-        /// is a fatal invariant violation. Pointer payloads are not freed.
+        /// For a matching live token in the current runtime, the caller must
+        /// transfer sole ownership after all borrows have ended and exclude
+        /// further access. This consumes the future exactly once. Invalid
+        /// tokens terminate at lookup. Pointer payloads remain borrowed.
         #[unsafe(no_mangle)]
         #[willow_runtime_macros::ffi_boundary]
         pub unsafe extern "C" fn $name(raw: *mut c_void) {
+            // SAFETY: The ABI caller transfers sole ownership with all borrows ended.
+            // The typed lookup removes the entry before reclaiming the Box.
             unsafe { release_raw::<$ty>(raw) };
         }
     };
@@ -252,19 +261,23 @@ release_abi!(willow_future_release_ptr, RuntimeFuture<*mut c_void>);
 
 /// # Safety
 ///
-/// `raw` must have been created for `RuntimeFuture<T>` and remain allocated for
-/// the lifetime of the returned reference.
+/// If lookup succeeds, the future must remain live and shared-only for the
+/// lifetime of the returned reference.
 unsafe fn future_from_raw<'a, T: Clone + 'static>(raw: *mut c_void) -> &'a RuntimeFuture<T> {
+    // SAFETY: The registry returns the original typed Box address; the caller keeps it live during
+    // the shared borrow.
     unsafe { &*checked_address::<RuntimeFuture<T>>(raw, false) }
 }
 
 /// # Safety
 ///
-/// In addition to naming a live `RuntimeFuture<T>`, `raw` must be exclusively
+/// If lookup succeeds, the caller must keep the future live and exclusively
 /// accessible for the lifetime of the returned mutable reference.
 unsafe fn future_from_raw_mut<'a, T: Clone + 'static>(
     raw: *mut c_void,
 ) -> &'a mut RuntimeFuture<T> {
+    // SAFETY: The registry recovers the typed Box address. The caller excludes release and
+    // competing borrows during mutation.
     unsafe { &mut *checked_address::<RuntimeFuture<T>>(raw, false) }
 }
 
@@ -358,8 +371,11 @@ pub fn void_future_into_raw_pub(future: WillowFutureVoid) -> *mut c_void {
 
 /// # Safety
 ///
-/// `raw` must name a live `WillowFutureVoid` allocated by this module.
+/// On successful lookup the future must stay live with only shared access
+/// for the entire returned borrow, including a blocking await.
 unsafe fn void_future_from_raw<'a>(raw: *mut c_void) -> &'a WillowFutureVoid {
+    // SAFETY: The registry returns the original typed Box address; the caller keeps it live during
+    // the shared borrow.
     unsafe { &*checked_address::<WillowFutureVoid>(raw, false) }
 }
 
@@ -382,6 +398,8 @@ pub extern "C" fn willow_future_pending_void() -> *mut c_void {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_is_ready_void(raw: *mut c_void) -> u8 {
+    // SAFETY: Lookup checks the live type. Adoption and release require exclusive
+    // ownership and cannot overlap this shared borrow.
     u8::from(unsafe { void_future_from_raw(raw) }.is_ready())
 }
 
@@ -412,6 +430,8 @@ pub extern "C" fn willow_future_ready_ptr(value: *mut c_void) -> *mut c_void {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_await_void(raw: *mut c_void) -> u8 {
+    // SAFETY: Lookup checks the live type. Adoption and release require exclusive
+    // ownership and cannot overlap this shared borrow.
     unsafe { void_future_from_raw(raw) }.block_until_ready();
     0
 }
@@ -419,6 +439,8 @@ pub extern "C" fn willow_future_await_void(raw: *mut c_void) -> u8 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_is_ready_i64(raw: *mut c_void) -> u8 {
+    // SAFETY: Lookup checks the type and liveness. Completion, adoption and release
+    // require exclusive access, so none may overlap this shared poll.
     match unsafe { future_from_raw::<i64>(raw) }.poll() {
         Poll::Ready(_) => 1,
         Poll::Pending => 0,
@@ -428,6 +450,8 @@ pub extern "C" fn willow_future_is_ready_i64(raw: *mut c_void) -> u8 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_await_i64(raw: *mut c_void) -> i64 {
+    // SAFETY: Lookup checks the type and liveness. Completion, adoption and release
+    // require exclusive access, so none may overlap this shared poll.
     match unsafe { future_from_raw::<i64>(raw) }.poll() {
         Poll::Ready(value) => value,
         Poll::Pending => 0,
@@ -443,6 +467,8 @@ pub extern "C" fn willow_future_pending_i64() -> *mut c_void {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_is_ready_bool(raw: *mut c_void) -> u8 {
+    // SAFETY: Lookup checks the live type. Adoption and release require exclusive
+    // ownership and cannot overlap this shared borrow.
     match unsafe { future_from_raw::<u8>(raw) }.poll() {
         Poll::Ready(_) => 1,
         Poll::Pending => 0,
@@ -452,6 +478,8 @@ pub extern "C" fn willow_future_is_ready_bool(raw: *mut c_void) -> u8 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_await_bool(raw: *mut c_void) -> u8 {
+    // SAFETY: Lookup checks the live type. Adoption and release require exclusive
+    // ownership and cannot overlap this shared borrow.
     match unsafe { future_from_raw::<u8>(raw) }.poll() {
         Poll::Ready(value) => {
             if value == 0 {
@@ -473,6 +501,8 @@ pub extern "C" fn willow_future_pending_bool() -> *mut c_void {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_is_ready_f64(raw: *mut c_void) -> u8 {
+    // SAFETY: Lookup checks the live type. Adoption and release require exclusive
+    // ownership and cannot overlap this shared borrow.
     match unsafe { future_from_raw::<f64>(raw) }.poll() {
         Poll::Ready(_) => 1,
         Poll::Pending => 0,
@@ -482,6 +512,8 @@ pub extern "C" fn willow_future_is_ready_f64(raw: *mut c_void) -> u8 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_await_f64(raw: *mut c_void) -> f64 {
+    // SAFETY: Lookup checks the live type. Adoption and release require exclusive
+    // ownership and cannot overlap this shared borrow.
     match unsafe { future_from_raw::<f64>(raw) }.poll() {
         Poll::Ready(value) => value,
         Poll::Pending => 0.0,
@@ -497,6 +529,8 @@ pub extern "C" fn willow_future_pending_f64() -> *mut c_void {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_is_ready_ptr(raw: *mut c_void) -> u8 {
+    // SAFETY: Lookup checks the live type. Adoption and release require exclusive
+    // ownership and cannot overlap this shared borrow.
     match unsafe { future_from_raw::<*mut c_void>(raw) }.poll() {
         Poll::Ready(_) => 1,
         Poll::Pending => 0,
@@ -506,6 +540,8 @@ pub extern "C" fn willow_future_is_ready_ptr(raw: *mut c_void) -> u8 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_await_ptr(raw: *mut c_void) -> *mut c_void {
+    // SAFETY: Lookup checks the live type. Adoption and release require exclusive
+    // ownership and cannot overlap this shared borrow.
     match unsafe { future_from_raw::<*mut c_void>(raw) }.poll() {
         Poll::Ready(value) => value,
         Poll::Pending => std::ptr::null_mut(),
@@ -518,11 +554,25 @@ pub extern "C" fn willow_future_pending_ptr() -> *mut c_void {
     into_raw(RuntimeFuture::<*mut c_void>::pending())
 }
 
-/// Complete a pending i64 future with a value (called by executor when async fn finishes).
-/// Returns 1 on success. A null handle is a fatal runtime invariant violation.
+/// Store the result of a legacy i64 future and return 1. The registry rejects
+/// null, stale and wrong-type tokens before accessing the future.
+///
+/// # Safety
+///
+/// If `raw` identifies a live i64 future in the current runtime, the caller
+/// must have exclusive access to that future from entry until return. All
+/// earlier borrows must have ended, and no other caller may poll, await,
+/// complete, adopt or release it through any copy of the token during the call.
+///
+/// ```compile_fail,E0133
+/// use willow_runtime::future::{willow_future_complete_i64, willow_future_pending_i64};
+/// let token = willow_future_pending_i64();
+/// willow_future_complete_i64(token, 42);
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_future_complete_i64(raw: *mut c_void, value: i64) -> u8 {
+pub unsafe extern "C" fn willow_future_complete_i64(raw: *mut c_void, value: i64) -> u8 {
+    // SAFETY: The completion ABI requires exclusive access to the live i64 future.
     unsafe { future_from_raw_mut::<i64>(raw) }.complete(value);
     1
 }
@@ -547,11 +597,17 @@ mod tests {
         let boolean = willow_future_ready_bool(7);
         let f64 = willow_future_ready_f64(3.5);
         let ptr = willow_future_ready_ptr(std::ptr::null_mut());
-        let void_owner = unsafe { LegacyFutureOwner::<WillowFutureVoid>::from_abi(void) };
-        let i64_owner = unsafe { LegacyFutureOwner::<RuntimeFuture<i64>>::from_abi(i64) };
-        let bool_owner = unsafe { LegacyFutureOwner::<RuntimeFuture<u8>>::from_abi(boolean) };
-        let f64_owner = unsafe { LegacyFutureOwner::<RuntimeFuture<f64>>::from_abi(f64) };
-        let ptr_owner = unsafe { LegacyFutureOwner::<RuntimeFuture<*mut c_void>>::from_abi(ptr) };
+        // SAFETY: Each constructor transferred one fresh token to this test. No
+        // future was borrowed or shared. Each matching adoption consumes it once.
+        let (void_owner, i64_owner, bool_owner, f64_owner, ptr_owner) = unsafe {
+            (
+                LegacyFutureOwner::<WillowFutureVoid>::from_abi(void),
+                LegacyFutureOwner::<RuntimeFuture<i64>>::from_abi(i64),
+                LegacyFutureOwner::<RuntimeFuture<u8>>::from_abi(boolean),
+                LegacyFutureOwner::<RuntimeFuture<f64>>::from_abi(f64),
+                LegacyFutureOwner::<RuntimeFuture<*mut c_void>>::from_abi(ptr),
+            )
+        };
         assert!(void_owner.get().is_ready());
         assert_eq!(i64_owner.get().poll(), Poll::Ready(42));
         assert_eq!(bool_owner.get().poll(), Poll::Ready(1));
@@ -584,6 +640,7 @@ mod tests {
             move || {
                 let raw = into_raw(ready_future(DropCount(drops)));
                 let _owner =
+                    // SAFETY: This closure alone owns the fresh token; no borrow preceded adoption.
                     unsafe { LegacyFutureOwner::<RuntimeFuture<DropCount>>::from_abi(raw) };
                 panic!("owner unwinds");
             }
@@ -596,6 +653,8 @@ mod tests {
         drop(owner);
         // Cancellation abandons ready values too; owner drop releases payload.
         let raw = into_raw(ready_future(DropCount(drops.clone())));
+        // SAFETY: Direct registration gave this test the only handle and it has never been
+        // borrowed.
         let mut owner = unsafe { LegacyFutureOwner::<RuntimeFuture<DropCount>>::from_abi(raw) };
         owner.get_mut().cancel();
         assert!(matches!(owner.get().poll(), Poll::Pending));
@@ -626,6 +685,8 @@ mod tests {
         struct VoidAbiOwner(*mut c_void);
         impl Drop for VoidAbiOwner {
             fn drop(&mut self) {
+                // SAFETY: This guard alone owns the token. Its synchronous awaits have
+                // ended; the observer only checks registry membership by numeric key.
                 unsafe {
                     willow_future_release_void(self.0);
                 }
@@ -657,7 +718,8 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let task = willow_sched_spawn(callback, std::ptr::null_mut());
+            // SAFETY: The callback accepts a null frame and uses no frame storage.
+            let task = unsafe { willow_sched_spawn(callback, std::ptr::null_mut()) };
             if index == 1 {
                 willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
                 assert_eq!(willow_sched_task_state(task), 2);
@@ -703,6 +765,8 @@ mod tests {
             .checked_address::<Owned>(token, true);
         assert_eq!(a.load(std::sync::atomic::Ordering::SeqCst), 0);
         // Explicit release transfers ownership exactly once.
+        // SAFETY: Removal transferred the original typed Box to its sole owner after all
+        // borrows ended. The registry can no longer reclaim this allocation.
         unsafe { drop(Box::from_raw(address)) };
         drop(first);
         assert_eq!(a.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -723,6 +787,7 @@ mod tests {
                 .collect();
             for (i, &token) in tokens.iter().enumerate().step_by(2) {
                 assert_eq!(willow_future_await_i64(token), i as i64);
+                // SAFETY: This stride consumes each even token once, after its await returned.
                 unsafe {
                     willow_future_release_i64(token);
                 }
@@ -742,6 +807,7 @@ mod tests {
                 );
             }
             for &token in tokens.iter().skip(1).step_by(2).chain(replacements.iter()) {
+                // SAFETY: The odd originals and fresh replacements are disjoint, owned solely here.
                 unsafe {
                     willow_future_release_i64(token);
                 }
@@ -774,9 +840,13 @@ mod tests {
         if let Ok(case) = std::env::var(CHILD) {
             let raw = willow_future_ready_i64(7);
             match case.as_str() {
+                // SAFETY: The registry checks the opaque token and type before any dereference,
+                // including on this deliberately invalid release or adoption.
                 "wrong_adopt" => unsafe {
                     LegacyFutureOwner::<WillowFutureVoid>::from_abi(raw);
                 },
+                // SAFETY: The registry checks the opaque token and type before any dereference,
+                // including on this deliberately invalid release or adoption.
                 "null_adopt" => unsafe {
                     LegacyFutureOwner::<RuntimeFuture<i64>>::from_abi(std::ptr::null_mut());
                 },
@@ -786,15 +856,20 @@ mod tests {
                 "wrong_await" => {
                     willow_future_await_f64(raw);
                 }
+                // SAFETY: The registry checks the opaque token and type before any dereference,
+                // including on this deliberately invalid release or adoption.
                 "wrong_release" => unsafe { willow_future_release_ptr(raw) },
-                "wrong_complete" => {
+                // SAFETY: The fresh bool token fails the type check before any borrow.
+                "wrong_complete" => unsafe {
                     willow_future_complete_i64(willow_future_ready_bool(1), 5);
-                }
+                },
                 "forged" => {
                     willow_future_await_void(std::ptr::without_provenance_mut(usize::MAX));
                 }
                 "double_void" => {
                     let raw = willow_future_ready_void();
+                    // SAFETY: The test exclusively owns this fresh token. Removal ends ownership;
+                    // any duplicate release is rejected before it can touch the allocation.
                     unsafe {
                         willow_future_release_void(raw);
                         willow_future_release_void(raw);
@@ -802,6 +877,8 @@ mod tests {
                 }
                 "double_bool" => {
                     let raw = willow_future_ready_bool(1);
+                    // SAFETY: The test exclusively owns this fresh token. Removal ends ownership;
+                    // any duplicate release is rejected before it can touch the allocation.
                     unsafe {
                         willow_future_release_bool(raw);
                         willow_future_release_bool(raw);
@@ -809,6 +886,8 @@ mod tests {
                 }
                 "double_f64" => {
                     let raw = willow_future_ready_f64(1.0);
+                    // SAFETY: The test exclusively owns this fresh token. Removal ends ownership;
+                    // any duplicate release is rejected before it can touch the allocation.
                     unsafe {
                         willow_future_release_f64(raw);
                         willow_future_release_f64(raw);
@@ -816,12 +895,16 @@ mod tests {
                 }
                 "double_ptr" => {
                     let raw = willow_future_ready_ptr(std::ptr::null_mut());
+                    // SAFETY: The test exclusively owns this fresh token. Removal ends ownership;
+                    // any duplicate release is rejected before it can touch the allocation.
                     unsafe {
                         willow_future_release_ptr(raw);
                         willow_future_release_ptr(raw);
                     }
                 }
                 _ => {
+                    // SAFETY: The test exclusively owns this fresh token. Removal ends ownership;
+                    // any duplicate release is rejected before it can touch the allocation.
                     unsafe {
                         willow_future_release_i64(raw);
                     }
@@ -829,7 +912,11 @@ mod tests {
                     let other = willow_future_ready_i64(9);
                     assert_ne!(raw, other);
                     match case.as_str() {
+                        // SAFETY: The registry checks the opaque token and type before any
+                        // dereference, including on this deliberately invalid release or adoption.
                         "double_i64" => unsafe { willow_future_release_i64(raw) },
+                        // SAFETY: The registry checks the opaque token and type before any
+                        // dereference, including on this deliberately invalid release or adoption.
                         "stale_adopt" => unsafe {
                             LegacyFutureOwner::<RuntimeFuture<i64>>::from_abi(raw);
                         },
@@ -839,9 +926,10 @@ mod tests {
                         "stale_await" => {
                             willow_future_await_i64(raw);
                         }
-                        "stale_complete" => {
+                        // SAFETY: Release removed this token. Lookup rejects it before any borrow.
+                        "stale_complete" => unsafe {
                             willow_future_complete_i64(raw, 10);
-                        }
+                        },
                         _ => panic!("unknown case"),
                     }
                 }
@@ -943,6 +1031,7 @@ mod tests {
                 }
                 assert_eq!(drops.get(), 0);
                 for raw in owned {
+                    // SAFETY: Draining the vector consumes each unique, never-borrowed token once.
                     unsafe { release_raw::<RuntimeFuture<DropCount>>(raw) };
                 }
                 assert_eq!(drops.get(), handles);
@@ -962,6 +1051,8 @@ mod tests {
         let raw = willow_future_ready_ptr(ptr);
         assert_eq!(willow_future_await_ptr(raw), ptr);
         assert_eq!(willow_future_await_ptr(raw), ptr);
+        // SAFETY: The constructor gave this test sole ownership; all synchronous borrows have
+        // ended.
         unsafe { willow_future_release_ptr(raw) };
         assert_eq!(*payload, 73);
         *payload = 91;
@@ -972,6 +1063,8 @@ mod tests {
     fn release_sleep_does_not_await_its_deadline() {
         let raw = void_future_into_raw(WillowFutureVoid::sleep_after_millis(3_600_000));
         assert_eq!(willow_future_is_ready_void(raw), 0);
+        // SAFETY: The constructor gave this test sole ownership; all synchronous borrows have
+        // ended.
         unsafe { willow_future_release_void(raw) };
     }
 
@@ -979,6 +1072,8 @@ mod tests {
     fn future_unit_01_ready_i64_abi_awaits_value() {
         let raw = willow_future_ready_i64(42);
         assert_eq!(willow_future_await_i64(raw), 42);
+        // SAFETY: The constructor gave this test sole ownership; all synchronous borrows have
+        // ended.
         unsafe { willow_future_release_i64(raw) };
     }
 
@@ -986,6 +1081,8 @@ mod tests {
     fn future_unit_02_ready_bool_abi_canonicalizes_true() {
         let raw = willow_future_ready_bool(7);
         assert_eq!(willow_future_await_bool(raw), 1);
+        // SAFETY: The constructor gave this test sole ownership; all synchronous borrows have
+        // ended.
         unsafe { willow_future_release_bool(raw) };
     }
 
@@ -993,6 +1090,8 @@ mod tests {
     fn future_unit_03_ready_bool_abi_preserves_false() {
         let raw = willow_future_ready_bool(0);
         assert_eq!(willow_future_await_bool(raw), 0);
+        // SAFETY: The constructor gave this test sole ownership; all synchronous borrows have
+        // ended.
         unsafe { willow_future_release_bool(raw) };
     }
 
@@ -1000,6 +1099,8 @@ mod tests {
     fn future_unit_04_ready_f64_abi_awaits_value() {
         let raw = willow_future_ready_f64(3.5);
         assert_eq!(willow_future_await_f64(raw), 3.5);
+        // SAFETY: The constructor gave this test sole ownership; all synchronous borrows have
+        // ended.
         unsafe { willow_future_release_f64(raw) };
     }
 
@@ -1009,6 +1110,8 @@ mod tests {
         let ptr = (&mut value as *mut i64).cast::<c_void>();
         let raw = willow_future_ready_ptr(ptr);
         assert_eq!(willow_future_await_ptr(raw), ptr);
+        // SAFETY: The constructor gave this test sole ownership; all synchronous borrows have
+        // ended.
         unsafe { willow_future_release_ptr(raw) };
     }
 
@@ -1016,6 +1119,8 @@ mod tests {
     fn future_unit_06_ready_void_abi_awaits_unit() {
         let raw = willow_future_ready_void();
         assert_eq!(willow_future_await_void(raw), 0);
+        // SAFETY: The constructor gave this test sole ownership; all synchronous borrows have
+        // ended.
         unsafe { willow_future_release_void(raw) };
     }
 
@@ -1055,14 +1160,25 @@ mod tests {
                 "await_ptr" => {
                     willow_future_await_ptr(raw);
                 }
+                // SAFETY: The registry checks the opaque token and type before any dereference,
+                // including on this deliberately invalid release or adoption.
                 "release_void" => unsafe { willow_future_release_void(raw) },
+                // SAFETY: The registry checks the opaque token and type before any dereference,
+                // including on this deliberately invalid release or adoption.
                 "release_i64" => unsafe { willow_future_release_i64(raw) },
+                // SAFETY: The registry checks the opaque token and type before any dereference,
+                // including on this deliberately invalid release or adoption.
                 "release_bool" => unsafe { willow_future_release_bool(raw) },
+                // SAFETY: The registry checks the opaque token and type before any dereference,
+                // including on this deliberately invalid release or adoption.
                 "release_f64" => unsafe { willow_future_release_f64(raw) },
+                // SAFETY: The registry checks the opaque token and type before any dereference,
+                // including on this deliberately invalid release or adoption.
                 "release_ptr" => unsafe { willow_future_release_ptr(raw) },
-                "complete_i64" => {
+                // SAFETY: The null token is rejected before any borrow.
+                "complete_i64" => unsafe {
                     willow_future_complete_i64(raw, 42);
-                }
+                },
                 _ => panic!("unknown child case"),
             }
             return;
@@ -1115,6 +1231,8 @@ mod tests {
                 let raw = $pending();
                 assert_eq!($poll(raw), 0);
                 assert_eq!($await(raw), $zero);
+                // SAFETY: The constructor gave this test sole ownership; all synchronous borrows
+                // have ended.
                 unsafe {
                     $release(raw);
                 }
@@ -1122,6 +1240,8 @@ mod tests {
                 assert_eq!($poll(raw), 1);
                 assert_eq!($await(raw), $value);
                 assert_eq!($await(raw), $value);
+                // SAFETY: The constructor gave this test sole ownership; all synchronous borrows
+                // have ended.
                 unsafe {
                     $release(raw);
                 }
@@ -1165,9 +1285,12 @@ mod tests {
             std::ptr::null_mut()
         );
         let raw = willow_future_pending_i64();
-        assert_eq!(willow_future_complete_i64(raw, 73), 1);
+        // SAFETY: This test alone owns the fresh token and polls it only after completion.
+        assert_eq!(unsafe { willow_future_complete_i64(raw, 73) }, 1);
         assert_eq!(willow_future_is_ready_i64(raw), 1);
         assert_eq!(willow_future_await_i64(raw), 73);
+        // SAFETY: The constructor gave this test sole ownership; all synchronous borrows have
+        // ended.
         unsafe {
             willow_future_release_i64(raw);
         }
@@ -1179,6 +1302,8 @@ mod tests {
             let raw = void_future_into_raw(future);
             assert_eq!(willow_future_is_ready_void(raw), expected);
             assert_eq!(willow_future_await_void(raw), 0);
+            // SAFETY: The constructor gave this test sole ownership; all synchronous borrows have
+            // ended.
             unsafe {
                 willow_future_release_void(raw);
             }
@@ -1189,6 +1314,8 @@ mod tests {
     fn future_unit_11_pending_i64_await_returns_zero_for_mvp() {
         let raw = into_raw(RuntimeFuture::<i64>::pending());
         assert_eq!(willow_future_await_i64(raw), 0);
+        // SAFETY: The constructor gave this test sole ownership; all synchronous borrows have
+        // ended.
         unsafe { willow_future_release_i64(raw) };
     }
 
@@ -1198,6 +1325,8 @@ mod tests {
         future.cancel();
         let raw = into_raw(future);
         assert_eq!(willow_future_await_i64(raw), 0);
+        // SAFETY: The constructor gave this test sole ownership; all synchronous borrows have
+        // ended.
         unsafe { willow_future_release_i64(raw) };
     }
 }

@@ -111,7 +111,8 @@ fn check_affinity_case(cancel: bool, task_count: usize, rendezvous_millis: u64) 
     RENDEZVOUS_MILLIS.store(rendezvous_millis, Ordering::Relaxed);
     assert_eq!(crate::native_stack::required_workers(), 0);
     let tasks: Vec<_> = (0..task_count)
-        .map(|_| willow_sched_spawn(deep_affinity_poll, std::ptr::null_mut()))
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        .map(|_| unsafe { willow_sched_spawn(deep_affinity_poll, std::ptr::null_mut()) })
         .collect();
     let mutator = crate::gc::MutatorRegistration::new();
     let completed = willow_sched_run_parallel(None, 4, None);
@@ -212,7 +213,8 @@ fn affinity_reroute_keeps_claim_visible_until_idle_snapshot_finishes() {
     let _guard = crate::gc::isolated_runtime();
     reset_global_scheduler_for_test();
     replace_global_scheduler_for_test(2);
-    let task = willow_sched_spawn(deep_affinity_poll, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let task = unsafe { willow_sched_spawn(deep_affinity_poll, std::ptr::null_mut()) };
     // An unstarted stack provides real affinity without leaving a suspended
     // callback to unwind when the fixture is torn down.
     let stack = crate::native_stack::NativeStack::acquire(deep_affinity_poll, std::ptr::null_mut());

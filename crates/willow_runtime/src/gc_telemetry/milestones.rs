@@ -443,7 +443,9 @@ mod tests {
     #[test]
     fn milestone_unobserved_cycles_emit_no_wake_calls() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let before = default_owner().state.1.notifications();
         for cycles in [1, 8, 64] {
             for _ in 0..cycles {
@@ -456,13 +458,17 @@ mod tests {
             assert_eq!(default_owner().state.1.notifications(), before);
             assert_eq!(snapshot().stage, GcStage::Quiescent as u32);
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn milestone_repeated_owned_cycles_in_one_election_do_not_nest() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         // Owned top-level cycles completing before election release (or with no
         // election at all) must not accumulate as active nesting.
         let mut epochs = Vec::new();
@@ -481,20 +487,26 @@ mod tests {
         assert_eq!(record(last).unwrap().stage, GcStage::SweepComplete as u32);
         quiescent();
         assert_eq!(record(last).unwrap().stage, GcStage::Quiescent as u32);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn milestone_runtime_reset_retires_unpublished_cycles() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let major = super::super::Cycle::begin(super::super::CycleKind::Major);
         let unfinished = snapshot().epoch;
         std::mem::forget(major);
         let minor = super::super::Cycle::begin(super::super::CycleKind::Minor);
         let finished = snapshot().epoch;
         minor.finish(0, 0, Default::default());
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let state = default_owner().state.0.lock().unwrap();
         assert!(state.active.is_empty() && state.finished.is_none());
         drop(state);
@@ -502,13 +514,17 @@ mod tests {
             assert_eq!(record(epoch).unwrap().aborted, 1);
         }
         drop(super::super::Cycle::begin(super::super::CycleKind::Major));
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn milestone_nested_minor_history_preserves_major_and_abort_restores_parent() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let major = super::super::Cycle::begin(super::super::CycleKind::Major);
         let parent = snapshot().epoch;
         for _ in 0..CAPACITY * 2 {
@@ -563,7 +579,9 @@ mod tests {
     fn milestone_future_wait_ignores_spurious_notifications_and_wakes_on_completion() {
         use std::sync::atomic::Ordering;
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let previous = request_gc_for_test().unwrap();
         let next = GcTicket(previous.0 + 1);
         default_owner().waits.store(0, Ordering::Relaxed);
@@ -586,18 +604,24 @@ mod tests {
         assert!(!observer.is_finished());
         assert_eq!(request_gc_for_test(), Some(next));
         assert_eq!(observer.join().unwrap().unwrap().epoch, next.0);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn milestone_major_empty_and_rooted_cycles_are_ordered() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let mut previous = 0;
         for rooted in [false, true] {
             let mut root = willow_alloc(8);
             if rooted {
-                willow_push_root(&mut root);
+                // SAFETY: The initialized slot stays at this address until its registration
+                // is popped; collection may rewrite it there.
+                unsafe { willow_push_root(&raw mut root) };
             }
             let ticket = request_gc_for_test().expect("own major cycle completed");
             assert!(ticket.0 > previous);
@@ -616,21 +640,29 @@ mod tests {
             }
             assert_eq!(willow_gc_allocated_bytes() != 0, rooted);
             if rooted {
-                willow_pop_root();
+                // SAFETY: The removed shadow-stack entries belong to this operation and their
+                // slot storage is still live.
+                unsafe { willow_pop_root() };
             }
         }
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn milestone_minor_completion_and_reset_preserve_identity() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         willow_gc_minor_collect();
         let before = snapshot();
         assert_eq!(before.stage, 3);
         assert_eq!(crate::gc_telemetry::snapshot().last_cycle.kind, 1);
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let ticket = request_gc_for_test().unwrap();
         assert!(ticket.0 > before.epoch);
         assert_eq!(
@@ -639,13 +671,17 @@ mod tests {
                 .epoch,
             before.epoch
         );
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn milestone_wait_timeout_invalid_and_registered_observers() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         assert_eq!(
             wait_gc_for_test(GcTicket(0), GcStage::Quiescent, Duration::ZERO).unwrap_err(),
             WaitError::Expired
@@ -669,13 +705,17 @@ mod tests {
             );
         }
         assert!(wait_gc_for_test(ticket, GcStage::Quiescent, Duration::ZERO).is_ok());
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn milestone_abort_never_fabricates_completion() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let epoch;
         {
             let _cycle = super::super::Cycle::begin(super::super::CycleKind::Major);
@@ -695,13 +735,17 @@ mod tests {
             );
         }
         assert!(request_gc_for_test().is_some());
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn milestone_history_is_bounded_and_old_tickets_expire() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let first = request_gc_for_test().unwrap();
         for _ in 0..CAPACITY {
             request_gc_for_test().unwrap();
@@ -714,27 +758,39 @@ mod tests {
             wait_gc_for_test(first, GcStage::Quiescent, Duration::ZERO).unwrap_err(),
             WaitError::Expired
         );
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     fn milestone_v3_negotiation_is_unaligned_and_preserves_nested_versions() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let ticket = request_gc_for_test().unwrap();
         let size = std::mem::size_of::<super::super::WillowGcStatsV3>();
         assert_eq!(super::super::willow_gc_stats_size(3), size as i64);
         let mut bytes = vec![0xa5; size + 2];
+        // SAFETY: The negotiated size covers the selected record. Unaligned record access supports
+        // byte-aligned caller storage.
         let out = unsafe { bytes.as_mut_ptr().add(1) };
         assert_eq!(
-            super::super::willow_gc_stats_snapshot(3, out, size as i64 - 1),
+            // SAFETY: The backing buffer covers the selected record on success; rejected
+            // requests write nothing.
+            unsafe { super::super::willow_gc_stats_snapshot(3, out, size as i64 - 1) },
             0
         );
         assert!(bytes.iter().all(|&b| b == 0xa5));
         assert_eq!(
-            super::super::willow_gc_stats_snapshot(3, out, size as i64),
+            // SAFETY: The backing buffer covers the selected record on success; rejected
+            // requests write nothing.
+            unsafe { super::super::willow_gc_stats_snapshot(3, out, size as i64) },
             size as i64
         );
+        // SAFETY: The negotiated size covers the selected record. Unaligned record access supports
+        // byte-aligned caller storage.
         let stats = unsafe { out.cast::<super::super::WillowGcStatsV3>().read_unaligned() };
         assert_eq!((stats.version, stats.struct_size), (3, size as u32));
         assert_eq!(stats.baseline.version, 2);
@@ -746,7 +802,9 @@ mod tests {
         assert_eq!(stats.milestones.epoch, ticket.0);
         assert_eq!(stats.milestones.stage, 3);
         assert_eq!((bytes[0], bytes[size + 1]), (0xa5, 0xa5));
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]

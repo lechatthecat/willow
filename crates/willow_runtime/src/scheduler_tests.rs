@@ -50,20 +50,26 @@ unsafe extern "C" fn poll_nested_then_check_quantum(_frame: *mut c_void) -> i32 
 #[test]
 fn nested_scheduler_restores_outer_task_quantum() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     NESTED_QUANTUM_RESTORED.store(false, TestOrdering::SeqCst);
 
-    let target = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let target = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     NESTED_QUANTUM_TARGET.store(target, TestOrdering::SeqCst);
-    willow_sched_spawn(poll_nested_then_check_quantum, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    unsafe { willow_sched_spawn(poll_nested_then_check_quantum, std::ptr::null_mut()) };
 
     assert_eq!(willow_sched_run(), 2);
     assert!(
         NESTED_QUANTUM_RESTORED.load(TestOrdering::SeqCst),
         "nested run_until must rebind the outer task's quantum"
     );
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -419,7 +425,7 @@ fn runq_02_physical_pop_keeps_the_claim_token_until_atomic_claim() {
         "the popped worker owns the outstanding claim until claim_for_poll"
     );
     assert_eq!(
-        s.with_task_mut(id, |task| task.claim_for_poll()),
+        s.with_task(id, |task| task.claim_for_poll()),
         Some(ClaimOutcome::Poll)
     );
     assert!(!s.is_queued(id));
@@ -462,11 +468,11 @@ fn runq_06_steal_clears_the_flag() {
     // Move it to worker 1's local queue, then have worker 0 steal it.
     assert_eq!(s.pop_for_worker(0), Some(id));
     assert_eq!(
-        s.with_task_mut(id, |task| task.claim_for_poll()),
+        s.with_task(id, |task| task.claim_for_poll()),
         Some(ClaimOutcome::Poll)
     );
     assert_eq!(
-        s.with_task_mut(id, |task| task.state.requeue_after_poll()),
+        s.with_task(id, |task| task.state.requeue_after_poll()),
         Some(BoundaryOutcome::Requeue)
     );
     s.run_queues.push_local_front(1, id);
@@ -474,7 +480,7 @@ fn runq_06_steal_clears_the_flag() {
     assert_eq!(s.pop_for_worker(0), Some(id), "worker 0 steals it");
     assert!(s.is_queued(id));
     assert_eq!(
-        s.with_task_mut(id, |task| task.claim_for_poll()),
+        s.with_task(id, |task| task.claim_for_poll()),
         Some(ClaimOutcome::Poll)
     );
     assert!(!s.is_queued(id));
@@ -725,7 +731,9 @@ fn runq_22_mixed_transition_sequence_keeps_queues_consistent() {
 #[test]
 fn runq_23_cancel_publishes_parked_task_once() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let id = with_global_for_test(|sched| sched.spawn_parked_placeholder());
     willow_sched_cancel(id);
@@ -735,7 +743,9 @@ fn runq_23_cancel_publishes_parked_task_once() {
         assert!(sched.queue_invariant_holds());
     });
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -1032,7 +1042,9 @@ fn bsq_29_global_block_and_wake_do_not_need_scheduler_metadata_lock() {
 fn sched_run_registers_driver_as_mutator_without_leaking() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     let before = crate::gc::registered_mutator_count();
     // Driving an empty scheduler registers the driver for the duration and
     // unregisters on the outermost exit: no net leak.
@@ -1067,7 +1079,9 @@ unsafe extern "C" fn poll_record_parallel_worker(_frame: *mut c_void) -> i32 {
 #[test]
 fn parallel_worker_pool_polls_tasks_on_multiple_threads() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     replace_global_scheduler_for_test(2);
     PARALLEL_POLL_THREADS
@@ -1076,8 +1090,10 @@ fn parallel_worker_pool_polls_tasks_on_multiple_threads() {
         .clear();
     PARALLEL_POLL_ENTERED.store(0, TestOrdering::SeqCst);
 
-    let a = willow_sched_spawn(poll_record_parallel_worker, std::ptr::null_mut());
-    let b = willow_sched_spawn(poll_record_parallel_worker, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let a = unsafe { willow_sched_spawn(poll_record_parallel_worker, std::ptr::null_mut()) };
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let b = unsafe { willow_sched_spawn(poll_record_parallel_worker, std::ptr::null_mut()) };
 
     let mutator = crate::gc::MutatorRegistration::new();
     let completed = willow_sched_run_parallel(None, 2, None);
@@ -1094,7 +1110,9 @@ fn parallel_worker_pool_polls_tasks_on_multiple_threads() {
         unique.len() >= 2,
         "expected two worker threads to poll tasks, got {threads:?}"
     );
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -1144,7 +1162,8 @@ fn parallel_completion_wakes_promptly() {
 unsafe extern "C" fn poll_collect_and_nested_drive(_frame: *mut c_void) -> i32 {
     crate::gc::minor_collect_internal();
     crate::gc::willow_gc_collect();
-    let child = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let child = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     willow_sched_run_until(child);
     assert_eq!(willow_sched_task_state(child), -1);
     RUNTIME_POLL_READY
@@ -1153,15 +1172,22 @@ unsafe extern "C" fn poll_collect_and_nested_drive(_frame: *mut c_void) -> i32 {
 #[test]
 fn parallel_completion_allows_worker_gc_and_nested_drive() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     replace_global_scheduler_for_test(2);
-    willow_sched_spawn(poll_collect_and_nested_drive, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    unsafe { willow_sched_spawn(poll_collect_and_nested_drive, std::ptr::null_mut()) };
     let mutator = crate::gc::MutatorRegistration::new();
     assert_eq!(willow_sched_run_parallel(None, 2, None), 2);
     drop(mutator);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[cfg(target_os = "linux")]
@@ -1179,18 +1205,25 @@ fn parallel_completion_driver_cpu_below_five_percent() {
     fn thread_cpu_seconds() -> f64 {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
         assert_eq!(
+            // SAFETY: getrusage receives writable rusage storage. The successful return
+            // initializes it before the read.
             unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) },
             0
         );
+        // SAFETY: getrusage receives writable rusage storage. The successful return initializes it
+        // before the read.
         let usage = unsafe { usage.assume_init() };
         (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
             + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 / 1_000_000.0
     }
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     replace_global_scheduler_for_test(2);
-    willow_sched_spawn(poll_one_second_of_work, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    unsafe { willow_sched_spawn(poll_one_second_of_work, std::ptr::null_mut()) };
     let mutator = crate::gc::MutatorRegistration::new();
     let cpu_start = thread_cpu_seconds();
     let start = Instant::now();
@@ -1204,7 +1237,9 @@ fn parallel_completion_driver_cpu_below_five_percent() {
         cpu < wall * 0.05,
         "driver CPU {cpu}s exceeds 5% of wall {wall}s"
     );
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 static WAKE_RACE_WAITER_REGISTERED: crate::runtime::PerRuntime<TestAtomicUsize> =
@@ -1222,7 +1257,9 @@ unsafe extern "C" fn poll_complete_after_waiter_registered(_frame: *mut c_void) 
 
 unsafe extern "C" fn poll_await_with_running_wake_race(frame: *mut c_void) -> i32 {
     let base = frame as *mut u8;
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let b_id = unsafe { *(base.add(async_frame_slot_offset(0)) as *const u64) };
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let state = unsafe { &mut *(base.add(async_frame_slot_offset(1)) as *mut i64) };
     *state += 1;
     if *state == 1 {
@@ -1238,18 +1275,25 @@ unsafe extern "C" fn poll_await_with_running_wake_race(frame: *mut c_void) -> i3
 #[test]
 fn parallel_wake_while_waiter_running_requeues_after_pending() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     replace_global_scheduler_for_test(2);
     WAKE_RACE_WAITER_REGISTERED.store(0, TestOrdering::SeqCst);
 
-    let b = willow_sched_spawn(poll_complete_after_waiter_registered, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let b =
+        unsafe { willow_sched_spawn(poll_complete_after_waiter_registered, std::ptr::null_mut()) };
     let a_frame = willow_async_frame_alloc(2, 0) as *mut c_void;
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     unsafe {
         let base = a_frame as *mut u8;
         *(base.add(async_frame_slot_offset(0)) as *mut u64) = b;
     }
-    let a = willow_sched_spawn(poll_await_with_running_wake_race, a_frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let a = unsafe { willow_sched_spawn(poll_await_with_running_wake_race, a_frame) };
 
     let mutator = crate::gc::MutatorRegistration::new();
     let completed = willow_sched_run_parallel(None, 2, None);
@@ -1261,7 +1305,9 @@ fn parallel_wake_while_waiter_running_requeues_after_pending() {
     );
     assert_eq!(willow_sched_task_state(a), -1);
     assert_eq!(willow_sched_task_state(b), -1);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -1269,8 +1315,10 @@ fn workqueue_single_worker_preserves_fifo() {
     // With one worker, spawn order == pop order (no behavior change vs. the
     // old single VecDeque).
     let mut s = RuntimeScheduler::with_worker_count(1);
-    let a = s.spawn_task(poll_ready_now, std::ptr::null_mut());
-    let b = s.spawn_task(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let a = unsafe { s.spawn_task(poll_ready_now, std::ptr::null_mut()) };
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let b = unsafe { s.spawn_task(poll_ready_now, std::ptr::null_mut()) };
     assert_eq!(s.pop_for_worker(0), Some(a));
     assert_eq!(s.pop_for_worker(0), Some(b));
 }
@@ -1284,22 +1332,26 @@ fn initialized_spawn_runs_initializer_before_task_or_queue_publication() {
     let run_queues = Arc::clone(&scheduler.run_queues);
     let mut published_id = 0;
 
-    let id = scheduler.spawn_task_initialized(
-        poll_ready_now,
-        std::ptr::null_mut(),
-        Some(cancel_noop),
-        |id| {
-            assert!(
-                tasks.with(id, |_| ()).is_none(),
-                "initializer must run before task-table publication"
-            );
-            assert!(
-                !run_queues.snapshot().contains(&id),
-                "initializer must run before run-queue publication"
-            );
-            published_id = id;
-        },
-    );
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = unsafe {
+        scheduler.spawn_task_initialized(
+            poll_ready_now,
+            std::ptr::null_mut(),
+            Some(cancel_noop),
+            |id| {
+                assert!(
+                    tasks.with(id, |_| ()).is_none(),
+                    "initializer must run before task-table publication"
+                );
+                assert!(
+                    !run_queues.snapshot().contains(&id),
+                    "initializer must run before run-queue publication"
+                );
+                published_id = id;
+            },
+        )
+    };
 
     assert_eq!(published_id, id);
     assert_eq!(run_queues.snapshot(), vec![id]);
@@ -1314,51 +1366,67 @@ fn initialized_spawn_runs_initializer_before_task_or_queue_publication() {
 #[test]
 fn global_initialized_spawn_allows_scheduler_reentry_before_publication() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let mut nested = 0;
     let mut parent_was_hidden = false;
 
-    let parent = spawn_global_task_initialized(
-        poll_ready_now,
-        std::ptr::null_mut(),
-        Some(cancel_noop),
-        |parent| {
-            parent_was_hidden = global_task_table().with(parent, |_| ()).is_none()
-                && !global_run_queues().snapshot().contains(&parent);
-            nested = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
-            assert_ne!(nested, parent);
-            assert_eq!(willow_sched_heavy_task_count(), 1);
-        },
-    );
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let parent = unsafe {
+        spawn_global_task_initialized(
+            poll_ready_now,
+            std::ptr::null_mut(),
+            Some(cancel_noop),
+            |parent| {
+                parent_was_hidden = global_task_table().with(parent, |_| ()).is_none()
+                    && !global_run_queues().snapshot().contains(&parent);
+                nested = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+                assert_ne!(nested, parent);
+                assert_eq!(willow_sched_heavy_task_count(), 1);
+            },
+        )
+    };
 
     assert!(parent_was_hidden);
     assert!(global_task_table().with(parent, |_| ()).is_some());
     assert!(global_task_table().with(nested, |_| ()).is_some());
     assert_eq!(willow_sched_heavy_task_count(), 2);
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn global_initialized_spawn_panic_rolls_back_unpublished_frame_root() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
     let roots_before = crate::gc::runtime_root_count();
 
     let panic = std::panic::catch_unwind(|| {
-        spawn_global_task_initialized(poll_ready_now, frame, Some(cancel_noop), |_id| {
-            panic!("initializer panic");
-        });
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        unsafe {
+            spawn_global_task_initialized(poll_ready_now, frame, Some(cancel_noop), |_id| {
+                panic!("initializer panic");
+            })
+        };
     });
 
     assert!(panic.is_err());
     assert_eq!(crate::gc::runtime_root_count(), roots_before);
     assert_eq!(willow_sched_heavy_task_count(), 0);
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 // ── Cooperative executable tasks ─────────────────────────
@@ -1370,11 +1438,17 @@ fn async_chain_text_walks_awaiter_links() {
     // main(id=1) awaits inner(id=2): register main as a waiter of inner, then
     // mark inner the running task. The chain is inner -> main.
     let (inner, main) = with_global(|sched| {
-        let inner = sched.spawn_task(poll_ready_now, std::ptr::null_mut());
-        let main = sched.spawn_task(poll_ready_now, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let inner = unsafe { sched.spawn_task(poll_ready_now, std::ptr::null_mut()) };
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let main = unsafe { sched.spawn_task(poll_ready_now, std::ptr::null_mut()) };
         sched.register_waiter(inner, main);
-        sched.with_task_mut(inner, |task| task.set_name("inner".to_string()));
-        sched.with_task_mut(main, |task| task.set_name("main".to_string()));
+        // SAFETY: The fixture updates task metadata under the shard lock and preserves the
+        // frame, callbacks and root ownership.
+        unsafe { sched.with_task_mut(inner, |task| task.set_name("inner".to_string())) };
+        // SAFETY: The fixture updates task metadata under the shard lock and preserves the
+        // frame, callbacks and root ownership.
+        unsafe { sched.with_task_mut(main, |task| task.set_name("main".to_string())) };
         sched.set_running(inner);
         (inner, main)
     });
@@ -1394,29 +1468,51 @@ fn async_chain_reads_awaiter_site_persisted_at_registration() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let (inner, main) = with_global(|sched| {
-        let inner = sched.spawn_task(poll_ready_now, std::ptr::null_mut());
-        let main = sched.spawn_task(poll_ready_now, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let inner = unsafe { sched.spawn_task(poll_ready_now, std::ptr::null_mut()) };
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let main = unsafe { sched.spawn_task(poll_ready_now, std::ptr::null_mut()) };
         (inner, main)
     });
     // main publishes its name and site thread-locally (no task-table write),
     // then registers as inner's awaiter, which copies both into its record.
     set_current_task(Some(main));
-    willow_sched_tag_current_task(b"main_fn".as_ptr(), 7);
-    crate::stack_trace::willow_trace_site_set(b"main_fn".as_ptr(), 7, b"m.wi".as_ptr(), 4, 3, 9, 1);
+    // SAFETY: The nonempty diagnostic names are byte literals with process lifetime and the
+    // supplied lengths fit those literals.
+    unsafe { willow_sched_tag_current_task(b"main_fn".as_ptr(), 7) };
+    // SAFETY: The nonempty diagnostic names are byte literals with process lifetime and the
+    // supplied lengths fit those literals.
+    unsafe {
+        crate::stack_trace::willow_trace_site_set(
+            b"main_fn".as_ptr(),
+            7,
+            b"m.wi".as_ptr(),
+            4,
+            3,
+            9,
+            1,
+        )
+    };
     assert!(with_global(|sched| sched.with_task(main, |task| task.name().is_none())).unwrap());
     with_global(|sched| sched.register_waiter(inner, main));
     // inner is now polled on this thread and overwrites the thread-local trace.
     set_current_task(Some(inner));
-    willow_sched_tag_current_task(b"inner_fn".as_ptr(), 8);
-    crate::stack_trace::willow_trace_site_set(
-        b"inner_fn".as_ptr(),
-        8,
-        b"i.wi".as_ptr(),
-        4,
-        5,
-        1,
-        1,
-    );
+    // SAFETY: The nonempty diagnostic names are byte literals with process lifetime and the
+    // supplied lengths fit those literals.
+    unsafe { willow_sched_tag_current_task(b"inner_fn".as_ptr(), 8) };
+    // SAFETY: The nonempty diagnostic names are byte literals with process lifetime and the
+    // supplied lengths fit those literals.
+    unsafe {
+        crate::stack_trace::willow_trace_site_set(
+            b"inner_fn".as_ptr(),
+            8,
+            b"i.wi".as_ptr(),
+            4,
+            5,
+            1,
+            1,
+        )
+    };
     let text = async_chain_text();
     set_current_task(None);
     crate::panic_context::willow_fault_site_clear();
@@ -1448,10 +1544,14 @@ fn async_chain_inspection_handles_depth_fanout_tombstones_and_cycles() {
                         sched.register_waiter(id, extra);
                     }
                     sched.unregister_waiter(id, removed);
-                    sched.with_task_mut(id, |task| {
-                        task.set_name(format!("chain_{index}"));
-                        task.set_spawn_site("inspection.wi".to_string(), index as u32 + 1);
-                    });
+                    // SAFETY: The fixture updates task metadata under the shard lock and
+                    // preserves the frame, callbacks and root ownership.
+                    unsafe {
+                        sched.with_task_mut(id, |task| {
+                            task.set_name(format!("chain_{index}"));
+                            task.set_spawn_site("inspection.wi".to_string(), index as u32 + 1);
+                        })
+                    };
                 }
                 sched.set_running(chain[0]);
             });
@@ -1477,7 +1577,8 @@ fn cooperative_poll_runs_without_an_active_native_stack() {
     }
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
-    let id = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = (unsafe { willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) }) as u64;
     assert!(
         global_task_table()
             .with(id, |task| task.cooperative_poll)
@@ -1493,14 +1594,20 @@ fn cooperative_boundary_returns_callback_result_and_releases_stack() {
         42
     }
     unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
-        assert_eq!(willow_task_stack_enter(helper, std::ptr::null_mut()), 42);
+        assert_eq!(
+            // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+            // live across scheduling and callback execution.
+            unsafe { willow_task_stack_enter(helper, std::ptr::null_mut()) },
+            42
+        );
         willow_task_stack_leave();
         assert!(crate::preempt::willow_sync_poll_counter().is_null());
         RUNTIME_POLL_READY
     }
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
-    let id = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = (unsafe { willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) }) as u64;
     willow_sched_run_until(id);
     assert!(target_is_done(Some(id)));
 }
@@ -1526,7 +1633,9 @@ fn cooperative_boundary_resumes_helper_without_restarting_it() {
         42
     }
     unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
-        let result = willow_task_stack_enter(helper, std::ptr::null_mut());
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        let result = unsafe { willow_task_stack_enter(helper, std::ptr::null_mut()) };
         // Leave must preserve a suspended callback until the next poll.
         willow_task_stack_leave();
         if result == RUNTIME_POLL_PREEMPTED {
@@ -1539,7 +1648,8 @@ fn cooperative_boundary_resumes_helper_without_restarting_it() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     ENTRIES.store(0, Ordering::SeqCst);
-    let id = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = (unsafe { willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) }) as u64;
     willow_sched_run_until(id);
     assert!(target_is_done(Some(id)));
 }
@@ -1555,8 +1665,12 @@ fn cooperative_cancel_bounded_cleanup_avoids_native_stack() {
     reset_global_scheduler_for_test();
     CALLED.store(0, Ordering::SeqCst);
     let frame = willow_async_frame_alloc(0, 0).cast();
-    let id = willow_sched_spawn_cooperative(poll_ready_now, frame) as u64;
-    willow_sched_set_cancel_fn_cooperative(id, cleanup, 0);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = (unsafe { willow_sched_spawn_cooperative(poll_ready_now, frame) }) as u64;
+    // SAFETY: This task was spawned with the frame layout expected by the cancellation
+    // callback.
+    unsafe { willow_sched_set_cancel_fn_cooperative(id, cleanup, 0) };
     willow_sched_cancel(id);
     willow_sched_run_until(id);
     assert_eq!(CALLED.load(Ordering::SeqCst), 1);
@@ -1585,8 +1699,12 @@ fn cooperative_cancel_unbounded_cleanup_retains_native_stack() {
     reset_global_scheduler_for_test();
     CALLED.store(0, Ordering::SeqCst);
     let frame = willow_async_frame_alloc(0, 0).cast();
-    let id = willow_sched_spawn_cooperative(poll_ready_now, frame) as u64;
-    willow_sched_set_cancel_fn_cooperative(id, cleanup, 1);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = (unsafe { willow_sched_spawn_cooperative(poll_ready_now, frame) }) as u64;
+    // SAFETY: This task was spawned with the frame layout expected by the cancellation
+    // callback.
+    unsafe { willow_sched_set_cancel_fn_cooperative(id, cleanup, 1) };
     willow_sched_cancel(id);
     willow_sched_run_until(id);
     assert_eq!(CALLED.load(Ordering::SeqCst), 1);
@@ -1597,9 +1715,21 @@ fn cooperative_spawn_publishes_call_site_before_first_poll() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let previous = crate::stack_trace::replace_current(Default::default());
-    crate::stack_trace::willow_callstack_push(b"child".as_ptr(), 5, b"spawn.wi".as_ptr(), 8, 42, 3);
+    // SAFETY: The source strings cover their byte counts through the synchronous copy.
+    unsafe {
+        crate::stack_trace::willow_callstack_push(
+            b"child".as_ptr(),
+            5,
+            b"spawn.wi".as_ptr(),
+            8,
+            42,
+            3,
+        )
+    };
     let frame = willow_async_frame_alloc(0, 0).cast();
-    let id = willow_sched_spawn_cooperative(poll_ready_now, frame) as u64;
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = (unsafe { willow_sched_spawn_cooperative(poll_ready_now, frame) }) as u64;
     crate::stack_trace::replace_current(previous);
     // Inspect the published record before the caller can invoke the
     // post-constructor setter: another worker can already claim it here.
@@ -1617,14 +1747,18 @@ fn cooperative_cancel_without_cleanup_reports_terminal_cancellation_once() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let mut before = WillowRuntimeMetricsV1::default();
-    willow_runtime_metrics_snapshot_v1(&mut before);
+    // SAFETY: The typed output owns one aligned, writable record for the call.
+    unsafe { willow_runtime_metrics_snapshot_v1(&mut before) };
     let frame = willow_async_frame_alloc(0, 0).cast();
-    let id = willow_sched_spawn_cooperative(poll_ready_now, frame) as u64;
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = (unsafe { willow_sched_spawn_cooperative(poll_ready_now, frame) }) as u64;
     willow_sched_cancel(id);
     willow_sched_run_until(id);
     willow_sched_run();
     let mut after = WillowRuntimeMetricsV1::default();
-    willow_runtime_metrics_snapshot_v1(&mut after);
+    // SAFETY: The typed output owns one aligned, writable record for the call.
+    unsafe { willow_runtime_metrics_snapshot_v1(&mut after) };
     assert_eq!(after.task_cancellations - before.task_cancellations, 1);
     assert_eq!(after.task_polls - before.task_polls, 0);
 }
@@ -1637,6 +1771,7 @@ unsafe extern "C" fn poll_ready_now(_frame: *mut c_void) -> i32 {
 /// Uses the frame's state word (offset 0) as a counter: Pending on the first
 /// poll, Ready on the second.
 unsafe extern "C" fn poll_ready_on_second(frame: *mut c_void) -> i32 {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let state = unsafe { &mut *(frame as *mut i64) };
     *state += 1;
     if *state >= 2 {
@@ -1649,9 +1784,12 @@ unsafe extern "C" fn poll_ready_on_second(frame: *mut c_void) -> i32 {
 #[test]
 fn coop_01_ready_task_runs_to_completion() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
-    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     assert_eq!(willow_sched_run(), 1);
     assert_eq!(willow_sched_task_state(id), -1); // terminal record reaped
 }
@@ -1659,11 +1797,15 @@ fn coop_01_ready_task_runs_to_completion() {
 #[test]
 fn coop_02_pending_parks_then_wake_resumes() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     // A frame with just the [state, slot_count] header; poll uses the state word.
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    let id = willow_sched_spawn(poll_ready_on_second, frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = unsafe { willow_sched_spawn(poll_ready_on_second, frame) };
     // First poll: state 0->1 -> Pending -> parked.
     assert_eq!(willow_sched_run(), 0);
     assert_eq!(willow_sched_task_state(id), 2); // Parked
@@ -1675,12 +1817,15 @@ fn coop_02_pending_parks_then_wake_resumes() {
     assert_eq!(willow_sched_task_state(id), 0); // Ready
     assert_eq!(willow_sched_run(), 1);
     assert_eq!(willow_sched_task_state(id), -1); // terminal record reaped
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 /// First poll registers a 5ms sleep then returns Pending; second poll
 /// (after the timer fires) returns Ready.
 unsafe extern "C" fn poll_sleep_then_ready(frame: *mut c_void) -> i32 {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let state = unsafe { &mut *(frame as *mut i64) };
     *state += 1;
     if *state >= 2 {
@@ -1694,6 +1839,7 @@ unsafe extern "C" fn poll_sleep_then_ready(frame: *mut c_void) -> i32 {
 /// First poll requests a cooperative yield then returns Pending; second poll
 /// returns Ready.
 unsafe extern "C" fn poll_yield_then_ready(frame: *mut c_void) -> i32 {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let state = unsafe { &mut *(frame as *mut i64) };
     *state += 1;
     if *state >= 2 {
@@ -1709,10 +1855,14 @@ fn coop_timer_wake_resumes_parked_task() {
     // a task that parks with a wake-deadline (sleep) is woken
     // by the timer-aware run loop and resumes to completion — no manual wake.
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    let id = willow_sched_spawn(poll_sleep_then_ready, frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = unsafe { willow_sched_spawn(poll_sleep_then_ready, frame) };
     let start = std::time::Instant::now();
     // Single run: first poll -> sleep+Pending -> parked with deadline; the
     // loop blocks ~5ms, wakes it, second poll -> Ready -> completed.
@@ -1723,26 +1873,36 @@ fn coop_timer_wake_resumes_parked_task() {
         "run loop should have waited for the wake-deadline"
     );
     assert_eq!(willow_sched_task_state(id), -1); // terminal record reaped
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn coop_yield_requeues_running_task_without_manual_wake() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    let id = willow_sched_spawn(poll_yield_then_ready, frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = unsafe { willow_sched_spawn(poll_yield_then_ready, frame) };
     assert_eq!(willow_sched_run(), 1);
     assert_eq!(willow_sched_task_state(id), -1); // terminal record reaped
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 /// Awaits the task whose id is stored in frame slot 0; resumes once it
 /// completes (slot 1 is a poll counter).
 unsafe extern "C" fn poll_await_dependency(frame: *mut c_void) -> i32 {
     let base = frame as *mut u8;
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let b_id = unsafe { *(base.add(async_frame_slot_offset(0)) as *const u64) };
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let state = unsafe { &mut *(base.add(async_frame_slot_offset(1)) as *mut i64) };
     *state += 1;
     if *state == 1 {
@@ -1762,18 +1922,25 @@ fn coop_dependency_wake_resumes_awaiter() {
     // wake); B's completion wakes A (dependency wake); A resumes. No manual
     // wake — the scheduler drives both to completion in one run.
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     // B: sleeps 5ms on the first poll, ready on the second.
     let b_frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    let b_id = willow_sched_spawn(poll_sleep_then_ready, b_frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let b_id = unsafe { willow_sched_spawn(poll_sleep_then_ready, b_frame) };
     // A: awaits B. Store B's id in slot 0; slot 1 is A's poll counter.
     let a_frame = willow_async_frame_alloc(2, 0) as *mut c_void;
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     unsafe {
         let base = a_frame as *mut u8;
         *(base.add(async_frame_slot_offset(0)) as *mut u64) = b_id;
     }
-    let a_id = willow_sched_spawn(poll_await_dependency, a_frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let a_id = unsafe { willow_sched_spawn(poll_await_dependency, a_frame) };
     let completed = willow_sched_run();
     assert_eq!(
         completed, 2,
@@ -1781,7 +1948,9 @@ fn coop_dependency_wake_resumes_awaiter() {
     );
     assert_eq!(willow_sched_task_state(a_id), -1); // A terminal record reaped
     assert_eq!(willow_sched_task_state(b_id), -1); // B terminal record reaped
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -1791,10 +1960,14 @@ fn coop_clear_running_prevents_stale_sleep() {
     // wake-deadline to the just-parked (now stale) task and spuriously wake
     // it on the next run.
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    let id = willow_sched_spawn(poll_ready_on_second, frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = unsafe { willow_sched_spawn(poll_ready_on_second, frame) };
     assert_eq!(willow_sched_run(), 0); // parks (no deadline); running cleared
     assert_eq!(willow_sched_task_state(id), 2); // Parked
     // Outside any poll (running == None): must be a no-op.
@@ -1805,7 +1978,9 @@ fn coop_clear_running_prevents_stale_sleep() {
         "stale task must not be woken by an out-of-poll sleep"
     );
     assert_eq!(willow_sched_task_state(id), 2); // still Parked, not woken/completed
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -1813,30 +1988,42 @@ fn coop_parked_without_deadline_stays_idle() {
     // A task parked WITHOUT a deadline is not spuriously woken by the timer
     // loop (regression guard for the cooperative suspension run-loop change).
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    let id = willow_sched_spawn(poll_ready_on_second, frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = unsafe { willow_sched_spawn(poll_ready_on_second, frame) };
     assert_eq!(willow_sched_run(), 0); // parks, no deadline
     assert_eq!(willow_sched_task_state(id), 2); // Parked
     assert_eq!(willow_sched_run(), 0); // stays parked (loop breaks, no timer)
     assert_eq!(willow_sched_task_state(id), 2);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn coop_03_suspended_frame_keeps_referenced_object_alive() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
 
     // Frame with one GC-reference data slot (mask bit 0).
     let mut frame = willow_async_frame_alloc(1, 0b1) as *mut u8;
     // Protect setup until spawn transfers ownership to the scheduler root.
-    crate::gc::willow_push_root(&mut frame as *mut *mut u8);
+    // SAFETY: The callback frame retains this initialized reference slot until the callback
+    // pops it.
+    unsafe { crate::gc::willow_push_root(&raw mut frame) };
     // A heap object reachable ONLY through the frame's GC slot.
     let obj = willow_alloc_typed(16, 0);
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let slot0 = unsafe { frame.add(async_frame_slot_offset(0)).cast::<*mut u8>() };
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     unsafe { slot0.write(obj) };
 
     let live = willow_gc_allocated_bytes(); // frame + obj
@@ -1846,8 +2033,12 @@ fn coop_03_suspended_frame_keeps_referenced_object_alive() {
 
     // Spawning roots the frame; the first poll parks the task (Pending). The
     // poll counter uses the state word, leaving the data slot untouched.
-    let id = willow_sched_spawn(poll_ready_on_second, frame as *mut c_void);
-    crate::gc::willow_pop_root();
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = unsafe { willow_sched_spawn(poll_ready_on_second, frame as *mut c_void) };
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { crate::gc::willow_pop_root() };
     assert_eq!(willow_sched_run(), 0);
     assert_eq!(willow_sched_task_state(id), 2); // Parked
 
@@ -1868,7 +2059,9 @@ fn coop_03_suspended_frame_keeps_referenced_object_alive() {
     // Nothing roots the frame/object now; both are collected.
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), 0);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -1881,10 +2074,14 @@ fn coop_04_unknown_task_state_is_minus_one() {
 #[test]
 fn coop_05_multiple_ready_tasks_all_complete() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
-    let a = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
-    let b = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let a = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let b = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     assert_eq!(willow_sched_run(), 2);
     assert_eq!(willow_sched_task_state(a), -1);
     assert_eq!(willow_sched_task_state(b), -1);
@@ -2082,7 +2279,8 @@ fn single_worker_guard_reuses_the_same_os_worker_across_drives() {
     reset_global_scheduler_for_test();
     THREADS.lock().unwrap().clear();
     for _ in 0..2 {
-        let id = willow_sched_spawn(poll_records_thread, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let id = unsafe { willow_sched_spawn(poll_records_thread, std::ptr::null_mut()) };
         assert_eq!(willow_sched_run_until(id), 1);
     }
     let threads = THREADS.lock().unwrap();
@@ -2106,7 +2304,8 @@ fn single_worker_run_until_does_not_reap_a_task_the_drive_woke() {
 
     let bystander = with_global_for_test(|sched| sched.spawn_parked_placeholder());
     WOKEN.store(bystander, Ordering::Release);
-    let target = willow_sched_spawn(poll_wakes_bystander, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let target = unsafe { willow_sched_spawn(poll_wakes_bystander, std::ptr::null_mut()) };
 
     // Perspective 12: the drive stops at its target. With the pool a second
     // worker could claim `bystander` the moment the target's poll woke it
@@ -2172,7 +2371,8 @@ fn single_worker_drives_are_repeatable() {
     // Perspective 20: the determinism is not a one-shot fluke.
     for _ in 0..32 {
         reset_global_scheduler_for_test();
-        let id = willow_sched_spawn(poll_ready_noop, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let id = unsafe { willow_sched_spawn(poll_ready_noop, std::ptr::null_mut()) };
         assert_eq!(willow_sched_run_until(id), 1);
         assert_eq!(willow_sched_task_state(id), -1);
     }
@@ -2796,7 +2996,8 @@ fn terminal_cleanups_pending() -> bool {
 /// Complete an executable task directly, so its terminal cleanup record is
 /// queued but not yet drained. The netpoll mark is what requires the record.
 fn complete_executable_without_drain() -> RuntimeTaskId {
-    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     note_netpoll_registration(id);
     with_global_for_test(|sched| {
         sched.set_running(id);
@@ -2892,7 +3093,8 @@ fn t8hq4_19_a_private_scheduler_does_not_touch_the_global_flag() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let mut scheduler = RuntimeScheduler::with_worker_count(TEST_WORKERS);
-    let id = scheduler.spawn_task(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { scheduler.spawn_task(poll_ready_now, std::ptr::null_mut()) };
     scheduler
         .tasks
         .with_mut(id, |task| task.netpoll_registered = true);
@@ -2939,6 +3141,28 @@ fn terminal_epoch() -> u64 {
 }
 
 #[test]
+fn task_table_mutex_observation_is_instance_and_thread_owned() {
+    let first = ShardedTaskTable::new();
+    let second = ShardedTaskTable::new();
+    std::thread::scope(|scope| {
+        for count in [8, 32] {
+            let (first, second) = (&first, &second);
+            scope.spawn(crate::runtime::serving(move || {
+                for _ in 0..count {
+                    drop(first.lock_shard(0));
+                    drop(second.lock_shard(1));
+                    drop(second.lock_shard(2));
+                }
+                assert_eq!(first.lock_observation.current(), count);
+                assert_eq!(second.lock_observation.current(), count * 2);
+            }));
+        }
+    });
+    assert_eq!(first.lock_observation.current(), 0);
+    assert_eq!(second.lock_observation.current(), 0);
+}
+
+#[test]
 fn task_table_locks_and_completion_epoch_have_separate_cache_lines() {
     let table = ShardedTaskTable::new();
     let epoch = &table.terminal_epoch as *const _ as usize;
@@ -2977,7 +3201,8 @@ fn t8hq4_19_terminal_epoch_advances_on_terminal_transitions_and_removals_only() 
     reset_global_scheduler_for_test();
     let start = terminal_epoch();
     let parked = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
-    let runnable = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let runnable = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     assert_eq!(terminal_epoch(), start, "spawning is not terminal");
     complete_executable_without_drain();
     let after_complete = terminal_epoch();
@@ -2999,7 +3224,8 @@ fn t8hq4_19_terminal_epoch_advances_on_terminal_transitions_and_removals_only() 
 fn t8hq4_19_target_watch_looks_again_only_after_the_epoch_moves() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
-    let target = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let target = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     let mut watch = TargetWatch::new(Some(target), None);
     assert!(!watch.is_done(), "the first question looks");
     // No epoch change: answered without the target's shard.
@@ -3046,7 +3272,8 @@ fn t8hq4_19_a_removed_target_is_done() {
 fn t8hq4_19_pool_workers_share_one_look_per_epoch() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
-    let target = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let target = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     let shared = SharedTargetCheck::default();
     let mut first = TargetWatch::new(Some(target), Some(&shared));
     assert!(!first.is_done(), "the first worker looks for this epoch");
@@ -3080,7 +3307,8 @@ fn t8hq4_19_racing_pool_watchers_never_miss_the_target() {
     const WATCHERS: usize = 4;
     for _ in 0..200 {
         reset_global_scheduler_for_test();
-        let target = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        let target = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
         let shared = SharedTargetCheck::default();
         let start = Barrier::new(WATCHERS + 1);
         std::thread::scope(|scope| {
@@ -3325,10 +3553,14 @@ fn t9ha4_21_wake_between_snapshot_and_wait_is_not_lost() {
 #[test]
 fn t9ha4_22_sleeping_task_completes_under_run_and_leaves_no_entry() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    let id = willow_sched_spawn(poll_sleep_then_ready, frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = unsafe { willow_sched_spawn(poll_sleep_then_ready, frame) };
 
     assert_eq!(willow_sched_run(), 1);
 
@@ -3343,16 +3575,22 @@ fn t9ha4_22_sleeping_task_completes_under_run_and_leaves_no_entry() {
         TimerQueue::empty_hint()
     );
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn t9ha4_23_run_until_returns_when_the_sleeping_target_completes() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    let target = willow_sched_spawn(poll_sleep_then_ready, frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let target = unsafe { willow_sched_spawn(poll_sleep_then_ready, frame) };
 
     let start = Instant::now();
     assert_eq!(willow_sched_run_until(target), 1);
@@ -3364,14 +3602,18 @@ fn t9ha4_23_run_until_returns_when_the_sleeping_target_completes() {
     assert_eq!(willow_sched_task_state(target), -1);
     assert_eq!(global_timers().len(), 0);
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn t9ha4_24_cancelling_a_sleeper_clears_its_deadline_and_the_drive_terminates() {
     let _guard = isolated_runtime();
     let single = single_worker_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let id = spawn_parked_long_sleeper(&single);
     // A short bounded drive finds nothing ready and returns at its deadline
@@ -3402,7 +3644,9 @@ fn t9ha4_24_cancelling_a_sleeper_clears_its_deadline_and_the_drive_terminates() 
     assert_eq!(willow_sched_task_state(id), -1);
     assert_eq!(global_timers().len(), 0);
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -3411,7 +3655,9 @@ fn t9ha4_25_drive_deadline_still_wins_over_a_far_off_sleeper() {
     // caller's deadline must survive the move to the separate lock.
     let _guard = isolated_runtime();
     let single = single_worker_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let id = spawn_parked_long_sleeper(&single);
 
@@ -3429,7 +3675,9 @@ fn t9ha4_25_drive_deadline_still_wins_over_a_far_off_sleeper() {
     assert_eq!(willow_sched_task_state(id), 2, "the sleeper stays parked");
     assert_eq!(global_timers().len(), 1, "its timer stays registered");
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 static T9HA4_COMPLETION_ORDER: crate::runtime::PerRuntime<TestMutex<Vec<i64>>> =
@@ -3439,8 +3687,11 @@ static T9HA4_COMPLETION_ORDER: crate::runtime::PerRuntime<TestMutex<Vec<i64>>> =
 /// Records its tag on completion so a test can assert the order.
 unsafe extern "C" fn poll_tagged_sleep_then_ready(frame: *mut c_void) -> i32 {
     let base = frame as *mut u8;
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let polls = unsafe { &mut *(base.add(async_frame_slot_offset(0)) as *mut i64) };
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let tag = unsafe { *(base.add(async_frame_slot_offset(1)) as *const i64) };
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let millis = unsafe { *(base.add(async_frame_slot_offset(2)) as *const i64) };
     *polls += 1;
     if *polls >= 2 {
@@ -3458,7 +3709,9 @@ unsafe extern "C" fn poll_tagged_sleep_then_ready(frame: *mut c_void) -> i32 {
 #[test]
 fn t9ha4_26_staggered_sleepers_complete_in_deadline_order() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     T9HA4_COMPLETION_ORDER
         .lock()
@@ -3468,12 +3721,15 @@ fn t9ha4_26_staggered_sleepers_complete_in_deadline_order() {
     // Spawn order deliberately disagrees with deadline order.
     for (tag, millis) in [(1i64, 120i64), (2, 0), (3, 60)] {
         let frame = willow_async_frame_alloc(3, 0) as *mut c_void;
+        // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
         unsafe {
             let base = frame as *mut u8;
             *(base.add(async_frame_slot_offset(1)) as *mut i64) = tag;
             *(base.add(async_frame_slot_offset(2)) as *mut i64) = millis;
         }
-        willow_sched_spawn(poll_tagged_sleep_then_ready, frame);
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        unsafe { willow_sched_spawn(poll_tagged_sleep_then_ready, frame) };
     }
 
     assert_eq!(willow_sched_run(), 3);
@@ -3487,7 +3743,9 @@ fn t9ha4_26_staggered_sleepers_complete_in_deadline_order() {
     );
     assert_eq!(global_timers().len(), 0);
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 // ── cancel runtime integrity ─────────────────────────────
@@ -3501,9 +3759,13 @@ fn cancel_finalize_wakes_parked_awaiter() {
 
     // Cancel-request the target, then let the claim boundary finalize it.
     assert_eq!(
-        s.with_task_mut(target, |task| task
-            .state
-            .request_cancel(&s.tasks.cancel_epoch)),
+        // SAFETY: The fixture updates task metadata under the shard lock and preserves the
+        // frame, callbacks and root ownership.
+        unsafe {
+            s.with_task_mut(target, |task| {
+                task.state.request_cancel(&s.tasks.cancel_epoch)
+            })
+        },
         Some(CancelOutcome::Deferred)
     );
     // The claim boundary finalizes the target (never claims it), wakes
@@ -3571,6 +3833,7 @@ fn wake_is_a_noop_on_cancelled_tasks() {
 
 /// Parks with a long sleep on the first poll, completes on the second.
 unsafe extern "C" fn poll_long_sleep_then_ready(frame: *mut c_void) -> i32 {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let state = unsafe { &mut *(frame as *mut i64) };
     *state += 1;
     if *state >= 2 {
@@ -3597,8 +3860,11 @@ unsafe extern "C" fn poll_long_sleep_then_ready(frame: *mut c_void) -> i32 {
 fn spawn_parked_long_sleeper(_single: &SingleWorkerForTest) -> u64 {
     assert_eq!(runtime_worker_config().active_workers(), 1);
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    let sleeper = willow_sched_spawn(poll_long_sleep_then_ready, frame);
-    let marker = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let sleeper = unsafe { willow_sched_spawn(poll_long_sleep_then_ready, frame) };
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let marker = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     assert_eq!(willow_sched_run_until(marker), 1);
     assert_eq!(willow_sched_task_state(marker), -1);
     assert_eq!(willow_sched_task_state(sleeper), 2, "the sleeper is parked");
@@ -3611,7 +3877,9 @@ fn deadline_01_empty_scheduler_returns_immediately() {
     // The deadline is a CEILING, not a sleep: with nothing to run the drive
     // must return at once so the caller can decide how to wait.
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let start = Instant::now();
     assert_eq!(
@@ -3623,15 +3891,20 @@ fn deadline_01_empty_scheduler_returns_immediately() {
         "an idle scheduler must not sleep out the deadline"
     );
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn deadline_02_ready_work_still_runs_before_the_deadline() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
-    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     assert_eq!(
         willow_sched_run_until_deadline(willow_monotonic_millis() + 5_000),
         1,
@@ -3639,7 +3912,9 @@ fn deadline_02_ready_work_still_runs_before_the_deadline() {
     );
     assert_eq!(willow_sched_task_state(id), -1); // terminal record reaped
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -3648,7 +3923,9 @@ fn deadline_03_run_returns_at_deadline_not_after_long_task() {
     // select drains a 2s task before ever re-checking a 30ms timeout.
     let _guard = isolated_runtime();
     let single = single_worker_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let long = spawn_parked_long_sleeper(&single);
     let start = Instant::now();
@@ -3668,16 +3945,22 @@ fn deadline_03_run_returns_at_deadline_not_after_long_task() {
         "the long task must remain parked, not be reaped as completed"
     );
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn deadline_04_past_deadline_returns_promptly() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    willow_sched_spawn(poll_long_sleep_then_ready, frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe { willow_sched_spawn(poll_long_sleep_then_ready, frame) };
     let start = Instant::now();
     willow_sched_run_until_deadline(willow_monotonic_millis() - 1);
     assert!(
@@ -3685,7 +3968,9 @@ fn deadline_04_past_deadline_returns_promptly() {
         "an already-expired deadline must not block on unrelated tasks"
     );
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -3693,7 +3978,9 @@ fn deadline_05_bounded_drive_leaves_no_scheduler_state_behind() {
     // The bound is caller-local: it must not register timers or tasks that
     // a later unbounded drive would then wait on.
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     willow_sched_run_until_deadline(willow_monotonic_millis() + 10);
     assert!(
@@ -3707,7 +3994,9 @@ fn deadline_05_bounded_drive_leaves_no_scheduler_state_behind() {
         "an empty scheduler must go idle immediately after a bounded drive"
     );
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -3715,17 +4004,23 @@ fn deadline_06_parked_task_timer_still_fires_before_a_far_deadline() {
     // Clamping idle waits must not SKIP a nearer task timer: a 5ms sleeper
     // still runs to completion under a 5s drive deadline.
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    let id = willow_sched_spawn(poll_sleep_then_ready, frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = unsafe { willow_sched_spawn(poll_sleep_then_ready, frame) };
     assert_eq!(
         willow_sched_run_until_deadline(willow_monotonic_millis() + 5_000),
         1
     );
     assert_eq!(willow_sched_task_state(id), -1); // terminal record reaped
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -4219,9 +4514,13 @@ fn status_frame() -> Box<[i64; 8]> {
 /// Spawn a ready placeholder that carries `frame`, as a real spawn would.
 fn spawn_with_frame(s: &mut RuntimeScheduler, frame: &mut [i64; 8]) -> RuntimeTaskId {
     let id = s.spawn_placeholder();
-    s.with_task_mut(id, |task| {
-        task.frame = frame.as_mut_ptr() as *mut c_void;
-    });
+    // SAFETY: This placeholder has no callbacks or owned GC root. The fixture retains the
+    // initialized frame through its last scheduler access.
+    unsafe {
+        s.with_task_mut(id, |task| {
+            task.frame = frame.as_mut_ptr() as *mut c_void;
+        })
+    };
     id
 }
 
@@ -4230,7 +4529,9 @@ fn frame_ptr(frame: &mut [i64; 8]) -> *mut c_void {
 }
 
 fn terminal_of(frame: &mut [i64; 8]) -> i64 {
-    crate::async_frame::frame_terminal_status(frame_ptr(frame))
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    unsafe { crate::async_frame::frame_terminal_status(frame_ptr(frame)) }
 }
 
 #[test]
@@ -4354,15 +4655,21 @@ fn fst_08_cancel_request_is_mirrored_into_the_frame() {
     let mut frame = status_frame();
     let id = with_global_for_test(|s| {
         let id = s.spawn_placeholder();
-        s.with_task_mut(id, |task| {
-            task.frame = frame.as_mut_ptr() as *mut c_void;
-        });
+        // SAFETY: This placeholder has no callbacks or owned GC root. The fixture retains the
+        // initialized frame through its last scheduler access.
+        unsafe {
+            s.with_task_mut(id, |task| {
+                task.frame = frame.as_mut_ptr() as *mut c_void;
+            })
+        };
         s.park(id);
         id
     });
     willow_sched_cancel(id);
     assert_eq!(
-        willow_frame_is_cancelled(frame_ptr(&mut frame)),
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { willow_frame_is_cancelled(frame_ptr(&mut frame)) },
         1,
         "is_cancelled() must answer from the frame as soon as cancel is requested"
     );
@@ -4381,15 +4688,21 @@ fn fst_09_cancel_then_finalize_keeps_both_bits() {
     let mut frame = status_frame();
     let id = with_global_for_test(|s| {
         let id = s.spawn_placeholder();
-        s.with_task_mut(id, |task| {
-            task.frame = frame.as_mut_ptr() as *mut c_void;
-        });
+        // SAFETY: This placeholder has no callbacks or owned GC root. The fixture retains the
+        // initialized frame through its last scheduler access.
+        unsafe {
+            s.with_task_mut(id, |task| {
+                task.frame = frame.as_mut_ptr() as *mut c_void;
+            })
+        };
         s.park(id);
         id
     });
     willow_sched_cancel(id);
     with_global_for_test(|s| s.finalize_cancelled(id));
-    let status = crate::async_frame::frame_status(frame_ptr(&mut frame));
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    let status = unsafe { crate::async_frame::frame_status(frame_ptr(&mut frame)) };
     assert_eq!(
         status & crate::async_frame::WILLOW_FRAME_STATUS_TERMINAL_MASK,
         crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED
@@ -4408,9 +4721,13 @@ fn fst_10_cancelling_a_completed_task_keeps_completed() {
     let mut frame = status_frame();
     let id = with_global_for_test(|s| {
         let id = s.spawn_placeholder();
-        s.with_task_mut(id, |task| {
-            task.frame = frame.as_mut_ptr() as *mut c_void;
-        });
+        // SAFETY: This placeholder has no callbacks or owned GC root. The fixture retains the
+        // initialized frame through its last scheduler access.
+        unsafe {
+            s.with_task_mut(id, |task| {
+                task.frame = frame.as_mut_ptr() as *mut c_void;
+            })
+        };
         s.complete(id);
         id
     });
@@ -4420,7 +4737,9 @@ fn fst_10_cancelling_a_completed_task_keeps_completed() {
         crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED
     );
     assert_eq!(
-        willow_frame_is_cancelled(frame_ptr(&mut frame)),
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { willow_frame_is_cancelled(frame_ptr(&mut frame)) },
         0,
         "cancelling a task that already finished must not make it look cancelled"
     );
@@ -4432,13 +4751,22 @@ fn fst_11_await_of_a_terminal_frame_needs_no_task_record() {
     let _guard = crate::gc::isolated_runtime();
     reset_global_scheduler_for_test();
     let mut frame = status_frame();
-    crate::async_frame::frame_publish_terminal(
-        frame_ptr(&mut frame),
-        crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED,
-    );
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    unsafe {
+        crate::async_frame::frame_publish_terminal(
+            frame_ptr(&mut frame),
+            crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED,
+        )
+    };
     // Id 9_999 was never spawned here: this is the shape a reaped task
     // leaves behind, and the frame alone must answer "done".
-    assert_eq!(willow_frame_await(frame_ptr(&mut frame), 9_999), 1);
+    assert_eq!(
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { willow_frame_await(frame_ptr(&mut frame), 9_999) },
+        1
+    );
     reset_global_scheduler_for_test();
 }
 
@@ -4449,14 +4777,20 @@ fn fst_12_await_of_a_pending_frame_registers_a_waiter() {
     let mut frame = status_frame();
     let (awaitee, waiter) = with_global_for_test(|s| {
         let awaitee = s.spawn_placeholder();
-        s.with_task_mut(awaitee, |task| {
-            task.frame = frame.as_mut_ptr() as *mut c_void;
-        });
+        // SAFETY: This placeholder has no callbacks or owned GC root. The fixture retains the
+        // initialized frame through its last scheduler access.
+        unsafe {
+            s.with_task_mut(awaitee, |task| {
+                task.frame = frame.as_mut_ptr() as *mut c_void;
+            })
+        };
         let waiter = s.spawn_parked_placeholder();
         (awaitee, waiter)
     });
     let done = with_current_task_for_test(waiter, || {
-        willow_frame_await(frame_ptr(&mut frame), awaitee)
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { willow_frame_await(frame_ptr(&mut frame), awaitee) }
     });
     assert_eq!(done, 0, "a pending frame must fall through to registration");
     with_global_for_test(|s| {
@@ -4471,7 +4805,12 @@ fn fst_12_await_of_a_pending_frame_registers_a_waiter() {
         terminal_of(&mut frame),
         crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED
     );
-    assert_eq!(willow_frame_await(frame_ptr(&mut frame), awaitee), 1);
+    assert_eq!(
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { willow_frame_await(frame_ptr(&mut frame), awaitee) },
+        1
+    );
     reset_global_scheduler_for_test();
 }
 
@@ -4484,14 +4823,18 @@ fn frame_await_repolling_does_not_duplicate_wait_relationships() {
             let mut frame = status_frame();
             let (awaitee, ids) = with_global_for_test(|s| {
                 let awaitee = s.spawn_placeholder();
-                s.with_task_mut(awaitee, |task| task.frame = frame_ptr(&mut frame));
+                // SAFETY: This placeholder has no callbacks or owned GC root. The fixture
+                // retains the initialized frame through its last scheduler access.
+                unsafe { s.with_task_mut(awaitee, |task| task.frame = frame_ptr(&mut frame)) };
                 let ids: Vec<_> = (0..waiters).map(|_| s.spawn_parked_placeholder()).collect();
                 (awaitee, ids)
             });
             for _ in 0..polls {
                 for &id in &ids {
                     let ready = with_current_task_for_test(id, || {
-                        willow_frame_await(frame_ptr(&mut frame), awaitee)
+                        // SAFETY: The frame owner retains the initialized ABI status word
+                        // through this atomic access.
+                        unsafe { willow_frame_await(frame_ptr(&mut frame), awaitee) }
                     });
                     assert_eq!(ready, 0);
                 }
@@ -4509,7 +4852,12 @@ fn frame_await_repolling_does_not_duplicate_wait_relationships() {
                     assert_eq!(s.with_task(id, |task| task.awaiting_count()), Some(0));
                 }
             });
-            assert_eq!(willow_frame_await(frame_ptr(&mut frame), awaitee), 1);
+            assert_eq!(
+                // SAFETY: The frame owner retains the initialized ABI status word through this
+                // atomic access.
+                unsafe { willow_frame_await(frame_ptr(&mut frame), awaitee) },
+                1
+            );
             println!(
                 "waiters={waiters} polls={polls} checks={} relationships={waiters}",
                 waiters * polls
@@ -4524,10 +4872,17 @@ fn fst_13_null_frame_await_falls_back_to_the_id_path() {
     let _guard = crate::gc::isolated_runtime();
     reset_global_scheduler_for_test();
     // Unknown id on the id path is treated as ready, so no permanent park.
-    assert_eq!(willow_frame_await(std::ptr::null_mut(), 9_999), 1);
+    assert_eq!(
+        // SAFETY: The null frame is explicitly accepted and has no status word to access.
+        unsafe { willow_frame_await(std::ptr::null_mut(), 9_999) },
+        1
+    );
     let id = with_global_for_test(|s| s.spawn_parked_placeholder());
     let waiter = with_global_for_test(|s| s.spawn_parked_placeholder());
-    let done = with_current_task_for_test(waiter, || willow_frame_await(std::ptr::null_mut(), id));
+    // SAFETY: The null frame is explicitly accepted and has no status word to access.
+    let done = with_current_task_for_test(waiter, || unsafe {
+        willow_frame_await(std::ptr::null_mut(), id)
+    });
     assert_eq!(done, 0);
     with_global_for_test(|s| {
         assert_eq!(
@@ -4545,23 +4900,41 @@ fn fst_14_await_check_passes_for_non_cancelled_frames() {
     // Pending, Completed and Panicked frames must all return normally; only
     // a Cancelled frame aborts (an abort cannot be exercised in-process).
     let mut pending = status_frame();
-    willow_frame_await_check(frame_ptr(&mut pending), 1);
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    unsafe { willow_frame_await_check(frame_ptr(&mut pending), 1) };
     let mut completed = status_frame();
-    crate::async_frame::frame_publish_terminal(
-        frame_ptr(&mut completed),
-        crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED,
-    );
-    willow_frame_await_check(frame_ptr(&mut completed), 2);
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    unsafe {
+        crate::async_frame::frame_publish_terminal(
+            frame_ptr(&mut completed),
+            crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED,
+        )
+    };
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    unsafe { willow_frame_await_check(frame_ptr(&mut completed), 2) };
     let mut panicked = status_frame();
-    crate::async_frame::frame_publish_terminal(
-        frame_ptr(&mut panicked),
-        crate::async_frame::WILLOW_FRAME_STATUS_PANICKED,
-    );
-    willow_frame_await_check(frame_ptr(&mut panicked), 3);
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    unsafe {
+        crate::async_frame::frame_publish_terminal(
+            frame_ptr(&mut panicked),
+            crate::async_frame::WILLOW_FRAME_STATUS_PANICKED,
+        )
+    };
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    unsafe { willow_frame_await_check(frame_ptr(&mut panicked), 3) };
     // A cancel REQUEST that never finalized is not a cancelled await either.
     let mut requested = status_frame();
-    crate::async_frame::frame_request_cancel(frame_ptr(&mut requested));
-    willow_frame_await_check(frame_ptr(&mut requested), 4);
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    unsafe {
+        crate::async_frame::frame_request_cancel(frame_ptr(&mut requested));
+        willow_frame_await_check(frame_ptr(&mut requested), 4);
+    }
     reset_global_scheduler_for_test();
 }
 
@@ -4572,9 +4945,13 @@ fn fst_15_task_state_stays_the_id_only_diagnostic() {
     let mut frame = status_frame();
     let id = with_global_for_test(|s| {
         let id = s.spawn_placeholder();
-        s.with_task_mut(id, |task| {
-            task.frame = frame.as_mut_ptr() as *mut c_void;
-        });
+        // SAFETY: This placeholder has no callbacks or owned GC root. The fixture retains the
+        // initialized frame through its last scheduler access.
+        unsafe {
+            s.with_task_mut(id, |task| {
+                task.frame = frame.as_mut_ptr() as *mut c_void;
+            })
+        };
         s.complete(id);
         id
     });
@@ -4584,10 +4961,14 @@ fn fst_15_task_state_stays_the_id_only_diagnostic() {
         "the id-only diagnostic becomes Unknown immediately after reaping"
     );
     assert_eq!(
-        crate::async_frame::frame_terminal_status(frame_ptr(&mut frame)),
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        unsafe { crate::async_frame::frame_terminal_status(frame_ptr(&mut frame)) },
         crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED
     );
-    assert_eq!(willow_frame_await(frame_ptr(&mut frame), id), 1);
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    assert_eq!(unsafe { willow_frame_await(frame_ptr(&mut frame), id) }, 1);
     reset_global_scheduler_for_test();
 }
 
@@ -4691,11 +5072,14 @@ fn assert_global_metadata_reaped(workload: &str) {
 
 fn reset_stress_fixture() {
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     assert!(runtime_worker_config().active_workers() >= 1);
 }
 
 unsafe extern "C" fn poll_zero_sleep_then_ready(frame: *mut c_void) -> i32 {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let state = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
     *state += 1;
     if *state >= 2 {
@@ -4707,6 +5091,7 @@ unsafe extern "C" fn poll_zero_sleep_then_ready(frame: *mut c_void) -> i32 {
 }
 
 unsafe extern "C" fn poll_yield_preempt_churn(frame: *mut c_void) -> i32 {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let state = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
     *state += 1;
     match *state {
@@ -4743,10 +5128,14 @@ fn reaping_01_poll_result_classification_is_exhaustive() {
 fn reaping_02_finish_terminal_captures_cleanup_before_task_removal() {
     let mut scheduler = RuntimeScheduler::with_worker_count(TEST_WORKERS);
     let id = scheduler.spawn_placeholder();
-    scheduler.with_task_mut(id, |task| {
-        task.install_channel_ownership(channel_token(0x1234));
-        task.install_channel_ownership(channel_token(0x5678));
-    });
+    // SAFETY: The fixture updates task metadata under the shard lock and preserves the frame,
+    // callbacks and root ownership.
+    unsafe {
+        scheduler.with_task_mut(id, |task| {
+            task.install_channel_ownership(channel_token(0x1234));
+            task.install_channel_ownership(channel_token(0x5678));
+        })
+    };
 
     scheduler.complete(id);
 
@@ -4820,10 +5209,14 @@ fn reaping_03_nested_drive_retains_terminal_frame_until_outer_quiescence() {
     NESTED_ROOTS_RETAINED.store(false, TestOrdering::SeqCst);
 
     let inner_frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    let inner = willow_sched_spawn(poll_ready_now, inner_frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let inner = unsafe { willow_sched_spawn(poll_ready_now, inner_frame) };
     NESTED_ROOT_TARGET.store(inner, TestOrdering::SeqCst);
     let outer_frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-    willow_sched_spawn(poll_nested_then_observe_frame_roots, outer_frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe { willow_sched_spawn(poll_nested_then_observe_frame_roots, outer_frame) };
 
     assert_eq!(willow_sched_run(), 2);
     assert!(
@@ -4839,11 +5232,13 @@ fn reaping_03_nested_drive_retains_terminal_frame_until_outer_quiescence() {
 #[test]
 fn reaping_04_executable_task_keeps_netpoll_cleanup_even_without_channels() {
     let mut scheduler = RuntimeScheduler::with_worker_count(TEST_WORKERS);
-    let id = scheduler.spawn_task(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let id = unsafe { scheduler.spawn_task(poll_ready_now, std::ptr::null_mut()) };
     assert_eq!(scheduler.claim_ready_for_worker(0), Some(id));
     // Successful netpoll registration marks the task for terminal cleanup.
-    scheduler
-        .with_task_mut(id, |task| task.netpoll_registered = true)
+    // SAFETY: The fixture updates task metadata under the shard lock and preserves the frame,
+    // callbacks and root ownership.
+    unsafe { scheduler.with_task_mut(id, |task| task.netpoll_registered = true) }
         .expect("spawned task exists");
     scheduler.complete(id);
     scheduler.clear_running();
@@ -4861,7 +5256,9 @@ fn stress_10k_sleeping_tasks_reap_all_scheduler_metadata() {
 
     for _ in 0..STRESS_TASKS {
         let frame = willow_async_frame_alloc(1, 0) as *mut c_void;
-        willow_sched_spawn(poll_zero_sleep_then_ready, frame);
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        unsafe { willow_sched_spawn(poll_zero_sleep_then_ready, frame) };
     }
     assert_eq!(willow_sched_run(), STRESS_TASKS as i64);
     assert_global_metadata_reaped("10k sleeping tasks");
@@ -4884,12 +5281,14 @@ fn stress_10k_tasks_on_one_channel_reap_all_scheduler_metadata() {
     for task_id in task_ids {
         assert_eq!(
             with_current_task_for_test(task_id, || {
-                crate::channel::willow_channel_recv_ready(channel)
+                // SAFETY: The handle is null or the live channel retained for this operation.
+                unsafe { crate::channel::willow_channel_recv_ready(channel) }
             }),
             0
         );
     }
-    crate::channel::willow_channel_close(channel);
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    unsafe { crate::channel::willow_channel_close(channel) };
     assert_eq!(willow_sched_run(), STRESS_TASKS as i64);
     assert_global_metadata_reaped("10k tasks on one channel");
     willow_gc_collect();
@@ -4902,7 +5301,12 @@ fn stress_10k_bounded_send_waiters_pass_on_defected_handoffs() {
     let _guard = isolated_runtime();
     reset_stress_fixture();
     let channel = crate::channel::willow_channel_new_bounded(0, 1);
-    assert_eq!(crate::channel::willow_channel_try_send_i64(channel, 1), 1);
+    assert_eq!(
+        // SAFETY: The constructor selected this channel element representation and the channel
+        // remains live during the send.
+        unsafe { crate::channel::willow_channel_try_send_i64(channel, 1) },
+        1
+    );
     let task_ids = with_global_for_test(|scheduler| {
         (0..STRESS_TASKS)
             .map(|_| scheduler.spawn_parked_placeholder())
@@ -4911,7 +5315,8 @@ fn stress_10k_bounded_send_waiters_pass_on_defected_handoffs() {
     for &task_id in &task_ids {
         assert_eq!(
             with_current_task_for_test(task_id, || {
-                crate::channel::willow_channel_send_ready(channel)
+                // SAFETY: The handle is null or the live channel retained for this operation.
+                unsafe { crate::channel::willow_channel_send_ready(channel) }
             }),
             0
         );
@@ -4920,10 +5325,15 @@ fn stress_10k_bounded_send_waiters_pass_on_defected_handoffs() {
     // Free one slot. Each awakened select then defects to another arm;
     // unregister must pass the unconsumed handoff to the next producer
     // until every one of the 10,000 waiters has had a turn.
-    assert_eq!(crate::channel::willow_channel_recv_i64(channel), 1);
+    assert_eq!(
+        // SAFETY: The handle is null or the live channel retained for this operation.
+        unsafe { crate::channel::willow_channel_recv_i64(channel) },
+        1
+    );
     for task_id in task_ids {
         with_current_task_for_test(task_id, || {
-            crate::channel::willow_channel_unregister_waiter(channel);
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            unsafe { crate::channel::willow_channel_unregister_waiter(channel) };
         });
     }
 
@@ -4941,7 +5351,9 @@ fn stress_10k_yield_preempt_tasks_reap_all_scheduler_metadata() {
 
     for _ in 0..STRESS_TASKS {
         let frame = willow_async_frame_alloc(1, 0) as *mut c_void;
-        willow_sched_spawn(poll_yield_preempt_churn, frame);
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        unsafe { willow_sched_spawn(poll_yield_preempt_churn, frame) };
     }
     assert_eq!(willow_sched_run(), STRESS_TASKS as i64);
     assert_global_metadata_reaped("10k yield/preempt tasks");
@@ -4998,7 +5410,8 @@ fn stress_repeated_10k_short_task_batches_plateau_at_zero() {
 
     for batch in 0..3 {
         for _ in 0..STRESS_TASKS {
-            willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+            // SAFETY: The callback accepts a null frame and uses no frame storage.
+            unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
         }
         assert_eq!(willow_sched_run(), STRESS_TASKS as i64);
         assert_global_metadata_reaped(&format!("10k short-task batch {batch}"));
@@ -5031,6 +5444,8 @@ fn take_test_panic_message() -> String {
     let message = if info.is_null() {
         String::new()
     } else {
+        // SAFETY: The recovered or active PanicInfo is retained while its initialized fields are
+        // read.
         let message = unsafe { crate::panic_context::panic_info_message(info) }.to_string();
         crate::panic_context::willow_panic_release_recovered(info);
         message
@@ -5156,7 +5571,8 @@ fn sched_wake_running_peer_is_a_wake_source_but_current_poll_is_not() {
 fn sched_wake_07_queued_task_is_a_wake_source() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
-    willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     assert!(scheduler_has_wake_source());
     willow_sched_run();
 }
@@ -5233,7 +5649,8 @@ fn sched_wake_12_completed_batch_leaves_no_claim() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     for _ in 0..64 {
-        willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+        // SAFETY: The callback accepts a null frame and uses no frame storage.
+        unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     }
     assert_eq!(willow_sched_run(), 64);
     assert!(!claims_in_flight(), "claims are scoped to the pop");
@@ -5258,7 +5675,8 @@ fn sched_wake_14_select_idle_wait_returns_when_work_is_queued() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let _context = install_test_panic_context(101);
-    willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     willow_select_idle_wait();
     assert_eq!(
         crate::panic_context::willow_panic_active(),
@@ -5286,7 +5704,9 @@ fn sched_wake_15_select_idle_wait_returns_for_an_in_flight_claim() {
 #[test]
 fn sched_wake_16_select_idle_wait_raises_on_real_deadlock() {
     let _guard = isolated_runtime();
-    crate::gc::willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::willow_gc_init() };
     reset_global_scheduler_for_test();
     let _context = install_test_panic_context(103);
     willow_select_idle_wait();
@@ -5303,7 +5723,9 @@ fn sched_wake_16_select_idle_wait_raises_on_real_deadlock() {
 #[test]
 fn sched_wake_17_select_idle_wait_is_bounded() {
     let _guard = isolated_runtime();
-    crate::gc::willow_gc_init();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::willow_gc_init() };
     reset_global_scheduler_for_test();
     let _context = install_test_panic_context(104);
     let started = Instant::now();
@@ -5327,7 +5749,8 @@ fn sched_wake_18_concurrent_spawns_are_never_stranded() {
     const PER_ROUND: usize = 32;
     for _ in 0..ROUNDS {
         for _ in 0..PER_ROUND {
-            willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+            // SAFETY: The callback accepts a null frame and uses no frame storage.
+            unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
         }
         let completed = willow_sched_run();
         assert_eq!(completed, PER_ROUND as i64, "every spawned task must run");
@@ -5347,12 +5770,15 @@ fn sched_wake_19_run_until_never_returns_with_a_pending_target() {
     for round in 0..64 {
         // Background load so several workers are claiming concurrently.
         for _ in 0..8 {
-            willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+            // SAFETY: The callback accepts a null frame and uses no frame storage.
+            unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
         }
         // Parks on a real timer, so the target is woken by the run loop
         // rather than depending on the drive that spawned it.
         let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
-        let target = willow_sched_spawn(poll_sleep_then_ready, frame);
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        let target = unsafe { willow_sched_spawn(poll_sleep_then_ready, frame) };
         willow_sched_run_until(target);
         assert!(
             target_is_done(Some(target)),
@@ -5370,7 +5796,8 @@ fn sched_wake_20_repeated_parallel_drives_settle_at_zero() {
     reset_global_scheduler_for_test();
     for _ in 0..32 {
         for _ in 0..16 {
-            willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+            // SAFETY: The callback accepts a null frame and uses no frame storage.
+            unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
         }
         willow_sched_run();
     }
@@ -5414,7 +5841,9 @@ fn unwind_at_drive_entry() {
 fn sched_drive_unwind_restores_state_and_can_drive_again() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let _context = install_test_panic_context(303);
     let context = crate::panic_context::current_context().unwrap();
     let before = crate::gc::registered_mutator_count();
@@ -5438,7 +5867,8 @@ fn sched_drive_unwind_restores_state_and_can_drive_again() {
                 assert!(crate::gc::registered_mutator_count() > 0);
             }))
         });
-    willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     assert_eq!(willow_sched_run(), 1);
     assert_eq!(SCHED_RUN_DEPTH.with(Cell::get), 0);
     assert_eq!(crate::gc::registered_mutator_count(), before);
@@ -5446,16 +5876,21 @@ fn sched_drive_unwind_restores_state_and_can_drive_again() {
         &context,
         &crate::panic_context::current_context().unwrap()
     ));
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn sched_drive_nested_unwind_restores_poll_and_outer_task() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let outer = SchedulerDriveGuard::new();
-    let task = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // SAFETY: The callback accepts a null frame and uses no frame storage.
+    let task = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     set_current_task(Some(task));
     let context = crate::panic_context::current_context().unwrap();
     let state = Arc::new(ParallelRunState::default());
@@ -5495,7 +5930,9 @@ fn sched_drive_nested_unwind_restores_poll_and_outer_task() {
     drop(outer);
     assert_eq!(current_task_id(), None);
     assert_eq!(willow_sched_run(), 1);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 // ── Terminal frame roots end with their grace period ────────
@@ -5532,6 +5969,7 @@ fn frame_reclaim_note_frame_roots() {
 /// Long-running driver: each poll starts one ready child and yields, until
 /// `FRAME_RECLAIM_LONG_DRIVE_TASKS` children were started.
 unsafe extern "C" fn poll_spawn_child_then_yield(frame: *mut c_void) -> i32 {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let started = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
     frame_reclaim_note_frame_roots();
     if *started == FRAME_RECLAIM_LONG_DRIVE_TASKS {
@@ -5539,14 +5977,18 @@ unsafe extern "C" fn poll_spawn_child_then_yield(frame: *mut c_void) -> i32 {
     }
     *started += 1;
     let child = willow_async_frame_alloc(0, 0);
-    willow_sched_spawn(poll_ready_now, child);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe { willow_sched_spawn(poll_ready_now, child) };
     RUNTIME_POLL_YIELD
 }
 
 fn run_long_drive() -> u64 {
     FRAME_RECLAIM_MAX_FRAME_ROOTS.store(0, TestOrdering::SeqCst);
     let driver = willow_async_frame_alloc(1, 0);
-    willow_sched_spawn(poll_spawn_child_then_yield, driver);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe { willow_sched_spawn(poll_spawn_child_then_yield, driver) };
     assert_eq!(
         willow_sched_run(),
         FRAME_RECLAIM_LONG_DRIVE_TASKS + 1,
@@ -5595,6 +6037,7 @@ static FRAME_RECLAIM_MAX_LIVE_BYTES: crate::runtime::PerRuntime<TestAtomicU64> =
 /// Like `poll_spawn_child_then_yield`, but collects every 100 children and
 /// records the live heap, so released frames must actually be freed.
 unsafe extern "C" fn poll_spawn_child_collect_then_yield(frame: *mut c_void) -> i32 {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let started = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
     if *started % 100 == 0 {
         willow_gc_collect();
@@ -5606,7 +6049,9 @@ unsafe extern "C" fn poll_spawn_child_collect_then_yield(frame: *mut c_void) -> 
     }
     *started += 1;
     let child = willow_async_frame_alloc(0, 0);
-    willow_sched_spawn(poll_ready_now, child);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe { willow_sched_spawn(poll_ready_now, child) };
     RUNTIME_POLL_YIELD
 }
 
@@ -5617,7 +6062,9 @@ fn frame_reclaim_03_released_frames_are_collected_during_the_drive() {
     reset_stress_fixture();
     FRAME_RECLAIM_MAX_LIVE_BYTES.store(0, TestOrdering::SeqCst);
     let driver = willow_async_frame_alloc(1, 0);
-    willow_sched_spawn(poll_spawn_child_collect_then_yield, driver);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe { willow_sched_spawn(poll_spawn_child_collect_then_yield, driver) };
     willow_sched_run();
     let frame_bytes = {
         willow_gc_collect();
@@ -5648,7 +6095,9 @@ static FRAME_RECLAIM_ROOTS_AFTER_OUTER: crate::runtime::PerRuntime<TestAtomicU64
 unsafe extern "C" fn poll_nested_children(_frame: *mut c_void) -> i32 {
     let mut last = 0;
     for _ in 0..FRAME_RECLAIM_NESTED_CHILDREN {
-        last = willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0));
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        last = unsafe { willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0)) };
     }
     willow_sched_run_until(last);
     // Drive any child the target overtook as well.
@@ -5660,11 +6109,14 @@ unsafe extern "C" fn poll_nested_children(_frame: *mut c_void) -> i32 {
 /// Runs after the nested-drive task finished: by now its unit is over, and
 /// enough retirements happened for the scan to run at least once.
 unsafe extern "C" fn poll_observe_after_outer(frame: *mut c_void) -> i32 {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let polls = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
     *polls += 1;
     if *polls < 2 * FRAME_RELEASE_MIN_BATCH as i64 {
         // Keep finishing fresh tasks so the release threshold is reached.
-        willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0));
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        unsafe { willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0)) };
         return RUNTIME_POLL_YIELD;
     }
     FRAME_RECLAIM_ROOTS_AFTER_OUTER.store(willow_sched_frame_root_count(), TestOrdering::SeqCst);
@@ -5678,10 +6130,14 @@ fn frame_reclaim_04_nested_drive_holds_frames_until_the_paused_poll_ends() {
     reset_stress_fixture();
     FRAME_RECLAIM_NESTED_HELD.store(0, TestOrdering::SeqCst);
     FRAME_RECLAIM_ROOTS_AFTER_OUTER.store(u64::MAX, TestOrdering::SeqCst);
-    let outer = willow_sched_spawn(poll_nested_children, willow_async_frame_alloc(0, 0));
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let outer = unsafe { willow_sched_spawn(poll_nested_children, willow_async_frame_alloc(0, 0)) };
     willow_sched_run_until(outer);
     let observer = willow_async_frame_alloc(1, 0);
-    willow_sched_spawn(poll_observe_after_outer, observer);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe { willow_sched_spawn(poll_observe_after_outer, observer) };
     willow_sched_run();
     let held = FRAME_RECLAIM_NESTED_HELD.load(TestOrdering::SeqCst);
     assert_eq!(
@@ -5701,6 +6157,7 @@ fn frame_reclaim_04_nested_drive_holds_frames_until_the_paused_poll_ends() {
 const FRAME_RECLAIM_RESULT: i64 = 4242;
 
 unsafe extern "C" fn poll_write_result(frame: *mut c_void) -> i32 {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     unsafe {
         *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) = FRAME_RECLAIM_RESULT
     };
@@ -5713,8 +6170,11 @@ fn frame_reclaim_06_handle_keeps_released_frame_and_result_alive() {
     reset_stress_fixture();
     // The holder's slot 0 is a GC reference, like an awaiter's `Task` slot.
     let holder = willow_async_frame_alloc(1, 0b1) as *mut u8;
-    crate::gc::willow_gc_add_runtime_root(holder);
+    // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+    // removal.
+    unsafe { crate::gc::willow_gc_add_runtime_root(holder) };
     let child = willow_async_frame_alloc(1, 0);
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     unsafe {
         crate::gc::willow_gc_write_barrier(
             holder,
@@ -5722,9 +6182,12 @@ fn frame_reclaim_06_handle_keeps_released_frame_and_result_alive() {
             child as *mut u8,
             willow_abi::GcStoreDestination::AsyncFrameSlot as i64,
         );
+        // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
         *(holder.add(async_frame_slot_offset(0)) as *mut *mut c_void) = child;
     }
-    willow_sched_spawn(poll_write_result, child);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    unsafe { willow_sched_spawn(poll_write_result, child) };
     assert_eq!(willow_sched_run(), 1);
     assert_eq!(
         willow_sched_frame_root_count(),
@@ -5733,14 +6196,20 @@ fn frame_reclaim_06_handle_keeps_released_frame_and_result_alive() {
     );
     willow_gc_collect();
     crate::gc::minor_collect_internal();
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let child = unsafe { *(holder.add(async_frame_slot_offset(0)) as *const *mut c_void) };
-    assert!(crate::async_frame::frame_is_terminal(child));
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    assert!(unsafe { crate::async_frame::frame_is_terminal(child) });
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let result = unsafe { *((child as *mut u8).add(async_frame_slot_offset(0)) as *const i64) };
     assert_eq!(
         result, FRAME_RECLAIM_RESULT,
         "the awaiter still reads the result"
     );
-    crate::gc::willow_gc_remove_runtime_root(holder);
+    // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+    // removal.
+    unsafe { crate::gc::willow_gc_remove_runtime_root(holder) };
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), 0);
     reset_stress_fixture();
@@ -5762,8 +6231,13 @@ fn frame_reclaim_07_cancelled_frames_are_released_too() {
     let count = 2 * FRAME_RELEASE_MIN_BATCH as u64;
     let ids: Vec<u64> = (0..count)
         .map(|_| {
-            let id = willow_sched_spawn(poll_ready_on_second, willow_async_frame_alloc(0, 0));
-            willow_sched_set_cancel_fn(id, frame_reclaim_count_cancel);
+            // SAFETY: The supplied callback matches this frame layout; the frame storage
+            // remains live across scheduling and callback execution.
+            let id =
+                unsafe { willow_sched_spawn(poll_ready_on_second, willow_async_frame_alloc(0, 0)) };
+            // SAFETY: This task was spawned with the frame layout expected by the
+            // cancellation callback.
+            unsafe { willow_sched_set_cancel_fn(id, frame_reclaim_count_cancel) };
             id
         })
         .collect();
@@ -5790,7 +6264,9 @@ fn frame_reclaim_retire(s: &mut RuntimeScheduler, count: usize) -> Vec<usize> {
     (0..count)
         .map(|_| {
             let frame = willow_async_frame_alloc(0, 0);
-            let id = s.spawn_task(poll_ready_now, frame);
+            // SAFETY: The supplied callback matches this frame layout; the frame storage
+            // remains live across scheduling and callback execution.
+            let id = unsafe { s.spawn_task(poll_ready_now, frame) };
             assert_eq!(s.claim_ready_for_worker(0), Some(id));
             s.complete(id);
             s.clear_running();
@@ -5876,7 +6352,9 @@ fn frame_reclaim_10_outermost_drive_end_releases_a_partial_batch() {
     let _guard = isolated_runtime();
     reset_stress_fixture();
     for _ in 0..3 {
-        willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0));
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        unsafe { willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0)) };
     }
     assert_eq!(willow_sched_run(), 3);
     assert_global_metadata_reaped("partial batch");
@@ -5888,7 +6366,9 @@ fn frame_reclaim_11_reset_drops_queued_retired_frames() {
     let _guard = isolated_runtime();
     reset_stress_fixture();
     let frame = willow_async_frame_alloc(0, 0);
-    let id = willow_sched_spawn(poll_ready_now, frame);
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = unsafe { willow_sched_spawn(poll_ready_now, frame) };
     with_global_for_test(|sched| {
         assert_eq!(sched.claim_ready_for_worker(0), Some(id));
         sched.complete(id);
@@ -6014,8 +6494,12 @@ fn m2_lifetime_worker_batch_frame_and_handle_matrix() {
                 // scheduler root and handle root have independent ownership.
                 for handle in &mut handles {
                     *handle = willow_async_frame_alloc(slots, 0).cast::<u8>();
-                    crate::gc::willow_push_root(handle);
-                    ids.push(willow_sched_spawn(poll_write_result, (*handle).cast()));
+                    // SAFETY: The slot storage stays live and stationary through the matching
+                    // pop, including during collection.
+                    unsafe { crate::gc::willow_push_root(handle) };
+                    // SAFETY: The supplied callback matches this frame layout; the frame
+                    // storage remains live across scheduling and callback execution.
+                    ids.push(unsafe { willow_sched_spawn(poll_write_result, (*handle).cast()) });
                 }
                 willow_sched_run();
                 let before = crate::frame_lifetime::snapshot();
@@ -6034,12 +6518,20 @@ fn m2_lifetime_worker_batch_frame_and_handle_matrix() {
                 // create roots nor need the reaped heavy scheduler record.
                 for (handle, id) in handles.iter().zip(&ids) {
                     for _ in 0..32 {
-                        assert_eq!(willow_frame_await((*handle).cast(), *id), 1);
+                        // SAFETY: The frame owner retains the initialized ABI status word
+                        // through this atomic access.
+                        assert_eq!(unsafe { willow_frame_await((*handle).cast(), *id) }, 1);
                         assert_eq!(
-                            crate::async_frame::willow_frame_is_cancelled((*handle).cast()),
+                            // SAFETY: The frame owner retains the initialized ABI status word
+                            // through this atomic access.
+                            unsafe {
+                                crate::async_frame::willow_frame_is_cancelled((*handle).cast())
+                            },
                             0
                         );
                         assert_eq!(
+                            // SAFETY: The test frame reserves the accessed slots at word-aligned
+                            // ABI offsets.
                             unsafe { *((*handle).add(async_frame_slot_offset(0)) as *const i64) },
                             FRAME_RECLAIM_RESULT
                         );
@@ -6070,7 +6562,9 @@ fn m2_lifetime_worker_batch_frame_and_handle_matrix() {
                 );
                 handles.fill(std::ptr::null_mut());
                 for _ in &handles {
-                    crate::gc::willow_pop_root();
+                    // SAFETY: The removed shadow-stack entries belong to this operation and
+                    // their slot storage is still live.
+                    unsafe { crate::gc::willow_pop_root() };
                 }
                 m2_wait_reclaimed(batch as u64);
                 println!(
@@ -6089,7 +6583,9 @@ fn m2_lifetime_worker_batch_frame_and_handle_matrix() {
 unsafe extern "C" fn m2_nested_last_poll(_frame: *mut c_void) -> i32 {
     let mut last = 0;
     for _ in 0..7 {
-        last = willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0));
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        last = unsafe { willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0)) };
     }
     willow_sched_run_until(last);
     willow_sched_run();
@@ -6112,7 +6608,9 @@ fn m2_inflight_last_poll_and_subthreshold_release_events() {
         let _workers = M2Workers::set(workers);
         reset_stress_fixture();
         crate::frame_lifetime::capture_events(true);
-        willow_sched_spawn(m2_nested_last_poll, willow_async_frame_alloc(0, 0));
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        unsafe { willow_sched_spawn(m2_nested_last_poll, willow_async_frame_alloc(0, 0)) };
         willow_sched_run();
         m2_wait_reclaimed(8);
         let events = crate::frame_lifetime::events();
@@ -6148,11 +6646,14 @@ static M2_CANCELLED: crate::runtime::PerRuntime<TestAtomicU64> =
 static M2_COMPLETED: crate::runtime::PerRuntime<TestAtomicU64> =
     crate::runtime::PerRuntime::new(|| TestAtomicU64::new(0));
 unsafe extern "C" fn m2_race_poll(frame: *mut c_void) -> i32 {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let phase = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
     if *phase == 0 {
         *phase = 1;
         // Allocation and detached completion race the cancellation requester.
-        willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(1, 0));
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        unsafe { willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(1, 0)) };
         RUNTIME_POLL_YIELD
     } else {
         M2_COMPLETED.fetch_add(1, TestOrdering::SeqCst);
@@ -6160,6 +6661,7 @@ unsafe extern "C" fn m2_race_poll(frame: *mut c_void) -> i32 {
     }
 }
 unsafe extern "C" fn m2_race_cancel(frame: *mut c_void) {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let count = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(1)) as *mut i64) };
     *count += 1;
     assert_eq!(*count, 1, "cancel cleanup runs at most once");
@@ -6176,8 +6678,13 @@ fn m2_detached_cancel_completion_allocation_race() {
             M2_COMPLETED.store(0, TestOrdering::SeqCst);
             let ids: Vec<_> = (0..count)
                 .map(|_| {
-                    let id = willow_sched_spawn(m2_race_poll, willow_async_frame_alloc(2, 0));
-                    willow_sched_set_cancel_fn(id, m2_race_cancel);
+                    // SAFETY: The supplied callback matches this frame layout; the frame
+                    // storage remains live across scheduling and callback execution.
+                    let id =
+                        unsafe { willow_sched_spawn(m2_race_poll, willow_async_frame_alloc(2, 0)) };
+                    // SAFETY: This task was spawned with the frame layout expected by the
+                    // cancellation callback.
+                    unsafe { willow_sched_set_cancel_fn(id, m2_race_cancel) };
                     id
                 })
                 .collect();
@@ -6212,12 +6719,15 @@ fn m2_detached_cancel_completion_allocation_race() {
 }
 
 unsafe extern "C" fn m2_subthreshold_driver(frame: *mut c_void) -> i32 {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let phase = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
     if *phase == 0 {
         *phase = 1;
         let mut last = 0;
         for _ in 0..7 {
-            last = willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0));
+            // SAFETY: The supplied callback matches this frame layout; the frame storage
+            // remains live across scheduling and callback execution.
+            last = unsafe { willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0)) };
         }
         willow_sched_run_until(last);
         willow_sched_run();
@@ -6237,13 +6747,16 @@ fn m2_collect_advances_subthreshold_grace_mid_drive() {
     for workers in [1, 4, 8] {
         let _workers = M2Workers::set(workers);
         reset_stress_fixture();
-        willow_sched_spawn(m2_subthreshold_driver, willow_async_frame_alloc(1, 0));
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        unsafe { willow_sched_spawn(m2_subthreshold_driver, willow_async_frame_alloc(1, 0)) };
         willow_sched_run();
         m2_wait_reclaimed(8);
     }
     reset_stress_fixture();
 }
 unsafe extern "C" fn m2_park_repeatedly(frame: *mut c_void) -> i32 {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let phase = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
     *phase += 1;
     if *phase == 16 {
@@ -6260,7 +6773,11 @@ fn m2_running_parked_handoff_preserves_runtime_root() {
         for count in [1, 7, 65] {
             reset_stress_fixture();
             let ids: Vec<_> = (0..count)
-                .map(|_| willow_sched_spawn(m2_park_repeatedly, willow_async_frame_alloc(1, 0)))
+                // SAFETY: The supplied callback matches this frame layout; the frame storage
+                // remains live across scheduling and callback execution.
+                .map(|_| unsafe {
+                    willow_sched_spawn(m2_park_repeatedly, willow_async_frame_alloc(1, 0))
+                })
                 .collect();
             for _ in 0..15 {
                 willow_sched_run();
@@ -6288,17 +6805,30 @@ fn m2_live_handle_after_scope_finish_survives_and_scope_releases_owners() {
         reset_stress_fixture();
         crate::frame_lifetime::capture_events(true);
         let mut scope = crate::cancellation::willow_task_scope_new();
-        crate::gc::willow_push_root(&mut scope);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { crate::gc::willow_push_root(&raw mut scope) };
         let mut child = willow_async_frame_alloc(2, 0).cast::<u8>();
-        crate::gc::willow_push_root(&mut child);
-        let id = willow_sched_spawn(poll_write_result, child.cast());
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { crate::gc::willow_push_root(&raw mut child) };
+        // SAFETY: The supplied callback matches this frame layout; the frame storage remains
+        // live across scheduling and callback execution.
+        let id = unsafe { willow_sched_spawn(poll_write_result, child.cast()) };
+        // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
         unsafe {
             *(child.add(async_frame_slot_offset(1)) as *mut u64) = id;
         }
-        crate::cancellation::willow_task_scope_add(scope, child);
-        let finish = crate::cancellation::willow_task_scope_finish(scope);
+        // SAFETY: The handles come from their matching constructors; attached frames carry
+        // the initialized task ID.
+        unsafe { crate::cancellation::willow_task_scope_add(scope, child) };
+        // SAFETY: The handles come from their matching constructors; attached frames carry
+        // the initialized task ID.
+        let finish = unsafe { crate::cancellation::willow_task_scope_finish(scope) };
         willow_sched_run();
-        assert!(crate::async_frame::frame_is_terminal(finish));
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert!(unsafe { crate::async_frame::frame_is_terminal(finish) });
         willow_gc_collect();
         let s = crate::frame_lifetime::snapshot();
         assert_eq!(s.scope_owner_releases, 1, "{s:?}");
@@ -6310,16 +6840,23 @@ fn m2_live_handle_after_scope_finish_survives_and_scope_releases_owners() {
             s.task_frames_reclaimed, 1,
             "unowned finish frame reclaimed: {s:?}"
         );
-        assert_eq!(willow_frame_await(child.cast(), id), 1);
+        // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+        // access.
+        assert_eq!(unsafe { willow_frame_await(child.cast(), id) }, 1);
         assert_eq!(
+            // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
             unsafe { *(child.add(async_frame_slot_offset(0)) as *const i64) },
             FRAME_RECLAIM_RESULT
         );
-        crate::gc::willow_pop_root(); // child
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { crate::gc::willow_pop_root() }; // child
         // Keep the scope wrapper itself live: finish has released its child edge.
         willow_gc_collect();
         assert_eq!(crate::frame_lifetime::snapshot().task_frames_reclaimed, 2);
-        crate::gc::willow_pop_root(); // scope
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { crate::gc::willow_pop_root() }; // scope
         m2_wait_reclaimed(2);
     }
     reset_stress_fixture();
@@ -6333,7 +6870,9 @@ fn m2_event_history_bounded_and_lifetime_operation_counts_linear() {
         reset_stress_fixture();
         crate::frame_lifetime::capture_events(true);
         for _ in 0..count {
-            willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0));
+            // SAFETY: The supplied callback matches this frame layout; the frame storage
+            // remains live across scheduling and callback execution.
+            unsafe { willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0)) };
         }
         willow_sched_run();
         m2_wait_reclaimed(count);
@@ -6367,6 +6906,7 @@ fn m2_event_history_bounded_and_lifetime_operation_counts_linear() {
 static M2_FRAME_DROPS: crate::runtime::PerRuntime<TestAtomicU64> =
     crate::runtime::PerRuntime::new(|| TestAtomicU64::new(0));
 unsafe fn m2_frame_drop(payload: *mut u8) {
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let count = unsafe { &mut *(payload.add(async_frame_slot_offset(1)) as *mut i64) };
     *count += 1;
     assert_eq!(*count, 1, "GC drop must run at most once per frame");
@@ -6387,9 +6927,13 @@ fn m2_pending_drop_quarantine_reusable_and_at_most_once_drop() {
         crate::frame_lifetime::capture_events(true);
         M2_FRAME_DROPS.store(0, TestOrdering::SeqCst);
         // This fixture contains only async frames (runtime type id zero).
-        crate::gc::willow_register_drop(0, m2_frame_drop);
+        // SAFETY: This fixture reserves the type ID for the payload consumed by this
+        // finalizer and initializes each instance before collection.
+        unsafe { crate::gc::willow_register_drop(0, m2_frame_drop) };
         for _ in 0..7 {
-            willow_sched_spawn(poll_write_result, willow_async_frame_alloc(2, 0));
+            // SAFETY: The supplied callback matches this frame layout; the frame storage
+            // remains live across scheduling and callback execution.
+            unsafe { willow_sched_spawn(poll_write_result, willow_async_frame_alloc(2, 0)) };
         }
         willow_sched_run();
         m2_wait_reclaimed(7);
@@ -6420,27 +6964,42 @@ fn m2_scope_finalization_reports_owner_release_without_finish() {
     let _guard = isolated_runtime();
     let _workers = M2Workers::set(1);
     reset_stress_fixture();
-    let mut scope = crate::cancellation::willow_task_scope_new();
-    crate::gc::willow_push_root(&mut scope);
+    let scope = std::cell::Cell::new(crate::cancellation::willow_task_scope_new());
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { crate::gc::willow_push_root(scope.as_ptr()) };
     let mut child = willow_async_frame_alloc(2, 0).cast::<u8>();
-    crate::gc::willow_push_root(&mut child);
-    let id = willow_sched_spawn(poll_write_result, child.cast());
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { crate::gc::willow_push_root(&raw mut child) };
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let id = unsafe { willow_sched_spawn(poll_write_result, child.cast()) };
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     unsafe {
         *(child.add(async_frame_slot_offset(1)) as *mut u64) = id;
     }
-    crate::cancellation::willow_task_scope_add(scope, child);
+    // SAFETY: The handles come from their matching constructors; attached frames carry the
+    // initialized task ID.
+    unsafe { crate::cancellation::willow_task_scope_add(scope.get(), child) };
     willow_sched_run();
-    scope = std::ptr::null_mut();
+    scope.set(std::ptr::null_mut());
     // Both slot addresses stay stable; nulling the scope's slot drops ownership.
-    assert!(scope.is_null());
+    assert!(scope.get().is_null());
     willow_gc_collect();
     let s = crate::frame_lifetime::snapshot();
     assert_eq!(s.scope_owner_releases, 1, "{s:?}");
     assert_eq!(s.task_frames_terminal, 1, "{s:?}");
     assert_eq!(s.task_frames_reclaimed, 0, "live independent handle: {s:?}");
-    assert_eq!(willow_frame_await(child.cast(), id), 1);
-    crate::gc::willow_pop_root();
-    crate::gc::willow_pop_root();
+    // SAFETY: The frame owner retains the initialized ABI status word through this atomic
+    // access.
+    assert_eq!(unsafe { willow_frame_await(child.cast(), id) }, 1);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe {
+        crate::gc::willow_pop_root();
+        crate::gc::willow_pop_root();
+    }
     m2_wait_reclaimed(1);
     reset_stress_fixture();
 }
@@ -6454,14 +7013,19 @@ fn stable_borrow_frame_address_survives_poll_resume_and_gc() {
         let frame = frame.cast::<u8>();
         // Slot 0 roots the caller frame; slots 1..3 preserve raw addresses to
         // its i64/f64/bool storage. Raw addresses deliberately are not roots.
+        // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
         let word = |i| unsafe { frame.add(async_frame_slot_offset(i)).cast::<usize>() };
+        // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
         let owner = unsafe { *word(0) } as *mut u8;
         let expected = [42u64, 4.25f64.to_bits(), 1];
         for (i, expected) in expected.into_iter().enumerate() {
+            // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
             let address = unsafe { *word(i + 1) } as *mut u64;
+            // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
             assert_eq!(address, unsafe {
                 owner.add(async_frame_slot_offset(i)).cast()
             });
+            // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
             assert_eq!(unsafe { *address }, expected);
         }
         // A synchronous GC between polls must preserve both the frame base
@@ -6477,16 +7041,22 @@ fn stable_borrow_frame_address_survives_poll_resume_and_gc() {
     }
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     POLLS.store(0, Ordering::SeqCst);
     let mut owner = willow_async_frame_alloc(3, 0).cast::<u8>();
-    crate::gc::willow_push_root(&mut owner);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { crate::gc::willow_push_root(&raw mut owner) };
     for (i, value) in [42u64, 4.25f64.to_bits(), 1].into_iter().enumerate() {
+        // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
         unsafe {
             *owner.add(async_frame_slot_offset(i)).cast::<u64>() = value;
         }
     }
     let child = willow_async_frame_alloc(4, 1).cast::<u8>();
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     unsafe {
         *child.add(async_frame_slot_offset(0)).cast::<*mut u8>() = owner;
         for i in 0..3 {
@@ -6494,15 +7064,21 @@ fn stable_borrow_frame_address_survives_poll_resume_and_gc() {
                 owner.add(async_frame_slot_offset(i));
         }
     }
-    let task = willow_sched_spawn_cooperative(poll, child.cast()) as u64;
+    // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
+    // across scheduling and callback execution.
+    let task = (unsafe { willow_sched_spawn_cooperative(poll, child.cast()) }) as u64;
     // From here only the scheduled child's traced owner edge keeps the caller
     // alive. There is no native activation retaining the borrowed addresses.
-    crate::gc::willow_pop_root();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { crate::gc::willow_pop_root() };
     willow_sched_run_until(task);
     assert!(target_is_done(Some(task)));
     assert_eq!(POLLS.load(Ordering::SeqCst), 16);
     reset_global_scheduler_for_test();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 // ── Independent runtime instances ───────────────────────
@@ -6515,6 +7091,7 @@ static INSTANCE_POLLS: crate::runtime::PerRuntime<TestAtomicUsize> =
 unsafe extern "C" fn poll_counted_after_self_wake(frame: *mut c_void) -> i32 {
     INSTANCE_POLLS.fetch_add(1, TestOrdering::SeqCst);
     let state = frame.cast::<u64>();
+    // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     unsafe {
         if *state == 0 {
             *state = 1;
@@ -6532,18 +7109,24 @@ fn concurrent_runtime_instances_schedule_independent_task_sets() {
     let rendezvous = Barrier::new(2);
     let drive = |tasks: usize| {
         let _runtime = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         reset_global_scheduler_for_test();
         // Async frames: the scheduler reads the `[state, slot_count]` header.
         let mut frames: Vec<*mut u8> = (0..tasks)
             .map(|_| willow_async_frame_alloc(0, 0).cast())
             .collect();
         for frame in &mut frames {
-            crate::gc::willow_push_root(frame);
+            // SAFETY: The slot storage stays live and stationary through the matching pop,
+            // including during collection.
+            unsafe { crate::gc::willow_push_root(frame) };
         }
         let ids: Vec<u64> = frames
             .iter()
-            .map(|frame| willow_sched_spawn(poll_counted_after_self_wake, frame.cast()))
+            // SAFETY: The supplied callback matches this frame layout; the frame storage
+            // remains live across scheduling and callback execution.
+            .map(|frame| unsafe { willow_sched_spawn(poll_counted_after_self_wake, frame.cast()) })
             .collect();
         let before = INSTANCE_POLLS.load(TestOrdering::SeqCst);
         rendezvous.wait();
@@ -6553,11 +7136,16 @@ fn concurrent_runtime_instances_schedule_independent_task_sets() {
         let remaining = willow_sched_queue_entry_count();
         let states: Vec<u64> = frames
             .iter()
+            // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
             .map(|frame| unsafe { frame.cast::<u64>().read() })
             .collect();
-        crate::gc::willow_pop_roots(tasks as i32);
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { crate::gc::willow_pop_roots(tasks as i32) };
         reset_global_scheduler_for_test();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         (
             std::ptr::from_ref(crate::runtime::current()) as usize,
             ids,
@@ -6598,6 +7186,8 @@ fn private_runtime_drop_joins_live_workers_before_reclaiming_collector_storage()
         }
     }
     unsafe fn reclaimed(payload: *mut u8) {
+        // SAFETY: The GC word-aligns this pointer slot. The test installs the owned box there and
+        // the registered finalizer takes it once.
         let events = unsafe { Box::from_raw(payload.cast::<*mut Events>().read()) };
         events.lock().unwrap().push("gc");
     }
@@ -6607,15 +7197,21 @@ fn private_runtime_drop_joins_live_workers_before_reclaiming_collector_storage()
     for count in [1, 4, 16] {
         let events: Events = Arc::new(TestMutex::new(Vec::new()));
         // Declared before `owner` so it outlives the runtime that registers it.
-        let mut tlab = crate::gc::tlab_state_for_test();
+        let mut tlab = crate::gc::GcTlabState::new();
         let owner = crate::runtime::Runtime::shared(workers);
-        let payload = crate::gc::allocate_finalized_for_test(
-            &owner,
-            &mut tlab,
-            FINALIZED,
-            reclaimed,
-            std::mem::size_of::<*mut Events>(),
-        );
+        // SAFETY: The private runtime is dropped before the TLAB. The caller initializes the
+        // sole pointer slot with the Box consumed by reclaimed.
+        let payload = unsafe {
+            crate::gc::allocate_finalized_for_test(
+                &owner,
+                &raw mut tlab,
+                FINALIZED,
+                reclaimed,
+                std::mem::size_of::<*mut Events>(),
+            )
+        };
+        // SAFETY: The GC word-aligns this pointer slot. The test installs the owned box there and
+        // the registered finalizer takes it once.
         unsafe {
             payload
                 .cast::<*mut Events>()

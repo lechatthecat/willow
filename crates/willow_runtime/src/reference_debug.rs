@@ -36,7 +36,11 @@ pub(crate) fn replace_current(context: ReferenceCallState) -> ReferenceCallState
     REFERENCE_CALL_STATE.with(|state| std::mem::replace(&mut *state.borrow_mut(), context))
 }
 
-fn ws(ptr: *const u8) -> String {
+/// # Safety
+/// Each non-null string argument must be the current address of a live, word-aligned Willow
+/// String, with its length and UTF-8 bytes initialized and stable while read.
+unsafe fn ws(ptr: *const u8) -> String {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     unsafe { willow_string_as_str(ptr) }.to_string()
 }
 
@@ -85,9 +89,12 @@ pub extern "C" fn willow_debug_reference_call_scope_push() {
     });
 }
 
+/// # Safety
+/// Each non-null string argument must be the current address of a live, word-aligned Willow
+/// String, with its length and UTF-8 bytes initialized and stable while read.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_debug_reference_call(
+pub unsafe extern "C" fn willow_debug_reference_call(
     file: *const u8,
     line: i32,
     col: i32,
@@ -99,17 +106,21 @@ pub extern "C" fn willow_debug_reference_call(
     place_name: *const u8,
 ) {
     REFERENCE_CALL_STATE.with(|state| {
-        state.borrow_mut().current = Some(ReferenceCallContext {
-            file: ws(file),
-            line,
-            col,
-            callee: ws(callee),
-            param: ws(param),
-            param_type: ws(param_type),
-            mode: ws(mode),
-            place_kind: ws(place_kind),
-            place_name: ws(place_name),
-        });
+        // SAFETY: The caller lends each optional Willow String until ws has copied its text.
+        let context = unsafe {
+            ReferenceCallContext {
+                file: ws(file),
+                line,
+                col,
+                callee: ws(callee),
+                param: ws(param),
+                param_type: ws(param_type),
+                mode: ws(mode),
+                place_kind: ws(place_kind),
+                place_name: ws(place_name),
+            }
+        };
+        state.borrow_mut().current = Some(context);
     });
 }
 
@@ -123,27 +134,33 @@ pub extern "C" fn willow_debug_reference_call_clear() {
 mod tests {
     use super::*;
     use crate::gc::{isolated_runtime, willow_gc_init};
-    use crate::string::willow_string_alloc;
+    use crate::string::willow_string_from_str;
 
     fn ws_ptr(s: &str) -> *mut u8 {
-        willow_string_alloc(s.as_bytes().as_ptr(), s.len() as i64)
+        willow_string_from_str(s)
     }
 
     #[test]
     fn reference_debug_unit_01_records_and_clears_reference_context() {
         let _guard = isolated_runtime();
-        willow_gc_init();
-        willow_debug_reference_call(
-            ws_ptr("main.wi"),
-            7,
-            13,
-            ws_ptr("increment"),
-            ws_ptr("x"),
-            ws_ptr("i64"),
-            ws_ptr("&mut"),
-            ws_ptr("local"),
-            ws_ptr("n"),
-        );
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
+        // SAFETY: The fixture supplies Willow strings allocated in the isolated heap and kept
+        // live through this call.
+        unsafe {
+            willow_debug_reference_call(
+                ws_ptr("main.wi"),
+                7,
+                13,
+                ws_ptr("increment"),
+                ws_ptr("x"),
+                ws_ptr("i64"),
+                ws_ptr("&mut"),
+                ws_ptr("local"),
+                ws_ptr("n"),
+            )
+        };
 
         let ctx = current_reference_call().expect("reference context should be recorded");
         assert_eq!(ctx.callee, "increment");
@@ -160,31 +177,41 @@ mod tests {
     #[test]
     fn reference_debug_unit_02_nested_scope_restores_parent_context() {
         let _guard = isolated_runtime();
-        willow_gc_init();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { willow_gc_init() };
         willow_debug_reference_call_scope_push();
-        willow_debug_reference_call(
-            ws_ptr("main.wi"),
-            3,
-            9,
-            ws_ptr("Outer::init"),
-            ws_ptr("seed"),
-            ws_ptr("i64"),
-            ws_ptr("&mut"),
-            ws_ptr("local"),
-            ws_ptr("n"),
-        );
+        // SAFETY: The fixture supplies Willow strings allocated in the isolated heap and kept
+        // live through this call.
+        unsafe {
+            willow_debug_reference_call(
+                ws_ptr("main.wi"),
+                3,
+                9,
+                ws_ptr("Outer::init"),
+                ws_ptr("seed"),
+                ws_ptr("i64"),
+                ws_ptr("&mut"),
+                ws_ptr("local"),
+                ws_ptr("n"),
+            )
+        };
         willow_debug_reference_call_scope_push();
-        willow_debug_reference_call(
-            ws_ptr("main.wi"),
-            8,
-            17,
-            ws_ptr("Inner::init"),
-            ws_ptr("seed"),
-            ws_ptr("i64"),
-            ws_ptr("&mut"),
-            ws_ptr("local"),
-            ws_ptr("seed"),
-        );
+        // SAFETY: The fixture supplies Willow strings allocated in the isolated heap and kept
+        // live through this call.
+        unsafe {
+            willow_debug_reference_call(
+                ws_ptr("main.wi"),
+                8,
+                17,
+                ws_ptr("Inner::init"),
+                ws_ptr("seed"),
+                ws_ptr("i64"),
+                ws_ptr("&mut"),
+                ws_ptr("local"),
+                ws_ptr("seed"),
+            )
+        };
 
         willow_debug_reference_call_clear();
         assert_eq!(

@@ -433,7 +433,7 @@ pub(crate) fn run_stdout_call<T: Send + 'static>(
 }
 
 fn run_sync_call_on<T: Send + 'static>(
-    kind: PoolKind,
+    _kind: PoolKind,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
     #[cfg(any(
@@ -449,7 +449,7 @@ fn run_sync_call_on<T: Send + 'static>(
         all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
     if crate::native_stack::is_active() {
-        return run_owned_on(kind.pool(), work);
+        return run_owned_on(_kind.pool(), work);
     }
     // SAFETY: `work` is `'static + Send`, so it holds no thread-owned runtime
     // state, and its contract above excludes managed objects.
@@ -675,7 +675,8 @@ pub(crate) mod test_support {
     pub(crate) fn queue_full_metric() -> u64 {
         use crate::observability::{WillowRuntimeMetricsV1, willow_runtime_metrics_snapshot_v1};
         let mut snapshot = WillowRuntimeMetricsV1::default();
-        willow_runtime_metrics_snapshot_v1(&mut snapshot);
+        // SAFETY: The typed output owns one aligned, writable record for the call.
+        unsafe { willow_runtime_metrics_snapshot_v1(&mut snapshot) };
         snapshot.blocking_queue_full
     }
 }
@@ -705,7 +706,8 @@ mod tests {
     /// Spawn `count` stand-in Tasks and park them all.
     fn parked_tasks(count: usize) -> Vec<u64> {
         let ids: Vec<u64> = (0..count)
-            .map(|_| willow_sched_spawn(parks_forever, std::ptr::null_mut()))
+            // SAFETY: The callback accepts a null frame and uses no frame storage.
+            .map(|_| unsafe { willow_sched_spawn(parks_forever, std::ptr::null_mut()) })
             .collect();
         willow_sched_run_until_deadline(willow_monotonic_millis() + 200);
         for id in &ids {
@@ -768,7 +770,8 @@ mod tests {
             running.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(PoolKind::Stdout.pool().try_submit(Box::new(|| {})).is_ok());
             let ids: Vec<_> = (0..count)
-                .map(|_| willow_sched_spawn(writer, std::ptr::null_mut()))
+                // SAFETY: The callback accepts a null frame and uses no frame storage.
+                .map(|_| unsafe { willow_sched_spawn(writer, std::ptr::null_mut()) })
                 .collect();
             willow_sched_run_until_deadline(willow_monotonic_millis() + 50);
             assert_eq!(

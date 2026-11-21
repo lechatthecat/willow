@@ -759,10 +759,14 @@ impl ConcurrentCycle {
         let mut slots = 0;
         let index_reader = self.objects.reader();
         for word in start..end {
+            // SAFETY: The immutable bitmap bounds this scan to the live object's word slots. GC
+            // base alignment and word stride preserve pointer alignment.
             let mut bits = unsafe { *descriptor.add(word + 1) };
             while bits != 0 {
                 let index = word * 64 + bits.trailing_zeros() as usize;
                 if index < words {
+                    // SAFETY: The immutable bitmap bounds this scan to the live object's word
+                    // slots. GC base alignment and word stride preserve pointer alignment.
                     let child = unsafe {
                         load_gc_reference(
                             (value as *mut u8)
@@ -1036,6 +1040,8 @@ impl ConcurrentCycle {
                 MarkWorkItem::Object(object) => {
                     // Queue ownership plus active_drains pins this claimed
                     // header until completion, just as for slice continuations.
+                    // SAFETY: Only the worker that claimed this live epoch entry reads its
+                    // metadata, before the epoch is retired.
                     let metadata = metadata.unwrap_or_else(|| unsafe {
                         match inline_reader.as_ref() {
                             Some(reader) => reader.claimed_metadata(object.addr()),
@@ -1070,6 +1076,8 @@ impl ConcurrentCycle {
                     let mut objects = objects.into_vec().into_iter();
                     while let Some(object) = objects.next() {
                         // Batches contain already-claimed, validated objects.
+                        // SAFETY: Only the worker that claimed this live epoch entry reads its
+                        // metadata, before the epoch is retired.
                         let metadata = unsafe {
                             match inline_reader.as_ref() {
                                 Some(reader) => reader.claimed_metadata(object.addr()),
@@ -1200,6 +1208,8 @@ pub(super) fn epoch_objects(
             // Retirement validates physical headers once; subsequent snapshots
             // use its persistent ordered index rather than reparsing boundaries.
             let object =
+                // SAFETY: Allocation metadata identifies a header-aligned object start within this
+                // live region or chunk.
                 HeapObject::from_raw(unsafe { chunk.base.add(usize::from(offset)) }.cast())
                     .unwrap();
             work.metadata_objects += 1;
@@ -1515,6 +1525,8 @@ pub(super) fn mark_worklist(
             let mut child_slots: Vec<*mut *mut u8> = Vec::new();
             // SAFETY: trace is the registered function for this type_id.
             native_counts.stopped(metadata.type_id, mode == TraceMode::StopOnly);
+            // SAFETY: The registered hook matches the allocation's type and runs while the
+            // collector retains its payload.
             unsafe { trace(object.payload().as_ptr(), &mut child_slots) };
             for slot in child_slots.into_iter().filter(|slot| !slot.is_null()) {
                 scanned_slots += 1;

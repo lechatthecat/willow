@@ -304,11 +304,15 @@ mod tests {
     fn runtime_soft_pressure_collects_without_changing_hard_cap() {
         use super::super::*;
         let _guard = isolated_runtime();
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         let root = willow_alloc(1024);
         assert!(!root.is_null());
-        willow_gc_add_runtime_root(root);
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { willow_gc_add_runtime_root(root) };
         assert_eq!(willow_gc_set_memory_limit(1), 0);
         assert!(allocation_should_collect_with_sync_in(
             crate::runtime::current(),
@@ -326,7 +330,9 @@ mod tests {
         // exceed a soft limit smaller than the live set and still progress.
         let extra = willow_alloc(8);
         assert!(!extra.is_null());
-        willow_gc_add_runtime_root(extra);
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { willow_gc_add_runtime_root(extra) };
         collect_internal();
         let before = runtime().heap.lock().unwrap().major_collections;
         for _ in 0..128 {
@@ -334,9 +340,15 @@ mod tests {
         }
         assert_eq!(runtime().heap.lock().unwrap().major_collections, before);
         assert_eq!(willow_gc_set_memory_limit(0), 1);
-        willow_gc_remove_runtime_root(extra);
-        willow_gc_remove_runtime_root(root);
-        reset_internal();
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { willow_gc_remove_runtime_root(extra) };
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { willow_gc_remove_runtime_root(root) };
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
     }
 
     #[test]
@@ -447,7 +459,9 @@ mod tests {
     fn process_pressure_reaches_pacer_but_relief_does_not() {
         use super::super::*;
         let _guard = isolated_runtime();
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
         assert!(!willow_alloc(8).is_null());
         let mut state = runtime().heap.lock().unwrap();
         state.soft_memory.set_limit(1 << 30);
@@ -458,7 +472,9 @@ mod tests {
         state.soft_memory.completed(input.occupied, input);
         assert!(!pacer_inputs(&state).feedback.pressure);
         drop(state);
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
     }
 
     #[test]
@@ -561,9 +577,14 @@ mod tests {
     fn cached_process_pressure_relief_preserves_live_runtime_root() {
         use super::super::*;
         let _guard = isolated_runtime();
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
         let root = willow_alloc((4096 - GC_HEADER_SIZE) as i64);
-        willow_gc_add_runtime_root(root);
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { willow_gc_add_runtime_root(root) };
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         unsafe {
             root.cast::<u64>().write(42);
         }
@@ -577,8 +598,19 @@ mod tests {
         for _ in 0..3 {
             {
                 let mut state = runtime().heap.lock().unwrap();
-                allocate_old_region_object_locked(&mut state, 0, 0, 4096 - GC_HEADER_SIZE, 0, true)
-                    .unwrap();
+                // SAFETY: The allocation path forwards the validated payload extent, type and
+                // tracing layout; its caller initializes native fields before collection.
+                unsafe {
+                    allocate_old_region_object_locked(
+                        &mut state,
+                        0,
+                        0,
+                        4096 - GC_HEADER_SIZE,
+                        0,
+                        true,
+                    )
+                }
+                .unwrap();
                 assert_eq!(state.allocated_bytes, 8192);
             }
             collect_internal();
@@ -590,15 +622,20 @@ mod tests {
             assert!(!willow_alloc(8).is_null());
         }
         assert_eq!(runtime().heap.lock().unwrap().major_collections, before);
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         assert_eq!(unsafe { root.cast::<u64>().read() }, 42);
         runtime().heap.lock().unwrap().soft_memory.resident = Some(512 << 10);
         collect_internal();
         collect_internal();
         assert!(!runtime().heap.lock().unwrap().soft_memory.relief);
-        willow_gc_remove_runtime_root(root);
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { willow_gc_remove_runtime_root(root) };
         collect_internal();
         assert_eq!(runtime().heap.lock().unwrap().allocated_bytes, 0);
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
     }
 
     #[test]
@@ -632,9 +669,14 @@ mod tests {
     fn concurrent_updates_preserve_roots_and_relief() {
         use super::super::*;
         let _guard = isolated_runtime();
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
         let root = willow_alloc(8);
-        willow_gc_add_runtime_root(root);
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { willow_gc_add_runtime_root(root) };
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         unsafe {
             root.cast::<u64>().write(0x1234);
         }
@@ -656,11 +698,16 @@ mod tests {
         });
         willow_gc_set_memory_limit(1);
         assert_eq!(runtime().heap.lock().unwrap().major_collections, before);
+        // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
         assert_eq!(unsafe { root.cast::<u64>().read() }, 0x1234);
-        willow_gc_remove_runtime_root(root);
+        // SAFETY: The runtime keeps this nonmoving payload at its registered address through
+        // removal.
+        unsafe { willow_gc_remove_runtime_root(root) };
         collect_internal();
         assert_eq!(runtime().heap.lock().unwrap().allocated_bytes, 0);
-        reset_internal();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
     }
 
     #[test]
@@ -668,13 +715,17 @@ mod tests {
         use super::super::*;
         let _guard = isolated_runtime();
         for nursery in [false, true] {
-            reset_internal();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal() };
             willow_gc_set_memory_limit(u64::MAX);
             runtime().storage_allocator.set_failures(1);
             runtime().storage_allocator.set_attempts(0);
-            let mut tls = tlab_state_for_test();
+            let tls = tlab_state_for_test();
             let result = if nursery {
-                willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0)
+                // SAFETY: The fixture owns the stable TLAB through unregistration. The
+                // requested size and tracing metadata describe the object initialized here.
+                unsafe { willow_gc_alloc_slow(tls.as_ptr(), 0, 0, 8, 0) }
             } else {
                 willow_alloc(GC_LARGE_OBJECT_THRESHOLD as i64)
             };
@@ -682,7 +733,9 @@ mod tests {
             assert_eq!(runtime().storage_allocator.attempts(), 2);
             assert_eq!(runtime().storage_allocator.failures(), 0);
             assert_eq!(runtime().heap.lock().unwrap().major_collections, 1);
-            reset_internal(); // TLS is still alive here.
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal() }; // TLS is still alive here.
         }
     }
 }

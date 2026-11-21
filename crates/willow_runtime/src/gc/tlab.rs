@@ -4,7 +4,10 @@ use super::*;
 // TLAB state and chunk management
 // ---------------------------------------------------------------------------
 
-pub(super) unsafe fn tlab_state_at(address: usize) -> &'static GcTlabState {
+/// # Safety
+/// The registered address must still identify its owner's initialized, aligned block.
+/// Limit the borrow to the interval during which registration protects its storage.
+pub(super) unsafe fn tlab_state_at<'a>(address: usize) -> &'a GcTlabState {
     // SAFETY: generated code passes the address of its aligned, zero-initialized
     // TLS block whose layout is locked by the compiler/runtime ABI tests.
     unsafe { &*(address as *const GcTlabState) }
@@ -182,12 +185,24 @@ thread_local! {
     pub(super) static HAS_REGISTERED_TLAB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// # Safety
+/// A non-null TLAB must be the initialized, naturally aligned allocation block of this mutator
+/// in the selected runtime (initially zeroed). Keep its address and storage valid until
+/// retirement AND removal from the registry, including during stops and teardown; only the
+/// owning mutator may bump it, following the collector stop protocol.
 #[cfg(test)]
-pub(super) fn register_tlab_state(state: &mut GcState, address: usize) {
-    register_tlab_state_in(runtime(), state, address);
+pub(super) unsafe fn register_tlab_state(state: &mut GcState, address: usize) {
+    // SAFETY: The mutator owns this initialized block at a stable address through retirement
+    // and removal from this runtime.
+    unsafe { register_tlab_state_in(runtime(), state, address) };
 }
 
-pub(super) fn register_tlab_state_in(gc: &GcRuntime, state: &mut GcState, address: usize) {
+/// # Safety
+/// A non-null TLAB must be the initialized, naturally aligned allocation block of this mutator
+/// in the selected runtime (initially zeroed). Keep its address and storage valid until
+/// retirement AND removal from the registry, including during stops and teardown; only the
+/// owning mutator may bump it, following the collector stop protocol.
+pub(super) unsafe fn register_tlab_state_in(gc: &GcRuntime, state: &mut GcState, address: usize) {
     if gc.serves_current_thread() {
         HAS_REGISTERED_TLAB.set(true);
     }

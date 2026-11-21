@@ -11,10 +11,16 @@ use willow_abi::native::{Distribution, MAX_POLICY_BYTES, POLICY_FILE};
 struct Handle(*mut c_void);
 // OS loader handles are process-wide; lookup is finished before publication and
 // no handle is unloaded while a Registry's pointers can be used.
+// SAFETY: OS module handles can cross threads; the owning Handle holds the loader reference until
+// drop.
 unsafe impl Send for Handle {}
+// SAFETY: OS module handles can cross threads; the owning Handle holds the loader reference until
+// drop.
 unsafe impl Sync for Handle {}
 impl Drop for Handle {
     fn drop(&mut self) {
+        // SAFETY: The loader receives a live NUL-terminated name or an owned open module handle.
+        // Unloading consumes that handle once.
         unsafe {
             os::close(self.0);
         }
@@ -90,16 +96,26 @@ impl Registry {
         }
         let mut libraries = HashMap::new();
         for (library, path) in distribution.libraries.into_iter().zip(paths) {
+            // SAFETY: The loader receives a live NUL-terminated name or an owned open module
+            // handle. Unloading consumes that handle once.
             let handle = Handle(unsafe { os::open(&path)? });
             let negotiation = CString::new(library.policy.abi_symbol).unwrap();
+            // SAFETY: The loader receives a live NUL-terminated name or an owned open module
+            // handle. Unloading consumes that handle once.
             let pointer = unsafe { os::symbol(handle.0, &negotiation)? };
+            // SAFETY: The library ABI reserves this symbol for the negotiation entry of exactly
+            // this signature. The open handle keeps its code loaded.
             let negotiate: willow_abi::native::Negotiate = unsafe { std::mem::transmute(pointer) };
+            // SAFETY: The library ABI reserves this symbol for the negotiation entry of exactly
+            // this signature. The open handle keeps its code loaded.
             if unsafe { negotiate(library.policy.version) } != library.policy.version {
                 return Err(format!("native_abi_mismatch: {}", library.name));
             }
             let mut symbols = HashMap::new();
             for symbol in library.policy.symbols {
                 let name = CString::new(symbol.as_str()).unwrap();
+                // SAFETY: The loader receives a live NUL-terminated name or an owned open module
+                // handle. Unloading consumes that handle once.
                 let pointer = unsafe { os::symbol(handle.0, &name)? };
                 symbols.insert(symbol, pointer as usize);
             }
@@ -147,9 +163,11 @@ pub unsafe extern "C" fn willow_native_symbol_v1(
         if library.is_null() || symbol.is_null() {
             return Err("native_invalid_name".into());
         }
+        // SAFETY: The generated loader ABI supplies a live NUL-terminated library or symbol name.
         let library = unsafe { CStr::from_ptr(library) }
             .to_str()
             .map_err(|_| "native_invalid_name".to_owned())?;
+        // SAFETY: The generated loader ABI supplies a live NUL-terminated library or symbol name.
         let symbol = unsafe { CStr::from_ptr(symbol) }
             .to_str()
             .map_err(|_| "native_invalid_name".to_owned())?;
@@ -182,6 +200,8 @@ mod os {
     use std::os::unix::ffi::OsStrExt;
     pub unsafe fn open(path: &Path) -> Result<*mut c_void, String> {
         let path = CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        // SAFETY: The loader receives a live NUL-terminated name or an owned open module handle.
+        // Unloading consumes that handle once.
         let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if handle.is_null() {
             Err("native_load_failed".into())
@@ -190,10 +210,14 @@ mod os {
         }
     }
     pub unsafe fn symbol(handle: *mut c_void, name: &CStr) -> Result<*mut c_void, String> {
+        // SAFETY: dlerror has no pointer arguments and inspects this thread's loader error.
         unsafe {
             libc::dlerror();
         }
+        // SAFETY: The loader receives a live NUL-terminated name or an owned open module handle.
+        // Unloading consumes that handle once.
         let pointer = unsafe { libc::dlsym(handle, name.as_ptr()) };
+        // SAFETY: dlerror has no pointer arguments and inspects this thread's loader error.
         if pointer.is_null() || !unsafe { libc::dlerror() }.is_null() {
             Err(format!("native_symbol_missing: {}", name.to_string_lossy()))
         } else {
@@ -201,6 +225,8 @@ mod os {
         }
     }
     pub unsafe fn close(handle: *mut c_void) {
+        // SAFETY: The loader receives a live NUL-terminated name or an owned open module handle.
+        // Unloading consumes that handle once.
         unsafe {
             libc::dlclose(handle);
         }
@@ -219,6 +245,8 @@ mod os {
     pub unsafe fn open(path: &Path) -> Result<*mut c_void, String> {
         let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         // Search dependencies only in the library's own directory and System32.
+        // SAFETY: The loader receives a live NUL-terminated name or an owned open module handle.
+        // Unloading consumes that handle once.
         let handle = unsafe { LoadLibraryExW(path.as_ptr(), std::ptr::null_mut(), 0x100 | 0x800) };
         if handle.is_null() {
             Err("native_load_failed".into())
@@ -227,6 +255,8 @@ mod os {
         }
     }
     pub unsafe fn symbol(handle: *mut c_void, name: &CStr) -> Result<*mut c_void, String> {
+        // SAFETY: The loader receives a live NUL-terminated name or an owned open module handle.
+        // Unloading consumes that handle once.
         let pointer = unsafe { GetProcAddress(handle, name.as_ptr()) };
         if pointer.is_null() {
             Err(format!("native_symbol_missing: {}", name.to_string_lossy()))
@@ -235,6 +265,8 @@ mod os {
         }
     }
     pub unsafe fn close(handle: *mut c_void) {
+        // SAFETY: The loader receives a live NUL-terminated name or an owned open module handle.
+        // Unloading consumes that handle once.
         unsafe {
             FreeLibrary(handle);
         }

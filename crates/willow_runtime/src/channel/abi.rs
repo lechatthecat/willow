@@ -7,17 +7,23 @@ use super::*;
 pub extern "C" fn willow_channel_new(is_ref: i64) -> *mut c_void {
     ensure_channel_registered();
     let is_ref = is_ref != 0;
-    let payload = crate::gc::willow_alloc_with_layout(
-        crate::gc::GcObjectKind::Channel,
-        CHANNEL_TYPE_ID,
-        std::mem::size_of::<WillowAbiChannel>() as i64,
-        0,
-    );
+    const { assert!(align_of::<WillowAbiChannel>() <= align_of::<crate::gc::GcHeader>()) };
+    // SAFETY: The constructor selects the matching payload layout and initializes its fields
+    // before exposing it or reaching a GC point.
+    let payload = unsafe {
+        crate::gc::willow_alloc_with_layout(
+            crate::gc::GcObjectKind::Channel,
+            CHANNEL_TYPE_ID,
+            std::mem::size_of::<WillowAbiChannel>() as i64,
+            0,
+        )
+    };
     if payload.is_null() {
         return std::ptr::null_mut();
     }
     // Placement-init into GC memory. `drop_channel` runs the Rust destructor
     // during sweep so the state-owned queue buffers are released too.
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     unsafe {
         (payload as *mut WillowAbiChannel).write(WillowAbiChannel::new(is_ref));
     }
@@ -38,6 +44,7 @@ pub extern "C" fn willow_channel_new_bounded(is_ref: i64, capacity: i64) -> *mut
         return std::ptr::null_mut();
     }
     let raw = willow_channel_new(is_ref);
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     if let Some(channel) = unsafe { channel_from_raw(raw) } {
         channel
             .state
@@ -48,37 +55,66 @@ pub extern "C" fn willow_channel_new_bounded(is_ref: i64, capacity: i64) -> *mut
     raw
 }
 
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait. For a reference payload the word must be null
+/// or the current address of a live managed object of the declared element type.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_try_send_i64(raw: *mut c_void, value: i64) -> i32 {
-    channel_try_send_value(raw, WillowChannelValue { i64_value: value })
+pub unsafe extern "C" fn willow_channel_try_send_i64(raw: *mut c_void, value: i64) -> i32 {
+    // SAFETY: The typed send supplies the live channel and matching union member; after a
+    // collecting wait both the channel and any reference value are reloaded from roots.
+    unsafe { channel_try_send_value(raw, WillowChannelValue { i64_value: value }) }
 }
 
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait. For a reference payload the word must be null
+/// or the current address of a live managed object of the declared element type.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_try_send_bool(raw: *mut c_void, value: u8) -> i32 {
-    channel_try_send_value(raw, bool_channel_value(value))
+pub unsafe extern "C" fn willow_channel_try_send_bool(raw: *mut c_void, value: u8) -> i32 {
+    // SAFETY: The typed send supplies the live channel and matching union member; after a
+    // collecting wait both the channel and any reference value are reloaded from roots.
+    unsafe { channel_try_send_value(raw, bool_channel_value(value)) }
 }
 
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait. For a reference payload the word must be null
+/// or the current address of a live managed object of the declared element type.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_try_send_f64(raw: *mut c_void, value: f64) -> i32 {
-    channel_try_send_value(raw, WillowChannelValue { f64_value: value })
+pub unsafe extern "C" fn willow_channel_try_send_f64(raw: *mut c_void, value: f64) -> i32 {
+    // SAFETY: The typed send supplies the live channel and matching union member; after a
+    // collecting wait both the channel and any reference value are reloaded from roots.
+    unsafe { channel_try_send_value(raw, WillowChannelValue { f64_value: value }) }
 }
 
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait. For a reference payload the word must be null
+/// or the current address of a live managed object of the declared element type.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_try_send_ptr(raw: *mut c_void, value: *mut c_void) -> i32 {
-    channel_try_send_value(raw, WillowChannelValue { ptr_value: value })
+pub unsafe extern "C" fn willow_channel_try_send_ptr(raw: *mut c_void, value: *mut c_void) -> i32 {
+    // SAFETY: The typed send supplies the live channel and matching union member; after a
+    // collecting wait both the channel and any reference value are reloaded from roots.
+    unsafe { channel_try_send_value(raw, WillowChannelValue { ptr_value: value }) }
 }
 
 /// Send-readiness probe for select send cases: 1 when not full
 /// (or closed/unbounded); 0 after registering the running task as a send
 /// waiter on a FULL bounded channel.
+///
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_send_ready(raw: *mut c_void) -> i32 {
+pub unsafe extern "C" fn willow_channel_send_ready(raw: *mut c_void) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return 1;
     };
@@ -109,10 +145,15 @@ pub extern "C" fn willow_channel_send_ready(raw: *mut c_void) -> i32 {
 /// returns 0 if the channel is empty and open,
 /// after registering the currently-running task as a waiter — the caller's poll
 /// fn then returns Pending and is woken by a later `send`/`close`.
+///
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
+pub unsafe extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
     let no_preempt = crate::preempt::NoPreemptGuard::enter();
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return 1;
     };
@@ -174,10 +215,16 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
 /// between, because the generated code has no safepoint there. A task with a
 /// pending cancellation still takes no unreserved value. `select` keeps
 /// `willow_channel_recv_ready`, since its probes must not consume.
+///
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait. When a value is taken, out_payload must
+/// exclusively address one aligned, writable i64 disjoint from the channel.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_recv_take(raw: *mut c_void, out_payload: *mut i64) -> i32 {
+pub unsafe extern "C" fn willow_channel_recv_take(raw: *mut c_void, out_payload: *mut i64) -> i32 {
     let no_preempt = crate::preempt::NoPreemptGuard::enter();
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return 2;
     };
@@ -206,6 +253,7 @@ pub extern "C" fn willow_channel_recv_take(raw: *mut c_void, out_payload: *mut i
     if let Some(value) = take_value(raw, &mut state, current) {
         open_inbox_if_idle(channel, &mut state);
         let value = finish_take(raw, channel, state, value);
+        // SAFETY: The ABI caller provides a live, aligned, writable output slot for this result.
         unsafe { out_payload.write(value.i64_value) };
         return 1;
     }
@@ -245,23 +293,33 @@ fn park_receiver(
 /// every recv channel while waiting; once it picks a case it must unregister
 /// from all of them so a later send/close does not spuriously wake the
 /// already-resumed task.
+///
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_unregister_waiter(raw: *mut c_void) {
-    willow_channel_select_cleanup(raw, std::ptr::null_mut(), -1);
+pub unsafe extern "C" fn willow_channel_unregister_waiter(raw: *mut c_void) {
+    // SAFETY: The handle is null or the live channel retained for this operation.
+    unsafe { willow_channel_select_cleanup(raw, std::ptr::null_mut(), -1) };
 }
 
 /// Called per channel arm by select, before committing its
 /// winning operation. Direction: 0 recv, 1 send, -1 non-channel winner.
 /// Repeated calls for aliased arms are harmless and retain the winning role.
+///
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_select_cleanup(
+pub unsafe extern "C" fn willow_channel_select_cleanup(
     raw: *mut c_void,
     winner: *mut c_void,
     direction: i64,
 ) {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return;
     };
@@ -305,16 +363,28 @@ pub extern "C" fn willow_channel_select_cleanup(
     }
 }
 
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait. For a reference payload the word must be null
+/// or the current address of a live managed object of the declared element type.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_send_i64(raw: *mut c_void, value: i64) {
-    willow_channel_send_value(raw, WillowChannelValue { i64_value: value });
+pub unsafe extern "C" fn willow_channel_send_i64(raw: *mut c_void, value: i64) {
+    // SAFETY: The typed send supplies the live channel and matching union member; after a
+    // collecting wait both the channel and any reference value are reloaded from roots.
+    unsafe { willow_channel_send_value(raw, WillowChannelValue { i64_value: value }) };
 }
 
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait. For a reference payload the word must be null
+/// or the current address of a live managed object of the declared element type.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_send_bool(raw: *mut c_void, value: u8) {
-    willow_channel_send_value(raw, bool_channel_value(value));
+pub unsafe extern "C" fn willow_channel_send_bool(raw: *mut c_void, value: u8) {
+    // SAFETY: The typed send supplies the live channel and matching union member; after a
+    // collecting wait both the channel and any reference value are reloaded from roots.
+    unsafe { willow_channel_send_value(raw, bool_channel_value(value)) };
 }
 
 /// A bool payload with every byte initialized: `recv_opt` hands the whole
@@ -325,39 +395,71 @@ fn bool_channel_value(value: u8) -> WillowChannelValue {
     }
 }
 
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait. For a reference payload the word must be null
+/// or the current address of a live managed object of the declared element type.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_send_f64(raw: *mut c_void, value: f64) {
-    willow_channel_send_value(raw, WillowChannelValue { f64_value: value });
+pub unsafe extern "C" fn willow_channel_send_f64(raw: *mut c_void, value: f64) {
+    // SAFETY: The typed send supplies the live channel and matching union member; after a
+    // collecting wait both the channel and any reference value are reloaded from roots.
+    unsafe { willow_channel_send_value(raw, WillowChannelValue { f64_value: value }) };
 }
 
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait. For a reference payload the word must be null
+/// or the current address of a live managed object of the declared element type.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_send_ptr(raw: *mut c_void, value: *mut c_void) {
-    willow_channel_send_value(raw, WillowChannelValue { ptr_value: value });
+pub unsafe extern "C" fn willow_channel_send_ptr(raw: *mut c_void, value: *mut c_void) {
+    // SAFETY: The typed send supplies the live channel and matching union member; after a
+    // collecting wait both the channel and any reference value are reloaded from roots.
+    unsafe { willow_channel_send_value(raw, WillowChannelValue { ptr_value: value }) };
 }
 
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_recv_i64(raw: *mut c_void) -> i64 {
+pub unsafe extern "C" fn willow_channel_recv_i64(raw: *mut c_void) -> i64 {
+    // SAFETY: The channel element ABI supplies the initialized union representation read by this
+    // operation.
     unsafe { willow_channel_recv_value(raw).i64_value }
 }
 
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_recv_bool(raw: *mut c_void) -> u8 {
+pub unsafe extern "C" fn willow_channel_recv_bool(raw: *mut c_void) -> u8 {
+    // SAFETY: The channel element ABI supplies the initialized union representation read by this
+    // operation.
     unsafe { willow_channel_recv_value(raw).bool_value }
 }
 
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_recv_f64(raw: *mut c_void) -> f64 {
+pub unsafe extern "C" fn willow_channel_recv_f64(raw: *mut c_void) -> f64 {
+    // SAFETY: The channel element ABI supplies the initialized union representation read by this
+    // operation.
     unsafe { willow_channel_recv_value(raw).f64_value }
 }
 
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_recv_ptr(raw: *mut c_void) -> *mut c_void {
+pub unsafe extern "C" fn willow_channel_recv_ptr(raw: *mut c_void) -> *mut c_void {
+    // SAFETY: The channel element ABI supplies the initialized union representation read by this
+    // operation.
     unsafe { willow_channel_recv_value(raw).ptr_value }
 }
 
@@ -366,12 +468,29 @@ pub extern "C" fn willow_channel_recv_ptr(raw: *mut c_void) -> *mut c_void {
 /// writing the received storage word to `out_payload`, or 1 (`None`) — the
 /// same tag/payload protocol as `willow_map_get_into`, so the compiler builds
 /// the `Option<T>` with the same code.
+///
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait. Even for a null or closed channel, out_payload
+/// must exclusively address one aligned, writable i64 disjoint from the channel and stable
+/// across any wait.
+///
+/// ```compile_fail,E0133
+/// let mut word = 0i64;
+/// willow_runtime::channel::willow_channel_recv_opt_into(std::ptr::null_mut(), &mut word);
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_recv_opt_into(raw: *mut c_void, out_payload: *mut i64) -> i64 {
+pub unsafe extern "C" fn willow_channel_recv_opt_into(
+    raw: *mut c_void,
+    out_payload: *mut i64,
+) -> i64 {
+    // SAFETY: The ABI caller provides a live, aligned, writable output slot for this result.
     unsafe { out_payload.write(0) };
     match channel_recv_or_closed(raw) {
         Some(value) => {
+            // SAFETY: The ABI caller provides a live, aligned, writable output slot for this
+            // result.
             unsafe { out_payload.write(value.i64_value) };
             0
         }
@@ -379,9 +498,13 @@ pub extern "C" fn willow_channel_recv_opt_into(raw: *mut c_void, out_payload: *m
     }
 }
 
+/// # Safety
+/// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable
+/// through the operation, including any wait.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_channel_close(raw: *mut c_void) {
+pub unsafe extern "C" fn willow_channel_close(raw: *mut c_void) {
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return;
     };
@@ -415,6 +538,8 @@ pub extern "C" fn willow_channel_close(raw: *mut c_void) {
     }
     let wake: Vec<_> = wake.into_iter().collect();
     // The native Vec remains valid across scheduler GC stress points.
+    // SAFETY: The slice supplies exactly the indicated number of task IDs and remains live for the
+    // call.
     unsafe { crate::scheduler::willow_sched_wake_many(wake.as_ptr(), wake.len()) };
     wake_recv_waiters(channel);
 }

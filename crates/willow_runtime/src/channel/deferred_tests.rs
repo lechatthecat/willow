@@ -5,7 +5,9 @@ use std::sync::atomic::Ordering::Relaxed;
 
 fn reset() {
     reset_global_scheduler_for_test();
-    crate::gc::reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { crate::gc::reset_internal_for_test() };
     CHANNEL_WAITER_VISITS.store(0, Relaxed);
 }
 
@@ -25,6 +27,7 @@ fn deferred_terminal_compensation_bounds_receive_independent_of_messages_and_wai
         for waiters in [33, 1_024, 4_096] {
             reset();
             let raw = willow_channel_new_bounded(0, 1);
+            // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
             let channel = unsafe { channel_from_raw(raw) }.unwrap();
             // Terminal/missing owners leave no reverse token. Deliberately keep
             // their FIFO entries, as in the stale-head regression fixture.
@@ -39,9 +42,12 @@ fn deferred_terminal_compensation_bounds_receive_independent_of_messages_and_wai
             let mut maximum = 0;
             let mut foreground = 0;
             for _ in 0..messages {
-                assert_eq!(willow_channel_try_send_i64(raw, 7), 1);
+                // SAFETY: The constructor selected this channel element representation and
+                // the channel remains live during the send.
+                assert_eq!(unsafe { willow_channel_try_send_i64(raw, 7) }, 1);
                 let before = CHANNEL_WAITER_VISITS.load(Relaxed);
-                assert_eq!(willow_channel_recv_i64(raw), 7);
+                // SAFETY: The handle is null or the live channel retained for this operation.
+                assert_eq!(unsafe { willow_channel_recv_i64(raw) }, 7);
                 let visits = CHANNEL_WAITER_VISITS.load(Relaxed) - before;
                 maximum = maximum.max(visits);
                 foreground += visits;
@@ -91,17 +97,24 @@ fn deferred_closed_final_receive_bounds_fanout_independent_of_messages_and_waite
             reset();
             let raw = willow_channel_new_bounded(0, 1);
             for _ in 1..messages {
-                assert_eq!(willow_channel_try_send_i64(raw, 9), 1);
-                assert_eq!(willow_channel_recv_i64(raw), 9);
+                // SAFETY: The constructor selected this channel element representation and
+                // the channel remains live during the send.
+                assert_eq!(unsafe { willow_channel_try_send_i64(raw, 9) }, 1);
+                // SAFETY: The handle is null or the live channel retained for this operation.
+                assert_eq!(unsafe { willow_channel_recv_i64(raw) }, 9);
             }
             let owner = with_global_for_test(|s| s.spawn_parked_placeholder());
-            assert_eq!(willow_channel_try_send_i64(raw, 9), 1);
+            // SAFETY: The constructor selected this channel element representation and the
+            // channel remains live during the send.
+            assert_eq!(unsafe { willow_channel_try_send_i64(raw, 9) }, 1);
             crate::scheduler::with_current_task_for_test(owner, || {
-                assert_eq!(willow_channel_recv_ready(raw), 1)
+                // SAFETY: The handle is null or the live channel retained for this operation.
+                assert_eq!(unsafe { willow_channel_recv_ready(raw) }, 1)
             });
             let peers: Vec<_> = with_global_for_test(|s| {
                 (0..waiters).map(|_| s.spawn_parked_placeholder()).collect()
             });
+            // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
             let channel = unsafe { channel_from_raw(raw) }.unwrap();
             {
                 let mut state = channel.state.lock().unwrap();
@@ -114,13 +127,24 @@ fn deferred_closed_final_receive_bounds_fanout_independent_of_messages_and_waite
                     ));
                 }
             }
-            willow_channel_close(raw);
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            unsafe { willow_channel_close(raw) };
             let before = CHANNEL_WAITER_VISITS.load(Relaxed);
             crate::scheduler::with_current_task_for_test(owner, || {
                 let mut payload = 0;
-                assert_eq!(willow_channel_recv_opt_into(raw, &mut payload), 0);
+                assert_eq!(
+                    // SAFETY: The channel handle is current and the payload output owns a
+                    // disjoint writable i64 across the receive.
+                    unsafe { willow_channel_recv_opt_into(raw, &mut payload) },
+                    0
+                );
                 assert_eq!(payload, 9);
-                assert_eq!(willow_channel_recv_opt_into(raw, &mut payload), 1);
+                assert_eq!(
+                    // SAFETY: The channel handle is current and the payload output owns a
+                    // disjoint writable i64 across the receive.
+                    unsafe { willow_channel_recv_opt_into(raw, &mut payload) },
+                    1
+                );
             });
             assert_eq!(
                 CHANNEL_WAITER_VISITS.load(Relaxed),
@@ -154,10 +178,14 @@ fn deferred_job_roots_channel_and_value_after_initiator_cancellation() {
     reset();
     let raw = willow_channel_new(1);
     let root = crate::gc::GcRootHandle::new(raw.cast());
-    let text = b"deferred channel GC child";
-    let value = crate::string::willow_string_alloc(text.as_ptr(), text.len() as i64);
+    let text = "deferred channel GC child";
+
+    let value = crate::string::willow_string_from_str(text);
     let raw = root.load().cast();
-    willow_channel_send_ptr(raw, value.cast());
+    // SAFETY: The constructor selected this channel element representation and the channel
+    // remains live during the send.
+    unsafe { willow_channel_send_ptr(raw, value.cast()) };
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let channel = unsafe { channel_from_raw(raw) }.unwrap();
     let initiator = with_global_for_test(|s| s.spawn_parked_placeholder());
     let live = with_global_for_test(|s| s.spawn_parked_placeholder());
@@ -181,6 +209,8 @@ fn deferred_job_roots_channel_and_value_after_initiator_cancellation() {
     drop(root);
     crate::gc::willow_gc_collect();
     let (_, _, frame) = deferred::jobs_for_test()[0];
+    // SAFETY: The scheduler pairs this poll with its live deferred-job frame. Frame slots are
+    // word-aligned by allocation and ABI stride.
     let raw = unsafe {
         frame
             .cast::<u8>()
@@ -188,9 +218,13 @@ fn deferred_job_roots_channel_and_value_after_initiator_cancellation() {
             .cast::<*mut c_void>()
             .read()
     };
+    // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
     let channel = unsafe { channel_from_raw(raw) }.unwrap();
+    // SAFETY: The channel element ABI supplies the initialized union representation read by this
+    // operation.
     let value = unsafe { channel.state.lock().unwrap().values[0].ptr_value };
     assert_eq!(
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         unsafe { crate::string::willow_string_as_str(value.cast()) },
         "deferred channel GC child"
     );
@@ -215,10 +249,16 @@ fn deferred_cleanup_scales_with_cases_and_restarts_after_quiescence() {
                 .map(|_| willow_channel_new_bounded(0, 1))
                 .collect();
             for &raw in &channels {
-                willow_channel_send_i64(raw, 1);
+                // SAFETY: The constructor selected this channel element representation and
+                // the channel remains live during the send.
+                unsafe { willow_channel_send_i64(raw, 1) };
                 crate::scheduler::with_current_task_for_test(owner, || {
-                    assert_eq!(willow_channel_recv_ready(raw), 1)
+                    // SAFETY: The handle is null or the live channel retained for this
+                    // operation.
+                    assert_eq!(unsafe { willow_channel_recv_ready(raw) }, 1)
                 });
+                // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC
+                // storage.
                 let mut state = unsafe { channel_from_raw(raw) }
                     .unwrap()
                     .state
@@ -231,7 +271,9 @@ fn deferred_cleanup_scales_with_cases_and_restarts_after_quiescence() {
             let before = CHANNEL_WAITER_VISITS.load(Relaxed);
             crate::scheduler::with_current_task_for_test(owner, || {
                 for &raw in &channels {
-                    willow_channel_select_cleanup(raw, std::ptr::null_mut(), -1);
+                    // SAFETY: The handle is null or the live channel retained for this
+                    // operation.
+                    unsafe { willow_channel_select_cleanup(raw, std::ptr::null_mut(), -1) };
                 }
             });
             assert_eq!(CHANNEL_WAITER_VISITS.load(Relaxed) - before, cases);
@@ -242,6 +284,7 @@ fn deferred_cleanup_scales_with_cases_and_restarts_after_quiescence() {
             let raw = channels[0];
             let live = with_global_for_test(|s| s.spawn_parked_placeholder());
             let cancelled = with_global_for_test(|s| s.spawn_parked_placeholder());
+            // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
             let channel = unsafe { channel_from_raw(raw) }.unwrap();
             {
                 let mut state = channel.state.lock().unwrap();
@@ -264,7 +307,8 @@ fn deferred_cleanup_scales_with_cases_and_restarts_after_quiescence() {
             crate::scheduler::willow_sched_cancel(cancelled);
             // Closing during deferred compensation must not strand remaining
             // waiters or resurrect the cancelled recipient.
-            willow_channel_close(raw);
+            // SAFETY: The handle is null or the live channel retained for this operation.
+            unsafe { willow_channel_close(raw) };
             crate::scheduler::willow_sched_run_until(cancelled);
             drain_jobs();
             with_global_for_test(|s| {
@@ -292,6 +336,7 @@ fn deferred_fragmented_fifo_has_bounded_physical_unlink_and_receive_work() {
         for waiters in [33usize, 1_024, 4_096] {
             reset();
             let raw = willow_channel_new_bounded(0, 1);
+            // SAFETY: The channel constructor places WillowAbiChannel in word-aligned GC storage.
             let channel = unsafe { channel_from_raw(raw) }.unwrap();
             {
                 let mut state = channel.state.lock().unwrap();
@@ -312,9 +357,12 @@ fn deferred_fragmented_fifo_has_bounded_physical_unlink_and_receive_work() {
             }
             let mut maximum = 0;
             for _ in 0..messages {
-                assert_eq!(willow_channel_try_send_i64(raw, 1), 1);
+                // SAFETY: The constructor selected this channel element representation and
+                // the channel remains live during the send.
+                assert_eq!(unsafe { willow_channel_try_send_i64(raw, 1) }, 1);
                 let before = channel.state.lock().unwrap().send_waiters.link_visits.get();
-                assert_eq!(willow_channel_recv_i64(raw), 1);
+                // SAFETY: The handle is null or the live channel retained for this operation.
+                assert_eq!(unsafe { willow_channel_recv_i64(raw) }, 1);
                 let visits = channel.state.lock().unwrap().send_waiters.link_visits.get() - before;
                 maximum = maximum.max(visits);
                 assert!(visits <= 2, "one head and at most one next link");

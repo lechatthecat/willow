@@ -87,7 +87,9 @@ fn private_mutator_retirement_forgets_only_its_tlab_records() {
                 let mut tlab = GcTlabState::new();
                 let registration = MutatorRegistration::new_in(runtime);
                 let address = &raw mut tlab as usize;
-                let object = tlab_alloc_slow_in(runtime, address, 0, 0, 8, 0);
+                // SAFETY: This mutator keeps its initialized TLAB at this address until
+                // registration ends and uses its runtime’s allocation layout.
+                let object = unsafe { tlab_alloc_slow_in(runtime, address, 0, 0, 8, 0) };
                 assert!(!object.is_null());
                 assert_ne!(tlab.cursor.load(Ordering::Acquire), 0);
                 ready.wait();
@@ -116,7 +118,9 @@ fn private_old_buffers_and_large_allocations_use_their_own_heap_and_phase() {
         for runtime in [&first, &second] {
             let _registration = MutatorRegistration::new_in(runtime);
             for size in [8, 24, GC_TLAB_MAX_OBJECT_SIZE + 8] {
-                let payload = allocate_old_in(runtime, 0, 0, size as i64, 0);
+                // SAFETY: This fixture selects the payload size and tracing layout for its
+                // object and initializes any native fields before collection.
+                let payload = unsafe { allocate_old_in(runtime, 0, 0, size as i64, 0) };
                 assert!(!payload.is_null());
                 let state = runtime.gc.heap.lock().unwrap();
                 let region_index = state.old_addresses.candidate(payload as usize).unwrap();
@@ -151,7 +155,10 @@ fn private_stressed_refills_collect_and_allocate_in_the_selected_runtime() {
         let registration = MutatorRegistration::new_in(runtime);
         let mut retained = std::ptr::null_mut();
         for size in [8, 24, 64] {
-            let payload = tlab_alloc_slow_in(runtime, &raw mut tlab as usize, 0, 0, size, 0);
+            // SAFETY: This mutator keeps its initialized TLAB at this address until
+            // registration ends and uses its runtime’s allocation layout.
+            let payload =
+                unsafe { tlab_alloc_slow_in(runtime, &raw mut tlab as usize, 0, 0, size, 0) };
             assert!(!payload.is_null());
             root::add_task_frame_root_in(runtime, payload);
             root::remove_runtime_root_in(runtime, retained);
@@ -172,28 +179,37 @@ fn private_stressed_refills_collect_and_allocate_in_the_selected_runtime() {
 #[test]
 fn private_runtime_drop_finalizes_indexed_buffered_and_young_native_owners() {
     unsafe fn release(payload: *mut u8) {
+        // SAFETY: the loop below writes a distinct Box<Arc<AtomicUsize>> via
+        // Box::into_raw into each object's aligned pointer slot. Runtime teardown
+        // finalizes each owning object once, returning its box to this callback.
         let counter = unsafe { Box::from_raw(payload.cast::<*mut Arc<AtomicUsize>>().read()) };
         counter.fetch_add(1, Ordering::Relaxed);
     }
     let first_count = Arc::new(AtomicUsize::new(0));
     let second_count = Arc::new(AtomicUsize::new(0));
     for count in [&first_count, &second_count] {
+        let mut tlab = GcTlabState::new();
         let runtime = owner();
         runtime.gc.drop_registry.lock().unwrap().insert(17, release);
-        let mut tlab = GcTlabState::new();
-        let young = tlab_alloc_slow_in(&runtime, &raw mut tlab as usize, 0, 17, 8, 0);
-        runtime.gc.old_lab_policy.store(false, Ordering::Release);
-        let indexed = allocate_old_in(&runtime, 0, 17, 8, 0);
-        runtime.gc.old_lab_policy.store(true, Ordering::Release);
-        let buffered = allocate_old_in(&runtime, 0, 17, 8, 0);
-        for payload in [young, indexed, buffered] {
+        let initialize = |payload: *mut u8| {
             assert!(!payload.is_null());
+            // SAFETY: Each allocation below has a fresh aligned pointer slot. Transfer
+            // one Box to the registered finalizer before making the next allocation.
             unsafe {
                 payload
                     .cast::<*mut Arc<AtomicUsize>>()
                     .write(Box::into_raw(Box::new(Arc::clone(count))))
             };
-        }
+        };
+        // SAFETY: The private runtime owns this ID. The mutator's initialized TLAB
+        // stays at the same address until the runtime is destroyed.
+        initialize(unsafe { tlab_alloc_slow_in(&runtime, &raw mut tlab as usize, 0, 17, 8, 0) });
+        runtime.gc.old_lab_policy.store(false, Ordering::Release);
+        // SAFETY: The ID selects release, and initialize supplies its Box immediately.
+        initialize(unsafe { allocate_old_in(&runtime, 0, 17, 8, 0) });
+        runtime.gc.old_lab_policy.store(true, Ordering::Release);
+        // SAFETY: The buffered object has the same pointer slot and ownership protocol.
+        initialize(unsafe { allocate_old_in(&runtime, 0, 17, 8, 0) });
         // No collection or registration retirement is needed to destroy the
         // runtime. In particular the buffered object's region index is absent.
         assert_eq!(count.load(Ordering::Relaxed), 0);
@@ -216,7 +232,9 @@ fn private_old_buffer_registration_lookups_scale_with_refills_not_peer_count() {
                     let (runtime, ready, release) = (&runtime, &ready, &release);
                     scope.spawn(crate::runtime::serving(move || {
                         let _registration = MutatorRegistration::new_in(runtime);
-                        assert!(!allocate_old_in(runtime, 0, 0, 8, 0).is_null());
+                        // SAFETY: This fixture selects the payload size and tracing layout
+                        // for its object and initializes any native fields before collection.
+                        assert!(!unsafe { allocate_old_in(runtime, 0, 0, 8, 0) }.is_null());
                         ready.wait();
                         release.wait();
                     }));
@@ -226,13 +244,17 @@ fn private_old_buffer_registration_lookups_scale_with_refills_not_peer_count() {
                 let before = runtime.gc.path_observation.old_lab_lookups();
                 for _ in 0..allocations {
                     assert!(
-                        !allocate_old_in(
-                            &runtime,
-                            0,
-                            0,
-                            (GC_TLAB_MAX_OBJECT_SIZE - GC_HEADER_SIZE) as i64,
-                            0,
-                        )
+                        // SAFETY: This fixture selects the payload size and tracing layout
+                        // for its object and initializes any native fields before collection.
+                        !unsafe {
+                            allocate_old_in(
+                                &runtime,
+                                0,
+                                0,
+                                (GC_TLAB_MAX_OBJECT_SIZE - GC_HEADER_SIZE) as i64,
+                                0,
+                            )
+                        }
                         .is_null()
                     );
                 }
@@ -322,6 +344,8 @@ fn private_idle_mutator_publishes_to_selected_registry() {
     let id = std::thread::current().id();
     {
         // No managed state is touched while the idle guard is held.
+        // SAFETY: This thread stops accessing movable data before entering idle and resumes only
+        // after rejoining the mutators.
         let _idle = unsafe { IdleMutator::enter_in(&runtime) };
         let coord = runtime.gc.coord.0.lock().unwrap();
         assert!(coord.parked.contains(&id));

@@ -39,6 +39,8 @@ impl<S: NativeFrameSpec> NativeTaskFrame<S> {
         // SAFETY: allocation contains the fixed async header, and the slot
         // count word is part of that header.
         unsafe {
+            // SAFETY: The frame allocator word-aligns the base. The validated slot layout places
+            // this word at a multiple of its alignment.
             *((raw as *mut u8)
                 .add(crate::async_frame::ASYNC_FRAME_SLOT_COUNT_OFFSET)
                 .cast::<i64>()) = i64::from(layout.slot_count());
@@ -52,7 +54,9 @@ impl<S: NativeFrameSpec> NativeTaskFrame<S> {
     /// View a raw pointer passed to a poll/cancel callback.
     ///
     /// # Safety
-    /// `raw` must be a live frame allocated using `S::LAYOUT`.
+    /// `raw` must remain a live native async frame while this view is used.
+    /// For a frame allocated with a different layout, the caller must restrict
+    /// accesses to slots with the same offset and kind in both layouts.
     pub unsafe fn from_raw(raw: *mut c_void) -> Self {
         debug_assert!(!raw.is_null(), "{} frame is null", S::NAME);
         Self {
@@ -83,6 +87,8 @@ impl<S: NativeFrameSpec> NativeTaskFrame<S> {
 
     unsafe fn slot<T>(&self, slot: usize) -> *mut T {
         let offset = S::LAYOUT.slot_offset(slot as u32, std::mem::size_of::<usize>() as u32);
+        // SAFETY: The frame allocator word-aligns the base. The validated slot layout places this
+        // word at a multiple of its alignment.
         unsafe { (self.raw as *mut u8).add(offset as usize).cast::<T>() }
     }
 
@@ -106,12 +112,16 @@ impl<S: NativeFrameSpec> NativeTaskFrame<S> {
 
     pub fn store_gc(&self, slot: usize, value: *mut u8) {
         self.check(slot, SlotKind::GcRef);
-        willow_gc_write_barrier(
-            self.raw.cast::<u8>(),
-            self.load_gc(slot),
-            value,
-            GcStoreDestination::AsyncFrameSlot as i64,
-        );
+        // SAFETY: The checked frame layout identifies this reference slot. The destination
+        // asserts no header bits.
+        unsafe {
+            willow_gc_write_barrier(
+                self.raw.cast::<u8>(),
+                self.load_gc(slot),
+                value,
+                GcStoreDestination::AsyncFrameSlot as i64,
+            )
+        };
         // SAFETY: checked slot is a GC reference in this live frame.
         unsafe { crate::gc::store_gc_reference(self.slot::<*mut u8>(slot), value) };
     }
@@ -151,9 +161,13 @@ mod tests {
     #[test]
     fn typed_native_frame_initializes_layout_and_round_trips_slot_kinds() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let frame = NativeTaskFrame::<TestFrame>::allocate().expect("frame allocation");
         assert_eq!(
+            // SAFETY: The frame allocator word-aligns the base. The validated slot layout places
+            // this word at a multiple of its alignment.
             unsafe {
                 *((frame.as_raw() as *mut u8)
                     .add(crate::async_frame::ASYNC_FRAME_SLOT_COUNT_OFFSET)
@@ -168,15 +182,20 @@ mod tests {
         assert_eq!(frame.load_native::<u64>(2), boxed);
         assert_eq!(frame.take_native::<u64>(2), boxed);
         assert!(frame.load_native::<u64>(2).is_null());
+        // SAFETY: The slot transferred the unique pointer originally produced by Box::into_raw.
         unsafe { drop(Box::from_raw(boxed)) };
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
     }
 
     #[test]
     #[should_panic(expected = "accessed as Word")]
     fn typed_native_frame_rejects_slot_kind_confusion() {
         let _guard = isolated_runtime();
-        reset_internal_for_test();
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
         let frame = NativeTaskFrame::<TestFrame>::allocate().expect("frame allocation");
         frame.store_word(0, 1);
     }

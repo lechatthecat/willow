@@ -740,13 +740,18 @@ mod tests {
         let other = RuntimeTask::new(2);
         assert_ne!(task.preempt_flag_ptr(), other.preempt_flag_ptr());
 
-        crate::preempt::willow_preempt_request(task.preempt_flag_ptr());
+        // SAFETY: The live task owns this address-stable AtomicBool through the operation.
+        unsafe { crate::preempt::willow_preempt_request(task.preempt_flag_ptr()) };
         assert_eq!(
-            crate::preempt::willow_preempt_requested(task.preempt_flag_ptr()),
+            // SAFETY: The live task owns this address-stable AtomicBool through the
+            // operation.
+            unsafe { crate::preempt::willow_preempt_requested(task.preempt_flag_ptr()) },
             1
         );
         assert_eq!(
-            crate::preempt::willow_preempt_requested(other.preempt_flag_ptr()),
+            // SAFETY: The live task owns this address-stable AtomicBool through the
+            // operation.
+            unsafe { crate::preempt::willow_preempt_requested(other.preempt_flag_ptr()) },
             0
         );
     }
@@ -985,9 +990,12 @@ mod footprint {
             table.insert(id, RuntimeTask::new(id));
         }
         assert_eq!(table[&1].preempt_flag_ptr(), flag, "F24: rehash keeps it");
-        crate::preempt::willow_preempt_request(flag);
+        // SAFETY: The live task owns this address-stable AtomicBool through the operation.
+        unsafe { crate::preempt::willow_preempt_request(flag) };
         assert_eq!(
-            crate::preempt::willow_preempt_requested(table[&1].preempt_flag_ptr()),
+            // SAFETY: The live task owns this address-stable AtomicBool through the
+            // operation.
+            unsafe { crate::preempt::willow_preempt_requested(table[&1].preempt_flag_ptr()) },
             1
         );
     }

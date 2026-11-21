@@ -5,6 +5,7 @@ static CALLBACK_TRACES: crate::runtime::PerRuntime<AtomicU64> =
 unsafe fn reference_callback(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     CALLBACK_TRACES.fetch_add(1, Ordering::Relaxed);
     slots.push(payload.cast());
+    // SAFETY: The fixture allocates these fields in word-aligned GC storage at whole-word offsets.
     slots.push(unsafe { payload.add(GC_STORAGE_WORD_BYTES) }.cast());
 }
 
@@ -18,6 +19,7 @@ unsafe fn reference_slice(
     let end = cursor.saturating_add(limit).min(2);
     for index in cursor..end {
         children
+            // SAFETY: The live object's trace layout reserves these aligned pointer slots.
             .push(unsafe { load_gc_reference(payload.add(index * GC_STORAGE_WORD_BYTES).cast()) });
     }
     if end < 2 {
@@ -48,19 +50,31 @@ fn m0_all_destination_barriers_publish_deletions_in_open_and_sealed_marking() {
     ];
     for phase in [1, 2] {
         for destination in destinations {
-            reset_internal_for_test();
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal_for_test() };
             let mut old = willow_alloc(8);
-            willow_push_root(&mut old);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut old) };
             let mut new = willow_alloc(8);
-            willow_push_root(&mut new);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut new) };
             let mut owner = willow_alloc_typed(24, 2);
-            willow_push_root(&mut owner);
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut owner) };
             let mut global = old;
             let slot = if destination == GcStoreDestination::GlobalStatic {
                 &mut global as *mut *mut u8
             } else {
+                // SAFETY: The fixture allocates these fields in word-aligned GC storage at
+                // whole-word offsets.
                 unsafe { owner.add(GC_STORAGE_WORD_BYTES) }.cast::<*mut u8>()
             };
+            // SAFETY: The fixture allocates these fields in word-aligned GC storage at whole-word
+            // offsets.
             unsafe {
                 slot.write(old);
             }
@@ -75,12 +89,18 @@ fn m0_all_destination_barriers_publish_deletions_in_open_and_sealed_marking() {
                 crate::runtime::current()
                     .mark_phase()
                     .store(phase, Ordering::Release);
-                willow_gc_write_barrier(
-                    owner_or_slot,
-                    old,
-                    new,
-                    destination as i64 | willow_abi::GC_STORE_VALUE_HAS_HEADER,
-                );
+                // SAFETY: The store uses its heap fixture’s objects for proven payloads and
+                // the addressed element for a slot-specific barrier.
+                unsafe {
+                    willow_gc_write_barrier(
+                        owner_or_slot,
+                        old,
+                        new,
+                        destination as i64 | willow_abi::GC_STORE_VALUE_HAS_HEADER,
+                    )
+                };
+                // SAFETY: The fixture allocates these fields in word-aligned GC storage at
+                // whole-word offsets.
                 unsafe {
                     slot.write(new);
                 }
@@ -91,23 +111,33 @@ fn m0_all_destination_barriers_publish_deletions_in_open_and_sealed_marking() {
                 1,
                 "{destination:?} phase={phase}"
             );
+            // SAFETY: The fixture allocates these fields in word-aligned GC storage at whole-word
+            // offsets.
             assert_eq!(unsafe { slot.read() }, new);
-            willow_pop_roots(3);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their
+            // slot storage is still live.
+            unsafe { willow_pop_roots(3) };
         }
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn m0_measurement_pending_reclaimed_reusable_and_phase_samples_are_distinct() {
     let _guard = isolated_runtime();
     let _normal = GcStressTestScope::normal();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
     let payload = GC_OLD_REGION_SIZE / 16;
     let dead_count = GC_OLD_REGION_SIZE / (payload + GC_HEADER_SIZE) + 2;
     let mut root = willow_alloc(payload as i64);
-    willow_push_root(&mut root);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut root) };
     for _ in 0..dead_count {
         willow_alloc(payload as i64);
     }
@@ -160,9 +190,13 @@ fn m0_measurement_pending_reclaimed_reusable_and_phase_samples_are_distinct() {
     let size = crate::gc_telemetry::willow_gc_stats_size(3);
     let mut bytes = vec![0; size as usize];
     assert_eq!(
-        crate::gc_telemetry::willow_gc_stats_snapshot(3, bytes.as_mut_ptr(), size),
+        // SAFETY: The backing buffer covers the selected record on success; rejected requests
+        // write nothing.
+        unsafe { crate::gc_telemetry::willow_gc_stats_snapshot(3, bytes.as_mut_ptr(), size) },
         size
     );
+    // SAFETY: The byte buffer contains the full stats record. read_unaligned accepts its byte
+    // alignment.
     let stats = unsafe {
         bytes
             .as_ptr()
@@ -175,14 +209,20 @@ fn m0_measurement_pending_reclaimed_reusable_and_phase_samples_are_distinct() {
         stats.frames.task_frames_running,
         crate::frame_lifetime::snapshot().task_frames_running
     );
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn m0_milestones_are_distinct_during_real_sweep_and_election_skip() {
     let _guard = isolated_runtime();
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     struct RestoreHook;
     impl Drop for RestoreHook {
         fn drop(&mut self) {
@@ -217,7 +257,9 @@ fn m0_milestones_are_distinct_during_real_sweep_and_election_skip() {
     let elected = cycle_wait::CollectorGuard::try_acquire().unwrap();
     assert!(crate::gc_telemetry::milestones::request_gc_for_test().is_none());
     drop(elected);
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 fn reachable(edges: &[Vec<usize>], roots: &[usize]) -> (Vec<bool>, usize) {
@@ -259,13 +301,19 @@ fn m0_differential_reference_tracer_randomized_heaps() {
     for shape in 0..4 {
         for count in [1, 8, 32, 128] {
             for round in 0..8 {
-                reset_internal_for_test();
+                // SAFETY: The test controls its isolated runtime at this reset boundary; no
+                // other mutator or subsequent access relies on the discarded heap.
+                unsafe { reset_internal_for_test() };
                 const CALLBACK_TYPE: u32 = 0x70701;
-                willow_register_type_capability(
-                    CALLBACK_TYPE,
-                    reference_callback,
-                    NativeTraceCapability::SliceConcurrentSafe(reference_slice),
-                );
+                // SAFETY: The fixture controls every instance of this ID and installs the
+                // matching stopped tracer and synchronized snapshot capability, if present.
+                unsafe {
+                    willow_register_type_capability(
+                        CALLBACK_TYPE,
+                        reference_callback,
+                        NativeTraceCapability::SliceConcurrentSafe(reference_slice),
+                    )
+                };
                 crate::gc_telemetry::failure_record::reproduction(
                     SEED,
                     ((shape as u64) << 48) | ((count as u64) << 16) | round,
@@ -287,10 +335,14 @@ fn m0_differential_reference_tracer_randomized_heaps() {
                         _ => (3, vec![]),
                     };
                     let node = if layout == 4 {
-                        willow_alloc_object(
-                            CALLBACK_TYPE as i64,
-                            (words * GC_STORAGE_WORD_BYTES) as i64,
-                        )
+                        // SAFETY: The requested layout describes the initialized words of
+                        // this object and its type’s tracing or finalization contract.
+                        unsafe {
+                            willow_alloc_object(
+                                CALLBACK_TYPE as i64,
+                                (words * GC_STORAGE_WORD_BYTES) as i64,
+                            )
+                        }
                     } else if words == 66 {
                         let bytes = words * GC_STORAGE_WORD_BYTES;
                         let id = willow_abi::gc_bitmap_layout_id(
@@ -298,17 +350,23 @@ fn m0_differential_reference_tracer_randomized_heaps() {
                             0,
                             willow_abi::gc_bitmap_fingerprint(&BITMAP[1..]),
                         );
-                        willow_gc_alloc_bitmap(id as i64, bytes as i64, BITMAP.as_ptr())
+                        // SAFETY: The immutable count-prefixed tracing bitmap covers the
+                        // requested payload and outlives its GC users.
+                        unsafe { willow_gc_alloc_bitmap(id as i64, bytes as i64, BITMAP.as_ptr()) }
                     } else {
                         let mask = refs.iter().fold(0, |mask, &slot| mask | (1u64 << slot));
                         willow_alloc_typed((words * GC_STORAGE_WORD_BYTES) as i64, mask)
                     };
+                    // SAFETY: The test owns the allocated span for the full stated length during
+                    // this byte access.
                     unsafe {
                         std::ptr::write_bytes(node, 0, words * GC_STORAGE_WORD_BYTES);
                     }
                     slots.push(refs);
                     nodes.push(node);
-                    willow_push_root(nodes.last_mut().unwrap());
+                    // SAFETY: Capacity was reserved for every push. The last element is initialized
+                    // and its address stays valid until all of these roots are popped.
+                    unsafe { willow_push_root(nodes.as_mut_ptr().add(nodes.len() - 1)) };
                 }
                 let calls_before = telemetry_heap_snapshot().0.barrier_calls;
                 for (index, refs) in slots.iter().enumerate() {
@@ -321,13 +379,19 @@ fn m0_differential_reference_tracer_randomized_heaps() {
                             _ => continue,
                         };
                         edges[index].push(child);
-                        willow_gc_write_barrier(
-                            nodes[index],
-                            std::ptr::null_mut(),
-                            nodes[child],
-                            GcStoreDestination::ObjectField as i64
-                                | willow_abi::GC_STORE_VALUE_HAS_HEADER,
-                        );
+                        // SAFETY: The store uses its heap fixture’s objects for proven
+                        // payloads and the addressed element for a slot-specific barrier.
+                        unsafe {
+                            willow_gc_write_barrier(
+                                nodes[index],
+                                std::ptr::null_mut(),
+                                nodes[child],
+                                GcStoreDestination::ObjectField as i64
+                                    | willow_abi::GC_STORE_VALUE_HAS_HEADER,
+                            )
+                        };
+                        // SAFETY: The fixture allocates these fields in word-aligned GC storage at
+                        // whole-word offsets.
                         unsafe {
                             nodes[index]
                                 .add(slot * GC_STORAGE_WORD_BYTES)
@@ -336,6 +400,8 @@ fn m0_differential_reference_tracer_randomized_heaps() {
                         }
                     }
                     // A valid pointer in a scalar slot must not become an edge.
+                    // SAFETY: The fixture allocates these fields in word-aligned GC storage at
+                    // whole-word offsets.
                     unsafe {
                         nodes[index]
                             .add(2 * GC_STORAGE_WORD_BYTES)
@@ -348,7 +414,9 @@ fn m0_differential_reference_tracer_randomized_heaps() {
                     edges.iter().map(Vec::len).sum::<usize>() as u64
                 );
                 for _ in 0..count {
-                    willow_pop_root();
+                    // SAFETY: The removed shadow-stack entries belong to this operation and
+                    // their slot storage is still live.
+                    unsafe { willow_pop_root() };
                 }
                 let root_indices: Vec<_> = if round == 0 {
                     vec![]
@@ -359,7 +427,9 @@ fn m0_differential_reference_tracer_randomized_heaps() {
                 assert!(inspections <= edges.iter().map(Vec::len).sum());
                 let mut roots: Vec<_> = root_indices.iter().map(|&i| nodes[i]).collect();
                 for root in &mut roots {
-                    willow_push_root(root);
+                    // SAFETY: The slot storage stays live and stationary through the matching
+                    // pop, including during collection.
+                    unsafe { willow_push_root(root) };
                 }
                 let callback_before = CALLBACK_TRACES.load(Ordering::Relaxed);
                 let ticket = crate::gc_telemetry::milestones::request_gc_for_test().unwrap();
@@ -393,12 +463,16 @@ fn m0_differential_reference_tracer_randomized_heaps() {
                     );
                 }
                 for _ in &roots {
-                    willow_pop_root();
+                    // SAFETY: The removed shadow-stack entries belong to this operation and
+                    // their slot storage is still live.
+                    unsafe { willow_pop_root() };
                 }
             }
         }
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]

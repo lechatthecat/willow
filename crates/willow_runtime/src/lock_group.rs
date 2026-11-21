@@ -41,25 +41,37 @@ impl Entry {
 
     fn acquire(&mut self) -> i32 {
         if self.mode == 0 {
-            willow_async_mutex_acquire(self.raw(), &mut self.token)
+            // SAFETY: The entry root retains the lock selected by mode and owns its token
+            // slot from acquisition through release.
+            unsafe { willow_async_mutex_acquire(self.raw(), &mut self.token) }
         } else {
-            willow_async_rwlock_acquire(self.raw(), self.mode, &mut self.token)
+            // SAFETY: The entry root retains the lock selected by mode and owns its token
+            // slot from acquisition through release.
+            unsafe { willow_async_rwlock_acquire(self.raw(), self.mode, &mut self.token) }
         }
     }
 
     fn poll(&self) -> i32 {
         if self.mode == 0 {
-            willow_async_mutex_poll(self.raw(), self.token)
+            // SAFETY: The entry root retains the lock selected by mode and owns its token
+            // slot from acquisition through release.
+            unsafe { willow_async_mutex_poll(self.raw(), self.token) }
         } else {
-            willow_async_rwlock_poll(self.raw(), self.token)
+            // SAFETY: The entry root retains the lock selected by mode and owns its token
+            // slot from acquisition through release.
+            unsafe { willow_async_rwlock_poll(self.raw(), self.token) }
         }
     }
 
     fn release(&self) -> i32 {
         if self.mode == 0 {
-            willow_async_mutex_release(self.raw(), self.token)
+            // SAFETY: The entry root retains the lock selected by mode and owns its token
+            // slot from acquisition through release.
+            unsafe { willow_async_mutex_release(self.raw(), self.token) }
         } else {
-            willow_async_rwlock_release(self.raw(), self.token)
+            // SAFETY: The entry root retains the lock selected by mode and owns its token
+            // slot from acquisition through release.
+            unsafe { willow_async_rwlock_release(self.raw(), self.token) }
         }
     }
 }
@@ -200,10 +212,16 @@ pub extern "C" fn willow_lock_group_new() -> *mut c_void {
 }
 
 /// Add a live, rooted lock before acquisition. Mode: mutex=0, read=1, write=2.
+///
+/// # Safety
+/// A non-null group must be a live Box from willow_lock_group_new, exclusively owned by the
+/// calling task. Never reuse it after successful release or cancellation. The handle must be
+/// a live async mutex for mode zero or a live async read/write lock for read/write mode.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_lock_group_add(group: *mut c_void, handle: *mut c_void, mode: i32) {
+pub unsafe extern "C" fn willow_lock_group_add(group: *mut c_void, handle: *mut c_void, mode: i32) {
     let _guard = NoPreemptGuard::enter();
+    // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until cleanup.
     let Some(group) = (unsafe { group.cast::<LockGroup>().as_mut() }) else {
         crate::panic_context::fatal_invariant("null simultaneous-lock group during construction");
     };
@@ -212,8 +230,12 @@ pub extern "C" fn willow_lock_group_add(group: *mut c_void, handle: *mut c_void,
     }
     // The compiler proves the target's type and supplies the matching mode.
     let id = if mode == 0 {
+        // SAFETY: The handle kind selects the matching lock type placed in word-aligned GC storage
+        // by its constructor.
         unsafe { &*handle.cast::<AsyncMutex>() }.lock_id()
     } else {
+        // SAFETY: The handle kind selects the matching lock type placed in word-aligned GC storage
+        // by its constructor.
         unsafe { &*handle.cast::<AsyncRwLock>() }.lock_id()
     };
     group.entries.push(Entry {
@@ -225,11 +247,16 @@ pub extern "C" fn willow_lock_group_add(group: *mut c_void, handle: *mut c_void,
     });
 }
 
+/// # Safety
+/// A non-null group must be a live Box from willow_lock_group_new, exclusively owned by the
+/// calling task. Never reuse it after successful release or cancellation. A non-null
+/// out_token must exclusively address one writable aligned i64 disjoint from the group.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_lock_group_acquire(group: *mut c_void, out_token: *mut i64) -> i32 {
+pub unsafe extern "C" fn willow_lock_group_acquire(group: *mut c_void, out_token: *mut i64) -> i32 {
     let _guard = NoPreemptGuard::enter();
     let (Some(group), Some(task)) = (
+        // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until cleanup.
         unsafe { group.cast::<LockGroup>().as_mut() },
         crate::scheduler::current_task(),
     ) else {
@@ -240,15 +267,20 @@ pub extern "C" fn willow_lock_group_acquire(group: *mut c_void, out_token: *mut 
     }
     group.owner = Some(task);
     if !out_token.is_null() {
+        // SAFETY: The ABI caller provides a live, aligned, writable output slot for this result.
         unsafe { *out_token = group.generation };
     }
     group.drive()
 }
 
+/// # Safety
+/// A non-null group must be a live Box from willow_lock_group_new, exclusively owned by the
+/// calling task. Never reuse it after successful release or cancellation.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_lock_group_poll(group: *mut c_void, token: i64) -> i32 {
+pub unsafe extern "C" fn willow_lock_group_poll(group: *mut c_void, token: i64) -> i32 {
     let _guard = NoPreemptGuard::enter();
+    // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until cleanup.
     let Some(group) = (unsafe { group.cast::<LockGroup>().as_mut() }) else {
         return MUTEX_STATUS_LOST;
     };
@@ -258,10 +290,14 @@ pub extern "C" fn willow_lock_group_poll(group: *mut c_void, token: i64) -> i32 
     group.drive()
 }
 
+/// # Safety
+/// A non-null group must be a live Box from willow_lock_group_new, exclusively owned by the
+/// calling task. Never reuse it after successful release or cancellation.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_lock_group_load(group: *mut c_void, index: i64) -> i64 {
+pub unsafe extern "C" fn willow_lock_group_load(group: *mut c_void, index: i64) -> i64 {
     let _guard = NoPreemptGuard::enter();
+    // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until cleanup.
     let Some(group) = (unsafe { group.cast::<LockGroup>().as_ref() }) else {
         return 0;
     };
@@ -275,16 +311,29 @@ pub extern "C" fn willow_lock_group_load(group: *mut c_void, index: i64) -> i64 
         return 0;
     };
     if entry.mode == 0 {
-        willow_async_mutex_load(entry.raw(), entry.token)
+        // SAFETY: The entry root retains the lock selected by mode and owns its token slot
+        // from acquisition through release.
+        unsafe { willow_async_mutex_load(entry.raw(), entry.token) }
     } else {
-        willow_async_rwlock_load(entry.raw(), entry.token)
+        // SAFETY: The entry root retains the lock selected by mode and owns its token slot
+        // from acquisition through release.
+        unsafe { willow_async_rwlock_load(entry.raw(), entry.token) }
     }
 }
 
+/// # Safety
+/// A non-null group must be a live Box from willow_lock_group_new, exclusively owned by the
+/// calling task. Never reuse it after successful release or cancellation. The value must
+/// match the selected lock, including a live current payload or null for a reference value.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_lock_group_commit(group: *mut c_void, index: i64, value: i64) -> i32 {
+pub unsafe extern "C" fn willow_lock_group_commit(
+    group: *mut c_void,
+    index: i64,
+    value: i64,
+) -> i32 {
     let _guard = NoPreemptGuard::enter();
+    // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until cleanup.
     let Some(group) = (unsafe { group.cast::<LockGroup>().as_ref() }) else {
         return 0;
     };
@@ -298,23 +347,33 @@ pub extern "C" fn willow_lock_group_commit(group: *mut c_void, index: i64, value
         return 0;
     };
     match entry.mode {
-        0 => willow_async_mutex_commit(entry.raw(), entry.token, value),
-        2 => willow_async_rwlock_commit(entry.raw(), entry.token, value),
+        // SAFETY: The entry root retains the lock selected by mode and owns its token slot
+        // from acquisition through release.
+        0 => unsafe { willow_async_mutex_commit(entry.raw(), entry.token, value) },
+        // SAFETY: The entry root retains the lock selected by mode and owns its token slot
+        // from acquisition through release.
+        2 => unsafe { willow_async_rwlock_commit(entry.raw(), entry.token, value) },
         _ => 0,
     }
 }
 
 /// Release in reverse acquisition order and retire the native group.
+///
+/// # Safety
+/// A non-null group must be a live Box from willow_lock_group_new, exclusively owned by the
+/// calling task. Never reuse it after successful release or cancellation.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_lock_group_release(group: *mut c_void, token: i64) -> i32 {
+pub unsafe extern "C" fn willow_lock_group_release(group: *mut c_void, token: i64) -> i32 {
     let _guard = NoPreemptGuard::enter();
+    // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until cleanup.
     let Some(borrowed) = (unsafe { group.cast::<LockGroup>().as_ref() }) else {
         return 0;
     };
     if !borrowed.is_owner() || borrowed.generation != token {
         return 0;
     }
+    // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until cleanup.
     let mut group = unsafe { Box::from_raw(group.cast::<LockGroup>()) };
     group.cleanup();
     1
@@ -322,10 +381,15 @@ pub extern "C" fn willow_lock_group_release(group: *mut c_void, token: i64) -> i
 
 /// Cancel a partial acquisition or release a held group, then retire it.
 /// The caller first commits initialized protected bindings, if any.
+///
+/// # Safety
+/// A non-null group must be a live Box from willow_lock_group_new, exclusively owned by the
+/// calling task. Never reuse it after successful release or cancellation.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_lock_group_cancel(group: *mut c_void) {
+pub unsafe extern "C" fn willow_lock_group_cancel(group: *mut c_void) {
     let _guard = NoPreemptGuard::enter();
+    // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until cleanup.
     let Some(borrowed) = (unsafe { group.cast::<LockGroup>().as_ref() }) else {
         return;
     };
@@ -333,6 +397,7 @@ pub extern "C" fn willow_lock_group_cancel(group: *mut c_void) {
     if borrowed.owner.is_some() && !borrowed.is_owner() {
         return;
     }
+    // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until cleanup.
     let mut group = unsafe { Box::from_raw(group.cast::<LockGroup>()) };
     group.cleanup();
 }
@@ -350,11 +415,13 @@ mod tests {
     }
 
     fn mutex(value: i64) -> GcRootHandle {
-        GcRootHandle::new(willow_async_mutex_new(value, 0).cast())
+        // SAFETY: The initial word matches the constructor’s reference flag.
+        GcRootHandle::new(unsafe { willow_async_mutex_new(value, 0) }.cast())
     }
 
     fn rwlock(value: i64) -> GcRootHandle {
-        GcRootHandle::new(willow_async_rwlock_new(value, 0).cast())
+        // SAFETY: The initial word matches the constructor’s reference flag.
+        GcRootHandle::new(unsafe { willow_async_rwlock_new(value, 0) }.cast())
     }
 
     #[test]
@@ -367,17 +434,31 @@ mod tests {
         with_current_task_for_test(task(), || {
             let raw = willow_lock_group_new();
             for handle in [&c, &a, &b] {
-                willow_lock_group_add(raw, handle.load().cast(), 0);
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_add(raw, handle.load().cast(), 0) };
             }
             let mut token = 0;
             assert_eq!(
-                willow_lock_group_acquire(raw, &mut token),
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_acquire(raw, &mut token) },
                 MUTEX_STATUS_ACQUIRED
             );
-            assert_eq!(willow_lock_group_load(raw, 0), 30);
-            assert_eq!(willow_lock_group_load(raw, 1), 10);
-            assert_eq!(willow_lock_group_load(raw, 2), 20);
-            assert_eq!(willow_lock_group_commit(raw, 1, 42), 1);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_load(raw, 0) }, 30);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_load(raw, 1) }, 10);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_load(raw, 2) }, 20);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_commit(raw, 1, 42) }, 1);
+            // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until
+            // cleanup.
             let group = unsafe { &mut *raw.cast::<LockGroup>() };
             assert_eq!(group.order, [1, 2, 0]);
             let expected = group
@@ -388,14 +469,28 @@ mod tests {
                 .collect::<Vec<_>>();
             group.cleanup();
             assert_eq!(group.released, expected);
-            assert_eq!(willow_lock_group_release(raw, token), 1);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_release(raw, token) }, 1);
             let mut acquired = 0;
             assert_eq!(
-                willow_async_mutex_acquire(a.load().cast(), &mut acquired),
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_acquire(a.load().cast(), &mut acquired) },
                 MUTEX_STATUS_ACQUIRED
             );
-            assert_eq!(willow_async_mutex_load(a.load().cast(), acquired), 42);
-            assert_eq!(willow_async_mutex_release(a.load().cast(), acquired), 1);
+            assert_eq!(
+                // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+                // disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_load(a.load().cast(), acquired) },
+                42
+            );
+            assert_eq!(
+                // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+                // disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_release(a.load().cast(), acquired) },
+                1
+            );
         });
     }
 
@@ -408,15 +503,25 @@ mod tests {
         with_current_task_for_test(task(), || {
             let raw = willow_lock_group_new();
             for handle in [&a, &b, &b] {
-                willow_lock_group_add(raw, handle.load().cast(), 0);
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_add(raw, handle.load().cast(), 0) };
             }
             let mut token = 0;
             assert_eq!(
-                willow_lock_group_acquire(raw, &mut token),
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_acquire(raw, &mut token) },
                 MUTEX_STATUS_RECURSIVE
             );
+            // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until
+            // cleanup.
             assert!(unsafe { &*raw.cast::<LockGroup>() }.acquired.is_empty());
-            willow_lock_group_cancel(raw);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            unsafe { willow_lock_group_cancel(raw) };
+            // SAFETY: The handle kind selects the matching lock type placed in word-aligned GC
+            // storage by its constructor.
             assert!(unsafe { &*a.load().cast::<AsyncMutex>() }.owner().is_none());
         });
     }
@@ -430,18 +535,32 @@ mod tests {
         let c = rwlock(30);
         with_current_task_for_test(task(), || {
             let raw = willow_lock_group_new();
-            willow_lock_group_add(raw, c.load().cast(), 2);
-            willow_lock_group_add(raw, a.load().cast(), 0);
-            willow_lock_group_add(raw, b.load().cast(), 1);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            unsafe {
+                willow_lock_group_add(raw, c.load().cast(), 2);
+                willow_lock_group_add(raw, a.load().cast(), 0);
+                willow_lock_group_add(raw, b.load().cast(), 1);
+            }
             let mut token = 0;
             assert_eq!(
-                willow_lock_group_acquire(raw, &mut token),
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_acquire(raw, &mut token) },
                 MUTEX_STATUS_ACQUIRED
             );
-            assert_eq!(willow_lock_group_load(raw, 2), 20);
-            assert_eq!(willow_lock_group_commit(raw, 2, 99), 0);
-            assert_eq!(willow_lock_group_commit(raw, 0, 99), 1);
-            assert_eq!(willow_lock_group_release(raw, token), 1);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_load(raw, 2) }, 20);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_commit(raw, 2, 99) }, 0);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_commit(raw, 0, 99) }, 1);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_release(raw, token) }, 1);
         });
     }
 
@@ -452,13 +571,21 @@ mod tests {
         let a = rwlock(10);
         with_current_task_for_test(task(), || {
             let raw = willow_lock_group_new();
-            willow_lock_group_add(raw, a.load().cast(), 1);
-            willow_lock_group_add(raw, a.load().cast(), 1);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            unsafe {
+                willow_lock_group_add(raw, a.load().cast(), 1);
+                willow_lock_group_add(raw, a.load().cast(), 1);
+            }
             assert_eq!(
-                willow_lock_group_acquire(raw, std::ptr::null_mut()),
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_acquire(raw, std::ptr::null_mut()) },
                 MUTEX_STATUS_RECURSIVE
             );
-            willow_lock_group_cancel(raw);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            unsafe { willow_lock_group_cancel(raw) };
         });
     }
 
@@ -473,28 +600,54 @@ mod tests {
         let mut held = 0;
         with_current_task_for_test(owner, || {
             assert_eq!(
-                willow_async_mutex_acquire(b.load().cast(), &mut held),
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_acquire(b.load().cast(), &mut held) },
                 MUTEX_STATUS_ACQUIRED
             );
         });
         with_current_task_for_test(waiter, || {
             let raw = willow_lock_group_new();
-            willow_lock_group_add(raw, b.load().cast(), 0);
-            willow_lock_group_add(raw, a.load().cast(), 0);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            unsafe {
+                willow_lock_group_add(raw, b.load().cast(), 0);
+                willow_lock_group_add(raw, a.load().cast(), 0);
+            }
             let mut token = 0;
             assert_eq!(
-                willow_lock_group_acquire(raw, &mut token),
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_acquire(raw, &mut token) },
                 MUTEX_STATUS_PENDING
             );
+            // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until
+            // cleanup.
             assert!(unsafe { &*raw.cast::<LockGroup>() }.acquired.is_empty());
+            // SAFETY: The handle kind selects the matching lock type placed in word-aligned GC
+            // storage by its constructor.
             assert!(unsafe { &*a.load().cast::<AsyncMutex>() }.owner().is_none());
-            assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_PENDING);
-            willow_lock_group_cancel(raw);
+            assert_eq!(
+                // SAFETY: The task owns this live group through cleanup. Its entries retain the
+                // matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_poll(raw, token) },
+                MUTEX_STATUS_PENDING
+            );
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            unsafe { willow_lock_group_cancel(raw) };
             assert!(crate::lock_wait::lock_wait_link_of(waiter).is_none());
+            // SAFETY: The handle kind selects the matching lock type placed in word-aligned GC
+            // storage by its constructor.
             assert!(unsafe { &*a.load().cast::<AsyncMutex>() }.owner().is_none());
         });
         with_current_task_for_test(owner, || {
-            assert_eq!(willow_async_mutex_release(b.load().cast(), held), 1);
+            assert_eq!(
+                // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+                // disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_release(b.load().cast(), held) },
+                1
+            );
         });
     }
 
@@ -511,31 +664,53 @@ mod tests {
         let mut token = 0;
         let raw = willow_lock_group_new();
         for handle in [&c, &b, &a] {
-            willow_lock_group_add(raw, handle.load().cast(), 0);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            unsafe { willow_lock_group_add(raw, handle.load().cast(), 0) };
         }
         with_current_task_for_test(owner, || {
             assert_eq!(
-                willow_async_mutex_acquire(b.load().cast(), &mut held),
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_acquire(b.load().cast(), &mut held) },
                 MUTEX_STATUS_ACQUIRED
             );
         });
         with_current_task_for_test(waiter, || {
             assert_eq!(
-                willow_lock_group_acquire(raw, &mut token),
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_acquire(raw, &mut token) },
                 MUTEX_STATUS_PENDING
             );
             assert_eq!(
-                willow_lock_group_poll(raw, token.wrapping_add(1)),
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_poll(raw, token.wrapping_add(1)) },
                 MUTEX_STATUS_LOST
             );
         });
         with_current_task_for_test(owner, || {
-            assert_eq!(willow_async_mutex_release(b.load().cast(), held), 1);
+            assert_eq!(
+                // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+                // disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_release(b.load().cast(), held) },
+                1
+            );
         });
         with_current_task_for_test(waiter, || {
-            assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_ACQUIRED);
-            assert_eq!(willow_lock_group_load(raw, 0), 30);
-            assert_eq!(willow_lock_group_release(raw, token), 1);
+            assert_eq!(
+                // SAFETY: The task owns this live group through cleanup. Its entries retain the
+                // matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_poll(raw, token) },
+                MUTEX_STATUS_ACQUIRED
+            );
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_load(raw, 0) }, 30);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_release(raw, token) }, 1);
         });
     }
 
@@ -550,36 +725,55 @@ mod tests {
         let mut held = 0;
         let mut successor_token = 0;
         let raw = willow_lock_group_new();
-        willow_lock_group_add(raw, a.load().cast(), 0);
+        // SAFETY: The task owns this live group through cleanup. Its entries retain the
+        // matching lock types and any token output is a local word.
+        unsafe { willow_lock_group_add(raw, a.load().cast(), 0) };
         with_current_task_for_test(owner, || {
             assert_eq!(
-                willow_async_mutex_acquire(a.load().cast(), &mut held),
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_acquire(a.load().cast(), &mut held) },
                 MUTEX_STATUS_ACQUIRED
             );
         });
         with_current_task_for_test(waiter, || {
             assert_eq!(
-                willow_lock_group_acquire(raw, std::ptr::null_mut()),
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_acquire(raw, std::ptr::null_mut()) },
                 MUTEX_STATUS_PENDING
             );
         });
         with_current_task_for_test(successor, || {
             assert_eq!(
-                willow_async_mutex_acquire(a.load().cast(), &mut successor_token),
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_acquire(a.load().cast(), &mut successor_token) },
                 MUTEX_STATUS_PENDING
             );
         });
         with_current_task_for_test(owner, || {
-            assert_eq!(willow_async_mutex_release(a.load().cast(), held), 1);
+            assert_eq!(
+                // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+                // disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_release(a.load().cast(), held) },
+                1
+            );
         });
-        with_current_task_for_test(waiter, || willow_lock_group_cancel(raw));
+        // SAFETY: The task owns this live group through cleanup. Its entries retain the
+        // matching lock types and any token output is a local word.
+        with_current_task_for_test(waiter, || unsafe { willow_lock_group_cancel(raw) });
         with_current_task_for_test(successor, || {
             assert_eq!(
-                willow_async_mutex_poll(a.load().cast(), successor_token),
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_poll(a.load().cast(), successor_token) },
                 MUTEX_STATUS_ACQUIRED
             );
             assert_eq!(
-                willow_async_mutex_release(a.load().cast(), successor_token),
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_release(a.load().cast(), successor_token) },
                 1
             );
         });
@@ -600,41 +794,65 @@ mod tests {
             let mut successor_token = 0;
             let raw = willow_lock_group_new();
             for handle in &locks {
-                willow_lock_group_add(raw, handle.load().cast(), 0);
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_add(raw, handle.load().cast(), 0) };
             }
             with_current_task_for_test(owner, || {
                 assert_eq!(
-                    willow_async_mutex_acquire(lock, &mut held),
+                    // SAFETY: The handle comes from the matching lock constructor. Any output
+                    // borrows disjoint local word storage for this operation.
+                    unsafe { willow_async_mutex_acquire(lock, &mut held) },
                     MUTEX_STATUS_ACQUIRED
                 );
             });
             with_current_task_for_test(grouped, || {
                 assert_eq!(
-                    willow_lock_group_acquire(raw, &mut token),
+                    // SAFETY: The task owns this live group through cleanup. Its entries
+                    // retain the matching lock types and any token output is a local word.
+                    unsafe { willow_lock_group_acquire(raw, &mut token) },
                     MUTEX_STATUS_PENDING
                 );
             });
             with_current_task_for_test(successor, || {
                 assert_eq!(
-                    willow_async_mutex_acquire(lock, &mut successor_token),
+                    // SAFETY: The handle comes from the matching lock constructor. Any output
+                    // borrows disjoint local word storage for this operation.
+                    unsafe { willow_async_mutex_acquire(lock, &mut successor_token) },
                     MUTEX_STATUS_PENDING
                 );
             });
             with_current_task_for_test(owner, || {
-                assert_eq!(willow_async_mutex_release(lock, held), 1);
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                assert_eq!(unsafe { willow_async_mutex_release(lock, held) }, 1);
             });
             // Giving the handoff back would pass the lock to the successor and
             // requeue the group behind it, for as long as waiters keep coming.
             with_current_task_for_test(grouped, || {
-                assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_ACQUIRED);
-                assert_eq!(willow_lock_group_release(raw, token), 1);
+                assert_eq!(
+                    // SAFETY: The task owns this live group through cleanup. Its entries retain
+                    // the matching lock types and any token output is a local word.
+                    unsafe { willow_lock_group_poll(raw, token) },
+                    MUTEX_STATUS_ACQUIRED
+                );
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                assert_eq!(unsafe { willow_lock_group_release(raw, token) }, 1);
             });
             with_current_task_for_test(successor, || {
                 assert_eq!(
-                    willow_async_mutex_poll(lock, successor_token),
+                    // SAFETY: The handle comes from the matching lock constructor. Any output
+                    // borrows disjoint local word storage for this operation.
+                    unsafe { willow_async_mutex_poll(lock, successor_token) },
                     MUTEX_STATUS_ACQUIRED
                 );
-                assert_eq!(willow_async_mutex_release(lock, successor_token), 1);
+                assert_eq!(
+                    // SAFETY: The handle comes from the matching lock constructor. Any output
+                    // borrows disjoint local word storage for this operation.
+                    unsafe { willow_async_mutex_release(lock, successor_token) },
+                    1
+                );
             });
         }
     }
@@ -655,47 +873,75 @@ mod tests {
             let mut token = 0;
             let raw = willow_lock_group_new();
             for handle in &locks {
-                willow_lock_group_add(raw, handle.load().cast(), 0);
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_add(raw, handle.load().cast(), 0) };
             }
             with_current_task_for_test(owner, || {
                 assert_eq!(
-                    willow_async_mutex_acquire(contended, &mut held),
+                    // SAFETY: The handle comes from the matching lock constructor. Any output
+                    // borrows disjoint local word storage for this operation.
+                    unsafe { willow_async_mutex_acquire(contended, &mut held) },
                     MUTEX_STATUS_ACQUIRED
                 );
             });
             with_current_task_for_test(grouped, || {
                 assert_eq!(
-                    willow_lock_group_acquire(raw, &mut token),
+                    // SAFETY: The task owns this live group through cleanup. Its entries
+                    // retain the matching lock types and any token output is a local word.
+                    unsafe { willow_lock_group_acquire(raw, &mut token) },
                     MUTEX_STATUS_PENDING
                 );
             });
             with_current_task_for_test(other, || {
                 assert_eq!(
-                    willow_async_mutex_acquire(busy, &mut busy_token),
+                    // SAFETY: The handle comes from the matching lock constructor. Any output
+                    // borrows disjoint local word storage for this operation.
+                    unsafe { willow_async_mutex_acquire(busy, &mut busy_token) },
                     MUTEX_STATUS_ACQUIRED
                 );
             });
             with_current_task_for_test(owner, || {
-                assert_eq!(willow_async_mutex_release(contended, held), 1);
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                assert_eq!(unsafe { willow_async_mutex_release(contended, held) }, 1);
             });
             with_current_task_for_test(grouped, || {
-                assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_PENDING);
+                assert_eq!(
+                    // SAFETY: The task owns this live group through cleanup. Its entries retain
+                    // the matching lock types and any token output is a local word.
+                    unsafe { willow_lock_group_poll(raw, token) },
+                    MUTEX_STATUS_PENDING
+                );
+                // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until
+                // cleanup.
                 let group = unsafe { &*raw.cast::<LockGroup>() };
                 assert!(group.acquired.is_empty());
                 assert!(group.entries.iter().all(|entry| !entry.held));
                 assert_eq!(group.pending, Some(1 - first));
             });
             assert!(
+                // SAFETY: The handle kind selects the matching lock type placed in word-aligned GC
+                // storage by its constructor.
                 unsafe { &*contended.cast::<AsyncMutex>() }
                     .owner()
                     .is_none()
             );
             with_current_task_for_test(other, || {
-                assert_eq!(willow_async_mutex_release(busy, busy_token), 1);
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                assert_eq!(unsafe { willow_async_mutex_release(busy, busy_token) }, 1);
             });
             with_current_task_for_test(grouped, || {
-                assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_ACQUIRED);
-                assert_eq!(willow_lock_group_release(raw, token), 1);
+                assert_eq!(
+                    // SAFETY: The task owns this live group through cleanup. Its entries retain
+                    // the matching lock types and any token output is a local word.
+                    unsafe { willow_lock_group_poll(raw, token) },
+                    MUTEX_STATUS_ACQUIRED
+                );
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                assert_eq!(unsafe { willow_lock_group_release(raw, token) }, 1);
             });
         }
     }
@@ -713,38 +959,70 @@ mod tests {
             let mut held = 0;
             let mut token = 0;
             let raw = willow_lock_group_new();
-            willow_lock_group_add(raw, lock, mode);
-            willow_lock_group_add(raw, other.load().cast(), 0);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            unsafe {
+                willow_lock_group_add(raw, lock, mode);
+                willow_lock_group_add(raw, other.load().cast(), 0);
+            }
             with_current_task_for_test(owner, || {
                 let status = if mode == 0 {
-                    willow_async_mutex_acquire(lock, &mut held)
+                    // SAFETY: The handle comes from the matching lock constructor. Any output
+                    // borrows disjoint local word storage for this operation.
+                    unsafe { willow_async_mutex_acquire(lock, &mut held) }
                 } else {
-                    willow_async_rwlock_acquire(lock, 2, &mut held)
+                    // SAFETY: The handle comes from the matching lock constructor. Any output
+                    // borrows disjoint local word storage for this operation.
+                    unsafe { willow_async_rwlock_acquire(lock, 2, &mut held) }
                 };
                 assert_eq!(status, MUTEX_STATUS_ACQUIRED);
             });
             with_current_task_for_test(grouped, || {
                 assert_eq!(
-                    willow_lock_group_acquire(raw, &mut token),
+                    // SAFETY: The task owns this live group through cleanup. Its entries
+                    // retain the matching lock types and any token output is a local word.
+                    unsafe { willow_lock_group_acquire(raw, &mut token) },
                     MUTEX_STATUS_PENDING
                 );
             });
             with_current_task_for_test(owner, || {
                 let released = if mode == 0 {
-                    willow_async_mutex_release(lock, held)
+                    // SAFETY: The handle comes from the matching lock constructor. Any output
+                    // borrows disjoint local word storage for this operation.
+                    unsafe { willow_async_mutex_release(lock, held) }
                 } else {
-                    willow_async_rwlock_release(lock, held)
+                    // SAFETY: The handle comes from the matching lock constructor. Any output
+                    // borrows disjoint local word storage for this operation.
+                    unsafe { willow_async_rwlock_release(lock, held) }
                 };
                 assert_eq!(released, 1);
             });
             with_current_task_for_test(grouped, || {
-                assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_ACQUIRED);
-                assert_eq!(willow_lock_group_load(raw, 0), 10);
-                assert_eq!(willow_lock_group_load(raw, 1), 20);
+                assert_eq!(
+                    // SAFETY: The task owns this live group through cleanup. Its entries retain
+                    // the matching lock types and any token output is a local word.
+                    unsafe { willow_lock_group_poll(raw, token) },
+                    MUTEX_STATUS_ACQUIRED
+                );
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                assert_eq!(unsafe { willow_lock_group_load(raw, 0) }, 10);
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                assert_eq!(unsafe { willow_lock_group_load(raw, 1) }, 20);
                 let writable = i32::from(mode != 1);
-                assert_eq!(willow_lock_group_commit(raw, 0, 11), writable);
-                assert_eq!(willow_lock_group_load(raw, 0), 10 + i64::from(writable));
-                assert_eq!(willow_lock_group_release(raw, token), 1);
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                assert_eq!(unsafe { willow_lock_group_commit(raw, 0, 11) }, writable);
+                assert_eq!(
+                    // SAFETY: The task owns this live group through cleanup. Its entries retain
+                    // the matching lock types and any token output is a local word.
+                    unsafe { willow_lock_group_load(raw, 0) },
+                    10 + i64::from(writable)
+                );
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                assert_eq!(unsafe { willow_lock_group_release(raw, token) }, 1);
             });
         }
     }
@@ -761,27 +1039,39 @@ mod tests {
         let mut held = 0;
         let mut token = 0;
         let raw = willow_lock_group_new();
-        willow_lock_group_add(raw, low_lock, 0);
-        willow_lock_group_add(raw, high_lock, 0);
+        // SAFETY: The task owns this live group through cleanup. Its entries retain the
+        // matching lock types and any token output is a local word.
+        unsafe {
+            willow_lock_group_add(raw, low_lock, 0);
+            willow_lock_group_add(raw, high_lock, 0);
+        }
         let acquire = |lock, held: &mut i64| {
             with_current_task_for_test(owner, || {
                 assert_eq!(
-                    willow_async_mutex_acquire(lock, held),
+                    // SAFETY: The handle comes from the matching lock constructor. Any output
+                    // borrows disjoint local word storage for this operation.
+                    unsafe { willow_async_mutex_acquire(lock, held) },
                     MUTEX_STATUS_ACQUIRED
                 );
             });
         };
         let release = |lock, held: i64| {
             with_current_task_for_test(owner, || {
-                assert_eq!(willow_async_mutex_release(lock, held), 1);
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                assert_eq!(unsafe { willow_async_mutex_release(lock, held) }, 1);
             });
         };
         acquire(high_lock, &mut held);
         with_current_task_for_test(grouped, || {
             assert_eq!(
-                willow_lock_group_acquire(raw, &mut token),
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_acquire(raw, &mut token) },
                 MUTEX_STATUS_PENDING
             );
+            // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until
+            // cleanup.
             let group = unsafe { &*raw.cast::<LockGroup>() };
             assert_eq!(group.pending, Some(1));
             assert!(!group.restart);
@@ -791,7 +1081,14 @@ mod tests {
         acquire(low_lock, &mut low_held);
         release(high_lock, held);
         with_current_task_for_test(grouped, || {
-            assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_PENDING);
+            assert_eq!(
+                // SAFETY: The task owns this live group through cleanup. Its entries retain the
+                // matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_poll(raw, token) },
+                MUTEX_STATUS_PENDING
+            );
+            // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until
+            // cleanup.
             let group = unsafe { &*raw.cast::<LockGroup>() };
             assert_eq!(group.pending, Some(0));
             assert!(group.restart);
@@ -802,7 +1099,14 @@ mod tests {
         acquire(high_lock, &mut high_held);
         release(low_lock, low_held);
         with_current_task_for_test(grouped, || {
-            assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_PENDING);
+            assert_eq!(
+                // SAFETY: The task owns this live group through cleanup. Its entries retain the
+                // matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_poll(raw, token) },
+                MUTEX_STATUS_PENDING
+            );
+            // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until
+            // cleanup.
             let group = unsafe { &*raw.cast::<LockGroup>() };
             assert_eq!(group.pending, Some(1));
             assert!(group.acquired.is_empty());
@@ -810,8 +1114,15 @@ mod tests {
         });
         release(high_lock, high_held);
         with_current_task_for_test(grouped, || {
-            assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_ACQUIRED);
-            assert_eq!(willow_lock_group_release(raw, token), 1);
+            assert_eq!(
+                // SAFETY: The task owns this live group through cleanup. Its entries retain the
+                // matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_poll(raw, token) },
+                MUTEX_STATUS_ACQUIRED
+            );
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_release(raw, token) }, 1);
         });
     }
 
@@ -828,17 +1139,25 @@ mod tests {
         let mut b_token = 0;
         let mut group_token = 0;
         let raw = willow_lock_group_new();
-        willow_lock_group_add(raw, a.load().cast(), 0);
-        willow_lock_group_add(raw, b.load().cast(), 0);
+        // SAFETY: The task owns this live group through cleanup. Its entries retain the
+        // matching lock types and any token output is a local word.
+        unsafe {
+            willow_lock_group_add(raw, a.load().cast(), 0);
+            willow_lock_group_add(raw, b.load().cast(), 0);
+        }
         with_current_task_for_test(ordinary, || {
             assert_eq!(
-                willow_async_mutex_acquire(a.load().cast(), &mut a_token),
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_acquire(a.load().cast(), &mut a_token) },
                 MUTEX_STATUS_ACQUIRED
             );
         });
         // Pause the group deterministically between its two acquisitions.
         // This is the state another worker can observe during `drive`.
         with_current_task_for_test(grouped, || {
+            // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until
+            // cleanup.
             let group = unsafe { &mut *raw.cast::<LockGroup>() };
             group.prepare();
             group.owner = Some(grouped);
@@ -848,15 +1167,21 @@ mod tests {
         });
         with_current_task_for_test(ordinary, || {
             assert_eq!(
-                willow_async_mutex_acquire(b.load().cast(), &mut b_token),
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_acquire(b.load().cast(), &mut b_token) },
                 MUTEX_STATUS_PENDING
             );
         });
         with_current_task_for_test(grouped, || {
             assert_eq!(
-                willow_lock_group_acquire(raw, &mut group_token),
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_acquire(raw, &mut group_token) },
                 MUTEX_STATUS_PENDING
             );
+            // SAFETY: The task owns this Box<LockGroup> and uses the handle serially until
+            // cleanup.
             let group = unsafe { &*raw.cast::<LockGroup>() };
             assert!(group.acquired.is_empty());
             assert_eq!(group.pending, Some(0));
@@ -865,20 +1190,40 @@ mod tests {
         // the permanent A→B→A wait cycle of a member held while waiting.
         with_current_task_for_test(ordinary, || {
             assert_eq!(
-                willow_async_mutex_poll(b.load().cast(), b_token),
+                // SAFETY: The handle comes from the matching lock constructor. Any output
+                // borrows disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_poll(b.load().cast(), b_token) },
                 MUTEX_STATUS_ACQUIRED
             );
-            assert_eq!(willow_async_mutex_release(b.load().cast(), b_token), 1);
-            assert_eq!(willow_async_mutex_release(a.load().cast(), a_token), 1);
+            assert_eq!(
+                // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+                // disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_release(b.load().cast(), b_token) },
+                1
+            );
+            assert_eq!(
+                // SAFETY: The handle comes from the matching lock constructor. Any output borrows
+                // disjoint local word storage for this operation.
+                unsafe { willow_async_mutex_release(a.load().cast(), a_token) },
+                1
+            );
         });
         with_current_task_for_test(grouped, || {
             assert_eq!(
-                willow_lock_group_poll(raw, group_token),
+                // SAFETY: The task owns this live group through cleanup. Its entries retain
+                // the matching lock types and any token output is a local word.
+                unsafe { willow_lock_group_poll(raw, group_token) },
                 MUTEX_STATUS_ACQUIRED
             );
-            assert_eq!(willow_lock_group_load(raw, 0), 10);
-            assert_eq!(willow_lock_group_load(raw, 1), 20);
-            assert_eq!(willow_lock_group_release(raw, group_token), 1);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_load(raw, 0) }, 10);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_load(raw, 1) }, 20);
+            // SAFETY: The task owns this live group through cleanup. Its entries retain the
+            // matching lock types and any token output is a local word.
+            assert_eq!(unsafe { willow_lock_group_release(raw, group_token) }, 1);
         });
     }
 }

@@ -1,34 +1,25 @@
 // Included only in test bridge crates. Observe the actual input/output Vec
 // allocations, with no production counters or allocator changes.
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-struct ObservedAllocator;
-#[global_allocator]
-static ALLOCATOR: ObservedAllocator = ObservedAllocator;
 static INPUT: AtomicUsize = AtomicUsize::new(0);
 static OUTPUT: AtomicUsize = AtomicUsize::new(0);
 static INPUT_DROPS: AtomicUsize = AtomicUsize::new(0);
 static OUTPUT_DROPS: AtomicUsize = AtomicUsize::new(0);
 
-unsafe impl GlobalAlloc for ObservedAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        for (slot, count, message) in [
-            (&INPUT, &INPUT_DROPS, b"BYTE_INPUT_RELEASED\n".as_slice()),
-            (&OUTPUT, &OUTPUT_DROPS, b"BYTE_OUTPUT_RELEASED\n".as_slice()),
-        ] {
-            if slot.compare_exchange(ptr as usize, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                count.fetch_add(1, Ordering::SeqCst);
-                // A literal write does not allocate. Clear the slot first so
-                // unrelated allocator activity cannot be mistaken for this Vec.
-                use std::io::Write;
-                let _ = std::io::stderr().write_all(message);
-            }
+#[unsafe(no_mangle)]
+pub extern "C" fn observe_bridge_deallocation(ptr: *mut u8) {
+    for (slot, count, message) in [
+        (&INPUT, &INPUT_DROPS, b"BYTE_INPUT_RELEASED\n".as_slice()),
+        (&OUTPUT, &OUTPUT_DROPS, b"BYTE_OUTPUT_RELEASED\n".as_slice()),
+    ] {
+        if slot.compare_exchange(ptr as usize, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            count.fetch_add(1, Ordering::SeqCst);
+            // A literal write does not allocate. Clear the slot first so
+            // unrelated allocator activity cannot be mistaken for this Vec.
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(message);
         }
-        unsafe { System.dealloc(ptr, layout) }
     }
 }
 

@@ -7,7 +7,9 @@ use crate::gc::*;
 use willow_abi::array_layout::{BUFFER_HEADER_WORDS, H_BUF};
 
 fn quiet_heap() {
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
     let mut state = runtime().heap.lock().unwrap();
     state.threshold_bytes = usize::MAX;
     state.pacer_trigger = u64::MAX;
@@ -25,6 +27,7 @@ fn minor() -> crate::gc_telemetry::MarkWork {
 }
 
 fn buffer_of(array: *mut u8) -> usize {
+    // SAFETY: The fixture allocates these fields in word-aligned GC storage at whole-word offsets.
     unsafe { *array.cast::<usize>().add(H_BUF) }
 }
 
@@ -32,23 +35,32 @@ fn slot_of(buffer: usize, index: usize) -> *mut u8 {
     (buffer + (BUFFER_HEADER_WORDS + index) * GC_STORAGE_WORD_BYTES) as *mut u8
 }
 
-fn young(tls: &mut GcTlabState, value: u64) -> *mut u8 {
-    let object = willow_gc_alloc_slow(tls, 1, 0, 8, 0);
+fn young(tls: &TestTlab, value: u64) -> *mut u8 {
+    // SAFETY: The fixture owns the stable TLAB through unregistration. The requested size and
+    // tracing metadata describe the object initialized here.
+    let object = unsafe { willow_gc_alloc_slow(tls.as_ptr(), 1, 0, 8, 0) };
+    // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
     unsafe { *object.cast::<u64>() = value };
     object
 }
 
 fn element_value(array: *mut u8, index: i64) -> u64 {
-    let child = willow_array_get(array, index) as *const u64;
+    // SAFETY: The calling card test supplies its rooted reference array and a populated
+    // index.
+    let child = unsafe { willow_array_get(array, index) } as *const u64;
     assert!(!child.is_null());
+    // SAFETY: The test retains this nonempty allocation and accesses a byte within its requested
+    // size.
     unsafe { *child }
 }
 
 fn remembered_flag(buffer: usize) -> u8 {
+    // SAFETY: The current GC payload follows its aligned header; its owner keeps it live here.
     unsafe { (*payload_to_header(buffer as *mut u8)).remembered }
 }
 
 fn generation(object: usize) -> u8 {
+    // SAFETY: The current GC payload follows its aligned header; its owner keeps it live here.
     unsafe { (*payload_to_header(object as *mut u8)).generation }
 }
 
@@ -92,7 +104,9 @@ fn card_threshold_selects_only_large_reference_buffers() {
     let object =
         HeapObject::from_payload(GcPayload::from_raw(buffer_of(scalar) as *mut u8).unwrap());
     assert!(card_array_capacity(object).is_none());
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -102,16 +116,20 @@ fn minor_card_slots_stay_flat_as_old_array_grows() {
     for len in [1024usize, 16_384, 262_144] {
         quiet_heap();
         let mut array = new_old_array(len as i64, 1);
-        willow_push_root(&mut array);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut array) };
         let buffer = buffer_of(array);
         assert_eq!(generation(buffer), GC_GENERATION_OLD);
-        let mut tls = tlab_state_for_test();
+        let tls = tlab_state_for_test();
         let indices = [0usize, len / 2, len - 1];
         let calls_before = runtime()
             .write_barrier_calls
             .load(std::sync::atomic::Ordering::Relaxed);
         for (n, &index) in indices.iter().enumerate() {
-            willow_array_set(array, index as i64, young(&mut tls, 100 + n as u64) as i64);
+            // SAFETY: The fixture retains the array and stores a word matching its element
+            // layout.
+            unsafe { willow_array_set(array, index as i64, young(&tls, 100 + n as u64) as i64) };
         }
         // Every young store reaches the barrier (no whole-owner flag), but
         // the owner enters the remembered set once.
@@ -150,11 +168,14 @@ fn minor_card_slots_stay_flat_as_old_array_grows() {
         assert_eq!(minor().remembered_card_slots, 0);
         for (n, &index) in indices.iter().enumerate() {
             assert_eq!(element_value(array, index as i64), 100 + n as u64);
-            let child = willow_array_get(array, index as i64) as usize;
+            // SAFETY: The fixture retains the array allocated for these accesses.
+            let child = unsafe { willow_array_get(array, index as i64) } as usize;
             assert_eq!(generation(child), GC_GENERATION_OLD);
         }
         table.push((len, 3 * ARRAY_CARD_SLOTS, minors));
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
     }
     for (len, slots, minors) in &table {
         eprintln!(
@@ -162,7 +183,9 @@ fn minor_card_slots_stay_flat_as_old_array_grows() {
         );
     }
     assert!(table.iter().all(|row| row.1 == table[0].1));
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -170,17 +193,23 @@ fn small_reference_buffers_keep_whole_owner_remembering() {
     let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(ARRAY_CARD_SLOTS as i64, 1);
-    willow_push_root(&mut array);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut array) };
     let buffer = buffer_of(array);
-    let mut tls = tlab_state_for_test();
-    willow_array_set(array, 3, young(&mut tls, 7) as i64);
+    let tls = tlab_state_for_test();
+    // SAFETY: The destination is the live fixture array; the element word matches its
+    // declared storage and tracing layout.
+    unsafe { willow_array_set(array, 3, young(&tls, 7) as i64) };
     assert_eq!(remembered_flag(buffer), 1);
     assert!(recorded_cards(buffer).is_none());
     assert_eq!(willow_gc_remembered_set_size(), 1);
     let calls = runtime()
         .write_barrier_calls
         .load(std::sync::atomic::Ordering::Relaxed);
-    willow_array_set(array, 4, young(&mut tls, 8) as i64);
+    // SAFETY: The destination is the live fixture array; the element word matches its
+    // declared storage and tracing layout.
+    unsafe { willow_array_set(array, 4, young(&tls, 8) as i64) };
     assert_eq!(
         runtime()
             .write_barrier_calls
@@ -193,8 +222,12 @@ fn small_reference_buffers_keep_whole_owner_remembering() {
     assert_eq!(element_value(array, 3), 7);
     assert_eq!(element_value(array, 4), 8);
     verify().unwrap();
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -202,16 +235,22 @@ fn repeated_stores_into_one_card_record_it_once() {
     let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
-    willow_push_root(&mut array);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut array) };
     let buffer = buffer_of(array);
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     for index in 0..ARRAY_CARD_SLOTS {
-        willow_array_set(array, index as i64, young(&mut tls, index as u64) as i64);
+        // SAFETY: The fixture retains the array and stores a word matching its element
+        // layout.
+        unsafe { willow_array_set(array, index as i64, young(&tls, index as u64) as i64) };
     }
     assert_eq!(recorded_cards(buffer).unwrap(), vec![0]);
     assert_eq!(hits(), 1);
     // Another card of the same owner adds a card, not an owner.
-    willow_array_set(array, ARRAY_CARD_SLOTS as i64, young(&mut tls, 99) as i64);
+    // SAFETY: The destination is the live fixture array; the element word matches its
+    // declared storage and tracing layout.
+    unsafe { willow_array_set(array, ARRAY_CARD_SLOTS as i64, young(&tls, 99) as i64) };
     assert_eq!(recorded_cards(buffer).unwrap(), vec![0, 1]);
     assert_eq!(hits(), 1);
     assert_eq!(minor().remembered_card_slots, (2 * ARRAY_CARD_SLOTS) as u64);
@@ -219,8 +258,12 @@ fn repeated_stores_into_one_card_record_it_once() {
         assert_eq!(element_value(array, index as i64), index as u64);
     }
     assert_eq!(element_value(array, ARRAY_CARD_SLOTS as i64), 99);
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -228,38 +271,55 @@ fn barrier_dedup_cache_does_not_survive_a_minor_that_dropped_the_card() {
     let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
-    willow_push_root(&mut array);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut array) };
     let buffer = buffer_of(array);
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let old_value = willow_alloc_typed(8, 0);
-    willow_array_set(array, 5, young(&mut tls, 1) as i64);
+    // SAFETY: The destination is the live fixture array; the element word matches its
+    // declared storage and tracing layout.
+    unsafe { willow_array_set(array, 5, young(&tls, 1) as i64) };
     // The young child is overwritten by an old value; the minor finds no
     // young child in card 0 and forgets it.
-    willow_array_set(array, 5, old_value as i64);
+    // SAFETY: The destination is the live fixture array; the element word matches its
+    // declared storage and tracing layout.
+    unsafe { willow_array_set(array, 5, old_value as i64) };
     minor();
     assert!(recorded_cards(buffer).is_none());
     assert_eq!(willow_gc_remembered_set_size(), 0);
     // This thread cached (buffer, card 0) before the minor. The new epoch
     // must force the store back to the locked path.
-    willow_array_set(array, 6, young(&mut tls, 66) as i64);
+    // SAFETY: The destination is the live fixture array; the element word matches its
+    // declared storage and tracing layout.
+    unsafe { willow_array_set(array, 6, young(&tls, 66) as i64) };
     assert_eq!(recorded_cards(buffer).unwrap(), vec![0]);
     verify().unwrap();
     minor();
     assert_eq!(element_value(array, 6), 66);
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
 fn growth_into_large_old_buffer_records_every_young_card() {
     let _guard = isolated_runtime();
     quiet_heap();
-    let mut array = crate::array::willow_array_new(0, 1);
-    willow_push_root(&mut array);
-    let mut tls = tlab_state_for_test();
+    // SAFETY: Flag 1 allocates full-width reference slots.
+    let mut array = unsafe { crate::array::willow_array_new(0, 1) };
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut array) };
+    let tls = tlab_state_for_test();
     let count = 1000usize;
     for index in 0..count {
-        willow_array_push(array, young(&mut tls, index as u64) as i64);
+        // SAFETY: The fixture retains the array and stores a word matching its element
+        // layout.
+        unsafe { willow_array_push(array, young(&tls, index as u64) as i64) };
     }
     let buffer = buffer_of(array);
     assert_eq!(generation(buffer), GC_GENERATION_OLD);
@@ -278,8 +338,12 @@ fn growth_into_large_old_buffer_records_every_young_card() {
         assert_eq!(element_value(array, index as i64), index as u64);
     }
     verify().unwrap();
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -287,14 +351,19 @@ fn slotless_barrier_remembers_whole_buffer_until_minor_converts_it() {
     let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
-    willow_push_root(&mut array);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut array) };
     let buffer = buffer_of(array);
-    let mut tls = tlab_state_for_test();
-    let child = young(&mut tls, 41);
+    let tls = tlab_state_for_test();
+    let child = young(&tls, 41);
     let flags = GcStoreDestination::ArrayElement as i64
         | willow_abi::GC_STORE_VALUE_HAS_HEADER
         | willow_abi::GC_STORE_OWNER_HAS_HEADER;
-    willow_gc_write_barrier(buffer as *mut u8, std::ptr::null_mut(), child, flags);
+    // SAFETY: The store uses its heap fixture’s objects for proven payloads and the addressed
+    // element for a slot-specific barrier.
+    unsafe { willow_gc_write_barrier(buffer as *mut u8, std::ptr::null_mut(), child, flags) };
+    // SAFETY: The live object's trace layout reserves these aligned pointer slots.
     unsafe { store_gc_reference(slot_of(buffer, 3000).cast(), child) };
     assert_eq!(remembered_flag(buffer), 1);
     assert!(recorded_cards(buffer).is_none());
@@ -310,8 +379,12 @@ fn slotless_barrier_remembers_whole_buffer_until_minor_converts_it() {
     assert_eq!(element_value(array, 3000), 41);
     verify().unwrap();
     assert_eq!(minor().remembered_card_slots, ARRAY_CARD_SLOTS as u64);
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -319,26 +392,37 @@ fn array_barrier_with_foreign_slot_falls_back_to_whole_owner() {
     let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
-    willow_push_root(&mut array);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut array) };
     let buffer = buffer_of(array);
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     let flags = GcStoreDestination::ArrayElement as i64
         | willow_abi::GC_STORE_VALUE_HAS_HEADER
         | willow_abi::GC_STORE_OWNER_HAS_HEADER;
     // The length word and a slot past capacity are not element slots.
     for slot in [buffer as *mut u8, slot_of(buffer, 1 << 20)] {
-        willow_gc_array_write_barrier(
-            buffer as *mut u8,
-            slot,
-            std::ptr::null_mut(),
-            young(&mut tls, 1),
-            flags,
-        );
+        // SAFETY: Both header flags name live GC payloads. The internal classifier examines
+        // the candidate address numerically, including candidates outside the elements.
+        unsafe {
+            barrier::write_barrier_in(
+                crate::runtime::current(),
+                buffer as *mut u8,
+                slot,
+                std::ptr::null_mut(),
+                young(&tls, 1),
+                flags,
+            )
+        };
         assert_eq!(remembered_flag(buffer), 1);
         assert!(recorded_cards(buffer).is_none());
     }
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -346,20 +430,27 @@ fn generated_array_barrier_records_slot_card() {
     let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
-    willow_push_root(&mut array);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut array) };
     let buffer = buffer_of(array);
-    let mut tls = tlab_state_for_test();
-    let child = young(&mut tls, 12);
+    let tls = tlab_state_for_test();
+    let child = young(&tls, 12);
     let slot = slot_of(buffer, 1234);
-    willow_gc_array_write_barrier(
-        buffer as *mut u8,
-        slot,
-        std::ptr::null_mut(),
-        child,
-        GcStoreDestination::ArrayElement as i64
-            | willow_abi::GC_STORE_VALUE_HAS_HEADER
-            | willow_abi::GC_STORE_OWNER_HAS_HEADER,
-    );
+    // SAFETY: The store uses its heap fixture’s objects for proven payloads and the addressed
+    // element for a slot-specific barrier.
+    unsafe {
+        willow_gc_array_write_barrier(
+            buffer as *mut u8,
+            slot,
+            std::ptr::null_mut(),
+            child,
+            GcStoreDestination::ArrayElement as i64
+                | willow_abi::GC_STORE_VALUE_HAS_HEADER
+                | willow_abi::GC_STORE_OWNER_HAS_HEADER,
+        )
+    };
+    // SAFETY: The live object's trace layout reserves these aligned pointer slots.
     unsafe { store_gc_reference(slot.cast(), child) };
     assert_eq!(
         recorded_cards(buffer).unwrap(),
@@ -368,8 +459,12 @@ fn generated_array_barrier_records_slot_card() {
     assert_eq!(remembered_flag(buffer), 0);
     minor();
     assert_eq!(element_value(array, 1234), 12);
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -377,20 +472,30 @@ fn verifier_rejects_young_child_in_unrecorded_card() {
     let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
-    willow_push_root(&mut array);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut array) };
     let buffer = buffer_of(array);
-    let mut tls = tlab_state_for_test();
-    willow_array_set(array, 0, young(&mut tls, 1) as i64);
+    let tls = tlab_state_for_test();
+    // SAFETY: The destination is the live fixture array; the element word matches its
+    // declared storage and tracing layout.
+    unsafe { willow_array_set(array, 0, young(&tls, 1) as i64) };
     verify().unwrap();
     // A store that bypassed the barrier leaves card 3 unrecorded.
-    let stray = young(&mut tls, 2);
+    let stray = young(&tls, 2);
+    // SAFETY: The live object's trace layout reserves these aligned pointer slots.
     unsafe { store_gc_reference(slot_of(buffer, 200).cast(), stray) };
     let error = verify().unwrap_err();
     assert!(error.contains("unrecorded card 3"), "{error}");
+    // SAFETY: The live object's trace layout reserves these aligned pointer slots.
     unsafe { store_gc_reference(slot_of(buffer, 200).cast(), std::ptr::null_mut()) };
     verify().unwrap();
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -398,19 +503,32 @@ fn compiled_array_stores_without_value_header_hit_card_cache() {
     let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
-    willow_push_root(&mut array);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut array) };
     let buffer = buffer_of(array);
-    let mut tls = tlab_state_for_test();
+    let tls = tlab_state_for_test();
     // Generated `xs[i] = v` passes only the owner-header proof.
     let flags = GcStoreDestination::ArrayElement as i64 | willow_abi::GC_STORE_OWNER_HAS_HEADER;
-    let store = |tls: &mut GcTlabState, index: usize, value: u64| {
+    let store = |tls: &TestTlab, index: usize, value: u64| {
         let child = young(tls, value);
         let slot = slot_of(buffer, index);
-        willow_gc_array_write_barrier(buffer as *mut u8, slot, std::ptr::null_mut(), child, flags);
+        // SAFETY: The store uses its heap fixture’s objects for proven payloads and the
+        // addressed element for a slot-specific barrier.
+        unsafe {
+            willow_gc_array_write_barrier(
+                buffer as *mut u8,
+                slot,
+                std::ptr::null_mut(),
+                child,
+                flags,
+            )
+        };
+        // SAFETY: The live object's trace layout reserves these aligned pointer slots.
         unsafe { store_gc_reference(slot.cast(), child) };
     };
     let hits_before = runtime().path_observation.card_cache_hits();
-    store(&mut tls, 2 * ARRAY_CARD_SLOTS, 0);
+    store(&tls, 2 * ARRAY_CARD_SLOTS, 0);
     assert_eq!(
         runtime().path_observation.card_cache_hits(),
         hits_before,
@@ -419,7 +537,7 @@ fn compiled_array_stores_without_value_header_hit_card_cache() {
     assert_eq!(hits(), 1);
     let repeats = ARRAY_CARD_SLOTS - 1;
     for offset in 1..ARRAY_CARD_SLOTS {
-        store(&mut tls, 2 * ARRAY_CARD_SLOTS + offset, offset as u64);
+        store(&tls, 2 * ARRAY_CARD_SLOTS + offset, offset as u64);
     }
     assert_eq!(
         runtime().path_observation.card_cache_hits() - hits_before,
@@ -432,7 +550,7 @@ fn compiled_array_stores_without_value_header_hit_card_cache() {
     // A minor advances the epoch: the next store relocks and re-records.
     minor();
     let after_minor = runtime().path_observation.card_cache_hits();
-    store(&mut tls, 2 * ARRAY_CARD_SLOTS, 99);
+    store(&tls, 2 * ARRAY_CARD_SLOTS, 99);
     assert_eq!(runtime().path_observation.card_cache_hits(), after_minor);
     assert_eq!(recorded_cards(buffer).unwrap(), vec![2]);
     verify().unwrap();
@@ -444,8 +562,12 @@ fn compiled_array_stores_without_value_header_hit_card_cache() {
             offset as u64
         );
     }
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -454,13 +576,17 @@ fn runtime_array_card_filter_counts_cards_instead_of_stores() {
     for count in [64usize, 128, 512, 1024] {
         quiet_heap();
         let mut array = new_old_array(4096, 1);
-        willow_push_root(&mut array);
-        let mut tls = tlab_state_for_test();
-        let child = young(&mut tls, 42);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut array) };
+        let tls = tlab_state_for_test();
+        let child = young(&tls, 42);
         let before = runtime().write_barrier_calls.load(Ordering::Relaxed);
         let cached = runtime().path_observation.card_cache_hits();
         for index in 0..count {
-            willow_array_set(array, index as i64, child as i64);
+            // SAFETY: The destination is the live fixture array; the element word matches its
+            // declared storage and tracing layout.
+            unsafe { willow_array_set(array, index as i64, child as i64) };
         }
         let cards = count.div_ceil(ARRAY_CARD_SLOTS) as u64;
         assert_eq!(
@@ -476,9 +602,13 @@ fn runtime_array_card_filter_counts_cards_instead_of_stores() {
         for index in 0..count {
             assert_eq!(element_value(array, index as i64), 42);
         }
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -486,13 +616,18 @@ fn runtime_cached_card_still_publishes_during_active_marking() {
     let _guard = isolated_runtime();
     quiet_heap();
     let mut array = new_old_array(4096, 1);
-    willow_push_root(&mut array);
-    let mut tls = tlab_state_for_test();
-    let child = young(&mut tls, 42);
-    willow_array_set(array, 0, child as i64);
+    // SAFETY: The initialized slot stays at this address until its registration is popped;
+    // collection may rewrite it there.
+    unsafe { willow_push_root(&raw mut array) };
+    let tls = tlab_state_for_test();
+    let child = young(&tls, 42);
+    // SAFETY: The destination is the live fixture array; the element word matches its
+    // declared storage and tracing layout.
+    unsafe { willow_array_set(array, 0, child as i64) };
     let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
     let before = runtime().write_barrier_calls.load(Ordering::Relaxed);
-    willow_array_set(array, 0, 0);
+    // SAFETY: The fixture retains the array and stores a word matching its element layout.
+    unsafe { willow_array_set(array, 0, 0) };
     assert_eq!(
         runtime().write_barrier_calls.load(Ordering::Relaxed),
         before + 1
@@ -502,9 +637,14 @@ fn runtime_cached_card_still_publishes_during_active_marking() {
         .expect("native array tracing closes concurrently");
     assert!(cycle.is_marked(child as usize));
     sweep::concurrent(plan);
-    assert_eq!(willow_array_get(array, 0), 0);
-    willow_pop_root();
-    reset_internal_for_test();
+    // SAFETY: The fixture retains the array allocated for these accesses.
+    assert_eq!(unsafe { willow_array_get(array, 0) }, 0);
+    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+    // storage is still live.
+    unsafe { willow_pop_root() };
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }
 
 #[test]
@@ -513,14 +653,20 @@ fn reference_array_growth_barriers_scale_with_cards() {
     for count in [512usize, 1024, 2048, 4096] {
         quiet_heap();
         let mut array = new_old_array(count as i64, 1);
-        willow_push_root(&mut array);
-        let mut tls = tlab_state_for_test();
-        let child = young(&mut tls, 42);
+        // SAFETY: The initialized slot stays at this address until its registration is
+        // popped; collection may rewrite it there.
+        unsafe { willow_push_root(&raw mut array) };
+        let tls = tlab_state_for_test();
+        let child = young(&tls, 42);
         for index in 0..count {
-            willow_array_set(array, index as i64, child as i64);
+            // SAFETY: The destination is the live fixture array; the element word matches its
+            // declared storage and tracing layout.
+            unsafe { willow_array_set(array, index as i64, child as i64) };
         }
         let before = runtime().write_barrier_calls.load(Ordering::Relaxed);
-        willow_array_push(array, child as i64);
+        // SAFETY: The destination is the live fixture array; the element word matches its
+        // declared storage and tracing layout.
+        unsafe { willow_array_push(array, child as i64) };
         let calls = runtime().write_barrier_calls.load(Ordering::Relaxed) - before;
         assert!(calls <= count.div_ceil(ARRAY_CARD_SLOTS) as u64 + 2);
         verify().unwrap();
@@ -528,7 +674,11 @@ fn reference_array_growth_barriers_scale_with_cards() {
         for index in 0..=count {
             assert_eq!(element_value(array, index as i64), 42);
         }
-        willow_pop_root();
+        // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+        // storage is still live.
+        unsafe { willow_pop_root() };
     }
-    reset_internal_for_test();
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
 }

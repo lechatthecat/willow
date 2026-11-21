@@ -1,8 +1,6 @@
 use crate::string::willow_string_as_str;
 
-pub fn nil_deref_message(file: *const u8, line: i32, col: i32, context: *const u8) -> String {
-    let file = unsafe { willow_string_as_str(file) };
-    let ctx = unsafe { willow_string_as_str(context) };
+pub fn nil_deref_message(file: &str, line: i32, col: i32, ctx: &str) -> String {
     if ctx.is_empty() {
         format!("runtime panic: nil dereference at {file}:{line}:{col}")
     } else {
@@ -10,21 +8,33 @@ pub fn nil_deref_message(file: *const u8, line: i32, col: i32, context: *const u
     }
 }
 
-pub fn abort_message(file: *const u8, line: i32) -> String {
-    let file = unsafe { willow_string_as_str(file) };
+pub fn abort_message(file: &str, line: i32) -> String {
     format!("panic at {file}:{line}")
 }
 
+/// # Safety
+/// Each non-null string argument must be the current address of a live, word-aligned Willow
+/// String, with its length and UTF-8 bytes initialized and stable while read.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_nil_deref(file: *const u8, line: i32, col: i32, context: *const u8) {
+pub unsafe extern "C" fn willow_nil_deref(
+    file: *const u8,
+    line: i32,
+    col: i32,
+    context: *const u8,
+) {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let ctx = unsafe { willow_string_as_str(context) };
     let message = if ctx.is_empty() {
         "nil dereference".to_string()
     } else {
         format!("nil dereference -- `{ctx}`")
     };
-    crate::panic_context::raise_language_message_at(&message, file, line.into(), col.into());
+    // SAFETY: The optional source file is null or a current Willow string and the panic path
+    // roots its string inputs before allocation.
+    unsafe {
+        crate::panic_context::raise_language_message_at(&message, file, line.into(), col.into())
+    };
 }
 
 /// Print the active async chain if a task is currently running, so
@@ -45,9 +55,14 @@ fn print_async_chain() {
 /// chain (task id + spawn site), then ABORTS THE WHOLE PROGRAM. The
 /// `RuntimeTaskState::Panicked` variant is reserved for a possible future
 /// recoverable policy; nothing sets it under the abort policy.
+///
+/// # Safety
+/// Each non-null string argument must be the current address of a live, word-aligned Willow
+/// String, with its length and UTF-8 bytes initialized and stable while read.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_panic(message: *const u8) {
+pub unsafe extern "C" fn willow_panic(message: *const u8) {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let msg = unsafe { willow_string_as_str(message) };
     eprintln!("runtime panic: {msg}");
     crate::reference_debug::print_current_reference_call_context();
@@ -60,12 +75,21 @@ pub extern "C" fn willow_panic(message: *const u8) {
 /// top-level error report to stderr and exits with a non-zero status.
 /// `message` is a WillowString pointer for `E = String`, or null for other error
 /// types (a generic report is printed).
+///
+/// # Safety
+/// Each non-null string argument must be the current address of a live, word-aligned Willow
+/// String, with its length and UTF-8 bytes initialized and stable while read.
+///
+/// ```compile_fail,E0133
+/// willow_runtime::panic::willow_main_fail(std::ptr::null());
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_main_fail(message: *const u8) {
+pub unsafe extern "C" fn willow_main_fail(message: *const u8) {
     if message.is_null() {
         eprintln!("Error: main returned Err");
     } else {
+        // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
         let msg = unsafe { willow_string_as_str(message) };
         eprintln!("Error: {msg}");
     }
@@ -78,10 +102,16 @@ pub extern "C" fn willow_main_fail(message: *const u8) {
 /// Like [`willow_panic`] but with the source location of the `panic(...)` call
 /// site (debug builds). Prints `runtime panic: <msg> at <file>:<line>:<col>`
 /// then aborts.
+///
+/// # Safety
+/// Each non-null string argument must be the current address of a live, word-aligned Willow
+/// String, with its length and UTF-8 bytes initialized and stable while read.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_panic_at(message: *const u8, file: *const u8, line: i32, col: i32) {
+pub unsafe extern "C" fn willow_panic_at(message: *const u8, file: *const u8, line: i32, col: i32) {
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let msg = unsafe { willow_string_as_str(message) };
+    // SAFETY: The string ABI permits null or a live UTF-8 payload throughout this borrow.
     let file = unsafe { willow_string_as_str(file) };
     eprintln!("runtime panic: {msg} at {file}:{line}:{col}");
     crate::reference_debug::print_current_reference_call_context();
@@ -94,15 +124,23 @@ pub extern "C" fn willow_panic_at(message: *const u8, file: *const u8, line: i32
 /// 0 = division by zero, 1 = MIN / -1 overflow, 2 = remainder by zero,
 /// 3 = MIN % -1 overflow. Bits 8..15 carry a non-i64 signed width;
 /// legacy kinds 0..3 remain i64. `file` is a WillowString pointer.
+///
+/// # Safety
+/// Each non-null string argument must be the current address of a live, word-aligned Willow
+/// String, with its length and UTF-8 bytes initialized and stable while read.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_int_div_panic(kind: i64, file: *const u8, line: i32, col: i32) {
-    crate::panic_context::raise_language_message_at(
-        &int_div_message(kind),
-        file,
-        line.into(),
-        col.into(),
-    );
+pub unsafe extern "C" fn willow_int_div_panic(kind: i64, file: *const u8, line: i32, col: i32) {
+    // SAFETY: The optional source file is null or a current Willow string and the panic path
+    // roots its string inputs before allocation.
+    unsafe {
+        crate::panic_context::raise_language_message_at(
+            &int_div_message(kind),
+            file,
+            line.into(),
+            col.into(),
+        )
+    };
 }
 
 fn int_div_message(kind: i64) -> std::borrow::Cow<'static, str> {
@@ -127,15 +165,28 @@ fn int_div_message(kind: i64) -> std::borrow::Cow<'static, str> {
 /// 0 = `+`, 1 = `-`, 2 = `*`, 3 = unary `-`, 4 = `**`, 5 = `<<` and 6 = `>>`
 /// with an amount outside `0..64`. Release builds wrap
 /// and never call this. `file` is a WillowString pointer.
+///
+/// # Safety
+/// Each non-null string argument must be the current address of a live, word-aligned Willow
+/// String, with its length and UTF-8 bytes initialized and stable while read.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_int_overflow_panic(kind: i64, file: *const u8, line: i32, col: i32) {
-    crate::panic_context::raise_language_message_at(
-        &int_overflow_message(kind),
-        file,
-        line.into(),
-        col.into(),
-    );
+pub unsafe extern "C" fn willow_int_overflow_panic(
+    kind: i64,
+    file: *const u8,
+    line: i32,
+    col: i32,
+) {
+    // SAFETY: The optional source file is null or a current Willow string and the panic path
+    // roots its string inputs before allocation.
+    unsafe {
+        crate::panic_context::raise_language_message_at(
+            &int_overflow_message(kind),
+            file,
+            line.into(),
+            col.into(),
+        )
+    };
 }
 
 fn int_overflow_message(kind: i64) -> std::borrow::Cow<'static, str> {
@@ -168,9 +219,14 @@ fn int_overflow_message(kind: i64) -> std::borrow::Cow<'static, str> {
     .into()
 }
 
+/// # Safety
+/// Each non-null string argument must be the current address of a live, word-aligned Willow
+/// String, with its length and UTF-8 bytes initialized and stable while read.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_abort(file: *const u8, line: i32) {
+pub unsafe extern "C" fn willow_abort(file: *const u8, line: i32) {
+    // SAFETY: The caller keeps the optional source String live through formatting.
+    let file = unsafe { willow_string_as_str(file) };
     eprintln!("{}", abort_message(file, line));
     crate::reference_debug::print_current_reference_call_context();
     crate::stack_trace::print_current_call_stack();
@@ -328,26 +384,16 @@ mod tests {
             "integer overflow: `>>` shift amount outside 0..8"
         );
     }
-    use crate::gc::{isolated_runtime, willow_gc_init};
-    use crate::string::willow_string_alloc;
-
-    fn ws(s: &str) -> *mut u8 {
-        willow_string_alloc(s.as_bytes().as_ptr(), s.len() as i64)
-    }
 
     #[test]
     fn panic_unit_01_nil_deref_message_without_context() {
-        let _guard = isolated_runtime();
-        willow_gc_init();
-        let msg = nil_deref_message(ws("main.wi"), 3, 4, std::ptr::null());
+        let msg = nil_deref_message("main.wi", 3, 4, "");
         assert_eq!(msg, "runtime panic: nil dereference at main.wi:3:4");
     }
 
     #[test]
     fn panic_unit_02_nil_deref_message_with_context() {
-        let _guard = isolated_runtime();
-        willow_gc_init();
-        let msg = nil_deref_message(ws("main.wi"), 3, 4, ws("box.value"));
+        let msg = nil_deref_message("main.wi", 3, 4, "box.value");
         assert_eq!(
             msg,
             "runtime panic: nil dereference at main.wi:3:4 -- `box.value`"
@@ -356,17 +402,19 @@ mod tests {
 
     #[test]
     fn panic_unit_03_abort_message_includes_source_line() {
-        let _guard = isolated_runtime();
-        willow_gc_init();
-        assert_eq!(abort_message(ws("panic.wi"), 9), "panic at panic.wi:9");
+        assert_eq!(abort_message("panic.wi", 9), "panic at panic.wi:9");
     }
 }
 
 /// Contract arithmetic is checked in every build mode. Operation codes are
 /// add, subtract, multiply, divide, remainder, power, negate, left/right shift.
+///
+/// # Safety
+/// Each non-null string argument must be the current address of a live, word-aligned Willow
+/// String, with its length and UTF-8 bytes initialized and stable while read.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_contract_i64(
+pub unsafe extern "C" fn willow_contract_i64(
     op: i64,
     a: i64,
     b: i64,
@@ -383,7 +431,11 @@ pub extern "C" fn willow_contract_i64(
         "contract evaluation error: invalid or overflowing {}{bits} arithmetic",
         if signed { "i" } else { "u" }
     );
-    crate::panic_context::raise_language_message_at(&message, file, line.into(), col.into());
+    // SAFETY: The optional source file is null or a current Willow string and the panic path
+    // roots its string inputs before allocation.
+    unsafe {
+        crate::panic_context::raise_language_message_at(&message, file, line.into(), col.into())
+    };
     0
 }
 
@@ -480,9 +532,12 @@ fn contract_i64(op: i64, a: i64, b: i64) -> Option<i64> {
     }
 }
 
+/// # Safety
+/// Each non-null string argument must be the current address of a live, word-aligned Willow
+/// String, with its length and UTF-8 bytes initialized and stable while read.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_contract_check(
+pub unsafe extern "C" fn willow_contract_check(
     condition: i64,
     post: i64,
     file: *const u8,
@@ -495,6 +550,10 @@ pub extern "C" fn willow_contract_check(
         } else {
             "contract violation: ensures"
         };
-        crate::panic_context::raise_language_message_at(message, file, line.into(), col.into());
+        // SAFETY: The optional source file is null or a current Willow string and the panic
+        // path roots its string inputs before allocation.
+        unsafe {
+            crate::panic_context::raise_language_message_at(message, file, line.into(), col.into())
+        };
     }
 }

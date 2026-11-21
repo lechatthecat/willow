@@ -44,6 +44,8 @@ pub const MUTEX_STATUS_PHASE_ACQUIRE: i32 = willow_abi::LockStatusPhase::Acquire
 pub const MUTEX_STATUS_PHASE_POLL: i32 = willow_abi::LockStatusPhase::Poll as i32;
 
 unsafe fn snapshot_async_mutex(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let value = unsafe { &*(payload as *const AsyncMutex) };
     if value.is_ref {
         children.push(value.value.load(Ordering::Acquire) as *mut u8);
@@ -61,11 +63,15 @@ unsafe fn snapshot_async_mutex_slice(
         "native trace slice requires positive work credit"
     );
     // One atomic reference load is the complete snapshot.
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     unsafe { snapshot_async_mutex(payload, children) };
     crate::gc::TraceSliceProgress::Done
 }
 
 unsafe fn trace_async_mutex(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let mutex = unsafe { &*(payload as *const AsyncMutex) };
     mutex.validated_state();
     if mutex.is_ref && mutex.value.load(Ordering::Acquire) != 0 {
@@ -75,12 +81,16 @@ unsafe fn trace_async_mutex(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
 }
 
 unsafe fn drop_async_mutex(payload: *mut u8) {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let mutex = unsafe { &*(payload as *const AsyncMutex) };
     if mutex.reclamation_status() != ReclamationStatus::Reclaimable {
         crate::panic_context::fatal_invariant(
             "collector attempted to reclaim an active scheduler-aware Mutex",
         );
     }
+    // SAFETY: Sweep invokes this registered destructor once on an initialized, word-aligned GC
+    // payload after its last use.
     unsafe { std::ptr::drop_in_place(payload as *mut AsyncMutex) };
 }
 
@@ -89,16 +99,23 @@ const ASYNC_MUTEX_DROP_COUNT: crate::observation::Counter =
     crate::observation::Counter(crate::observation::Event::AsyncMutexDropCount);
 const ASYNC_MUTEX_REGISTRATION: crate::gc::NativeGcRegistration =
     crate::gc::NativeGcRegistration::AsyncMutex;
-const ASYNC_MUTEX_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
-    ASYNC_MUTEX_TYPE_ID,
-    Some(trace_async_mutex),
-    Some(drop_async_mutex),
-)
-.with_concurrent_trace(snapshot_async_mutex)
-.with_concurrent_slice(snapshot_async_mutex_slice)];
+// SAFETY: The constructor initializes this exact lock type for the selected ID. Its
+// stopped tracer exposes the value slot, its concurrent tracers snapshot that slot
+// atomically, and its finalizer drops the initialized lock after its last use.
+const ASYNC_MUTEX_GC_TYPES: &[crate::gc::NativeGcType] = &[unsafe {
+    crate::gc::NativeGcType::new(
+        ASYNC_MUTEX_TYPE_ID,
+        Some(trace_async_mutex),
+        Some(drop_async_mutex),
+    )
+    .with_concurrent_trace(snapshot_async_mutex)
+    .with_concurrent_slice(snapshot_async_mutex_slice)
+}];
 
 fn ensure_async_mutex_registered() {
-    ASYNC_MUTEX_REGISTRATION.ensure(ASYNC_MUTEX_GC_TYPES);
+    // SAFETY: This is the complete descriptor set for the async mutex registration group and
+    // its constructors.
+    unsafe { ASYNC_MUTEX_REGISTRATION.ensure(ASYNC_MUTEX_GC_TYPES) };
 }
 
 /// # Safety
@@ -107,6 +124,8 @@ fn ensure_async_mutex_registered() {
 /// lifetime of the returned borrow. The caller must also keep the owning
 /// Willow handle rooted so collection cannot reclaim it while borrowed.
 unsafe fn mutex_from_raw<'a>(raw: *mut c_void) -> Option<&'a AsyncMutex> {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     (!raw.is_null()).then(|| unsafe { &*(raw as *const AsyncMutex) })
 }
 
@@ -116,62 +135,105 @@ fn current_task() -> Option<RuntimeTaskId> {
     crate::scheduler::current_task()
 }
 
+/// # Safety
+/// When is_ref is nonzero, value must be null or the current address of a live managed
+/// payload.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_mutex_new(value: i64, is_ref: i64) -> *mut c_void {
+pub unsafe extern "C" fn willow_async_mutex_new(value: i64, is_ref: i64) -> *mut c_void {
     ensure_async_mutex_registered();
     let root = (is_ref != 0).then(|| crate::gc::GcRootHandle::new(value as *mut u8));
-    let payload = crate::gc::willow_alloc_with_layout(
-        crate::gc::GcObjectKind::LockHandle,
-        ASYNC_MUTEX_TYPE_ID,
-        std::mem::size_of::<AsyncMutex>() as i64,
-        0,
-    );
+    const { assert!(align_of::<AsyncMutex>() <= align_of::<crate::gc::GcHeader>()) };
+    // SAFETY: The constructor selects the matching payload layout and initializes its fields
+    // before exposing it or reaching a GC point.
+    let payload = unsafe {
+        crate::gc::willow_alloc_with_layout(
+            crate::gc::GcObjectKind::LockHandle,
+            ASYNC_MUTEX_TYPE_ID,
+            std::mem::size_of::<AsyncMutex>() as i64,
+            0,
+        )
+    };
     if payload.is_null() {
         return std::ptr::null_mut();
     }
     let value = root.as_ref().map_or(value, |root| root.load() as i64);
+    // SAFETY: The fresh GC payload has the size of the lock and the GC allocator's word alignment.
     unsafe {
         (payload as *mut AsyncMutex).write(AsyncMutex::new_payload(value, is_ref != 0));
     }
     if is_ref != 0 {
-        crate::gc::willow_gc_write_barrier(
-            payload,
-            std::ptr::null_mut(),
-            value as *mut u8,
-            crate::gc::GcStoreDestination::AsyncMutexCell as i64,
-        );
+        // SAFETY: The reference cell supplies its previous word and incoming value. This
+        // destination asserts no header bits.
+        unsafe {
+            crate::gc::willow_gc_write_barrier(
+                payload,
+                std::ptr::null_mut(),
+                value as *mut u8,
+                crate::gc::GcStoreDestination::AsyncMutexCell as i64,
+            )
+        };
     }
     payload as *mut c_void
 }
 
 /// Acquire for the running task. Writes the registration token to `out_token`
 /// on `ACQUIRED` and `PENDING`; leaves it untouched otherwise.
+///
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_mutex_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released. Each non-null output
+/// must exclusively address an aligned, writable i64 through this call, disjoint from the
+/// lock and any other output.
+///
+/// ```compile_fail,E0133
+/// let mut word = 0i64;
+/// willow_runtime::async_mutex::willow_async_mutex_acquire(std::ptr::null_mut(), &mut word);
+/// ```
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_mutex_acquire(raw: *mut c_void, out_token: *mut i64) -> i32 {
-    acquire_impl(raw, out_token, std::ptr::null_mut())
+pub unsafe extern "C" fn willow_async_mutex_acquire(raw: *mut c_void, out_token: *mut i64) -> i32 {
+    // SAFETY: The ABI caller retains the matching mutex and lends the non-null output slots
+    // for the call.
+    unsafe { acquire_impl(raw, out_token, std::ptr::null_mut()) }
 }
 
 /// Scalar lowering writes the existing 64-bit async-frame value slot in the
 /// acquire boundary. Reference/pair values keep the separately rooted load path.
+///
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_mutex_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released. Each non-null output
+/// must exclusively address an aligned, writable i64 through this call, disjoint from the
+/// lock and any other output.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_mutex_acquire_load(
+pub unsafe extern "C" fn willow_async_mutex_acquire_load(
     raw: *mut c_void,
     out_token: *mut i64,
     out_value: *mut i64,
 ) -> i32 {
-    acquire_impl(raw, out_token, out_value)
+    // SAFETY: The ABI caller retains the matching mutex and lends the non-null output slots
+    // for the call.
+    unsafe { acquire_impl(raw, out_token, out_value) }
 }
 
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_mutex_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released. Each non-null output
+/// must exclusively address an aligned, writable i64 through this call, disjoint from the
+/// lock and any other output.
 #[inline]
-fn acquire_impl(raw: *mut c_void, out_token: *mut i64, out_value: *mut i64) -> i32 {
+unsafe fn acquire_impl(raw: *mut c_void, out_token: *mut i64, out_value: *mut i64) -> i32 {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return MUTEX_STATUS_LOST;
     };
     let store = |token: RegistrationToken| {
         if !out_token.is_null() {
+            // SAFETY: The ABI caller provides a live, aligned, writable output slot for this
+            // result.
             unsafe { *out_token = token as i64 };
         }
     };
@@ -179,6 +241,8 @@ fn acquire_impl(raw: *mut c_void, out_token: *mut i64, out_value: *mut i64) -> i
         MutexAcquire::Acquired(token) => {
             store(token);
             if !out_value.is_null() {
+                // SAFETY: The ABI caller provides a live, aligned, writable output slot for this
+                // result.
                 unsafe {
                     *out_value = mutex.value.load(Ordering::Acquire);
                 }
@@ -195,31 +259,53 @@ fn acquire_impl(raw: *mut c_void, out_token: *mut i64, out_value: *mut i64) -> i
 }
 
 /// Re-poll a pending acquire after a wake.
+///
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_mutex_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_mutex_poll(raw: *mut c_void, token: i64) -> i32 {
-    poll_impl(raw, token, std::ptr::null_mut())
+pub unsafe extern "C" fn willow_async_mutex_poll(raw: *mut c_void, token: i64) -> i32 {
+    // SAFETY: The ABI caller retains the matching mutex and lends the non-null output slots
+    // for the call.
+    unsafe { poll_impl(raw, token, std::ptr::null_mut()) }
 }
 
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_mutex_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released. Each non-null output
+/// must exclusively address an aligned, writable i64 through this call, disjoint from the
+/// lock and any other output.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_mutex_poll_load(
+pub unsafe extern "C" fn willow_async_mutex_poll_load(
     raw: *mut c_void,
     token: i64,
     out_value: *mut i64,
 ) -> i32 {
-    poll_impl(raw, token, out_value)
+    // SAFETY: The ABI caller retains the matching mutex and lends the non-null output slots
+    // for the call.
+    unsafe { poll_impl(raw, token, out_value) }
 }
 
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_mutex_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released. Each non-null output
+/// must exclusively address an aligned, writable i64 through this call, disjoint from the
+/// lock and any other output.
 #[inline]
-fn poll_impl(raw: *mut c_void, token: i64, out_value: *mut i64) -> i32 {
+unsafe fn poll_impl(raw: *mut c_void, token: i64, out_value: *mut i64) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return MUTEX_STATUS_LOST;
     };
     match mutex.poll_acquire(task, token as RegistrationToken) {
         MutexResume::Acquired => {
             if !out_value.is_null() {
+                // SAFETY: The ABI caller provides a live, aligned, writable output slot for this
+                // result.
                 unsafe {
                     *out_value = mutex.value.load(Ordering::Acquire);
                 }
@@ -234,9 +320,15 @@ fn poll_impl(raw: *mut c_void, token: i64, out_value: *mut i64) -> i32 {
 /// Load the protected value. Returns `0` when the caller does not own the lock;
 /// the generated frame only calls this after an `ACQUIRED` status, so a `0` here
 /// means the ABI was misused rather than that the value is zero.
+///
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_mutex_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_mutex_load(raw: *mut c_void, token: i64) -> i64 {
+pub unsafe extern "C" fn willow_async_mutex_load(raw: *mut c_void, token: i64) -> i64 {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return 0;
     };
@@ -245,24 +337,45 @@ pub extern "C" fn willow_async_mutex_load(raw: *mut c_void, token: i64) -> i64 {
 
 /// Commit the protected value. Returns 1 on success, 0 if the caller is not the
 /// current owner.
+///
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_mutex_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released. For a reference payload
+/// the word must be null or the current address of a live managed object of the declared
+/// element type.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_mutex_commit(raw: *mut c_void, token: i64, value: i64) -> i32 {
-    let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
-        return 0;
-    };
-    mutex.commit(task, token as RegistrationToken, value) as i32
-}
-
-/// Commit and release a loaded frame in one ABI call. The original separate
-/// entry points remain available for callers that do not have a loaded value.
-#[unsafe(no_mangle)]
-#[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_mutex_commit_release(
+pub unsafe extern "C" fn willow_async_mutex_commit(
     raw: *mut c_void,
     token: i64,
     value: i64,
 ) -> i32 {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
+    let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
+        return 0;
+    };
+    // SAFETY: The ABI caller supplies the live managed reference lock and its new referent.
+    (unsafe { mutex.commit(task, token as RegistrationToken, value) }) as i32
+}
+
+/// Commit and release a loaded frame in one ABI call. The original separate
+/// entry points remain available for callers that do not have a loaded value.
+///
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_mutex_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released. For a reference payload
+/// the word must be null or the current address of a live managed object of the declared
+/// element type.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub unsafe extern "C" fn willow_async_mutex_commit_release(
+    raw: *mut c_void,
+    token: i64,
+    value: i64,
+) -> i32 {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return 0;
     };
@@ -274,9 +387,15 @@ pub extern "C" fn willow_async_mutex_commit_release(
 
 /// Release ownership and hand off. Returns 1 on success, 0 if the caller was not
 /// the owner (a stale or double release).
+///
+/// # Safety
+/// A non-null handle must be a live allocation from willow_async_mutex_new in this runtime.
+/// Retain it while waiting and until the acquired guard is released.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_mutex_release(raw: *mut c_void, token: i64) -> i32 {
+pub unsafe extern "C" fn willow_async_mutex_release(raw: *mut c_void, token: i64) -> i32 {
+    // SAFETY: The constructor places this lock type in word-aligned GC storage and the handle
+    // keeps it live.
     let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return 0;
     };
@@ -300,15 +419,24 @@ pub extern "C" fn willow_async_mutex_cancel() -> i32 {
 /// Raise the non-reentrant-mutex fault (§11, §22 "Reentrant lock"). Separate
 /// from the acquire entry point so the generated code supplies the source
 /// location of the offending `lock` statement.
+///
+/// # Safety
+/// Each non-null string argument must point to a live, aligned Willow String with its
+/// initialized length and UTF-8 payload. Keep the bytes stable and immutable through the
+/// borrow.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_async_mutex_recursive_panic(file: *const u8, line: i32, col: i32) {
-    crate::panic_context::raise_language_message_at(
-        "recursive lock acquisition on non-reentrant Mutex",
-        file,
-        line.into(),
-        col.into(),
-    );
+pub unsafe extern "C" fn willow_async_mutex_recursive_panic(file: *const u8, line: i32, col: i32) {
+    // SAFETY: The optional source file is null or a current Willow string and the panic path
+    // roots its string inputs before allocation.
+    unsafe {
+        crate::panic_context::raise_language_message_at(
+            "recursive lock acquisition on non-reentrant Mutex",
+            file,
+            line.into(),
+            col.into(),
+        )
+    };
 }
 
 /// Abort on an async-mutex status outside the closed ABI set. This is not a
