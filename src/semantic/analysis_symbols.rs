@@ -43,6 +43,9 @@ pub(crate) struct MemberReference {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Facts {
+    /// Method calls whose receiver resolved to the lexical base class.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub super_calls: Vec<Span>,
     /// Small, body-local import usage set, retained even outside AI capture.
     #[serde(default, serialize_with = "serialize_used_imports")]
     pub used_imports: std::collections::HashSet<String>,
@@ -65,6 +68,7 @@ fn serialize_used_imports<S: serde::Serializer>(
 
 impl Facts {
     pub fn extend(&mut self, other: Self) {
+        self.super_calls.extend(other.super_calls);
         self.used_imports.extend(other.used_imports);
         self.declarations.extend(other.declarations);
         self.members.extend(other.members);

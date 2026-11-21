@@ -838,6 +838,9 @@ impl TypeChecker {
             }
         };
         let receiver = Type::Named(base.clone());
+        if self.capture_call_sites {
+            self.analysis_symbols.super_calls.push(m.span);
+        }
         self.expr_types.insert(m.object.id(), receiver.clone());
         self.check_task_method_call(&receiver, m);
         if let Some(defining) = self.resolved_method_class(&base, &m.method) {

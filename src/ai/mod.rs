@@ -217,6 +217,8 @@ pub(crate) fn capture(
     let mut result = capture_unit_declarations(program, graph, indirect, symbol_facts, symbols);
     let mut pending = capture_body_roots(program, index);
     let builtin_aliases = crate::compiler_db::normalize::builtin_module_aliases(program);
+    let super_calls: std::collections::HashSet<_> =
+        symbol_facts.super_calls.iter().copied().collect();
     let mut lambda_roots = HashMap::new();
     while let Some((id, span, body_id, body, is_async)) = pending.pop() {
         result.identities.insert(id, body_id);
@@ -354,26 +356,23 @@ pub(crate) fn capture(
                             .site(symbols, id, *target, receiver, e.span());
                     }
                     if let Expr::MethodCall(call) = e
+                        && super_calls.contains(&call.span)
+                    {
+                        // The graph already has the selected ancestor body. Adding a
+                        // receiver dispatch query here would also reach its overrides.
+                        if let Some(Some(target)) = calls.get(&call.id) {
+                            result.rename_calls.push((call.span, *target));
+                        }
+                    } else if let Expr::MethodCall(call) = e
                         && let Some(Type::Named(name) | Type::Generic(name, _)) =
                             types.get(&call.object.id())
                         && let Some(class) = symbols.lookup_class(name)
                     {
-                        result.rename_calls.push((
-                            call.span,
-                            FunctionId::method(TypeId::from_source_name(&class.name), &call.method),
-                        ));
-                        result.dispatch_sites.insert(
-                            call.span,
-                            FunctionId::method(TypeId::from_source_name(&class.name), &call.method),
-                        );
-                        result
-                            .dispatches
-                            .entry(id)
-                            .or_default()
-                            .insert(FunctionId::method(
-                                TypeId::from_source_name(&class.name),
-                                &call.method,
-                            ));
+                        let target =
+                            FunctionId::method(TypeId::from_source_name(&class.name), &call.method);
+                        result.rename_calls.push((call.span, target));
+                        result.dispatch_sites.insert(call.span, target);
+                        result.dispatches.entry(id).or_default().insert(target);
                     }
                 }
                 _ => {}

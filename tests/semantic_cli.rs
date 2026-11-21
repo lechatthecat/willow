@@ -6477,6 +6477,152 @@ fn interface_boundary_reasons_keep_reachable_caller_provenance() {
     }
 }
 
+fn super_dispatch_fixture() -> Fixture {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/base.wi"),
+        r#"module base;
+fn base_hit() -> i64 { let xs = [1, 2]; return 1; }
+pub open class Base {
+    pub open fn score(self) -> i64 { return base_hit(); }
+    pub fn via_self(self) -> i64 { return self.score(); }
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        r#"import base;
+fn sibling_hit() -> i64 {
+    let mut i = 0;
+    while i < 3 { i += 1; }
+    return i;
+}
+open class Middle extends base::Base {
+    pub open override fn score(self) -> i64 { return super.score(); }
+}
+open class Gap extends Middle {}
+class Leaf extends Gap {
+    pub override fn score(self) -> i64 { return super.score(); }
+    pub fn mixed(self, other: base::Base, flag: bool) -> i64 {
+        if flag { let super = other; return super.score(); }
+        return super.score();
+    }
+}
+class Sibling extends base::Base {
+    pub override fn score(self) -> i64 { return sibling_hit(); }
+}
+fn via_base(other: base::Base) -> i64 { return other.score(); }
+fn via_shadow(super: base::Base) -> i64 { return super.score(); }
+fn main() { println(new Leaf().score()); println(via_base(new Sibling())); }
+"#,
+    )
+    .unwrap();
+    f
+}
+
+#[test]
+fn super_dispatch_effects_keep_only_the_selected_chain() {
+    let f = super_dispatch_fixture();
+    let effects = |name| f.json(&["effects", name, "--explain"], 0)["result"].clone();
+    let base_hit = effects("base::base_hit")["selected"]["id"].clone();
+    let base = effects("base::Base::score")["selected"]["id"].clone();
+    let middle = effects("main::Middle::score");
+    let leaf = effects("main::Leaf::score");
+    let sibling = effects("main::Sibling::score");
+    let middle_id = &middle["selected"]["id"];
+    let leaf_id = &leaf["selected"]["id"];
+    for (result, path) in [
+        (&middle, vec![middle_id, &base, &base_hit]),
+        (&leaf, vec![leaf_id, middle_id, &base, &base_hit]),
+    ] {
+        let witnesses = result["witness"].as_array().unwrap();
+        assert_eq!(witnesses.len(), path.len(), "{result}");
+        for (node, target) in witnesses.iter().zip(&path) {
+            assert_eq!(&node["function"], *target, "{result}");
+        }
+        let evidence = result["effect_evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 1, "{result}");
+        assert_eq!(evidence[0]["call_chain"], serde_json::json!(path));
+        assert_eq!(
+            evidence[0]["witness"]["cause"]["operation"],
+            "array-allocation"
+        );
+        assert_eq!(
+            evidence[0]["witness"]["cause"]["location"]["path"],
+            "src/base.wi"
+        );
+    }
+    for caller in [
+        "main::via_base",
+        "base::Base::via_self",
+        "main::via_shadow",
+        "main::Leaf::mixed",
+    ] {
+        let result = effects(caller);
+        let witnesses = result["witness"].as_array().unwrap();
+        for target in [&base, middle_id, leaf_id, &sibling["selected"]["id"]] {
+            assert!(
+                witnesses.iter().any(|w| &w["function"] == target),
+                "{caller}: {result}"
+            );
+        }
+        assert!(
+            result["effect_evidence"].as_array().unwrap().iter().any(
+                |entry| entry["witness"]["cause"]["operation"] == "loop-safepoint"
+                    && entry["call_chain"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&sibling["selected"]["id"])
+            ),
+            "{caller}: {result}"
+        );
+    }
+}
+
+#[test]
+fn super_dispatch_impact_preserves_only_reachable_callers() {
+    let f = super_dispatch_fixture();
+    // Query helpers with unique names so override-family definition grouping
+    // cannot hide a false caller edge or shorten the selected ancestor path.
+    let callers = |name| {
+        let result = f.json(&["impact", name], 0);
+        result["result"]["impact"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| {
+                (
+                    node["selector"].as_str().unwrap().to_owned(),
+                    node["distance"].as_u64().unwrap(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let base = callers("base::base_hit");
+    assert_eq!(base["base::Base::score"], 1);
+    assert_eq!(base["main::Middle::score"], 2);
+    assert_eq!(base["main::Leaf::score"], 3);
+    assert!(!base.contains_key("main::Sibling::score"));
+    let sibling = callers("main::sibling_hit");
+    assert_eq!(sibling["main::Sibling::score"], 1);
+    for excluded in [
+        "base::Base::score",
+        "main::Middle::score",
+        "main::Leaf::score",
+    ] {
+        assert!(!sibling.contains_key(excluded), "{sibling:?}");
+    }
+    for caller in [
+        "main::via_base",
+        "base::Base::via_self",
+        "main::via_shadow",
+        "main::Leaf::mixed",
+    ] {
+        assert_eq!(sibling[caller], 2);
+        assert_eq!(base[caller], 2);
+    }
+}
+
 #[test]
 fn inherited_method_effects_match_base_and_contract() {
     let f = Fixture::new();

@@ -601,6 +601,36 @@ fn semantic_diff_failed_target_preserves_baseline_contract_errors() {
 }
 
 #[test]
+fn super_dispatch_edits_match_clean_analysis_in_both_directions() {
+    let direct = "open class Base { pub open fn run(self) {} }
+class Sibling extends Base { pub override fn run(self) { let xs = [1, 2]; } }
+class Child extends Base { pub fn apply(self, other: Base) { super.run(); } }
+fn main() {}";
+    let virtual_call = direct.replace("super.run()", "other.run()");
+    for (before, after, delta) in [
+        (direct, virtual_call.as_str(), "added"),
+        (virtual_call.as_str(), direct, "removed"),
+    ] {
+        let (old, clean) = captures_mode(before, after, false);
+        let expected = compare(&old, &clean, false).unwrap();
+        assert!(
+            expected
+                .changes
+                .iter()
+                .any(|change| change["effects"][delta]
+                    .as_array()
+                    .is_some_and(|bits| bits.iter().any(|bit| bit == "may-allocate"))),
+            "{expected:?}"
+        );
+        let (old, retained) = captures(before, after);
+        assert_eq!(
+            serde_json::to_value(compare(&old, &retained, false).unwrap()).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+}
+
+#[test]
 fn semantic_diff_virtual_dispatch_target_set_changes() {
     let a = "open class Base { pub open fn run(self) {} } class A extends Base { pub override fn run(self) {} } fn caller(b: Base) { b.run(); } fn main() { let b: Base = new A(); caller(b); }";
     let b = format!("{a} class B extends Base {{ pub override fn run(self) {{ println(1); }} }}");
