@@ -130,10 +130,12 @@ impl super::tracked::QueryProvider for LayoutProvider {
         &self,
         table: &super::tracked::TrackedQueryTable,
         node: &super::tracked::QueryNode,
-    ) -> Result<super::tracked::QueryValue> {
-        use super::tracked::{InputNode, QueryNode, QueryValue, ResultFingerprint};
+    ) -> Result<super::tracked::QueryOutcome<super::tracked::QueryValue>> {
+        use super::tracked::{
+            InputNode, QueryNode, QueryOutcome, QueryValue, ResultFingerprint, query_ready,
+        };
         if let QueryNode::GcLayout(id) = node {
-            let layout = table.read(self, QueryNode::ClassLayout(*id))?;
+            let layout = query_ready!(table.evaluate(self, QueryNode::ClassLayout(*id)));
             let layout = layout.get::<TrackedLayout>();
             let trace = GcTraceLayout::from_field_slots(&layout.fields, |ty| {
                 let (managed, interface) = match field_type_id(ty) {
@@ -148,23 +150,28 @@ impl super::tracked::QueryProvider for LayoutProvider {
                     interface,
                 ))
             })?;
-            return Ok(QueryValue::new(
+            return Ok(QueryOutcome::Ready(QueryValue::new(
                 trace,
                 ResultFingerprint::bytes(b"gc-trace-layout"),
-            ));
+            )));
         }
         if let QueryNode::InterfaceLayout(id) = node {
-            return table.input(&InputNode::InterfaceDeclaration(*id));
+            return table
+                .input(&InputNode::InterfaceDeclaration(*id))
+                .map(QueryOutcome::Ready);
         }
         let QueryNode::ClassLayout(id) = node else {
             anyhow::bail!("unexpected layout query {node:?}")
         };
         let input = table.input(&InputNode::LayoutDeclaration(*id))?;
         let declaration = input.get::<ClassLayoutDeclaration>();
-        let parent = declaration
-            .base
-            .map(|id| table.read(self, QueryNode::ClassLayout(id)))
-            .transpose()?;
+        let parent = if let Some(id) = declaration.base {
+            Some(query_ready!(
+                table.evaluate(self, QueryNode::ClassLayout(id))
+            ))
+        } else {
+            None
+        };
         let parent = parent.as_ref().map(|v| v.get::<TrackedLayout>());
         let mut fields = parent.map(|p| (*p.fields).clone()).unwrap_or_default();
         let mut names: HashSet<_> = fields.iter().map(|(name, _)| name.clone()).collect();
@@ -182,7 +189,7 @@ impl super::tracked::QueryProvider for LayoutProvider {
             fields: Arc::new(fields),
             slots: Arc::new(slots),
         };
-        Ok(QueryValue::new(result, fingerprint))
+        Ok(QueryOutcome::Ready(QueryValue::new(result, fingerprint)))
     }
 }
 

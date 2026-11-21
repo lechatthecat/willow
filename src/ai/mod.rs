@@ -22,9 +22,8 @@ pub(crate) mod incremental_snapshot;
 mod semantic;
 mod storage;
 pub(crate) use incremental_snapshot::{
-    VerificationRelocation, VerificationSnapshotColdFallback, VerificationSnapshotFallback,
-    VerificationSnapshotState, VerificationSnapshotUpdate, capture_incremental,
-    incremental_snapshot,
+    SnapshotOutcome, SnapshotRetry, VerificationRelocation, VerificationSnapshotState,
+    VerificationSnapshotUpdate, capture_incremental, incremental_snapshot,
 };
 pub(crate) mod symbols;
 pub use graph::{Direction, Impact, ImpactNode, Limits};

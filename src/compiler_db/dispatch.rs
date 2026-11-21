@@ -2,7 +2,8 @@
 use super::{
     incremental::SyntaxQueries,
     tracked::{
-        InputNode, QueryNode, QueryProvider, QueryValue, ResultFingerprint, TrackedQueryTable,
+        InputNode, QueryNode, QueryOutcome, QueryProvider, QueryValue, ResultFingerprint,
+        TrackedQueryTable,
     },
 };
 use crate::{
@@ -65,7 +66,11 @@ pub(crate) fn capture(
 
 pub(crate) struct DispatchProvider;
 impl QueryProvider for DispatchProvider {
-    fn compute(&self, table: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
+    fn compute(
+        &self,
+        table: &TrackedQueryTable,
+        node: &QueryNode,
+    ) -> Result<QueryOutcome<QueryValue>> {
         let QueryNode::DispatchTargets(unit, class, method) = node else {
             anyhow::bail!("unexpected dispatch query {node:?}");
         };
@@ -95,7 +100,7 @@ impl QueryProvider for DispatchProvider {
             },
         )?;
         let value = serde_json::to_value(targets)?;
-        super::incremental::value(value)
+        super::incremental::value(value).map(QueryOutcome::Ready)
     }
 }
 

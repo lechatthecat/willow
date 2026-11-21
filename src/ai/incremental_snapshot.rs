@@ -12,23 +12,35 @@ use std::{
 
 type Key = (UnitId, FunctionId);
 
-#[derive(Debug)]
-pub(crate) struct VerificationSnapshotFallback;
-impl std::fmt::Display for VerificationSnapshotFallback {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("verification snapshot scope requires full capture")
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SnapshotRetry {
+    FullCapture,
+    ColdCompilation,
 }
-impl std::error::Error for VerificationSnapshotFallback {}
 
-#[derive(Debug)]
-pub(crate) struct VerificationSnapshotColdFallback;
-impl std::fmt::Display for VerificationSnapshotColdFallback {
+impl std::fmt::Display for SnapshotRetry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ambiguous verification identities require cold compilation")
+        f.write_str(match self {
+            Self::FullCapture => "verification snapshot scope requires full capture",
+            Self::ColdCompilation => "ambiguous verification identities require cold compilation",
+        })
     }
 }
-impl std::error::Error for VerificationSnapshotColdFallback {}
+
+pub(crate) enum SnapshotOutcome<T> {
+    Done(T),
+    Retry(SnapshotRetry),
+}
+
+// Leave the candidate unpublished when any part of a delta needs a wider capture.
+macro_rules! snapshot_done {
+    ($attempt:expr) => {
+        match $attempt? {
+            SnapshotOutcome::Done(value) => value,
+            SnapshotOutcome::Retry(retry) => return Ok(SnapshotOutcome::Retry(retry)),
+        }
+    };
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct VerificationRelocation {
@@ -275,9 +287,16 @@ struct Plan {
     annotation_starts: HashMap<UnitId, usize>,
     symbol_owners: HashMap<Span, String>,
     unit_items: HashMap<UnitId, usize>,
-    fallback: bool,
-    cold_fallback: bool,
+    retry: Option<SnapshotRetry>,
     owner_checks: usize,
+}
+impl Plan {
+    fn request_retry(&mut self, retry: SnapshotRetry) {
+        // A full capture cannot repair ambiguous identities in the frontend.
+        if self.retry != Some(SnapshotRetry::ColdCompilation) {
+            self.retry = Some(retry);
+        }
+    }
 }
 thread_local! { static PLAN: RefCell<Option<Rc<RefCell<Plan>>>> = const { RefCell::new(None) }; }
 /// Installs a revision's snapshot plan for the type-checker hooks below and
@@ -367,8 +386,7 @@ impl VerificationSnapshotState {
                 annotation_starts: HashMap::new(),
                 symbol_owners: HashMap::new(),
                 unit_items: HashMap::new(),
-                fallback: false,
-                cold_fallback: false,
+                retry: None,
                 owner_checks: 0,
             }))
         });
@@ -618,8 +636,7 @@ pub(crate) fn record_root(unit: UnitId, item: usize, function: &FunctionDecl) {
                 .insert((unit, FunctionId::free(&function.name)), function.body.id)
                 .is_some()
             {
-                plan.fallback = true;
-                plan.cold_fallback = true;
+                plan.retry = Some(SnapshotRetry::ColdCompilation);
             }
             plan.current_roots.insert(
                 function.body.id,
@@ -651,8 +668,7 @@ pub(crate) fn record_method(
                 ),
             );
             if plan.current_keys.insert(key, method.body.id).is_some() {
-                plan.fallback = true;
-                plan.cold_fallback = true;
+                plan.retry = Some(SnapshotRetry::ColdCompilation);
             }
             plan.current_roots.insert(
                 method.body.id,
@@ -719,8 +735,7 @@ fn record_member_root(
                 plan.current_keys.entry(key).or_insert(body);
                 plan.constructor_groups.entry(key).or_default().insert(body);
             } else if plan.current_keys.insert(key, body).is_some() {
-                plan.fallback = true;
-                plan.cold_fallback = true;
+                plan.retry = Some(SnapshotRetry::ColdCompilation);
             }
             plan.current_roots.insert(
                 body,
@@ -769,35 +784,32 @@ pub(crate) fn capture_incremental(
         return capture(program, graph, inputs, facts, symbols, index);
     };
     let Some(bodies) = bodies else {
-        plan.borrow_mut().fallback = true;
+        plan.borrow_mut().request_retry(SnapshotRetry::FullCapture);
         return capture(program, graph, inputs, facts, symbols, index);
     };
-    let selection = (|| -> Result<_> {
+    let selection = (|| -> Result<_, SnapshotRetry> {
         let mut plan = plan.borrow_mut();
 
         let known = plan
             .previous
             .units
             .get(&unit)
-            .ok_or(VerificationSnapshotFallback)?;
+            .ok_or(SnapshotRetry::FullCapture)?;
         if !known.unique_roots {
-            plan.cold_fallback = true;
-            return Err(VerificationSnapshotColdFallback.into());
+            return Err(SnapshotRetry::ColdCompilation);
         }
-        ensure!(
-            known.imports == imports(program),
-            VerificationSnapshotFallback
-        );
+        if known.imports != imports(program) {
+            return Err(SnapshotRetry::FullCapture);
+        }
         let source_changes = bodies
             .effect_source_changes(unit)
-            .ok_or(VerificationSnapshotFallback)?;
-        if known.items != program.items.len() || bodies.declarations_changed(unit) {
-            ensure!(
-                source_changes
-                    .iter()
-                    .all(|(owner, _)| owner.starts_with("Function:")),
-                VerificationSnapshotFallback
-            );
+            .ok_or(SnapshotRetry::FullCapture)?;
+        if (known.items != program.items.len() || bodies.declarations_changed(unit))
+            && source_changes
+                .iter()
+                .any(|(owner, _)| !owner.starts_with("Function:"))
+        {
+            return Err(SnapshotRetry::FullCapture);
         }
         plan.unit_items.insert(unit, program.items.len());
         let mut changed: HashSet<_> = bodies
@@ -810,7 +822,7 @@ pub(crate) fn capture_incremental(
             plan.owner_checks += 1;
             let name = owner
                 .strip_prefix("Function:")
-                .ok_or(VerificationSnapshotFallback)?;
+                .ok_or(SnapshotRetry::FullCapture)?;
             let key = (unit, FunctionId::free(name));
             if exists {
                 if let Some(group) = plan.source_keys.get(&key) {
@@ -819,7 +831,7 @@ pub(crate) fn capture_incremental(
                     plan.changed.insert(key);
                     source_only_spans.insert(span);
                 } else {
-                    return Err(VerificationSnapshotFallback.into());
+                    return Err(SnapshotRetry::FullCapture);
                 }
             } else {
                 plan.removed.insert(key);
@@ -947,14 +959,13 @@ pub(crate) fn capture_incremental(
             let root = plan
                 .current_roots
                 .get(&body)
-                .ok_or(VerificationSnapshotFallback)?
+                .ok_or(SnapshotRetry::FullCapture)?
                 .clone();
             let (block, span, item) = match (program.items.get(root.item), root.kind) {
                 (Some(Item::Function(function)), RootKind::Function) => {
-                    ensure!(
-                        function.type_params.is_empty() && function.rust_bridge.is_none(),
-                        VerificationSnapshotFallback
-                    );
+                    if !function.type_params.is_empty() || function.rust_bridge.is_some() {
+                        return Err(SnapshotRetry::FullCapture);
+                    }
                     (
                         &function.body,
                         function.span,
@@ -962,11 +973,13 @@ pub(crate) fn capture_incremental(
                     )
                 }
                 (Some(Item::Class(class)), RootKind::Method(member)) => {
-                    ensure!(class.type_params.is_empty(), VerificationSnapshotFallback);
+                    if !class.type_params.is_empty() {
+                        return Err(SnapshotRetry::FullCapture);
+                    }
                     let method = class
                         .methods
                         .get(member)
-                        .ok_or(VerificationSnapshotFallback)?;
+                        .ok_or(SnapshotRetry::FullCapture)?;
                     let selected_class = ClassDecl {
                         abi_storage: class.abi_storage.clone(),
                         type_params: vec![],
@@ -984,11 +997,13 @@ pub(crate) fn capture_incremental(
                     (&method.body, method.span, Item::Class(selected_class))
                 }
                 (Some(Item::Class(class)), RootKind::Constructor(member)) => {
-                    ensure!(class.type_params.is_empty(), VerificationSnapshotFallback);
+                    if !class.type_params.is_empty() {
+                        return Err(SnapshotRetry::FullCapture);
+                    }
                     let constructor = class
                         .constructors
                         .get(member)
-                        .ok_or(VerificationSnapshotFallback)?;
+                        .ok_or(SnapshotRetry::FullCapture)?;
                     let selected_class = ClassDecl {
                         abi_storage: class.abi_storage.clone(),
                         type_params: vec![],
@@ -1010,18 +1025,17 @@ pub(crate) fn capture_incremental(
                     )
                 }
                 (Some(Item::Interface(interface)), RootKind::Default(member)) => {
-                    ensure!(
-                        interface.type_params.is_empty(),
-                        VerificationSnapshotFallback
-                    );
+                    if !interface.type_params.is_empty() {
+                        return Err(SnapshotRetry::FullCapture);
+                    }
                     let method = interface
                         .methods
                         .get(member)
-                        .ok_or(VerificationSnapshotFallback)?;
+                        .ok_or(SnapshotRetry::FullCapture)?;
                     let block = method
                         .default_body
                         .as_ref()
-                        .ok_or(VerificationSnapshotFallback)?;
+                        .ok_or(SnapshotRetry::FullCapture)?;
                     let selected_interface = crate::parser::ast::InterfaceDecl {
                         default_import_uses: vec![],
                         name: interface.name.clone(),
@@ -1035,9 +1049,11 @@ pub(crate) fn capture_incremental(
                     };
                     (block, method.span, Item::Interface(selected_interface))
                 }
-                _ => return Err(VerificationSnapshotFallback.into()),
+                _ => return Err(SnapshotRetry::FullCapture),
             };
-            ensure!(block.id == body, VerificationSnapshotFallback);
+            if block.id != body {
+                return Err(SnapshotRetry::FullCapture);
+            }
             if let Some(sites) = graph.get(&root.key.1) {
                 selected_graph.merge(root.key.1, sites.clone());
             }
@@ -1047,14 +1063,18 @@ pub(crate) fn capture_incremental(
                     if let Some(sites) = graph.get(&FunctionId::lambda(child)) {
                         selected_graph.merge(FunctionId::lambda(child), sites.clone());
                     }
-                    let typed = bodies.read(child)?;
+                    let typed = bodies.read(child).map_err(|_| SnapshotRetry::FullCapture)?;
                     selected_symbols.extend(typed.analysis_symbols());
                     typed.snapshot_tables(
                         &mut selected_types,
                         &mut selected_calls,
                         &mut selected_patterns,
                     );
-                    selected_indirect.extend(bodies.indirect_inputs(child)?);
+                    selected_indirect.extend(
+                        bodies
+                            .indirect_inputs(child)
+                            .map_err(|_| SnapshotRetry::FullCapture)?,
+                    );
                     nested.push(child);
                 }
             }
@@ -1062,7 +1082,7 @@ pub(crate) fn capture_incremental(
             match bodies.indirect_inputs(body) {
                 Ok(inputs) => selected_indirect.extend(inputs),
                 Err(_) if copied => {}
-                Err(error) => return Err(error),
+                Err(_) => return Err(SnapshotRetry::FullCapture),
             }
             match bodies.read(body) {
                 Ok(typed) => {
@@ -1076,7 +1096,7 @@ pub(crate) fn capture_incremental(
                     }
                 }
                 Err(_) if copied => {}
-                Err(error) => return Err(error),
+                Err(_) => return Err(SnapshotRetry::FullCapture),
             }
             // Copied defaults may use checked metadata owned by their source.
             for event in AstWalk::new(AstEvent::Block(block)) {
@@ -1177,8 +1197,8 @@ pub(crate) fn capture_incremental(
             }
             captured
         }
-        Err(_) => {
-            plan.borrow_mut().fallback = true;
+        Err(retry) => {
+            plan.borrow_mut().request_retry(retry);
             capture(program, graph, inputs, facts, symbols, index)
         }
     }
@@ -1472,15 +1492,49 @@ struct SnapshotInputs<'a> {
     source: &'a str,
     project: Option<&'a Path>,
 }
+/// Projection consumes the unit captures. Move their effect maps intact so
+/// the state can install them after projection and retirement both succeed.
+struct CapturedOwnEffects(Vec<(UnitId, HashMap<FunctionId, u8>)>);
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static OWN_EFFECT_ENTRIES_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl CapturedOwnEffects {
+    fn install(self, state: &mut VerificationSnapshotState) {
+        for (unit, effects) in self.0 {
+            for (id, bits) in effects {
+                #[cfg(test)]
+                OWN_EFFECT_ENTRIES_COPIED.with(|count| count.set(count.get() + 1));
+                state.own.insert((unit, id), bits);
+            }
+        }
+    }
+}
+
 impl SnapshotInputs<'_> {
-    fn snapshot(&self, boundary: SnapshotBoundary<'_>) -> Result<Snapshot> {
-        snapshot_with_boundary(
+    fn snapshot(&self, boundary: SnapshotBoundary<'_>) -> Result<(Snapshot, CapturedOwnEffects)> {
+        let effects = self
+            .frontend
+            .db
+            .effects
+            .analysis
+            .borrow_mut()
+            .as_mut()
+            .context("analysis capture disabled")?
+            .iter_mut()
+            .filter(|(_, unit)| !unit.own_effects.is_empty())
+            .map(|(&id, unit)| (id, std::mem::take(&mut unit.own_effects)))
+            .collect();
+        let snapshot = snapshot_with_boundary(
             self.frontend,
             self.entry,
             self.source,
             self.project,
             boundary,
-        )
+        )?;
+        Ok((snapshot, CapturedOwnEffects(effects)))
     }
 }
 
@@ -1495,46 +1549,30 @@ pub(crate) fn incremental_snapshot(
     project: Option<&Path>,
     state: &mut VerificationSnapshotState,
     scope: &CaptureScope,
-) -> Result<VerificationSnapshotUpdate> {
+) -> Result<SnapshotOutcome<VerificationSnapshotUpdate>> {
     let inputs = SnapshotInputs {
         frontend,
         entry,
         source,
         project,
     };
-    let own = own_effects(frontend);
-    // Foreign review depends on whole source/dependency inputs, including removals.
-    // Rebuild its bounded provenance graph rather than reusing a partial patch.
+    let Some(plan) = &scope.plan else {
+        return full_snapshot(inputs, state).map(SnapshotOutcome::Done);
+    };
+    let plan = plan.borrow();
+    // A bridge requires complete unit captures. An active plan may already
+    // have omitted unchanged owners or discovered ambiguous frontend identities.
     if !frontend.db.rust_bridge_symbols.is_empty()
         || state
             .metadata
             .as_ref()
-            .is_some_and(|s| !s.semantic.interop.bridges.is_empty())
+            .is_some_and(|snapshot| !snapshot.semantic.interop.bridges.is_empty())
     {
-        return full_snapshot(inputs, state, own);
+        return Ok(SnapshotOutcome::Retry(
+            plan.retry.unwrap_or(SnapshotRetry::FullCapture),
+        ));
     }
-    match scope.plan.as_ref().filter(|_| state.metadata.is_some()) {
-        Some(plan) => delta_snapshot(inputs, state, &plan.borrow(), own),
-        None => full_snapshot(inputs, state, own),
-    }
-}
-
-/// Body-local runtime effects of every checked callable.
-fn own_effects(frontend: &crate::Frontend) -> Vec<(Key, u8)> {
-    frontend
-        .db
-        .effects
-        .analysis
-        .borrow()
-        .as_ref()
-        .into_iter()
-        .flat_map(|units| units.iter())
-        .flat_map(|(&unit, c)| {
-            c.own_effects
-                .iter()
-                .map(move |(&id, &bits)| ((unit, id), bits))
-        })
-        .collect()
+    delta_snapshot(inputs, state, &plan)
 }
 
 fn body_locations(snapshot: &Snapshot) -> HashMap<BodyId, usize> {
@@ -1596,7 +1634,6 @@ fn bodyless_effects(
 fn full_snapshot(
     inputs: SnapshotInputs<'_>,
     state: &mut VerificationSnapshotState,
-    own: Vec<(Key, u8)>,
 ) -> Result<VerificationSnapshotUpdate> {
     let frontend = inputs.frontend;
     let graph_keys: Vec<_> = frontend
@@ -1615,7 +1652,7 @@ fn full_snapshot(
     }
     let dispatch = RefCell::new(None);
     let instances = RefCell::new(Vec::new());
-    let full = inputs.snapshot(SnapshotBoundary {
+    let (full, own) = inputs.snapshot(SnapshotBoundary {
         instances: Some(&instances),
         dispatch: Some(&dispatch),
         ..SnapshotBoundary::default()
@@ -1643,9 +1680,6 @@ fn full_snapshot(
         state.dirty_instance_owners.insert(id.clone());
         state.records.insert(id, Arc::new(record));
     }
-    for (key, bits) in own {
-        state.own.insert(key, bits);
-    }
     state.register_units(frontend, inputs.entry);
     state.anchor_owners();
     state.bind_full_records(frontend, &full);
@@ -1657,6 +1691,7 @@ fn full_snapshot(
         }
     }
     state.enforce_size()?;
+    own.install(state);
     Ok(VerificationSnapshotUpdate::Full(full))
 }
 
@@ -1671,6 +1706,7 @@ struct DeltaClosure {
 /// and instance edges it produced.
 struct PatchProjection {
     patch: Snapshot,
+    own: CapturedOwnEffects,
     dispatch: Option<super::incremental_dispatch::State>,
     dispatch_visits: usize,
     dispatch_affected: HashSet<String>,
@@ -1682,27 +1718,26 @@ fn delta_snapshot(
     inputs: SnapshotInputs<'_>,
     state: &mut VerificationSnapshotState,
     plan: &Plan,
-    own: Vec<(Key, u8)>,
-) -> Result<VerificationSnapshotUpdate> {
+) -> Result<SnapshotOutcome<VerificationSnapshotUpdate>> {
     let frontend = inputs.frontend;
-    state.begin_delta(frontend, plan)?;
+    snapshot_done!(state.begin_delta(frontend, plan));
     let retired_bodies: HashSet<_> = state
         .units
         .keys()
         .flat_map(|unit| frontend.db.effects.removed_roots(*unit))
         .collect();
-    let mut closure = state.affected_closure(frontend, plan, &retired_bodies)?;
+    let mut closure = snapshot_done!(state.affected_closure(frontend, plan, &retired_bodies));
     let relocations = state.relocate_owners(plan);
     let mut changed_ids = state.changed_ids(plan);
     state.retire_declarations(plan);
-    let projection = project_patch(
+    let projection = snapshot_done!(project_patch(
         inputs,
         state,
         plan,
         &retired_bodies,
         &mut closure,
         &mut changed_ids,
-    )?;
+    ));
     let DeltaClosure {
         mut affected,
         mut removed_ids,
@@ -1745,9 +1780,6 @@ fn delta_snapshot(
     }
     state.insert_symbol_types(&patch.semantic.symbols);
     state.retire_bodies(plan, retired_bodies);
-    for (key, bits) in own {
-        state.own.insert(key, bits);
-    }
     state.header = Some(Header::from(&patch));
     for (unit, count) in &plan.unit_items {
         if let Some(value) = state.units.get_mut(unit) {
@@ -1755,12 +1787,13 @@ fn delta_snapshot(
         }
     }
     state.enforce_size()?;
-    Ok(VerificationSnapshotUpdate::Delta {
+    projection.own.install(state);
+    Ok(SnapshotOutcome::Done(VerificationSnapshotUpdate::Delta {
         patch,
         removed_functions,
         removed_symbols,
         relocations,
-    })
+    }))
 }
 
 /// Fixes every unaffected callee of the affected closure, and every newly
@@ -1836,7 +1869,7 @@ fn project_patch(
     retired_bodies: &HashSet<BodyId>,
     closure: &mut DeltaClosure,
     changed_ids: &mut HashSet<String>,
-) -> Result<PatchProjection> {
+) -> Result<SnapshotOutcome<PatchProjection>> {
     let frontend = inputs.frontend;
     let fixed_ids = RefCell::new(HashSet::new());
     let compact = |id: &str| compact_function(state, &fixed_ids, id);
@@ -1867,14 +1900,14 @@ fn project_patch(
         }
     }
     let indirect_inputs = state.indirect.inputs(&closure.indirect_callers);
-    let selected_generic_sources = select_generic_sources(
+    let selected_generic_sources = snapshot_done!(select_generic_sources(
         frontend,
         state,
         plan,
         retired_bodies,
         &mut closure.affected,
         changed_ids,
-    )?;
+    ));
     let dispatch = RefCell::new(state.dispatch.clone());
     let dispatch_affected = RefCell::new(HashSet::new());
     let dispatch_visits = std::cell::Cell::new(0);
@@ -1896,7 +1929,7 @@ fn project_patch(
         result
     };
     let instances = RefCell::new(Vec::new());
-    let patch = inputs.snapshot(SnapshotBoundary {
+    let (patch, own) = inputs.snapshot(SnapshotBoundary {
         instances: Some(&instances),
         functions: boundary,
         synthetic,
@@ -1910,14 +1943,15 @@ fn project_patch(
         indirect: Some(&indirect_inputs),
         generics: (!selected_generic_sources.is_empty()).then_some(&selected_generic_sources),
     })?;
-    Ok(PatchProjection {
+    Ok(SnapshotOutcome::Done(PatchProjection {
         patch,
+        own,
         dispatch: dispatch.into_inner(),
         dispatch_visits: dispatch_visits.get(),
         dispatch_affected: dispatch_affected.into_inner(),
         dispatch_removed: dispatch_removed.into_inner(),
         instances: instances.into_inner(),
-    })
+    }))
 }
 
 /// Selects the generic sources named by changed, affected and retired owners.
@@ -1929,7 +1963,7 @@ fn select_generic_sources(
     retired_bodies: &HashSet<BodyId>,
     affected: &mut HashSet<String>,
     changed_ids: &mut HashSet<String>,
-) -> Result<HashMap<UnitId, generics::Source>> {
+) -> Result<SnapshotOutcome<HashMap<UnitId, generics::Source>>> {
     let mut generic_names: HashMap<UnitId, HashSet<String>> = HashMap::new();
     for (unit, id) in &plan.changed {
         generic_names
@@ -1964,9 +1998,9 @@ fn select_generic_sources(
     let mut selected_generic_sources = HashMap::new();
     for (unit, names) in generic_names {
         if let Some(source) = frontend.db.generic_sources.get(&unit) {
-            let selected = source
-                .selected_functions(&names)
-                .ok_or(VerificationSnapshotFallback)?;
+            let Some(selected) = source.selected_functions(&names) else {
+                return Ok(SnapshotOutcome::Retry(SnapshotRetry::FullCapture));
+            };
             if selected.has_workspace_generics() {
                 for name in selected.items.keys() {
                     let id = hash(serde_json::to_vec(&(&state.units[&unit].path, name))?);
@@ -1977,7 +2011,7 @@ fn select_generic_sources(
             }
         }
     }
-    Ok(selected_generic_sources)
+    Ok(SnapshotOutcome::Done(selected_generic_sources))
 }
 
 /// Re-projects the retained callers of functions whose dispatch changed, plus
@@ -2342,23 +2376,26 @@ fn bind_record_owner(
 /// Delta stages, in the order `delta_snapshot` runs them.
 impl VerificationSnapshotState {
     /// Resets per-revision counters and rejects revisions a delta cannot patch.
-    fn begin_delta(&mut self, frontend: &crate::Frontend, plan: &Plan) -> Result<()> {
+    fn begin_delta(
+        &mut self,
+        frontend: &crate::Frontend,
+        plan: &Plan,
+    ) -> Result<SnapshotOutcome<()>> {
         self.projection_items_cloned.set(0);
         self.boundary_functions.set(0);
         self.owner_checks = plan.owner_checks;
         self.coordinate_owners = plan.current_roots.len() + plan.declarations.len();
-        ensure!(!plan.cold_fallback, VerificationSnapshotColdFallback);
-        ensure!(
-            self.dispatch
-                .as_ref()
-                .is_none_or(|dispatch| dispatch.supported()),
-            VerificationSnapshotFallback
-        );
-        ensure!(!plan.fallback, VerificationSnapshotFallback);
-        ensure!(
-            frontend.module_graph.files.len() + 1 == self.units.len(),
-            VerificationSnapshotFallback
-        );
+        if let Some(retry) = plan.retry {
+            return Ok(SnapshotOutcome::Retry(retry));
+        }
+        if self
+            .dispatch
+            .as_ref()
+            .is_some_and(|dispatch| !dispatch.supported())
+            || frontend.module_graph.files.len() + 1 != self.units.len()
+        {
+            return Ok(SnapshotOutcome::Retry(SnapshotRetry::FullCapture));
+        }
         for key in &plan.changed {
             if !self.keys.contains_key(key) {
                 let path = &self.units[&key.0].path;
@@ -2366,7 +2403,7 @@ impl VerificationSnapshotState {
                     .insert(*key, hash(serde_json::to_vec(&(path, key.1.to_string()))?));
             }
         }
-        Ok(())
+        Ok(SnapshotOutcome::Done(()))
     }
 
     /// Removed owners with their descendants, and the reverse-call closure of
@@ -2376,7 +2413,7 @@ impl VerificationSnapshotState {
         frontend: &crate::Frontend,
         plan: &Plan,
         retired_bodies: &HashSet<BodyId>,
-    ) -> Result<DeltaClosure> {
+    ) -> Result<SnapshotOutcome<DeltaClosure>> {
         let mut removed_functions: Vec<_> = plan
             .removed
             .iter()
@@ -2406,11 +2443,9 @@ impl VerificationSnapshotState {
             &mut queue,
         )?;
         for key in plan.changed.iter().chain(&plan.removed) {
-            let id = self
-                .keys
-                .get(key)
-                .ok_or(VerificationSnapshotFallback)?
-                .clone();
+            let Some(id) = self.keys.get(key).cloned() else {
+                return Ok(SnapshotOutcome::Retry(SnapshotRetry::FullCapture));
+            };
             if affected.insert(id.clone()) {
                 queue.push_back(id);
             }
@@ -2432,11 +2467,11 @@ impl VerificationSnapshotState {
             }
         }
         affected.retain(|id| !removed_ids.contains(id));
-        Ok(DeltaClosure {
+        Ok(SnapshotOutcome::Done(DeltaClosure {
             affected,
             removed_ids,
             indirect_callers,
-        })
+        }))
     }
 
     /// Replaces the indirect-call inputs of retired, re-projected, changed and

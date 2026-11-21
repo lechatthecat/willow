@@ -60,7 +60,9 @@ impl AnalysisRevision {
         verification: bool,
     ) -> Result<ai::Snapshot> {
         match self.analyze_policy_update(session, emitter, artifact_limit, verification, false)? {
-            ai::VerificationSnapshotUpdate::Full(snapshot) => Ok(snapshot),
+            ai::SnapshotOutcome::Done(ai::VerificationSnapshotUpdate::Full(snapshot)) => {
+                Ok(snapshot)
+            }
             _ => unreachable!("full analysis policy"),
         }
     }
@@ -69,7 +71,7 @@ impl AnalysisRevision {
         &mut self,
         session: CompilerSession<'_>,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
-    ) -> Result<ai::VerificationSnapshotUpdate> {
+    ) -> Result<ai::SnapshotOutcome<ai::VerificationSnapshotUpdate>> {
         self.analyze_policy_update(session, emitter, 128 * 1024 * 1024, true, true)
     }
 
@@ -81,7 +83,7 @@ impl AnalysisRevision {
         artifact_limit: u64,
         verification: bool,
         delta: bool,
-    ) -> Result<ai::VerificationSnapshotUpdate> {
+    ) -> Result<ai::SnapshotOutcome<ai::VerificationSnapshotUpdate>> {
         use anyhow::Context;
         let prepare_start = std::time::Instant::now();
         let _symbols = self.symbols.enter();
@@ -178,14 +180,17 @@ impl AnalysisRevision {
         let snapshot_start = std::time::Instant::now();
         let changed_bodies = syntax.borrow().changed_bodies();
         let update = if let Some(capture_scope) = &capture_scope {
-            ai::incremental_snapshot(
+            match ai::incremental_snapshot(
                 &frontend,
                 &path,
                 &source,
                 session.project_root.as_deref(),
                 &mut snapshot_state,
                 capture_scope,
-            )?
+            )? {
+                ai::SnapshotOutcome::Done(update) => update,
+                ai::SnapshotOutcome::Retry(retry) => return Ok(ai::SnapshotOutcome::Retry(retry)),
+            }
         } else {
             ai::VerificationSnapshotUpdate::Full(ai::snapshot(
                 &frontend,
@@ -335,7 +340,7 @@ impl AnalysisRevision {
         self.signature_edges = frontend.db.typed_bodies.signature_edge_count();
         self.distinct_signatures = frontend.db.typed_bodies.distinct_signature_count();
         self.frontend = Some(frontend);
-        Ok(update)
+        Ok(ai::SnapshotOutcome::Done(update))
     }
 }
 

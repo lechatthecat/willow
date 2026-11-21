@@ -438,39 +438,34 @@ fn analyze(
         revision.analyze_verification_delta(session, diagnostics)
     };
     let mut diagnostics = Diagnostics::default();
-    let result = run(revision, &mut diagnostics);
-    let mut update = match result {
-        Err(error)
-            if error
-                .downcast_ref::<crate::ai::VerificationSnapshotColdFallback>()
-                .is_some() =>
-        {
-            // Duplicate declaration identities cannot safely key reusable body
-            // or call-graph facts. Rebuild this ambiguous scope from source.
-            *revision = crate::compiler_db::revision::AnalysisRevision::default();
-            diagnostics = Diagnostics::default();
-            run(revision, &mut diagnostics)
-        }
-        Err(error)
-            if error
-                .downcast_ref::<crate::ai::VerificationSnapshotFallback>()
-                .is_some() =>
-        {
-            revision.snapshot_state = crate::ai::VerificationSnapshotState::default();
+    let result = match run(revision, &mut diagnostics) {
+        Ok(crate::ai::SnapshotOutcome::Retry(retry)) => {
+            match retry {
+                // Duplicate identities cannot safely key reusable compiler facts.
+                crate::ai::SnapshotRetry::ColdCompilation => *revision = Default::default(),
+                crate::ai::SnapshotRetry::FullCapture => {
+                    revision.snapshot_state = Default::default()
+                }
+            }
             diagnostics = Diagnostics::default();
             run(revision, &mut diagnostics)
         }
         result => result,
-    }
-    .map_err(|error| {
-        let messages = diagnostics
-            .facts
-            .iter()
-            .map(|d| format!("{}: {}", d.code, d.message))
-            .collect::<Vec<_>>()
-            .join("; ");
-        anyhow::anyhow!("{error:#}: {messages}")
-    })?;
+    };
+    let mut update = result
+        .and_then(|outcome| match outcome {
+            crate::ai::SnapshotOutcome::Done(update) => Ok(update),
+            crate::ai::SnapshotOutcome::Retry(retry) => anyhow::bail!("{retry}"),
+        })
+        .map_err(|error| {
+            let messages = diagnostics
+                .facts
+                .iter()
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::anyhow!("{error:#}: {messages}")
+        })?;
     let capture_result = (|| -> Result<Capture> {
         let snapshot = match &mut update {
             crate::ai::VerificationSnapshotUpdate::Full(snapshot) => snapshot,
@@ -608,18 +603,6 @@ fn compare_keys(
         }
     }
     for (base_key, new_key) in comparisons {
-        // Emit evidence only for the compared slice, never the untouched
-        // inventory. Persistent maps above keep lookup proportional to output.
-        if let Some(key) = base_key
-            && let Some(evidence) = before.panic_evidence.get(key)
-        {
-            old_panic.insert(key, evidence);
-        }
-        if let Some(key) = new_key
-            && let Some(evidence) = after.panic_evidence.get(key)
-        {
-            new_panic.insert(key, evidence);
-        }
         let key = base_key.or(new_key).expect("comparison identity");
         let target_key = new_key.unwrap_or(key);
         let a = base_key.and_then(|key| old.facts.get(key));
@@ -637,31 +620,41 @@ fn compare_keys(
         let be = b
             .and_then(|f| f.effects.as_ref())
             .map_or(0, |e| e.may | e.unknown);
-        let stem = key.rsplit_once('#').map_or(key.as_str(), |(stem, _)| stem);
-        if before.ambiguous.contains(stem) || after.ambiguous.contains(stem) {
-            continue;
-        }
         let added = be & !ae;
         let removed = ae & !be;
         let av = ae & contract_bits(ca);
         let bv = be & contract_bits(cb);
+        let signature_a = a.and_then(|f| f.signature.as_ref());
+        let signature_b = b.and_then(|f| f.signature.as_ref());
+        let effects_changed =
+            a.and_then(|f| f.effects.as_ref()) != b.and_then(|f| f.effects.as_ref());
+        let summary_changed =
+            signature_a != signature_b || effects_changed || ca != cb || av != 0 || bv != 0;
+        let raw_targets_changed = a.map(|f| &f.callees) != b.map(|f| &f.callees);
+        // Body-only edits still carry proof evidence. Visiting an identical
+        // owner during matching or a full comparison must not add evidence.
+        if base_key != new_key
+            || summary_changed
+            || raw_targets_changed
+            || a.map(|f| &f.body) != b.map(|f| &f.body)
+        {
+            old_panic.extend(base_key.and_then(|key| before.panic_evidence.get_key_value(key)));
+            new_panic.extend(new_key.and_then(|key| after.panic_evidence.get_key_value(key)));
+        }
+        let stem = key.rsplit_once('#').map_or(key.as_str(), |(stem, _)| stem);
+        if before.ambiguous.contains(stem) || after.ambiguous.contains(stem) {
+            continue;
+        }
         if added != 0 {
             growth += 1;
         }
-        let signature_a = a.and_then(|f| f.signature.as_ref());
-        let signature_b = b.and_then(|f| f.signature.as_ref());
-        let targets_a = a.map(|f| matching::targets(&f.callees, &renames));
         let targets_b = b.map(|f| &f.callees);
-        let effects_changed =
-            a.and_then(|f| f.effects.as_ref()) != b.and_then(|f| f.effects.as_ref());
-        if signature_a == signature_b
-            && !effects_changed
-            && ca == cb
-            && targets_a.as_ref() == targets_b
-            && !renamed
-            && av == 0
-            && bv == 0
-        {
+        let targets_changed = if renames.is_empty() {
+            raw_targets_changed
+        } else {
+            a.map(|f| matching::targets(&f.callees, &renames)).as_ref() != targets_b
+        };
+        if !summary_changed && !targets_changed && !renamed {
             continue;
         }
         let matching = if renamed {
@@ -725,7 +718,7 @@ fn compare_keys(
             "contract":{"change":contract_change,"base":ca,"target":cb,"base_violations":effect_names(av),"target_violations":effect_names(bv)},
             "public_api":public_api,
             "targets":{"base":a.map(|f| &f.callees),"target":targets_b,
-                "change":if targets_a.as_ref() == targets_b {"unchanged"} else {"changed"}}}));
+                "change":if targets_changed {"changed"} else {"unchanged"}}}));
     }
     impact::assign(&mut changes, old, new)?;
     let impacted: BTreeSet<_> = changes

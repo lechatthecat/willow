@@ -233,7 +233,9 @@ impl EffectRootLocation {
     fn block(self, program: &Program) -> Option<&Block> {
         match self {
             Self::Function(item) => match program.items.get(item)? {
-                Item::Function(f) => Some(&f.body),
+                // The parser gives a foreign declaration a placeholder block.
+                // Its effects are seeded from the declaration by the full unit solver.
+                Item::Function(f) if f.rust_bridge.is_none() => Some(&f.body),
                 _ => None,
             },
             Self::Method { item, member } => match program.items.get(item)? {

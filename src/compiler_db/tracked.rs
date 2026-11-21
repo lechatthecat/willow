@@ -299,17 +299,41 @@ pub(crate) struct TrackedStats {
 /// Dispatcher implementations may only read captured inputs and other queries.
 /// Source capture, resolution and artifact I/O remain outside this boundary.
 pub(crate) trait QueryProvider {
-    fn compute(&self, table: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue>;
+    fn compute(
+        &self,
+        table: &TrackedQueryTable,
+        node: &QueryNode,
+    ) -> Result<QueryOutcome<QueryValue>>;
     fn contains_body(&self, _body: BodyId) -> bool {
         false
     }
 }
 
-/// A pure query needs work performed outside evaluation (artifact/checker I/O).
-/// This control-flow error is never memoized as a diagnostic.
-#[derive(Debug, thiserror::Error)]
-#[error("deferred compiler query: {0:?}")]
-pub(crate) struct DeferredQuery(pub QueryNode);
+/// A deferred query needs work outside pure evaluation and cannot publish a memo.
+pub(crate) enum QueryOutcome<T> {
+    Ready(T),
+    Deferred(Box<QueryNode>),
+}
+
+impl<T> QueryOutcome<T> {
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> QueryOutcome<U> {
+        match self {
+            Self::Ready(value) => QueryOutcome::Ready(f(value)),
+            Self::Deferred(node) => QueryOutcome::Deferred(node),
+        }
+    }
+}
+
+// Propagate both a failed read and a deferred dependency through a provider.
+macro_rules! query_ready {
+    ($read:expr) => {
+        match $read? {
+            QueryOutcome::Ready(value) => value,
+            QueryOutcome::Deferred(node) => return Ok(QueryOutcome::Deferred(node)),
+        }
+    };
+}
+pub(crate) use query_ready;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -821,12 +845,24 @@ impl TrackedQueryTable {
             });
         }
     }
+    /// Read a required value after its inputs or prepared result have been supplied.
     pub(crate) fn read(
         &self,
         provider: &impl QueryProvider,
         node: QueryNode,
     ) -> Result<QueryValue> {
-        self.read_stamped(provider, node).map(|(value, _)| value)
+        match self.evaluate(provider, node)? {
+            QueryOutcome::Ready(value) => Ok(value),
+            QueryOutcome::Deferred(node) => anyhow::bail!("deferred compiler query: {node:?}"),
+        }
+    }
+
+    pub(crate) fn evaluate(
+        &self,
+        provider: &impl QueryProvider,
+        node: QueryNode,
+    ) -> Result<QueryOutcome<QueryValue>> {
+        Ok(self.read_stamped(provider, node)?.map(|(value, _)| value))
     }
     /// The stamp changes only when exact query-value equality detects a change.
     /// It is meaningful within this table and its revision candidates only.
@@ -834,7 +870,7 @@ impl TrackedQueryTable {
         &self,
         provider: &impl QueryProvider,
         node: QueryNode,
-    ) -> Result<(QueryValue, Revision)> {
+    ) -> Result<QueryOutcome<(QueryValue, Revision)>> {
         if self.demanded.borrow_mut().insert(node.clone()) {
             self.demanded_bytes.set(
                 self.demanded_bytes.get()
@@ -842,23 +878,31 @@ impl TrackedQueryTable {
                     + (std::mem::size_of::<QueryNode>() + 32) * 2,
             );
         }
-        let memo = self.validate(provider, &node)?;
+        let memo = query_ready!(self.validate(provider, &node));
         self.record(DependencyNode::Query(node), memo.changed_at);
         memo.result
-            .map(|value| (value, memo.changed_at))
+            .map(|value| QueryOutcome::Ready((value, memo.changed_at)))
             .map_err(|error| anyhow::anyhow!("{error}"))
     }
-    fn validate(&self, provider: &impl QueryProvider, node: &QueryNode) -> Result<Memo> {
+    fn validate(
+        &self,
+        provider: &impl QueryProvider,
+        node: &QueryNode,
+    ) -> Result<QueryOutcome<Memo>> {
         // Dependency validation walks an explicit stack: nested bodies form
         // long dependency chains, and native recursion would make the stack
         // grow with source nesting. Only recomputation re-enters the provider.
-        let mut frames = match self.begin(provider, node)? {
-            Begin::Done(memo) => return Ok(memo),
+        let mut frames = match query_ready!(self.begin(provider, node)) {
+            Begin::Done(memo) => return Ok(QueryOutcome::Ready(memo)),
             Begin::Frame(frame) => Frames(vec![frame]),
         };
         self.drive(provider, &mut frames)
     }
-    fn drive<'a>(&'a self, provider: &impl QueryProvider, frames: &mut Frames<'a>) -> Result<Memo> {
+    fn drive<'a>(
+        &'a self,
+        provider: &impl QueryProvider,
+        frames: &mut Frames<'a>,
+    ) -> Result<QueryOutcome<Memo>> {
         let mut child: Option<Memo> = None;
         loop {
             let Frame {
@@ -891,7 +935,8 @@ impl TrackedQueryTable {
                         *durability = (*durability).min(v.durability);
                         v.changed_at
                     }),
-                    DependencyNode::Query(query) => match self.begin(provider, query)? {
+                    DependencyNode::Query(query) => match query_ready!(self.begin(provider, query))
+                    {
                         Begin::Done(memo) => {
                             *durability = (*durability).min(memo.durability);
                             Some(memo.changed_at)
@@ -913,17 +958,21 @@ impl TrackedQueryTable {
             let memo = if green {
                 self.publish_green(frame)
             } else {
-                self.recompute(provider, frame)?
+                query_ready!(self.recompute(provider, frame))
             };
             if frames.0.is_empty() {
-                return Ok(memo);
+                return Ok(QueryOutcome::Ready(memo));
             }
             child = Some(memo);
         }
     }
     /// Enter one query: return a current memo, or a frame whose previous
     /// dependencies still need validation. A query without a memo computes.
-    fn begin<'a>(&'a self, provider: &impl QueryProvider, node: &QueryNode) -> Result<Begin<'a>> {
+    fn begin<'a>(
+        &'a self,
+        provider: &impl QueryProvider,
+        node: &QueryNode,
+    ) -> Result<QueryOutcome<Begin<'a>>> {
         self.assert_active_owner();
         self.check_cycle()?;
         if let QueryNode::TypedBody(body) | QueryNode::LirBody(body) = node {
@@ -958,14 +1007,14 @@ impl TrackedQueryTable {
                     let mut memo = memo.clone();
                     memo.verified_at = self.revision;
                     memo.durability = durability;
-                    return Ok(Begin::Done(memo));
+                    return Ok(QueryOutcome::Ready(Begin::Done(memo)));
                 }
                 debug_assert!(
                     memo.changed_at <= memo.verified_at,
                     "invalid revision in {node:?}"
                 );
                 if memo.verified_at == self.revision {
-                    return Ok(Begin::Done(memo.clone()));
+                    return Ok(QueryOutcome::Ready(Begin::Done(memo.clone())));
                 }
                 Some(memo.clone())
             }
@@ -996,7 +1045,7 @@ impl TrackedQueryTable {
                         shortcut: false,
                     },
                 )
-                .map(Begin::Done);
+                .map(|outcome| outcome.map(Begin::Done));
         };
         self.bump(|s| s.validated += 1);
         crate::query_stats::tracked_event(node, "validate", self.revision.0);
@@ -1006,13 +1055,13 @@ impl TrackedQueryTable {
         } else {
             Durability::High
         };
-        Ok(Begin::Frame(Frame {
+        Ok(QueryOutcome::Ready(Begin::Frame(Frame {
             guard,
             previous,
             next: 0,
             durability,
             shortcut,
-        }))
+        })))
     }
     fn publish_green(&self, frame: Frame<'_>) -> Memo {
         let Frame {
@@ -1051,23 +1100,26 @@ impl TrackedQueryTable {
         self.bump(|stats| stats.validation_metadata_entries += 1);
         memo
     }
-    fn recompute(&self, provider: &impl QueryProvider, frame: Frame<'_>) -> Result<Memo> {
+    fn recompute(
+        &self,
+        provider: &impl QueryProvider,
+        frame: Frame<'_>,
+    ) -> Result<QueryOutcome<Memo>> {
         let Frame {
             guard, previous, ..
         } = frame;
         let node = &guard.node;
         self.stack.borrow_mut().last_mut().unwrap().recording = true;
         crate::query_stats::tracked_event(node, "recompute", self.revision.0);
-        let result = provider.compute(self, node);
-        if let Err(error) = &result
-            && error.downcast_ref::<DeferredQuery>().is_some()
-        {
-            self.deferred.set(true);
-            return Err(result.err().unwrap());
-        }
-        if self.deferred.get() {
-            return Err(DeferredQuery(node.clone()).into());
-        }
+        let result = match provider.compute(self, node) {
+            Ok(QueryOutcome::Deferred(node)) => {
+                self.deferred.set(true);
+                return Ok(QueryOutcome::Deferred(node));
+            }
+            _ if self.deferred.get() => return Ok(QueryOutcome::Deferred(Box::new(node.clone()))),
+            Ok(QueryOutcome::Ready(value)) => Ok(value),
+            Err(error) => Err(error),
+        };
         self.bump(|s| s.recomputed += 1);
         #[cfg(test)]
         {
@@ -1162,7 +1214,7 @@ impl TrackedQueryTable {
                     + (std::mem::size_of::<QueryNode>() + 32) * 2,
             );
         }
-        Ok(memo)
+        Ok(QueryOutcome::Ready(memo))
     }
     fn bump(&self, f: impl FnOnce(&mut TrackedStats)) {
         let before = self.stats.get();
@@ -1257,8 +1309,12 @@ mod tests {
     use super::*;
     struct InputReader(InputNode);
     impl QueryProvider for InputReader {
-        fn compute(&self, table: &TrackedQueryTable, _: &QueryNode) -> Result<QueryValue> {
-            table.input(&self.0)
+        fn compute(
+            &self,
+            table: &TrackedQueryTable,
+            _: &QueryNode,
+        ) -> Result<QueryOutcome<QueryValue>> {
+            table.input(&self.0).map(QueryOutcome::Ready)
         }
     }
     #[test]
@@ -1346,8 +1402,14 @@ mod tests {
     fn changed_query_journal_excludes_equal_recomputation_and_presentation() {
         struct Parity;
         impl QueryProvider for Parity {
-            fn compute(&self, table: &TrackedQueryTable, _: &QueryNode) -> Result<QueryValue> {
-                Ok(value(*table.input(&input(0))?.get::<i64>() % 2))
+            fn compute(
+                &self,
+                table: &TrackedQueryTable,
+                _: &QueryNode,
+            ) -> Result<QueryOutcome<QueryValue>> {
+                Ok(QueryOutcome::Ready(value(
+                    *table.input(&input(0))?.get::<i64>() % 2,
+                )))
             }
         }
         let mut table = TrackedQueryTable::default();
@@ -1400,28 +1462,98 @@ mod tests {
     fn changed_query_journal_excludes_unpublished_deferred_and_cyclic_results() {
         struct Deferred;
         impl QueryProvider for Deferred {
-            fn compute(&self, _: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
-                Err(DeferredQuery(node.clone()).into())
+            fn compute(
+                &self,
+                _: &TrackedQueryTable,
+                node: &QueryNode,
+            ) -> Result<QueryOutcome<QueryValue>> {
+                Ok(QueryOutcome::Deferred(Box::new(node.clone())))
             }
         }
         struct Cycle;
         impl QueryProvider for Cycle {
-            fn compute(&self, table: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
-                table.read(self, node.clone())
+            fn compute(
+                &self,
+                table: &TrackedQueryTable,
+                node: &QueryNode,
+            ) -> Result<QueryOutcome<QueryValue>> {
+                table.evaluate(self, node.clone())
             }
         }
         let table = TrackedQueryTable::default();
-        assert!(table.read(&Deferred, query(0)).is_err());
+        assert!(
+            matches!(table.evaluate(&Deferred, query(0)).unwrap(), QueryOutcome::Deferred(node) if *node == query(0))
+        );
         assert!(table.changed_queries().is_empty());
         assert!(table.read(&Cycle, query(0)).is_err());
         assert!(table.changed_queries().is_empty());
     }
 
     #[test]
+    fn deferred_child_prevents_publication_and_recovers_after_preparation() {
+        struct Parent {
+            prepared: Cell<bool>,
+            fail: bool,
+        }
+        impl QueryProvider for Parent {
+            fn compute(
+                &self,
+                table: &TrackedQueryTable,
+                node: &QueryNode,
+            ) -> Result<QueryOutcome<QueryValue>> {
+                if node == &query(1) {
+                    let input = table.input(&input(0))?;
+                    return Ok(if self.prepared.get() {
+                        QueryOutcome::Ready(input)
+                    } else {
+                        QueryOutcome::Deferred(Box::new(node.clone()))
+                    });
+                }
+                match table.evaluate(self, query(1))? {
+                    QueryOutcome::Ready(value) => Ok(QueryOutcome::Ready(value)),
+                    QueryOutcome::Deferred(_) if self.fail => anyhow::bail!("incomplete child"),
+                    QueryOutcome::Deferred(_) => Ok(QueryOutcome::Ready(value(99))),
+                }
+            }
+        }
+        for fail in [false, true] {
+            let parent = Parent {
+                prepared: Cell::new(false),
+                fail,
+            };
+            let mut table = TrackedQueryTable::default();
+            table.accept(vec![(input(0), value(1))]).unwrap();
+            assert!(
+                matches!(table.evaluate(&parent, query(0)).unwrap(), QueryOutcome::Deferred(node) if *node == query(0))
+            );
+            assert!(table.states.borrow().is_empty());
+            assert!(table.changed_queries().is_empty());
+            parent.prepared.set(true);
+            assert_eq!(*table.read(&parent, query(0)).unwrap().get::<i64>(), 1);
+            table.accept(vec![(input(0), value(2))]).unwrap();
+            parent.prepared.set(false);
+            // Validation of an existing edge propagates the child's identity
+            // and preserves both previous memos for another attempt.
+            assert!(
+                matches!(table.evaluate(&parent, query(0)).unwrap(), QueryOutcome::Deferred(node) if *node == query(1))
+            );
+            assert!(table.changed_queries().is_empty());
+            assert_eq!(table.states.borrow().len(), 2);
+            parent.prepared.set(true);
+            assert_eq!(*table.read(&parent, query(0)).unwrap().get::<i64>(), 2);
+            assert_eq!(table.changed_queries().len(), 2);
+        }
+    }
+
+    #[test]
     fn changed_query_journal_tracks_only_demanded_results_and_cached_errors() {
         struct Fallible;
         impl QueryProvider for Fallible {
-            fn compute(&self, table: &TrackedQueryTable, _: &QueryNode) -> Result<QueryValue> {
+            fn compute(
+                &self,
+                table: &TrackedQueryTable,
+                _: &QueryNode,
+            ) -> Result<QueryOutcome<QueryValue>> {
                 let n = *table.input(&input(0))?.get::<i64>();
                 anyhow::bail!("failure {n}")
             }
@@ -1507,15 +1639,19 @@ mod tests {
     fn green_parent_inherits_downgraded_dependency_durability() {
         struct Chain(usize);
         impl QueryProvider for Chain {
-            fn compute(&self, table: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
+            fn compute(
+                &self,
+                table: &TrackedQueryTable,
+                node: &QueryNode,
+            ) -> Result<QueryOutcome<QueryValue>> {
                 let QueryNode::Parse(path) = node else {
                     unreachable!()
                 };
                 let index: usize = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
                 if index < self.0 {
-                    table.read(self, query(index + 1))
+                    table.evaluate(self, query(index + 1))
                 } else {
-                    table.input(&input(0))
+                    table.input(&input(0)).map(QueryOutcome::Ready)
                 }
             }
         }
@@ -1587,17 +1723,21 @@ mod tests {
         catch: bool,
     }
     impl QueryProvider for RecoveringCycle {
-        fn compute(&self, table: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
+        fn compute(
+            &self,
+            table: &TrackedQueryTable,
+            node: &QueryNode,
+        ) -> Result<QueryOutcome<QueryValue>> {
             if node == &query(0) && *table.input(&input(0))?.get::<i64>() != 0 {
-                return Ok(value(42));
+                return Ok(QueryOutcome::Ready(value(42)));
             }
             let QueryNode::Parse(path) = node else {
                 unreachable!()
             };
             let index: usize = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
-            let result = table.read(self, query((index + 1) % self.length));
+            let result = table.evaluate(self, query((index + 1) % self.length));
             if self.catch {
-                Ok(result.unwrap_or_else(|_| value(99)))
+                Ok(result.unwrap_or_else(|_| QueryOutcome::Ready(value(99))))
             } else {
                 result.context("dependent query failed")
             }
@@ -1680,17 +1820,25 @@ mod tests {
         fail: bool,
     }
     impl QueryProvider for Graph {
-        fn compute(&self, table: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
+        fn compute(
+            &self,
+            table: &TrackedQueryTable,
+            node: &QueryNode,
+        ) -> Result<QueryOutcome<QueryValue>> {
             let mut total = 0;
             for dep in &self.edges[node] {
                 let v = match dep {
                     DependencyNode::Input(i) => table.input(i)?,
-                    DependencyNode::Query(q) => table.read(self, q.clone())?,
+                    DependencyNode::Query(q) => query_ready!(table.evaluate(self, q.clone())),
                 };
                 total += *v.get::<i64>();
             }
             anyhow::ensure!(!self.fail || total >= 0, "negative input");
-            Ok(value(if self.parity { total % 2 } else { total }))
+            Ok(QueryOutcome::Ready(value(if self.parity {
+                total % 2
+            } else {
+                total
+            })))
         }
     }
     fn graph(edges: Vec<(usize, Vec<DependencyNode>)>) -> Graph {
@@ -1765,9 +1913,13 @@ mod tests {
     fn result_collision_and_diagnostic_changes_propagate() {
         struct Diagnostics;
         impl QueryProvider for Diagnostics {
-            fn compute(&self, table: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
+            fn compute(
+                &self,
+                table: &TrackedQueryTable,
+                node: &QueryNode,
+            ) -> Result<QueryOutcome<QueryValue>> {
                 let result = if node == &query(0) {
-                    table.read(self, query(1))?
+                    query_ready!(table.evaluate(self, query(1)))
                 } else {
                     let input = table.input(&input(0))?;
                     QueryValue::new(
@@ -1775,7 +1927,7 @@ mod tests {
                         ResultFingerprint(0),
                     )
                 };
-                Ok(result)
+                Ok(QueryOutcome::Ready(result))
             }
         }
         let mut table = TrackedQueryTable::default();
@@ -1794,8 +1946,12 @@ mod tests {
     fn cross_database_reads_cannot_escape_dependency_recording() {
         struct CrossDatabase(TrackedQueryTable);
         impl QueryProvider for CrossDatabase {
-            fn compute(&self, _: &TrackedQueryTable, _: &QueryNode) -> Result<QueryValue> {
-                self.0.input(&input(0))
+            fn compute(
+                &self,
+                _: &TrackedQueryTable,
+                _: &QueryNode,
+            ) -> Result<QueryOutcome<QueryValue>> {
+                self.0.input(&input(0)).map(QueryOutcome::Ready)
             }
         }
         let mut other = TrackedQueryTable::default();
@@ -1856,7 +2012,11 @@ mod tests {
         assert_frozen_read();
         struct Panics;
         impl QueryProvider for Panics {
-            fn compute(&self, _: &TrackedQueryTable, _: &QueryNode) -> Result<QueryValue> {
+            fn compute(
+                &self,
+                _: &TrackedQueryTable,
+                _: &QueryNode,
+            ) -> Result<QueryOutcome<QueryValue>> {
                 panic!("test")
             }
         }
@@ -1876,7 +2036,11 @@ mod tests {
     fn panic_during_nested_validation_unwinds_every_frame() {
         struct PanicsAt<'a>(&'a Graph, QueryNode);
         impl QueryProvider for PanicsAt<'_> {
-            fn compute(&self, table: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
+            fn compute(
+                &self,
+                table: &TrackedQueryTable,
+                node: &QueryNode,
+            ) -> Result<QueryOutcome<QueryValue>> {
                 assert_ne!(node, &self.1, "test");
                 self.0.compute(table, node)
             }
@@ -1968,9 +2132,15 @@ mod tests {
     fn branch_changes_replace_dependencies_even_when_result_backdates() {
         struct Branch;
         impl QueryProvider for Branch {
-            fn compute(&self, table: &TrackedQueryTable, _: &QueryNode) -> Result<QueryValue> {
+            fn compute(
+                &self,
+                table: &TrackedQueryTable,
+                _: &QueryNode,
+            ) -> Result<QueryOutcome<QueryValue>> {
                 let selector = *table.input(&input(0))?.get::<i64>();
-                table.input(&input(if selector == 0 { 1 } else { 2 }))
+                table
+                    .input(&input(if selector == 0 { 1 } else { 2 }))
+                    .map(QueryOutcome::Ready)
             }
         }
         let mut table = TrackedQueryTable::default();
@@ -1997,10 +2167,14 @@ mod tests {
     fn debug_guards_detect_read_bypass_missing_inputs_and_dangling_bodies() {
         struct Bypass;
         impl QueryProvider for Bypass {
-            fn compute(&self, _: &TrackedQueryTable, _: &QueryNode) -> Result<QueryValue> {
+            fn compute(
+                &self,
+                _: &TrackedQueryTable,
+                _: &QueryNode,
+            ) -> Result<QueryOutcome<QueryValue>> {
                 let old = super::super::query::QueryTable::<i32, i32>::default();
                 old.ready(&0);
-                Ok(value(0))
+                Ok(QueryOutcome::Ready(value(0)))
             }
         }
         let table = TrackedQueryTable::default();

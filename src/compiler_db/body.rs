@@ -640,7 +640,7 @@ impl BodyQueries {
         while let Some(body) = pending.pop() {
             let Some(candidate) = self.candidates.borrow_mut().remove(&body) else {
                 // A missing artifact still demands the semantic query before
-                // checking; its DeferredQuery is resolved by publication below.
+                // checking; publication below makes the deferred result available.
                 if body == id
                     && let Some(tracking) = self.tracking.borrow().as_ref()
                     && let Some((path, owner)) = tracking.owners.get(&id)

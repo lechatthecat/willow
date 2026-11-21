@@ -955,6 +955,10 @@ fn semantic_diff_incremental_cold_oracle_edit_shapes() {
     ]);
     for (before, after) in [
         (
+            "fn leaf() {} @effects(no_panic) fn guard() { leaf(); } fn main() {}",
+            r#"fn leaf() { panic("bad"); } @effects(no_panic) fn guard() { leaf(); } fn main() {}"#,
+        ),
+        (
             "fn a() { b(); } fn b() { a(); } fn main() {}",
             "fn a() { b(); } fn b() { println(1); a(); } fn main() {}",
         ),
@@ -1342,6 +1346,149 @@ fn semantic_diff_retained_nominal_coordinates_match_cold() {
     let after = format!("fn leaf() {{ println(42); }}\n{suffix}");
     let moved = format!("\n\n{after}");
     incremental_oracle(&[&before, &after, &moved, &before]);
+}
+
+#[test]
+fn semantic_diff_retry_scope_preserves_the_accepted_revision() {
+    use crate::ai::incremental_snapshot::OWN_EFFECT_ENTRIES_COPIED;
+    use crate::ai::{SnapshotOutcome, SnapshotRetry, VerificationSnapshotUpdate};
+    let scratch = tree::Scratch::new().unwrap();
+    let path = scratch.0.join("main.wi");
+    let options = crate::CompilerOptions::debug();
+    let session = || crate::CompilerSession::new(path.to_str().unwrap(), "", &options, None);
+    for count in [8, 32, 128] {
+        let owners = (0..count)
+            .map(|i| format!("fn owner_{i}() {{}} "))
+            .collect::<String>();
+        let base = format!("{owners} fn same() {{}} fn main() {{}}");
+        let edits = owners.replace("{}", "{ println(1); }");
+        for (edited, expected) in [
+            (
+                "class Added {} fn same() {} fn main() {}",
+                SnapshotRetry::FullCapture,
+            ),
+            (
+                "fn same() {} fn same() { println(42); } fn main() {}",
+                SnapshotRetry::ColdCompilation,
+            ),
+        ] {
+            let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+            fs::write(&path, &base).unwrap();
+            OWN_EFFECT_ENTRIES_COPIED.set(0);
+            assert!(matches!(
+                revision
+                    .analyze_verification_delta(session(), &mut Diagnostics::default())
+                    .unwrap(),
+                SnapshotOutcome::Done(VerificationSnapshotUpdate::Full(_))
+            ));
+            let full_copies = OWN_EFFECT_ENTRIES_COPIED.get();
+            assert_eq!(full_copies, count + 2);
+            let accepted =
+                serde_json::to_value(revision.snapshot_state.materialize().unwrap()).unwrap();
+            fs::write(&path, format!("{edits} {edited}")).unwrap();
+            OWN_EFFECT_ENTRIES_COPIED.set(0);
+            let attempt = revision
+                .analyze_verification_delta(session(), &mut Diagnostics::default())
+                .unwrap();
+            assert!(
+                matches!(attempt, SnapshotOutcome::Retry(retry) if retry == expected),
+                "{edited}"
+            );
+            assert_eq!(
+                OWN_EFFECT_ENTRIES_COPIED.get(),
+                0,
+                "{expected:?} at {count}"
+            );
+            eprintln!("effect copy {expected:?} owners={count} full={full_copies} retry=0");
+            assert_eq!(
+                serde_json::to_value(revision.snapshot_state.materialize().unwrap()).unwrap(),
+                accepted
+            );
+            fs::write(&path, &base).unwrap();
+            assert!(matches!(
+                revision
+                    .analyze_verification_delta(session(), &mut Diagnostics::default())
+                    .unwrap(),
+                SnapshotOutcome::Done(VerificationSnapshotUpdate::Delta { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn semantic_diff_first_rust_bridge_retries_and_matches_cold() {
+    use crate::ai::{SnapshotOutcome, SnapshotRetry};
+    use crate::compiler_db::revision::AnalysisRevision;
+    let scratch = tree::Scratch::new().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_bridge/path");
+    for file in ["project.toml", "native/Cargo.toml", "native/src/lib.rs"] {
+        let target = scratch.0.join(file);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(fixture.join(file), target).unwrap();
+    }
+    fs::write(
+        scratch.0.join("bridge.rs"),
+        "pub fn foreign() -> i64 { willow_bridge_native::answer() as i64 }",
+    )
+    .unwrap();
+    fs::create_dir(scratch.0.join("src")).unwrap();
+    fs::write(
+        scratch.0.join("src/helper.wi"),
+        "pub fn untouched() -> i64 { return 7; }",
+    )
+    .unwrap();
+    let entry = Path::new("src/main.wi");
+    let path = scratch.0.join(entry);
+    let options = Options {
+        root: scratch.0.clone(),
+        entry: Some(entry.into()),
+        project: true,
+        base: String::new(),
+        fail_on_growth: false,
+    };
+    let mut compiler = crate::CompilerOptions::debug();
+    compiler.offline = true;
+    for (extra, expected) in [
+        ("", SnapshotRetry::FullCapture),
+        ("fn same() { println(42); }", SnapshotRetry::ColdCompilation),
+    ] {
+        let mut revision = AnalysisRevision::default();
+        fs::write(
+            &path,
+            "import helper; fn same() {} fn main() { println(helper::untouched()); }",
+        )
+        .unwrap();
+        let base = analyze(&options, &scratch, &mut revision, entry).unwrap();
+        fs::write(&path, format!("import helper; extern rust {{ fn foreign() -> i64; }} fn same() {{}} {extra} fn main() {{ println(foreign() + helper::untouched()); }}")).unwrap();
+        let session = crate::CompilerSession::new(
+            path.to_str().unwrap(),
+            "",
+            &compiler,
+            Some(scratch.0.clone()),
+        );
+        let attempt = revision
+            .analyze_verification_delta(session, &mut Diagnostics::default())
+            .unwrap();
+        assert!(
+            matches!(attempt, SnapshotOutcome::Retry(retry) if retry == expected),
+            "{expected:?}"
+        );
+
+        let warm = analyze(&options, &scratch, &mut revision, entry).unwrap();
+        let mut fresh = AnalysisRevision::default();
+        let cold = analyze(&options, &scratch, &mut fresh, entry).unwrap();
+        let snapshot = revision.snapshot_state.materialize().unwrap();
+        assert_eq!(snapshot.semantic.interop.bridges.len(), 1);
+        assert!(snapshot.functions.iter().any(|f| f.name == "untouched"));
+        assert_eq!(
+            serde_json::to_value(snapshot).unwrap(),
+            serde_json::to_value(fresh.snapshot_state.materialize().unwrap()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(compare(&base, &warm, false).unwrap()).unwrap(),
+            serde_json::to_value(compare(&base, &cold, false).unwrap()).unwrap()
+        );
+    }
 }
 
 #[test]

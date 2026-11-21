@@ -1,8 +1,8 @@
 //! Pure syntax queries; source capture and artifact I/O stay at the caller.
 use super::retained::Retained;
 use super::tracked::{
-    InputNode, QueryNode, QueryProvider, QueryValue, ResultFingerprint, TrackedQueryTable,
-    TrackedStats,
+    InputNode, QueryNode, QueryOutcome, QueryProvider, QueryValue, ResultFingerprint,
+    TrackedQueryTable, TrackedStats, query_ready,
 };
 use crate::{
     diagnostics::{Diagnostic, FileId, Span},
@@ -650,20 +650,11 @@ impl SyntaxQueries {
         self.capture_semantic(unit, reads)?;
         self.register_body(unit, body, path, owner);
         self.checked_roots.insert(body);
-        match self
-            .table
-            .read(&self.provider(), QueryNode::TypedBody(body))
-        {
-            Ok(_) => Ok(true),
-            Err(error)
-                if error
-                    .downcast_ref::<super::tracked::DeferredQuery>()
-                    .is_some() =>
-            {
-                Ok(false)
-            }
-            Err(error) => Err(error),
-        }
+        Ok(matches!(
+            self.table
+                .evaluate(&self.provider(), QueryNode::TypedBody(body))?,
+            QueryOutcome::Ready(_)
+        ))
     }
     /// Typed owners whose semantic result changed in this candidate. Source
     /// removals must be supplied separately by the source inventory owner.
@@ -775,8 +766,8 @@ impl SyntaxQueries {
                 ResultFingerprint::bytes(b"derived-dependencies-v1"),
             ),
         )?;
-        match self.table.read(&self.provider(), node) {
-            Ok(result) => {
+        match self.table.evaluate(&self.provider(), node)? {
+            QueryOutcome::Ready(result) => {
                 let wire = &result.get::<DerivedValue>().wire;
                 match wire.split_first() {
                     Some((&DERIVED_WIRE_VERSION, payload)) => {
@@ -785,14 +776,7 @@ impl SyntaxQueries {
                     _ => Ok(None), // An older wire schema must be recomputed.
                 }
             }
-            Err(error)
-                if error
-                    .downcast_ref::<super::tracked::DeferredQuery>()
-                    .is_some() =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(error),
+            QueryOutcome::Deferred(_) => Ok(None),
         }
     }
     /// Record that this revision's correspondence moves retained coordinates.
@@ -893,20 +877,11 @@ impl SyntaxQueries {
     }
     pub(crate) fn validate_effects(&mut self, unit: UnitId, _roots: Vec<BodyId>) -> Result<bool> {
         self.capture_effect_epoch(unit)?;
-        match self
-            .table
-            .read(&self.provider(), QueryNode::EffectInventory(unit))
-        {
-            Ok(_) => Ok(true),
-            Err(error)
-                if error
-                    .downcast_ref::<super::tracked::DeferredQuery>()
-                    .is_some() =>
-            {
-                Ok(false)
-            }
-            Err(error) => Err(error),
-        }
+        Ok(matches!(
+            self.table
+                .evaluate(&self.provider(), QueryNode::EffectInventory(unit))?,
+            QueryOutcome::Ready(_)
+        ))
     }
     #[cfg(test)]
     pub(crate) fn publish_effects(
@@ -1556,8 +1531,12 @@ impl QueryProvider for SyntaxProvider<'_> {
         self.bodies.contains_key(&body)
     }
     #[allow(clippy::too_many_lines, reason = "split pending")]
-    fn compute(&self, table: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
-        match node {
+    fn compute(
+        &self,
+        table: &TrackedQueryTable,
+        node: &QueryNode,
+    ) -> Result<QueryOutcome<QueryValue>> {
+        let value = match node {
             QueryNode::CompilerEnvironment => {
                 let compiler = table.input(&InputNode::CompilerStamp)?;
                 let stdlib = table.input(&InputNode::StdlibStamp)?;
@@ -1569,7 +1548,7 @@ impl QueryProvider for SyntaxProvider<'_> {
                 ]))
             }
             QueryNode::Parse(path) => {
-                table.read(self, QueryNode::CompilerEnvironment)?;
+                query_ready!(table.evaluate(self, QueryNode::CompilerEnvironment));
                 let input = table.input(&InputNode::Source(path.clone()))?;
                 let source = input.get::<Source>();
                 let mut inventory = Vec::new();
@@ -1654,7 +1633,7 @@ impl QueryProvider for SyntaxProvider<'_> {
                 ))
             }
             QueryNode::SyntaxDeclarations(path) | QueryNode::SyntaxImports(path) => {
-                let parsed = table.read(self, QueryNode::Parse(path.clone()))?;
+                let parsed = query_ready!(table.evaluate(self, QueryNode::Parse(path.clone())));
                 let parsed = parsed.get::<ParsedValue>();
                 if matches!(node, QueryNode::SyntaxImports(_)) {
                     Ok(parsed.imports.clone().into_query())
@@ -1669,11 +1648,11 @@ impl QueryProvider for SyntaxProvider<'_> {
                     InputNode::SyntaxSignature(path.clone(), owner.clone())
                 };
                 if table.contains_input(&input) {
-                    return table.input(&input);
+                    return table.input(&input).map(QueryOutcome::Ready);
                 }
                 // An owner never observed in this file still has to track its
                 // possible future addition. A captured removal uses Null above.
-                let parsed = table.read(self, QueryNode::Parse(path.clone()))?;
+                let parsed = query_ready!(table.evaluate(self, QueryNode::Parse(path.clone())));
                 match parsed.get::<ParsedValue>().owners.get(owner) {
                     Some((signature, body)) => {
                         Ok((if matches!(node, QueryNode::BodySyntax(_, _)) {
@@ -1696,18 +1675,18 @@ impl QueryProvider for SyntaxProvider<'_> {
             | QueryNode::LirUnit(_)
             | QueryNode::AsyncFrameLayout(_) => {
                 let Some(prepared) = self.derived.get(node) else {
-                    return Err(super::tracked::DeferredQuery(node.clone()).into());
+                    return Ok(QueryOutcome::Deferred(Box::new(node.clone())));
                 };
                 let dependencies = table.input(&InputNode::DerivedDependencies(node.clone()))?;
                 for dependency in dependencies.get::<Vec<QueryNode>>() {
-                    table.read(self, dependency.clone())?;
+                    query_ready!(table.evaluate(self, dependency.clone()));
                 }
                 let fingerprint = ResultFingerprint::bytes(&prepared.canonical);
                 Ok(QueryValue::new(prepared.clone(), fingerprint))
             }
             QueryNode::EffectInventory(unit) => {
                 let Some(prepared) = self.effects.get(unit) else {
-                    return Err(super::tracked::DeferredQuery(node.clone()).into());
+                    return Ok(QueryOutcome::Deferred(Box::new(node.clone())));
                 };
                 self.effect_dependency_reads.set(
                     self.effect_dependency_reads.get()
@@ -1721,13 +1700,15 @@ impl QueryProvider for SyntaxProvider<'_> {
                 // journals separately force completion after type-only changes;
                 // no per-function dependency inventory is rebuilt here.
                 if let Some(path) = self.source_paths.get(unit) {
-                    table.read(self, QueryNode::Parse(path.clone()))?;
+                    query_ready!(table.evaluate(self, QueryNode::Parse(path.clone())));
                 }
                 for &id in self.interface_dispatch.get(unit).into_iter().flatten() {
-                    table.read(self, QueryNode::InterfaceDispatchTargets(*unit, id))?;
+                    query_ready!(
+                        table.evaluate(self, QueryNode::InterfaceDispatchTargets(*unit, id))
+                    );
                 }
                 for unit in &prepared.source_units {
-                    table.read(self, QueryNode::EffectInventory(*unit))?;
+                    query_ready!(table.evaluate(self, QueryNode::EffectInventory(*unit)));
                 }
                 Ok(QueryValue::new(
                     prepared.inventory.clone(),
@@ -1762,10 +1743,11 @@ impl QueryProvider for SyntaxProvider<'_> {
                 for id in members.get::<Vec<super::references::SymbolUseId>>() {
                     references.push((
                         id.clone(),
-                        table
-                            .read(self, QueryNode::ResolvedReference(id.clone()))?
-                            .get::<CompactJson>()
-                            .clone(),
+                        query_ready!(
+                            table.evaluate(self, QueryNode::ResolvedReference(id.clone()))
+                        )
+                        .get::<CompactJson>()
+                        .clone(),
                     ));
                 }
                 Ok(QueryValue::new(
@@ -1777,19 +1759,19 @@ impl QueryProvider for SyntaxProvider<'_> {
                 table.input(&InputNode::InterfaceDispatch(*unit, *id))
             }
             QueryNode::DispatchTargets(..) => {
-                super::dispatch::DispatchProvider.compute(table, node)
+                return super::dispatch::DispatchProvider.compute(table, node);
             }
             QueryNode::SemanticSignature(unit, key) => {
                 if let Ok(crate::semantic::symbols::SymbolRead::Dispatch(class, method)) =
                     serde_json::from_str(key)
                 {
-                    return table.read(self, QueryNode::DispatchTargets(*unit, class, method));
+                    return table.evaluate(self, QueryNode::DispatchTargets(*unit, class, method));
                 }
                 table.input(&InputNode::SemanticSymbol(*unit, key.clone()))
             }
             QueryNode::VisibleScope(unit, path) => {
-                table.read(self, QueryNode::SyntaxDeclarations(path.clone()))?;
-                table.read(self, QueryNode::SyntaxImports(path.clone()))?;
+                query_ready!(table.evaluate(self, QueryNode::SyntaxDeclarations(path.clone())));
+                query_ready!(table.evaluate(self, QueryNode::SyntaxImports(path.clone())));
                 table.input(&InputNode::VisibleDeclarations(*unit))
             }
             QueryNode::TypedBody(body) => {
@@ -1798,23 +1780,24 @@ impl QueryProvider for SyntaxProvider<'_> {
                     .get(body)
                     .ok_or_else(|| anyhow::anyhow!("unregistered body {body:?}"))?;
                 let Some(prepared) = self.prepared.get(body) else {
-                    return Err(super::tracked::DeferredQuery(node.clone()).into());
+                    return Ok(QueryOutcome::Deferred(Box::new(node.clone())));
                 };
                 let syntax_node =
                     QueryNode::BodySyntax(binding.path.clone(), binding.owner.clone());
-                let (_, syntax_revision) = table.read_stamped(self, syntax_node.clone())?;
-                table.read(
+                let (_, syntax_revision) =
+                    query_ready!(table.read_stamped(self, syntax_node.clone()));
+                query_ready!(table.evaluate(
                     self,
                     QueryNode::SyntaxSignature(binding.path.clone(), binding.owner.clone()),
-                )?;
+                ));
                 for key in &prepared.keys {
-                    table.read(
+                    query_ready!(table.evaluate(
                         self,
                         QueryNode::SemanticSignature(binding.unit, key.clone()),
-                    )?;
+                    ));
                 }
                 for child in &prepared.children {
-                    table.read(self, QueryNode::TypedBody(*child))?;
+                    query_ready!(table.evaluate(self, QueryNode::TypedBody(*child)));
                 }
                 Ok(QueryValue::new(
                     TypedBodyValue {
@@ -1826,7 +1809,8 @@ impl QueryProvider for SyntaxProvider<'_> {
                 ))
             }
             _ => anyhow::bail!("unsupported syntax query {node:?}"),
-        }
+        }?;
+        Ok(QueryOutcome::Ready(value))
     }
 }
 
