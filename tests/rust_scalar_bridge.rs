@@ -1506,7 +1506,15 @@ impl Fixture {
         let output = self.successful(&["query", "rust-bridge", "--offline", "--format", "json"]);
         let query: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         let fingerprint = query["review_fingerprint"].as_str().unwrap();
-        let source = willow.replace("REVIEW", fingerprint);
+        fs::write(
+            self.root.join("rust-review.toml"),
+            format!("fingerprint = \"{fingerprint}\"\n"),
+        )
+        .unwrap();
+        let source = willow.replace(
+            "REVIEW",
+            query["legacy_review_fingerprint"].as_str().unwrap(),
+        );
         self.sources(&source, rust);
         source
     }
@@ -1643,6 +1651,7 @@ fn nonblocking_adapter_admission_counts_are_constant_per_call() {
             .map(|_| {
                 let mut symbol = RustBridgeSymbol::new("f".into(), vec![Scalar::I64], Scalar::I64);
                 symbol.declare_nonblocking("0".repeat(64));
+                symbol.apply_review(true);
                 symbol
             })
             .collect();
@@ -1805,7 +1814,12 @@ fn nonblocking_foreign_body_allows_other_worker_and_gc_progress() {
 fn nonblocking_regex_example_review_is_portable() {
     let f = Fixture::new();
     let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/rust_task_bridge");
-    for file in ["project.toml", "bridge.rs", "src/main.wi"] {
+    for file in [
+        "project.toml",
+        "bridge.rs",
+        "src/main.wi",
+        "rust-review.toml",
+    ] {
         fs::copy(example.join(file), f.root.join(file)).unwrap();
     }
     assert_eq!(
@@ -2294,7 +2308,24 @@ fn nonblocking_opaque_close_requires_its_own_review() {
     );
     let output = f.command(&["check", "."]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("E0810"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("rust_nonblocking_review_required"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Removing the close claim also invalidates the shared claim inventory.
+    // Renew the remaining function claim to isolate the unreviewed close.
+    f.reviewed_sources(
+        &template.replace("nonblocking(\"REVIEW\") opaque", "opaque"),
+        rust,
+    );
+    let output = f.command(&["check", "."]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("E0810"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     f.sources(
         &reviewed,
         &format!("{rust}\n// changed destructor review input"),

@@ -44,7 +44,7 @@ impl SemanticDiff {
     }
     pub fn incomplete(reason: String) -> Self {
         Self {
-            schema: "willow.semantic-diff.v1",
+            schema: "willow.semantic-diff.v3",
             status: "incomplete",
             base: Value::Null,
             target: Value::Null,
@@ -83,6 +83,22 @@ impl SemanticDiff {
                             matching::human_name(name),
                             proof["basis"].as_str().unwrap_or("unproven")
                         ));
+                    }
+                }
+            }
+        }
+        for side in ["base", "target"] {
+            if let Some(functions) = self.summary["assumptions"][side].as_object() {
+                for (function, contracts) in functions {
+                    if let Some(contracts) = contracts.as_object() {
+                        for (contract, evidence) in contracts {
+                            text.push_str(&format!(
+                                "{contract} {side} {}: assumption at {}:{}\n",
+                                matching::human_name(function),
+                                evidence["location"]["path"].as_str().unwrap_or("?"),
+                                evidence["location"]["start"]
+                            ));
+                        }
                     }
                 }
             }
@@ -188,6 +204,7 @@ pub(crate) struct Capture {
     ambiguous: im::OrdSet<String>,
     contract_index: Option<Node>,
     panic_evidence: im::OrdMap<String, Value>,
+    assumption_evidence: BTreeMap<String, Value>,
     violations: im::OrdSet<String>,
 }
 #[derive(Clone, Default)]
@@ -303,6 +320,28 @@ impl Capture {
             .iter()
             .filter_map(|(id, e)| ids.get(id).map(|key| (key.clone(), e.clone())))
             .collect();
+        let assumptions = super::super::assumptions::Analysis::new(snapshot);
+        let assumption_evidence = snapshot
+            .functions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                let mut evidence = assumptions.output(i);
+                let contracts = contracts.get(&ids[&f.id])?;
+                evidence
+                    .as_object_mut()?
+                    .retain(|kind, value| contracts.contains(kind) && !value.is_null());
+                for value in evidence.as_object_mut()?.values_mut() {
+                    if let Some(path) = value["location"]["path"].as_str() {
+                        value["location"]["path"] = json!(relative(path, &snapshot.workspace));
+                    }
+                    if let Some(function) = value["function"].as_str().and_then(|id| ids.get(id)) {
+                        value["function"] = json!(function);
+                    }
+                }
+                (!evidence.as_object()?.is_empty()).then(|| (ids[&f.id].clone(), evidence))
+            })
+            .collect();
         let mut causes = CausePaths::default();
         let mut retained = state::ReportState::new(snapshot, ids, type_names);
         retained.replace_leaves(snapshot, &mut causes);
@@ -342,6 +381,7 @@ impl Capture {
             retained,
             contract_index,
             panic_evidence,
+            assumption_evidence,
             violations,
             baseline,
             contracts,
@@ -716,7 +756,7 @@ fn compare_keys(
         "incomplete"
     };
     Ok(SemanticDiff {
-        schema: "willow.semantic-diff.v1",
+        schema: "willow.semantic-diff.v3",
         status,
         base: Value::Null,
         target: Value::Null,
@@ -724,6 +764,7 @@ fn compare_keys(
         summary: json!({"contract_violations":violations,"policy_violations":if fail_on_growth {growth} else {0},
             "effect_growth":growth,"impacted_callers":impacted_count,"uncertainty":uncertainty,
             "no_panic":{"base":old_panic,"target":new_panic},
+            "assumptions":{"base":before.assumption_evidence,"target":after.assumption_evidence},
             "diagnostics":{"base":old.diagnostics,"target":new.diagnostics}}),
     })
 }

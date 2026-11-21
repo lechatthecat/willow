@@ -240,7 +240,7 @@
           }
         },
         "schema": {
-          "const": "willow.effects.v2"
+          "const": "willow.effects.v3"
         }
       }
     },
@@ -345,15 +345,17 @@
     },
     "effectStates": {
       "type": "array",
-      "minItems": 6,
-      "maxItems": 6,
+      "minItems": 7,
+      "maxItems": 7,
       "items": {
         "type": "object",
         "required": [
           "effect",
           "state",
           "witness",
-          "unknown_reasons"
+          "unknown_reasons",
+          "evidence_kind",
+          "assumption"
         ],
         "properties": {
           "effect": {
@@ -363,7 +365,8 @@
               4,
               8,
               16,
-              32
+              32,
+              64
             ]
           },
           "state": {
@@ -407,6 +410,20 @@
                 }
               }
             }
+          },
+          "evidence_kind": {
+            "enum": [
+              "compiler-proven",
+              "runtime-checked",
+              "assumption",
+              "unknown"
+            ]
+          },
+          "assumption": {
+            "type": [
+              "object",
+              "null"
+            ]
           }
         }
       }
@@ -419,7 +436,7 @@
       ],
       "properties": {
         "schema": {
-          "const": "willow.effects.v2"
+          "const": "willow.effects.v3"
         },
         "effects": {
           "$ref": "#/$defs/effectStates"
@@ -434,7 +451,7 @@
             "runtime": {
               "type": "integer",
               "minimum": 0,
-              "maximum": 63
+              "maximum": 127
             },
             "compiler": {
               "type": [
@@ -442,7 +459,30 @@
                 "null"
               ],
               "minimum": 0,
-              "maximum": 63
+              "maximum": 127
+            }
+          }
+        },
+        "assumptions": {
+          "type": "object",
+          "properties": {
+            "no_io": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "no_block": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "no_wait": {
+              "type": [
+                "object",
+                "null"
+              ]
             }
           }
         }

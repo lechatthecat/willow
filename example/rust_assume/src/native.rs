@@ -1,18 +1,18 @@
-#[willow::assume(no_block)]
+#[willow::assume(no_block, no_io)]
 pub struct Handle(i64);
 
-#[willow::assume(no_block)]
+#[willow::assume(no_block, no_io)]
 pub fn make() -> Box<Handle> {
     Handle::new()
 }
 
 impl Handle {
-    #[willow::assume(no_block)]
+    #[willow::assume(no_block, no_io)]
     pub fn new() -> Box<Self> {
         Box::new(Self(42))
     }
 
-    #[willow::assume(no_block)]
+    #[willow::assume(no_block, no_io)]
     pub fn read(&self) -> i64 {
         self.0
     }

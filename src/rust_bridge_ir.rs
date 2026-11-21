@@ -219,9 +219,13 @@ pub struct RustBridgeSymbol {
     pub records: RecordDefinitions,
     pub output_type: Scalar,
     pub effects: u8,
-    /// Trusted declaration that the foreign implementation does not access external resources.
+    /// Developer assertion; effective only while the shared review is current.
     #[serde(default)]
     pub no_io: bool,
+    #[serde(default)]
+    pub review_current: bool,
+    #[serde(default)]
+    pub assumption_span: Option<crate::diagnostics::Span>,
     #[serde(default)]
     pub close_handle: bool,
     /// Developer assertion, bound to the resolved lock and bridge source.
@@ -280,6 +284,8 @@ impl RustBridgeSymbol {
             native: None,
             is_async: false,
             no_io: false,
+            review_current: false,
+            assumption_span: None,
             rust_crate: String::new(),
             close_handle: false,
             nonblocking: None,
@@ -293,11 +299,35 @@ impl RustBridgeSymbol {
     }
     pub fn declare_nonblocking(&mut self, fingerprint: String) {
         self.nonblocking = Some(Box::new(NonblockingReview { fingerprint }));
-        self.effects &= !willow_abi::RuntimeEffects::MAY_BLOCK.bits();
+    }
+
+    pub fn assumes_no_block(&self) -> bool {
+        self.review_current && self.nonblocking.is_some()
+    }
+
+    pub fn assumes_no_io(&self) -> bool {
+        self.review_current && self.no_io
+    }
+
+    pub fn has_assumptions(&self) -> bool {
+        self.nonblocking.is_some() || self.no_io
+    }
+
+    /// Declaration metadata survives failed review; only effective capabilities change.
+    pub fn apply_review(&mut self, current: bool) {
+        use willow_abi::RuntimeEffects as E;
+        self.review_current = current;
+        self.effects |= E::MAY_IO.union(E::MAY_BLOCK).bits();
+        if self.assumes_no_io() {
+            self.effects &= !E::MAY_IO.bits();
+        }
+        if self.is_async || self.assumes_no_block() {
+            self.effects &= !E::MAY_BLOCK.bits();
+        }
     }
 
     pub fn entry_guard(&self) -> &'static str {
-        if self.is_async || self.nonblocking.is_some() {
+        if self.is_async || self.assumes_no_block() {
             "willow_rust_bridge_enter_nonblocking"
         } else {
             "willow_rust_bridge_enter"

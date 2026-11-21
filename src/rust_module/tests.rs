@@ -2,7 +2,7 @@ use super::*;
 
 fn interface(source: &str) -> Program {
     let (program, errors) = parse(Path::new("src/native.rs"), source, FileId(7));
-    assert!(errors.is_empty(), "{errors:#?}");
+    assert!(errors.is_empty(), "{source}: {errors:#?}");
     program
 }
 
@@ -355,8 +355,8 @@ fn assume_no_block_attribute_validation_perspectives() {
     for source in [
         "#[willow::assume] pub fn f() {}",
         "#[willow::assume()] pub fn f() {}",
-        "#[willow::assume(no_io)] pub fn f() {}",
-        "#[willow::assume(no_block, no_io)] pub fn f() {}",
+        "#[willow::assume(no_panic)] pub fn f() {}",
+        "#[willow::assume(no_alloc)] pub fn f() {}",
         "#[willow::assume(\"no_block\")] pub fn f() {}",
         "#[willow::assume(no_block)] #[willow::assume(no_block)] pub fn f() {}",
         "#[willow::assume(no_block)] pub struct Record { pub x: i64 }",
@@ -381,7 +381,7 @@ fn assume_no_block_generated_work_is_linear() {
             })
             .collect();
         let program = interface(&source);
-        let symbols: Vec<_> = program
+        let mut symbols: Vec<_> = program
             .items
             .iter()
             .filter_map(|item| match item {
@@ -397,6 +397,9 @@ fn assume_no_block_generated_work_is_linear() {
                 .count(),
             1
         );
+        for symbol in &mut symbols {
+            symbol.apply_review(true);
+        }
         let wrappers = crate::rust_bridge_ir::wrappers(&symbols, Path::new("abi.rs"), 1);
         assert_eq!(
             wrappers
@@ -430,4 +433,79 @@ fn assume_no_block_methods_preserve_private_helpers_and_raw_owners() {
         "#[willow::assume(no_block)] pub struct r#struct(i64); impl r#struct { #[willow::assume(no_block)] pub fn read(&self) -> i64 { self.0 } }",
     );
     assert!(function(&program, "struct_read").nonblocking.is_some());
+}
+
+#[test]
+fn unified_assumption_attributes_and_review_states() {
+    for (names, block, io) in [
+        ("no_io", false, true),
+        ("no_block", true, false),
+        ("no_block, no_io", true, true),
+        ("no_io, no_block,", true, true),
+    ] {
+        for (source, function_name) in [
+            (
+                format!("#[willow::assume({names})] pub fn answer() -> i64 {{ 42 }}"),
+                "answer",
+            ),
+            (
+                format!(
+                    "pub struct Handle(i64); impl Handle {{ #[willow::assume({names})] pub fn read(&self) -> i64 {{ self.0 }} }}"
+                ),
+                "Handle_read",
+            ),
+            (
+                format!(
+                    "#[willow::assume({names})] pub struct Handle(i64); pub fn make() -> Box<Handle> {{ todo!() }}"
+                ),
+                "Handle_close",
+            ),
+        ] {
+            let program = interface(&source);
+            let mut symbol = function(&program, function_name).clone();
+            assert_eq!(symbol.nonblocking.is_some(), block);
+            assert_eq!(symbol.no_io, io);
+            assert!(symbol.assumption_span.is_some());
+            for reviewed in [false, true, false] {
+                symbol.apply_review(reviewed);
+                assert_eq!(symbol.assumes_no_block(), reviewed && block);
+                assert_eq!(symbol.assumes_no_io(), reviewed && io);
+                assert_eq!(
+                    symbol.effects & willow_abi::RuntimeEffects::MAY_BLOCK.bits() == 0,
+                    reviewed && block
+                );
+                assert_eq!(
+                    symbol.effects & willow_abi::RuntimeEffects::MAY_IO.bits() == 0,
+                    reviewed && io
+                );
+                assert_ne!(
+                    symbol.effects & willow_abi::RuntimeEffects::MAY_PANIC.bits(),
+                    0
+                );
+                assert_ne!(
+                    symbol.effects & willow_abi::RuntimeEffects::MAY_ALLOCATE.bits(),
+                    0
+                );
+            }
+        }
+    }
+    let program = interface("#[willow::assume(no_io)] pub async fn answer() -> i64 { 42 }");
+    assert!(function(&program, "answer").no_io);
+    for names in [
+        "unknown",
+        "pure",
+        "no_wait",
+        "no_suspend",
+        "no_io, no_io",
+        "no_block, no_block",
+        "no_io no_block",
+        "no_io = true",
+    ] {
+        let (_, errors) = parse(
+            Path::new("src/native.rs"),
+            &format!("#[willow::assume({names})] pub fn answer() {{}}"),
+            FileId(7),
+        );
+        assert!(!errors.is_empty(), "{names}");
+    }
 }

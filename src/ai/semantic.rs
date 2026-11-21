@@ -1295,6 +1295,7 @@ impl QuerySession {
             .effect_states
             .get_or_insert_with(|| effect_states::Analysis::new(&self.snapshot))
             .output(i);
+        let assumptions = self.effect_states.as_ref().unwrap().assumptions(i);
         let mut walk = EffectWalk::new(self, i);
         walk.run();
         let missing = walk.complete_missing_witnesses();
@@ -1316,7 +1317,7 @@ impl QuerySession {
         self.present_lock_types(&mut evidence);
         self.attach_call_chains(&witness, &mut evidence);
         let compiler_witnesses = self.local_compiler_witnesses(f);
-        json!({"schema":effect_states::SCHEMA,"effects":states,
+        json!({"schema":effect_states::SCHEMA,"effects":states,"assumptions":assumptions,
             "status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
             "reason":f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }), "unknown_causes":unknown_causes, "bounds":{"runtime":f.runtime_effects,"compiler":self.snapshot.semantic.compiler_effects.get(&f.id)},"effect_evidence":evidence, "no_panic":self.snapshot.semantic.panic_evidence.get(&f.id),
             "witness":witness, "compiler_witnesses":compiler_witnesses,

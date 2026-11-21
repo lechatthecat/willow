@@ -1,0 +1,396 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Willow Rust bridge query v2",
+  "type": "object",
+  "required": [
+    "schema",
+    "kind",
+    "status",
+    "bridges",
+    "crate_candidates"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": 2
+    },
+    "kind": {
+      "const": "rust-bridge"
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "unknown"
+      ]
+    },
+    "bridges": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/bridge"
+      }
+    },
+    "crate_candidates": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/crate"
+      }
+    },
+    "review_fingerprint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "legacy_review_fingerprint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "$defs": {
+    "crate": {
+      "type": "object",
+      "required": [
+        "name",
+        "version",
+        "source"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {}
+      }
+    },
+    "bridge": {
+      "type": "object",
+      "required": [
+        "schema",
+        "kind",
+        "symbol",
+        "function",
+        "identity",
+        "crate",
+        "rust_adapter",
+        "abi_symbol",
+        "signature",
+        "declaration",
+        "declaration_text",
+        "coverage",
+        "assumptions",
+        "review_current",
+        "evidence_kind",
+        "assumption_location"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": 2
+        },
+        "kind": {
+          "const": "rust-bridge"
+        },
+        "symbol": {
+          "type": "string"
+        },
+        "function": {
+          "type": "string"
+        },
+        "identity": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "crate": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/crate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rust_adapter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "abi_symbol": {
+          "type": "string"
+        },
+        "signature": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "inputs",
+            "output"
+          ],
+          "properties": {
+            "inputs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/value_type"
+              }
+            },
+            "output": {
+              "$ref": "#/$defs/value_type"
+            }
+          }
+        },
+        "declaration": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "path",
+              "start",
+              "end"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "start": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "end": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "declaration_text": {
+          "type": "string"
+        },
+        "coverage": {
+          "type": "string"
+        },
+        "async": {
+          "type": "boolean"
+        },
+        "no_io": {
+          "type": "boolean"
+        },
+        "effects": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "nonblocking": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trust": {
+          "enum": [
+            "undeclared",
+            "developer_declared",
+            "official_verified"
+          ]
+        },
+        "official_verified": {
+          "type": "boolean"
+        },
+        "review_current": {
+          "type": "boolean"
+        },
+        "records": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/record"
+          }
+        },
+        "assume_no_block": {
+          "type": "boolean"
+        },
+        "assumptions": {
+          "type": "object",
+          "required": [
+            "no_block",
+            "no_io"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "no_block": {
+              "type": "boolean"
+            },
+            "no_io": {
+              "type": "boolean"
+            }
+          }
+        },
+        "evidence_kind": {
+          "enum": [
+            "assumption",
+            "unknown"
+          ]
+        },
+        "assumption_location": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "start": {
+              "type": "integer"
+            },
+            "end": {
+              "type": "integer"
+            }
+          }
+        }
+      }
+    },
+    "value_type": {
+      "oneOf": [
+        {
+          "enum": [
+            "I8",
+            "I16",
+            "I32",
+            "I64",
+            "U8",
+            "U16",
+            "U32",
+            "U64",
+            "Char",
+            "F64",
+            "Bool",
+            "Void",
+            "String",
+            "Bytes"
+          ],
+          "description": "Bytes is packed Array<u8>; synchronous input &[u8], async input and all outputs Vec<u8>."
+        },
+        {
+          "type": "object",
+          "required": [
+            "Option"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "Option": {
+              "$ref": "#/$defs/value_type"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "Result"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "Result": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "$ref": "#/$defs/value_type"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "Opaque"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "Opaque": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "Array"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "Array": {
+              "enum": [
+                "I8",
+                "I16",
+                "I32",
+                "I64",
+                "U16",
+                "U32",
+                "U64",
+                "Char",
+                "String",
+                "F64",
+                "Bool"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "Record"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "Record": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "record": {
+      "type": "object",
+      "required": [
+        "name",
+        "fields"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/value_type"
+              }
+            ],
+            "items": false
+          }
+        }
+      }
+    }
+  }
+}

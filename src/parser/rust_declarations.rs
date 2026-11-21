@@ -210,12 +210,11 @@ impl Parser {
                 );
                 symbol.close_handle = true;
                 symbol.no_io = !effect_contracts.is_empty();
-                if symbol.no_io {
-                    symbol.effects &= !willow_abi::RuntimeEffects::MAY_IO.bits();
-                }
+
                 if let Some(fingerprint) = nonblocking {
                     symbol.declare_nonblocking(fingerprint);
                 }
+                symbol.assumption_span = symbol.has_assumptions().then_some(span);
                 items.push(Item::Function(FunctionDecl {
                     requires: Vec::new(),
                     ensures: Vec::new(),
@@ -296,9 +295,7 @@ impl Parser {
             let mut symbol = RustBridgeSymbol::new(name.clone(), inputs, output);
             symbol.is_async = is_async;
             symbol.no_io = !effect_contracts.is_empty();
-            if symbol.no_io {
-                symbol.effects &= !willow_abi::RuntimeEffects::MAY_IO.bits();
-            }
+
             if is_async {
                 symbol.effects &= !willow_abi::RuntimeEffects::MAY_BLOCK.bits();
                 symbol.effects |= willow_abi::RuntimeEffects::MAY_SUSPEND.bits();
@@ -307,6 +304,7 @@ impl Parser {
             if let Some(fingerprint) = nonblocking {
                 symbol.declare_nonblocking(fingerprint);
             }
+            symbol.assumption_span = symbol.has_assumptions().then_some(span);
             items.push(Item::Function(FunctionDecl {
                 requires: Vec::new(),
                 ensures: Vec::new(),

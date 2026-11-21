@@ -41,15 +41,21 @@ pub(crate) fn rust_input_hash(
     abi_revision: &str,
 ) -> Result<String> {
     use sha2::{Digest, Sha256};
-    Ok(format!(
-        "{:x}",
-        crate::hex::Hex(&Sha256::digest(serde_json::to_vec(&(
-            &project.rust_dependencies,
-            &project.rust,
-            wrapper_schema,
-            abi_revision,
-        ))?))
-    ))
+    let rust = (
+        &project.rust_dependencies,
+        &project.rust,
+        wrapper_schema,
+        abi_revision,
+    );
+    // A foreign assertion also covers native code reached through the adapter.
+    // Bind its pinned artifacts and link configuration to the same review.
+    // Keep projects without native libraries on their existing review identity.
+    let bytes = if let Some(native) = &project.native {
+        serde_json::to_vec(&(rust, native))?
+    } else {
+        serde_json::to_vec(&rust)?
+    };
+    Ok(format!("{:x}", crate::hex::Hex(&Sha256::digest(bytes))))
 }
 
 pub(crate) fn read_rust_lock(root: &Path) -> Result<Option<RustLock>> {
@@ -707,4 +713,73 @@ fn resolve_native_lock(
             .map(|plan| plan.lock)
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod review_input_tests {
+    use super::*;
+
+    #[test]
+    fn unified_review_binds_native_manifest_without_changing_rust_only_identity() {
+        use sha2::{Digest, Sha256};
+        let mut project: crate::project::ProjectManifest =
+            toml::from_str("[project]\nname='review_inputs'\nversion='0.1.0'\n").unwrap();
+        let legacy =
+            serde_json::to_vec(&(&project.rust_dependencies, &project.rust, "wrapper", "abi"))
+                .unwrap();
+        let rust_only = rust_input_hash(&project, "wrapper", "abi").unwrap();
+        assert_eq!(
+            rust_only,
+            format!("{:x}", crate::hex::Hex(&Sha256::digest(legacy)))
+        );
+        let native = serde_json::json!({
+            "roots": ["math"], "reproducible": true,
+            "libraries": {"math": {
+                "name": "math", "version": "1", "license": "MIT", "provenance": "local",
+                "dependencies": [], "targets": {"x86_64-unknown-linux-gnu": {
+                    "source": {"kind": "local", "path": "native"},
+                    "digest": "a".repeat(64), "architecture": "x86_64", "abi": "C",
+                    "abi-version": "1", "linkage": "static", "inputs": [],
+                    "header-roots": [], "adapter-roots": []
+                }}
+            }}
+        });
+        project.native = Some(serde_json::from_value(native.clone()).unwrap());
+        let reviewed = rust_input_hash(&project, "wrapper", "abi").unwrap();
+        assert_ne!(reviewed, rust_only);
+        for (pointer, replacement) in [
+            ("/libraries/math/version", serde_json::json!("2")),
+            (
+                "/libraries/math/targets/x86_64-unknown-linux-gnu/digest",
+                serde_json::json!("b".repeat(64)),
+            ),
+            (
+                "/libraries/math/targets/x86_64-unknown-linux-gnu/abi-version",
+                serde_json::json!("2"),
+            ),
+            (
+                "/libraries/math/targets/x86_64-unknown-linux-gnu/source/path",
+                serde_json::json!("other"),
+            ),
+            (
+                "/libraries/math/targets/x86_64-unknown-linux-gnu/adapter-roots",
+                serde_json::json!(["adapter"]),
+            ),
+            (
+                "/libraries/math/targets/x86_64-unknown-linux-gnu/inputs",
+                serde_json::json!([{"kind":"system","value":"math"}]),
+            ),
+            ("/reproducible", serde_json::json!(false)),
+            ("/roots", serde_json::json!([])),
+        ] {
+            let mut edited = native.clone();
+            *edited.pointer_mut(pointer).unwrap() = replacement;
+            project.native = Some(serde_json::from_value(edited).unwrap());
+            assert_ne!(
+                reviewed,
+                rust_input_hash(&project, "wrapper", "abi").unwrap(),
+                "{pointer}"
+            );
+        }
+    }
 }

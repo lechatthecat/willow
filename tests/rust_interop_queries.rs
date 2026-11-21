@@ -100,7 +100,7 @@ fn rust_bridge_json_schema_package_identity_and_unknown_selector() {
     let before = f.files();
     let (ok, v) = f.run(&["query", "rust-bridge", "regex_is_match"]);
     assert!(ok, "{v}");
-    assert_eq!(v["schema"], 1);
+    assert_eq!(v["schema"], 2);
     assert_eq!(v["status"], "ok");
     let b = &v["bridges"][0];
     assert_eq!(b["symbol"], "regex_is_match");

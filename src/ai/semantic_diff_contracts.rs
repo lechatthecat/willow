@@ -157,7 +157,7 @@ pub fn verify(options: &Options, policy: &Policy) -> Result<SemanticDiff> {
             && report.target["digest"] == hash_serialized(&without_lock(&target))?,
         "effect and contract snapshots differ"
     );
-    report.schema = "willow.semantic-diff.v2";
+    report.schema = "willow.semantic-diff.v4";
     report.summary["effects"] = json!({"changes":report.changes,"summary":report.summary});
     report.changes = compared["changes"]
         .as_array()

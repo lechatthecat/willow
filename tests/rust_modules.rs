@@ -638,7 +638,7 @@ async fn main() {
         assert_eq!(b["trust"], "developer_declared");
         assert_eq!(b["review_current"], false);
         let effects = b["effects"].as_u64().unwrap() as u8;
-        assert_eq!(effects & willow_abi::RuntimeEffects::MAY_BLOCK.bits(), 0);
+        assert_ne!(effects & willow_abi::RuntimeEffects::MAY_BLOCK.bits(), 0);
         assert_ne!(effects & willow_abi::RuntimeEffects::MAY_ALLOCATE.bits(), 0);
         assert_ne!(effects & willow_abi::RuntimeEffects::MAY_PANIC.bits(), 0);
         assert_ne!(effects & willow_abi::ffi::FOREIGN_CALL, 0);
@@ -955,4 +955,652 @@ fn native_assume_external_sources_in_unused_and_legacy_files_fail_closed() {
             );
         }
     }
+}
+
+fn unified_assumption_effects(fixture: &Fixture, name: &str) -> serde_json::Value {
+    use willow_compiler::{
+        CompilerOptions, CompilerSession,
+        ai::{QueryRequest, QuerySession},
+        diagnostics::HumanEmitter,
+    };
+    let mut options = CompilerOptions::debug();
+    options.offline = true;
+    let snapshot = CompilerSession::new(
+        fixture.root.join("src/main.wi").to_str().unwrap(),
+        "",
+        &options,
+        Some(fixture.root.clone()),
+    )
+    .analysis_with_emitter(&mut HumanEmitter)
+    .unwrap();
+    let function = snapshot
+        .functions
+        .iter()
+        .find(|f| f.name == name)
+        .unwrap()
+        .id
+        .clone();
+    let revision = snapshot.revision.clone();
+    QuerySession::new(snapshot)
+        .unwrap()
+        .query(QueryRequest::Effects { revision, function })["result"]
+        .take()
+}
+
+#[test]
+fn unified_assumption_native_review_and_transitive_evidence() {
+    use willow_abi::RuntimeEffects;
+    for no_block in [false, true] {
+        let f = Fixture::new();
+        let effects = if no_block { "no_block, no_io" } else { "no_io" };
+        let native = ASSUMED_NATIVE.replace("no_block", effects);
+        f.write("src/native.rs", &native);
+        let contracts = if no_block { "no_io, no_wait" } else { "no_io" };
+        f.write(
+            "src/main.wi",
+            &format!(
+                r#"
+import native;
+fn helper() -> i64 {{
+    let handle = native::make();
+    let value = native::Handle_read(handle) + native::answer();
+    native::Handle_close(handle);
+    return value;
+}}
+@effects({contracts}) fn exercise() -> i64 {{ return helper(); }}
+fn main() {{ println(exercise()); }}
+"#
+            ),
+        );
+        let missing = f.review_query();
+        assert_eq!(missing["schema"], 2);
+        assert_eq!(missing["bridges"].as_array().unwrap().len(), 4);
+        for bridge in missing["bridges"].as_array().unwrap() {
+            assert_eq!(bridge["schema"], 2);
+            assert_eq!(bridge["assumptions"]["no_io"], true);
+            assert_eq!(bridge["assumptions"]["no_block"], no_block);
+            assert_eq!(bridge["review_current"], false);
+            assert_eq!(bridge["evidence_kind"], "unknown");
+            let bits = bridge["effects"].as_u64().unwrap() as u8;
+            assert_ne!(bits & RuntimeEffects::MAY_IO.bits(), 0);
+            assert_ne!(bits & RuntimeEffects::MAY_BLOCK.bits(), 0);
+        }
+        let output = f.command(&["check", ".", "--offline"]).output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("E2612"),
+            "{output:?}"
+        );
+
+        let record = f.approve_native();
+        f.success(&["check", ".", "--offline"]);
+        let reviewed = f.review_query();
+        for bridge in reviewed["bridges"].as_array().unwrap() {
+            assert_eq!(bridge["review_current"], true);
+            assert_eq!(bridge["evidence_kind"], "assumption");
+            assert_eq!(bridge["official_verified"], false);
+            let bits = bridge["effects"].as_u64().unwrap() as u8;
+            assert_eq!(bits & RuntimeEffects::MAY_IO.bits(), 0);
+            assert_eq!(bits & RuntimeEffects::MAY_BLOCK.bits() == 0, no_block);
+            assert_ne!(bits & RuntimeEffects::MAY_ALLOCATE.bits(), 0);
+            assert_ne!(bits & RuntimeEffects::MAY_PANIC.bits(), 0);
+            let location = &bridge["assumption_location"];
+            assert!(location["path"].as_str().unwrap().ends_with("native.rs"));
+            let start = location["start"].as_u64().unwrap() as usize;
+            let end = location["end"].as_u64().unwrap() as usize;
+            assert_eq!(&native[start..end], format!("#[willow::assume({effects})]"));
+        }
+        for function in ["helper", "exercise"] {
+            let evidence = unified_assumption_effects(&f, function);
+            assert_eq!(evidence["schema"], "willow.effects.v3");
+            assert_eq!(evidence["assumptions"]["no_io"]["kind"], "assumption");
+            assert_eq!(!evidence["assumptions"]["no_wait"].is_null(), no_block);
+            let io = evidence["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|effect| effect["effect"] == RuntimeEffects::MAY_IO.bits())
+                .unwrap();
+            assert_eq!(io["state"], "none", "{evidence}");
+            assert_eq!(io["evidence_kind"], "assumption", "{evidence}");
+            assert!(
+                io["assumption"]["location"]["path"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("native.rs")
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(f.root.join("rust-review.toml")).unwrap(),
+            record
+        );
+        // Both changed source and a removed record revoke all claims together.
+        f.write("src/native.rs", &native.replace("42", "43"));
+        let stale = f.review_query();
+        assert_ne!(stale["review_fingerprint"], reviewed["review_fingerprint"]);
+        assert!(
+            stale["bridges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|b| b["review_current"] == false)
+        );
+        let output = f.command(&["check", ".", "--offline"]).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("E2612"));
+        f.approve_native();
+        f.success(&["check", ".", "--offline"]);
+        fs::remove_file(f.root.join("rust-review.toml")).unwrap();
+        let output = f.command(&["check", ".", "--offline"]).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("E2612"));
+    }
+}
+
+#[test]
+fn unified_assumption_native_library_legacy_no_io_requires_shared_review() {
+    use willow_abi::RuntimeEffects;
+    let f = Fixture::new();
+    f.local_dependency();
+    f.write("project.toml", "[project]\nname=\"native_review\"\nversion=\"0.1.0\"\n[rust]\nbridge=\"bridge.rs\"\n[rust-dependencies]\nnative_probe={path=\"dependency\"}\n");
+    f.write("bridge.rs", "unsafe extern \"C\" { fn abs(value: i32) -> i32; }\npub fn absolute(value: i64) -> i64 { unsafe { abs(value as i32) as i64 } }\n");
+    f.write("src/main.wi", "extern rust { @effects(no_io) fn absolute(value: i64) -> i64; }\nfn helper() -> i64 { return absolute(-7); }\n@effects(no_io) fn exercise() -> i64 { return helper(); }\nfn main() { println(exercise()); }\n");
+    let missing = f.review_query();
+    assert_eq!(missing["schema"], 2);
+    assert_eq!(missing["bridges"][0]["review_current"], false);
+    assert_ne!(
+        missing["bridges"][0]["effects"].as_u64().unwrap() as u8 & RuntimeEffects::MAY_IO.bits(),
+        0
+    );
+    let output = f.command(&["check", ".", "--offline"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("E2612"),
+        "{output:?}"
+    );
+    f.approve_native();
+    f.success(&["check", ".", "--offline"]);
+    let reviewed = f.review_query();
+    assert_eq!(reviewed["bridges"][0]["review_current"], true);
+    assert_eq!(reviewed["bridges"][0]["evidence_kind"], "assumption");
+    let evidence = unified_assumption_effects(&f, "exercise");
+    assert_eq!(evidence["assumptions"]["no_io"]["kind"], "assumption");
+    assert!(
+        evidence["assumptions"]["no_io"]["location"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("main.wi")
+    );
+    f.write("bridge.rs", "unsafe extern \"C\" { fn abs(value: i32) -> i32; }\npub fn absolute(value: i64) -> i64 { unsafe { abs(value as i32) as i64 + 1 } }\n");
+    let output = f.command(&["check", ".", "--offline"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("E2612"));
+    assert_eq!(f.review_query()["bridges"][0]["review_current"], false);
+}
+
+#[test]
+fn unified_assumption_legacy_claim_edits_invalidate_shared_review() {
+    let f = Fixture::new();
+    f.local_dependency();
+    f.write("project.toml", "[project]\nname='legacy_claims'\nversion='0.1.0'\n[rust]\nbridge='bridge.rs'\n[rust-dependencies]\nnative_probe={path='dependency'}\n");
+    f.write(
+        "bridge.rs",
+        "pub fn safe() -> i64 { 42 }\npub fn noisy() -> i64 { println!(\"I/O\"); 7 }\n",
+    );
+    let source = |safe: &str, noisy: &str, callee: &str| {
+        format!(
+            "extern rust {{ {safe} fn safe() -> i64; {noisy} fn noisy() -> i64; }}\n@effects(no_io) fn guard() -> i64 {{ return {callee}(); }}\nfn main() {{ println(guard()); }}\n"
+        )
+    };
+    let original = source("@effects(no_io)", "", "safe");
+    f.write("src/main.wi", &original);
+    let record = f.approve_native();
+    f.success(&["check", ".", "--offline"]);
+    let reviewed = f.review_query();
+    let inline = reviewed["legacy_review_fingerprint"].as_str().unwrap();
+    let shared = &reviewed["review_fingerprint"];
+
+    // Layout and declaration iteration order are not new claims.
+    f.write("src/main.wi", "// moved declarations\nextern rust { fn noisy() -> i64;\n    @effects(no_io) fn safe() -> i64; }\n@effects(no_io) fn guard() -> i64 { return safe(); }\nfn main() { println(guard()); }\n");
+    let reordered = f.review_query();
+    assert_eq!(&reordered["review_fingerprint"], shared);
+    assert_eq!(reordered["legacy_review_fingerprint"], inline);
+    assert!(
+        reordered["bridges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["symbol"] == "safe" && b["review_current"] == true)
+    );
+    f.success(&["check", ".", "--offline"]);
+
+    for (mutation, edited) in [
+        (
+            "add no_io to an already-declared I/O function",
+            source("@effects(no_io)", "@effects(no_io)", "noisy"),
+        ),
+        ("remove no_io", source("", "", "safe")),
+        (
+            "change no_io to no_block",
+            source(&format!("nonblocking(\"{inline}\")"), "", "safe"),
+        ),
+    ] {
+        f.write("src/main.wi", &edited);
+        let query = f.review_query();
+        assert_ne!(&query["review_fingerprint"], shared, "{mutation}: {query}");
+        assert_eq!(query["legacy_review_fingerprint"], inline, "{mutation}");
+        assert!(
+            query["bridges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|b| b["review_current"] == false),
+            "{mutation}: {query}"
+        );
+        let output = f.command(&["check", ".", "--offline"]).output().unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{mutation}");
+        assert!(
+            error.contains("E2612") && error.contains("no_io"),
+            "{mutation}: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("rust-review.toml")).unwrap(),
+            record
+        );
+    }
+    f.write("src/main.wi", &original);
+    assert_eq!(&f.review_query()["review_fingerprint"], shared);
+    f.success(&["check", ".", "--offline"]);
+}
+
+#[test]
+fn unified_assumption_dependency_input_escape_fails_closed() {
+    let f = Fixture::new();
+    f.local_dependency();
+    f.write("project.toml", "[project]\nname='dependency_boundary'\nversion='0.1.0'\n[rust-dependencies]\nnative_probe={path='dependency'}\n");
+    f.write(
+        "src/native.rs",
+        "#[willow::assume(no_block, no_io)]\npub fn answer() -> i64 { native_probe::value() }\n",
+    );
+    f.write("src/main.wi", "import native;\n@effects(no_io, no_wait) fn guard() -> i64 { return native::answer(); }\nfn main() { println(guard()); }\n");
+    let record = f.approve_native();
+    f.success(&["check", ".", "--offline"]);
+    f.write("outside.bin", "*");
+    for (case, dependency, hidden) in [
+        (
+            "safe code hidden in an excluded directory",
+            "include!(\"../target/behavior.rs\");\n",
+            "pub fn value() -> i64 { 1 }\n",
+        ),
+        (
+            "I/O and waiting code hidden in an excluded directory",
+            "include!(\"../target/behavior.rs\");\n",
+            "pub fn value() -> i64 { println!(\"I/O\"); std::thread::sleep(std::time::Duration::from_millis(1)); 1 }\n",
+        ),
+        (
+            "data outside the dependency root",
+            "pub fn value() -> i64 { include_bytes!(\"../../outside.bin\")[0] as i64 }\n",
+            "pub fn value() -> i64 { 1 }\n",
+        ),
+    ] {
+        f.write("dependency/target/behavior.rs", hidden);
+        f.write("dependency/src/lib.rs", dependency);
+        let query = f
+            .command(&[
+                "query",
+                "rust-bridge",
+                "--project-dir",
+                ".",
+                "--offline",
+                "--format",
+                "json",
+            ])
+            .output()
+            .unwrap();
+        let error = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&query.stdout),
+            String::from_utf8_lossy(&query.stderr)
+        );
+        assert!(!query.status.success(), "{case}: {query:?}");
+        assert!(
+            error.contains("rust_review_source_layout"),
+            "{case}: {error}"
+        );
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&query.stdout) {
+            assert!(value["review_fingerprint"].is_null(), "{case}: {value}");
+        }
+        let checked = f.command(&["check", ".", "--offline"]).output().unwrap();
+        let error = String::from_utf8_lossy(&checked.stderr);
+        assert!(!checked.status.success(), "{case}: {checked:?}");
+        for expected in ["E2612", "no_io", "no_wait"] {
+            assert!(error.contains(expected), "{case}/{expected}: {error}");
+        }
+        assert_eq!(
+            fs::read_to_string(f.root.join("rust-review.toml")).unwrap(),
+            record,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn unified_assumption_root_native_link_archive_replacement_fails_closed() {
+    for legacy in [false, true] {
+        let f = Fixture::new();
+        f.local_dependency();
+        let bridge_setting = if legacy {
+            "[rust]\nbridge='bridge.rs'\n"
+        } else {
+            ""
+        };
+        f.write("project.toml", &format!("[project]\nname='root_link'\nversion='0.1.0'\n{bridge_setting}[rust-dependencies]\nnative_probe={{path='dependency'}}\n"));
+        let path = if legacy { "bridge.rs" } else { "src/native.rs" };
+        let attribute = if legacy {
+            ""
+        } else {
+            "#[willow::assume(no_block, no_io)]\n"
+        };
+        f.write(
+            path,
+            &format!("{attribute}pub fn answer() -> i64 {{ 42 }}\n"),
+        );
+        let main = |fingerprint: &str| {
+            let prefix = if legacy {
+                format!(
+                    "extern rust {{ @effects(no_io) nonblocking(\"{fingerprint}\") fn answer() -> i64; }}\n"
+                )
+            } else {
+                "import native;\n".into()
+            };
+            let call = if legacy { "answer" } else { "native::answer" };
+            format!(
+                "{prefix}@effects(no_io, no_wait) fn guard() -> i64 {{ return {call}(); }}\nfn main() {{ println(guard()); }}\n"
+            )
+        };
+        f.write("src/main.wi", &main(&"0".repeat(64)));
+        let native = root_link_archive(&f, false);
+        let run = |args: &[&str]| {
+            f.command(args)
+                .env_remove("RUSTFLAGS")
+                .env(
+                    "CARGO_ENCODED_RUSTFLAGS",
+                    format!("-L\u{1f}native={}", native.display()),
+                )
+                .output()
+                .unwrap()
+        };
+        let query_args = [
+            "query",
+            "rust-bridge",
+            "--project-dir",
+            ".",
+            "--offline",
+            "--format",
+            "json",
+        ];
+        if legacy {
+            let output = run(&query_args);
+            assert!(output.status.success(), "{output:?}");
+            let query: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            f.write(
+                "src/main.wi",
+                &main(query["legacy_review_fingerprint"].as_str().unwrap()),
+            );
+        }
+        let output = run(&query_args);
+        assert!(output.status.success(), "{output:?}");
+        let query: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let record = format!(
+            "fingerprint='{}'\n",
+            query["review_fingerprint"].as_str().unwrap()
+        );
+        f.write("rust-review.toml", &record);
+        let checked = run(&["check", ".", "--offline"]);
+        assert!(checked.status.success(), "{checked:?}");
+
+        f.write(path, &format!("#[link(name=\"willow_payload\", kind=\"static\")]\nunsafe extern \"C\" {{ fn payload() -> i64; }}\n{attribute}pub fn answer() -> i64 {{ unsafe {{ payload() }} }}\n"));
+        for io in [false, true] {
+            if io {
+                assert_eq!(root_link_archive(&f, true), native);
+            }
+            reject_opaque_root_claims(&f, &run, &record);
+        }
+    }
+}
+
+fn reject_opaque_root_claims(fixture: &Fixture, run: &impl Fn(&[&str]) -> Output, record: &str) {
+    let output = run(&[
+        "query",
+        "rust-bridge",
+        "--project-dir",
+        ".",
+        "--offline",
+        "--format",
+        "json",
+    ]);
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{diagnostic}");
+    assert!(
+        diagnostic.contains("rust_review_source_layout"),
+        "{diagnostic}"
+    );
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+        assert!(value["review_fingerprint"].is_null(), "{value}");
+    }
+    let checked = run(&["check", ".", "--offline"]);
+    let diagnostic = String::from_utf8_lossy(&checked.stderr);
+    assert!(!checked.status.success(), "{diagnostic}");
+    for expected in ["E2612", "no_io", "no_wait"] {
+        assert!(diagnostic.contains(expected), "{expected}: {diagnostic}");
+    }
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("rust-review.toml")).unwrap(),
+        record
+    );
+}
+
+#[test]
+fn unified_assumption_root_assembly_input_replacement_fails_closed() {
+    for legacy in [false, true] {
+        let f = Fixture::new();
+        f.local_dependency();
+        let bridge = if legacy {
+            "[rust]\nbridge='bridge.rs'\n"
+        } else {
+            ""
+        };
+        f.write("project.toml", &format!("[project]\nname='root_assembly'\nversion='0.1.0'\n{bridge}[rust-dependencies]\nnative_probe={{path='dependency'}}\n"));
+        let path = if legacy { "bridge.rs" } else { "src/native.rs" };
+        let attribute = if legacy {
+            ""
+        } else {
+            "#[willow::assume(no_block, no_io)]\n"
+        };
+        f.write(
+            path,
+            &format!("{attribute}pub fn answer() -> i64 {{ 42 }}\n"),
+        );
+        let main = |fingerprint: &str| {
+            let prefix = if legacy {
+                format!(
+                    "extern rust {{ @effects(no_io) nonblocking(\"{fingerprint}\") fn answer() -> i64; }}\n"
+                )
+            } else {
+                "import native;\n".into()
+            };
+            let call = if legacy { "answer" } else { "native::answer" };
+            format!(
+                "{prefix}@effects(no_io, no_wait) fn guard() -> i64 {{ return {call}(); }}\nfn main() {{ println(guard()); }}\n"
+            )
+        };
+        f.write("src/main.wi", &main(&"0".repeat(64)));
+        if legacy {
+            let query = f.review_query();
+            f.write(
+                "src/main.wi",
+                &main(query["legacy_review_fingerprint"].as_str().unwrap()),
+            );
+        }
+        let record = f.approve_native();
+        f.success(&["check", ".", "--offline"]);
+        let external = f.temp.join("external_payload.s");
+        let run = |args: &[&str]| f.command(args).output().unwrap();
+        for (mac, operation) in [
+            ("global_asm", ".include"),
+            ("asm", ".include"),
+            ("asm", ".incbin"),
+            ("naked_asm", ".include"),
+        ] {
+            let directive = format!("{operation} {:?}", external.to_string_lossy());
+            let source = root_assembly_source(attribute, mac, &directive);
+            f.write(path, &source);
+            // These inputs are deliberately never assembled by this test:
+            // the reviewed-source gate must reject them on every host.
+            for payload in [
+                ".text\n.globl assembly_payload\nassembly_payload:\nmov rax, 42\nret\n",
+                ".text\n.globl assembly_payload\nassembly_payload:\nsub rsp, 8\nlea rdi, [rip + message]\ncall puts\nadd rsp, 8\nmov rax, 42\nret\n.section .rodata\nmessage: .asciz \"unexpected I/O\"\n",
+            ] {
+                fs::write(&external, payload).unwrap();
+                reject_opaque_root_claims(&f, &run, &record);
+                assert_eq!(fs::read_to_string(f.root.join(path)).unwrap(), source);
+            }
+        }
+    }
+}
+
+fn root_assembly_source(attribute: &str, mac: &str, directive: &str) -> String {
+    match mac {
+        "global_asm" => format!(
+            "std::arch::global_asm!({directive:?});\nunsafe extern \"C\" {{ fn assembly_payload() -> i64; }}\n{attribute}pub fn answer() -> i64 {{ unsafe {{ assembly_payload() }} }}\n"
+        ),
+        "asm" => format!(
+            "{attribute}pub fn answer() -> i64 {{ unsafe {{ std::arch::asm!({directive:?}); }} 42 }}\n"
+        ),
+        "naked_asm" => format!(
+            "#[unsafe(naked)]\nunsafe extern \"C\" fn assembly_payload() -> i64 {{ std::arch::naked_asm!({directive:?}); }}\n{attribute}pub fn answer() -> i64 {{ unsafe {{ assembly_payload() }} }}\n"
+        ),
+        _ => unreachable!(),
+    }
+}
+
+/// Compile and execute a real native archive independently of Willow admission.
+/// The directory deliberately lies outside the reviewed project source tree.
+fn root_link_archive(fixture: &Fixture, io: bool) -> PathBuf {
+    let directory = fixture.temp.join("external-native");
+    fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("payload.c");
+    fs::write(&source, if io {
+        "#include <stdint.h>\n#include <stdio.h>\nint64_t payload(void) { puts(\"unexpected I/O\"); return 42; }\n"
+    } else {
+        "#include <stdint.h>\nint64_t payload(void) { return 42; }\n"
+    }).unwrap();
+    let host = target_lexicon::HOST.to_string();
+    let mut builder = cc::Build::new();
+    builder
+        .cargo_metadata(false)
+        .host(&host)
+        .target(&host)
+        .opt_level(0)
+        .debug(false)
+        .out_dir(&directory)
+        .file(&source);
+    let compiler = builder.get_compiler();
+    let archive = directory.join(if compiler.is_like_msvc() {
+        "willow_payload.lib"
+    } else {
+        "libwillow_payload.a"
+    });
+    if archive.exists() {
+        fs::remove_file(&archive).unwrap();
+    }
+    builder.compile("willow_payload");
+    let harness = directory.join("harness.c");
+    fs::write(&harness, "#include <stdint.h>\nint64_t payload(void);\nint main(void) { return payload() == 42 ? 0 : 1; }\n").unwrap();
+    let executable = directory.join(if cfg!(windows) {
+        "harness.exe"
+    } else {
+        "harness"
+    });
+    let mut command = compiler.to_command();
+    command.current_dir(&directory).arg(&harness).arg(&archive);
+    if compiler.is_like_msvc() {
+        command
+            .arg("/nologo")
+            .arg(format!("/Fe{}", executable.display()));
+    } else {
+        command.arg("-o").arg(&executable);
+    }
+    let compiled = command.output().unwrap();
+    assert!(compiled.status.success(), "{compiled:?}");
+    let output = Command::new(&executable).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        if io { "unexpected I/O\n" } else { "" }
+    );
+    directory
+}
+
+#[test]
+fn unified_assumption_native_manifest_review_and_execution() {
+    let f = Fixture::new();
+    let mut prepare = Command::new(if cfg!(windows) { "python" } else { "python3" });
+    prepare
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("example/native_library/prepare.py"))
+        .arg(&f.root);
+    #[cfg(all(windows, target_env = "msvc"))]
+    {
+        let compiler = cc::windows_registry::find_tool(&target_lexicon::HOST.to_string(), "cl.exe")
+            .expect("native example requires MSVC");
+        prepare.env("CC", compiler.path());
+        for (key, value) in compiler.get_envs() {
+            prepare.env(key, value);
+        }
+    }
+    let output = prepare
+        .output()
+        .expect("native example requires Python and a C toolchain");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    f.write("src/main.wi", "extern rust { @effects(no_io) fn add(a: i64, b: i64) -> i64; }\n@effects(no_io) fn exercise() -> i64 { return add(20, 22); }\nfn main() { println(exercise()); }\n");
+    f.success(&["fetch", "--offline"]);
+    assert_eq!(f.review_query()["bridges"][0]["review_current"], false);
+    let output = f.command(&["check", ".", "--offline"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("E2612"));
+    let record = f.approve_native();
+    f.success(&["check", ".", "--offline"]);
+    let output = f.success(&["run", ".", "--offline"]);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+    assert_eq!(
+        f.review_query()["bridges"][0]["evidence_kind"],
+        "assumption"
+    );
+    let manifest = fs::read_to_string(f.root.join("project.toml")).unwrap();
+    f.write(
+        "project.toml",
+        &manifest.replace("locally compiled add.c", "reviewed native provider changed"),
+    );
+    let stale = f.review_query();
+    assert_eq!(stale["bridges"][0]["review_current"], false);
+    let output = f.command(&["check", ".", "--offline"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("E2612"));
+    assert_eq!(
+        fs::read_to_string(f.root.join("rust-review.toml")).unwrap(),
+        record
+    );
+    f.approve_native();
+    f.success(&["check", ".", "--offline"]);
 }

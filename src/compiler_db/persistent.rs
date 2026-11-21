@@ -339,6 +339,15 @@ pub(crate) fn run(
     inputs: CompilerInputs,
     emitter: &mut dyn DiagnosticEmitter,
 ) -> Result<Frontend> {
+    // Cargo path dependency contents are not Willow body-cache inputs. Reviewed
+    // foreign projects always pass through fresh metadata and semantic checks.
+    if inputs
+        .query_cache_root
+        .as_ref()
+        .is_some_and(|root| root.join("rust-review.toml").exists())
+    {
+        return crate::run_frontend_revision(source, root, map, inputs, emitter, None, None);
+    }
     // Persistence is experimental: its restore/save cost can exceed a clean
     // check. Neither a cache directory nor statistics implicitly enables it.
     if std::env::var_os("WILLOW_QUERY_CACHE").is_none_or(|v| v != "1") {

@@ -3,7 +3,7 @@ use super::*;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 
-pub const SCHEMA: &str = "willow.effects.v2";
+pub const SCHEMA: &str = "willow.effects.v3";
 const COUNT: usize = RuntimeEffects::BIT_COUNT as usize;
 const MISSING_WITNESS: usize = 5;
 const REASONS: [&str; 7] = [
@@ -41,6 +41,7 @@ impl Fact {
 /// cause sets. At most COUNT * (1 + REASONS.len()) facts arrive at each node.
 pub(super) struct Analysis {
     facts: Vec<[Fact; COUNT]>,
+    assumptions: super::assumptions::Analysis,
     evidence: Vec<Value>,
     pub edge_visits: usize,
 }
@@ -48,21 +49,23 @@ impl Analysis {
     pub fn new(snapshot: &Snapshot) -> Self {
         let index = graph::Index::new(&snapshot.functions);
         let mut result = Self {
+            assumptions: super::assumptions::Analysis::new(snapshot),
             facts: (0..snapshot.functions.len())
                 .map(|_| std::array::from_fn(|_| Fact::default()))
                 .collect(),
             evidence: Vec::new(),
             edge_visits: 0,
         };
-        let mut declared_no_io = vec![false; snapshot.functions.len()];
+        let mut declared_absent = vec![RuntimeEffects::NONE; snapshot.functions.len()];
         for bridge in &snapshot.semantic.interop.bridges {
             if let Some(&i) = index.by_id.get(bridge.function.as_str()) {
-                declared_no_io[i] = bridge.symbol.no_io;
-                let unknown = if bridge.symbol.no_io {
-                    RuntimeEffects::ALL.difference(RuntimeEffects::MAY_IO)
-                } else {
-                    RuntimeEffects::ALL
-                };
+                if bridge.symbol.assumes_no_io() {
+                    declared_absent[i] = declared_absent[i].union(RuntimeEffects::MAY_IO);
+                }
+                if bridge.symbol.assumes_no_block() {
+                    declared_absent[i] = declared_absent[i].union(RuntimeEffects::MAY_BLOCK);
+                }
+                let unknown = RuntimeEffects::ALL.difference(declared_absent[i]);
                 result.reason(i, unknown.bits(), 4, None);
             }
         }
@@ -77,11 +80,7 @@ impl Analysis {
         }
         for (i, f) in snapshot.functions.iter().enumerate() {
             if !bodies[i] && !f.synthetic {
-                let unknown = if declared_no_io[i] {
-                    RuntimeEffects::ALL.difference(RuntimeEffects::MAY_IO)
-                } else {
-                    RuntimeEffects::ALL
-                };
+                let unknown = RuntimeEffects::ALL.difference(declared_absent[i]);
                 result.reason(i, unknown.bits(), 3, f.locations.first());
             }
             if f.id.starts_with("$indirect-arity:") {
@@ -121,7 +120,9 @@ impl Analysis {
                     let w = &fact["witness"];
                     let location =
                         serde_json::from_value::<Location>(w["cause"]["location"].clone()).ok();
-                    let reason = if w["kind"] == "external-boundary" {
+                    let reason = if w["kind"] == "external-boundary"
+                        || w["cause"]["operation"] == "extern rust"
+                    {
                         Some(4)
                     } else if w["cause"]["operation"] == "indirect-call" {
                         Some(0)
@@ -256,18 +257,24 @@ impl Analysis {
             }
         }
     }
+    pub fn assumptions(&self, function: usize) -> Value {
+        self.assumptions.output(function)
+    }
     pub fn output(&self, function: usize) -> Value {
+        let assumptions = self.assumptions(function);
         Value::Array(self.facts[function].iter().enumerate().map(|(bit, fact)| {
+            let assumption = if (1 << bit) == RuntimeEffects::MAY_IO.bits() { &assumptions["no_io"] }
+                else if (1 << bit) == RuntimeEffects::MAY_BLOCK.bits() { &assumptions["no_block"] } else { &Value::Null };
             let reasons: Vec<_> = fact.reasons.iter().flatten().map(|&i| &self.evidence[i]).collect();
             json!({"effect":1u8 << bit, "state":if fact.witness.is_some() {"may"} else if !reasons.is_empty() {"unknown"} else {"none"},
-                "witness":fact.witness.map(|i| &self.evidence[i]), "unknown_reasons":reasons})
+                "evidence_kind":if fact.witness.is_some() { "compiler-proven" } else if !reasons.is_empty() { "unknown" } else if !assumption.is_null() { "assumption" } else { "compiler-proven" }, "assumption":assumption, "witness":fact.witness.map(|i| &self.evidence[i]), "unknown_reasons":reasons})
         }).collect())
     }
     pub fn unavailable() -> Value {
         Value::Array(
             (0..COUNT)
                 .map(|bit| {
-                    json!({"effect":1u8 << bit, "state":"unknown", "witness":null,
+                    json!({"effect":1u8 << bit, "state":"unknown", "evidence_kind":"unknown", "assumption":null, "witness":null,
             "unknown_reasons":[{"code":"missing-body", "location":null}]})
                 })
                 .collect(),

@@ -127,7 +127,16 @@ impl AnalysisRevision {
             .tracked
             .matches_inputs(&accepted)
             .then_some(self.frontend.as_ref())
-            .flatten();
+            .flatten()
+            // External review depends on resolved Rust dependency inputs outside
+            // the Willow body query graph. Recheck this boundary as a whole.
+            .filter(|frontend| {
+                frontend.db.rust_bridge_symbols.is_empty()
+                    && !session
+                        .project_root
+                        .as_ref()
+                        .is_some_and(|root| root.join("rust-review.toml").exists())
+            });
         let syntax = if previous.is_some() {
             self.syntax.borrow().candidate()?
         } else {

@@ -565,7 +565,12 @@ fn public_signature(value: Option<&Value>) -> bool {
     value.is_some_and(|v| v["exported"] == true)
 }
 fn configuration_inputs(root: &Path, inputs: &mut im::OrdMap<String, String>) -> Result<()> {
-    for name in ["project.toml", "project.lock"] {
+    for name in [
+        "project.toml",
+        "project.lock",
+        "rust-review.toml",
+        ".willow/rust/Cargo.lock",
+    ] {
         match std::fs::read(root.join(name)) {
             Ok(bytes) => {
                 inputs.insert(name.into(), hash(bytes));

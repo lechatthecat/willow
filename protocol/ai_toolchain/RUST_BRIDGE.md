@@ -19,7 +19,7 @@ Omit the selector for all bridges, or pass the returned `function` ID to disting
 same-named declarations. Each record contains `schema`, `kind`, `symbol`, `crate`,
 `rust_adapter`, `abi_symbol`, `signature`, `identity`, declaration spans, and the
 original `declaration_text`. The response schema is
-[`rust-bridge-v1.schema.json`](rust-bridge-v1.schema.json).
+[`rust-bridge-v2.schema.json`](rust-bridge-v2.schema.json).
 Boundary signatures encode scalar types as strings, `Array` with its element type,
 and `Record` with its declared name. Each bridge's optional `records` array defines
 reachable record names and ordered `[field_name, value_type]` pairs. Nested records
@@ -118,14 +118,39 @@ existing build paths.
 
 ## Bounded synchronous calls from tasks
 
-A function can declare `nonblocking("<review_fingerprint>")` before `fn` inside
+A function can declare `nonblocking("<legacy_review_fingerprint>")` before `fn` inside
 `extern rust`. Obtain the current fingerprint with `willow query rust-bridge`.
-Review the adapter and its resolved dependencies before copying the fingerprint
-into each function declaration. `check`, `build`, and `run` reject stale reviews.
+Review the adapter and its resolved dependencies before copying
+`legacy_review_fingerprint` into each function declaration. Write the distinct
+shared `review_fingerprint` into `rust-review.toml`; it also binds the canonical
+legacy claim identities and effect names. Adding, removing or changing a claim
+requires a new shared review, without changing the inline digest encoding. `check`, `build`, and `run` reject stale reviews.
 The fingerprint binds the resolved Cargo.lock (including crate versions), root
 bridge source, and Rust manifest configuration. Dependency updates require a new
-review; local path dependencies and bridge submodules still require developer
-review when their implementation changes without changing those inputs.
+review. Mutable Cargo path-dependency trees are included in the shared
+fingerprint, even without version changes. Mutable path packages support normal
+in-tree Rust modules and unqualified literal `include_bytes!`/`include_str!`
+references to included in-tree files. Code includes, path overrides, dynamic or
+aliased loaders, unknown macros, procedural attributes, native `link` attributes,
+mutable build scripts and
+procedural macros cannot establish a closed input set and are rejected for
+review. Private/generated directories and out-of-tree files cannot be consumed
+by an admitted layout. A fixed set of standard formatting/assertion macros and
+built-in derives is supported; imports that could shadow them are rejected.
+Cargo targets must use in-tree `.rs` files. File-loading root adapter constructs
+must satisfy the closed reviewed source boundary. This includes `#[link(...)]`
+in root adapters and native Rust modules, even under conditional attributes or
+inside macros: declare native libraries through the manifest so their reviewed
+inputs are explicit. Replacing an unbound archive cannot preserve an admitted
+root claim because such a source layout is rejected before review issuance.
+Root adapters and native Rust modules use the same closed expansion policy as
+mutable dependencies. Global, inline and naked assembly are unsupported for
+reviewed claims, including assembler file directives and macro aliases. Only
+the fixed unqualified standard macro/derive set and the compiler-provided
+`#[willow::assume(...)]` marker are admitted; custom macros, arbitrary procedural
+attributes and environment/file-loading expansions fail closed. Root Rust
+modules must be inline or imported independently through Willow. This prevents
+new expansion mechanisms from silently adding unreviewed inputs.
 
 This is a developer assertion that the complete call, including conversion and
 native destructors, is short and bounded, fits the available native stack, and
@@ -142,7 +167,7 @@ The declaration removes MAY_BLOCK, permitting `no_wait` and lock contexts, while
 retaining MAY_ALLOCATE, MAY_PANIC and FOREIGN_CALL. It never establishes purity.
 Undeclared functions retain static task rejection and the runtime task guard.
 Generated opaque close functions remain blocking unless separately reviewed:
-place `nonblocking("<review_fingerprint>")` before the `opaque` declaration to
+place `nonblocking("<legacy_review_fingerprint>")` before the `opaque` declaration to
 review its generated close function. Reviewing another function does not review
 close; arbitrary native Drop implementations can block.
 
@@ -168,3 +193,39 @@ restricted auto-binding subset are future directions, not available features or
 a delivery commitment. Keep using concrete handwritten adapters and the current
 boundary types; one-way Future support does not imply general bidirectional
 runtime integration.
+
+## Reviewed effect assumptions
+
+Rust functions, methods and opaque types accept one attribute:
+`#[willow::assume(no_block, no_io)]`. Either name may be used alone, in either
+order. On an opaque type the claim covers its generated close operation and
+`Drop`. `no_block` excludes waiting in synchronous calls; `no_io` excludes
+external I/O. Async functions may assert `no_io`, but not `no_block`.
+Unknown names, duplicates, and other effects are errors. `no_panic` and
+`no_alloc` cannot be asserted because adapters may panic or allocate.
+
+Every claim requires the same current `rust-review.toml` fingerprint, including
+legacy `nonblocking("...")` and extern `@effects(no_io)` declarations. Legacy
+inline fingerprints must also remain current during migration. A missing or
+stale record disables every claim; dependent contracts fail closed. Querying
+`rust-bridge` can still produce the review fingerprint when contracts fail.
+Review sources and resolved dependencies before explicitly updating the record;
+commands never approve a review automatically. Native-library adapters follow
+these same rules and native manifest changes invalidate the review.
+
+Bridge schema 2 reports declared `assumptions`, `review_current`, effective
+`effects`, `evidence_kind`, and `assumption_location`. A declared but inactive
+claim is `unknown`, never proof. Effects schema `willow.effects.v3` reports
+`evidence_kind: "assumption"` and a source location for absence dependent on a
+reviewed boundary; the `assumptions` map also covers `no_wait`. Contract
+warnings use W2613 and point to the assumption. `verify-edit` schema v3 (v4
+with contract approval policy) exposes `summary.assumptions.base/target`, even
+for unchanged contracts. Clients must check versions and reject unsupported
+versions. Archived bridge schema 1 rejects schema 2 output.
+
+Assumption provenance keeps one representative source location per effect and
+callable; the bridge inventory lists every declared boundary. Reviewed foreign
+projects recheck their source/dependency boundary before semantic analysis; no
+extra checks or allocations are added to generated runtime call paths. Git
+verification captures tracked Cargo package inputs and fails closed for
+unavailable inputs instead of borrowing current files for a historical base.

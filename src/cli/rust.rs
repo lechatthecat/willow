@@ -198,11 +198,7 @@ impl RustCommand {
             .symbols
             .iter()
             .any(|symbol| symbol.native.is_none());
-        let has_claim = self
-            .options
-            .symbols
-            .iter()
-            .any(|s| s.native.is_some() && s.nonblocking.is_some());
+        let has_claim = self.options.symbols.iter().any(|s| s.has_assumptions());
         let recorded = willow_compiler::toolchain::rust_bridge_build::review::recorded(root)?;
         if enabled && (!has_native_sources || has_legacy || has_claim || recorded.is_some()) {
             let build =
@@ -215,17 +211,6 @@ impl RustCommand {
         value["review_fingerprint"] = serde_json::json!(review);
         if has_legacy && (has_claim || recorded.is_some()) {
             value["legacy_review_fingerprint"] = serde_json::json!(legacy_review);
-        }
-        for bridge in value["bridges"].as_array_mut().unwrap() {
-            bridge["review_current"] = serde_json::json!(if bridge["assume_no_block"] == true {
-                review
-                    .as_ref()
-                    .is_some_and(|r| recorded.as_ref() == Some(r))
-            } else {
-                legacy_review
-                    .as_ref()
-                    .is_some_and(|r| bridge["nonblocking"].as_str() == Some(r))
-            });
         }
         super::write_machine_output(&value)?;
         Ok(())
@@ -251,13 +236,20 @@ impl RustCommand {
             let mut options = CompilerOptions::debug();
             options.locked = self.options.locked;
             options.offline = self.options.offline;
-            let snapshot = willow_compiler::CompilerSession::new(
+            let session = willow_compiler::CompilerSession::new(
                 entry.to_str().context("non UTF-8 entry path")?,
                 "",
                 &options,
                 Some(root.clone()),
-            )
-            .analysis_for_edit_with_emitter(&mut willow_compiler::diagnostics::HumanEmitter)?;
+            );
+            let snapshot = if self.operation == "rust-bridge" {
+                session
+                    .analysis_for_verification(&mut willow_compiler::diagnostics::HumanEmitter)?
+            } else {
+                session.analysis_for_edit_with_emitter(
+                    &mut willow_compiler::diagnostics::HumanEmitter,
+                )?
+            };
             self.options.symbols = snapshot.semantic.rust_bridges.clone();
             Some(snapshot)
         } else {

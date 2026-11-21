@@ -244,22 +244,40 @@ impl Deriver<'_> {
     fn attributes(&self, attrs: &[syn::Attribute]) -> Result<(), Diagnostic> {
         self.assumptions(attrs, false).map(|_| ())
     }
-    fn assumptions(&self, attrs: &[syn::Attribute], supported: bool) -> Result<bool, Diagnostic> {
-        let mut assumed = false;
+    fn assumptions(
+        &self,
+        attrs: &[syn::Attribute],
+        supported: bool,
+    ) -> Result<Option<(bool, bool, Span)>, Diagnostic> {
+        let mut assumed = None;
         for attr in attrs {
             if attr.path().segments.len() == 2
                 && attr.path().segments[0].ident == "willow"
                 && attr.path().segments[1].ident == "assume"
             {
-                if !supported
-                    || assumed
-                    || !attr
-                        .parse_args::<syn::Ident>()
-                        .is_ok_and(|name| name == "no_block")
-                {
-                    return Err(self.error(attr.span(), "expected one #[willow::assume(no_block)] on a function, method or opaque type"));
+                let error = || {
+                    self.error(attr.span(), "expected one #[willow::assume(no_block, no_io)] with unique supported effect names on a function, method or opaque type")
+                };
+                if !supported || assumed.is_some() {
+                    return Err(error());
                 }
-                assumed = true;
+                let names = attr
+                    .parse_args_with(
+                        syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated,
+                    )
+                    .map_err(|_| error())?;
+                if names.is_empty() {
+                    return Err(error());
+                }
+                let (mut no_block, mut no_io) = (false, false);
+                for name in names {
+                    match name.to_string().as_str() {
+                        "no_block" if !no_block => no_block = true,
+                        "no_io" if !no_io => no_io = true,
+                        _ => return Err(error()),
+                    }
+                }
+                assumed = Some((no_block, no_io, self.span(attr.span())));
                 continue;
             }
             if !attr.path().is_ident("doc")
@@ -465,12 +483,16 @@ impl Deriver<'_> {
             types.iter().map(|t| t.scalar(&self.module)).collect(),
             output.scalar(&self.module),
         );
-        if assumed {
-            if f.sig.asyncness.is_some() {
+        if let Some((no_block, no_io, span)) = assumed {
+            if no_block && f.sig.asyncness.is_some() {
                 return Err(self.error(f.sig.span(), "async Rust bridge cannot declare no_block"));
             }
             // Native claims are bound to the single project review at validation.
-            symbol.declare_nonblocking(String::new());
+            if no_block {
+                symbol.declare_nonblocking(String::new());
+            }
+            symbol.no_io = no_io;
+            symbol.assumption_span = Some(span);
         }
         symbol.is_async = f.sig.asyncness.is_some();
         if symbol.is_async {
@@ -1022,7 +1044,7 @@ impl RecordInterfaces {
         span: Span,
         path: &Path,
         program: &mut Program,
-        assumed: bool,
+        assumed: Option<(bool, bool, Span)>,
     ) {
         program.items.push(Item::Enum(EnumDecl {
             name: name.clone(),
@@ -1047,8 +1069,12 @@ impl RecordInterfaces {
             Scalar::Void,
         );
         symbol.close_handle = true;
-        if assumed {
-            symbol.declare_nonblocking(String::new());
+        if let Some((no_block, no_io, span)) = assumed {
+            if no_block {
+                symbol.declare_nonblocking(String::new());
+            }
+            symbol.no_io = no_io;
+            symbol.assumption_span = Some(span);
         }
         symbol.native = Some(NativeBridge {
             module: d.module.clone(),

@@ -1,6 +1,6 @@
 import native;
 
-@effects(no_wait) fn read_and_close() -> i64 {
+@effects(no_wait, no_io) fn read_and_close() -> i64 {
     let handle = native::make();
     let value = native::Handle_read(handle);
     native::Handle_close(handle);

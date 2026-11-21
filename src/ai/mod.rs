@@ -1,4 +1,5 @@
 //! Opt-in, compiler-owned impact facts. No backend or runtime dependency.
+pub(crate) mod assumptions;
 mod diff;
 pub mod direct;
 mod dispatch;

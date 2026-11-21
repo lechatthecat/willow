@@ -55,7 +55,7 @@ edit, run `willow check . --format ndjson`, then
 `willow verify-edit --base BASE --format json`. Fix problems, repeat verification,
 run focused tests, and review the source diff. Verification complements tests.
 
-`verify-edit` emits one `willow.semantic-diff.v1` JSON document, not NDJSON
+`verify-edit` emits one `willow.semantic-diff.v3` JSON document, not NDJSON
 protocol events. Exit codes: 0 complete without policy violations; 1 contract or
 requested policy violation; 2 command failure; 3 incomplete evidence. Reject
 incomplete evidence even when the change list is empty. Add

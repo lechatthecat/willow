@@ -48,7 +48,13 @@ pub(super) fn update_shapes(
             hash(&source) == *digest,
             "source changed while matching declarations"
         );
-        let tokens = super::super::super::TokenHashes::with_identifier_shape(&source, true)?;
+        // Native bodies contain Rust attributes and syntax. Keep their token
+        // identity conservative rather than treating them as Willow renames.
+        let tokens = if Path::new(path).extension().is_some_and(|ext| ext == "rs") {
+            super::super::super::TokenHashes::rust(&source)?
+        } else {
+            super::super::super::TokenHashes::with_identifier_shape(&source, true)?
+        };
         for (id, location) in ranges {
             shapes.insert(
                 ids[id].clone(),
@@ -379,7 +385,7 @@ mod tests {
     #[test]
     fn semantic_diff_rename_human_names_cover_evidence() {
         let report = SemanticDiff {
-            schema: "willow.semantic-diff.v1",
+            schema: "willow.semantic-diff.v3",
             status: "complete",
             base: Value::Null,
             target: Value::Null,

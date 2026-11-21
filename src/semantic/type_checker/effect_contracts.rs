@@ -710,16 +710,12 @@ impl TypeChecker {
                 let bridge = f.rust_bridge.as_ref()?;
                 // A reviewed `nonblocking` declaration does not wait; an
                 // `@effects(no_io)` declaration performs no I/O.
-                let mut effects = if bridge.nonblocking.is_some() {
+                let mut effects = if bridge.assumes_no_block() {
                     RuntimeEffects::NONE
                 } else {
                     LOCK_EFFECT_WAIT
                 };
-                if !f
-                    .effect_contracts
-                    .iter()
-                    .any(|c| c.kind == EffectContractKind::NoIo)
-                {
+                if !bridge.assumes_no_io() {
                     effects = effects.union(RuntimeEffects::MAY_IO);
                 }
                 // Same identity as the effect summaries: a namespaced
@@ -2053,7 +2049,7 @@ mod tests {
             (
                 "declared foreign",
                 "extern rust { @effects(no_io) fn foreign(); } @effects(no_io) fn f() { foreign(); }",
-                None,
+                Some(ErrorCode::E2612),
             ),
             (
                 "foreign relay",
@@ -2063,7 +2059,7 @@ mod tests {
             (
                 "declared relay",
                 "extern rust { @effects(no_io) fn foreign(); } fn relay() { foreign(); } @effects(no_io) fn f() { relay(); }",
-                None,
+                Some(ErrorCode::E2612),
             ),
             (
                 "unused foreign",

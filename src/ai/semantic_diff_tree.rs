@@ -37,15 +37,40 @@ pub fn resolve_base(root: &Path, revision: &str) -> Result<String> {
     );
     Ok(object)
 }
-fn relevant(path: &str, lock: bool) -> bool {
+fn cargo_roots<'a>(paths: impl Iterator<Item = &'a str>) -> BTreeSet<&'a str> {
+    paths
+        .filter_map(|path| path.strip_suffix("/Cargo.toml"))
+        .collect()
+}
+fn relevant(path: &str, lock: bool, packages: &BTreeSet<&str>) -> bool {
+    if path.split('/').any(|part| {
+        matches!(
+            part,
+            "requirements" | ".git" | "target" | ".willow" | ".willow-edits"
+        )
+    }) {
+        return false;
+    }
+    // Cargo path packages may use arbitrary include_bytes!/build-script inputs.
+    // Capture their tracked trees with the same exclusions as review hashing.
+    let mut parent = path;
+    while let Some((directory, _)) = parent.rsplit_once('/') {
+        if packages.contains(directory) {
+            return true;
+        }
+        parent = directory;
+    }
     if lock && path == "contracts.lock" {
         return true;
     }
     path.ends_with(".wi")
-        || path
-            .rsplit('/')
-            .next()
-            .is_some_and(|s| matches!(s, "project.toml" | "project.lock"))
+        || path.ends_with(".rs")
+        || path.rsplit('/').next().is_some_and(|s| {
+            matches!(
+                s,
+                "project.toml" | "project.lock" | "rust-review.toml" | "Cargo.toml" | "Cargo.lock"
+            )
+        })
 }
 fn safe(path: &str) -> bool {
     !path.is_empty()
@@ -73,6 +98,16 @@ pub(super) fn base_inputs(root: &Path, object: &str, lock: bool) -> Result<Tree>
     let prefix = String::from_utf8(git(root, &["rev-parse", "--show-prefix"])?)?;
     let prefix = prefix.trim_end_matches('\n');
     let listing = git(root, &["ls-tree", "-rz", "--full-tree", object])?;
+    let records = listing
+        .split(|b| *b == 0)
+        .filter(|r| !r.is_empty())
+        .map(std::str::from_utf8)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let packages = cargo_roots(
+        records
+            .iter()
+            .filter_map(|record| record.split_once('\t')?.1.strip_prefix(prefix)),
+    );
     let mut objects = Vec::new();
     for record in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
         let record = std::str::from_utf8(record)?;
@@ -80,7 +115,7 @@ pub(super) fn base_inputs(root: &Path, object: &str, lock: bool) -> Result<Tree>
         let Some(path) = path.strip_prefix(prefix) else {
             continue;
         };
-        if !relevant(path, lock) {
+        if !relevant(path, lock, &packages) {
             continue;
         }
         let parts: Vec<_> = header.split_whitespace().collect();
@@ -164,10 +199,11 @@ pub(super) fn target_inputs(root: &Path, lock: bool) -> Result<Tree> {
             Err(e) => return Err(e.into()),
         }
     }
+    let packages = cargo_roots(paths.iter().copied());
     let mut tree = Tree::new();
     let mut total = 0;
-    for path in paths {
-        if !relevant(path, lock) {
+    for path in &paths {
+        if !relevant(path, lock, &packages) {
             continue;
         }
         ensure!(safe(path), "invalid input path");
@@ -189,7 +225,7 @@ pub(super) fn target_inputs(root: &Path, lock: bool) -> Result<Tree> {
         fs::File::open(full)?
             .take((LIMIT - total + 1) as u64)
             .read_to_end(&mut bytes)?;
-        insert(&mut tree, &mut total, path.to_owned(), bytes)?;
+        insert(&mut tree, &mut total, (*path).to_owned(), bytes)?;
     }
     Ok(tree)
 }
@@ -248,4 +284,32 @@ pub(super) fn protected_commit(root: &Path, commit: &str) -> Result<String> {
         "protected base must identify a commit directly"
     );
     Ok(commit.to_owned())
+}
+
+#[cfg(test)]
+mod foreign_input_tests {
+    use super::*;
+    #[test]
+    fn foreign_review_inputs_include_package_data_and_exclude_private_outputs() {
+        let packages = cargo_roots(["native/Cargo.toml", "native/nested/Cargo.toml"].into_iter());
+        for path in [
+            "native/data/table.dat",
+            "native/build.rs",
+            "native/nested/resources/key.txt",
+            "src/native.rs",
+            "rust-review.toml",
+        ] {
+            assert!(relevant(path, false, &packages), "{path}");
+        }
+        for path in [
+            "requirements/private.rs",
+            "native/requirements/private.dat",
+            "native/target/a",
+            "native/.willow/a",
+            "native/.git/config",
+            "unrelated/data.dat",
+        ] {
+            assert!(!relevant(path, false, &packages), "{path}");
+        }
+    }
 }

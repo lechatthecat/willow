@@ -183,7 +183,7 @@ again after analysis. A cold baseline is analyzed first; the target reuses its
 compiler revision and rechecks affected bodies. There is no persistent cache
 publication by this command.
 
-JSON uses `schema: "willow.semantic-diff.v1"` with `status`, `base`, `target`,
+JSON uses `schema: "willow.semantic-diff.v3"` with `status`, `base`, `target`,
 `changes`, and `summary`. Each change identifies its symbol and match result,
 added/removed effects, witness causes and certainty, impacted callers, contracts,
 public API changes, and call-target changes. Symbol matching uses module-relative
@@ -198,7 +198,10 @@ Call-target comparison follows the correspondence while retaining the original
 `targets.base` and `targets.target` identities; `targets.change` indicates whether
 the target set actually changed. Text output presents source names for dispatch,
 lambda and function-value summaries. Paths use workspace-relative `/` separators.
-The legacy `edit verify` and effects JSON formats remain unchanged.
+The legacy `edit verify` envelope remains unchanged. Effects use
+`willow.effects.v3`; this report uses v3 (v4 with contract approval policy).
+`summary.assumptions.base/target` locates reviewed dependencies of declared
+contracts, including unchanged contracts. Clients must reject unknown versions.
 
 Exit codes are 0 for a complete result without violations, 1 for a contract
 violation or explicitly selected policy violation, 2 for invalid arguments or

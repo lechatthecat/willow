@@ -1,9 +1,9 @@
 # Reviewed Rust modules
 
-`#[willow::assume(no_block)]` asserts that a synchronous function or method
+`#[willow::assume(no_block, no_io)]` asserts that a synchronous function or method
 finishes without blocking a worker. On an opaque struct it asserts the same
-for its generated `Type_close` operation, including `Drop`. This removes only
-MAY_BLOCK; allocation, panic and foreign-call effects remain. It is a developer
+for its generated `Type_close` operation, including `Drop`. The two claims remove
+MAY_BLOCK and MAY_IO; allocation, panic and foreign-call effects remain. It is a developer
 assertion, never official verification or a purity proof. Methods use the
 `Type_method(handle, ...)` facade with shared opaque `&self` receivers.
 

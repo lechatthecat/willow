@@ -662,3 +662,172 @@ fn cli_build_run_frozen_and_stale_rust_graph() {
     );
     assert_eq!(project, fs::read(f.root.join("project.lock")).unwrap());
 }
+
+#[test]
+fn unified_review_binds_all_target_dependency_closures() {
+    use willow_compiler::rust_bridge_ir::{RustBridgeSymbol, Scalar};
+    let mut fixture = Fixture::new("path");
+    for platform in ["unix", "windows"] {
+        let root = fixture.root.join("native").join(platform);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Cargo.toml"), format!(
+            "[package]\nname=\"review_{platform}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[features]\nreviewed=[]\n[workspace]\n"
+        )).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 42 }\n").unwrap();
+    }
+    let manifest_path = fixture.root.join("native/Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(&manifest_path, format!(
+        "{manifest}\n[target.'cfg(unix)'.dependencies]\nreview_unix={{path=\"unix\",features=[\"reviewed\"]}}\n[target.'cfg(windows)'.dependencies]\nreview_windows={{path=\"windows\",features=[\"reviewed\"]}}\n"
+    )).unwrap();
+    let mut symbol =
+        RustBridgeSymbol::new("add".into(), vec![Scalar::I64, Scalar::I64], Scalar::I64);
+    symbol.no_io = true;
+    fixture.options.symbols.push(symbol);
+    fixture.options.read_only = true;
+    let targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"];
+    let mut fingerprints = Vec::new();
+    for target in targets {
+        fixture.options.target = Some(target.into());
+        let build = inspect_bridge(&fixture.manifest(), &fixture.root, &fixture.options)
+            .unwrap()
+            .unwrap();
+        assert!(build.staticlib.is_none());
+        assert!(build.messages.artifacts.is_empty());
+        let packages = build.metadata["packages"].as_array().unwrap();
+        for name in ["review_unix", "review_windows"] {
+            let package = packages
+                .iter()
+                .find(|package| package["name"] == name)
+                .unwrap();
+            let node = build.metadata["resolve"]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["id"] == package["id"])
+                .unwrap();
+            assert!(
+                node["features"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|feature| feature == "reviewed")
+            );
+        }
+        fingerprints.push(build.review_fingerprint.clone());
+    }
+    assert_eq!(fingerprints[0], fingerprints[1]);
+    // A dependency inactive on Linux must still revoke the Linux review.
+    fs::write(
+        fixture.root.join("native/windows/src/lib.rs"),
+        "pub fn answer() -> i32 { 43 }\n",
+    )
+    .unwrap();
+    let mut changed = Vec::new();
+    for target in targets {
+        fixture.options.target = Some(target.into());
+        let build = inspect_bridge(&fixture.manifest(), &fixture.root, &fixture.options)
+            .unwrap()
+            .unwrap();
+        changed.push(build.review_fingerprint.clone());
+    }
+    assert_eq!(changed[0], changed[1]);
+    assert_ne!(changed[0], fingerprints[0]);
+    assert!(!fixture.root.join("project.lock").exists());
+    assert!(!fixture.root.join(".willow").exists());
+    assert!(!fixture.root.join("rust-review.toml").exists());
+}
+
+#[test]
+fn unified_review_rejects_unbounded_dependency_inputs() {
+    use willow_compiler::rust_bridge_ir::{RustBridgeSymbol, Scalar};
+    let mut fixture = Fixture::new("path");
+    fs::write(
+        fixture.root.join("bridge.rs"),
+        "pub fn answer() -> i64 { willow_bridge_native::answer() as i64 }\n",
+    )
+    .unwrap();
+    let mut symbol = RustBridgeSymbol::new("answer".into(), vec![], Scalar::I64);
+    symbol.no_io = true;
+    fixture.options.symbols.push(symbol);
+    fixture.options.read_only = true;
+    let native = fixture.root.join("native");
+    let source = native.join("src/lib.rs");
+    let allowed = r#"
+mod helper;
+const DATA: &[u8] = include_bytes!("../data.bin");
+const LABEL: &str = include_str!("../label.txt");
+pub fn answer() -> i32 { helper::answer() + DATA[0] as i32 + LABEL.len() as i32 }
+"#;
+    fs::write(&source, allowed).unwrap();
+    fs::write(
+        native.join("src/helper.rs"),
+        "pub fn answer() -> i32 { 40 }\n",
+    )
+    .unwrap();
+    fs::write(native.join("data.bin"), [1]).unwrap();
+    fs::write(native.join("label.txt"), "a").unwrap();
+    let fingerprint = || {
+        inspect_bridge(&fixture.manifest(), &fixture.root, &fixture.options)
+            .unwrap()
+            .unwrap()
+            .review_fingerprint
+            .clone()
+    };
+    let reviewed = fingerprint();
+    let record_path = fixture.root.join("rust-review.toml");
+    let record = format!("fingerprint = \"{reviewed}\"\n");
+    fs::write(&record_path, &record).unwrap();
+    for (path, changed) in [
+        (native.join("data.bin"), b"2".as_slice()),
+        (native.join("label.txt"), b"longer".as_slice()),
+    ] {
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, changed).unwrap();
+        assert_ne!(fingerprint(), reviewed, "{}", path.display());
+        assert_eq!(fs::read_to_string(&record_path).unwrap(), record);
+        fs::write(path, original).unwrap();
+    }
+    assert_eq!(fingerprint(), reviewed);
+    let reject = |case: &str| {
+        let error = inspect_bridge(&fixture.manifest(), &fixture.root, &fixture.options)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("rust_review_source_layout"),
+            "{case}: {error}"
+        );
+        assert_eq!(fs::read_to_string(&record_path).unwrap(), record, "{case}");
+    };
+    // Both versions of formerly unbound code are rejected, so changing an
+    // excluded input cannot retain the earlier review of a harmless version.
+    fs::create_dir_all(native.join("target")).unwrap();
+    fs::write(&source, "include!(\"../target/behavior.rs\");\n").unwrap();
+    for behavior in [
+        "pub fn answer() -> i32 { 42 }\n",
+        "pub fn answer() -> i32 { std::println!(\"io\"); 42 }\n",
+    ] {
+        fs::write(native.join("target/behavior.rs"), behavior).unwrap();
+        reject("excluded included Rust code");
+    }
+    for excluded in [".git", "target", ".willow", ".willow-edits", "requirements"] {
+        fs::create_dir_all(native.join(excluded)).unwrap();
+        fs::write(native.join(excluded).join("data.bin"), [42]).unwrap();
+        fs::write(&source, format!(
+            "pub fn answer() -> i32 {{ include_bytes!(\"../{excluded}/data.bin\")[0] as i32 }}\n"
+        )).unwrap();
+        reject(excluded);
+    }
+    fs::write(fixture.root.join("outside.bin"), [42]).unwrap();
+    fs::write(
+        &source,
+        "pub fn answer() -> i32 { include_bytes!(\"../../outside.bin\")[0] as i32 }\n",
+    )
+    .unwrap();
+    reject("out-of-package data");
+    fs::write(&source, allowed).unwrap();
+    assert_eq!(fingerprint(), reviewed);
+    assert_eq!(fs::read_to_string(record_path).unwrap(), record);
+    assert!(!fixture.root.join("project.lock").exists());
+    assert!(!fixture.root.join(".willow").exists());
+}

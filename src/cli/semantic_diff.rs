@@ -35,10 +35,10 @@ fn parse(args: &[String]) -> Result<(Options, bool, bool, Option<Policy>)> {
         match key.as_str() {
             "--schema" => {
                 anyhow::ensure!(
-                    matches!(value.as_str(), "v1" | "v2"),
-                    "schema must be v1 or v2"
+                    matches!(value.as_str(), "v3" | "v4"),
+                    "schema must be v3 or v4"
                 );
-                v2 = value == "v2";
+                v2 = value == "v4";
             }
             "--protected-base" => {
                 policy.protected_base = Some(value.clone());
@@ -84,7 +84,7 @@ fn parse(args: &[String]) -> Result<(Options, bool, bool, Option<Policy>)> {
     options.base = resolve_base(&options.root, &options.base).context("invalid base revision")?;
     anyhow::ensure!(
         !policy_seen || v2,
-        "contract policy options require --schema v2"
+        "contract policy options require --schema v4"
     );
     anyhow::ensure!(
         policy.approval_evidence.is_some() == policy.approval_verifier.is_some(),
@@ -95,7 +95,7 @@ fn parse(args: &[String]) -> Result<(Options, bool, bool, Option<Policy>)> {
 pub(super) fn run(args: &[String]) -> Result<i32> {
     if args == ["--help"] || args == ["-h"] {
         println!(
-            "Usage: willow verify-edit --base REV [--root DIR] [--entry FILE] [--project] [--format json|text] [--explain] [--fail-on effect-growth] [--schema v1|v2] [--protected-base COMMIT] [--approval-evidence FILE --approval-verifier EXTERNAL_EXECUTABLE] [--write-contracts-lock]"
+            "Usage: willow verify-edit --base REV [--root DIR] [--entry FILE] [--project] [--format json|text] [--explain] [--fail-on effect-growth] [--schema v3|v4] [--protected-base COMMIT] [--approval-evidence FILE --approval-verifier EXTERNAL_EXECUTABLE] [--write-contracts-lock]"
         );
         return Ok(0);
     }
@@ -109,7 +109,7 @@ pub(super) fn run(args: &[String]) -> Result<i32> {
     let report = if let Some(policy) = policy {
         contracts::verify(&options, &policy).unwrap_or_else(|error| {
             let mut r = SemanticDiff::incomplete(format!("{error:#}"));
-            r.schema = "willow.semantic-diff.v2";
+            r.schema = "willow.semantic-diff.v4";
             r
         })
     } else {
@@ -118,7 +118,7 @@ pub(super) fn run(args: &[String]) -> Result<i32> {
     use std::io::Write;
     let output = if json {
         format!("{}\n", serde_json::to_string(&report)?)
-    } else if report.schema == "willow.semantic-diff.v2" {
+    } else if report.schema == "willow.semantic-diff.v4" {
         format!("{}\n", serde_json::to_string_pretty(&report)?)
     } else {
         report.human(explain)

@@ -39,7 +39,7 @@ impl StaticInitQueries {
                 Item::Function(f)
                     if f.rust_bridge
                         .as_ref()
-                        .is_some_and(|bridge| bridge.nonblocking.is_some()) =>
+                        .is_some_and(|bridge| bridge.assumes_no_block()) =>
                 {
                     leaves.insert(FunctionId::free_from_source_name(&f.name));
                 }
@@ -92,7 +92,7 @@ impl StaticInitQueries {
                 .filter_map(|item| match item {
                     Item::Function(f)
                         if f.rust_bridge.as_ref().is_some_and(|bridge| {
-                            !bridge.is_async && bridge.nonblocking.is_none()
+                            !bridge.is_async && !bridge.assumes_no_block()
                         }) =>
                     {
                         Some(FunctionId::free_from_source_name(&f.name))

@@ -1381,7 +1381,7 @@ struct UnitInventory<'a> {
     contract_spans: HashMap<BodyId, ContractRuntimeEffects>,
     pending: Vec<(FunctionId, BodyId, &'a Block)>,
     helpers: HashMap<FunctionId, crate::diagnostics::Span>,
-    foreign: Vec<(FunctionId, crate::diagnostics::Span, bool, bool)>,
+    foreign: Vec<(FunctionId, crate::diagnostics::Span, bool, bool, bool)>,
     value_constructors: Vec<FunctionId>,
     /// Injected default copies the checker skipped: they have no typed body in
     /// this unit and reuse their declaring interface's check.
@@ -1411,8 +1411,9 @@ impl<'a> UnitInventory<'a> {
                         inventory.foreign.push((
                             FunctionId::free_from_source_name(&f.name),
                             f.span,
-                            bridge.nonblocking.is_some(),
+                            bridge.assumes_no_block(),
                             bridge.is_async,
+                            bridge.assumes_no_io(),
                         ));
                         continue;
                     }
@@ -1565,7 +1566,7 @@ impl<'a> ColdUnitSolve<'a> {
     fn seed_declarations(
         &mut self,
         value_constructors: Vec<FunctionId>,
-        foreign: Vec<(FunctionId, crate::diagnostics::Span, bool, bool)>,
+        foreign: Vec<(FunctionId, crate::diagnostics::Span, bool, bool, bool)>,
     ) -> usize {
         // Memberwise and enum initialization only store already-evaluated arguments.
         // Publish its empty summary even when no body in this unit constructs the
@@ -1576,7 +1577,7 @@ impl<'a> ColdUnitSolve<'a> {
             self.own.insert(id);
             self.seed(id, RuntimeEffects::NONE, None);
         }
-        for (id, span, nonblocking, is_async) in foreign {
+        for (id, span, nonblocking, is_async, no_io) in foreign {
             self.seed(
                 id,
                 PANIC.union(RuntimeEffects::MAY_ALLOCATE),
@@ -1593,7 +1594,7 @@ impl<'a> ColdUnitSolve<'a> {
                     Some(EffectWitness::Lock(LockEffectWitness {
                         owner: id,
                         cause: LockEffectCause {
-                            is_conservative: false,
+                            is_conservative: true,
                             span,
                             operation: "extern rust".into(),
                             kind: if is_async {
@@ -1606,7 +1607,14 @@ impl<'a> ColdUnitSolve<'a> {
                     })),
                 );
             }
-            self.may_io.insert(id);
+            if !no_io {
+                self.seed(
+                    id,
+                    RuntimeEffects::MAY_IO,
+                    Some(EffectWitness::External(id)),
+                );
+                self.may_io.insert(id);
+            }
         }
         visits
     }

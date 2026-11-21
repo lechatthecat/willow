@@ -1,7 +1,10 @@
 //! Socket-free PostgreSQL v3 codec. Willow owns transport and cancellation.
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
-pub use https_api_bridge_tests::*;
+pub use https_api_bridge_tests::{
+    Http, Tls, http_body, http_encode, http_feed, http_new, http_route, tls_client, tls_created,
+    tls_drops, tls_plain, tls_ready, tls_send, tls_send_bytes, tls_server, tls_step,
+};
 use postgres_protocol::{
     IsNull, authentication,
     message::{backend, frontend},
@@ -201,7 +204,13 @@ fn feed(state: &mut State, input: &[u8], user: &str, password: &str) -> Result<V
             .map_err(error)?
             .ok_or("incomplete frame")?;
         state.messages += 1;
-        use backend::Message::*;
+        use backend::Message::{
+            AuthenticationCleartextPassword, AuthenticationMd5Password, AuthenticationOk,
+            AuthenticationSasl, AuthenticationSaslContinue, AuthenticationSaslFinal,
+            BackendKeyData, BindComplete, CommandComplete, DataRow, EmptyQueryResponse,
+            ErrorResponse, NoData, NoticeResponse, ParameterStatus, ParseComplete, ReadyForQuery,
+            RowDescription,
+        };
         match message {
             AuthenticationCleartextPassword if state.auth_phase == 0 && !state.authenticated => {
                 state.auth_phase = 1;

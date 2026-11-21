@@ -6345,7 +6345,7 @@ fn effect_states_versioned_schema_matches_impact_and_preserves_witnesses() {
     .unwrap();
     let value = f.json(&["effects", "main::mixed"], 0);
     let result = &value["result"];
-    assert_eq!(result["schema"], "willow.effects.v2");
+    assert_eq!(result["schema"], "willow.effects.v3");
     assert!(result.get("runtime_effects").is_none());
     let effects = result["effects"].as_array().unwrap();
     assert_eq!(
@@ -6356,7 +6356,7 @@ fn effect_states_versioned_schema_matches_impact_and_preserves_witnesses() {
     assert_eq!(panic["state"], "may", "{value}");
     assert!(panic["witness"]["location"].is_object(), "{value}");
     let impact = f.json(&["impact", "main::mixed"], 0);
-    assert_eq!(impact["result"]["impact"]["schema"], "willow.effects.v2");
+    assert_eq!(impact["result"]["impact"]["schema"], "willow.effects.v3");
     let node = impact["result"]["impact"]["nodes"]
         .as_array()
         .unwrap()
@@ -6367,7 +6367,7 @@ fn effect_states_versioned_schema_matches_impact_and_preserves_witnesses() {
     assert!(node.get("runtime_effects").is_none());
     assert!(node.get("unknown").is_none());
     let missing = f.json(&["effects", "main::absent"], 1);
-    assert_eq!(missing["result"]["schema"], "willow.effects.v2");
+    assert_eq!(missing["result"]["schema"], "willow.effects.v3");
     assert_eq!(missing["result"]["status"], "unknown");
     assert!(missing["result"].get("effects").is_none());
     let pure = f.json(&["effects", "main::pure"], 0);

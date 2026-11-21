@@ -1503,6 +1503,16 @@ pub(crate) fn incremental_snapshot(
         project,
     };
     let own = own_effects(frontend);
+    // Foreign review depends on whole source/dependency inputs, including removals.
+    // Rebuild its bounded provenance graph rather than reusing a partial patch.
+    if !frontend.db.rust_bridge_symbols.is_empty()
+        || state
+            .metadata
+            .as_ref()
+            .is_some_and(|s| !s.semantic.interop.bridges.is_empty())
+    {
+        return full_snapshot(inputs, state, own);
+    }
     match scope.plan.as_ref().filter(|_| state.metadata.is_some()) {
         Some(plan) => delta_snapshot(inputs, state, &plan.borrow(), own),
         None => full_snapshot(inputs, state, own),

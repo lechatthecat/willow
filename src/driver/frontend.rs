@@ -152,7 +152,7 @@ pub(crate) fn run_frontend_revision_cached(
     source: &str,
     root: &std::path::Path,
     map: &diagnostics::SourceMap,
-    inputs: compiler_db::inputs::CompilerInputs,
+    mut inputs: compiler_db::inputs::CompilerInputs,
     emitter: &mut dyn diagnostics::DiagnosticEmitter,
     (previous, disk): (
         Option<&Frontend>,
@@ -198,6 +198,18 @@ pub(crate) fn run_frontend_revision_cached(
             parse.error_count + imports.error_count
         );
     }
+    let emit_assumptions = !inputs.capture_analysis;
+    let review_diagnostics = super::foreign_review::apply(
+        std::iter::once(&mut program).chain(graph.files.iter_mut().map(|f| &mut f.program)),
+        &mut inputs,
+    )?;
+    emit_frontend_diagnostics(
+        &review_diagnostics,
+        map,
+        &graph,
+        &diagnostic_modules,
+        emitter,
+    )?;
     // Keep resolved and recovered declarations even when another import fails.
     // Clearing the graph makes healthy imports disappear from the type checker
     // and manufactures cross-file cascades. All import errors remain fatal at
@@ -240,14 +252,40 @@ pub(crate) fn run_frontend_revision_cached(
         root,
         map,
     )?;
-    check_frontend(
+    let frontend = check_frontend(
         frontend,
         artifacts,
-        parse.error_count + imports.error_count + desugar.error_count,
+        parse.error_count
+            + imports.error_count
+            + desugar.error_count
+            + diagnostic_error_count(&review_diagnostics),
         map,
         &diagnostic_modules,
         emitter,
-    )
+    )?;
+    if emit_assumptions
+        && frontend
+            .db
+            .rust_bridge_symbols
+            .iter()
+            .any(|(_, s)| s.review_current && s.has_assumptions())
+    {
+        let snapshot = ai::snapshot(
+            &frontend,
+            std::path::Path::new(&map.path),
+            source,
+            frontend.db.inputs().query_cache_root.as_deref(),
+        )?;
+        let diagnostics = super::foreign_review::diagnostics(&frontend, &snapshot, map);
+        emit_frontend_diagnostics(
+            &diagnostics,
+            map,
+            &frontend.module_graph,
+            &diagnostic_modules,
+            emitter,
+        )?;
+    }
+    Ok(frontend)
 }
 
 #[derive(Clone, Copy)]

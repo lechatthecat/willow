@@ -200,7 +200,7 @@ impl TypeChecker {
             foreign: f
                 .rust_bridge
                 .as_ref()
-                .is_some_and(|bridge| bridge.nonblocking.is_none()),
+                .is_some_and(|bridge| !bridge.assumes_no_block()),
             param_infos,
             params,
             return_type,

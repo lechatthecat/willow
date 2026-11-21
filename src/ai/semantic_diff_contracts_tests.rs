@@ -40,7 +40,7 @@ fn fixture() -> (tree::Scratch, Options, Policy) {
 fn contract_policy_lock_and_source_changed_together_need_approval() {
     let (dir, o, mut p) = fixture();
     let initial = verify(&o, &p).unwrap();
-    assert_eq!(initial.schema, "willow.semantic-diff.v2");
+    assert_eq!(initial.schema, "willow.semantic-diff.v4");
     assert_eq!(initial.exit_code(), 0, "{initial:?}");
     assert_eq!(
         initial.summary["approval"]["contract_status"],

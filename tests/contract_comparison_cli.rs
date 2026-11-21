@@ -51,19 +51,19 @@ fn contract_comparison_cli_initializes_checked_context_and_preserves_versions() 
         );
         serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap()
     };
-    assert_eq!(run(&[], 0)["schema"], "willow.semantic-diff.v1");
-    let r = run(&["--schema", "v2", "--protected-base", &commit], 0);
-    assert_eq!(r["schema"], "willow.semantic-diff.v2");
+    assert_eq!(run(&[], 0)["schema"], "willow.semantic-diff.v3");
+    let r = run(&["--schema", "v4", "--protected-base", &commit], 0);
+    assert_eq!(r["schema"], "willow.semantic-diff.v4");
     assert_eq!(r["changes"][0]["implementation_verified"], true);
     assert_eq!(r["changes"][0]["contract_preserved"], "PROVEN");
-    assert_eq!(run(&["--schema", "v2"], 3)["status"], "incomplete");
+    assert_eq!(run(&["--schema", "v4"], 3)["status"], "incomplete");
     fs::write(
         root.join("main.wi"),
         source.replace("requires x>=0", "requires x>=10"),
     )
     .unwrap();
     assert_eq!(
-        run(&["--schema", "v2", "--protected-base", &commit], 1)["changes"][0]["contract_preserved"],
+        run(&["--schema", "v4", "--protected-base", &commit], 1)["changes"][0]["contract_preserved"],
         "NOT_PRESERVED"
     );
 }

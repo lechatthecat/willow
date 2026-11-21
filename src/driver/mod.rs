@@ -1,3 +1,4 @@
+mod foreign_review;
 use crate::qualified_name::QualifiedName;
 use crate::{
     ai, backend, compiler_db, desugar, diagnostics, errors, ir, lexer, module, package, parser,
@@ -90,7 +91,7 @@ impl<'a> CompilerSession<'a> {
 
     /// Capture semantic evidence even when the final checker reports errors.
     /// This never authorizes code generation or edit application.
-    pub(crate) fn analysis_for_verification(
+    pub fn analysis_for_verification(
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
     ) -> Result<ai::Snapshot> {

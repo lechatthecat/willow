@@ -28,7 +28,7 @@ impl InteropGraph {
             .collect();
         let records: Vec<_> = bridges.iter().map(|b| {
             let mut record = json!({
-            "schema":1,"kind":"rust-bridge","symbol":b.symbol.willow_function,
+            "schema":2,"kind":"rust-bridge","symbol":b.symbol.willow_function,
             "function":b.function,"identity":b.identity,
             "crate": if self.crates.len() == 1 { json!(self.crates[0]) } else { Value::Null },
             "rust_adapter":self.rust_adapter,
@@ -38,6 +38,10 @@ impl InteropGraph {
             "nonblocking":if b.symbol.native.is_some() { None } else { b.symbol.nonblocking.as_ref() },
             "assume_no_block":b.symbol.native.is_some() && b.symbol.nonblocking.is_some(),
             "no_io":b.symbol.no_io,
+            "assumptions": {"no_block": b.symbol.nonblocking.is_some(), "no_io": b.symbol.no_io},
+            "review_current": b.symbol.review_current,
+            "evidence_kind": if b.symbol.review_current && b.symbol.has_assumptions() { "assumption" } else { "unknown" },
+            "assumption_location": b.symbol.assumption_span.map(|span| json!({"path":b.symbol.native.as_ref().map(|n| n.source_path.to_string_lossy().into_owned()).or_else(|| b.declaration.first().map(|l| l.path.clone())), "start":span.start,"end":span.end})),
             "trust":if b.symbol.nonblocking.is_some() || b.symbol.no_io {"developer_declared"} else {"undeclared"},
             "official_verified":false,
             "signature":{"inputs":b.symbol.input_types,"output":b.symbol.output_type},
@@ -55,7 +59,7 @@ impl InteropGraph {
             }
             record
         }).collect();
-        json!({"schema":1,"kind":"rust-bridge","status":if selector.is_some() && records.is_empty() {"unknown"} else {"ok"},"bridges":records,"crate_candidates":self.crates})
+        json!({"schema":2,"kind":"rust-bridge","status":if selector.is_some() && records.is_empty() {"unknown"} else {"ok"},"bridges":records,"crate_candidates":self.crates})
     }
 
     pub(crate) fn load_project(&mut self, root: &Path) -> Result<()> {

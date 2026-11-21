@@ -30,7 +30,7 @@ fn report(a: &str, b: &str) -> SemanticDiff {
 #[test]
 fn semantic_diff_identical_and_digest_contract() {
     let r = report("pub fn main() {}", "pub fn main() {}");
-    assert_eq!(r.schema, "willow.semantic-diff.v1");
+    assert_eq!(r.schema, "willow.semantic-diff.v3");
     assert_eq!(r.exit_code(), 0);
     assert!(r.changes.is_empty());
 }

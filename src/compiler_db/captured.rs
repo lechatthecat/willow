@@ -191,6 +191,9 @@ pub(crate) fn configuration(
     let roots: std::collections::BTreeSet<_> = project
         .into_iter()
         .map(Path::to_path_buf)
+        // Persistent cache admission may pass the entry's source directory.
+        // The selected project still owns its review and configuration files.
+        .chain(inputs.query_cache_root.iter().cloned())
         .chain(
             inputs
                 .package_graph
@@ -199,7 +202,20 @@ pub(crate) fn configuration(
         )
         .collect();
     for root in roots {
-        for (name, manifest) in [("project.toml", true), ("project.lock", false)] {
+        if let Some(digest) =
+            crate::toolchain::rust_bridge_build::review::source_input_fingerprint(&root)?
+        {
+            result.push((
+                InputNode::Lock(root.join(".willow/review-source-inputs")),
+                bytes(digest.into_bytes()),
+            ));
+        }
+        for (name, manifest) in [
+            ("project.toml", true),
+            ("project.lock", false),
+            ("rust-review.toml", false),
+            (".willow/rust/Cargo.lock", false),
+        ] {
             let path = root.join(name);
             let captured = match std::fs::read(&path) {
                 Ok(bytes) => Some(bytes),
@@ -226,6 +242,48 @@ pub(crate) fn configuration(
 mod tests {
     use super::*;
     use crate::compiler_db::tracked::TrackedQueryTable;
+
+    #[test]
+    fn configuration_invalidates_on_unimported_review_source_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "willow-review-configuration-{}",
+            std::process::id()
+        ));
+        assert!(!root.exists());
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("project.toml"),
+            "[project]\nname='review_configuration'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let mut inputs = CompilerInputs::native(crate::CompilerOptions::debug(), root.join("src"));
+        inputs.query_cache_root = Some(root.clone());
+        let entry = root.join("src/main.wi");
+        let node = InputNode::Lock(root.join(".willow/review-source-inputs"));
+        let capture = || configuration(&inputs, &entry, Some(&inputs.project_root)).unwrap();
+        assert!(!capture().iter().any(|(key, _)| key == &node));
+        std::fs::write(root.join("rust-review.toml"), "fingerprint='review'").unwrap();
+        let mut table = TrackedQueryTable::default();
+        table.replace_inputs(capture()).unwrap();
+        for source in [Some("pub fn a() {}"), Some("pub fn b() {}"), None] {
+            match source {
+                Some(source) => std::fs::write(root.join("src/unused.rs"), source).unwrap(),
+                None => std::fs::remove_file(root.join("src/unused.rs")).unwrap(),
+            }
+            let after = capture();
+            let changed: Vec<_> = after
+                .iter()
+                .filter(|entry| !table.matches_inputs(std::slice::from_ref(*entry)))
+                .map(|(key, _)| key.clone())
+                .collect();
+            assert_eq!(changed.as_slice(), std::slice::from_ref(&node));
+            table.replace_inputs(after).unwrap();
+        }
+        std::fs::remove_file(root.join("rust-review.toml")).unwrap();
+        assert!(!capture().iter().any(|(key, _)| key == &node));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn configuration_inputs_are_independent() {
         let mut inputs =

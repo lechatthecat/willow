@@ -251,6 +251,7 @@ error_codes! {
     E2631, // unsupported verification or missing declaration/body prerequisite
     E2632, // solver UNKNOWN/failure, invalid budget, internal or artifact I/O failure
     E2612, // effect contract cannot be proven
+    W2613, // effect contract depends on a reviewed external assumption
     E2606, // `lock` inside a `match` arm has no frame-backed resume shape
 }
 

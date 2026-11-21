@@ -141,12 +141,12 @@ Successful query envelopes carry `revision` and `result`; an invalid revision
 returns top-level `status: stale` before lookup. Unknown positions/identities,
 ambiguous source positions and incomplete evidence remain distinct.
 
-Effect responses and impact objects carry `schema: "willow.effects.v2"`.
+Effect responses and impact objects carry `schema: "willow.effects.v3"`.
 Effect responses have `effects`; each impact node has the same `effects` array.
-Every array contains all six runtime capability bits, including absent effects:
+Every array contains all seven runtime capability bits, including absent effects:
 
 ```json
-{"effect":32,"state":"may","witness":{"function":"...","location":{"path":"main.wi","start":12,"end":17},"operation":"division"},"unknown_reasons":[{"code":"indirect-call","location":null}]}
+{"effect":32,"state":"may","evidence_kind":"compiler-proven","assumption":null,"witness":{"function":"...","location":{"path":"main.wi","start":12,"end":17},"operation":"division"},"unknown_reasons":[{"code":"indirect-call","location":null}]}
 ```
 
 `may` means an operation witness exists, not that execution is inevitable.

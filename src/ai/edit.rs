@@ -154,7 +154,12 @@ impl AnalysisInputs {
         let root = fs::canonicalize(project.unwrap_or(entry.parent().context("entry parent")?))?;
         let mut files = BTreeMap::new();
         let mut manifest_entry = None;
-        for name in ["project.toml", "project.lock"] {
+        for name in [
+            "project.toml",
+            "project.lock",
+            "rust-review.toml",
+            ".willow/rust/Cargo.lock",
+        ] {
             files.insert(
                 name.into(),
                 match fs::read(root.join(name)) {
@@ -434,7 +439,12 @@ impl Workspace {
             sources.insert(relative, source);
         }
         let mut absent = Vec::new();
-        for name in ["project.toml", "project.lock"] {
+        for name in [
+            "project.toml",
+            "project.lock",
+            "rust-review.toml",
+            ".willow/rust/Cargo.lock",
+        ] {
             if self.root.join(name).exists() {
                 let bytes = fs::read(self.file(name)?)?;
                 inputs.insert(name.into(), hash(&bytes));

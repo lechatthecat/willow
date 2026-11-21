@@ -530,9 +530,13 @@ extern rust {
 }
 ```
 
-This declaration is a **trusted developer boundary**: Willow does not inspect
-the foreign implementation, its dependencies or destructors, and an incorrect
-declaration invalidates the guarantee. It does not imply `nonblocking`; the two
+This declaration is a **reviewed assumption**: it requires a current shared
+`rust-review.toml` fingerprint. Missing or stale review disables the claim.
+Willow does not prove the foreign implementation, its dependencies or destructors;
+an incorrect claim invalidates the guarantee. Rust modules use
+`#[willow::assume(no_block, no_io)]` (either effect may be used alone).
+Successful dependent contracts report `assumption` with its source location,
+including in effects queries and `verify-edit`. It does not imply `nonblocking`; the two
 modifiers are independent, and `@effects(no_io)` comes first when both are
 used. `willow effects` reports the I/O bit (64), and `verify-edit` reports it
 as `may-io`.
@@ -884,14 +888,14 @@ stated scope.
 | Effect `UNKNOWN` (`unknown` in JSON) | A conservative capability is retained without a supporting witness | Indirect/unresolved calls, missing bodies, incomplete flow, or external interop require assumptions; this is not evidence that the effect occurs or is absent |
 | Effect `NONE` (`none` in JSON) | Neither a witness nor an uncertainty reason remains for that capability in the modeled analysis | Scoped to available compiler knowledge, not a guarantee about unmodeled behavior |
 
-The `willow.effects.v2` output keeps `witness` and `unknown_reasons` separate.
+The `willow.effects.v3` output keeps `witness` and `unknown_reasons` separate.
 Missing evidence is not purity. Safety checks retain conservative capability
 bounds even when the explanatory query reports `UNKNOWN`; a query does not
 waive E2604. See the [effect-state example](example/effect_states.wi).
 
 ### Compare scalar contracts across an edit
 
-`willow verify-edit --base BASE --schema v2 --protected-base FULL_COMMIT --format json`
+`willow verify-edit --base BASE --schema v4 --protected-base FULL_COMMIT --format json`
 adds purity, `requires`/`ensures`, and proof-dependency comparisons. The default remains
 v1. `contract_preserved` does not imply `implementation_verified` or behavioral
 equivalence; behavioral equivalence is unsupported. Unsupported inputs and missing
@@ -977,7 +981,7 @@ Willow is an experimental language and compiler, **not yet suitable for producti
 - E2402 checks async-call arguments and movable Task frames, not every shared-memory access: static fields are shared without a check.
 - E2604 does not count console output as a wait and does not bound computation time inside a lock body.
 - Conservative analysis of dynamic and indirect calls may reject code that is actually safe. Unavailable evidence is never treated as proof of purity.
-- Rust adapters, native libraries and the declarations that describe them (`nonblocking`, `@effects(no_io)`) are trusted, not verified. Compiler and runtime defects are outside every static guarantee.
+- Rust adapters, native libraries and the declarations that describe them (`nonblocking`, `@effects(no_io)`, `willow::assume`) are assumptions bound to one current review record, not proofs of foreign behavior. Compiler and runtime defects are outside every static guarantee.
 - The runtime benchmarks and agent-token experiment measure limited, published workloads.
 
 **The goal:** make semantic safety properties part of the compiler's ordinary contract, and make their evidence accessible to both humans and coding agents.

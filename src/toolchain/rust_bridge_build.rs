@@ -404,9 +404,9 @@ impl BridgeCargo<'_> {
         let mut metadata_command = self.command();
         metadata_command
             .args(["metadata", "--format-version=1", "--manifest-path"])
-            .arg(self.manifest_path)
-            .arg("--filter-platform")
-            .arg(self.target);
+            // A shared review binds all target-conditional dependencies and
+            // features. Actual compilation independently selects its target.
+            .arg(self.manifest_path);
         if options.offline {
             metadata_command.arg("--offline");
         }
@@ -669,6 +669,7 @@ fn prepare_bridge(
         bridge.as_deref(),
         native_hash,
         &rust_lock,
+        &metadata,
     )?;
     let source_hash = hash(&serde_json::to_vec(&(&bridge_hash, &options.symbols))?);
     let manifest_hash = hash(manifest.as_bytes());
@@ -766,13 +767,13 @@ fn bridge_reviews(
     bridge: Option<&Path>,
     native_hash: Option<String>,
     rust_lock: &crate::package::lock::RustLock,
+    metadata: &Value,
 ) -> Result<(String, String, String)> {
-    let has_native_modules = options.symbols.iter().any(|symbol| symbol.native.is_some());
     // Compute once for all declarations. Source and manifest changes require
     // review even when Cargo's resolved package versions have not changed.
-    // Line endings carry no Rust meaning and differ between checkouts (CRLF on
-    // Windows), so a reviewed fingerprint stays portable across platforms.
-    let native_review = has_native_modules && review::required(root, &options.symbols);
+    // Root Rust sources normalize line endings. Dependency trees bind exact
+    // bytes because arbitrary files may be consumed by build/include code.
+    let native_review = review::required(root, &options.symbols);
     let legacy_hash = bridge
         .map(|path| {
             if native_review {
@@ -793,13 +794,18 @@ fn bridge_reviews(
         &rust_lock.bridge_input_hash,
     ))?);
     let review = if native_review {
-        review::fingerprint(
+        let sources = review::fingerprint(
             root,
             &options.symbols,
             &rust_lock.cargo_lock_hash,
             &rust_lock.bridge_input_hash,
             legacy_hash.as_deref(),
-        )?
+        )?;
+        hash(&serde_json::to_vec(&(
+            "foreign-review-v2",
+            sources,
+            review::dependency_fingerprint(root, metadata)?,
+        ))?)
     } else {
         legacy_review.clone()
     };
