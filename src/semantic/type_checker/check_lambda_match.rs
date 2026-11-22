@@ -1874,12 +1874,6 @@ impl TypeChecker {
     }
 }
 
-/// The lambda capture scan, on the shared structural walk.
-///
-/// It needs exactly the walk's own shadowing rule — a name bound inside the
-/// lambda is not a capture — so the scope stack comes from the walker's
-/// [`AstVisitor::enter_scope`]/[`AstVisitor::bind`] hooks rather than being
-/// re-implemented here. Everything else is one check on [`Expr::Var`].
 /// One value a lambda takes from its enclosing function.
 ///
 /// The name is the enclosing function's spelling, which is also the name the
@@ -1896,6 +1890,7 @@ pub struct LambdaCapture {
     pub declaration_span: Span,
 }
 
+/// Uses the structural walk's scope and binding events to resolve captures.
 struct CaptureScan<'a> {
     checker: &'a mut TypeChecker,
     scopes: crate::semantic::scopes::Scopes<()>,
@@ -2060,7 +2055,8 @@ mod lambda_capture_tests {
     //! first-mention order, 39 a field write THROUGH a capture is not a write
     //! to it, 40 a capture two frames up rides both environments.
     use crate::diagnostics::Diagnostic;
-    use crate::parser::ast::ExprId;
+    use crate::parser::ast::Item;
+    use crate::parser::iter::{AstEvent, AstWalk};
 
     #[test]
     fn deep_capture_scan_uses_a_one_megabyte_stack() {
@@ -2118,41 +2114,27 @@ mod lambda_capture_tests {
         let mut checker = crate::semantic::TypeChecker::new();
         crate::register_prelude(&mut checker).expect("prelude");
         checker.check_program(&program);
-        struct LambdaOrder(Vec<ExprId>);
-        impl crate::parser::visit::AstVisitor for LambdaOrder {
-            fn visit_lambda(&mut self, lambda: &crate::parser::ast::LambdaExpr) {
-                self.0.push(lambda.id);
-                crate::parser::visit::walk_lambda(self, lambda);
+        let mut captures = Vec::new();
+        let mut collect_captures = |body| {
+            for event in AstWalk::new(AstEvent::Block(body)) {
+                if let AstEvent::Lambda(lambda) = event
+                    && let Some(slots) = checker.lambda_captures.get(&lambda.id)
+                {
+                    captures.push(slots.iter().map(|slot| slot.name.clone()).collect());
+                }
             }
-        }
-        let mut order = LambdaOrder(Vec::new());
+        };
         for item in &program.items {
             match item {
-                crate::parser::ast::Item::Function(f) => {
-                    crate::parser::visit::walk_block(&mut order, &f.body)
-                }
-                crate::parser::ast::Item::Class(c) => {
-                    for m in &c.methods {
-                        crate::parser::visit::walk_block(&mut order, &m.body);
+                Item::Function(f) => collect_captures(&f.body),
+                Item::Class(c) => {
+                    for method in &c.methods {
+                        collect_captures(&method.body);
                     }
                 }
                 _ => {}
             }
         }
-        let lambdas: Vec<_> = order
-            .0
-            .iter()
-            .filter_map(|id| {
-                checker
-                    .lambda_captures
-                    .get(id)
-                    .map(|captures| (id, captures))
-            })
-            .collect();
-        let captures = lambdas
-            .into_iter()
-            .map(|(_, c)| c.iter().map(|c| c.name.clone()).collect())
-            .collect();
         (checker.errors, captures)
     }
 
@@ -2350,7 +2332,7 @@ mod lambda_capture_tests {
 
     // --- Shared structural AST walk ---
     //
-    // The scan reads the shared walk in `parser::visit`, so a slot the walk
+    // The scan reads the shared walk in `parser::iter`, so a slot the walk
     // misses is a value the environment never carries — the body would read an
     // empty slot at runtime — and a binding the walk forgets is a capture of a
     // name the enclosing frame does not even have. These perspectives pin the

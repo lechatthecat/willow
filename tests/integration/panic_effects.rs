@@ -740,7 +740,7 @@ fn pe_24_virtual_self_call_agrees_in_release() {
 
 // --- Shared structural AST walk ---
 //
-// The effect summary reads the shared walk in `parser::visit` rather than its
+// The effect summary reads the shared walk in `parser::iter` rather than its
 // own traversal. A child slot the walk never reaches makes a hazardous
 // function summarize as NO_PANIC, its caller drops the panic-depth snapshot,
 // and a recovery that should fire silently does not. These perspectives pin

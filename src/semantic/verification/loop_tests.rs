@@ -468,9 +468,8 @@ fn verified_loop_counterexample_names_arbitrary_head() {
 }
 
 #[test]
-fn verified_loop_annotations_reach_shared_walkers() {
+fn verified_loop_annotations_reach_shared_walk() {
     use crate::parser::iter::{AstEvent, AstWalk};
-    use crate::parser::visit::{AstVisitor, walk_expr};
     let p = parse("fn f(){let mut x=1;while x>0 invariant x>=0 variant x {x=x-1;}}");
     let Item::Function(f) = &p.items[0] else {
         panic!()
@@ -478,17 +477,5 @@ fn verified_loop_annotations_reach_shared_walkers() {
     let events = AstWalk::new(AstEvent::Block(&f.body))
         .filter(|e| matches!(e, AstEvent::Expr(Expr::Var(n, ..)) if n=="x"))
         .count();
-    struct Count(usize);
-    impl AstVisitor for Count {
-        fn visit_expr(&mut self, e: &Expr) {
-            if matches!(e, Expr::Var(n, ..) if n=="x") {
-                self.0 += 1;
-            }
-            walk_expr(self, e);
-        }
-    }
-    let mut visitor = Count(0);
-    visitor.visit_block(&f.body);
     assert_eq!(events, 4);
-    assert_eq!(visitor.0, events);
 }

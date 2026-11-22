@@ -842,7 +842,7 @@ mod tests {
     // --- Shared structural AST walk ---
     //
     // Await points and by-reference call sites are collected on the shared
-    // walk in `parser::visit`. A slot the walk misses drops a suspension point
+    // walk in `parser::iter`. A slot the walk misses drops a suspension point
     // or a reference call site from the debug map, which the debugger then
     // cannot show, so each container gets its own program.
 

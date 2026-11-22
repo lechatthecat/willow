@@ -1,5 +1,9 @@
 //! Explicit-stack, source-order structural events for read-only AST passes.
-//! Exit events allow postorder consumers without recursive callbacks.
+//! [`AstEvent::Expr`] and [`AstEvent::Stmt`] precede their children. Their exit
+//! events support postorder analyses. Scope and binding events mark when names
+//! become visible, including after a let initializer. Consumers that analyze
+//! callable bodies independently can prune [`AstEvent::Lambda`] with
+//! [`AstWalk::skip_children`].
 use super::ast::*;
 
 #[derive(Clone, Copy)]
@@ -315,3 +319,6 @@ fn push_pattern<'a>(pending: &mut Vec<AstEvent<'a>>, pattern: &'a Pattern) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

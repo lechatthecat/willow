@@ -2156,7 +2156,7 @@ fn add_one(n: i64) -> i64 {
     // --- Shared structural AST walk ---
     //
     // The loop detector and the helper call graph both read the shared walk in
-    // `parser::visit` instead of carrying their own hand-written traversals.
+    // `parser::iter` instead of carrying their own hand-written traversals.
     // Both failure modes are silent: a loop the walk never reaches makes a
     // helper look preemptible, and a call the walk never reaches makes a
     // helper look loop-free. So every container gets its own program.
@@ -2276,8 +2276,7 @@ fn add_one(n: i64) -> i64 {
     }
 
     /// A lambda body is a separate callable, so a loop inside one is not the
-    /// enclosing function's loop. This is the `visit_lambda` override, and it
-    /// is the one place where stopping early is the correct answer.
+    /// enclosing function's loop. The loop detector prunes lambda bodies.
     #[test]
     fn walk_does_not_attribute_a_lambda_body_loop_to_its_enclosing_function() {
         assert_no_loop_is_attributed(

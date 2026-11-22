@@ -349,7 +349,7 @@ impl HirExpr {
     /// The match is exhaustive on purpose: a new [`HirExprKind`] has to be
     /// threaded through here or this stops compiling, so a consumer that walks
     /// the tree cannot silently miss a node kind (the same discipline as
-    /// `parser::visit`).
+    /// `parser::iter`).
     ///
     /// Two kinds carry STATEMENT bodies that introduce their own bindings —
     /// [`HirExprKind::Lambda`] (its parameters) and [`HirExprKind::Match`] (each

@@ -12,7 +12,6 @@ mod rust_declarations;
 mod stmt;
 pub(crate) mod tuples;
 mod types;
-pub mod visit;
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::lexer::token::{Token, TokenKind};
@@ -3192,25 +3191,19 @@ class ProtectedCtor { prot init(self) {} }
         patterns: Vec<PatternId>,
     }
 
-    impl crate::parser::visit::AstVisitor for IdTrace {
-        fn visit_expr(&mut self, expr: &Expr) {
-            self.exprs.push(expr.id());
-            crate::parser::visit::walk_expr(self, expr);
-        }
-
-        fn visit_pattern(&mut self, pattern: &Pattern) {
-            self.patterns.push(pattern.id());
-            crate::parser::visit::walk_pattern(self, pattern);
-        }
-    }
-
     fn trace_ids(source: &str) -> IdTrace {
-        use crate::parser::visit::AstVisitor;
+        use super::iter::{AstEvent, AstWalk};
         let program = parse_ok(source);
         let mut trace = IdTrace::default();
         for item in &program.items {
             if let Item::Function(function) = item {
-                trace.visit_block(&function.body);
+                for event in AstWalk::new(AstEvent::Block(&function.body)) {
+                    match event {
+                        AstEvent::Expr(expr) => trace.exprs.push(expr.id()),
+                        AstEvent::Pattern(pattern) => trace.patterns.push(pattern.id()),
+                        _ => {}
+                    }
+                }
             }
         }
         trace
