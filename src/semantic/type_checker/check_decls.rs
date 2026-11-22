@@ -35,11 +35,13 @@ impl TypeChecker {
         let Some(info) = self.symbols.lookup_enum(&decl.name).cloned() else {
             return;
         };
+        let outer = self.enter_type_parameters(decl.type_params.iter().cloned().collect());
         for variant in &info.variants {
             for payload in &variant.payload_types {
-                self.validate_declared_type(payload, &decl.type_params, variant.declaration_span);
+                self.validate_type(payload, variant.declaration_span);
             }
         }
+        self.local.declared_type_params = outer;
     }
 
     /// Validate an interface's `extends` clause:
@@ -54,17 +56,23 @@ impl TypeChecker {
             // `Self` is bound by the interface too: `instantiate_interface`
             // substitutes the receiver for it at every use, so a signature
             // may name it as freely as a type parameter.
-            let mut bound = decl.type_params.clone();
-            bound.push("Self".to_string());
+            let outer = self.enter_type_parameters(
+                decl.type_params
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once("Self".into()))
+                    .collect(),
+            );
             for name in &info.method_order {
                 let Some(m) = info.methods.get(name) else {
                     continue;
                 };
-                self.validate_declared_type(&m.return_type, &bound, m.declaration_span);
+                self.validate_type(&m.return_type, m.declaration_span);
                 for param in &m.param_infos {
-                    self.validate_declared_type(&param.ty, &bound, param.span);
+                    self.validate_type(&param.ty, param.span);
                 }
             }
+            self.local.declared_type_params = outer;
         }
         // Each super-interface must exist and be an interface.
         for sup in &decl.extends {
@@ -249,7 +257,11 @@ impl TypeChecker {
         );
     }
 
-    pub(super) fn check_class_header(&mut self, c: &ClassDecl) -> Type {
+    pub(super) fn check_class_header(
+        &mut self,
+        c: &ClassDecl,
+        constructors: Option<&[std::rc::Rc<SuperInitPlacement>]>,
+    ) -> Type {
         let receiver_ty = self.normalize_type(&c.receiver_type(), c.span);
         self.check_class_inheritance(c);
         // A class on, or extending into, an `extends` cycle has no usable base
@@ -259,7 +271,7 @@ impl TypeChecker {
         // checked so an editor keeps reporting the errors around the cycle.
         //
         if self.class_extends_cycle(&c.name).is_none() {
-            self.check_constructor_inheritance_rules(c);
+            self.check_constructor_inheritance_rules(c, constructors);
             self.check_class_implements(c, &receiver_ty);
             self.check_class_marker_contract(c);
         }
@@ -573,7 +585,11 @@ impl TypeChecker {
         }
     }
 
-    pub(super) fn check_constructor_inheritance_rules(&mut self, c: &ClassDecl) {
+    pub(super) fn check_constructor_inheritance_rules(
+        &mut self,
+        c: &ClassDecl,
+        constructors: Option<&[std::rc::Rc<SuperInitPlacement>]>,
+    ) {
         let Some(base_name) = c.base_class.as_ref().map(type_path_name) else {
             return;
         };
@@ -601,9 +617,15 @@ impl TypeChecker {
             }
             return;
         }
-        for ctor in &c.constructors {
-            let mut super_init_spans = Vec::new();
-            collect_super_init_spans(&ctor.body, &mut super_init_spans);
+        for (index, ctor) in c.constructors.iter().enumerate() {
+            let fresh;
+            let placement = if let Some(placements) = constructors {
+                placements[index].as_ref()
+            } else {
+                fresh = SuperInitPlacement::of(ctor);
+                &fresh
+            };
+            let super_init_spans = &placement.calls;
             if super_init_spans.len() > 1 {
                 for span in super_init_spans.iter().skip(1) {
                     self.push(
@@ -618,12 +640,7 @@ impl TypeChecker {
             }
 
             if let Some(span) = super_init_spans.first().copied() {
-                if !ctor
-                    .body
-                    .stmts
-                    .iter()
-                    .any(|stmt| matches!(stmt, Stmt::SuperInit(init) if init.span == span))
-                {
+                if !placement.first_is_top_level {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -784,7 +801,7 @@ impl TypeChecker {
             s.args.len(),
             s.span,
         );
-        self.check_call_args_against_param_infos(&param_infos, &s.args);
+        self.check_call_args_against_param_infos(&param_infos, &s.args, false);
     }
 
     /// Whether `object` is the `super` receiver of `super.method(...)`: the
@@ -842,14 +859,14 @@ impl TypeChecker {
             self.analysis_symbols.super_calls.push(m.span);
         }
         self.expr_types.insert(m.object.id(), receiver.clone());
-        self.check_task_method_call(&receiver, m);
+        self.check_task_method_call(&receiver, m, &m.method);
         if let Some(defining) = self.resolved_method_class(&base, &m.method) {
             self.record_lock_effect_call(
                 FunctionId::method(TypeId::from_source_name(&defining), m.method.as_str()),
                 m.span,
             );
         }
-        self.resolve_method(&receiver, m, false)
+        self.resolve_method(&receiver, m, &m.method, false, None)
     }
 
     /// The one body `super.method(...)` runs, for the call graph; `None` when
@@ -871,7 +888,7 @@ impl TypeChecker {
     /// Type-check `new Class(args...)` (constructor support §10): resolve the class, pick
     /// the explicit `init` or the implicit memberwise constructor, check
     /// visibility and arguments, and yield `Class`.
-    pub(super) fn check_new(&mut self, n: &NewExpr, class_name: &str) -> Type {
+    pub(super) fn check_new(&mut self, n: &NewExpr, class_name: &str, checked: bool) -> Type {
         let resolved = self
             .resolve_static_call_class_name(class_name, n.span)
             .unwrap_or_else(|| class_name.to_owned());
@@ -880,7 +897,7 @@ impl TypeChecker {
         // Keep independent argument errors, but do not look up the recovery marker.
         if Self::is_error_name(&resolved) {
             for arg in &n.args {
-                self.check_expr(&arg.expr);
+                self.check_or_reuse_expr(&arg.expr, checked);
             }
             return Self::error_type();
         }
@@ -889,7 +906,7 @@ impl TypeChecker {
             // No signature exists to provide argument context, but still check
             // every argument so its independent diagnostics are preserved.
             for arg in &n.args {
-                self.check_expr(&arg.expr);
+                self.check_or_reuse_expr(&arg.expr, checked);
             }
             if self.symbols.lookup_interface(&resolved).is_some() {
                 self.push(
@@ -921,14 +938,14 @@ impl TypeChecker {
         // still yields the class type for the code around it.
         if self.class_extends_cycle(&resolved).is_some() {
             for arg in &n.args {
-                self.check_expr(&arg.expr);
+                self.check_or_reuse_expr(&arg.expr, checked);
             }
             return Type::Named(resolved);
         }
 
         if resolved == "PanicInfo" {
             for arg in &n.args {
-                self.check_expr(&arg.expr);
+                self.check_or_reuse_expr(&arg.expr, checked);
             }
             self.push(
                 Diagnostic::new(
@@ -974,7 +991,7 @@ impl TypeChecker {
             None => {
                 let Some(fields) = self.implicit_constructor_field_infos(&resolved) else {
                     for arg in &n.args {
-                        self.check_expr(&arg.expr);
+                        self.check_or_reuse_expr(&arg.expr, checked);
                     }
                     return Type::Named(resolved);
                 };
@@ -1003,8 +1020,8 @@ impl TypeChecker {
         let mut arg_types = Vec::with_capacity(n.args.len());
         for (idx, arg) in n.args.iter().enumerate() {
             arg_types.push(match param_infos.get(idx) {
-                Some(param) => self.check_expr_expecting(&arg.expr, &param.ty),
-                None => self.check_expr(&arg.expr),
+                Some(param) => self.check_argument_expecting(&arg.expr, &param.ty, checked),
+                None => self.check_or_reuse_expr(&arg.expr, checked),
             });
         }
 
@@ -1061,7 +1078,7 @@ impl TypeChecker {
                     (ParamMode::Reference { mutable, .. }, CallArgMode::Reference { .. }) => {
                         // Reports the reference-specific mismatch (E1705) itself,
                         // so the by-value comparison above is deliberately skipped.
-                        self.check_reference_argument(param, arg, *mutable);
+                        self.check_reference_argument(param, arg, *mutable, false);
                     }
                 }
             }

@@ -156,6 +156,10 @@ impl FlatSyntax {
         let mut pending = std::collections::VecDeque::from([root]);
         let mut nodes = Vec::new();
         while let Some(mut node) = pending.pop_front() {
+            #[cfg(test)]
+            if matches!(node, NodeOwned::Expr(_)) {
+                SERIALIZED_EXPR_NODES.with(|count| count.set(count.get() + 1));
+            }
             let (expressions, statements) = child_counts(node.as_mut());
             let mut children = vec![0; expressions + statements];
             let (mut expr_index, mut stmt_index) = (0, expressions);

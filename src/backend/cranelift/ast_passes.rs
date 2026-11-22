@@ -249,7 +249,7 @@ pub(crate) fn collect_nil_check_names_in_block(block: &Block, out: &mut HashSet<
                 out.insert(name.clone());
             }
             AstEvent::Expr(Expr::MethodCall(m)) => {
-                out.insert(m.method.clone());
+                out.insert(m.method.as_str().to_owned());
             }
             AstEvent::Expr(Expr::StaticCall(s)) => {
                 out.insert(QualifiedName::join(&s.class, &s.method));

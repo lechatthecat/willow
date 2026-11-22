@@ -1,44 +1,14 @@
 //! Resolved identity for Willow's builtin methods (shared compiler infrastructure, catalog item 7).
 //!
-//! A call like `ch.recv()` or `arr.to_string()` is not a user method call: it is
-//! a compiler intrinsic that lowers to a specific runtime symbol. Deciding
-//! *which* intrinsic a call denotes used to be done by comparing the method
-//! name and the receiver's type name against string literals, and that decision
-//! was re-made independently in at least four places:
+//! The checker resolves a receiver method's spelling to a signature once and
+//! saves its intrinsic identity by expression ID. Checked bodies carry that fact
+//! into analysis and HIR. Declared methods with the same spelling have no entry.
+//! Lowering without checker facts uses the same signature table.
 //!
-//! * the type checker, for validity and the call's result type,
-//! * `Codegen::ast_type_of_structural`, for the backend's own type walk,
-//! * `FuncGen::emit_method_call`, to pick the lowering,
-//! * the LIR walker's eligibility predicate and the cooperative-scheduling
-//!   passes, to recognise suspension points.
-//!
-//! Four string waterfalls answering the same question is four chances to
-//! disagree, and they did: the backend's type walk knew `Array::freeze` but not
-//! `Array::to_string`, typed `Map::to_string` as `void`, and did not know
-//! `Task::result` at all. Those gaps were masked only because the checker's
-//! span→type side-map takes priority over the structural walk for expressions
-//! that appear in source.
-//!
-//! This module is the single answer. [`resolve`] maps a receiver type, a method
-//! name and an argument count to an [`Intrinsic`] — a plain enum — plus the
-//! result type. Callers match on the enum instead of on strings, so a new
-//! builtin is a new variant that every `match` must handle, and a receiver the
-//! table does not know resolves to `None` exactly once.
-//!
-//! Option/Result are deliberately absent: their combinators already resolve
-//! through a single shared function (`option_result_method_return_type`) used by
-//! both the checker and the backend, which is the shape this module generalises,
-//! and their result types depend on a closure argument's type rather than on the
-//! receiver alone.
-//!
-//! # Relationship to the type checker
-//!
-//! The checker remains the authority on *validity*: it produces the diagnostic
-//! for a misspelled method, a wrong argument count, or a non-`Send` channel
-//! item. This table is deliberately no wider than what the checker accepts, so
-//! anything it returns `None` for is either a user method or already a compile
-//! error. What it guarantees is that everything downstream of the checker agrees
-//! on what an accepted call *means* and what type it produces.
+//! The checker owns argument validation, recovery and diagnostics. Executable
+//! consumers use arity-checked identities. Recovery passes can also inspect the
+//! candidate for an invalid call. Option and Result methods use typed IDs and retain their
+//! argument-dependent contracts.
 
 use crate::parser::ast::Type;
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
@@ -221,38 +191,85 @@ pub enum IntrinsicReturn<N = String> {
     SameAsArg(usize),
 }
 
+/// A checked member can still have an arity error. Retain its identity for
+/// recovery diagnostics, while executable consumers see only complete calls.
+#[derive(Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BuiltinCalls(
+    std::collections::HashMap<crate::parser::ast::ExprId, (BuiltinMethod, bool)>,
+);
+
+impl BuiltinCalls {
+    pub(crate) fn record(
+        &mut self,
+        id: crate::parser::ast::ExprId,
+        method: BuiltinMethod,
+        arity: usize,
+        supplied: usize,
+    ) {
+        self.0.insert(id, (method, arity == supplied));
+    }
+
+    pub(crate) fn get(&self, id: &crate::parser::ast::ExprId) -> Option<&Intrinsic> {
+        match self.0.get(id) {
+            Some((BuiltinMethod::Intrinsic(id), true)) => Some(id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn candidate(&self, id: &crate::parser::ast::ExprId) -> Option<&Intrinsic> {
+        match self.0.get(id) {
+            Some((BuiltinMethod::Intrinsic(id), _)) => Some(id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn checked(&self, id: &crate::parser::ast::ExprId) -> Option<BuiltinMethod> {
+        self.0
+            .get(id)
+            .and_then(|(method, valid)| valid.then_some(*method))
+    }
+    /// ADT contracts model a recognized call even during arity recovery.
+    pub(crate) fn effect_method(&self, id: &crate::parser::ast::ExprId) -> Option<BuiltinMethod> {
+        let &(method, valid) = self.0.get(id)?;
+        (valid || matches!(method, BuiltinMethod::Adt(_))).then_some(method)
+    }
+
+    pub(crate) fn adt(&self, id: &crate::parser::ast::ExprId) -> Option<AdtMethod> {
+        match self.0.get(id) {
+            Some((BuiltinMethod::Adt(method), _)) => Some(*method),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+}
+
 /// A resolved builtin call: what it is, and what it produces.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedMethod<N = String> {
     pub intrinsic: Intrinsic,
+    pub arity: usize,
     pub ret: IntrinsicReturn<N>,
 }
 
-impl<N: Clone + From<&'static str>> ResolvedMethod<N> {
-    fn fixed(intrinsic: Intrinsic, ret: Type<N>) -> Self {
-        Self {
-            intrinsic,
-            ret: IntrinsicReturn::Fixed(ret),
-        }
-    }
-
-    fn same_as_arg(intrinsic: Intrinsic, index: usize) -> Self {
-        Self {
-            intrinsic,
-            ret: IntrinsicReturn::SameAsArg(index),
-        }
-    }
-
+impl<N: From<&'static str>> ResolvedMethod<N> {
     /// The result type, given a way to type the call's arguments. Callers that
     /// have no argument types available can pass a closure returning `None`; the
     /// two argument-typed intrinsics then fall back to their receiver family's
     /// declared shape (`Task<void>`), which is the same conservative answer the
     /// checker gives for a malformed `add`/`attach`.
-    pub fn return_type(&self, arg_type: impl Fn(usize) -> Option<Type<N>>) -> Type<N> {
-        match &self.ret {
-            IntrinsicReturn::Fixed(ty) => ty.clone(),
+    pub fn return_type(self, arg_type: impl Fn(usize) -> Option<Type<N>>) -> Type<N> {
+        match self.ret {
+            IntrinsicReturn::Fixed(ty) => ty,
             IntrinsicReturn::SameAsArg(index) => {
-                arg_type(*index).unwrap_or_else(|| Type::Generic("Task".into(), vec![Type::Void]))
+                arg_type(index).unwrap_or_else(|| Type::Generic("Task".into(), vec![Type::Void]))
             }
         }
     }
@@ -451,6 +468,15 @@ impl Intrinsic {
             MapValues => &["values"],
             MapEntries => &["entries"],
             MapFreeze => &["freeze"],
+        }
+    }
+
+    pub(crate) fn channel_wait_name(self) -> Option<&'static str> {
+        match self {
+            Self::ChannelSend => Some("Channel.send"),
+            Self::ChannelRecv => Some("Channel.recv"),
+            Self::ChannelRecvOpt => Some("Channel.recv_opt"),
+            _ => None,
         }
     }
 
@@ -681,35 +707,6 @@ impl Intrinsic {
 /// identifier, so no user type can collide with it.
 const INTRINSIC_OWNER: &str = "$intrinsic";
 
-/// Leaf ADT methods lower inline rather than through the intrinsic backend.
-/// Callback combinators deliberately remain unresolved until their callback
-/// targets can be proven; their effects must never be classified as pure.
-pub(crate) fn adt_method_target(ty: &Type, method: &str) -> Option<FunctionId> {
-    let family = builtin_types::resolve(ty)?.id;
-    let known = match family {
-        B::Option => matches!(
-            method,
-            "unwrap" | "expect" | "unwrap_or" | "is_some" | "is_none"
-        ),
-        B::Result => matches!(
-            method,
-            "unwrap" | "unwrap_err" | "expect" | "unwrap_or" | "is_ok" | "is_err"
-        ),
-        _ => false,
-    };
-    known.then(|| FunctionId::method(TypeId::local("$adt"), method))
-}
-
-/// Inline combinators have a bounded compiler-owned dispatch; their callback
-/// remains an independent indirect-call obligation (never a pure leaf).
-pub(crate) fn adt_callback(ty: &Type, method: &str) -> bool {
-    match builtin_types::resolve(ty).map(|ty| ty.id) {
-        Some(B::Option) => matches!(method, "map" | "and_then" | "or_else"),
-        Some(B::Result) => matches!(method, "map" | "map_err" | "and_then" | "or_else"),
-        _ => false,
-    }
-}
-
 /// The builtin free functions code generation defines as ordinary
 /// Willow-ABI functions, so they can be used as `fn` values. Every other
 /// builtin is lowered inline at each call site and has no address.
@@ -745,14 +742,14 @@ pub(crate) fn builtin_target_effects(target: &FunctionId) -> Option<RuntimeEffec
     if let Some(intrinsic) = Intrinsic::from_function_id(target) {
         return Some(intrinsic.runtime_effects());
     }
-    if target.owner().as_deref() == Some("$adt") && target.namespace().is_none() {
-        return match target.name().as_ref() {
-            "unwrap" | "unwrap_err" | "expect" => {
-                Some(RuntimeEffects::MAY_PANIC.union(RuntimeEffects::MAY_ALLOCATE))
+    if let Some(method) = target.adt_method() {
+        return (!method.callback()).then(|| {
+            if method.can_panic() {
+                RuntimeEffects::MAY_PANIC.union(RuntimeEffects::MAY_ALLOCATE)
+            } else {
+                RuntimeEffects::NONE
             }
-            "unwrap_or" | "is_some" | "is_none" | "is_ok" | "is_err" => Some(RuntimeEffects::NONE),
-            _ => None,
-        };
+        });
     }
     if target.owner().is_some() || target.namespace().is_some() {
         return None;
@@ -803,9 +800,7 @@ pub(crate) fn builtin_contract_effects(
         !symbols.is_empty() && symbols.iter().all(|s| FAULT_ONLY_ALLOCATION.contains(s))
     } else {
         // Unwrapping only allocates the panic payload on the failing branch.
-        target.owner().as_deref() == Some("$adt")
-            && target.namespace().is_none()
-            && matches!(target.name().as_ref(), "unwrap" | "unwrap_err" | "expect")
+        target.adt_method().is_some_and(AdtMethod::can_panic)
     };
     Some(if fault_only {
         effects.difference(RuntimeEffects::MAY_ALLOCATE)
@@ -866,8 +861,6 @@ pub(crate) fn builtin_static_effects(
     namespace_builtin(namespace, method).map(|entry| symbol_effects(entry.runtime))
 }
 
-/// The name a receiver type resolves under, for the families this table keys on
-/// by name. Returns `None` for receivers no builtin family claims.
 /// Resolve a builtin method call.
 ///
 /// `recv` is the receiver's type, `method` the source-level method name, and
@@ -878,357 +871,608 @@ pub(crate) fn builtin_static_effects(
 /// Returns `None` when the call is not a builtin — a user class method, an
 /// interface method, an Option/Result combinator, or an error the checker has
 /// already reported.
-#[allow(clippy::too_many_lines, reason = "split pending")]
 pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
     recv: &Type<N>,
     method: &str,
     arity: usize,
 ) -> Option<ResolvedMethod<N>> {
-    if matches!(recv, Type::String) {
-        let entry = match (method, arity) {
-            ("len", 0) => Some((Intrinsic::StringLen, Type::I64)),
-            ("byte_at", 1) => Some((Intrinsic::StringByteAt, Type::I64)),
-            ("substring" | "slice", 2) => Some((Intrinsic::StringSubstring, Type::String)),
-            ("split", 1) => Some((Intrinsic::StringSplit, Type::Array(Box::new(Type::String)))),
-            ("contains", 1) => Some((Intrinsic::StringContains, Type::Bool)),
-            ("find", 1) => Some((Intrinsic::StringFind, B::Option.apply(vec![Type::I64]))),
-            ("ends_with", 1) => Some((Intrinsic::StringEndsWith, Type::Bool)),
-            ("replace", 2) => Some((Intrinsic::StringReplace, Type::String)),
-            ("trim_start", 0) => Some((Intrinsic::StringTrimStart, Type::String)),
-            ("trim_end", 0) => Some((Intrinsic::StringTrimEnd, Type::String)),
-            ("to_lower", 0) => Some((Intrinsic::StringToLower, Type::String)),
-            ("to_upper", 0) => Some((Intrinsic::StringToUpper, Type::String)),
-            ("trim", 0) => Some((Intrinsic::StringTrim, Type::String)),
-            ("repeat", 1) => Some((Intrinsic::StringRepeat, Type::String)),
-            ("starts_with", 1) => Some((Intrinsic::StringStartsWith, Type::Bool)),
-            _ => None,
-        };
-        if let Some((intrinsic, ty)) = entry {
-            return Some(ResolvedMethod::fixed(intrinsic, ty));
-        }
-    }
-    // Explicit overflow behavior, independent of the build mode.
-    //
-    if recv.integer_layout().is_some() {
-        let option = || B::Option.apply(vec![recv.clone()]);
-        let entry = match (method, arity) {
-            ("wrapping_add", 1) => Some((Intrinsic::I64WrappingAdd, recv.clone())),
-            ("wrapping_sub", 1) => Some((Intrinsic::I64WrappingSub, recv.clone())),
-            ("wrapping_mul", 1) => Some((Intrinsic::I64WrappingMul, recv.clone())),
-            ("wrapping_neg", 0) => Some((Intrinsic::I64WrappingNeg, recv.clone())),
-            ("checked_add", 1) => Some((Intrinsic::I64CheckedAdd, option())),
-            ("checked_sub", 1) => Some((Intrinsic::I64CheckedSub, option())),
-            ("checked_mul", 1) => Some((Intrinsic::I64CheckedMul, option())),
-            ("checked_neg", 0) => Some((Intrinsic::I64CheckedNeg, option())),
-            _ => None,
-        };
-        if let Some((intrinsic, ty)) = entry {
-            return Some(ResolvedMethod::fixed(intrinsic, ty));
-        }
-    }
-    if arity == 0 {
-        if let Some(target) = scalar_conversion_target(method, "parse_")
-            && matches!(recv, Type::String)
-        {
-            return Some(ResolvedMethod::fixed(
-                Intrinsic::ScalarParse,
-                B::Option.apply(vec![target]),
-            ));
-        }
-        if let Some(source) = recv.scalar_layout() {
-            if let Some(target) = scalar_conversion_target(method, "checked_to_") {
-                return Some(ResolvedMethod::fixed(
-                    Intrinsic::IntegerCheckedConvert,
-                    B::Option.apply(vec![target]),
-                ));
-            }
-            if let Some(target) = scalar_conversion_target(method, "wrapping_to_")
-                && target.integer_layout().is_some()
-                && recv.integer_layout().is_some()
-            {
-                return Some(ResolvedMethod::fixed(
-                    Intrinsic::IntegerWrappingConvert,
-                    target,
-                ));
-            }
-            if let Some(target) = scalar_conversion_target(method, "to_")
-                && let Some(layout) = target.integer_layout()
-                && layout.min() <= source.min()
-                && layout.max()
-                    >= if matches!(recv, Type::Char) {
-                        0x10ffff
-                    } else {
-                        source.max()
-                    }
-            {
-                return Some(ResolvedMethod::fixed(Intrinsic::IntegerConvert, target));
-            }
-        }
-    }
-    if matches!(method, "to_string" | "__abi_debug")
-        && arity == 0
-        && matches!(recv, Type::Char | Type::U64)
-    {
-        return Some(ResolvedMethod::fixed(
-            Intrinsic::ScalarToString,
-            Type::String,
-        ));
-    }
-    // Scalar `to_string` conversions.
-    if method == "to_string" && arity == 0 {
-        match recv {
-            Type::I8
-            | Type::I16
-            | Type::I32
-            | Type::U16
-            | Type::U32
-            | Type::U64
-            | Type::Char
-            | Type::U8
-            | Type::I64 => {
-                return Some(ResolvedMethod::fixed(Intrinsic::I64ToString, Type::String));
-            }
-            Type::F64 => return Some(ResolvedMethod::fixed(Intrinsic::F64ToString, Type::String)),
-            Type::Bool => {
-                return Some(ResolvedMethod::fixed(Intrinsic::BoolToString, Type::String));
-            }
-            Type::String => {
-                return Some(ResolvedMethod::fixed(
-                    Intrinsic::StringToString,
-                    Type::String,
-                ));
-            }
-            _ => {}
-        }
-    }
-
-    if method == "__abi_debug" && arity == 0 {
-        return match recv {
-            Type::String => Some(ResolvedMethod::fixed(Intrinsic::StringDebug, Type::String)),
-            Type::I8
-            | Type::I16
-            | Type::I32
-            | Type::U16
-            | Type::U32
-            | Type::U64
-            | Type::Char
-            | Type::U8
-            | Type::I64 => Some(ResolvedMethod::fixed(Intrinsic::I64ToString, Type::String)),
-            Type::F64 => Some(ResolvedMethod::fixed(Intrinsic::F64ToString, Type::String)),
-            Type::Bool => Some(ResolvedMethod::fixed(Intrinsic::BoolToString, Type::String)),
-            _ => None,
-        };
-    }
-    if let Type::Array(elem) | Type::FixedArray(elem, _) = recv {
-        return match (method, arity) {
-            ("__abi_concat", 0) if matches!(**elem, Type::String) => Some(ResolvedMethod::fixed(
-                Intrinsic::StringConcatArray,
-                Type::String,
-            )),
-            ("__abi_len", 0) => Some(ResolvedMethod::fixed(Intrinsic::ArrayLen, Type::I64)),
-            ("__abi_resize", 1) if !matches!(recv, Type::FixedArray(..)) => {
-                Some(ResolvedMethod::fixed(Intrinsic::ArrayResize, Type::Void))
-            }
-            ("__abi_copy", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::ArrayCopy,
-                Type::Generic("FrozenArray".into(), vec![elem.as_ref().clone()]),
-            )),
-            _ => None,
-        };
-    }
-
-    // Nominal, non-generic receivers: the atomics and the two cancellation
-    // handles. A user class named `AtomicI64` cannot reach here because these
-    // names are owned by the prelude.
-    if let Some(builtin) = builtin_types::resolve(recv)
-        && builtin.args.is_empty()
-    {
-        return match (builtin.id, method, arity) {
-            (B::AtomicI64 | B::AtomicBool, "compare_exchange", 2) => Some(ResolvedMethod::fixed(
-                Intrinsic::AtomicCompareExchange,
-                Type::Bool,
-            )),
-            (B::AtomicI64, "load", 0) => {
-                Some(ResolvedMethod::fixed(Intrinsic::AtomicLoad, Type::I64))
-            }
-            (B::AtomicI64, "store", 1) => {
-                Some(ResolvedMethod::fixed(Intrinsic::AtomicStore, Type::Void))
-            }
-            (B::AtomicI64, "swap", 1) => {
-                Some(ResolvedMethod::fixed(Intrinsic::AtomicSwap, Type::I64))
-            }
-            (B::AtomicI64, "add", 1) => {
-                Some(ResolvedMethod::fixed(Intrinsic::AtomicAdd, Type::I64))
-            }
-            (B::AtomicI64, "sub", 1) => {
-                Some(ResolvedMethod::fixed(Intrinsic::AtomicSub, Type::I64))
-            }
-            (B::AtomicBool, "load", 0) => {
-                Some(ResolvedMethod::fixed(Intrinsic::AtomicLoad, Type::Bool))
-            }
-            (B::AtomicBool, "store", 1) => {
-                Some(ResolvedMethod::fixed(Intrinsic::AtomicStore, Type::Void))
-            }
-            (B::AtomicBool, "swap", 1) => {
-                Some(ResolvedMethod::fixed(Intrinsic::AtomicSwap, Type::Bool))
-            }
-
-            (B::CancellationToken, "is_cancelled", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::TokenIsCancelled,
-                Type::Bool,
-            )),
-            (B::CancellationToken, "cancel", 0) => {
-                Some(ResolvedMethod::fixed(Intrinsic::TokenCancel, Type::Void))
-            }
-            (B::CancellationToken, "child", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::TokenChild,
-                B::CancellationToken.apply(vec![]),
-            )),
-            (B::CancellationToken, "attach", 1) => {
-                Some(ResolvedMethod::same_as_arg(Intrinsic::TokenAttach, 0))
-            }
-
-            (B::TaskScope, "is_cancelled", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::ScopeIsCancelled,
-                Type::Bool,
-            )),
-            (B::TaskScope, "cancel", 0) => {
-                Some(ResolvedMethod::fixed(Intrinsic::ScopeCancel, Type::Void))
-            }
-            (B::TaskScope, "child", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::ScopeChild,
-                B::TaskScope.apply(vec![]),
-            )),
-            (B::TaskScope, "add", 1) => Some(ResolvedMethod::same_as_arg(Intrinsic::ScopeAdd, 0)),
-            (B::TaskScope, "finish", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::ScopeFinish,
-                B::Task.apply(vec![
-                    B::Result.apply(vec![Type::Void, B::Cancelled.apply(vec![])]),
-                ]),
-            )),
-            _ => None,
-        };
-    }
-
-    let family = builtin_types::resolve(recv)?;
-    let args = family.args;
-    match (family.id, args.len()) {
-        // `Task<T>` and `JoinHandle<T>` share a representation: the async frame.
-        (B::Task | B::JoinHandle, 1) => match (method, arity) {
-            ("cancel", 0) => Some(ResolvedMethod::fixed(Intrinsic::TaskCancel, Type::Void)),
-            ("is_cancelled", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::TaskIsCancelled,
-                Type::Bool,
-            )),
-            ("result", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::TaskResult,
-                B::TaskResult.apply(vec![args[0].clone()]),
-            )),
-            _ => None,
-        },
-        (B::BlockingCell, 1) => match (method, arity) {
-            ("get", 0) => Some(ResolvedMethod::fixed(Intrinsic::CellGet, args[0].clone())),
-            ("set", 1) => Some(ResolvedMethod::fixed(Intrinsic::CellSet, Type::Void)),
-            _ => None,
-        },
-        (B::BlockingRwCell, 1) => match (method, arity) {
-            ("read", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::RwCellRead,
-                args[0].clone(),
-            )),
-            ("write", 1) => Some(ResolvedMethod::fixed(Intrinsic::RwCellWrite, Type::Void)),
-            _ => None,
-        },
-        (B::Channel, 1) => match (method, arity) {
-            ("send", 1) => Some(ResolvedMethod::fixed(Intrinsic::ChannelSend, Type::Void)),
-            ("recv", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::ChannelRecv,
-                args[0].clone(),
-            )),
-            ("recv_opt", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::ChannelRecvOpt,
-                B::Option.apply(vec![args[0].clone()]),
-            )),
-            ("close", 0) => Some(ResolvedMethod::fixed(Intrinsic::ChannelClose, Type::Void)),
-            _ => None,
-        },
-        (B::FrozenArray, 1) => match (method, arity) {
-            ("len", 0) => Some(ResolvedMethod::fixed(Intrinsic::FrozenArrayLen, Type::I64)),
-            _ => None,
-        },
-        (B::Map, 2) => match (method, arity) {
-            ("insert", 2) => Some(ResolvedMethod::fixed(Intrinsic::MapInsert, Type::Void)),
-            ("remove", 1) => Some(ResolvedMethod::fixed(
-                Intrinsic::MapRemove,
-                B::Option.apply(vec![args[1].clone()]),
-            )),
-            ("keys", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::MapKeys,
-                Type::Array(Box::new(args[0].clone())),
-            )),
-            ("values", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::MapValues,
-                Type::Array(Box::new(args[1].clone())),
-            )),
-            ("entries", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::MapEntries,
-                Type::Array(Box::new(Type::Generic("$Tuple2".into(), args.to_vec()))),
-            )),
-            ("get", 1) => Some(ResolvedMethod::fixed(
-                Intrinsic::MapGet,
-                B::Option.apply(vec![args[1].clone()]),
-            )),
-            ("contains", 1) => Some(ResolvedMethod::fixed(Intrinsic::MapContains, Type::Bool)),
-            ("len", 0) => Some(ResolvedMethod::fixed(Intrinsic::MapLen, Type::I64)),
-            ("to_string", 0) => Some(ResolvedMethod::fixed(Intrinsic::MapToString, Type::String)),
-            ("freeze", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::MapFreeze,
-                B::FrozenMap.apply(args.to_vec()),
-            )),
-            _ => None,
-        },
-        // A frozen map is the same runtime object, so reads lower identically —
-        // but `insert`/`freeze` are absent rather than aliased, because the
-        // checker rejects them and an intrinsic the checker rejects must not
-        // have a lowering waiting for it.
-        (B::FrozenMap, 2) => match (method, arity) {
-            ("get", 1) => Some(ResolvedMethod::fixed(
-                Intrinsic::FrozenMapGet,
-                B::Option.apply(vec![args[1].clone()]),
-            )),
-            ("contains", 1) => Some(ResolvedMethod::fixed(
-                Intrinsic::FrozenMapContains,
-                Type::Bool,
-            )),
-            ("len", 0) => Some(ResolvedMethod::fixed(Intrinsic::FrozenMapLen, Type::I64)),
-            _ => None,
-        },
+    match lookup(recv, method) {
+        MethodLookup::Intrinsic(sig) if sig.arity == arity => Some(sig),
         _ => None,
     }
 }
 
-/// Builtin and `std` method names retired by the naming rule: every public
-/// method and function name is `snake_case`. A call written with the old name
-/// on a receiver that has the new one is rejected with a diagnostic naming the
-/// replacement; there is no deprecation period because no released code
-/// depends on the old spelling. A type that declares the old name itself keeps
-/// it: user names are the user's.
-const RENAMED_METHODS: &[(&str, &str)] = &[("toString", "to_string")];
+pub(crate) const LENGTH: &str = "len";
+pub(crate) const ARRAY_LENGTH: &str = "__abi_len";
+pub(crate) const ARRAY_RESIZE: &str = "__abi_resize";
+pub(crate) const MAP_ENTRIES: &str = "entries";
 
-/// The current name of a retired builtin method name, if `old` is one.
-pub(crate) fn renamed_method(old: &str) -> Option<&'static str> {
-    RENAMED_METHODS
-        .iter()
-        .find_map(|&(retired, current)| (retired == old).then_some(current))
+/// Select case syntax uses the same channel operation spellings before typing.
+pub(crate) mod channel_names {
+    pub const SEND: &str = "send";
+    pub const RECV: &str = "recv";
+    pub const RECV_OPT: &str = "recv_opt";
+}
+
+/// The two builtin dispatch paths share one checked fact per method expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BuiltinMethod {
+    Intrinsic(Intrinsic),
+    Adt(AdtMethod),
+}
+
+impl BuiltinMethod {
+    pub(crate) fn is_suspension_point(self) -> bool {
+        matches!(self, Self::Intrinsic(id) if id.is_suspension_point())
+    }
+}
+
+macro_rules! method_names {
+    (adt {
+        option { $($opt:ident => $opt_name:literal $(+ $also:ident)?),+ $(,)? }
+        result_only { $($res:ident => $res_name:literal),+ $(,)? }
+    } other $other:tt) => {
+        method_names!(@all { $($opt => $opt_name,)+ $($res => $res_name),+ } other $other);
+        impl AdtMethod {
+            pub(crate) const OPTION_NAMES: &'static [&'static str] = &[$($opt_name),+];
+
+            fn accepts(self, family: B) -> bool {
+                match self {
+                    $(Self::$opt => matches!(family, B::Option $(| B::$also)?),)+
+                    $(Self::$res)|+ => family == B::Result,
+                }
+            }
+        }
+    };
+    (@all { $($adt:ident => $spelling:literal),+ } other { $($other:ident => $name:tt $(:: $part:ident)*),+ $(,)? }) => {
+        #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        pub enum AdtMethod { $(#[serde(rename = $spelling)] $adt),+ }
+        impl AdtMethod {
+            fn name(self) -> &'static str { match self { $(Self::$adt => $spelling),+ } }
+            pub(crate) fn from_graph_name(name: &str) -> Option<Self> {
+                match name { $($spelling => Some(Self::$adt),)+ _ => None }
+            }
+        }
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum MethodName { Adt(AdtMethod), $($other,)+ Parse(ScalarTarget), CheckedConvert(ScalarTarget), WrappingConvert(ScalarTarget), Convert(ScalarTarget), Unknown }
+        impl MethodName {
+            pub(crate) fn fixed_spelling(self) -> Option<&'static str> {
+                match self {
+                    Self::Adt(method) => Some(method.name()),
+                    $(Self::$other => Some($name $(:: $part)*),)+
+                    _ => None,
+                }
+            }
+            pub(crate) fn classify(method: &str) -> Self {
+                #[cfg(test)]
+                METHOD_LOOKUPS.with(|count| count.set(count.get() + 1));
+                match method {
+                    $($spelling => Self::Adt(AdtMethod::$adt),)+
+                    $($name $(:: $part)* => Self::$other,)+
+                    _ => {
+                        if let Some(s) = method.strip_prefix("parse_") { ScalarTarget::from_suffix(s).map(Self::Parse) }
+                        else if let Some(s) = method.strip_prefix("checked_to_") { ScalarTarget::from_suffix(s).map(Self::CheckedConvert) }
+                        else if let Some(s) = method.strip_prefix("wrapping_to_") { ScalarTarget::from_suffix(s).map(Self::WrappingConvert) }
+                        else if let Some(s) = method.strip_prefix("to_") { ScalarTarget::from_suffix(s).map(Self::Convert) }
+                        else { None }.unwrap_or(Self::Unknown)
+                    }
+                }
+            }
+        }
+    };
+}
+method_names! {
+    adt {
+        // Declaration order breaks ties in Option's typo suggestions.
+        option {
+            Unwrap => "unwrap" + Result,
+            Expect => "expect" + Result,
+            UnwrapOr => "unwrap_or" + Result,
+            IsSome => "is_some",
+            IsNone => "is_none",
+            Map => "map" + Result,
+            AndThen => "and_then" + Result,
+            OrElse => "or_else" + Result,
+        }
+        result_only {
+            IsOk => "is_ok",
+            IsErr => "is_err",
+            UnwrapErr => "unwrap_err",
+            MapErr => "map_err",
+        }
+    }
+    other {
+        AbiConcat => "__abi_concat",
+        AbiCopy => "__abi_copy",
+        AbiDebug => "__abi_debug",
+        AbiLen => ARRAY_LENGTH,
+        AbiResize => ARRAY_RESIZE,
+        Add => "add",
+        Attach => "attach",
+        ByteAt => "byte_at",
+        Cancel => "cancel",
+        CheckedAdd => "checked_add",
+        CheckedMul => "checked_mul",
+        CheckedNeg => "checked_neg",
+        CheckedSub => "checked_sub",
+        Child => "child",
+        Close => "close",
+        CompareExchange => "compare_exchange",
+        Contains => "contains",
+        EndsWith => "ends_with",
+        Entries => MAP_ENTRIES,
+        Find => "find",
+        Finish => "finish",
+        Freeze => "freeze",
+        Get => "get",
+        Insert => "insert",
+        IsCancelled => "is_cancelled",
+        Join => "join",
+        Keys => "keys",
+        Len => LENGTH,
+        Load => "load",
+        Pop => "pop",
+        Push => "push",
+        Read => "read",
+        Recv => channel_names::RECV,
+        RecvOpt => channel_names::RECV_OPT,
+        Remove => "remove",
+        Repeat => "repeat",
+        Replace => "replace",
+        Result => "result",
+        Send => channel_names::SEND,
+        Set => "set",
+        Slice => "slice",
+        Split => "split",
+        StartsWith => "starts_with",
+        Store => "store",
+        Sub => "sub",
+        Substring => "substring",
+        Swap => "swap",
+        RetiredToString => "toString",
+        ToLower => "to_lower",
+        ToString => "to_string",
+        ToUpper => "to_upper",
+        Trim => "trim",
+        TryJoin => "try_join",
+        TrimEnd => "trim_end",
+        TrimStart => "trim_start",
+        Values => "values",
+        WrappingAdd => "wrapping_add",
+        WrappingMul => "wrapping_mul",
+        WrappingNeg => "wrapping_neg",
+        WrappingSub => "wrapping_sub",
+        Write => "write",
+    }
+}
+
+// Keep the established LIR debug dump (quoted source spelling).
+impl std::fmt::Debug for AdtMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.name(), f)
+    }
+}
+impl std::fmt::Display for AdtMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+impl AdtMethod {
+    pub(crate) fn callback(self) -> bool {
+        matches!(
+            self,
+            Self::Map | Self::MapErr | Self::AndThen | Self::OrElse
+        )
+    }
+    fn can_panic(self) -> bool {
+        matches!(self, Self::Expect | Self::Unwrap | Self::UnwrapErr)
+    }
+    pub(crate) fn target(self) -> Option<FunctionId> {
+        (!self.callback()).then(|| FunctionId::method(TypeId::local("$adt"), self.name()))
+    }
+    pub(crate) fn arity(self) -> usize {
+        usize::from(self.callback() || matches!(self, Self::Expect | Self::UnwrapOr))
+    }
+}
+impl MethodName {
+    pub(crate) fn is_retired_wait(self) -> bool {
+        matches!(self, Self::Join | Self::TryJoin)
+    }
+
+    fn scalar_operation(self) -> Option<(Intrinsic, ScalarTarget)> {
+        Some(match self {
+            Self::Parse(target) => (Intrinsic::ScalarParse, target),
+            Self::CheckedConvert(target) => (Intrinsic::IntegerCheckedConvert, target),
+            Self::WrappingConvert(target) => (Intrinsic::IntegerWrappingConvert, target),
+            Self::Convert(target) => (Intrinsic::IntegerConvert, target),
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn replacement(self) -> Option<(&'static str, Self)> {
+        let current = match self {
+            Self::RetiredToString => Self::ToString,
+            _ => return None,
+        };
+        Some((current.fixed_spelling()?, current))
+    }
+
+    pub(crate) fn channel(self) -> Option<Intrinsic> {
+        Some(match self {
+            Self::Send => Intrinsic::ChannelSend,
+            Self::Recv => Intrinsic::ChannelRecv,
+            Self::RecvOpt => Intrinsic::ChannelRecvOpt,
+            Self::Close => Intrinsic::ChannelClose,
+            _ => return None,
+        })
+    }
+}
+
+pub(crate) enum Lookup<S> {
+    Intrinsic(S),
+    Adt(AdtMethod),
+    Missing(MethodName),
+}
+pub(crate) type MethodLookup<N> = Lookup<ResolvedMethod<N>>;
+
+impl<N> MethodLookup<N> {
+    pub(crate) fn is_retired_wait(&self) -> bool {
+        matches!(self, Self::Missing(name) if name.is_retired_wait())
+    }
+
+    pub(crate) fn into_signature(self) -> Option<ResolvedMethod<N>> {
+        if let Self::Intrinsic(sig) = self {
+            Some(sig)
+        } else {
+            None
+        }
+    }
+    pub(crate) fn identity(&self) -> Option<(BuiltinMethod, usize)> {
+        match self {
+            Self::Intrinsic(sig) => Some((BuiltinMethod::Intrinsic(sig.intrinsic), sig.arity)),
+            Self::Adt(method) => Some((BuiltinMethod::Adt(*method), method.arity())),
+            Self::Missing(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SCALAR_TARGET_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static RECEIVER_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static METHOD_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn lookup<N: builtin_types::TypeName + Clone + From<&'static str>>(
+    recv: &Type<N>,
+    method: &str,
+) -> MethodLookup<N> {
+    MethodName::classify(method).lookup(recv)
+}
+
+impl MethodName {
+    pub(crate) fn lookup<N: builtin_types::TypeName + Clone + From<&'static str>>(
+        self,
+        recv: &Type<N>,
+    ) -> MethodLookup<N> {
+        self.lookup_with(recv, |intrinsic, arity, rule| ResolvedMethod {
+            intrinsic,
+            arity,
+            ret: match rule {
+                SignatureReturn::Fixed(pattern) => IntrinsicReturn::Fixed(pattern.materialize()),
+                SignatureReturn::SameAsArg(i) => IntrinsicReturn::SameAsArg(i),
+            },
+        })
+    }
+
+    pub(crate) fn has_method_on<N: builtin_types::TypeName>(self, recv: &Type<N>) -> bool {
+        !matches!(self.lookup_with(recv, |_, _, _| ()), Lookup::Missing(_))
+    }
+
+    fn lookup_with<N: builtin_types::TypeName, S>(
+        self,
+        recv: &Type<N>,
+        select: impl FnOnce(Intrinsic, usize, SignatureReturn<'_, N>) -> S,
+    ) -> Lookup<S> {
+        #[cfg(test)]
+        RECEIVER_LOOKUPS.with(|count| count.set(count.get() + 1));
+        if let Self::Adt(adt) = self {
+            if builtin_types::resolve(recv).is_some_and(|family| adt.accepts(family.id)) {
+                return Lookup::Adt(adt);
+            }
+        } else if let Some(signature) = intrinsic_contract(recv, self, select) {
+            return Lookup::Intrinsic(signature);
+        }
+        Lookup::Missing(self)
+    }
+}
+
+enum SignatureReturn<'a, N> {
+    Fixed(ResultPattern<'a, N>),
+    SameAsArg(usize),
+}
+
+/// A return type pattern borrows receiver payloads. Composite nodes refer to
+/// their children only while the selected signature is being consumed.
+enum ResultPattern<'a, N> {
+    Borrowed(&'a Type<N>),
+    Scalar(ScalarTarget),
+    Bool,
+    Void,
+    String,
+    Array(&'a Self),
+    Named(B),
+    Generic(&'static str, &'a [Self]),
+}
+
+impl<N> ResultPattern<'_, N> {
+    fn materialize(&self) -> Type<N>
+    where
+        N: Clone + From<&'static str>,
+    {
+        match self {
+            Self::Borrowed(ty) => (*ty).clone(),
+            Self::Scalar(target) => target.ty(),
+            Self::Bool => Type::Bool,
+            Self::Void => Type::Void,
+            Self::String => Type::String,
+            Self::Array(item) => Type::Array(Box::new(item.materialize())),
+            Self::Named(head) => Type::Named(head.source_name().into()),
+            Self::Generic(name, args) => {
+                Type::Generic((*name).into(), args.iter().map(Self::materialize).collect())
+            }
+        }
+    }
+
+    fn matches(&self, ty: &Type<N>) -> bool
+    where
+        N: From<&'static str> + PartialEq,
+    {
+        match (self, ty) {
+            (Self::Borrowed(expected), actual) => *expected == actual,
+            (Self::Scalar(target), actual) => {
+                std::mem::discriminant(&target.ty::<N>()) == std::mem::discriminant(actual)
+            }
+            (Self::Bool, Type::Bool) | (Self::Void, Type::Void) | (Self::String, Type::String) => {
+                true
+            }
+            (Self::Array(item), Type::Array(actual)) => item.matches(actual),
+            (Self::Named(head), Type::Named(actual)) => *actual == head.source_name().into(),
+            (Self::Generic(name, args), Type::Generic(actual, items)) => {
+                *actual == (*name).into()
+                    && args.len() == items.len()
+                    && args.iter().zip(items).all(|(arg, item)| arg.matches(item))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Verify the recorded operation and result against the same typed mapping
+/// used by the checker. No source spelling or owned result type is needed.
+pub(crate) fn matches_signature<N: builtin_types::TypeName + PartialEq + From<&'static str>>(
+    recv: &Type<N>,
+    name: MethodName,
+    id: Intrinsic,
+    args: &[Type<N>],
+    result: &Type<N>,
+) -> bool {
+    intrinsic_contract(recv, name, |canonical, arity, rule| {
+        id == canonical
+            && args.len() == arity
+            && match rule {
+                SignatureReturn::Fixed(pattern) => pattern.matches(result),
+                SignatureReturn::SameAsArg(i) => args.get(i) == Some(result),
+            }
+    })
+    .unwrap_or(false)
+}
+
+fn intrinsic_contract<N: builtin_types::TypeName, S>(
+    recv: &Type<N>,
+    name: MethodName,
+    select: impl FnOnce(Intrinsic, usize, SignatureReturn<'_, N>) -> S,
+) -> Option<S> {
+    use Intrinsic::*;
+    use ResultPattern as P;
+    macro_rules! methods {
+        ($($name:pat => $id:ident $(if $guard:tt)? : ($arity:literal, $ty:expr)),+ $(,)?) => {{
+            match name {
+                $($name $(if $guard)? => Some(select($id, $arity, SignatureReturn::Fixed($ty))),)+
+                _ => None,
+            }
+        }};
+    }
+
+    if let Some((op, target)) = name.scalar_operation() {
+        let destination = target.ty::<N>();
+        let scalar = P::Scalar(target);
+        let option_args = [P::Scalar(target)];
+        let result = match op {
+            ScalarParse if matches!(recv, Type::String) => {
+                P::Generic(B::Option.source_name(), &option_args)
+            }
+            IntegerCheckedConvert if recv.scalar_layout().is_some() => {
+                P::Generic(B::Option.source_name(), &option_args)
+            }
+            IntegerWrappingConvert
+                if recv.integer_layout().is_some() && destination.integer_layout().is_some() =>
+            {
+                scalar
+            }
+            IntegerConvert => {
+                let source = recv.scalar_layout()?;
+                let dest = destination.integer_layout()?;
+                let max = if matches!(recv, Type::Char) {
+                    0x10ffff
+                } else {
+                    source.max()
+                };
+                if dest.min() > source.min() || dest.max() < max {
+                    return None;
+                }
+                scalar
+            }
+            _ => return None,
+        };
+        return Some(select(op, 0, SignatureReturn::Fixed(result)));
+    }
+    if matches!(recv, Type::String) {
+        return methods!(
+            MethodName::ToString => StringToString: (0, P::String),
+            MethodName::AbiDebug => StringDebug: (0, P::String),
+            MethodName::Len => StringLen: (0, P::Scalar(ScalarTarget::I64)),
+            MethodName::ByteAt => StringByteAt: (1, P::Scalar(ScalarTarget::I64)),
+            MethodName::Substring | MethodName::Slice => StringSubstring: (2, P::String),
+            MethodName::Split => StringSplit: (1, P::Array(&P::String)),
+            MethodName::Contains => StringContains: (1, P::Bool),
+            MethodName::Find => StringFind: (1, P::Generic(B::Option.source_name(), &[P::Scalar(ScalarTarget::I64)])),
+            MethodName::EndsWith => StringEndsWith: (1, P::Bool),
+            MethodName::Replace => StringReplace: (2, P::String),
+            MethodName::TrimStart => StringTrimStart: (0, P::String),
+            MethodName::TrimEnd => StringTrimEnd: (0, P::String),
+            MethodName::ToLower => StringToLower: (0, P::String),
+            MethodName::ToUpper => StringToUpper: (0, P::String),
+            MethodName::Trim => StringTrim: (0, P::String),
+            MethodName::Repeat => StringRepeat: (1, P::String),
+            MethodName::StartsWith => StringStartsWith: (1, P::Bool),
+        );
+    }
+    if matches!(recv, Type::Char | Type::U64)
+        && matches!(name, MethodName::ToString | MethodName::AbiDebug)
+    {
+        return Some(select(ScalarToString, 0, SignatureReturn::Fixed(P::String)));
+    }
+    if recv.integer_layout().is_some() {
+        return methods!(
+            MethodName::ToString | MethodName::AbiDebug => I64ToString: (0, P::String),
+            MethodName::WrappingAdd => I64WrappingAdd: (1, P::Borrowed(recv)),
+            MethodName::WrappingSub => I64WrappingSub: (1, P::Borrowed(recv)),
+            MethodName::WrappingMul => I64WrappingMul: (1, P::Borrowed(recv)),
+            MethodName::WrappingNeg => I64WrappingNeg: (0, P::Borrowed(recv)),
+            MethodName::CheckedAdd => I64CheckedAdd: (1, P::Generic(B::Option.source_name(), &[P::Borrowed(recv)])),
+            MethodName::CheckedSub => I64CheckedSub: (1, P::Generic(B::Option.source_name(), &[P::Borrowed(recv)])),
+            MethodName::CheckedMul => I64CheckedMul: (1, P::Generic(B::Option.source_name(), &[P::Borrowed(recv)])),
+            MethodName::CheckedNeg => I64CheckedNeg: (0, P::Generic(B::Option.source_name(), &[P::Borrowed(recv)])),
+        );
+    }
+    match recv {
+        Type::Bool => {
+            return methods!(MethodName::ToString | MethodName::AbiDebug => BoolToString: (0, P::String));
+        }
+        Type::F64 => {
+            return methods!(MethodName::ToString | MethodName::AbiDebug => F64ToString: (0, P::String));
+        }
+        Type::Array(elem) | Type::FixedArray(elem, _) => {
+            return methods!(
+                MethodName::AbiConcat => StringConcatArray if (matches!(**elem, Type::String)): (0, P::String),
+                MethodName::AbiLen => ArrayLen: (0, P::Scalar(ScalarTarget::I64)),
+                MethodName::AbiResize => ArrayResize if (matches!(recv, Type::Array(_))): (1, P::Void),
+                MethodName::AbiCopy => ArrayCopy: (0, P::Generic(B::FrozenArray.source_name(), &[P::Borrowed(elem)])),
+            );
+        }
+        _ => {}
+    }
+
+    let family = builtin_types::resolve(recv)?;
+    match (family.id, family.args) {
+        (B::AtomicI64 | B::AtomicBool, []) => {
+            let word = if family.id == B::AtomicI64 {
+                P::Scalar(ScalarTarget::I64)
+            } else {
+                P::Bool
+            };
+            methods!(
+                MethodName::Load => AtomicLoad: (0, word),
+                MethodName::Store => AtomicStore: (1, P::Void),
+                MethodName::Swap => AtomicSwap: (1, word),
+                MethodName::CompareExchange => AtomicCompareExchange: (2, P::Bool),
+                MethodName::Add => AtomicAdd if (family.id == B::AtomicI64): (1, word),
+                MethodName::Sub => AtomicSub if (family.id == B::AtomicI64): (1, word),
+            )
+        }
+        (B::CancellationToken, []) => {
+            if name == MethodName::Attach {
+                return Some(select(TokenAttach, 1, SignatureReturn::SameAsArg(0)));
+            }
+            methods!(
+                MethodName::Cancel => TokenCancel: (0, P::Void),
+                MethodName::IsCancelled => TokenIsCancelled: (0, P::Bool),
+                MethodName::Child => TokenChild: (0, P::Named(B::CancellationToken)),
+            )
+        }
+        (B::TaskScope, []) => {
+            if name == MethodName::Add {
+                return Some(select(ScopeAdd, 1, SignatureReturn::SameAsArg(0)));
+            }
+            methods!(
+                MethodName::Cancel => ScopeCancel: (0, P::Void),
+                MethodName::IsCancelled => ScopeIsCancelled: (0, P::Bool),
+                MethodName::Child => ScopeChild: (0, P::Named(B::TaskScope)),
+                MethodName::Finish => ScopeFinish: (0, P::Generic(B::Task.source_name(), &[P::Generic(B::Result.source_name(), &[P::Void, P::Named(B::Cancelled)])])),
+            )
+        }
+        (B::Task | B::JoinHandle, [item]) => methods!(
+            MethodName::Cancel => TaskCancel: (0, P::Void),
+            MethodName::IsCancelled => TaskIsCancelled: (0, P::Bool),
+            MethodName::Result => TaskResult: (0, P::Generic(B::TaskResult.source_name(), &[P::Borrowed(item)])),
+        ),
+        (B::BlockingCell, [item]) => methods!(
+            MethodName::Get => CellGet: (0, P::Borrowed(item)),
+            MethodName::Set => CellSet: (1, P::Void),
+        ),
+        (B::BlockingRwCell, [item]) => methods!(
+            MethodName::Read => RwCellRead: (0, P::Borrowed(item)),
+            MethodName::Write => RwCellWrite: (1, P::Void),
+        ),
+        (B::Channel, [item]) => {
+            let id = name.channel()?;
+            let optional_item = [P::Borrowed(item)];
+            let (arity, result) = match id {
+                ChannelSend => (1, P::Void),
+                ChannelRecv => (0, P::Borrowed(item)),
+                ChannelRecvOpt => (0, P::Generic(B::Option.source_name(), &optional_item)),
+                ChannelClose => (0, P::Void),
+                _ => return None,
+            };
+            Some(select(id, arity, SignatureReturn::Fixed(result)))
+        }
+        (B::FrozenArray, [_]) => {
+            methods!(MethodName::Len => FrozenArrayLen: (0, P::Scalar(ScalarTarget::I64)))
+        }
+        (B::Map, [k, v]) => methods!(
+            MethodName::Insert => MapInsert: (2, P::Void),
+            MethodName::Remove => MapRemove: (1, P::Generic(B::Option.source_name(), &[P::Borrowed(v)])),
+            MethodName::Keys => MapKeys: (0, P::Array(&P::Borrowed(k))),
+            MethodName::Values => MapValues: (0, P::Array(&P::Borrowed(v))),
+            MethodName::Entries => MapEntries: (0, P::Array(&P::Generic("$Tuple2", &[P::Borrowed(k), P::Borrowed(v)]))),
+            MethodName::Get => MapGet: (1, P::Generic(B::Option.source_name(), &[P::Borrowed(v)])),
+            MethodName::Contains => MapContains: (1, P::Bool),
+            MethodName::Len => MapLen: (0, P::Scalar(ScalarTarget::I64)),
+            MethodName::ToString => MapToString: (0, P::String),
+            MethodName::Freeze => MapFreeze: (0, P::Generic(B::FrozenMap.source_name(), &[P::Borrowed(k), P::Borrowed(v)])),
+        ),
+        (B::FrozenMap, [_, v]) => methods!(
+            MethodName::Get => FrozenMapGet: (1, P::Generic(B::Option.source_name(), &[P::Borrowed(v)])),
+            MethodName::Contains => FrozenMapContains: (1, P::Bool),
+            MethodName::Len => FrozenMapLen: (0, P::Scalar(ScalarTarget::I64)),
+        ),
+        _ => None,
+    }
 }
 
 /// Convenience wrapper for callers that only want the intrinsic identity.
-pub fn resolve_intrinsic<N: builtin_types::TypeName + Clone + From<&'static str>>(
+pub fn resolve_intrinsic<N: builtin_types::TypeName>(
     recv: &Type<N>,
     method: &str,
     arity: usize,
 ) -> Option<Intrinsic> {
-    resolve(recv, method, arity).map(|r| r.intrinsic)
+    match MethodName::classify(method)
+        .lookup_with(recv, |id, expected, _| (expected == arity).then_some(id))
+    {
+        Lookup::Intrinsic(id) => id,
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1258,8 +1502,8 @@ mod tests {
             ("to_string", 0, Type::String, false, false),
         ] {
             let resolved = resolve(&Type::String, method, arity).unwrap();
-            assert_eq!(resolved.return_type(|_| None), result);
             let effects = resolved.intrinsic.runtime_effects();
+            assert_eq!(resolved.return_type(|_| None), result);
             assert_eq!(
                 effects.contains(RuntimeEffects::MAY_ALLOCATE),
                 allocates,
@@ -1902,7 +2146,18 @@ mod tests {
             for method in methods {
                 for arity in 0..3 {
                     if let Some(r) = resolve(recv, method, arity) {
-                        seen.insert(r.intrinsic);
+                        let id = r.intrinsic;
+                        let args = vec![Type::I64; arity];
+                        let result = r.return_type(|i| args.get(i).cloned());
+                        let name = MethodName::classify(method);
+                        for &candidate in Intrinsic::ALL {
+                            assert_eq!(
+                                matches_signature(recv, name, candidate, &args, &result),
+                                candidate == id,
+                                "{recv:?}.{method} with {candidate:?}"
+                            );
+                        }
+                        seen.insert(id);
                     }
                 }
             }
@@ -2074,7 +2329,12 @@ mod checker_agreement_tests {
                     panic!("checker recorded no receiver type for `{}`", call.method)
                 })
                 .clone();
-            let Some(resolved) = resolve(&recv, &call.method, call.args.len()) else {
+            let resolution = resolve(&recv, &call.method, call.args.len());
+            assert_eq!(
+                checker.builtin_calls.get(&call.id),
+                resolution.as_ref().map(|sig| &sig.intrinsic)
+            );
+            let Some(resolved) = resolution else {
                 if matches!(recv, Type::Array(_)) {
                     // Public array methods must have an ordinary source target.
                     let owner = checker
@@ -2092,6 +2352,7 @@ mod checker_agreement_tests {
                 .get(&call.id)
                 .unwrap_or_else(|| panic!("checker recorded no result type for `{}`", call.method))
                 .clone();
+            reached.push(resolved.intrinsic);
             let resolved_ret = resolved.return_type(|i| {
                 call.args
                     .get(i)
@@ -2105,7 +2366,6 @@ mod checker_agreement_tests {
                 type_name_for_message(&recv),
                 call.method
             );
-            reached.push(resolved.intrinsic);
         }
         assert_eq!(
             builtin_calls, expected,
@@ -2758,18 +3018,49 @@ pub(crate) fn namespace_builtin(class: &str, method: &str) -> Option<NamespaceBu
     })
 }
 
-/// Parse one scalar target spelling; the table is independent of source type.
-fn scalar_conversion_target<N>(method: &str, prefix: &str) -> Option<Type<N>> {
-    Some(match method.strip_prefix(prefix)? {
-        "i8" => Type::I8,
-        "i16" => Type::I16,
-        "i32" => Type::I32,
-        "i64" => Type::I64,
-        "u8" => Type::U8,
-        "u16" => Type::U16,
-        "u32" => Type::U32,
-        "u64" => Type::U64,
-        "char" => Type::Char,
-        _ => return None,
-    })
+/// Destination encoded by a scalar conversion or parse member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScalarTarget {
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    Char,
+}
+
+impl ScalarTarget {
+    fn from_suffix(suffix: &str) -> Option<Self> {
+        #[cfg(test)]
+        SCALAR_TARGET_PARSES.with(|count| count.set(count.get() + 1));
+        Some(match suffix {
+            "i8" => Self::I8,
+            "i16" => Self::I16,
+            "i32" => Self::I32,
+            "i64" => Self::I64,
+            "u8" => Self::U8,
+            "u16" => Self::U16,
+            "u32" => Self::U32,
+            "u64" => Self::U64,
+            "char" => Self::Char,
+            _ => return None,
+        })
+    }
+
+    fn ty<N>(self) -> Type<N> {
+        match self {
+            Self::I8 => Type::I8,
+            Self::I16 => Type::I16,
+            Self::I32 => Type::I32,
+            Self::I64 => Type::I64,
+            Self::U8 => Type::U8,
+            Self::U16 => Type::U16,
+            Self::U32 => Type::U32,
+            Self::U64 => Type::U64,
+            Self::Char => Type::Char,
+        }
+    }
 }

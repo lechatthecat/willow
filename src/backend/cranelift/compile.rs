@@ -1322,11 +1322,11 @@ impl UnitCodegenContext<'_> {
         // aliases in contextual lambda signatures. Only the owning checker
         // knows those aliases; resolve them as HIR lowering does before using
         // the backend's declaration scope.
-        let checked_type = self.checked.and_then(|checked| {
+        let checked_type = self.checked.as_ref().and_then(|checked| {
             checked
                 .expr_types
                 .get(&l.id)
-                .map(|ty| Type::from(checked.tables().normalize(ty)))
+                .map(|ty| Type::from(checked.normalize(ty)))
         });
         let lambda_type = checked_type
             .as_ref()

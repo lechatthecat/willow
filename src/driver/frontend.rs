@@ -294,6 +294,14 @@ struct RevisionReuse<'a> {
     disk: Option<&'a compiler_db::persistent::DiskRevision>,
 }
 
+impl<'a> RevisionReuse<'a> {
+    fn prechecks(&self) -> Option<&'a semantic::type_checker::precheck::Cache> {
+        self.previous
+            .map(|old| old.db.prechecks.as_ref())
+            .or_else(|| self.disk.map(|old| &old.prechecks))
+    }
+}
+
 struct ExpandedTemplates {
     program: parser::ast::Program,
     generic_sources: std::collections::HashMap<module::UnitId, ai::generics::Source>,
@@ -449,7 +457,6 @@ fn expand_templates(
     diagnostic_modules: &DiagnosticModuleIndex,
     emitter: &mut dyn diagnostics::DiagnosticEmitter,
 ) -> Result<ExpandedTemplates> {
-    let RevisionReuse { previous, disk } = reuse;
     let mut generic_sources = std::collections::HashMap::new();
     let mut runtime_names = std::collections::HashMap::new();
     let has_generics = |p: &parser::ast::Program| {
@@ -495,9 +502,7 @@ fn expand_templates(
         .chain(graph.files.iter().map(|m| &m.program))
         .any(|p| has_generics(p) || has_foreign_generic_default(p));
     let prechecks = std::rc::Rc::new(semantic::type_checker::precheck::Cache::revision(
-        previous
-            .map(|old| old.db.prechecks.as_ref())
-            .or_else(|| disk.map(|old| &old.prechecks)),
+        reuse.prechecks(),
         &graph
             .artifacts
             .as_ref()
@@ -813,6 +818,13 @@ fn prepare_database(
             .register_unit(&mut module.program, module.id);
     }
     artifacts.body_index_mut().finish_revision();
+    // Final class bodies acquire their reconciled identities during expansion.
+    // Instantiated owners use the syntax of their indexed source body.
+    if let Some(old) = reuse.prechecks() {
+        prechecks.reuse_body_facts(old, &artifacts.correspondence, false, |id| {
+            artifacts.bodies.source_body(id)
+        });
+    }
     artifacts.previous_parsed = None;
     artifacts.previous_expanded = None;
     let syntax_queries = artifacts.syntax_queries.take();
@@ -988,6 +1000,7 @@ fn check_frontend(
             let local_helpers = db.nonpreemptible_helpers(module.id, &body)?;
             let mut concurrency = check_unit_concurrency(
                 &body,
+                &checker.builtin_calls,
                 &graph.files,
                 db.dependencies(),
                 &db.effects,
@@ -998,6 +1011,7 @@ fn check_frontend(
                 &body,
                 &checker.expr_types,
                 &checker.reference_arg_modes,
+                &checker.builtin_calls,
             )?);
             let mut checked = compiler_db::CheckedUnit::from(checker.into_inner());
             checked.diagnostics.extend(concurrency);
@@ -1010,6 +1024,7 @@ fn check_frontend(
         let local_helpers = db.nonpreemptible_helpers(module::UnitId::ENTRY, &body)?;
         let mut concurrency = check_unit_concurrency(
             &body,
+            &checked.checker.builtin_calls,
             &graph.files,
             db.dependencies(),
             &db.effects,
@@ -1020,6 +1035,7 @@ fn check_frontend(
             &body,
             &checked.checker.expr_types,
             &checked.checker.reference_arg_modes,
+            &checked.checker.builtin_calls,
         )?);
         let mut checked = compiler_db::CheckedUnit::from(checked.checker.into_inner());
         checked.diagnostics.extend(concurrency);
@@ -1578,6 +1594,7 @@ pub(super) fn imported_nonpreemptible_method_owners(
 /// the already-checked units this program imports.
 pub(super) fn check_unit_concurrency(
     program: &parser::ast::Program,
+    calls: &semantic::intrinsics::BuiltinCalls,
     modules: &[module::ResolvedModule],
     dependencies: &ModuleDependencies,
     effects: &compiler_db::effects::EffectQueries,
@@ -1648,7 +1665,7 @@ pub(super) fn check_unit_concurrency(
     match local_helpers {
         Some((helpers, _)) => {
             analyzer
-                .check_program_cached(program, helpers, body_queries)
+                .check_program_cached(program, helpers, calls, body_queries)
                 .errors
         }
         None => analyzer.check_program(program).errors,
@@ -2237,6 +2254,7 @@ mod frontend_phase_tests {
         let program = parse_source("async fn update(x: &mut fn(i64) -> i64) {} fn main() {}");
         let phase = check_unit_concurrency(
             &program,
+            &Default::default(),
             &[],
             &ModuleDependencies::new(&[]),
             &compiler_db::effects::EffectQueries::default(),

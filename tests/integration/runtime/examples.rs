@@ -67,7 +67,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("tests/regressions/async_growing_string.wi", "120000\n"),
         (
             "example/builtin_method_surface.wi",
-            "a\n5\n1.5\ntrue\n3\n1\n1\n",
+            "a\n5\n1.5\ntrue\n3\n1\n1\n18\n",
         ),
         ("example/class_private_scope.wi", "true\n"),
         ("tests/regressions/closure_chain_stack.wi", "1000\n"),

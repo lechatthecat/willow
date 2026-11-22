@@ -828,7 +828,7 @@ fn l12_array_for_desugar() {
     };
     let header_instructions = &f.blocks[header.0].instrs;
     assert!(header_instructions.iter().any(|inst| matches!(inst,
-            SourceInst::Compute { value: LirRvalue::IntrinsicCall { method, .. }, .. } if method == "__abi_len")));
+            SourceInst::Compute { value: LirRvalue::IntrinsicCall { method, .. }, .. } if method.as_str() == "__abi_len")));
     assert!(header_instructions.iter().any(|inst| matches!(inst,
             SourceInst::Compute { local, value: LirRvalue::Binary { op: crate::parser::ast::BinOp::Lt, .. }, .. }
                 if f.locals[local.0 as usize].name == *condition)));

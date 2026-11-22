@@ -49,6 +49,7 @@ willow_continuations = { path = "crates/willow_continuations" }
 toml_edit = "0.25.17"
 syn = { version = "3.0.7", features = ["full", "visit", "visit-mut"] }
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
+indexmap = { version = "2.14.2", features = ["serde"] }
 im = { version = "15.1.0", features = ["serde"] }
 
 # The runtime's hot FFI entry points (willow_sync_poll_counter, safepoint and

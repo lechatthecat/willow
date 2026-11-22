@@ -1,4 +1,5 @@
 use super::*;
+use crate::semantic::intrinsics::BuiltinMethod;
 
 pub(super) fn lower(
     expr: &mut HirExpr,
@@ -384,6 +385,7 @@ impl<'e> ScalarLowering<'_, 'e> {
             method,
             args,
             super_class,
+            builtin,
         } = &node.kind
         else {
             unreachable!()
@@ -402,39 +404,35 @@ impl<'e> ScalarLowering<'_, 'e> {
                     .expect("typed argument")
             })
             .collect();
-        let value = if let Some(resolved) =
-            crate::semantic::intrinsics::resolve(&object.ty, method, args.len())
-        {
-            LirRvalue::IntrinsicCall {
-                intrinsic: resolved.intrinsic,
+        let value = match builtin {
+            Some(BuiltinMethod::Intrinsic(id)) => LirRvalue::IntrinsicCall {
+                intrinsic: *id,
                 method: method.clone(),
                 receiver,
                 receiver_ty: object.ty.clone(),
                 args: operands,
                 arg_types,
                 result: node.ty.clone(),
-            }
-        } else if enum_method(&object.ty, method) {
-            LirRvalue::EnumMethod {
+            },
+            Some(BuiltinMethod::Adt(id)) => LirRvalue::EnumMethod {
                 receiver,
                 receiver_ty: object.ty.clone(),
-                method: method.clone(),
+                method: *id,
                 args: operands,
                 arg_types,
                 result: node.ty.clone(),
-            }
-        } else {
-            LirRvalue::MethodCall {
+            },
+            None => LirRvalue::MethodCall {
                 receiver,
                 receiver_ty: object.ty.clone(),
-                method: method.clone(),
+                method: method.to_string(),
                 // Filled in the common final call walk below.
                 is_async: false,
                 args: operands,
                 arg_types,
                 result: node.ty.clone(),
                 super_class: *super_class,
-            }
+            },
         };
         LirOperand::Local(self.emit(value, node.ty.clone(), node.span))
     }
@@ -768,20 +766,7 @@ impl<'e> ScalarLowering<'_, 'e> {
                 self.enter_await(node, targets)
             }
             HirExprKind::ReferenceArg { .. } => self.enter_reference_arg(node),
-            HirExprKind::MethodCall {
-                object,
-                method,
-                args,
-                super_class,
-            } if instance_method(
-                super_class.map(Type::Named).as_ref().unwrap_or(&object.ty),
-                method,
-                args,
-                self.callables,
-            ) =>
-            {
-                self.enter_method_call(node, targets)
-            }
+            HirExprKind::MethodCall { builtin: None, .. } => self.enter_method_call(node, targets),
             HirExprKind::StaticCall { class, .. }
                 if self.callables.resolution.enums.contains_key(class) =>
             {
@@ -799,51 +784,51 @@ impl<'e> ScalarLowering<'_, 'e> {
     }
 
     fn prepare_references(&mut self, node: &HirExpr) {
-        let reference_call = match &node.kind {
-            HirExprKind::Call { callee, args } => Some((*callee, args)),
+        let args = match &node.kind {
+            HirExprKind::Call { args, .. }
+            | HirExprKind::New { args, .. }
+            | HirExprKind::StaticCall { args, .. }
+            | HirExprKind::MethodCall {
+                builtin: None,
+                args,
+                ..
+            } => args,
+            _ => return,
+        };
+        let mut sites = args
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| matches!(arg.kind, HirExprKind::ReferenceArg { .. }))
+            .peekable();
+        if sites.peek().is_none() {
+            return;
+        }
+        let callee = match &node.kind {
+            HirExprKind::Call { callee, .. } => *callee,
             HirExprKind::MethodCall {
                 object,
                 method,
-                args,
                 super_class,
-            } => match &object.ty {
-                Type::Named(owner) | Type::Generic(owner, _) => Some((
-                    FunctionId::method(super_class.unwrap_or(*owner), method),
-                    args,
-                )),
-                _ => None,
-            },
-            HirExprKind::New { class, args } => Some((FunctionId::method(*class, "init"), args)),
-            HirExprKind::StaticCall {
-                class,
-                method,
-                args,
-            } => Some((FunctionId::method(*class, method), args)),
-            ir_variants!(
-                HirExprKind;
-                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Invoke, Print, Array, Index,
-                Ternary, FieldAccess, ObjectLiteral, StaticField, ReferenceArg, Range, Await,
-                TryPropagate, Lambda, Match, Select
-            ) => None,
+                ..
+            } => {
+                let (Type::Named(owner) | Type::Generic(owner, _)) = &object.ty else {
+                    return;
+                };
+                FunctionId::method(super_class.unwrap_or(*owner), method)
+            }
+            HirExprKind::New { class, .. } => FunctionId::method(*class, "init"),
+            HirExprKind::StaticCall { class, method, .. } => FunctionId::method(*class, method),
+            _ => unreachable!(),
         };
-        if let Some((callee, args)) = reference_call {
-            let has_refs = args
-                .iter()
-                .any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. }));
-            for (index, arg) in args.iter().enumerate() {
-                if matches!(arg.kind, HirExprKind::ReferenceArg { .. }) {
-                    self.reference_sites
-                        .insert(std::ptr::from_ref(arg), (callee, index));
-                }
-            }
-            if has_refs
-                && !matches!(
-                    node.kind,
-                    HirExprKind::MethodCall { .. } | HirExprKind::New { .. }
-                )
-            {
-                self.emit(LirRvalue::BeginReferenceCall, Type::Void, node.span);
-            }
+        for (index, arg) in sites {
+            self.reference_sites
+                .insert(std::ptr::from_ref(arg), (callee, index));
+        }
+        if !matches!(
+            node.kind,
+            HirExprKind::MethodCall { .. } | HirExprKind::New { .. }
+        ) {
+            self.emit(LirRvalue::BeginReferenceCall, Type::Void, node.span);
         }
     }
 
@@ -923,6 +908,20 @@ impl<'e> ScalarLowering<'_, 'e> {
         // Never local in its unreachable merge block, not a value.
         if node.ty == Type::Never && matches!(node.kind, HirExprKind::Var(_)) {
             return Some(node.kind.clone());
+        }
+        // A checked builtin consumes value operands in receiver-first order.
+        // Only declared methods need a prepared receiver and parameter coercions.
+        if let HirExprKind::MethodCall {
+            builtin: Some(_),
+            object,
+            args,
+            ..
+        } = &node.kind
+        {
+            self.work.push(Work::Finish(node));
+            self.work.extend(args.iter().rev().map(Work::Enter));
+            self.work.push(Work::Enter(object));
+            return None;
         }
         let targets = argument_types(node, self.names, self.locals, self.callables);
         self.prepare_references(node);
@@ -1103,7 +1102,7 @@ impl<'e> ScalarLowering<'_, 'e> {
             LirRvalue::PrepareMethod {
                 receiver,
                 receiver_ty: object.ty.clone(),
-                method: method.clone(),
+                method: method.to_string(),
             },
             object.ty.clone(),
             node.span,

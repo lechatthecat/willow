@@ -942,6 +942,25 @@ impl LirTypeCtx<'_> {
         self.same_repr_inner(target, value, &mut open)
     }
 
+    /// Compare an applied generic whose argument types may come from different
+    /// operands. Callers can validate the result without building a type tree.
+    pub(super) fn same_generic_repr<'a>(
+        &self,
+        name: &TypeId,
+        args: impl ExactSizeIterator<Item = &'a Type>,
+        value: &Type,
+        open: &mut HashSet<(TypeId, TypeId)>,
+    ) -> bool {
+        let Type::Generic(other, actual) = value else {
+            return false;
+        };
+        (name == other || self.same_iface(name, other) || self.same_enum(name, other, open))
+            && args.len() == actual.len()
+            && args
+                .zip(actual)
+                .all(|(x, y)| self.same_repr_inner(x, y, open))
+    }
+
     /// `open` carries the enum name pairs already being compared, so a
     /// recursive payload (`enum List { Cons(List), Nil }`) closes its cycle
     /// instead of recursing forever.
@@ -961,13 +980,8 @@ impl LirTypeCtx<'_> {
             (Type::Array(a) | Type::FixedArray(a, _), Type::Array(b) | Type::FixedArray(b, _)) => {
                 self.same_repr_inner(a, b, open)
             }
-            (Type::Generic(a, ta), Type::Generic(b, tb)) => {
-                (a == b || self.same_iface(a, b) || self.same_enum(a, b, open))
-                    && ta.len() == tb.len()
-                    && ta
-                        .iter()
-                        .zip(tb)
-                        .all(|(x, y)| self.same_repr_inner(x, y, open))
+            (Type::Generic(name, args), _) => {
+                self.same_generic_repr(name, args.iter(), value, open)
             }
             // A signature can name one class under two spellings, like any
             // other position.

@@ -8,6 +8,7 @@ use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::TypeId;
+use crate::semantic::intrinsics::{BuiltinCalls, Intrinsic};
 
 #[derive(Default, Debug)]
 pub(crate) struct Counts {
@@ -91,6 +92,7 @@ fn summarize(
     functions: &HashMap<&str, (usize, bool)>,
     types: &HashMap<ExprId, Type>,
     owners: &HashMap<ExprId, TypeId>,
+    builtin_calls: &BuiltinCalls,
     counts: &mut Counts,
 ) -> Option<Summary> {
     if !f.type_params.is_empty()
@@ -185,10 +187,10 @@ fn summarize(
                         });
                         out = slot;
                     }
-                    Expr::MethodCall(c) if builtin(&c.object, B::Channel) => {
+                    Expr::MethodCall(c) => {
                         let channel = *values.get(&c.object.id())?;
-                        match c.method.as_str() {
-                            "recv" | "recv_opt" => {
+                        match builtin_calls.get(&c.id)? {
+                            Intrinsic::ChannelRecv | Intrinsic::ChannelRecvOpt => {
                                 summary.ops.push(Op::Receive {
                                     out: slot,
                                     channel,
@@ -197,7 +199,7 @@ fn summarize(
                                 // recv_opt carries an Option, not a Task handle.
                                 out = slot;
                             }
-                            "send" => {
+                            Intrinsic::ChannelSend => {
                                 let count = sends.entry(channel).or_default();
                                 if *count < 2 {
                                     summary.ops.push(Op::Send {
@@ -207,12 +209,10 @@ fn summarize(
                                     *count += 1;
                                 }
                             }
-                            "close" => summary.ops.push(Op::Close(channel)),
+                            Intrinsic::TaskResult if builtin(&c.object, B::Task) => out = channel,
+                            Intrinsic::ChannelClose => summary.ops.push(Op::Close(channel)),
                             _ => return None,
                         }
-                    }
-                    Expr::MethodCall(c) if builtin(&c.object, B::Task) && c.method == "result" => {
-                        out = *values.get(&c.object.id())?
                     }
                     Expr::Await(a) => summary.ops.push(Op::Await {
                         value: *values.get(&a.expr.id())?,
@@ -500,6 +500,7 @@ pub(crate) fn check(
     program: &Program,
     types: &HashMap<ExprId, Type>,
     owners: &HashMap<ExprId, TypeId>,
+    builtin_calls: &BuiltinCalls,
 ) -> Analysis {
     let mut result = Analysis::default();
     let functions: Vec<_> = program
@@ -520,7 +521,7 @@ pub(crate) fn check(
         .collect();
     let summaries: Vec<_> = functions
         .iter()
-        .map(|f| summarize(f, &index, types, owners, &mut result.counts))
+        .map(|f| summarize(f, &index, types, owners, builtin_calls, &mut result.counts))
         .collect();
     // A helper may be detached, cancelled or bounded by its caller's select.
     // Only the actual entry's reachable wait chain establishes a program wait.

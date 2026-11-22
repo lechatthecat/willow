@@ -21,7 +21,7 @@ struct StaticCall<'a> {
     args: &'a [CallArg],
     span: Span,
     method_span: Span,
-    expected: Option<&'a Type>,
+    context: CallContext<'a>,
 }
 
 #[cfg(test)]
@@ -1133,6 +1133,9 @@ impl TypeChecker {
     /// answer for one of them. The canonical spelling is registered as a key of
     /// its own as well, since `normalize_type` rewrites every reference to it.
     pub(super) fn register_enum(&mut self, decl: &EnumDecl) {
+        let tuple = crate::parser::tuples::is_tuple(&decl.name);
+        let outer = (!tuple)
+            .then(|| self.enter_type_parameters(decl.type_params.iter().cloned().collect()));
         let mut variant_infos = Vec::new();
         for (tag, variant) in decl.variants.iter().enumerate() {
             variant_infos.push(EnumVariantInfo {
@@ -1141,16 +1144,19 @@ impl TypeChecker {
                     .payload
                     .iter()
                     .map(|ty| {
-                        if crate::parser::tuples::is_tuple(&decl.name) {
+                        if tuple {
                             ty.clone()
                         } else {
-                            self.normalize_declared_type(ty, &decl.type_params, variant.span)
+                            self.normalize_type(ty, variant.span)
                         }
                     })
                     .collect(),
                 tag: tag as i64,
                 declaration_span: variant.span,
             });
+        }
+        if let Some(outer) = outer {
+            self.local.declared_type_params = outer;
         }
         self.define_declared_enum(decl, variant_infos);
     }
@@ -1186,7 +1192,11 @@ impl TypeChecker {
         self.symbols.define_enum(decl.name.clone(), info);
     }
 
-    pub(super) fn register_class(&mut self, c: &ClassDecl) {
+    pub(super) fn register_class(
+        &mut self,
+        c: &ClassDecl,
+        isolation: Option<&precheck::ClassIsolation>,
+    ) {
         let identity = if QualifiedName::new(&c.name).is_qualified() {
             c.name.clone()
         } else {
@@ -1204,7 +1214,7 @@ impl TypeChecker {
             self.normalized_types
                 .insert(Type::Named(identity.clone()), storage.clone());
         }
-        let info = self.class_info_from_decl(c, &identity, None);
+        let info = self.class_info_from_decl(c, &identity, None, isolation);
         if identity != c.name {
             self.symbols.define_class(identity, info.clone());
         }
@@ -1212,8 +1222,15 @@ impl TypeChecker {
     }
 
     pub(super) fn register_interface(&mut self, decl: &InterfaceDecl, module_path: Option<&str>) {
-        let mut bound = decl.type_params.clone();
-        bound.push("Self".to_string());
+        let outer_params = module_path.is_none().then(|| {
+            self.enter_type_parameters(
+                decl.type_params
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once("Self".into()))
+                    .collect(),
+            )
+        });
         let registered_name = match module_path {
             Some(module) => QualifiedName::join(module, &decl.name),
             None => decl.name.clone(),
@@ -1231,14 +1248,14 @@ impl TypeChecker {
             // module's interface keeps its own spellings; the module's
             // checker has already judged them.
             let return_type = if module_path.is_none() {
-                self.normalize_declared_type(&m.return_type, &bound, m.span)
+                self.normalize_type(&m.return_type, m.span)
             } else {
                 m.return_type.clone()
             };
             let params: Vec<Type> = if module_path.is_none() {
                 m.params
                     .iter()
-                    .map(|param| self.normalize_declared_type(&param.ty, &bound, param.type_span))
+                    .map(|param| self.normalize_type(&param.ty, param.type_span))
                     .collect()
             } else {
                 m.params.iter().map(|p| p.ty.clone()).collect()
@@ -1288,6 +1305,9 @@ impl TypeChecker {
                 },
             );
         }
+        if let Some(outer) = outer_params {
+            self.local.declared_type_params = outer;
+        }
         self.symbols.define_interface(
             registered_name.clone(),
             InterfaceInfo {
@@ -1311,16 +1331,14 @@ impl TypeChecker {
     /// the class object unconverted. A whole `-> Self` result is rebuilt as
     /// the interface by the backend, and an interface default's own `self`
     /// is the opaque receiver, so neither is rejected.
-    fn rejects_unknown_self(
-        &mut self,
+    fn unknown_self_error(
+        &self,
         iface: &InterfaceInfo,
         method: &str,
         obj_ty: &Type,
         span: Span,
-    ) -> bool {
-        let Some(m) = iface.methods.get(method) else {
-            return false;
-        };
+    ) -> Option<Diagnostic> {
+        let m = iface.methods.get(method)?;
         let is_self = |n: &str| n == "Self";
         let position = if m
             .params
@@ -1333,9 +1351,9 @@ impl TypeChecker {
         {
             "its result"
         } else {
-            return false;
+            return None;
         };
-        self.push(
+        Some(
             Diagnostic::new(
                 Severity::Error,
                 ErrorCode::E0201,
@@ -1346,8 +1364,7 @@ impl TypeChecker {
             )
             .with_label(Label::primary(span, "the implementing class is unknown here"))
             .with_help("call it on a value of the implementing class"),
-        );
-        true
+        )
     }
 
     /// Substitute an interface's generic type parameters with `type_args` and
@@ -1585,29 +1602,6 @@ impl TypeChecker {
         }
     }
 
-    /// Explicit wrapping/checked integer arithmetic. Kept out
-    /// of line: `resolve_method` recurses through nested calls, so its frame
-    /// size bounds how deep a call chain the checker accepts.
-    #[inline(never)]
-    fn resolve_i64_overflow_method(
-        &mut self,
-        receiver: &Type,
-        method_name: &str,
-        args: &[CallArg],
-        span: Span,
-    ) -> Option<Type> {
-        let params: &[Type] = match method_name {
-            "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "checked_add" | "checked_sub"
-            | "checked_mul" => std::slice::from_ref(receiver),
-            "wrapping_neg" | "checked_neg" => &[],
-            _ => return None,
-        };
-        self.check_call_argument_count(method_name, params.len(), args.len(), span);
-        self.check_value_call_args(params, args);
-        crate::semantic::intrinsics::resolve(receiver, method_name, params.len())
-            .map(|resolution| resolution.return_type(|_| None))
-    }
-
     /// Label the already-checked receiver without rechecking or walking its expression tree.
     pub(super) fn label_receiver_call_origin(
         &self,
@@ -1629,25 +1623,8 @@ impl TypeChecker {
         }
     }
 
-    /// Whether `ty` has a method named `method` (builtin, `std` or declared).
-    /// Inspect method declarations only: never check the receiver/arguments again
-    /// or request a generic body merely to choose an error message.
-    pub(super) fn type_has_method(&self, ty: &Type, method: &str) -> bool {
-        use crate::semantic::intrinsics;
-
-        if method.starts_with("__abi_") || method == "init" {
-            return false;
-        }
-        if intrinsics::adt_method_target(ty, method).is_some()
-            || intrinsics::adt_callback(ty, method)
-        {
-            return true;
-        }
-        // Intrinsic source signatures currently have zero, one, or two arguments.
-        // Existence is independent of the erroneous call's argument count.
-        if (0..=2).any(|arity| intrinsics::resolve(ty, method, arity).is_some()) {
-            return true;
-        }
+    /// Inspect std and user declarations without checking a body to choose a diagnostic.
+    pub(super) fn type_declares_method(&self, ty: &Type, method: &str) -> bool {
         let name = match ty {
             Type::Named(name) | Type::Generic(name, _) => name.as_str(),
             Type::Array(_) | Type::FixedArray(..) => {
@@ -1671,13 +1648,17 @@ impl TypeChecker {
         &mut self,
         obj_ty: &Type,
         call: &MethodCallExpr,
+        method_name: &str,
         virtual_dispatch: bool,
+        builtin: Option<(MethodName, Option<ResolvedMethod>)>,
     ) -> Type {
-        let method_name = call.method.as_str();
         let args = call.args.as_slice();
+        let classified = builtin.as_ref().map(|(name, _)| *name);
+        let retired_wait = classified.is_some_and(MethodName::is_retired_wait);
         let span = call.span;
         let receiver = &call.object;
-        if method_name == "__abi_debug"
+        let abi_debug = matches!(builtin, Some((MethodName::AbiDebug, _)));
+        if abi_debug
             && self.array_abi_files.contains(&span.file_id)
             && matches!(
                 obj_ty,
@@ -1698,76 +1679,56 @@ impl TypeChecker {
             self.check_call_argument_count(method_name, 0, args.len(), span);
             return Type::String;
         }
-        if *obj_ty == Type::String {
-            let params: Option<&[Type]> = match method_name {
-                "len" | "trim" | "trim_start" | "trim_end" | "to_lower" | "to_upper" => Some(&[]),
-                "substring" | "slice" => Some(&[Type::I64, Type::I64]),
-                "repeat" | "byte_at" => Some(&[Type::I64]),
-                "replace" => Some(&[Type::String, Type::String]),
-                "split" | "contains" | "find" | "starts_with" | "ends_with" => {
-                    Some(&[Type::String])
+        if let Some((_, Some(sig))) = builtin {
+            use Intrinsic::*;
+            let params: &[Type] = match sig.intrinsic {
+                StringSubstring => &[Type::I64, Type::I64],
+                StringRepeat | StringByteAt => &[Type::I64],
+                StringReplace => &[Type::String, Type::String],
+                StringSplit | StringContains | StringFind | StringStartsWith | StringEndsWith => {
+                    &[Type::String]
                 }
-                _ => None,
+                I64WrappingAdd | I64WrappingSub | I64WrappingMul | I64CheckedAdd
+                | I64CheckedSub | I64CheckedMul => std::slice::from_ref(obj_ty),
+                _ => &[],
             };
-            if let Some(params) = params {
-                self.check_call_argument_count(method_name, params.len(), args.len(), span);
-                self.check_value_call_args(params, args);
-                return crate::semantic::intrinsics::resolve(obj_ty, method_name, params.len())
-                    .expect("String method signature has an intrinsic")
-                    .return_type(|_| None);
+            // Scalar conversions and debug formatting do not check extra arguments.
+            match sig.intrinsic {
+                I64ToString | F64ToString | BoolToString | StringToString | ScalarToString
+                    if !abi_debug =>
+                {
+                    self.check_builtin_arity(
+                        BuiltinArity::new(0, ArityText::Display).label("unexpected arguments"),
+                        "primitive",
+                        method_name,
+                        args.len(),
+                        span,
+                    );
+                    return Type::String;
+                }
+                IntegerConvert | IntegerWrappingConvert | IntegerCheckedConvert | ScalarParse => {
+                    self.check_call_argument_count(method_name, 0, args.len(), span);
+                    return sig.return_type(|_| None);
+                }
+                _ if !abi_debug => {
+                    self.check_call_argument_count(method_name, params.len(), args.len(), span);
+                    self.check_value_call_args(params, args);
+                    return sig.return_type(|_| None);
+                }
+                _ => {}
             }
-        }
-        if obj_ty.integer_layout().is_some()
-            && let Some(ty) = self.resolve_i64_overflow_method(obj_ty, method_name, args, span)
-        {
-            return ty;
-        }
-        if let Some(resolved) = crate::semantic::intrinsics::resolve(obj_ty, method_name, 0)
-            && matches!(
-                resolved.intrinsic,
-                crate::semantic::intrinsics::Intrinsic::IntegerConvert
-                    | crate::semantic::intrinsics::Intrinsic::IntegerWrappingConvert
-                    | crate::semantic::intrinsics::Intrinsic::IntegerCheckedConvert
-                    | crate::semantic::intrinsics::Intrinsic::ScalarParse
-            )
-        {
-            self.check_call_argument_count(method_name, 0, args.len(), span);
-            return resolved.return_type(|_| None);
-        }
-        // Built-in `to_string()` on primitives: `i64`/`f64`/`bool`/`String` ->
-        // `String`. Class `to_string()` falls through to normal
-        // instance-method resolution.
-        if method_name == "to_string"
-            && matches!(
-                obj_ty,
-                Type::I8
-                    | Type::I16
-                    | Type::I32
-                    | Type::U16
-                    | Type::U32
-                    | Type::U64
-                    | Type::Char
-                    | Type::U8
-                    | Type::I64
-                    | Type::F64
-                    | Type::Bool
-                    | Type::String
-            )
-        {
-            self.check_builtin_arity(
-                method_arity("primitive", method_name),
-                "primitive",
-                method_name,
-                args.len(),
-                span,
-            );
-            return Type::String;
         }
         if let Some(inner) = crate::semantic::builtin_types::unary_arg(
             obj_ty,
             crate::semantic::builtin_types::BuiltinTypeId::Option,
         ) {
-            let mut diagnostic = if self.type_has_method(inner, method_name) {
+            // A missing Option member can still be available on its payload.
+            let payload_has_method =
+                !method_name.starts_with("__abi_") && method_name != "init" && {
+                    let name = classified.unwrap_or(call.method.kind());
+                    name.has_method_on(inner) || self.type_declares_method(inner, method_name)
+                };
+            let mut diagnostic = if payload_has_method {
                 Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0201,
@@ -1788,17 +1749,9 @@ impl TypeChecker {
                     ),
                 )
                 .with_label(Label::primary(span, "unknown method"));
-                let methods = [
-                    "unwrap",
-                    "expect",
-                    "unwrap_or",
-                    "is_some",
-                    "is_none",
-                    "map",
-                    "and_then",
-                    "or_else",
-                ];
-                if let Some(suggestion) = suggest_similar_name(method_name, methods.iter()) {
+                if let Some(suggestion) =
+                    suggest_similar_name(method_name, AdtMethod::OPTION_NAMES.iter())
+                {
                     diagnostic = diagnostic.with_help(format!(
                         "there is a method with a similar name: `{suggestion}`"
                     ));
@@ -1806,10 +1759,7 @@ impl TypeChecker {
                 diagnostic
             };
             self.label_receiver_call_origin(&mut diagnostic, receiver, obj_ty);
-            self.push(diagnostic);
-            for arg in args {
-                self.check_expr(&arg.expr);
-            }
+            self.report_missing_method_with_args(diagnostic, args, retired_wait);
             return Self::error_type();
         }
         // A receiver typed as a generic interface instantiation (`Box<String>`):
@@ -1818,13 +1768,23 @@ impl TypeChecker {
         if let Type::Generic(name, type_args) = obj_ty
             && let Some(iface) = self.symbols.lookup_interface(name).cloned()
         {
-            if self.rejects_unknown_self(&iface, method_name, obj_ty, span) {
+            if let Some(error) = self.unknown_self_error(&iface, method_name, obj_ty, span) {
+                if retired_wait {
+                    self.check_discarded_builtin_args(args);
+                }
+                self.push(error);
                 return Self::error_type();
             }
             // `Self` in a method called through the interface is the full
             // receiver instantiation (`Box<i64>`), not bare `Box`.
             let instantiated = self.instantiate_interface(&iface, type_args, obj_ty);
-            return self.resolve_interface_method(&instantiated, method_name, args, span);
+            return self.resolve_interface_method(
+                &instantiated,
+                method_name,
+                args,
+                span,
+                retired_wait,
+            );
         }
         // An interface default's opaque receiver reaches its interface's
         // methods, whose `Self` stays the receiver.
@@ -1841,7 +1801,7 @@ impl TypeChecker {
             } else {
                 self.instantiate_interface(&iface, &type_args, obj_ty)
             };
-            return self.resolve_interface_method(&iface, method_name, args, span);
+            return self.resolve_interface_method(&iface, method_name, args, span, retired_wait);
         }
         let class_name = match obj_ty {
             Type::Named(n) => n.clone(),
@@ -1872,6 +1832,9 @@ impl TypeChecker {
                     diagnostic = diagnostic.with_help(format!("available methods: {methods}"));
                 }
                 self.label_receiver_call_origin(&mut diagnostic, receiver, obj_ty);
+                if retired_wait {
+                    self.check_discarded_builtin_args(args);
+                }
                 self.push(diagnostic);
                 return Type::Void;
             }
@@ -1879,7 +1842,11 @@ impl TypeChecker {
         // Interface-typed receiver: only the interface's declared methods are
         // callable, and the call dispatches through the interface vtable.
         if let Some(mut iface) = self.symbols.lookup_interface(&class_name).cloned() {
-            if self.rejects_unknown_self(&iface, method_name, obj_ty, span) {
+            if let Some(error) = self.unknown_self_error(&iface, method_name, obj_ty, span) {
+                if retired_wait {
+                    self.check_discarded_builtin_args(args);
+                }
+                self.push(error);
                 return Self::error_type();
             }
             // Dispatch returns the concrete object for `-> Self`; the backend
@@ -1891,9 +1858,12 @@ impl TypeChecker {
             {
                 method.return_type = obj_ty.clone();
             }
-            return self.resolve_interface_method(&iface, method_name, args, span);
+            return self.resolve_interface_method(&iface, method_name, args, span, retired_wait);
         }
         if self.symbols.lookup_class(&class_name).is_none() {
+            if retired_wait {
+                self.check_discarded_builtin_args(args);
+            }
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -2027,22 +1997,16 @@ impl TypeChecker {
                         );
                     }
                 }
-                if mi.params.len() != args.len() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "method `{}` takes {} argument(s) but {} were supplied",
-                                method_name,
-                                mi.params.len(),
-                                args.len()
-                            ),
-                        )
-                        .with_label(Label::primary(span, "wrong number of arguments")),
-                    );
+                let checked = retired_wait && !virtual_dispatch;
+                if checked {
+                    self.check_discarded_builtin_args(args);
                 }
-                self.check_call_args_against_param_infos(&mi.param_infos, args);
+                if let Some(arity) =
+                    Self::method_arity_error(method_name, mi.params.len(), args.len(), span)
+                {
+                    self.push(arity);
+                }
+                self.check_call_args_against_param_infos(&mi.param_infos, args, checked);
                 let retains = mi.is_async
                     || (virtual_dispatch
                         && matches!(&mi.return_type, Type::Generic(name, _) if Builtin::from_name(name) == Some(Builtin::Task))
@@ -2055,6 +2019,24 @@ impl TypeChecker {
         }
     }
 
+    fn method_arity_error(
+        name: &str,
+        expected: usize,
+        supplied: usize,
+        span: Span,
+    ) -> Option<Diagnostic> {
+        (expected != supplied).then(|| {
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0201,
+                format!(
+                    "method `{name}` takes {expected} argument(s) but {supplied} were supplied"
+                ),
+            )
+            .with_label(Label::primary(span, "wrong number of arguments"))
+        })
+    }
+
     /// Resolve a method call on an interface-typed receiver. Only methods declared
     /// by the interface are callable; the return type is the interface method's.
     pub(super) fn resolve_interface_method(
@@ -2063,6 +2045,7 @@ impl TypeChecker {
         method_name: &str,
         args: &[CallArg],
         span: Span,
+        retired_wait: bool,
     ) -> Type {
         let Some(m) = iface.methods.get(method_name) else {
             let mut diag = Diagnostic::new(
@@ -2080,11 +2063,7 @@ impl TypeChecker {
                 diag = diag
                     .with_help("only methods declared in the interface are callable on its values");
             }
-            self.push(diag);
-            // Still check the args for internal errors.
-            for arg in args {
-                self.check_expr(&arg.expr);
-            }
+            self.report_missing_method_with_args(diag, args, retired_wait);
             return Type::Void;
         };
 
@@ -2096,20 +2075,12 @@ impl TypeChecker {
             args,
             Some((&m.params, &m.return_type)),
         );
-        if m.params.len() != args.len() {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0201,
-                    format!(
-                        "method `{}` takes {} argument(s) but {} were supplied",
-                        method_name,
-                        m.params.len(),
-                        args.len()
-                    ),
-                )
-                .with_label(Label::primary(span, "wrong number of arguments")),
-            );
+        if retired_wait {
+            self.check_discarded_builtin_args(args);
+        }
+        if let Some(arity) = Self::method_arity_error(method_name, m.params.len(), args.len(), span)
+        {
+            self.push(arity);
         }
         for (idx, arg) in args.iter().enumerate() {
             // A `&`/`&mut` parameter is passed as a pointer, so an interface
@@ -2122,11 +2093,12 @@ impl TypeChecker {
                 && (matches!(param.mode, ParamMode::Reference { .. })
                     || matches!(arg.mode, CallArgMode::Reference { .. }))
             {
-                self.check_call_arg_against_param(param, arg);
+                self.check_call_arg_against_param(param, arg, retired_wait);
                 continue;
             }
             let arg_ty = match m.params.get(idx) {
-                Some(param_ty) => self.check_expr_expecting(&arg.expr, param_ty),
+                Some(param_ty) => self.check_argument_expecting(&arg.expr, param_ty, retired_wait),
+                None if retired_wait => continue,
                 None => self.check_expr(&arg.expr),
             };
             if let Some(param_ty) = m.params.get(idx)
@@ -2173,7 +2145,7 @@ impl TypeChecker {
         method_name: &str,
         args: &[CallArg],
         spans: (Span, Span),
-        expected: Option<&Type>,
+        context: CallContext<'_>,
     ) -> Type {
         let (span, method_span) = spans;
         let references = self.analysis_symbols.references.len();
@@ -2185,7 +2157,7 @@ impl TypeChecker {
             args,
             span,
             method_span,
-            expected,
+            context,
         });
         if self.capture_call_sites
             && self.error_generation == errors
@@ -2537,7 +2509,7 @@ impl TypeChecker {
             type_args,
             args,
             span,
-            expected,
+            context,
             ..
         } = *call;
         self.reject_reference_args(&QualifiedName::join(class_name, "new"), args);
@@ -2553,16 +2525,16 @@ impl TypeChecker {
         // The written type argument, else the expected lock's element, is
         // the argument's context: `Mutex::new([])` expected as
         // `Mutex<Array<i64>>` types `[]` as `Array<i64>`.
-        let context = match (type_args, expected) {
+        let element = match (type_args, context.expected) {
             ([t], _) => Some(t),
             ([], Some(Type::Generic(name, elem))) if name == class_name && elem.len() == 1 => {
                 Some(&elem[0])
             }
             _ => None,
         };
-        let arg_ty = match context {
-            Some(context) => self.check_expr_expecting(&args[0].expr, context),
-            None => self.check_expr(&args[0].expr),
+        let arg_ty = match element {
+            Some(element) => self.check_argument_expecting(&args[0].expr, element, context.checked),
+            None => self.check_or_reuse_expr(&args[0].expr, context.checked),
         };
         let elem = match type_args {
             [] => arg_ty.clone(),
@@ -2853,7 +2825,7 @@ impl TypeChecker {
                 span,
             );
         }
-        self.check_call_args_against_param_infos(&fi.param_infos, args);
+        self.check_call_args_against_param_infos(&fi.param_infos, args, call.context.checked);
         self.check_async_call_captures(&fi.param_infos, args, fi.is_async);
         // A module-qualified call to an async fn yields `Task<T>`,
         // just like a local async call — without this the call site
@@ -2933,7 +2905,7 @@ impl TypeChecker {
                 span,
             );
         }
-        self.check_call_args_against_param_infos(&mi.param_infos, args);
+        self.check_call_args_against_param_infos(&mi.param_infos, args, call.context.checked);
         self.check_async_call_captures(&mi.param_infos, args, mi.is_async);
         method_call_return_type(&mi)
     }

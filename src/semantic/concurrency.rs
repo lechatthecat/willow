@@ -4,6 +4,7 @@ use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use crate::semantic::ids::{FunctionId, TypeId};
+use crate::semantic::intrinsics::{BuiltinCalls, Intrinsic, MethodName};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -104,6 +105,7 @@ struct SyncHelperRef {
 #[derive(Debug)]
 pub struct ConcurrencyAnalyzer {
     check_reads: std::cell::RefCell<HashSet<CheckInput>>,
+    cache_checks: bool,
     pub errors: Vec<Diagnostic>,
     pub report: ConcurrencyReport,
     current_async_context: bool,
@@ -123,6 +125,7 @@ impl Default for ConcurrencyAnalyzer {
     fn default() -> Self {
         Self {
             check_reads: Default::default(),
+            cache_checks: false,
             errors: Vec::new(),
             report: ConcurrencyReport::default(),
             current_async_context: false,
@@ -225,24 +228,29 @@ impl ConcurrencyAnalyzer {
     }
 
     pub fn check_program(self, program: &Program) -> Self {
-        let helpers = compute_nonpreemptible_helpers(program);
-        self.check_program_with_helpers(program, &helpers)
+        let (graph, calls) =
+            crate::semantic::TypeChecker::resolved_effect_graph_and_builtins(program);
+        let helpers = helpers_from_graph(program, &graph);
+        self.check_program_with_helpers(program, &helpers, &calls)
     }
 
     pub(crate) fn check_program_with_helpers(
         self,
         program: &Program,
         helpers: &crate::compiler_db::HelperSummary,
+        calls: &BuiltinCalls,
     ) -> Self {
-        self.check_program_cached(program, helpers, None)
+        self.check_program_cached(program, helpers, calls, None)
     }
 
     pub(crate) fn check_program_cached(
         mut self,
         program: &Program,
         helpers: &crate::compiler_db::HelperSummary,
+        calls: &BuiltinCalls,
         queries: Option<&crate::compiler_db::body::BodyQueries>,
     ) -> Self {
+        self.cache_checks = queries.is_some();
         self.index_nonpreemptible_sync_helpers(helpers);
         for item in &program.items {
             if let Item::Class(class) = item {
@@ -252,21 +260,29 @@ impl ConcurrencyAnalyzer {
         for item in &program.items {
             match item {
                 Item::Function(function) => {
+                    let Some(queries) = queries else {
+                        self.check_function(function, calls);
+                        continue;
+                    };
                     let syntax = crate::compiler_db::syntax::semantic(
                         &serde_json::to_value(function).expect("function serialization"),
                     );
-                    self.check_cached(function.body.id, syntax, queries, |s| {
-                        s.check_function(function)
+                    self.check_cached(function.body.id, syntax, calls, queries, |s| {
+                        s.check_function(function, calls)
                     });
                 }
                 Item::Class(class) => {
                     for method in &class.methods {
+                        let Some(queries) = queries else {
+                            self.check_method(&class.name, method, calls);
+                            continue;
+                        };
                         let syntax = crate::compiler_db::syntax::semantic(
                             &serde_json::to_value((&class.name, method))
                                 .expect("method serialization"),
                         );
-                        self.check_cached(method.body.id, syntax, queries, |s| {
-                            s.check_method(&class.name, method)
+                        self.check_cached(method.body.id, syntax, calls, queries, |s| {
+                            s.check_method(&class.name, method, calls)
                         });
                     }
                 }
@@ -278,7 +294,7 @@ impl ConcurrencyAnalyzer {
     }
 
     fn helper_exists(&self, id: &FunctionId) -> bool {
-        if !self.sync_stack_preemption && self.current_async_context {
+        if !self.sync_stack_preemption && self.current_async_context && self.cache_checks {
             self.check_reads
                 .borrow_mut()
                 .insert(CheckInput::Helper(*id));
@@ -286,16 +302,19 @@ impl ConcurrencyAnalyzer {
         self.nonpreemptible_sync_helpers.contains_key(id)
     }
     fn reference_class(&self, name: &str) -> bool {
-        self.check_reads
-            .borrow_mut()
-            .insert(CheckInput::Class(name.to_owned()));
+        if self.cache_checks {
+            self.check_reads
+                .borrow_mut()
+                .insert(CheckInput::Class(name.to_owned()));
+        }
         self.reference_classes.contains(name)
     }
-    fn check_input(&self, input: &CheckInput) -> serde_json::Value {
+    fn check_input(&self, input: &CheckInput, calls: &BuiltinCalls) -> serde_json::Value {
         match input {
             CheckInput::SignatureType(..) | CheckInput::SignatureSymbol(..) => {
                 unreachable!("signature dependency in concurrency check")
             }
+            CheckInput::Method(id) => serde_json::json!(calls.get(id)),
             CheckInput::Target => serde_json::json!(self.sync_stack_preemption),
             CheckInput::Class(name) => serde_json::json!(self.reference_classes.contains(name)),
             CheckInput::Helper(id) => self
@@ -310,47 +329,47 @@ impl ConcurrencyAnalyzer {
         &mut self,
         body: BodyId,
         syntax: serde_json::Value,
-        queries: Option<&crate::compiler_db::body::BodyQueries>,
+        calls: &BuiltinCalls,
+        queries: &crate::compiler_db::body::BodyQueries,
         compute: impl FnOnce(&mut Self),
     ) {
         let prior = std::mem::take(&mut self.report);
-        if let Some(CheckValue::Concurrency(report, errors)) = queries.and_then(|q| {
-            q.cached_check(body, CheckKind::Concurrency, &syntax, |key| {
-                self.check_input(key)
+        if let Some(CheckValue::Concurrency(report, errors)) = queries
+            .cached_check(body, CheckKind::Concurrency, &syntax, |key| {
+                self.check_input(key, calls)
             })
             .ok()
             .flatten()
-        }) {
+        {
             self.report = report;
             self.errors.extend(errors);
         } else {
-            if let Some(q) = queries {
-                q.concurrency_checks.set(q.concurrency_checks.get() + 1);
-            }
+            queries
+                .concurrency_checks
+                .set(queries.concurrency_checks.get() + 1);
             let start = self.errors.len();
-            self.check_reads.borrow_mut().clear();
-            self.check_reads.borrow_mut().insert(CheckInput::Target);
+            let reads = self.check_reads.get_mut();
+            reads.clear();
+            reads.insert(CheckInput::Target);
             compute(self);
-            if let Some(q) = queries {
-                let inputs = self
-                    .check_reads
-                    .borrow()
-                    .iter()
-                    .map(|key| (key.clone(), self.check_input(key)))
-                    .collect();
-                q.store_check(
-                    body,
-                    CheckKind::Concurrency,
-                    CheckRecord {
-                        syntax: std::rc::Rc::new(syntax),
-                        inputs,
-                        value: CheckValue::Concurrency(
-                            self.report.clone(),
-                            self.errors[start..].to_vec(),
-                        ),
-                    },
-                );
-            }
+            let inputs = self
+                .check_reads
+                .borrow()
+                .iter()
+                .map(|key| (key.clone(), self.check_input(key, calls)))
+                .collect();
+            queries.store_check(
+                body,
+                CheckKind::Concurrency,
+                CheckRecord {
+                    syntax: std::rc::Rc::new(syntax),
+                    inputs,
+                    value: CheckValue::Concurrency(
+                        self.report.clone(),
+                        self.errors[start..].to_vec(),
+                    ),
+                },
+            );
         }
         self.report.async_functions += prior.async_functions;
         self.report.await_expressions += prior.await_expressions;
@@ -375,18 +394,18 @@ impl ConcurrencyAnalyzer {
         }
     }
 
-    fn check_function(&mut self, function: &FunctionDecl) {
+    fn check_function(&mut self, function: &FunctionDecl, calls: &BuiltinCalls) {
         if function.is_async {
             self.report.async_functions += 1;
             self.check_async_reference_params("async function", function.span, &function.params);
         }
         let previous_async_context = self.current_async_context;
         self.current_async_context = function.is_async;
-        self.check_block(&function.body);
+        self.check_block(&function.body, calls);
         self.current_async_context = previous_async_context;
     }
 
-    fn check_method(&mut self, class_name: &str, method: &MethodDecl) {
+    fn check_method(&mut self, class_name: &str, method: &MethodDecl, calls: &BuiltinCalls) {
         if method.is_async {
             self.report.async_functions += 1;
             self.check_async_reference_params("async method", method.span, &method.params);
@@ -396,12 +415,12 @@ impl ConcurrencyAnalyzer {
             .current_class
             .replace(TypeId::from_source_name(class_name));
         self.current_async_context = method.is_async;
-        self.check_block(&method.body);
+        self.check_block(&method.body, calls);
         self.current_async_context = previous_async_context;
         self.current_class = previous_class;
     }
 
-    fn check_block(&mut self, block: &Block) {
+    fn check_block(&mut self, block: &Block, calls: &BuiltinCalls) {
         let mut lambda_contexts = Vec::new();
         for event in AstWalk::new(AstEvent::Block(block)) {
             match event {
@@ -423,11 +442,29 @@ impl ConcurrencyAnalyzer {
                 }
                 // Method operation accounting follows its receiver, as in the
                 // original recursive traversal, and precedes its arguments.
-                AstEvent::CallArguments(Expr::MethodCall(method)) => match method.method.as_str() {
-                    "result" => self.report.task_result_queries += 1,
-                    "send" | "recv" | "recv_opt" | "close" => self.report.channel_operations += 1,
-                    _ => {}
-                },
+                AstEvent::CallArguments(Expr::MethodCall(method)) => {
+                    let name = method.method.kind();
+                    if name != MethodName::Result && name.channel().is_none() {
+                        continue;
+                    }
+                    // A candidate on a user receiver is a negative dependency: its
+                    // checked identity may change while the body syntax stays the same.
+                    if self.cache_checks {
+                        self.check_reads
+                            .get_mut()
+                            .insert(CheckInput::Method(method.id));
+                    }
+                    match calls.get(&method.id) {
+                        Some(Intrinsic::TaskResult) => self.report.task_result_queries += 1,
+                        Some(
+                            Intrinsic::ChannelSend
+                            | Intrinsic::ChannelRecv
+                            | Intrinsic::ChannelRecvOpt
+                            | Intrinsic::ChannelClose,
+                        ) => self.report.channel_operations += 1,
+                        _ => {}
+                    }
+                }
                 AstEvent::Expr(Expr::StaticCall(static_call)) => {
                     let callee = if static_call.class == "Self" {
                         FunctionId::method(
@@ -530,9 +567,11 @@ impl ConcurrencyAnalyzer {
         if self.sync_stack_preemption || !self.current_async_context {
             return;
         }
-        self.check_reads
-            .borrow_mut()
-            .insert(CheckInput::Helper(*callee));
+        if self.cache_checks {
+            self.check_reads
+                .get_mut()
+                .insert(CheckInput::Helper(*callee));
+        }
         let Some(helper) = self.nonpreemptible_sync_helpers.get(callee) else {
             return;
         };
@@ -562,9 +601,16 @@ pub(crate) fn compute_nonpreemptible_helpers(
     program: &Program,
 ) -> crate::compiler_db::HelperSummary {
     let graph = crate::semantic::TypeChecker::resolved_effect_graph(program);
+    helpers_from_graph(program, &graph)
+}
+
+fn helpers_from_graph(
+    program: &Program,
+    graph: &crate::semantic::call_graph::CallGraph,
+) -> crate::compiler_db::HelperSummary {
     let effects = crate::compiler_db::effects::solve_unit(
         program,
-        &graph,
+        graph,
         &HashMap::<ExprId, Type>::new(),
         None,
         &HashMap::new(),
@@ -683,14 +729,107 @@ mod tests {
                     analyzer
                 }
             };
-            let warm = analyzer().check_program_cached(&program, &helpers, Some(&queries));
-            let clean = analyzer().check_program_with_helpers(&program, &helpers);
+            let warm = analyzer().check_program_cached(
+                &program,
+                &helpers,
+                &builtin_calls(&program),
+                Some(&queries),
+            );
+            let clean =
+                analyzer().check_program_with_helpers(&program, &helpers, &builtin_calls(&program));
             assert_eq!(warm.report, clean.report);
             assert_eq!(
                 serde_json::to_value(warm.errors).unwrap(),
                 serde_json::to_value(clean.errors).unwrap()
             );
             assert_eq!(queries.concurrency_checks.get(), expected_checks);
+        }
+    }
+
+    #[test]
+    fn cached_method_dependencies_only_grow_with_concurrency_candidates() {
+        use crate::compiler_db::{body::BodyQueries, ids::BodyIndex};
+        use crate::module::artifacts::UnitArtifacts;
+        use std::{cell::Cell, rc::Rc};
+
+        for ordinary in [0, 1, 16, 128] {
+            for groups in [0, 1, 8] {
+                let program = parse(&format!(
+                    "class C {{ pub fn tick(self) {{}} pub fn recv(self) {{}} pub fn len(self) -> i64 {{ return 0; }} }}
+                     fn probe(c: C, ch: Channel<i64>, t: Task<i64>) {{ {} {} }}",
+                    r#"c.tick(); c.len(); "s".len();"#.repeat(ordinary),
+                    "c.recv(); ch.send(1); ch.recv(); ch.recv_opt(); ch.close(); t.result();"
+                        .repeat(groups)
+                ));
+                let calls = builtin_calls(&program);
+                let artifacts = UnitArtifacts::new().unwrap();
+                let queries =
+                    BodyQueries::new(Rc::clone(&artifacts.store), Rc::new(BodyIndex::default()));
+                let analyzer = ConcurrencyAnalyzer::new().check_program_cached(
+                    &program,
+                    &Default::default(),
+                    &calls,
+                    Some(&queries),
+                );
+                assert_eq!(analyzer.report.channel_operations, 4 * groups);
+                assert_eq!(analyzer.report.task_result_queries, groups);
+                let Item::Function(probe) = program.items.last().unwrap() else {
+                    unreachable!()
+                };
+                let syntax =
+                    crate::compiler_db::syntax::semantic(&serde_json::to_value(probe).unwrap());
+                let positive = Cell::new(0);
+                let negative = Cell::new(0);
+                // Replaying a hit enumerates the dependencies actually stored in the record.
+                let cached = queries
+                    .cached_check(probe.body.id, CheckKind::Concurrency, &syntax, |key| {
+                        let value = analyzer.check_input(key, &calls);
+                        if matches!(key, CheckInput::Method(_)) {
+                            let n = if value.is_null() {
+                                &negative
+                            } else {
+                                &positive
+                            };
+                            n.set(n.get() + 1);
+                        }
+                        value
+                    })
+                    .unwrap();
+                assert!(matches!(cached, Some(CheckValue::Concurrency(..))));
+                assert_eq!(
+                    (positive.get(), negative.get()),
+                    (5 * groups, groups),
+                    "ordinary={ordinary} groups={groups}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_concurrency_tracks_receiver_identity_changes() {
+        use crate::compiler_db::{body::BodyQueries, ids::BodyIndex};
+        use crate::module::artifacts::UnitArtifacts;
+        use std::rc::Rc;
+        let program = parse("fn read(ch: Channel<i64>) { ch.recv(); } fn unchanged() {}");
+        let artifacts = UnitArtifacts::new().unwrap();
+        let queries = BodyQueries::new(Rc::clone(&artifacts.store), Rc::new(BodyIndex::default()));
+        let helpers = crate::compiler_db::HelperSummary::new();
+        let channel = builtin_calls(&program);
+        let declared = BuiltinCalls::default();
+        for (calls, count, computations) in [
+            (&declared, 0, 2),
+            (&channel, 1, 3),
+            (&channel, 1, 3),
+            (&declared, 0, 4),
+        ] {
+            let analyzer = ConcurrencyAnalyzer::new().check_program_cached(
+                &program,
+                &helpers,
+                calls,
+                Some(&queries),
+            );
+            assert_eq!(analyzer.report.channel_operations, count);
+            assert_eq!(queries.concurrency_checks.get(), computations);
         }
     }
 
@@ -721,19 +860,27 @@ mod tests {
         );
     }
 
+    fn builtin_calls(program: &Program) -> BuiltinCalls {
+        let mut checker = crate::semantic::TypeChecker::new();
+        checker.check_program(program);
+        checker.builtin_calls
+    }
+
     fn analyze(source: &str) -> ConcurrencyAnalyzer {
+        let program = parse(source);
         ConcurrencyAnalyzer::new()
             .with_sync_stack_preemption(false)
-            .check_program(&parse(source))
+            .check_program(&program)
     }
 
     /// Analyze `entry` with one imported module's looping sync helpers seeded
     /// under `module_name::*`, mirroring the entry-program path in `main.rs`.
     fn analyze_with_module(entry: &str, module_name: &str, module: &str) -> ConcurrencyAnalyzer {
+        let program = parse(entry);
         ConcurrencyAnalyzer::new()
             .with_sync_stack_preemption(false)
             .with_module_helpers(module_name, &parse(module))
-            .check_program(&parse(entry))
+            .check_program(&program)
     }
 
     fn assert_error_contains(source: &str, code: ErrorCode, message: &str) {
@@ -1368,10 +1515,11 @@ async fn run() -> i64 {
         module: &str,
         module_src: &str,
     ) -> ConcurrencyAnalyzer {
+        let program = parse(entry);
         ConcurrencyAnalyzer::new()
             .with_sync_stack_preemption(false)
             .with_item_helper(local, item, module, &parse(module_src))
-            .check_program(&parse(entry))
+            .check_program(&program)
     }
 
     #[test]

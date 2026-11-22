@@ -70,10 +70,14 @@ struct Admission {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Snapshot {
+struct Snapshot<
+    Records = Vec<(String, crate::semantic::type_checker::precheck::Record)>,
+    Facts = [crate::semantic::type_checker::precheck::ClassBodyFacts; 2],
+> {
     // Must remain first: admission reads this field before loading any payload.
     admission: Admission,
-    prechecks: Vec<(String, crate::semantic::type_checker::precheck::Record)>,
+    prechecks: Records,
+    class_body_facts: Facts,
     key: CacheKey,
     id_ends: [u64; 2],
     modules: Vec<ModuleIdentity>,
@@ -262,9 +266,12 @@ fn load_file(file: std::fs::File, key: &CacheKey) -> Result<(DiskRevision, Synta
     )?;
     let effects = super::effects::EffectQueries::default();
     effects.restore_solutions(snapshot.effects)?;
+    let mut prechecks =
+        crate::semantic::type_checker::precheck::Cache::restore(snapshot.prechecks)?;
+    prechecks.body_facts = snapshot.class_body_facts.map(RefCell::new);
     Ok((
         DiskRevision {
-            prechecks: crate::semantic::type_checker::precheck::Cache::restore(snapshot.prechecks)?,
+            prechecks,
             effects,
             store,
             parsed,
@@ -300,7 +307,8 @@ fn save(path: &Path, key: CacheKey, frontend: &Frontend, syntax: &SyntaxQueries)
             key: key.clone(),
             sources: syntax.disk_admission()?,
         },
-        prechecks: frontend.db.prechecks.snapshot(),
+        prechecks: frontend.db.prechecks.active_records(),
+        class_body_facts: &frontend.db.prechecks.body_facts,
         key,
         id_ends: crate::parser::ast::cached_id_ends(),
         modules: frontend

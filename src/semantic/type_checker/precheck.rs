@@ -8,7 +8,248 @@ use std::{
     rc::Rc,
 };
 
-#[derive(Clone, Serialize, Deserialize)]
+/// Registration and signature validation depend on the interface header. Default
+/// bodies have their own precheck records.
+fn interface_header_syntax(decl: &InterfaceDecl) -> Value {
+    let InterfaceDecl {
+        default_import_uses,
+        name,
+        public,
+        type_params,
+        extends,
+        methods,
+        instance_of,
+        template_checked,
+        span,
+    } = decl;
+    let mut header = json!({
+        "name": name,
+        "public": public,
+        "type_params": type_params,
+        "extends": extends,
+        "instance_of": instance_of,
+        "span": span,
+    });
+    if !default_import_uses.is_empty() {
+        header["default_import_uses"] = json!(default_import_uses);
+    }
+    if *template_checked {
+        header["template_checked"] = Value::Bool(true);
+    }
+    header["methods"] = Value::Array(
+        methods
+            .iter()
+            .map(|method| {
+                let InterfaceMethodDecl {
+                    effect_contracts,
+                    name,
+                    params,
+                    is_static,
+                    return_type,
+                    default_body: _,
+                    span,
+                } = method;
+                let mut signature = json!({
+                    "name": name,
+                    "params": params,
+                    "is_static": is_static,
+                    "return_type": return_type,
+                    "default_body": null,
+                    "span": span,
+                });
+                if !effect_contracts.is_empty() {
+                    signature["effect_contracts"] = json!(effect_contracts);
+                }
+                signature
+            })
+            .collect(),
+    );
+    header
+}
+
+/// Registration keeps the same wire form as a signature-only class without
+/// constructing a second declaration or walking executable syntax.
+fn class_registration_syntax(class: &ClassDecl, isolation: &ClassIsolation) -> Value {
+    let ClassDecl {
+        abi_storage,
+        type_params,
+        name,
+        public,
+        is_open,
+        base_class,
+        implements,
+        source_implements_len,
+        fields,
+        methods,
+        constructors,
+        span,
+    } = class;
+    let mut header = json!({
+        "abi_storage": abi_storage,
+        "type_params": type_params,
+        "name": name,
+        "public": public,
+        "is_open": is_open,
+        "base_class": base_class,
+        "implements": implements,
+        "source_implements_len": source_implements_len,
+        "span": span,
+    });
+    let empty_block = |body: &Block| Block {
+        id: body.id,
+        span: body.span,
+        stmts: Vec::new(),
+    };
+    header["fields"] = Value::Array(
+        fields
+            .iter()
+            .map(|f| {
+                let FieldDecl {
+                    name,
+                    ty,
+                    public,
+                    protected,
+                    is_static,
+                    is_mut,
+                    span,
+                    initializer: _,
+                } = f;
+                json!({
+                    "name": name,
+                    "ty": ty,
+                    "public": public,
+                    "protected": protected,
+                    "is_static": is_static,
+                    "is_mut": is_mut,
+                    "initializer": null,
+                    "span": span,
+                })
+            })
+            .collect(),
+    );
+    header["constructors"] = Value::Array(
+        constructors
+            .iter()
+            .map(|c| {
+                let ConstructorDecl {
+                    public,
+                    protected,
+                    params,
+                    body,
+                    span,
+                } = c;
+                json!({
+                    "public": public,
+                    "protected": protected,
+                    "params": params,
+                    "body": empty_block(body),
+                    "span": span,
+                })
+            })
+            .collect(),
+    );
+    header["methods"] = Value::Array(
+        methods
+            .iter()
+            .map(|m| {
+                let MethodDecl {
+                    effect_contracts,
+                    array_body_optimization,
+                    constraint,
+                    name,
+                    public,
+                    protected,
+                    is_async,
+                    is_open,
+                    is_override,
+                    is_static,
+                    params,
+                    return_type,
+                    body,
+                    span,
+                    is_default_injected,
+                    is_interface_default,
+                } = m;
+                let mut method = json!({
+                    "array_body_optimization": array_body_optimization,
+                    "constraint": constraint,
+                    "name": name,
+                    "public": public,
+                    "protected": protected,
+                    "is_async": is_async,
+                    "is_open": is_open,
+                    "is_override": is_override,
+                    "is_static": is_static,
+                    "params": params,
+                    "return_type": return_type,
+                    "body": empty_block(body),
+                    "span": span,
+                    "is_default_injected": is_default_injected,
+                    "is_interface_default": is_interface_default,
+                });
+                if !effect_contracts.is_empty() {
+                    method["effect_contracts"] = json!(effect_contracts);
+                }
+                method
+            })
+            .collect(),
+    );
+    Value::Array(vec![header, json!(isolation)])
+}
+
+fn class_header_syntax(class: &ClassDecl, constructors: &[Rc<SuperInitPlacement>]) -> Value {
+    let methods: Vec<_> = class
+        .methods
+        .iter()
+        .map(|m| {
+            let signature =
+                (class.base_class.is_some() && m.is_override && !m.is_static).then(|| {
+                    let params: Vec<_> = m.params.iter().map(|p| (&p.ty, p.type_span)).collect();
+                    (params, &m.return_type, m.is_async)
+                });
+            (&m.name, m.is_static, m.is_override, signature, m.span)
+        })
+        .collect();
+    let fields: Vec<_> = class
+        .fields
+        .iter()
+        .map(|f| (f.is_static.then_some(&f.name), &f.ty, f.span))
+        .collect();
+    let constructors: Vec<_> = constructors
+        .iter()
+        .zip(&class.constructors)
+        .map(|(placement, ctor)| (placement, ctor.span))
+        .collect();
+    json!({
+        "name": class.name, "span": class.span, "abi_storage": class.abi_storage,
+        "type_params": class.type_params, "base_class": class.base_class,
+        "implements": class.implements, "source_implements_len": class.source_implements_len,
+        "fields": fields, "methods": methods, "constructors": constructors,
+    })
+}
+
+fn foreign_defaults_syntax(class: &ClassDecl, copies: &[(&str, Span)]) -> Value {
+    // The provider compares the complete body span for equality. Encode it as
+    // an identity, since the cache normally relocates diagnostic spans.
+    let origins: Vec<_> = copies
+        .iter()
+        .map(|(name, span)| {
+            (
+                name,
+                (span.file_id, span.start, span.end, span.line, span.col),
+            )
+        })
+        .collect();
+    json!({"implements": class.implements, "span": class.span, "copies": origins})
+}
+
+#[derive(Serialize)]
+pub(super) struct ClassIsolation {
+    pub(super) constructor: Option<bool>,
+    pub(super) methods: Vec<bool>,
+}
+
+#[derive(Serialize, Deserialize)]
 pub(crate) struct Record {
     syntax: Value,
     input_spans: Vec<Span>,
@@ -22,10 +263,63 @@ pub(crate) struct Record {
     emitted: Vec<Item>,
     source_symbols: crate::semantic::analysis_symbols::Facts,
 }
+#[derive(Default, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Clone))]
+pub(crate) struct ClassBodyFacts {
+    #[cfg_attr(test, serde(serialize_with = "fact_map_probe::serialize"))]
+    isolation: HashMap<BodyId, bool>,
+    #[cfg_attr(test, serde(serialize_with = "fact_map_probe::serialize"))]
+    placements: HashMap<BodyId, Rc<SuperInitPlacement>>,
+}
+
+#[cfg(test)]
+pub(crate) mod fact_map_probe {
+    use super::*;
+
+    thread_local! {
+        static ENTRIES: RefCell<Option<Vec<usize>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn observe<T>(write: impl FnOnce() -> T) -> (T, Vec<usize>) {
+        ENTRIES.set(Some(Vec::new()));
+        let result = write();
+        (result, ENTRIES.take().unwrap())
+    }
+
+    pub(super) fn serialize<V: Serialize, S: serde::Serializer>(
+        map: &HashMap<BodyId, V>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        ENTRIES.with_borrow_mut(|entries| {
+            if let Some(entries) = entries {
+                entries.extend(map.keys().map(|key| std::ptr::from_ref(key).addr()));
+            }
+        });
+        map.serialize(serializer)
+    }
+}
+
+struct ActiveRecords<'a>(&'a Cache);
+
+impl Serialize for ActiveRecords<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let records = self.0.records.borrow();
+        serializer.collect_seq(
+            self.0
+                .active
+                .borrow()
+                .iter()
+                .filter_map(|key| records.get(key).map(|record| (key, record.as_ref()))),
+        )
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Cache {
     records: RefCell<HashMap<String, Rc<Record>>>,
     active: RefCell<HashSet<String>>,
+    /// Source and expanded bodies reconcile at different stages of the frontend.
+    pub(crate) body_facts: [RefCell<ClassBodyFacts>; 2],
     correspondence: crate::compiler_db::syntax::Correspondence,
     pub replay_us: Cell<u128>,
     pub semantic_us: Cell<u128>,
@@ -45,25 +339,88 @@ impl Cache {
         result.correspondence.spans = correspondence.spans.clone();
         if let Some(previous) = previous {
             *result.records.borrow_mut() = previous.records.borrow().clone();
+            result.reuse_body_facts(previous, correspondence, true, |id| id);
         }
         result
     }
+    pub(crate) fn reuse_body_facts(
+        &self,
+        previous: &Self,
+        correspondence: &crate::compiler_db::syntax::Correspondence,
+        precheck: bool,
+        source_body: impl Fn(BodyId) -> BodyId,
+    ) {
+        let index = usize::from(precheck);
+        let previous = previous.body_facts[index].borrow();
+        let mut facts = self.body_facts[index].borrow_mut();
+        let unchanged = |id| correspondence.unchanged.contains(&source_body(id));
+        facts.isolation.extend(
+            previous
+                .isolation
+                .iter()
+                .filter(|(id, _)| unchanged(**id))
+                .map(|(&id, &value)| (id, value)),
+        );
+        for (&id, placement) in &previous.placements {
+            if unchanged(id)
+                && let Some(mapped) = placement.relocated(correspondence)
+            {
+                facts.placements.insert(id, mapped);
+            }
+        }
+    }
+    fn constructor_placements(
+        &self,
+        class: &ClassDecl,
+        precheck: bool,
+    ) -> Vec<Rc<SuperInitPlacement>> {
+        if class.base_class.is_none() {
+            return Vec::new();
+        }
+        let mut facts = self.body_facts[usize::from(precheck)].borrow_mut();
+        class
+            .constructors
+            .iter()
+            .map(|ctor| {
+                // A signature shell can share its body ID with the hydrated constructor.
+                if ctor.body.stmts.is_empty() {
+                    return Rc::new(SuperInitPlacement::of(ctor));
+                }
+                Rc::clone(
+                    facts
+                        .placements
+                        .entry(ctor.body.id)
+                        .or_insert_with(|| Rc::new(SuperInitPlacement::of(ctor))),
+                )
+            })
+            .collect()
+    }
+    fn class_isolation(&self, class: &ClassDecl, precheck: bool) -> ClassIsolation {
+        let mut facts = self.body_facts[usize::from(precheck)].borrow_mut();
+        let mut isolated = |body: &Block| {
+            // Empty signature shells need no walk and can share a body ID with
+            // the hydrated definition.
+            if body.stmts.is_empty() {
+                return true;
+            }
+            *facts
+                .isolation
+                .entry(body.id)
+                .or_insert_with(|| transfer_ownership::isolated_body(body))
+        };
+        ClassIsolation {
+            constructor: class.constructors.first().map(|c| isolated(&c.body)),
+            methods: class.methods.iter().map(|m| isolated(&m.body)).collect(),
+        }
+    }
+
     pub(crate) fn finish(&self) {
         self.records
             .borrow_mut()
             .retain(|key, _| self.active.borrow().contains(key));
     }
-    pub(crate) fn snapshot(&self) -> Vec<(String, Record)> {
-        self.active
-            .borrow()
-            .iter()
-            .filter_map(|key| {
-                self.records
-                    .borrow()
-                    .get(key)
-                    .map(|r| (key.clone(), (**r).clone()))
-            })
-            .collect()
+    pub(crate) fn active_records(&self) -> impl Serialize + '_ {
+        ActiveRecords(self)
     }
     pub(crate) fn restore(records: Vec<(String, Record)>) -> anyhow::Result<Self> {
         let result = Self::default();
@@ -601,8 +958,9 @@ impl TypeChecker {
     }
     pub(super) fn check_local_decl_collision(&mut self, name: &str, span: Span) {
         self.cached_validation(
-            format!("import_collision:{name}"),
-            json!([name, span]),
+            "import_collision",
+            name,
+            |_| json!([name, span]),
             |checker| {
                 if journal::is_active() {
                     journal::read(
@@ -616,8 +974,9 @@ impl TypeChecker {
     }
     pub(super) fn cached_constant_collision(&mut self, f: &FunctionDecl) -> bool {
         self.cached_validation(
-            format!("constant_collision:{}", f.name),
-            json!([f.name, f.span, f.constant]),
+            "constant_collision",
+            &f.name,
+            |_| json!([f.name, f.span, f.constant]),
             |checker| {
                 if journal::is_active() {
                     journal::read(
@@ -642,16 +1001,19 @@ impl TypeChecker {
         (first_span, first_kind, first_generic): (Span, &str, bool),
     ) {
         self.cached_validation(
-            format!("duplicate:{name}"),
-            json!([
-                name,
-                span,
-                kind,
-                generic,
-                first_span,
-                first_kind,
-                first_generic
-            ]),
+            "duplicate",
+            name,
+            |_| {
+                json!([
+                    name,
+                    span,
+                    kind,
+                    generic,
+                    first_span,
+                    first_kind,
+                    first_generic
+                ])
+            },
             |checker| {
                 if generic || first_generic {
                     checker.push(
@@ -670,8 +1032,9 @@ impl TypeChecker {
     }
     fn cached_validation<T: Serialize + DeserializeOwned>(
         &mut self,
-        key: String,
-        syntax: Value,
+        kind: &str,
+        name: &str,
+        syntax: impl FnOnce(&Cache) -> Value,
         check: impl FnOnce(&mut Self) -> T,
     ) -> T {
         let Some(cache) = self
@@ -687,9 +1050,10 @@ impl TypeChecker {
         } else {
             "final"
         };
+        let syntax = syntax(&cache);
         let previous = self.prechecks.replace(cache);
         let result = self.precheck_operation(
-            format!("{phase}_validate:{key}"),
+            format!("{phase}_validate:{kind}:{name}"),
             BodyId::fresh(),
             syntax,
             |checker| {
@@ -703,43 +1067,55 @@ impl TypeChecker {
     }
     pub(super) fn cached_enum_validation(&mut self, decl: &EnumDecl) {
         self.cached_validation(
-            format!("enum:{}", decl.name),
-            serde_json::to_value(decl).unwrap(),
+            "enum",
+            &decl.name,
+            |_| serde_json::to_value(decl).unwrap(),
             |checker| checker.check_enum_types(decl),
         );
     }
     pub(super) fn cached_interface_validation(&mut self, decl: &InterfaceDecl) {
-        let mut signature = decl.clone();
-        for method in &mut signature.methods {
-            method.default_body = None;
-        }
         self.cached_validation(
-            format!("interface:{}", decl.name),
-            serde_json::to_value(signature).unwrap(),
+            "interface",
+            &decl.name,
+            |_| interface_header_syntax(decl),
             |checker| checker.check_interface_header(decl),
         );
     }
     pub(super) fn cached_class_validation(&mut self, class: &ClassDecl) -> Type {
+        let constructors = std::cell::OnceCell::new();
+        let precheck = self.prechecks.is_some();
         self.cached_validation(
-            format!("class:{}", class.name),
-            serde_json::to_value(class).unwrap(),
-            |checker| checker.check_class_header(class),
+            "class",
+            &class.name,
+            |cache| {
+                let placements =
+                    constructors.get_or_init(|| cache.constructor_placements(class, precheck));
+                class_header_syntax(class, placements)
+            },
+            |checker| checker.check_class_header(class, constructors.get().map(Vec::as_slice)),
         )
     }
     pub(super) fn cached_class_defaults(&mut self, class: &ClassDecl) -> HashSet<String> {
-        if !class.methods.iter().any(|m| {
-            m.is_interface_default
-                && !m.is_default_injected
-                && m.body.span.file_id != class.span.file_id
-        }) {
+        let copies: Vec<_> = class
+            .methods
+            .iter()
+            .filter(|m| {
+                m.is_interface_default
+                    && !m.is_default_injected
+                    && m.body.span.file_id != class.span.file_id
+            })
+            .map(|m| (m.name.as_str(), m.body.span))
+            .collect();
+        if copies.is_empty() {
             return HashSet::new();
         }
         self.cached_validation(
-            format!("defaults:{}", class.name),
-            serde_json::to_value(class).unwrap(),
+            "defaults",
+            &class.name,
+            |_| foreign_defaults_syntax(class, &copies),
             |checker| {
                 checker
-                    .instantiate_foreign_defaults(class)
+                    .instantiate_foreign_defaults(class, &copies)
                     .into_iter()
                     .map(str::to_owned)
                     .collect()
@@ -747,8 +1123,8 @@ impl TypeChecker {
         )
     }
     pub(super) fn precheck_declaration(&mut self, item: &Item) {
-        let check = |checker: &mut Self| match item {
-            Item::Class(c) => checker.register_class(c),
+        let check = |checker: &mut Self, isolation: Option<&ClassIsolation>| match item {
+            Item::Class(c) => checker.register_class(c, isolation),
             Item::Enum(e) => checker.register_enum(e),
             Item::Interface(i) => checker.register_interface(i, None),
             _ => unreachable!(),
@@ -759,7 +1135,7 @@ impl TypeChecker {
             .or_else(|| self.declaration_cache.clone())
             .filter(|_| !journal::is_active())
         else {
-            check(self);
+            check(self, None);
             return;
         };
         let phase = if self.prechecks.is_some() {
@@ -767,24 +1143,28 @@ impl TypeChecker {
         } else {
             "final"
         };
-        let (kind, name, syntax) = match item {
-            Item::Class(c) => (
-                "class",
-                c.name.as_str(),
-                serde_json::to_value(generics::class_signature(c)).unwrap(),
-            ),
-            Item::Enum(e) => ("enum", e.name.as_str(), serde_json::to_value(e).unwrap()),
-            Item::Interface(i) => {
-                let mut signature = i.clone();
-                for method in &mut signature.methods {
-                    method.default_body = None;
-                }
+        let (kind, name, syntax, isolation) = match item {
+            Item::Class(c) => {
+                let isolation = cache.class_isolation(c, self.prechecks.is_some());
                 (
-                    "interface",
-                    i.name.as_str(),
-                    serde_json::to_value(signature).unwrap(),
+                    "class",
+                    c.name.as_str(),
+                    class_registration_syntax(c, &isolation),
+                    Some(isolation),
                 )
             }
+            Item::Enum(e) => (
+                "enum",
+                e.name.as_str(),
+                serde_json::to_value(e).unwrap(),
+                None,
+            ),
+            Item::Interface(i) => (
+                "interface",
+                i.name.as_str(),
+                interface_header_syntax(i),
+                None,
+            ),
             _ => unreachable!(),
         };
         let previous = self.prechecks.replace(cache);
@@ -795,7 +1175,7 @@ impl TypeChecker {
             |checker| {
                 let cache = checker.prechecks.as_ref().unwrap();
                 cache.declarations.set(cache.declarations.get() + 1);
-                check(checker);
+                check(checker, isolation.as_ref());
             },
         );
         self.prechecks = previous;
@@ -848,6 +1228,397 @@ impl TypeChecker {
 mod tests {
     use super::*;
 
+    fn restore_records(cache: &Cache) -> Cache {
+        let bytes = serde_json::to_vec(&cache.active_records()).unwrap();
+        Cache::restore(serde_json::from_slice(&bytes).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn validation_builds_syntax_only_for_an_active_cache_lookup() {
+        let builds = Cell::new(0);
+        let validate = |checker: &mut TypeChecker| {
+            checker.cached_validation(
+                "enum",
+                "Example",
+                |_| {
+                    builds.set(builds.get() + 1);
+                    json!("header")
+                },
+                |_| 42,
+            )
+        };
+        let mut checker = TypeChecker::new();
+        assert_eq!(validate(&mut checker), 42);
+        assert_eq!(builds.get(), 0);
+
+        checker.declaration_cache = Some(Rc::default());
+        let capture = journal::begin();
+        assert_eq!(validate(&mut checker), 42);
+        assert_eq!(builds.get(), 0);
+        drop(capture);
+        assert_eq!(validate(&mut checker), 42);
+        assert_eq!(builds.get(), 1);
+    }
+
+    #[test]
+    fn uncached_enum_validation_skips_payload_serialization() {
+        use crate::parser::ast::SERIALIZED_TYPE_NODES;
+
+        for count in [1, 16, 128] {
+            let variants = (0..count)
+                .map(|i| format!("V{i}(i64)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let source = format!("enum Example {{ {variants} }}");
+            let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+            let (program, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            let Item::Enum(decl) = &program.items[0] else {
+                panic!("expected enum")
+            };
+            let mut checker = TypeChecker::new();
+            checker.register_enum(decl);
+            SERIALIZED_TYPE_NODES.set(0);
+            checker.cached_enum_validation(decl);
+            assert_eq!(SERIALIZED_TYPE_NODES.get(), 0);
+            assert!(checker.errors.is_empty());
+            // The eager key would have serialized every variant's payload.
+            let _ = serde_json::to_value(decl).unwrap();
+            assert_eq!(SERIALIZED_TYPE_NODES.get(), count);
+        }
+    }
+
+    #[test]
+    fn interface_header_cache_reuses_signatures_without_copying_default_bodies() {
+        use crate::parser::ownership::CLONED_EXPR_NODES;
+
+        let parse = |size, return_type: &str| {
+            let body = "1;".repeat(size);
+            let source = format!(
+                "interface Example {{ @pure fn read(self, x: i64) -> {return_type} {{ {body} return x; }} }}"
+            );
+            let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+            let (mut program, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            program.items.pop().unwrap()
+        };
+        let check = |item: &Item, cache: Option<Rc<Cache>>| {
+            let Item::Interface(interface) = item else {
+                panic!("expected interface")
+            };
+            let mut checker = TypeChecker::new();
+            checker.prechecks = cache;
+            CLONED_EXPR_NODES.set(0);
+            checker.precheck_declaration(item);
+            checker.cached_interface_validation(interface);
+            assert_eq!(CLONED_EXPR_NODES.get(), 0);
+            assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+        };
+
+        let mut previous = None;
+        for size in [0, 1, 16, 256] {
+            let item = parse(size, "i64");
+            let Item::Interface(interface) = &item else {
+                panic!("expected interface")
+            };
+            // Compare the wire representation and independently calibrate the
+            // AST copy counter against the original clone-and-strip operation.
+            CLONED_EXPR_NODES.set(0);
+            let mut signature = interface.clone();
+            assert_eq!(CLONED_EXPR_NODES.get(), size + 1);
+            signature.methods[0].default_body = None;
+            assert_eq!(interface_header_syntax(interface), json!(signature));
+            check(&item, None);
+
+            let cold = Rc::new(Cache::default());
+            check(&item, Some(Rc::clone(&cold)));
+            assert_eq!((cold.declarations.get(), cold.validations.get()), (1, 1));
+
+            let warm = Rc::new(Cache::revision(
+                previous.as_deref().or(Some(&cold)),
+                &Default::default(),
+            ));
+            check(&item, Some(Rc::clone(&warm)));
+            assert_eq!((warm.declarations.get(), warm.validations.get()), (0, 0));
+            previous = Some(warm);
+        }
+
+        let changed = Rc::new(Cache::revision(previous.as_deref(), &Default::default()));
+        check(&parse(256, "bool"), Some(Rc::clone(&changed)));
+        assert_eq!(
+            (changed.declarations.get(), changed.validations.get()),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn constructor_placement_replays_reconciled_and_relocated_bodies() {
+        use crate::compiler_db::syntax::Correspondence;
+
+        fn parse(size: usize, ordinary: usize, nested: bool) -> Program {
+            let init = if nested {
+                "if true { super.init(); }"
+            } else {
+                "super.init();"
+            };
+            let source = format!(
+                "open class Base {{ pub init(self) {{}} }}
+                 class Child extends Base {{
+                   pub fn ordinary(self) {{ {} }}
+                   pub init(self) {{ {} {init} }}
+                 }}",
+                "2;\n".repeat(ordinary),
+                "1;".repeat(size)
+            );
+            let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+            let (program, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            program
+        }
+        fn validate(program: &Program, cache: Option<Rc<Cache>>) -> (Vec<Diagnostic>, usize) {
+            let [Item::Class(base), Item::Class(child)] = program.items.as_slice() else {
+                unreachable!()
+            };
+            let mut checker = TypeChecker::new();
+            checker.register_class(base, None);
+            checker.register_class(child, None);
+            checker.declaration_cache = cache;
+            PLACEMENT_STATEMENT_VISITS.set(0);
+            checker.cached_class_validation(child);
+            (checker.errors, PLACEMENT_STATEMENT_VISITS.get())
+        }
+        for size in [1, 16, 128, 256] {
+            let mut program = parse(size, 1, false);
+            let mut cache = Rc::new(Cache::default());
+            let (errors, visits) = validate(&program, Some(Rc::clone(&cache)));
+            assert!(errors.is_empty());
+            assert_eq!(visits, size + 1);
+            let mut previous_nested = false;
+            for (ordinary, nested) in [
+                (8, false),
+                (16, false),
+                (16, true),
+                (32, true),
+                (64, true),
+                (64, false),
+            ] {
+                let mut edited = parse(size, ordinary, nested);
+                let header_edit = ordinary == 64;
+                if header_edit {
+                    let Item::Class(child) = &mut edited.items[1] else {
+                        unreachable!()
+                    };
+                    child.methods[0].is_static = true;
+                }
+                let mut correspondence = Correspondence::default();
+                correspondence.reconcile(&program, &mut edited).unwrap();
+                let next = Rc::new(Cache::revision(Some(&cache), &correspondence));
+                next.reuse_body_facts(&cache, &correspondence, false, |id| id);
+                let (errors, visits) = validate(&edited, Some(Rc::clone(&next)));
+                let (clean, cold_visits) = validate(&edited, None);
+                assert_eq!(errors, clean);
+                assert_eq!(errors.len(), usize::from(nested));
+                if nested {
+                    assert_eq!(errors[0].code, ErrorCode::E0848);
+                }
+                let changed = nested != previous_nested;
+                assert_eq!(visits, if changed { cold_visits } else { 0 });
+                assert_eq!(next.validations.get(), usize::from(changed || header_edit));
+                assert_eq!(cold_visits, size + 1 + usize::from(nested));
+                (program, cache, previous_nested) = (edited, next, nested);
+            }
+        }
+    }
+
+    #[test]
+    fn class_registration_serializes_borrowed_signature_types() {
+        for depth in [0, 4, 16] {
+            let ty = format!("{}i64{}", "FrozenArray<".repeat(depth), ">".repeat(depth));
+            for width in [1, 8, 32] {
+                let mut source = format!(
+                    "class C {{ pub value: {ty}; pub init(self, arg: {ty}) {{ self.value = arg; }}"
+                );
+                for i in 0..width {
+                    source.push_str(&format!(
+                        "pub fn f{i}(self, arg: {ty}) -> {ty} {{ return arg; }}"
+                    ));
+                }
+                source.push('}');
+                let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+                let (program, errors) = crate::parser::Parser::new(tokens).parse();
+                assert!(errors.is_empty(), "{errors:?}");
+                let Item::Class(class) = &program.items[0] else {
+                    unreachable!()
+                };
+                let isolation = Cache::default().class_isolation(class, false);
+                REBUILT_TYPE_NODES.set(0);
+                let original = json!([generics::class_signature(class), isolation]);
+                assert_eq!(REBUILT_TYPE_NODES.get(), (2 + 2 * width) * (depth + 1));
+                REBUILT_TYPE_NODES.set(0);
+                assert_eq!(class_registration_syntax(class, &isolation), original);
+                assert_eq!(REBUILT_TYPE_NODES.get(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn class_validation_keys_track_constructor_placement_and_foreign_origins() {
+        fn parse(source: &str) -> Program {
+            let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+            let (program, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            program
+        }
+        let base = parse("open class Base { pub init(self) {} }");
+        let Item::Class(base) = &base.items[0] else {
+            unreachable!()
+        };
+        let provider = parse("pub interface Get<T> { fn get(self) -> i64 { return 1; } }");
+        let Item::Interface(interface) = &provider.items[0] else {
+            unreachable!()
+        };
+        let origin = interface.methods[0].default_body.as_ref().unwrap().span;
+
+        let make = |size, constructor: &str| {
+            let program = parse(&format!(
+                "class Example extends Base implements util::Get<i64> {{
+                  pub init(self) {{ {constructor} }}
+                  pub fn get(self) -> i64 {{ return 1; }}
+                  pub fn ordinary(self) {{ {} }}
+                }}",
+                "1;".repeat(size)
+            ));
+            let Item::Class(mut class) = program.items.into_iter().next().unwrap() else {
+                unreachable!()
+            };
+            class.span.file_id = crate::diagnostics::FileId(1);
+            class.methods[0].is_interface_default = true;
+            class.methods[0].body.span = origin;
+            class
+        };
+        let run = |class: &ClassDecl, previous: Option<&Cache>| {
+            let cache = Rc::new(Cache::revision(previous, &Default::default()));
+            let mut checker = TypeChecker::new();
+            checker
+                .generics
+                .registry
+                .borrow_mut()
+                .intern_interface(interface);
+            checker.register_module("util", "util", "util.wi", &provider);
+            checker.register_class(base, None);
+            checker.register_class(class, None);
+            checker.prechecks = Some(Rc::clone(&cache));
+
+            checker.cached_class_validation(class);
+            let header_checks = cache.validations.get();
+            let handled = checker.cached_class_defaults(class);
+            let default_checks = cache.validations.get() - header_checks;
+            let diagnostics: Vec<_> = checker.errors.iter().map(|d| d.message.as_str()).collect();
+            let nested = diagnostics
+                .contains(&"`super.init(...)` must be a top-level statement of the constructor");
+            assert_eq!(diagnostics.len(), usize::from(nested), "{diagnostics:?}");
+            (
+                cache,
+                (
+                    header_checks,
+                    default_checks,
+                    nested,
+                    handled.contains("get"),
+                ),
+            )
+        };
+
+        let mut previous = None;
+        for size in [1, 16, 128, 256] {
+            let class = make(size, "super.init();");
+            SERIALIZED_EXPR_NODES.set(0);
+            let _ = serde_json::to_value(&class).unwrap();
+            assert_eq!(SERIALIZED_EXPR_NODES.get(), 2 * (size + 1));
+            SERIALIZED_EXPR_NODES.set(0);
+            let placement = SuperInitPlacement::of(&class.constructors[0]);
+            let _ = class_header_syntax(&class, &[Rc::new(placement)]);
+            assert_eq!(SERIALIZED_EXPR_NODES.get(), 0);
+            let _ = foreign_defaults_syntax(&class, &[("get", origin)]);
+            assert_eq!(SERIALIZED_EXPR_NODES.get(), 0);
+
+            let (cache, result) = run(&class, previous.as_deref());
+            let cold = usize::from(previous.is_none());
+            assert_eq!(result, (cold, cold, false, true), "body size {size}");
+            previous = Some(cache);
+        }
+        let mut class = make(256, "if true { super.init(); }");
+        let (previous, result) = run(&class, previous.as_deref());
+        assert_eq!(result, (1, 0, true, true));
+        class.methods[0].body.span.start += 1;
+        let (previous, result) = run(&class, Some(&previous));
+        assert_eq!(result, (0, 1, true, false));
+        class.methods[0].body.span = origin;
+        let (_, result) = run(&class, Some(&previous));
+        assert_eq!(result, (0, 1, true, true));
+    }
+
+    #[test]
+    fn class_registration_tracks_changed_isolation_and_reuses_unchanged_bodies() {
+        let parse = |body: &str| {
+            let source =
+                format!("class C {{ pub init(self) {{ 1; }} pub fn f(self) {{ {body} }} }}");
+            let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+            let (program, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            program.items.into_iter().next().unwrap()
+        };
+        let mut item = parse("1;");
+        let Item::Class(class) = &item else {
+            unreachable!()
+        };
+        let ctor = class.constructors[0].body.id;
+        let method = class.methods[0].body.id;
+        let run = |item: &Item, previous: Option<&Cache>, unchanged: &[BodyId]| {
+            let mut correspondence = crate::compiler_db::syntax::Correspondence::default();
+            correspondence.unchanged.extend(unchanged);
+            let cache = Rc::new(Cache::revision(previous, &correspondence));
+            let mut checker = TypeChecker::new();
+            if let Some(previous) = previous {
+                cache.reuse_body_facts(previous, &correspondence, false, |id| id);
+            }
+            checker.declaration_cache = Some(Rc::clone(&cache));
+            transfer_ownership::ISOLATION_WALKS.set(0);
+            checker.precheck_declaration(item);
+            let info = checker.symbols.lookup_class("C").unwrap();
+            let result = (
+                info.methods["f"].isolated_body,
+                cache.declarations.get(),
+                transfer_ownership::ISOLATION_WALKS.get(),
+            );
+            (cache, result)
+        };
+        let (cache, result) = run(&item, None, &[]);
+        assert_eq!(result, (true, 1, 2));
+        let (mut cache, result) = run(&item, Some(&cache), &[ctor, method]);
+        assert_eq!(result, (true, 0, 0));
+        for (body, isolated, registrations) in
+            [("2;", true, 0), ("other();", false, 1), ("1;", true, 1)]
+        {
+            let Item::Class(other) = parse(body) else {
+                unreachable!()
+            };
+            let Item::Class(class) = &mut item else {
+                unreachable!()
+            };
+            // Reconciliation preserves the body owner across an edit.
+            class.methods[0].body.stmts = other.methods.into_iter().next().unwrap().body.stmts;
+            let (next, result) = run(&item, Some(&cache), &[ctor]);
+            assert_eq!(result, (isolated, registrations, 1));
+            cache = next;
+        }
+        let Item::Class(class) = &mut item else {
+            unreachable!()
+        };
+        class.methods[0].return_type = Type::Bool;
+        let (_, result) = run(&item, Some(&cache), &[ctor, method]);
+        assert_eq!(result, (true, 1, 0));
+    }
+
     #[test]
     fn precheck_own_async_dispatch_replays_without_semantic_work() {
         let tokens =
@@ -870,7 +1641,7 @@ mod tests {
                 syntax.clone(),
                 |checker| {
                     cache.bodies.set(cache.bodies.get() + 1);
-                    checker.register_class(class);
+                    checker.register_class(class, None);
                     checker.symbols.dispatch_may_start_task("Local", "go")
                 },
             );
@@ -896,7 +1667,7 @@ mod tests {
         // Exercise retained records and the persisted decoder independently.
         for disk in [false, true] {
             let mut prior = if disk {
-                Rc::new(Cache::restore(initial.snapshot()).unwrap())
+                Rc::new(restore_records(&initial))
             } else {
                 Rc::clone(&initial)
             };
@@ -937,8 +1708,8 @@ mod tests {
         let body = BodyId::fresh();
         let execute = |cache: Rc<Cache>, external_async: bool| {
             let mut checker = TypeChecker::new();
-            checker.register_class(classes[0]);
-            checker.register_class(classes[1]);
+            checker.register_class(classes[0], None);
+            checker.register_class(classes[1], None);
             let mut external = checker.symbols.lookup_class("External").unwrap().clone();
             external.methods.get_mut("go").unwrap().is_async = external_async;
             checker.symbols.define_class("External".into(), external);
@@ -949,9 +1720,9 @@ mod tests {
                 json!([classes[2], classes[3]]),
                 |checker| {
                     cache.bodies.set(cache.bodies.get() + 1);
-                    checker.register_class(classes[2]);
+                    checker.register_class(classes[2], None);
                     let result = checker.symbols.dispatch_may_start_task("Root", "go");
-                    checker.register_class(classes[3]);
+                    checker.register_class(classes[3], None);
                     result
                 },
             );
@@ -968,7 +1739,7 @@ mod tests {
         assert_eq!(clean[0], Value::Bool(false));
         for disk in [false, true] {
             let mut prior = if disk {
-                Rc::new(Cache::restore(initial.snapshot()).unwrap())
+                Rc::new(restore_records(&initial))
             } else {
                 Rc::clone(&initial)
             };

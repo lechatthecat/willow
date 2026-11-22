@@ -14,7 +14,12 @@ fn analyze(source: &str) -> Analysis {
         "{source}: {:?}",
         checker.errors
     );
-    let result = check(&program, &checker.expr_types, &checker.static_call_classes);
+    let result = check(
+        &program,
+        &checker.expr_types,
+        &checker.static_call_classes,
+        &checker.builtin_calls,
+    );
     assert_eq!(
         checker
             .errors

@@ -9,12 +9,13 @@ use crate::qualified_name::QualifiedName;
 use crate::semantic::async_borrows::ReferenceArgMode;
 pub(crate) mod analysis;
 pub(crate) mod body;
+use crate::semantic::intrinsics::{AdtMethod, Intrinsic, MethodLookup, MethodName, ResolvedMethod};
 mod builtin_methods;
 mod check;
 mod check_calls;
 mod check_collections;
 mod check_concurrency;
-use builtin_methods::{ArityText, BuiltinArgument, BuiltinArity, constructor_arity, method_arity};
+use builtin_methods::{ArityText, BuiltinArgument, BuiltinArity, constructor_arity};
 mod check_decls;
 mod check_lambda_match;
 mod exhaustiveness;
@@ -231,6 +232,7 @@ pub struct TypeChecker {
     /// Resolved class/module identity for every static call and field, including
     /// unchanged spellings. Interned identities avoid per-site name allocation.
     pub static_call_classes: HashMap<ExprId, crate::semantic::ids::TypeId>,
+    pub builtin_calls: crate::semantic::intrinsics::BuiltinCalls,
     /// What each lambda captures from its enclosing function, keyed by the
     /// lambda expression's ID and ordered as the closure environment lays the
     /// slots out. An empty vector denotes a non-capturing
@@ -301,6 +303,14 @@ struct ReferencePlaceInfo {
     /// reported with this message instead of the "declare it `mut`" advice,
     /// which would be unactionable.
     immutable_reason: Option<&'static str>,
+}
+
+/// Context passed to call resolution. An independently checked argument can
+/// reuse both its type and its failure when the result supplies a new hint.
+#[derive(Clone, Copy, Default)]
+struct CallContext<'a> {
+    expected: Option<&'a Type>,
+    checked: bool,
 }
 
 impl std::ops::Deref for TypeChecker {
@@ -423,6 +433,7 @@ impl TypeChecker {
             signature_normalized: HashMap::new(),
             signature_values: Default::default(),
             static_call_classes: HashMap::new(),
+            builtin_calls: Default::default(),
             lambda_captures: HashMap::new(),
             reported_class_cycles: ObservedSet::new("resolution.reported_class_cycles"),
             invalid_type_names: std::rc::Rc::new(std::cell::RefCell::new(ObservedSet::new(
@@ -841,6 +852,18 @@ impl TypeChecker {
             .or_else(|| self.array_classes.get(storage))
     }
 
+    /// Fixed arrays use the dynamic Array declaration for source methods.
+    fn array_storage_method_class(&self, receiver: &Type) -> Option<&String> {
+        match receiver {
+            Type::FixedArray(elem, _) => self
+                .array_classes
+                .get(&Type::Array(Box::new(self.declaration_type_key(elem))))
+                .or_else(|| self.array_classes.get(&Type::Array(elem.clone()))),
+            Type::Array(_) => self.array_class(receiver),
+            _ => None,
+        }
+    }
+
     /// Shared generic signatures use nominal aliases. Key storage dispatch by
     /// declaration identity so inferred local spellings and imported aliases agree.
     pub(super) fn declaration_type_key(&self, storage: &Type) -> Type {
@@ -881,6 +904,7 @@ impl TypeChecker {
         class: &ClassDecl,
         registered_name: &str,
         module_prefix: Option<&str>,
+        isolation: Option<&precheck::ClassIsolation>,
     ) -> ClassInfo {
         if let Some(storage) = &class.abi_storage {
             let storage = self.normalize_decl_type(storage, class.span, module_prefix);
@@ -931,7 +955,9 @@ impl TypeChecker {
                 .map(|p| self.normalize_decl_type(&p.ty, p.type_span, module_prefix))
                 .collect();
             crate::semantic::symbols::ConstructorInfo {
-                isolated_body: transfer_ownership::isolated_body(&ctor.body)
+                isolated_body: isolation
+                    .and_then(|i| i.constructor)
+                    .unwrap_or_else(|| transfer_ownership::isolated_body(&ctor.body))
                     && ctor
                         .params
                         .iter()
@@ -943,7 +969,7 @@ impl TypeChecker {
                 declaration_span: ctor.span,
             }
         });
-        for method in &class.methods {
+        for (index, method) in class.methods.iter().enumerate() {
             let outer_metadata = self.signature_metadata;
             self.signature_metadata |= method.is_interface_default;
             let params = method
@@ -954,7 +980,10 @@ impl TypeChecker {
             methods.insert(
                 method.name.clone(),
                 MethodInfo {
-                    isolated_body: transfer_ownership::isolated_body(&method.body),
+                    isolated_body: isolation.map_or_else(
+                        || transfer_ownership::isolated_body(&method.body),
+                        |i| i.methods[index],
+                    ),
                     effect_contracts: method.effect_contracts.clone(),
                     array_body_optimization: method.array_body_optimization,
                     param_infos: self.normalize_decl_param_infos(&method.params, module_prefix),
@@ -1102,10 +1131,15 @@ impl TypeChecker {
 
     /// Element type `T` of a `Channel<T>` used in a select case, or `Void` with a
     /// diagnostic if the operand is not a channel.
-    fn select_channel_elem(&mut self, ch_ty: &Type, span: Span) -> Type {
+    fn select_channel_elem<'a>(
+        &mut self,
+        ch_ty: &'a Type,
+        span: Span,
+    ) -> std::borrow::Cow<'a, Type> {
+        use std::borrow::Cow;
         match channel_element_type(ch_ty) {
-            Some(t) => t,
-            None if Self::contains_error_type(ch_ty) => Self::error_type(),
+            Some(t) => Cow::Borrowed(t),
+            None if Self::contains_error_type(ch_ty) => Cow::Owned(Self::error_type()),
             None => {
                 self.push(
                     Diagnostic::new(
@@ -1118,17 +1152,24 @@ impl TypeChecker {
                     )
                     .with_label(Label::primary(span, "not a channel")),
                 );
-                Type::Void
+                Cow::Owned(Type::Void)
             }
         }
     }
 
-    fn reference_place_info(&mut self, expr: &Expr, arg_span: Span) -> Option<ReferencePlaceInfo> {
+    fn reference_place_info(
+        &mut self,
+        expr: &Expr,
+        arg_span: Span,
+        checked: bool,
+    ) -> Option<ReferencePlaceInfo> {
         match expr {
             Expr::Var(name, _, _) => {
                 self.record_binding_use(name, expr.span(), "reference-argument");
                 let Some(var_info) = self.symbols.lookup_var(name).cloned() else {
-                    self.check_expr(expr);
+                    if !checked {
+                        self.check_expr(expr);
+                    }
                     return None;
                 };
                 // Place checking bypasses check_expr, but the argument still
@@ -1144,7 +1185,11 @@ impl TypeChecker {
                 })
             }
             Expr::FieldAccess(obj, field_name, span, _) => {
-                let obj_ty = self.check_expr(obj);
+                let obj_ty = if checked && let Some(ty) = self.expr_types.get(&obj.id()) {
+                    ty.clone()
+                } else {
+                    self.check_expr(obj)
+                };
                 let field_ty = self.resolve_field(&obj_ty, field_name, *span, true, "read");
                 // Reference arguments check places directly, bypassing
                 // check_expr's type recording. Lowering still needs the
@@ -1168,7 +1213,11 @@ impl TypeChecker {
                 })
             }
             Expr::Index(array, index, span, _) => {
-                let elem_ty = self.check_index(array, index, *span);
+                let elem_ty = if checked {
+                    self.expr_types[&expr.id()].clone()
+                } else {
+                    self.check_index(array, index, *span)
+                };
                 if matches!(elem_ty, Type::Void) {
                     return None;
                 }
@@ -1183,7 +1232,9 @@ impl TypeChecker {
                 })
             }
             _ => {
-                self.check_expr(expr);
+                if !checked {
+                    self.check_expr(expr);
+                }
                 let mut diagnostic = Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E1704,
@@ -1574,7 +1625,7 @@ impl TypeChecker {
             }
             // A type parameter of the declaration under validation: `T` in
             // `enum Wrap<T> { Val(T) }` is bound by the declaration itself.
-            Type::Named(name) if self.local.declared_type_params.iter().any(|p| p == name) => {}
+            Type::Named(name) if self.local.declared_type_params.contains(name) => {}
             Type::Named(name) => {
                 // A named type must resolve to a known class or enum (including
                 // module-qualified ones like `geometry::Point`, which are
@@ -1623,21 +1674,11 @@ impl TypeChecker {
         }
     }
 
-    fn normalize_declared_type(&mut self, ty: &Type, type_params: &[String], span: Span) -> Type {
-        let outer = std::mem::replace(&mut self.local.declared_type_params, type_params.to_vec());
-        let normalized = self.normalize_type(ty, span);
-        self.local.declared_type_params = outer;
-        normalized
-    }
-
-    /// Validate `ty` as written inside a declaration that binds `type_params`. Runs after
-    /// every declaration is registered, so a
-    /// forward reference resolves, and with the parameters in scope, so `T`
-    /// is a parameter rather than an unknown type.
-    pub(super) fn validate_declared_type(&mut self, ty: &Type, type_params: &[String], span: Span) {
-        let outer = std::mem::replace(&mut self.local.declared_type_params, type_params.to_vec());
-        self.validate_type(ty, span);
-        self.local.declared_type_params = outer;
+    fn enter_type_parameters(
+        &mut self,
+        params: body::DeclaredTypeParams,
+    ) -> body::DeclaredTypeParams {
+        std::mem::replace(&mut self.local.declared_type_params, params)
     }
 
     /// Check a written type's type-argument count against the declaration

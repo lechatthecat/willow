@@ -25,6 +25,7 @@ use crate::diagnostics::Span;
 use crate::parser::ast::{ExprId, LockMode};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::{FunctionId, SemanticType as Type, TypeId};
+use crate::semantic::intrinsics::{AdtMethod, BuiltinMethod, Intrinsic};
 use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type};
 use std::collections::HashMap;
 
@@ -1015,6 +1016,7 @@ fn static_signature(
 
 #[cfg(test)]
 std::thread_local! {
+    pub(crate) static DECLARED_METHOD_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METHOD_EFFECT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static DISPATCH_EFFECT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1130,6 +1132,8 @@ fn method_signature(
     receiver: &Type,
     method: &str,
 ) -> Option<super::typed_ast::HirSignature> {
+    #[cfg(test)]
+    DECLARED_METHOD_LOOKUPS.set(DECLARED_METHOD_LOOKUPS.get() + 1);
     let (Type::Named(class) | Type::Generic(class, _)) = receiver else {
         return None;
     };
@@ -1338,9 +1342,8 @@ fn expr_suspends_here(expr: &HirExpr) -> bool {
             false
         }
         HirExprKind::Await { .. } | HirExprKind::Select { .. } => true,
-        HirExprKind::MethodCall { object, method, .. } => {
-            builtin_types::unary_arg(&object.ty, B::Channel).is_some()
-                && matches!(method.as_str(), "send" | "recv" | "recv_opt")
+        HirExprKind::MethodCall { builtin, .. } => {
+            builtin.is_some_and(BuiltinMethod::is_suspension_point)
         }
         ir_variants!(
             HirExprKind;
@@ -1497,20 +1500,9 @@ fn expression_executes_call(expr: &HirExpr) -> bool {
             return false;
         }
         if let HirExprKind::MethodCall {
-            object,
-            method,
-            args,
+            builtin: Some(BuiltinMethod::Intrinsic(Intrinsic::ArrayLen | Intrinsic::FrozenArrayLen)),
             ..
         } = &expr.kind
-            && crate::semantic::intrinsics::resolve(&object.ty, method, args.len()).is_some_and(
-                |resolution| {
-                    matches!(
-                        resolution.intrinsic,
-                        crate::semantic::intrinsics::Intrinsic::ArrayLen
-                            | crate::semantic::intrinsics::Intrinsic::FrozenArrayLen
-                    )
-                },
-            )
         {
             return false;
         }
@@ -1883,7 +1875,9 @@ impl Builder {
                 method,
                 args,
                 super_class,
+                builtin,
             } => HirExprKind::MethodCall {
+                builtin: *builtin,
                 super_class: *super_class,
                 object: Box::new(capture(self, "self", object)),
                 method: method.clone(),
@@ -2000,23 +1994,25 @@ impl Builder {
             }
             HirExprKind::MethodCall {
                 object,
-                method,
+                builtin: Some(BuiltinMethod::Intrinsic(id)),
                 args,
                 ..
-            } if builtin_types::unary_arg(&object.ty, B::Channel).is_some() => {
+            } if id.is_suspension_point() => {
                 let receiver = self.lower_operand_before_suspend(object)?;
                 let channel_name = self.synthetic_name("channel");
                 let channel = self.push_synth_let(&channel_name, false, receiver);
-                match (method.as_str(), args.as_slice()) {
-                    ("recv" | "recv_opt", []) => SuspendOp::ChannelRecv {
-                        channel,
-                        result: destination,
-                        elem_ty: builtin_types::unary_arg(&object.ty, B::Channel)
-                            .expect("channel receiver has an element type")
-                            .clone(),
-                        closed_aware: method == "recv_opt",
-                    },
-                    ("send", [sent]) => {
+                match (id, args.as_slice()) {
+                    (Intrinsic::ChannelRecv | Intrinsic::ChannelRecvOpt, []) => {
+                        SuspendOp::ChannelRecv {
+                            channel,
+                            result: destination,
+                            elem_ty: builtin_types::unary_arg(&object.ty, B::Channel)
+                                .expect("channel receiver has an element type")
+                                .clone(),
+                            closed_aware: *id == Intrinsic::ChannelRecvOpt,
+                        }
+                    }
+                    (Intrinsic::ChannelSend, [sent]) => {
                         let Type::Generic(_, type_args) = &object.ty else {
                             unreachable!("channel method receiver has a generic channel type");
                         };
@@ -2339,7 +2335,11 @@ impl Builder {
             LirRvalue::EnumMethod {
                 receiver: receiver.clone(),
                 receiver_ty: inner.ty.clone(),
-                method: if is_option { "is_some" } else { "is_ok" }.into(),
+                method: if is_option {
+                    AdtMethod::IsSome
+                } else {
+                    AdtMethod::IsOk
+                },
                 args: Vec::new(),
                 arg_types: Vec::new(),
                 result: Type::Bool,
@@ -2376,7 +2376,7 @@ impl Builder {
                     LirRvalue::EnumMethod {
                         receiver: receiver.clone(),
                         receiver_ty: inner.ty.clone(),
-                        method: "unwrap_err".into(),
+                        method: AdtMethod::UnwrapErr,
                         args: Vec::new(),
                         arg_types: Vec::new(),
                         result: source_error.clone(),
@@ -2456,7 +2456,7 @@ impl Builder {
                 value: LirRvalue::EnumMethod {
                     receiver,
                     receiver_ty: inner.ty.clone(),
-                    method: "unwrap".into(),
+                    method: AdtMethod::Unwrap,
                     args: Vec::new(),
                     arg_types: Vec::new(),
                     result: expression.ty.clone(),
@@ -4417,17 +4417,24 @@ impl Builder {
                         span,
                     },
                 );
+                let (length, spelling) = if matches!(arr_var.ty, Type::Array(_)) {
+                    (
+                        Intrinsic::ArrayLen,
+                        crate::semantic::intrinsics::ARRAY_LENGTH,
+                    )
+                } else {
+                    (
+                        Intrinsic::FrozenArrayLen,
+                        crate::semantic::intrinsics::LENGTH,
+                    )
+                };
                 // Not hoisted into a `let`: the header re-evaluates it, so a
                 // body that grows or shrinks the array is observed.
                 bound_expr = HirExpr {
                     kind: HirExprKind::MethodCall {
                         object: Box::new(arr_var.clone()),
-                        method: if matches!(arr_var.ty, Type::Array(_)) {
-                            "__abi_len"
-                        } else {
-                            "len"
-                        }
-                        .to_string(),
+                        builtin: Some(BuiltinMethod::Intrinsic(length)),
+                        method: spelling.into(),
                         args: vec![],
                         super_class: None,
                     },

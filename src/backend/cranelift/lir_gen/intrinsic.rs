@@ -517,21 +517,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Resolved enum combinators consume already-evaluated, typed operands.
     pub(super) fn emit_flat_enum_method(
         &mut self,
-        receiver: cranelift_codegen::ir::Value,
-        receiver_ty: &Type,
-        method: &str,
+        (recv, receiver_ty): (cranelift_codegen::ir::Value, &Type),
+        method: AdtMethod,
         args: &[cranelift_codegen::ir::Value],
         arg_types: &[Type],
+        result: &Type,
         span: Span,
     ) -> cranelift_codegen::ir::Value {
         const OK_TAG: i64 = 0;
         const ERR_TAG: i64 = 1;
+        #[cfg(test)]
+        let initial_copies = crate::parser::ast::REBUILT_TYPE_NODES.get();
         let resolved = builtin_types::resolve(receiver_ty)
             .expect("Option/Result receiver vetted by eligibility");
-        let id = resolved.id;
-        let payload = |i: usize| resolved.args.get(i).cloned().unwrap_or(Type::Void);
-        let (ok_ty, err_ty) = (payload(0), payload(1));
-        let recv = receiver;
+        let void = Type::Void;
+        let ok_ty = resolved.args.first().unwrap_or(&void);
+        let err_ty = resolved.args.get(1).unwrap_or(&void);
         let roots_before = self.roots.gc_root_count;
         // The operands stay rooted for the whole method. Every combinator
         // reads the receiver and its arguments before its first GC point (the
@@ -548,88 +549,110 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if is_gc_managed(receiver_ty, self.enum_infos) {
             self.emit_push_relocatable_root(recv);
         }
-        let value = match (id, method) {
-            (B::Option, "is_some") => self.emit_option_is_some(recv, &ok_ty),
-            (B::Option, "is_none") => {
-                let some = self.emit_option_is_some(recv, &ok_ty);
+        let value = match (resolved.id, method) {
+            (B::Option, AdtMethod::IsSome) => self.emit_option_is_some(recv, ok_ty),
+            (B::Option, AdtMethod::IsNone) => {
+                let some = self.emit_option_is_some(recv, ok_ty);
                 let zero = self.builder.ins().iconst(types::I8, 0);
                 self.builder.ins().icmp(IntCC::Equal, some, zero)
             }
-            (B::Option, "unwrap") => {
+            (B::Option, AdtMethod::Unwrap) => {
                 let msg = self.emit_string_literal("called `Option::unwrap()` on a `None` value");
-                self.emit_option_unwrap(recv, &ok_ty, msg, Some(span))
+                self.emit_option_unwrap(recv, ok_ty, msg, Some(span))
             }
-            (B::Option, "expect") => {
+            (B::Option, AdtMethod::Expect) => {
                 let msg = args[0];
-                self.emit_option_unwrap(recv, &ok_ty, msg, Some(span))
+                self.emit_option_unwrap(recv, ok_ty, msg, Some(span))
             }
-            (B::Option, "unwrap_or") => {
+            (B::Option, AdtMethod::UnwrapOr) => {
                 let default_val = args[0];
-                self.emit_option_unwrap_or(recv, &ok_ty, default_val)
+                self.emit_option_unwrap_or(recv, ok_ty, default_val)
             }
-            (B::Result, "is_ok") | (B::Result, "is_err") => {
+            (B::Result, AdtMethod::IsOk) | (B::Result, AdtMethod::IsErr) => {
                 let tag = self.emit_load_enum_tag(recv);
-                let want = self
-                    .builder
-                    .ins()
-                    .iconst(types::I64, if method == "is_ok" { OK_TAG } else { ERR_TAG });
+                let want = self.builder.ins().iconst(
+                    types::I64,
+                    if method == AdtMethod::IsOk {
+                        OK_TAG
+                    } else {
+                        ERR_TAG
+                    },
+                );
                 self.builder.ins().icmp(IntCC::Equal, tag, want)
             }
-            (B::Result, "unwrap") => {
+            (B::Result, AdtMethod::Unwrap) => {
                 let msg = self.emit_string_literal("called `Result::unwrap()` on an `Err` value");
-                self.emit_enum_unwrap(recv, &ok_ty, OK_TAG, msg, Some(span))
+                self.emit_enum_unwrap(recv, ok_ty, OK_TAG, msg, Some(span))
             }
-            (B::Result, "unwrap_err") => {
+            (B::Result, AdtMethod::UnwrapErr) => {
                 let msg =
                     self.emit_string_literal("called `Result::unwrap_err()` on an `Ok` value");
-                self.emit_enum_unwrap(recv, &err_ty, ERR_TAG, msg, Some(span))
+                self.emit_enum_unwrap(recv, err_ty, ERR_TAG, msg, Some(span))
             }
-            (B::Result, "expect") => {
+            (B::Result, AdtMethod::Expect) => {
                 let msg = args[0];
-                self.emit_enum_unwrap(recv, &ok_ty, OK_TAG, msg, Some(span))
+                self.emit_enum_unwrap(recv, ok_ty, OK_TAG, msg, Some(span))
             }
-            (B::Result, "unwrap_or") => {
+            (B::Result, AdtMethod::UnwrapOr) => {
                 let default_val = args[0];
-                self.emit_enum_unwrap_or(recv, &ok_ty, OK_TAG, default_val)
+                self.emit_enum_unwrap_or(recv, ok_ty, OK_TAG, default_val)
             }
             // The callable-taking combinators. The receiver
             // is already rooted above, which is what makes calling an arbitrary
             // function — and allocating the new enum around its result — safe
             // here. Shared helpers enforce tag layout, the pointer niche,
             // and the indirect-call ABI.
-            (B::Option, "map") => {
-                let (f_val, f_ty) = (args[0], arg_types[0].clone());
-                let produced = fn_return_type(&f_ty);
-                self.emit_option_map(recv, &ok_ty, &produced, f_val, &f_ty)
+            (B::Option, AdtMethod::Map) => {
+                self.emit_option_map(recv, ok_ty, result, args[0], &arg_types[0])
             }
-            (B::Option, "and_then") => {
-                let (f_val, f_ty) = (args[0], arg_types[0].clone());
-                self.emit_option_and_then(recv, &ok_ty, f_val, &f_ty)
+            (B::Option, AdtMethod::AndThen) => {
+                self.emit_option_and_then(recv, ok_ty, args[0], &arg_types[0])
             }
-            (B::Option, "or_else") => {
-                let (f_val, f_ty) = (args[0], arg_types[0].clone());
-                self.emit_option_or_else(recv, &ok_ty, f_val, &f_ty)
+            (B::Option, AdtMethod::OrElse) => {
+                self.emit_option_or_else(recv, ok_ty, args[0], &arg_types[0])
             }
-            (B::Result, "map") => {
+            (B::Result, AdtMethod::Map) => {
                 let (f_val, f_ty) = (args[0], &arg_types[0]);
-                self.emit_result_map_side(ResultSide::Ok, recv, &ok_ty, &err_ty, f_val, f_ty)
+                self.emit_result_map_side(
+                    ResultSide::Ok,
+                    recv,
+                    ok_ty,
+                    err_ty,
+                    (f_val, f_ty),
+                    result,
+                )
             }
-            (B::Result, "map_err") => {
+            (B::Result, AdtMethod::MapErr) => {
                 let (f_val, f_ty) = (args[0], &arg_types[0]);
-                self.emit_result_map_side(ResultSide::Err, recv, &ok_ty, &err_ty, f_val, f_ty)
+                self.emit_result_map_side(
+                    ResultSide::Err,
+                    recv,
+                    ok_ty,
+                    err_ty,
+                    (f_val, f_ty),
+                    result,
+                )
             }
-            (B::Result, "and_then") => {
+            (B::Result, AdtMethod::AndThen) => {
                 let (f_val, f_ty) = (args[0], &arg_types[0]);
-                self.emit_result_chain_side(ResultSide::Ok, recv, &ok_ty, &err_ty, f_val, f_ty)
+                self.emit_result_chain_side(ResultSide::Ok, recv, ok_ty, err_ty, f_val, f_ty)
             }
-            (B::Result, "or_else") => {
+            (B::Result, AdtMethod::OrElse) => {
                 let (f_val, f_ty) = (args[0], &arg_types[0]);
-                self.emit_result_chain_side(ResultSide::Err, recv, &ok_ty, &err_ty, f_val, f_ty)
+                self.emit_result_chain_side(ResultSide::Err, recv, ok_ty, err_ty, f_val, f_ty)
             }
             _ => unreachable!("unsupported `{method}` on an Option/Result passed eligibility"),
         };
         self.emit_pop_roots_n(self.roots.gc_root_count - roots_before);
         self.roots.gc_root_count = roots_before;
+        #[cfg(test)]
+        {
+            let (calls, copies) = ENUM_EMISSION_WORK.get();
+            ENUM_EMISSION_WORK.set((
+                calls + 1,
+                copies + (crate::parser::ast::REBUILT_TYPE_NODES.get() - initial_copies),
+            ));
+        }
         value
     }
 

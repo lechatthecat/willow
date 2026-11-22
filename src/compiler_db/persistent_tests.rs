@@ -388,6 +388,81 @@ fn persistent_cache_corrupt_records_are_misses_and_can_be_replaced() {
 }
 
 #[test]
+fn persistent_snapshot_borrows_class_fact_entries_and_restores_both_phases() {
+    use crate::semantic::type_checker::precheck::fact_map_probe::observe;
+
+    for count in [1, 8, 32, 64] {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("analysis.cache");
+        let mut source = String::from("open class Base { pub init(self) {} } fn main() {}");
+        for index in 0..count {
+            source.push_str(&format!(
+                " class C{index} extends Base {{
+                pub init(self) {{ super.init(); }}
+                pub fn value(self) -> i64 {{ return {index}; }}
+            }}"
+            ));
+        }
+        let (frontend, syntax) = fixture.compile(&source, None, SyntaxQueries::default());
+        let facts = &frontend.db.prechecks.body_facts;
+        let (expected, entries) = observe(|| serde_json::to_value(facts).unwrap());
+        let live: std::collections::HashSet<_> = entries.iter().copied().collect();
+        let phases = expected.as_array().unwrap();
+        assert_eq!(phases.len(), 2);
+        for phase in phases {
+            assert!(phase["isolation"].as_object().unwrap().len() >= 2 * count);
+            assert!(phase["placements"].as_object().unwrap().len() >= count);
+        }
+        // Retain the original maps while observing the owned snapshot control.
+        let detached = facts.each_ref().map(|phase| phase.borrow().clone());
+        let (control, copies) = observe(|| serde_json::to_value(&detached).unwrap());
+        assert_eq!(control, expected);
+        assert_eq!(copies.len(), live.len());
+        assert!(copies.iter().all(|entry| !live.contains(entry)));
+
+        let ((), saved) =
+            observe(|| save(&path, fixture.key(), &frontend, &syntax.borrow()).unwrap());
+        assert_eq!(saved.len(), live.len());
+        let copied = saved.iter().filter(|entry| !live.contains(entry)).count();
+        assert_eq!(copied, 0);
+        assert_eq!(saved, entries, "each phase must serialize its own maps");
+        let (restored, _) = load(&path, &fixture.key()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.prechecks.body_facts).unwrap(),
+            expected
+        );
+        println!(
+            "classes={count} fact_entries={} owned_copies={} saved_copies={copied}",
+            live.len(),
+            copies.len()
+        );
+    }
+}
+
+#[test]
+fn persistent_constructor_placement_reuses_relocated_calls_after_method_edit() {
+    use crate::semantic::type_checker::analysis::PLACEMENT_STATEMENT_VISITS;
+
+    let fixture = Fixture::new();
+    let path = fixture.0.join("analysis.cache");
+    let source = "open class Base { pub init(self) {} }
+        class C extends Base {
+            pub fn f(self) -> i64 { return 1; }
+            pub init(self) { super.init(); }
+        } fn main() {}";
+    PLACEMENT_STATEMENT_VISITS.set(0);
+    let (cold, syntax) = fixture.compile(source, None, SyntaxQueries::default());
+    assert!(PLACEMENT_STATEMENT_VISITS.get() > 0);
+    save(&path, fixture.key(), &cold, &syntax.borrow()).unwrap();
+    let (previous, syntax) = load(&path, &fixture.key()).unwrap();
+    let edited = source.replace("return 1;", "let value = 2;\nreturn value;");
+    PLACEMENT_STATEMENT_VISITS.set(0);
+    let (warm, _) = fixture.compile(&edited, Some(&previous), syntax);
+    assert_eq!(PLACEMENT_STATEMENT_VISITS.get(), 0);
+    assert_eq!(warm.db.typed_bodies.typechecks(), 1);
+}
+
+#[test]
 fn persistent_cache_noop_and_single_body_edit_reuse_counts() {
     let fixture = Fixture::new();
     let path = fixture.saved();

@@ -11,7 +11,7 @@ use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 
-use super::TypeChecker;
+use super::{Intrinsic, TypeChecker};
 
 #[derive(Default)]
 struct Graph {
@@ -155,11 +155,18 @@ impl Graph {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static ISOLATION_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A deliberately small proof: stores target only the receiver and no call,
 /// closure, static storage, indexed store or superclass initializer can retain
 /// its identity. Call sites additionally require Sync parameters and results
 /// for methods. Constructors join their arguments into the new aggregate.
 pub(super) fn isolated_body(body: &Block) -> bool {
+    #[cfg(test)]
+    ISOLATION_WALKS.with(|n| n.set(n.get() + 1));
     AstWalk::new(AstEvent::Block(body)).all(|event| match event {
         AstEvent::Expr(
             Expr::Call(_)
@@ -572,10 +579,12 @@ impl TypeChecker {
             .get(&call.object.id())
             .and_then(builtin_types::resolve)
             .map(|b| b.id);
-        let channel = builtin.is_some_and(|b| b == B::Channel);
+        let id = self.builtin_calls.candidate(&call.id).copied();
         let cell = builtin.is_some_and(|b| matches!(b, B::BlockingCell | B::BlockingRwCell));
-        let send = (channel && call.method == "send")
-            || (cell && matches!(call.method.as_str(), "set" | "write"));
+        let send = matches!(
+            id,
+            Some(Intrinsic::ChannelSend | Intrinsic::CellSet | Intrinsic::RwCellWrite)
+        );
         if cell && result.is_some() {
             self.push(
                 Diagnostic::new(
@@ -590,10 +599,12 @@ impl TypeChecker {
                 .with_help("use Mutex and access this value inside a lexical lock"),
             );
         }
-        let receive = channel && matches!(call.method.as_str(), "recv" | "recv_opt");
-        let option_action = builtin.and_then(|owner| {
-            super::builtin_methods::option_method(owner, &call.method).map(|(_, action)| action)
-        });
+        let receive = matches!(id, Some(Intrinsic::ChannelRecv | Intrinsic::ChannelRecvOpt));
+        let option_action = self
+            .builtin_calls
+            .adt(&call.id)
+            .zip(builtin)
+            .map(|(method, owner)| super::builtin_methods::option_action(owner, method));
         if let Some(super::builtin_methods::OptionAction::Transform {
             error_input,
             no_input,
@@ -738,7 +749,7 @@ impl TypeChecker {
             let (is_async, is_open) = match self.expr_types.get(&call.object.id()) {
                 Some(Type::Named(class)) => *state
                     .task_methods
-                    .entry((class.clone(), call.method.clone()))
+                    .entry((class.clone(), call.method.as_str().to_owned()))
                     .or_insert_with(|| {
                         self.lookup_method_in_hierarchy(class, &call.method)
                             .map_or((false, true), |(_, method)| {

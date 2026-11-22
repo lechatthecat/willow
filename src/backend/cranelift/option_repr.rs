@@ -39,21 +39,23 @@ pub(crate) fn option_inner(ty: &Type) -> Option<&Type> {
 /// A nested Option is excluded because zero can already be a valid inner
 /// representation. The remaining GC-managed types are represented by non-null
 /// heap pointers when valid, so zero is available for `None`.
-pub(crate) fn option_repr(ty: &Type, enum_infos: &TypeMap<EnumInfo>) -> Option<OptionRepr> {
-    let inner = option_inner(ty)?;
-    let niche = option_inner(inner).is_none() && is_gc_managed(inner, enum_infos);
-    Some(if is_scalar_pair(ty) {
+pub(crate) fn option_payload_repr(inner: &Type, enum_infos: &TypeMap<EnumInfo>) -> OptionRepr {
+    if builtin_types::is_scalar_adt_payload(inner) {
         OptionRepr::TaggedPair
-    } else if niche {
+    } else if option_inner(inner).is_none() && is_gc_managed(inner, enum_infos) {
         OptionRepr::NullableGcPointer
     } else {
         OptionRepr::BoxedTaggedEnum
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn option_repr(ty: &Type, enums: &TypeMap<EnumInfo>) -> Option<OptionRepr> {
+        option_inner(ty).map(|inner| option_payload_repr(inner, enums))
+    }
 
     fn option(inner: Type) -> Type {
         Type::Generic("Option".to_string().into(), vec![inner])

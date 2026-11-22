@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::builtin_types::{self, BuiltinTypeId};
+use super::intrinsics::{BuiltinCalls, Intrinsic};
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
@@ -30,8 +31,9 @@ pub fn check(
     program: &Program,
     types: &HashMap<ExprId, Type>,
     modes: &HashMap<ExprId, ReferenceArgMode>,
+    calls: &BuiltinCalls,
 ) -> Vec<Diagnostic> {
-    check_with(program, types, modes, |_, compute| Ok(compute()))
+    check_with(program, types, modes, calls, |_, compute| Ok(compute()))
         .expect("standalone borrow analysis is infallible")
 }
 
@@ -47,6 +49,7 @@ pub(crate) fn check_with(
     program: &Program,
     types: &HashMap<ExprId, Type>,
     modes: &HashMap<ExprId, ReferenceArgMode>,
+    calls: &BuiltinCalls,
     mut evaluate: impl FnMut(
         BorrowRoot,
         &mut dyn FnMut() -> BorrowReport,
@@ -81,6 +84,7 @@ pub(crate) fn check_with(
     let mut checker = Checker {
         types,
         modes,
+        calls,
         errors: Vec::new(),
         reported: HashSet::new(),
     };
@@ -118,6 +122,7 @@ pub(crate) type BorrowReport = Vec<(ExprId, Diagnostic)>;
 struct Checker<'a> {
     types: &'a HashMap<ExprId, Type>,
     modes: &'a HashMap<ExprId, ReferenceArgMode>,
+    calls: &'a BuiltinCalls,
     errors: BorrowReport,
     reported: HashSet<ExprId>,
 }
@@ -280,10 +285,9 @@ impl Checker<'_> {
                     if let Some(Expr::Await(wait)) = root {
                         let operand = match &wait.expr {
                             Expr::MethodCall(c)
-                                if c.method == "result"
-                                    && c.args.is_empty()
-                                    && self.types.get(&c.object.id()).is_some_and(|t| {
-                                        builtin_types::unary_arg(t, BuiltinTypeId::Task).is_some()
+                                if self.calls.get(&c.id) == Some(&Intrinsic::TaskResult)
+                                    && self.types.get(&c.object.id()).is_some_and(|ty| {
+                                        builtin_types::unary_arg(ty, BuiltinTypeId::Task).is_some()
                                     }) =>
                             {
                                 &c.object
@@ -591,8 +595,7 @@ impl<'a> WalkState<'a> {
             _ => None,
         };
         if let Some(Expr::MethodCall(call)) = awaited
-            && call.method == "finish"
-            && call.args.is_empty()
+            && checker.calls.get(&call.id) == Some(&Intrinsic::ScopeFinish)
             && let Some(scope) = self.scope_receiver(checker, &call.object, callable, loops)
         {
             statement.scope_receiver = Some(call.object.id());
@@ -605,12 +608,12 @@ impl<'a> WalkState<'a> {
         let Some(scope) = self.scope_receiver(checker, &call.object, callable, loops) else {
             return;
         };
-        if call.method == "cancel" && call.args.is_empty() {
+        let intrinsic = checker.calls.get(&call.id).copied();
+        if intrinsic == Some(Intrinsic::ScopeCancel) {
             // Requesting cancellation preserves membership and every loan.
             // Only awaiting finish proves that all observing defers have run.
             statement.scope_receiver = Some(call.object.id());
-        } else if call.method == "child"
-            && call.args.is_empty()
+        } else if intrinsic == Some(Intrinsic::ScopeChild)
             && let Some(name) = binding
         {
             let child = self.task_scopes.len();
@@ -624,7 +627,7 @@ impl<'a> WalkState<'a> {
             self.task_scopes[scope].children.push(child);
             statement.scope_binding = Some((name, child));
             statement.scope_receiver = Some(call.object.id());
-        } else if call.method == "add" && call.args.len() == 1 {
+        } else if intrinsic == Some(Intrinsic::ScopeAdd) {
             let arg = &call.args[0].expr;
             if let Some(task) = checker.borrowed_call(arg, block) {
                 let keys = task
@@ -807,7 +810,12 @@ mod tests {
         assert!(errors.is_empty(), "{source}: {errors:?}");
         let mut checker = TypeChecker::new();
         checker.check_module_program(&program);
-        let borrows = check(&program, &checker.expr_types, &checker.reference_arg_modes);
+        let borrows = check(
+            &program,
+            &checker.expr_types,
+            &checker.reference_arg_modes,
+            &checker.builtin_calls,
+        );
         (borrows, checker.errors)
     }
 
@@ -1183,13 +1191,27 @@ mod tests {
                     .sum();
                 AST_EVENTS.with(|count| count.set(0));
                 assert!(
-                    check(&program, &checker.expr_types, &checker.reference_arg_modes).is_empty()
+                    check(
+                        &program,
+                        &checker.expr_types,
+                        &checker.reference_arg_modes,
+                        &checker.builtin_calls
+                    )
+                    .is_empty()
                 );
                 let actual = AST_EVENTS.with(|count| count.get());
                 assert_eq!(actual, expected, "depth={depth}, pending={pending}");
                 println!("depth={depth} pending={pending} events={actual}");
                 AST_EVENTS.with(|count| count.set(0));
-                assert!(check(&program, &HashMap::new(), &HashMap::new()).is_empty());
+                assert!(
+                    check(
+                        &program,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        &Default::default()
+                    )
+                    .is_empty()
+                );
                 assert_eq!(AST_EVENTS.with(|count| count.get()), 0);
             }
         }

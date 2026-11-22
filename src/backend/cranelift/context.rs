@@ -172,7 +172,7 @@ impl Codegen {
         input: CheckedUnitInput<'a>,
     ) -> Result<DeclaredModule> {
         let mut context = self.declaration_context();
-        context.checked = Some(input.checked);
+        context.checked = Some(input.checked.tables());
         context.effect_queries = Some((input.effects, input.unit));
         let types = context.checked_expr_types();
         context.declare_module_with_types(
@@ -192,7 +192,7 @@ impl Codegen {
         input: CheckedUnitInput<'a>,
     ) -> Result<DeclaredProgram> {
         let mut context = self.declaration_context();
-        context.checked = Some(input.checked);
+        context.checked = Some(input.checked.tables());
         context.effect_queries = Some((input.effects, input.unit));
         let types = context.checked_expr_types();
         context.declare_program_with_types(program, source_file, &types, input.scope)
@@ -211,7 +211,7 @@ impl Codegen {
         emit: impl FnOnce(&mut UnitCodegenContext<'_>) -> Result<()>,
     ) -> Result<()> {
         let mut context = self.emission_context();
-        context.checked = Some(checked);
+        context.checked = Some(checked.tables());
         context.emit_module(unit, emit)
     }
     /// Emit the interface defaults another unit received from `unit`, checked and scoped as
@@ -225,7 +225,7 @@ impl Codegen {
         emit: impl FnOnce(&mut UnitCodegenContext<'_>) -> Result<()>,
     ) -> Result<()> {
         let mut context = self.emission_context();
-        context.checked = Some(checked);
+        context.checked = Some(checked.tables());
         context.emit_foreign_bodies(unit, bare, methods, emit)
     }
     pub fn with_program_bodies<'a>(
@@ -235,7 +235,7 @@ impl Codegen {
         emit: impl FnOnce(&mut UnitCodegenContext<'_>) -> Result<()>,
     ) -> Result<()> {
         let mut context = self.emission_context();
-        context.checked = Some(checked);
+        context.checked = Some(checked.tables());
         context.emit_program(unit, emit)
     }
     pub fn compile_program(
@@ -276,6 +276,7 @@ pub(crate) struct CheckedUnitInput<'a> {
 impl UnitCodegenContext<'_> {
     fn checked_expr_types(&self) -> HashMap<ExprId, Type> {
         self.checked
+            .as_ref()
             .expect("checked declaration input")
             .expr_types
             .iter()

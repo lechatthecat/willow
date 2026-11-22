@@ -238,31 +238,14 @@ impl TypeChecker {
     /// ABI rows describe the runtime entry point, not the typed storage-word
     /// conversions emitted before calling it. Preserve scalar/non-pair calls.
     fn contract_call_storage_allocates(&self, call: &MethodCallExpr) -> bool {
-        use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
-        use crate::semantic::intrinsics::{self, Intrinsic};
-        let Some(receiver) = self.expr_types.get(&call.object.id()) else {
-            return false;
-        };
-        let Some(storage) = builtin_types::resolve(receiver) else {
-            return false;
-        };
-        // Map operations and constructors already carry MAY_ALLOCATE in their
-        // ABI rows. Restrict resolution to these one-word writers; resolving a
-        // read merely to inspect its identity would clone its result type.
-        if call.args.len() != 1
-            || !matches!(storage.id, B::BlockingCell | B::BlockingRwCell | B::Channel)
-        {
-            return false;
-        }
-        let Some(resolved) = intrinsics::resolve(receiver, &call.method, call.args.len()) else {
-            return false;
-        };
         matches!(
-            resolved.intrinsic,
-            Intrinsic::CellSet | Intrinsic::RwCellWrite | Intrinsic::ChannelSend
-        ) && storage
-            .args
-            .first()
+            self.builtin_calls.get(&call.id),
+            Some(Intrinsic::CellSet | Intrinsic::RwCellWrite | Intrinsic::ChannelSend)
+        ) && self
+            .expr_types
+            .get(&call.object.id())
+            .and_then(crate::semantic::builtin_types::resolve)
+            .and_then(|storage| storage.args.first())
             .is_some_and(|ty| self.contract_storage_type_allocates(ty))
     }
 
@@ -1120,6 +1103,7 @@ impl TypeChecker {
             let (diagnostics, verification) = crate::semantic::verification::check(
                 program,
                 &self.errors,
+                &self.builtin_calls,
                 &writes,
                 &options,
                 &mut self.verification_cache,

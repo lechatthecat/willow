@@ -186,8 +186,8 @@ pub(crate) fn method_call_return_type(info: &MethodInfo) -> Type {
     }
 }
 
-pub(crate) fn channel_element_type<N: TypeName + Clone>(ty: &Type<N>) -> Option<Type<N>> {
-    builtin_types::unary_arg(ty, B::Channel).cloned()
+pub(crate) fn channel_element_type<N: TypeName>(ty: &Type<N>) -> Option<&Type<N>> {
+    builtin_types::unary_arg(ty, B::Channel)
 }
 
 pub(crate) fn qualify_type_for_module(ty: &Type, module_prefix: Option<&str>) -> Type {

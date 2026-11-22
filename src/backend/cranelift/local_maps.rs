@@ -107,25 +107,6 @@ pub(super) fn confined_scalar_maps(f: &LirFunction) -> bool {
                     let valid_use = map_uses == 0
                         || match value {
                             LirRvalue::Use(_) => produces_map,
-                            LirRvalue::PrepareMethod {
-                                receiver, method, ..
-                            } => {
-                                map_uses == 1
-                                    && map_operand(receiver)
-                                    && matches!(
-                                        method.as_str(),
-                                        "insert"
-                                            | "get"
-                                            | "contains"
-                                            | "len"
-                                            | "to_string"
-                                            | "freeze"
-                                            | "remove"
-                                            | "keys"
-                                            | "values"
-                                            | "entries"
-                                    )
-                            }
                             LirRvalue::IntrinsicCall {
                                 intrinsic,
                                 receiver,
@@ -154,7 +135,7 @@ pub(super) fn confined_scalar_maps(f: &LirFunction) -> bool {
                                 ObjectAlloc, FieldLoad, FieldStore, StaticField, StaticStore,
                                 StaticCall, EnumAlloc, EnumPayloadStore, ConstructorCall, Range,
                                 EnumMethod, BuiltinCall, FormatScalar, Panic, Recover,
-                                ReferenceDebug, RebindResultError, IntoError, MethodCall,
+                                ReferenceDebug, RebindResultError, IntoError, PrepareMethod, MethodCall,
                                 StringLiteral, FunctionRef, Closure, Print, DirectCall,
                                 IndirectCall, Unary, Binary, StringConcat
                             ) => false,

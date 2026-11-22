@@ -1,6 +1,18 @@
 import std::collections::{Array, Map};
 // These successful calls demonstrate the methods listed by unknown-method errors.
-fn main() {
+class Counter {
+    pub value: i64;
+    pub fn send(self, n: i64) -> i64 { return self.value + n; }
+    pub fn recv(self) -> i64 { return self.value; }
+    pub fn len(self) -> i64 { return self.value + 1; }
+}
+
+async fn round_trip(channel: Channel<i64>, counter: Counter) -> i64 {
+    channel.send(counter.send(2));
+    return channel.recv() + counter.recv() + counter.len();
+}
+
+async fn main() {
     println("abc".substring(0, 1));
     println(3.wrapping_add(2).to_string());
     println(1.5.to_string());
@@ -12,4 +24,7 @@ fn main() {
     entries.insert("key", 7);
     println(entries.len().to_string());
     println("abc".find("b").unwrap_or(-1).to_string());
+    let channel = Channel<i64>::with_capacity(1);
+    let task = round_trip(channel, new Counter(5));
+    println(await task);
 }

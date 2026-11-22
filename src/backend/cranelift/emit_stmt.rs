@@ -52,7 +52,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // flush rewrites `vars`. Whatever comes after it — the `return` whose
         // value was bound AFTER the registration, the rest of an enclosing
         // scope — still expects its own bindings.
-        let vars_before = self.locals.vars.clone();
+        let mut vars_before = None;
         'frames: for (index, (frame, guarded)) in
             frames.iter_rev().take(frame_count - depth).enumerate()
         {
@@ -94,7 +94,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // execute it a second time.
                 self.cleanup.unavailable_defer_ids.insert(entry.id);
                 self.cleanup.sync_cancel_defer_context = self.cleanup.defer_stack.fresh_identity();
-                self.locals.vars = (*entry.vars_at_registration).clone();
+                let previous =
+                    std::mem::replace(&mut self.locals.vars, (*entry.vars_at_registration).clone());
+                vars_before.get_or_insert(previous);
                 // Rebind the hidden frame operands: coop loop bodies restore
                 // `vars`, wiping the names between registration and a
                 // function-exit flush.
@@ -151,7 +153,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         self.cleanup.unavailable_defer_ids = unavailable_before;
         self.cleanup.sync_cancel_defer_context = cancel_context_before;
-        self.locals.vars = vars_before;
+        if let Some(vars) = vars_before {
+            self.locals.vars = vars;
+        }
     }
 
     /// Commit and release every `lock` whose critical section owns the defer

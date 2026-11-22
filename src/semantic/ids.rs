@@ -173,6 +173,9 @@ struct SymbolTable {
     types: Vec<TypeName>,
     type_ids: HashMap<TypeName, TypeId>,
     functions: Vec<FunctionName>,
+    // Only synthetic Option/Result leaf targets have entries. Decode their
+    // canonical symbol once, including when a persisted graph is restored.
+    adt_targets: HashMap<FunctionId, crate::semantic::intrinsics::AdtMethod>,
     function_ids: HashMap<FunctionName, FunctionId>,
 }
 /// An index is meaningful only in its owner. Owner IDs are never reused.
@@ -421,6 +424,13 @@ impl SymbolTable {
             return *id;
         }
         let id = FunctionId(self.handle(self.functions.len()));
+        if owner == Some("$adt")
+            && module.is_none()
+            && namespace.is_none()
+            && let Some(method) = crate::semantic::intrinsics::AdtMethod::from_graph_name(name)
+        {
+            self.adt_targets.insert(id, method);
+        }
         self.functions.push(key.clone());
         self.function_ids.insert(key, id);
         id
@@ -579,6 +589,11 @@ impl<'de> serde::Deserialize<'de> for TypeId {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct FunctionId(Handle);
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static METHOD_INTERN_REQUESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl FunctionId {
     fn intern(namespace: Option<&str>, owner: Option<&str>, name: &str) -> Self {
         match namespace.and_then(SymbolModule::for_namespace) {
@@ -609,6 +624,11 @@ impl FunctionId {
         self.0
             .with_table(|table| table.functions[self.0.index as usize].clone())
     }
+    pub(crate) fn adt_method(self) -> Option<crate::semantic::intrinsics::AdtMethod> {
+        self.0
+            .with_table(|table| table.adt_targets.get(&self).copied())
+    }
+
     pub fn free(name: impl AsRef<str>) -> Self {
         Self::intern(None, None, name.as_ref())
     }
@@ -619,6 +639,8 @@ impl FunctionId {
         }
     }
     pub fn method(owner: TypeId, name: impl AsRef<str>) -> Self {
+        #[cfg(test)]
+        METHOD_INTERN_REQUESTS.set(METHOD_INTERN_REQUESTS.get() + 1);
         let _symbols = owner.0.owner().enter();
         let owner = owner.spelling();
         Self::intern_in(

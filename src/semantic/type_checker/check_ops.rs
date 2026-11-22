@@ -73,13 +73,14 @@ impl TypeChecker {
     /// Traverse contiguous unary/binary trees on the heap. Non-operator leaves
     /// still use normal checking so contextual and callable state is preserved.
     pub(super) fn check_operator_tree(&mut self, expr: &Expr) -> Type {
-        self.check_operator_tree_expecting(expr, None)
+        self.check_operator_tree_expecting(expr, None, false)
     }
 
     pub(super) fn check_operator_tree_expecting(
         &mut self,
         expr: &Expr,
         expected: Option<&Type>,
+        checked: bool,
     ) -> Type {
         let is_integer_literal = |expr: &Expr| {
             matches!(expr, Expr::Integer(..))
@@ -147,14 +148,16 @@ impl TypeChecker {
                 }
                 Work::Enter(leaf, context) => {
                     value = if let Some(expected) = context {
-                        self.check_expr_expecting(leaf, &expected)
+                        self.check_argument_expecting(leaf, &expected, checked)
+                    } else if checked {
+                        self.reuse_checked_type(leaf.id())
                     } else {
                         self.check_expr(leaf)
                     }
                 }
                 Work::AfterRightForLiteral(binary) => {
                     let right = value;
-                    let left = self.check_expr_expecting(&binary.lhs, &right);
+                    let left = self.check_argument_expecting(&binary.lhs, &right, checked);
                     value = self.finish_binary(binary, left, right);
                     self.expr_types.insert(binary.id, value.clone());
                 }
@@ -164,7 +167,7 @@ impl TypeChecker {
                         && is_option_type(&left)
                         && is_option_none_expr(self, &binary.rhs)
                     {
-                        let right = self.check_expr_expecting(&binary.rhs, &left);
+                        let right = self.check_argument_expecting(&binary.rhs, &left, checked);
                         value = self.finish_binary(binary, left, right);
                         self.expr_types.insert(binary.id, value.clone());
                     } else {
@@ -181,7 +184,9 @@ impl TypeChecker {
                 Work::AfterRightForBareNoneLhs(binary) => {
                     let right = value;
                     let left = if is_option_type(&right) {
-                        self.check_expr_expecting(&binary.lhs, &right)
+                        self.check_argument_expecting(&binary.lhs, &right, checked)
+                    } else if checked {
+                        self.reuse_checked_type(binary.lhs.id())
                     } else {
                         self.check_expr(&binary.lhs)
                     };

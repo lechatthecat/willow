@@ -272,7 +272,10 @@ impl BodyQueries {
                         CheckInput::SignatureType(..) | CheckInput::SignatureSymbol(..)
                     ) | (
                         CheckKind::Concurrency,
-                        CheckInput::Helper(..) | CheckInput::Class(..) | CheckInput::Target
+                        CheckInput::Helper(..)
+                            | CheckInput::Class(..)
+                            | CheckInput::Method(..)
+                            | CheckInput::Target
                     )
                 )),
                 "invalid signature check inputs"
@@ -1069,9 +1072,10 @@ impl BodyQueries {
             crate::parser::ast::ExprId,
             crate::semantic::async_borrows::ReferenceArgMode,
         >,
+        calls: &crate::semantic::intrinsics::BuiltinCalls,
     ) -> Result<Vec<crate::diagnostics::Diagnostic>> {
         use crate::semantic::async_borrows::{self, BorrowRoot};
-        async_borrows::check_with(program, types, modes, |root, compute| {
+        async_borrows::check_with(program, types, modes, calls, |root, compute| {
             let id = match root {
                 BorrowRoot::Block(id) => id,
                 BorrowRoot::Initializer(expr) => self
@@ -1650,11 +1654,17 @@ mod tests {
             &program,
             &checker.expr_types,
             &checker.reference_arg_modes,
+            &checker.builtin_calls,
         );
         assert!(!expected.is_empty());
         for _ in 0..4 {
             let actual = queries
-                .check_async_borrows(&program, &checker.expr_types, &checker.reference_arg_modes)
+                .check_async_borrows(
+                    &program,
+                    &checker.expr_types,
+                    &checker.reference_arg_modes,
+                    &checker.builtin_calls,
+                )
                 .unwrap();
             assert_eq!(
                 serde_json::to_value(actual).unwrap(),
@@ -1734,6 +1744,7 @@ mod tests {
             &program,
             &checker.expr_types,
             &checker.reference_arg_modes,
+            &checker.builtin_calls,
             |root, compute| {
                 let BorrowRoot::Block(id) = root else {
                     panic!()
@@ -1749,7 +1760,12 @@ mod tests {
             queries.async_borrow_report(id, || report).unwrap();
         }
         let actual = queries
-            .check_async_borrows(&program, &checker.expr_types, &checker.reference_arg_modes)
+            .check_async_borrows(
+                &program,
+                &checker.expr_types,
+                &checker.reference_arg_modes,
+                &checker.builtin_calls,
+            )
             .unwrap();
         assert_eq!(
             serde_json::to_value(actual).unwrap(),

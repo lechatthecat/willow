@@ -126,15 +126,6 @@ pub(super) fn supported_lir_pattern<'n>(
     }
 }
 
-/// The return type of a `fn(...) -> R` value. Eligibility has already proved
-/// every combinator operand is one, so a non-function here is a compiler bug.
-pub(super) fn fn_return_type(f_ty: &Type) -> Type {
-    match f_ty {
-        Type::Fn(_, ret) | Type::Closure(_, ret) => (**ret).clone(),
-        _ => unreachable!("combinator operand vetted by eligibility is a function"),
-    }
-}
-
 /// One of the two atomic cells, and the width every operand
 /// and result of its methods has.
 ///
@@ -309,111 +300,103 @@ pub(super) fn scheduler_lock(ty: &Type) -> Option<(&'static str, &Type)> {
     }
 }
 
+/// The type produced by an enum method. For map operations, the arguments
+/// of the constructed generic come from the receiver and the callback.
+#[derive(Debug, PartialEq)]
+pub(super) enum EnumMethodResult<'a> {
+    Value(&'a Type),
+    Option(&'a Type),
+    Result(&'a Type, &'a Type),
+}
+
+impl EnumMethodResult<'_> {
+    pub(super) fn matches(self, actual: &Type, ctx: &LirTypeCtx<'_>) -> bool {
+        match self {
+            Self::Value(ty) => ctx.same_repr(ty, actual),
+            Self::Option(t) => ctx.same_generic_repr(
+                &TypeId::from_source_name(B::Option.source_name()),
+                [t].into_iter(),
+                actual,
+                &mut HashSet::new(),
+            ),
+            Self::Result(t, e) => ctx.same_generic_repr(
+                &TypeId::from_source_name(B::Result.source_name()),
+                [t, e].into_iter(),
+                actual,
+                &mut HashSet::new(),
+            ),
+        }
+    }
+}
+
 /// The result type of a builtin `Option`/`Result` method the walker emits, or
 /// `None` when the receiver/method pair is outside the subset.
 ///
-/// A `void` payload is excluded throughout because the unwrap family would read
-/// a payload slot that an all-`void` variant does not allocate, and the
-/// callable-taking combinators would build one.
-///
-/// The combinators (`map`/`map_err`/`and_then`/`or_else`) came with function
-/// values in. Each rule below reconstructs the type the SHARED
-/// emitter actually builds; the caller then compares it against the checker's
-/// own type for the expression, so a disagreement refuses the body rather
-/// than being reinterpreted here.
-///
-/// `args` are the call's argument types, so arity and the default/message
-/// operand are vetted here rather than at two call sites.
-pub(super) fn option_result_method(recv: &Type, method: &str, args: &[Type]) -> Option<Type> {
+/// Payload reads and callable combinators require a stored (non-void)
+/// payload. Predicates inspect only the tag. The result borrows the types
+/// used by the emitter so validation can compare representations directly.
+pub(super) fn option_result_method<'a>(
+    recv: &'a Type,
+    method: AdtMethod,
+    args: &'a [Type],
+) -> Option<EnumMethodResult<'a>> {
+    use EnumMethodResult::Value;
     let resolved = builtin_types::resolve(recv)?;
-    let payload = |i: usize| -> Option<Type> {
-        resolved
-            .args
-            .get(i)
-            .filter(|t| !matches!(t, Type::Void))
-            .cloned()
+    let non_void = |ty: &&Type| !matches!(ty, Type::Void);
+    let payload = |i: usize| resolved.args.get(i).filter(non_void);
+    let no_args = |t: &'a Type| args.is_empty().then_some(Value(t));
+    let one_string = |t: &'a Type| matches!(args, [Type::String]).then_some(Value(t));
+    let one_of = |t: &'a Type| matches!(args, [a] if assignable_repr(t, a)).then_some(Value(t));
+    let one_fn = |params: &[Type]| match args {
+        [Type::Fn(ps, ret)] if ps.as_slice() == params => Some(ret.as_ref()),
+        _ => None,
     };
-    let no_args = |t: Type| args.is_empty().then_some(t);
-    // `expect(msg)` takes exactly one `String`; `unwrap_or(default)` takes
-    // exactly one value of the payload type. Emission passes both
-    // straight through with no coercion, so `assignable_repr` is the rule.
-    let one_string = |t: Type| matches!(args, [Type::String]).then_some(t);
-    let one_of = |t: Type| matches!(args, [a] if assignable_repr(&t, a)).then_some(t);
-    // The single callable operand, given the parameter list the emitter feeds
-    // it. Yields the callable's return type, which is what every combinator's
-    // result is built from.
-    let one_fn = |params: &[Type]| -> Option<Type> {
-        match args {
-            [Type::Fn(ps, ret)] if ps.as_slice() == params => Some((**ret).clone()),
-            _ => None,
-        }
-    };
-    let non_void = |t: Type| (!matches!(t, Type::Void)).then_some(t);
-    let option_of = |t: Type| B::Option.apply(vec![t]);
-    let result_of = |ok: Type, err: Type| B::Result.apply(vec![ok, err]);
+    let unary_fn = |i| one_fn(std::slice::from_ref(payload(i)?));
+    static BOOL: Type = Type::Bool;
     match resolved.id {
         B::Option => match method {
-            "is_some" | "is_none" => no_args(Type::Bool),
-            "unwrap" => no_args(payload(0)?),
-            "expect" => one_string(payload(0)?),
-            "unwrap_or" => one_of(payload(0)?),
-            // `Option<T>::map(fn(T) -> U) -> Option<U>`.
-            "map" => Some(option_of(non_void(one_fn(&[payload(0)?])?)?)),
-            // `Option<T>::and_then(fn(T) -> Option<U>) -> Option<U>`: the
-            // emitter reads `U` out of the callable's return type to build the
-            // `None` arm, so that return type IS the result.
-            "and_then" => {
-                let produced = one_fn(&[payload(0)?])?;
-                builtin_types::unary_arg(&produced, B::Option)
-                    .filter(|u| !matches!(u, Type::Void))?;
-                Some(produced)
+            AdtMethod::IsSome | AdtMethod::IsNone => no_args(&BOOL),
+            AdtMethod::Unwrap => no_args(payload(0)?),
+            AdtMethod::Expect => one_string(payload(0)?),
+            AdtMethod::UnwrapOr => one_of(payload(0)?),
+            AdtMethod::Map => Some(EnumMethodResult::Option(unary_fn(0).filter(non_void)?)),
+            AdtMethod::AndThen => {
+                let produced = unary_fn(0)?;
+                builtin_types::unary_arg(produced, B::Option).filter(non_void)?;
+                Some(Value(produced))
             }
-            // `Option<T>::or_else(fn -> Option<T>) -> Option<T>`: the `Some`
-            // arm passes the RECEIVER through, so the callable must produce the
-            // receiver's payload type — that payload is what picks the pointer
-            // niche over the box, so both arms merge one representation.
-            "or_else" => {
+            AdtMethod::OrElse => {
                 let produced = one_fn(&[])?;
-                (builtin_types::unary_arg(&produced, B::Option) == Some(&payload(0)?))
-                    .then_some(produced)
+                (builtin_types::unary_arg(produced, B::Option) == Some(payload(0)?))
+                    .then_some(Value(produced))
             }
             _ => None,
         },
         B::Result => match method {
-            "is_ok" | "is_err" => no_args(Type::Bool),
-            "unwrap" => no_args(payload(0)?),
-            "unwrap_err" => no_args(payload(1)?),
-            "expect" => one_string(payload(0)?),
-            "unwrap_or" => one_of(payload(0)?),
-            // `Result<T, E>::map(fn(T) -> U) -> Result<U, E>`; the `Err` arm
-            // passes the receiver through, so `E` is unchanged.
-            "map" => Some(result_of(non_void(one_fn(&[payload(0)?])?)?, payload(1)?)),
-            // `Result<T, E>::map_err(fn(E) -> F) -> Result<T, F>`.
-            "map_err" => Some(result_of(payload(0)?, non_void(one_fn(&[payload(1)?])?)?)),
-            // `Result<T, E>::and_then(fn(T) -> Result<U, E>) -> Result<U, E>`.
-            // The result is the CALLABLE's return type, which is also what the
-            // checker records: the `Err` arm passes the receiver through, and
-            // that is representation-safe because every `Result` is the same
-            // two-word box whatever its type arguments.
-            //
-            // NEITHER error type is constrained, the receiver's included. A
-            // `Result::Ok(5)` written with nothing to infer `E` from records
-            // `Result<i64, void>`, and requiring a non-void one here took the
-            // whole enclosing function out of LIR for a receiver
-            // whose error type `emit_result_chain_side` reads only to
-            // rewrap a pass-through `Err` whose representation changes.
-            "and_then" => {
-                let produced = one_fn(&[payload(0)?])?;
-                let (ok, _) = builtin_types::binary_args(&produced, B::Result)?;
-                non_void(ok.clone()).map(|_| produced)
+            AdtMethod::IsOk | AdtMethod::IsErr => no_args(&BOOL),
+            AdtMethod::Unwrap => no_args(payload(0)?),
+            AdtMethod::UnwrapErr => no_args(payload(1)?),
+            AdtMethod::Expect => one_string(payload(0)?),
+            AdtMethod::UnwrapOr => one_of(payload(0)?),
+            AdtMethod::Map => Some(EnumMethodResult::Result(
+                unary_fn(0).filter(non_void)?,
+                payload(1)?,
+            )),
+            AdtMethod::MapErr => Some(EnumMethodResult::Result(
+                payload(0)?,
+                unary_fn(1).filter(non_void)?,
+            )),
+            // An inferred Result::Ok may leave E as Void. The pass-through
+            // error uses the same boxed representation on either side.
+            AdtMethod::AndThen => {
+                let produced = unary_fn(0)?;
+                let (ok, _) = builtin_types::binary_args(produced, B::Result)?;
+                (!matches!(ok, Type::Void)).then_some(Value(produced))
             }
-            // `Result<T, E>::or_else(fn(E) -> Result<T, F>) -> Result<T, F>`:
-            // the mirror image — the `Ok` arm passes the receiver through, so
-            // only the ok payload has to line up.
-            "or_else" => {
-                let produced = one_fn(&[payload(1)?])?;
-                let (ok, _) = builtin_types::binary_args(&produced, B::Result)?;
-                (*ok == payload(0)?).then_some(produced)
+            AdtMethod::OrElse => {
+                let produced = unary_fn(1)?;
+                let (ok, _) = builtin_types::binary_args(produced, B::Result)?;
+                (ok == payload(0)?).then_some(Value(produced))
             }
             _ => None,
         },

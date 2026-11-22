@@ -33,6 +33,25 @@ pub mod toolchain;
 mod workspace_transaction;
 
 mod driver;
+/// Counts actual hash operations, including index construction and growth.
+#[cfg(test)]
+mod counted_hashes {
+    thread_local! {
+        pub(crate) static HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[derive(Default)]
+    pub(crate) struct KeyHasher(std::collections::hash_map::RandomState);
+
+    impl std::hash::BuildHasher for KeyHasher {
+        type Hasher = std::collections::hash_map::DefaultHasher;
+        fn build_hasher(&self) -> Self::Hasher {
+            HASHES.with(|n| n.set(n.get() + 1));
+            self.0.build_hasher()
+        }
+    }
+}
+
 #[cfg(test)]
 use anyhow::Result;
 pub use driver::{

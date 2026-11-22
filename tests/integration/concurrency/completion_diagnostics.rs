@@ -30,6 +30,17 @@ fn tmig_02_join_in_a_select_case_reports_e0812() {
 }
 
 #[test]
+fn bare_join_select_case_reports_e0812() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "async fn w() -> i64 { return 1; } async fn main() { let h = w(); select { h.join() => { println(1); } } }",
+        &[],
+    );
+    assert!(!ok);
+    assert!(stderr.contains("error[E0812]"), "{stderr}");
+    assert!(stderr.contains("let v = await t"), "{stderr}");
+}
+
+#[test]
 fn tmig_03_try_join_on_a_task_reports_e0813() {
     let (ok, stderr) = compile_with_compiler_env(
         "async fn w() -> i64 { return 1; }\nfn main() { let value = w().try_join(); }",

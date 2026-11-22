@@ -6,24 +6,75 @@ use crate::diagnostics::Span;
 use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
 
-/// Collect the span of every `super(...)` call in the block.
-pub(crate) fn collect_super_init_spans(block: &Block, out: &mut Vec<Span>) {
-    walk_constructor_statements(block, |stmt| {
+/// Call spans in diagnostic order and whether the first belongs to the
+/// constructor's outermost statement list.
+fn collect_super_init_spans(block: &Block) -> (Vec<Span>, bool) {
+    let mut calls = Vec::new();
+    let mut first_is_top_level = false;
+    walk_constructor_statements(block, |stmt, top_level| {
         if let Stmt::SuperInit(init) = stmt {
-            out.push(init.span);
+            calls.push(init.span);
+            first_is_top_level |= top_level && calls.first() == Some(&init.span);
         }
     });
+    (calls, first_is_top_level)
+}
+
+/// The constructor syntax used by inheritance diagnostics and their cache key.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SuperInitPlacement {
+    pub calls: Vec<Span>,
+    pub first_is_top_level: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PLACEMENT_STATEMENT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl SuperInitPlacement {
+    pub(super) fn relocated(
+        self: &std::rc::Rc<Self>,
+        correspondence: &crate::compiler_db::syntax::Correspondence,
+    ) -> Option<std::rc::Rc<Self>> {
+        let mut mapped = std::rc::Rc::clone(self);
+        for (index, &old) in self.calls.iter().enumerate() {
+            let new = correspondence.span(old)?;
+            if new != old {
+                std::rc::Rc::make_mut(&mut mapped).calls[index] = new;
+            }
+        }
+        Some(mapped)
+    }
+
+    pub(super) fn of(ctor: &ConstructorDecl) -> Self {
+        if ctor.body.stmts.is_empty() {
+            return Self::default();
+        }
+        let (calls, first_is_top_level) = collect_super_init_spans(&ctor.body);
+        Self {
+            calls,
+            first_is_top_level,
+        }
+    }
 }
 
 /// Constructor scans only inspect statement structure: assignments in a lambda
 /// or match expression belong to that body. Deferred work runs after the
 /// constructor's definite-assignment point and must also be excluded.
-fn walk_constructor_statements(block: &Block, mut visit: impl FnMut(&Stmt)) {
+fn walk_constructor_statements(block: &Block, mut visit: impl FnMut(&Stmt, bool)) {
+    let mut scope_depth = 0;
     let mut walk = AstWalk::new(AstEvent::Block(block));
     while let Some(event) = walk.next() {
+        #[cfg(test)]
+        if matches!(event, AstEvent::Stmt(_)) {
+            PLACEMENT_STATEMENT_VISITS.with(|n| n.set(n.get() + 1));
+        }
         match event {
             AstEvent::Expr(_) | AstEvent::Stmt(Stmt::Defer(_)) => walk.skip_children(),
-            AstEvent::Stmt(stmt) => visit(stmt),
+            AstEvent::EnterScope => scope_depth += 1,
+            AstEvent::ExitScope => scope_depth -= 1,
+            AstEvent::Stmt(stmt) => visit(stmt, scope_depth == 1),
             _ => {}
         }
     }
@@ -348,8 +399,8 @@ mod tests {
                         span,
                     };
                 }
-                let mut spans = Vec::new();
-                collect_super_init_spans(&body, &mut spans);
+                let (spans, top_level) = collect_super_init_spans(&body);
+                assert!(!top_level);
                 assert_eq!(spans, [span]);
                 let mut fields = HashSet::new();
                 collect_test_assignments(&body, &mut fields);
@@ -390,7 +441,7 @@ mod tests {
 
     // Exercise the structural walker independently of definite assignment.
     fn collect_test_assignments(block: &Block, out: &mut HashSet<String>) {
-        walk_constructor_statements(block, |stmt| {
+        walk_constructor_statements(block, |stmt, _| {
             if let Stmt::FieldAssign(assign) = stmt
                 && matches!(&assign.object, Expr::Var(name, ..) if name == "self")
             {
@@ -400,8 +451,7 @@ mod tests {
     }
 
     fn super_init_lines(src: &str) -> Vec<usize> {
-        let mut out = Vec::new();
-        collect_super_init_spans(&class_ctor_body(src, "C"), &mut out);
+        let (out, _) = collect_super_init_spans(&class_ctor_body(src, "C"));
         out.into_iter().map(|span| span.line).collect()
     }
 

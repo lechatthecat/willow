@@ -10,7 +10,8 @@ pub(super) struct Constructor {
     pub fields: Vec<(String, Type)>,
 }
 #[derive(Default)]
-pub(super) struct DataTypes {
+pub(super) struct DataTypes<'a> {
+    pub calls: Option<&'a crate::semantic::intrinsics::BuiltinCalls>,
     pub constructors: HashMap<Type, Vec<Constructor>>,
     pub definitions: String,
     pub digest: String,
@@ -80,7 +81,7 @@ pub(super) fn constructor(ty: &Type, index: usize) -> String {
 pub(super) fn selector(ty: &Type, variant: usize, field: usize) -> String {
     format!("field_{}_{variant}_{field}", type_key(ty))
 }
-impl DataTypes {
+impl DataTypes<'_> {
     pub fn new(program: &Program, writes: &FieldWrites) -> Self {
         let declarations: HashMap<_, _> = program
             .items

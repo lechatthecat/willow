@@ -3,7 +3,7 @@
 //! a `-1` sentinel.
 
 use super::check_source;
-use crate::semantic::intrinsics::renamed_method;
+use crate::semantic::intrinsics::MethodName;
 
 /// `check_source` sees no prelude: declare the Option enum patterns name.
 const PRELUDE: &str = "import std::collections::{Array, Map}; enum Option<T> { Some(T), None }";
@@ -29,9 +29,71 @@ fn rename_diagnostics(diagnostics: &[crate::diagnostics::Diagnostic]) -> usize {
 
 #[test]
 fn renamed_method_table_maps_retired_names_only() {
+    let renamed_method = |name| {
+        MethodName::classify(name)
+            .replacement()
+            .map(|(spelling, _)| spelling)
+    };
     assert_eq!(renamed_method("toString"), Some("to_string"));
     for current in ["to_string", "len", "find", "tostring", "ToString", ""] {
         assert_eq!(renamed_method(current), None, "{current}");
+    }
+}
+
+#[test]
+fn method_recovery_reuses_the_classified_spelling() {
+    use crate::semantic::intrinsics::{METHOD_LOOKUPS, RECEIVER_LOOKUPS};
+    check_source("");
+    for (params, body, expected_message, lookups) in [
+        ("n: i64", "n.toString();", "it was renamed", 1),
+        (
+            "o: Option<String>",
+            "o.len();",
+            "without handling absence",
+            2,
+        ),
+        ("n: i64", "n.recv();", "cannot call", 1),
+    ] {
+        METHOD_LOOKUPS.with(|count| count.set(0));
+        RECEIVER_LOOKUPS.with(|count| count.set(0));
+        let errors = check_body(params, body);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains(expected_message), "{errors:?}");
+        assert_eq!(METHOD_LOOKUPS.with(|count| count.get()), 1, "{body}");
+        assert_eq!(
+            RECEIVER_LOOKUPS.with(|count| count.get()),
+            lookups,
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn retired_method_chain_recovery_scales_with_depth() {
+    use crate::parser::ownership::CLONED_EXPR_NODES;
+    use crate::semantic::intrinsics::{METHOD_LOOKUPS, RECEIVER_LOOKUPS};
+    check_source("");
+    for depth in [1, 8, 32, 128] {
+        let check_chain = |method: &str| {
+            let chain = format!(".{method}()").repeat(depth);
+            METHOD_LOOKUPS.with(|count| count.set(0));
+            RECEIVER_LOOKUPS.with(|count| count.set(0));
+            CLONED_EXPR_NODES.with(|count| count.set(0));
+            let errors = check_body("s: String", &format!("let result: String = s{chain};"));
+            let copies = CLONED_EXPR_NODES.with(|count| count.get());
+            assert_eq!(METHOD_LOOKUPS.with(|count| count.get()), depth);
+            assert_eq!(RECEIVER_LOOKUPS.with(|count| count.get()), depth);
+            (errors, copies)
+        };
+        let (control, control_copies) = check_chain("to_string");
+        assert!(control.is_empty(), "{control:?}");
+        let (errors, copies) = check_chain("toString");
+        assert_eq!(errors.len(), depth, "{errors:?}");
+        assert_eq!(rename_diagnostics(&errors), depth);
+        assert_eq!(copies, control_copies, "recovery copied expression nodes");
+        println!(
+            "depth={depth} classifications={depth} rename_diagnostics={depth} cloned_nodes={copies} control_cloned_nodes={control_copies}"
+        );
     }
 }
 
@@ -327,7 +389,13 @@ fn public_builtin_and_std_names_follow_the_naming_rule() {
         (B::Option, "or_else"),
     ] {
         assert!(
-            super::builtin_methods::option_method(owner, method).is_some(),
+            matches!(
+                crate::semantic::intrinsics::lookup(
+                    &crate::parser::ast::Type::<String>::Named(owner.source_name().into()),
+                    method
+                ),
+                crate::semantic::intrinsics::MethodLookup::Adt(_)
+            ),
             "{method} is an Option/Result method"
         );
         check(method, false, "Option/Result method");

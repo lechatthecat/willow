@@ -58,7 +58,7 @@ impl TypeChecker {
 
     pub(super) fn check_value_call_args(&mut self, params: &[Type], args: &[CallArg]) {
         let param_infos = value_param_infos(params);
-        self.check_call_args_against_param_infos(&param_infos, args);
+        self.check_call_args_against_param_infos(&param_infos, args, false);
     }
 
     /// Check value sharing and record reference retention for resolved calls.
@@ -94,14 +94,21 @@ impl TypeChecker {
         &mut self,
         params: &[ParamInfo],
         args: &[CallArg],
+        checked: bool,
     ) {
         for (param, arg) in params.iter().zip(args) {
-            self.check_call_arg_against_param(param, arg);
+            self.check_call_arg_against_param(param, arg, checked);
         }
         self.check_mut_reference_aliases(params, args);
     }
 
-    pub(super) fn check_call_arg_against_param(&mut self, param: &ParamInfo, arg: &CallArg) {
+    pub(super) fn check_call_arg_against_param(
+        &mut self,
+        param: &ParamInfo,
+        arg: &CallArg,
+        checked: bool,
+    ) {
+        let checked = checked && self.expr_types.contains_key(&arg.expr.id());
         // Imported parameter signatures, like expression results, may still
         // contain a generic class application during the discovery pass.
         let normalized;
@@ -118,18 +125,24 @@ impl TypeChecker {
         };
         match (&param.mode, &arg.mode) {
             (ParamMode::Value, CallArgMode::Value) => {
-                self.check_value_arg_type(&param.ty, arg);
+                self.check_value_arg_type(&param.ty, arg, checked);
             }
             (ParamMode::Value, CallArgMode::Reference { .. }) => {
-                let arg_ty = self.check_expr(&arg.expr);
+                let arg_ty = if checked {
+                    self.reuse_checked_type(arg.expr.id())
+                } else {
+                    self.check_expr(&arg.expr)
+                };
                 self.push_unexpected_reference_arg(&param.ty, &arg_ty, arg.span);
             }
             (ParamMode::Reference { .. }, CallArgMode::Value) => {
-                self.check_expr(&arg.expr);
+                if !checked {
+                    self.check_expr(&arg.expr);
+                }
                 self.push_missing_reference_arg(arg);
             }
             (ParamMode::Reference { mutable, .. }, CallArgMode::Reference { .. }) => {
-                self.check_reference_argument(param, arg, *mutable);
+                self.check_reference_argument(param, arg, *mutable, checked);
             }
         }
     }
@@ -192,7 +205,7 @@ impl TypeChecker {
         self.push(diagnostic);
     }
 
-    pub(super) fn check_value_arg_type(&mut self, param_ty: &Type, arg: &CallArg) {
+    pub(super) fn check_value_arg_type(&mut self, param_ty: &Type, arg: &CallArg, checked: bool) {
         // Route through `check_expr_expecting` so an unqualified enum-variant
         // construction in argument position (`unwrap_or_zero(Ok(42))`) resolves
         // against the parameter type, just like a contextually-typed lambda.
@@ -200,7 +213,7 @@ impl TypeChecker {
         let arg_ty = if let Some(ty) = self.prechecked_array_args.remove(&arg.expr.id()) {
             ty
         } else {
-            self.check_expr_expecting(&arg.expr, param_ty)
+            self.check_argument_expecting(&arg.expr, param_ty, checked)
         };
         if !self.types_compatible(param_ty, &arg_ty) {
             let diagnostic = Diagnostic::new(
@@ -277,14 +290,40 @@ impl TypeChecker {
     }
 
     pub(super) fn check_expr_expecting(&mut self, expr: &Expr, expected: &Type) -> Type {
-        let ty = self.check_expr_expecting_inner(expr, expected);
+        let generation = self.error_generation;
+        let ty = self.check_expr_expecting_inner(expr, expected, false);
+        self.record_contextual_type(expr, ty, generation)
+    }
+
+    /// With an independently checked argument, apply only the contextual rules.
+    /// The ordinary expression result is already recorded for this visit.
+    pub(super) fn check_argument_expecting(
+        &mut self,
+        expr: &Expr,
+        expected: &Type,
+        checked: bool,
+    ) -> Type {
+        let generation = self.error_generation;
+        // Arity and name recovery can skip a child during the independent pass.
+        let checked = checked && self.expr_types.contains_key(&expr.id());
+        let ty = self.check_expr_expecting_inner(expr, expected, checked);
+        self.record_contextual_type(expr, ty, generation)
+    }
+
+    fn record_contextual_type(&mut self, expr: &Expr, ty: Type, generation: usize) -> Type {
+        if self.error_generation != 0 {
+            self.record_check_failure(
+                super::body::FailedCheck::Value(expr.id()),
+                self.error_generation != generation,
+            );
+        }
         self.finalize_builtin_static_call(expr, &ty);
         self.record_static_target(expr);
         self.expr_types.insert(expr.id(), ty.clone());
         ty
     }
 
-    fn check_expr_expecting_inner(&mut self, expr: &Expr, expected: &Type) -> Type {
+    fn check_expr_expecting_inner(&mut self, expr: &Expr, expected: &Type, checked: bool) -> Type {
         if let Some(layout) = expected.integer_layout() {
             if let Expr::Integer(value, span, _) = expr {
                 if !layout.contains(*value) {
@@ -303,7 +342,7 @@ impl TypeChecker {
                 return expected.clone();
             }
             if matches!(expr, Expr::Binary(_) | Expr::Unary(_)) {
-                return self.check_operator_tree_expecting(expr, Some(expected));
+                return self.check_operator_tree_expecting(expr, Some(expected), checked);
             }
         }
         if crate::semantic::generic_inference::has_enum_hole(expected) {
@@ -311,6 +350,7 @@ impl TypeChecker {
                 expr,
                 expected,
                 &HashSet::from([crate::semantic::generic_inference::ENUM_HOLE]),
+                checked,
             );
         }
         if let Expr::New(n) = expr {
@@ -318,7 +358,7 @@ impl TypeChecker {
             if let Some(ty) = self.contextual_new_type(n, expected) {
                 let ty = if let Type::Named(name) = &ty {
                     self.generics.objects.insert(n.id, name.clone());
-                    self.check_new_with_effects(n, name)
+                    self.check_new_with_effects(n, name, checked)
                 } else {
                     ty
                 };
@@ -328,10 +368,10 @@ impl TypeChecker {
         // Every array element receives the contextual element type, including
         // nested literals and class values stored through an interface.
         if let (Expr::ArrayLiteral(elements, _, _), Type::Array(elem)) = (expr, expected) {
-            return self.check_array_literal_expecting(elements, Some(elem));
+            return self.check_array_literal_expecting(elements, Some(elem), checked);
         }
         if let (Expr::ArrayLiteral(elements, _, _), Type::FixedArray(elem, n)) = (expr, expected) {
-            self.check_array_literal_expecting(elements, Some(elem));
+            self.check_array_literal_expecting(elements, Some(elem), checked);
             if elements.len() as u64 != *n {
                 self.push(
                     Diagnostic::new(
@@ -348,9 +388,12 @@ impl TypeChecker {
         // Check the receiver once with that context; ordinary values and explicit
         // constructor arguments retain their actual types in the normal checker.
         if let Expr::MethodCall(call) = expr
-            && call.method == "freeze"
+            && call.method.kind() == MethodName::Freeze
         {
             use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
+            if checked && self.expr_types.get(&call.id) == Some(expected) {
+                return self.reuse_checked_type(expr.id());
+            }
             let receiver = if let Some(element) = builtin_types::unary_arg(expected, B::FrozenArray)
             {
                 Some(Type::Array(Box::new(element.clone())))
@@ -360,27 +403,38 @@ impl TypeChecker {
             };
             if let Some(receiver) = receiver {
                 let generation = self.error_generation;
-                let ty = self.check_method_call_expecting(call, Some(&receiver));
+                let ty = self.check_method_call_expecting(call, Some(&receiver), checked);
                 return self.record_checked_expr(expr, ty, generation);
             }
         }
         // Contextually-typed lambda.
         if let (Expr::Lambda(lambda), Type::Fn(..) | Type::Closure(..)) = (expr, expected) {
+            // A successfully checked callable with this signature already owns
+            // its body facts. A different parameter or return type needs inference.
+            if checked
+                && let Some(actual) = self.expr_types.get(&lambda.id)
+                && (actual == expected
+                    || matches!((actual, expected),
+                    (Type::Fn(args, ret), Type::Closure(params, result)) if args == params && ret == result))
+                && !self
+                    .local
+                    .failed_checks
+                    .contains(&super::body::FailedCheck::Value(lambda.id))
+            {
+                return actual.clone();
+            }
             return self.check_lambda_expecting(lambda, expected);
         }
         // A ternary propagates the expected type into BOTH branches, so
         // `ok ? Ok(10) : Err("bad")` resolves its unqualified variants against
         // the expected enum exactly like a direct `return` does.
         if let Expr::Ternary(t) = expr {
-            return self.check_ternary_expecting(t, expected);
+            return self.check_ternary_expecting(t, expected, checked);
         }
         // A `match` in value position is the same story one arm wider: the
         // expected type reaches every arm VALUE.
         if let Expr::Match(m) = expr {
-            let previous = self.local.match_expected.replace(expected.clone());
-            let ty = self.check_match_expr(m);
-            self.local.match_expected = previous;
-            return ty;
+            return self.check_match_expr(m, Some(expected), checked);
         }
         // Unqualified enum-variant construction resolved by the expected type: `Ok(42)`
         // (payload) and `Closed`/`None` (fieldless), for
@@ -389,7 +443,7 @@ impl TypeChecker {
             && self.prelude_variant_name_is_unshadowed(&c.callee)
             && let Some((enum_name, payloads, result)) = self.expected_variant(&c.callee, expected)
         {
-            return self.construct_variant_call(c, &enum_name, &payloads, result);
+            return self.construct_variant_call(c, &enum_name, &payloads, result, checked);
         }
         // Qualified construction uses the same payload context. In
         // `Option::Some(Option::None)` expected as
@@ -400,7 +454,8 @@ impl TypeChecker {
                 self.expected_qualified_variant(&call.method, expected)
             && self.static_variant_matches_expected_enum(call, &enum_name, expected)
         {
-            return self.construct_static_variant_call(call, &enum_name, &payloads, result);
+            return self
+                .construct_static_variant_call(call, &enum_name, &payloads, result, checked);
         }
         if let Expr::Var(name, _span, _) = expr {
             // A bare identifier resolves to a fieldless variant only when no
@@ -434,14 +489,20 @@ impl TypeChecker {
         };
         let actual = if contextual_call {
             let generation = self.error_generation;
+            let context = CallContext {
+                expected: Some(expected),
+                checked,
+            };
             let ty = match expr {
-                Expr::StaticCall(call) => self.check_static_call(call, Some(expected)),
+                Expr::StaticCall(call) => self.check_static_call(call, context),
                 Expr::Call(call) => self
-                    .check_generic_call(call, Some(expected))
+                    .check_generic_call(call, context)
                     .expect("a registered generic function is checked"),
                 _ => unreachable!("contextual calls are calls"),
             };
             self.finish_checked_expr(expr, ty, generation)
+        } else if checked {
+            self.reuse_checked_type(expr.id())
         } else {
             self.check_expr(expr)
         };
@@ -519,33 +580,15 @@ impl TypeChecker {
     /// stays `bool`, and BOTH branches are checked expecting `expected`, so
     /// contextual forms (unqualified enum variants, contextually-typed lambdas,
     /// nested ternaries) resolve inside the branches.
-    pub(super) fn check_ternary_expecting(&mut self, t: &TernaryExpr, expected: &Type) -> Type {
-        let errors_before = self.error_generation;
-        let cond_ty = self.check_expr(&t.condition);
-        if cond_ty != Type::Bool
-            && self.error_generation == errors_before
-            && !Self::contains_error_type(&cond_ty)
-        {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0901,
-                    format!(
-                        "if-expression condition must be `bool`, found `{}`",
-                        self.diagnostic_type_name(&cond_ty)
-                    ),
-                )
-                .with_label(Label::primary(
-                    t.condition.span(),
-                    format!(
-                        "expected `bool`, found `{}`",
-                        self.diagnostic_type_name(&cond_ty)
-                    ),
-                )),
-            );
-        }
-        let then_ty = self.check_expr_expecting(&t.then_expr, expected);
-        let else_ty = self.check_expr_expecting(&t.else_expr, expected);
+    pub(super) fn check_ternary_expecting(
+        &mut self,
+        t: &TernaryExpr,
+        expected: &Type,
+        checked: bool,
+    ) -> Type {
+        self.check_ternary_condition(&t.condition, checked);
+        let then_ty = self.check_argument_expecting(&t.then_expr, expected, checked);
+        let else_ty = self.check_argument_expecting(&t.else_expr, expected, checked);
         let unified = if crate::semantic::generic_inference::has_enum_hole(expected) {
             match (&then_ty, &else_ty) {
                 (Type::Never, _) => Some(else_ty.clone()),
@@ -658,6 +701,7 @@ impl TypeChecker {
         enum_name: &str,
         payload_types: &[Type],
         result: Type,
+        checked: bool,
     ) -> Type {
         // `void` carries no runtime value, so a single `void` payload may be
         // omitted (`Ok()` for `Result<void, E>`). This is the unqualified
@@ -680,7 +724,7 @@ impl TypeChecker {
             );
         }
         for (param_ty, arg) in payload_types.iter().zip(c.args.iter()) {
-            let arg_ty = self.check_expr_expecting(&arg.expr, param_ty);
+            let arg_ty = self.check_argument_expecting(&arg.expr, param_ty, checked);
             if !self.types_compatible(param_ty, &arg_ty) {
                 let diagnostic = Diagnostic::new(
                     Severity::Error,
@@ -777,6 +821,7 @@ impl TypeChecker {
         enum_name: &str,
         payload_types: &[Type],
         result: Type,
+        checked: bool,
     ) -> Type {
         self.record_variant_use(enum_name, &call.method, call.method_span);
         // This contextual path bypasses check_expr/record_symbol_use.
@@ -814,7 +859,7 @@ impl TypeChecker {
             );
         }
         for (param_ty, arg) in payload_types.iter().zip(call.args.iter()) {
-            let arg_ty = self.check_expr_expecting(&arg.expr, param_ty);
+            let arg_ty = self.check_argument_expecting(&arg.expr, param_ty, checked);
             if !self.types_compatible(param_ty, &arg_ty) {
                 if crate::parser::tuples::is_tuple(enum_name) {
                     self.push(
@@ -902,7 +947,12 @@ impl TypeChecker {
     /// `self.heavy()`, free-function, and static-method calls are handled by the
     /// AST-level `ConcurrencyAnalyzer`; this covers the typed-receiver case it
     /// cannot resolve, so the two never overlap.
-    pub(super) fn check_task_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) {
+    pub(super) fn check_task_method_call(
+        &mut self,
+        obj_ty: &Type,
+        m: &MethodCallExpr,
+        spelling: &str,
+    ) {
         if self.task_sync_preemption || !self.local.current_async_context {
             return;
         }
@@ -916,12 +966,12 @@ impl TypeChecker {
         // base chain), so an override on a subclass is judged on its own body —
         // a loop-free override must not inherit the base's E0810, and an
         // inherited looping method is attributed to the base that defines it.
-        let Some(declaring) = self.resolved_method_class(class, &m.method) else {
+        let Some(declaring) = self.resolved_method_class(class, spelling) else {
             return;
         };
         let key = crate::semantic::ids::FunctionId::method(
             crate::semantic::ids::TypeId::from_source_name(&declaring),
-            m.method.as_str(),
+            spelling,
         );
         self.task_method_calls
             .push(crate::compiler_db::effects::TaskMethodCall {
@@ -990,8 +1040,9 @@ impl TypeChecker {
         param: &ParamInfo,
         arg: &CallArg,
         require_mutable: bool,
+        checked: bool,
     ) {
-        let Some(place) = self.reference_place_info(&arg.expr, arg.span) else {
+        let Some(place) = self.reference_place_info(&arg.expr, arg.span, checked) else {
             return;
         };
         self.check_reference_argument_place(param, arg, require_mutable, place);

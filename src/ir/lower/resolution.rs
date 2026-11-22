@@ -62,7 +62,7 @@ fn lower_source_declarations(
                      result: &Type,
                      is_static,
                      is_async,
-                     bound: &[String]| HirSignature {
+                     bound: Option<&BoundNames<'_>>| HirSignature {
         params: params
             .iter()
             .map(|p| tables.normalize_declared(&p.ty, bound).into())
@@ -85,6 +85,7 @@ fn lower_source_declarations(
     for item in prelude.items.iter().chain(&program.items) {
         match item {
             Item::Enum(e) => {
+                let bound = bound_names(&e.type_params);
                 out.enums.insert(
                     canonical(&e.name),
                     HirEnumInfo {
@@ -103,7 +104,7 @@ fn lower_source_declarations(
                                 payloads: variant
                                     .payload
                                     .iter()
-                                    .map(|ty| tables.normalize_declared(ty, &e.type_params).into())
+                                    .map(|ty| tables.normalize_declared(ty, Some(&bound)).into())
                                     .collect(),
                             })
                             .collect(),
@@ -113,7 +114,7 @@ fn lower_source_declarations(
             Item::Function(f) => {
                 out.functions.insert(
                     FunctionId::free_from_source_name(&f.name),
-                    signature(&f.params, &f.return_type, true, f.is_async, &[]),
+                    signature(&f.params, &f.return_type, true, f.is_async, None),
                 );
             }
             Item::Class(c) => {
@@ -143,7 +144,7 @@ fn lower_source_declarations(
                 info.constructor = c
                     .constructors
                     .first()
-                    .map(|ctor| signature(&ctor.params, &Type::Void, false, false, &[]));
+                    .map(|ctor| signature(&ctor.params, &Type::Void, false, false, None));
                 for method in &c.methods {
                     info.methods.insert(
                         method.name.clone(),
@@ -152,13 +153,15 @@ fn lower_source_declarations(
                             &method.return_type,
                             method.is_static,
                             method.is_async,
-                            &[],
+                            None,
                         ),
                     );
                 }
                 out.classes.insert(canonical(&c.name), info);
             }
             Item::Interface(interface) => {
+                let mut bound = bound_names(&interface.type_params);
+                bound.insert("Self");
                 if interface.public {
                     out.open_dispatch_types.insert(canonical(&interface.name));
                 }
@@ -186,12 +189,7 @@ fn lower_source_declarations(
                                         &method.return_type,
                                         method.is_static,
                                         false,
-                                        &interface
-                                            .type_params
-                                            .iter()
-                                            .cloned()
-                                            .chain(std::iter::once("Self".to_string()))
-                                            .collect::<Vec<_>>(),
+                                        Some(&bound),
                                     ),
                                 )
                             })
@@ -206,6 +204,7 @@ fn lower_source_declarations(
 fn lower_checked_declarations(tables: &PartialCheckerTables<'_>, out: &mut HirResolution) {
     if let Some(enums) = tables.enums {
         for (key, info) in enums {
+            let bound = bound_names(&info.type_params);
             insert_declared(
                 &mut out.enums,
                 key,
@@ -225,7 +224,7 @@ fn lower_checked_declarations(tables: &PartialCheckerTables<'_>, out: &mut HirRe
                             payloads: variant
                                 .payload_types
                                 .iter()
-                                .map(|ty| tables.normalize_declared(ty, &info.type_params).into())
+                                .map(|ty| tables.normalize_declared(ty, Some(&bound)).into())
                                 .collect(),
                         })
                         .collect(),
@@ -265,7 +264,7 @@ fn lower_checked_symbols(tables: &PartialCheckerTables<'_>, out: &mut HirResolut
                              result: &Type,
                              is_static,
                              is_async,
-                             bound: &[String]| {
+                             bound: Option<&BoundNames<'_>>| {
         HirSignature {
             params: params
                 .iter()
@@ -299,7 +298,7 @@ fn lower_checked_symbols(tables: &PartialCheckerTables<'_>, out: &mut HirResolut
                             &function.return_type,
                             true,
                             function.is_async,
-                            &[],
+                            None,
                         ),
                     )
                 })
@@ -316,11 +315,13 @@ fn lower_checked_symbols(tables: &PartialCheckerTables<'_>, out: &mut HirResolut
                     &function.return_type,
                     true,
                     function.is_async,
-                    &[],
+                    None,
                 ),
             );
         }
         for (key, interface) in &symbols.interfaces {
+            let mut bound = bound_names(&interface.type_params);
+            bound.insert("Self");
             if interface.public {
                 out.open_dispatch_types.insert(*key);
                 out.open_dispatch_types
@@ -353,12 +354,7 @@ fn lower_checked_symbols(tables: &PartialCheckerTables<'_>, out: &mut HirResolut
                                     &method.return_type,
                                     method.is_static,
                                     false,
-                                    &interface
-                                        .type_params
-                                        .iter()
-                                        .cloned()
-                                        .chain(std::iter::once("Self".to_string()))
-                                        .collect::<Vec<_>>(),
+                                    Some(&bound),
                                 ),
                             )
                         })
@@ -400,7 +396,7 @@ fn lower_checked_symbols(tables: &PartialCheckerTables<'_>, out: &mut HirResolut
                             &Type::Void,
                             false,
                             false,
-                            &[],
+                            None,
                         )
                     }),
                     methods: class
@@ -415,7 +411,7 @@ fn lower_checked_symbols(tables: &PartialCheckerTables<'_>, out: &mut HirResolut
                                     &method.return_type,
                                     method.is_static,
                                     method.is_async,
-                                    &[],
+                                    None,
                                 ),
                             )
                         })

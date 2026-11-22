@@ -625,8 +625,14 @@ impl CloneShell for SelectCaseKind {
         }
     }
 }
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CLONED_EXPR_NODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 impl Expr {
     fn shallow_clone(&self) -> Self {
+        #[cfg(test)]
+        CLONED_EXPR_NODES.with(|count| count.set(count.get() + 1));
         match self {
             Self::Binary(v) => Self::Binary(v.clone_shell()),
             Self::Unary(v) => Self::Unary(v.clone_shell()),

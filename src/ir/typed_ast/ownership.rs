@@ -164,7 +164,9 @@ fn shallow_expr(source: &HirExpr) -> HirExpr {
             method,
             args,
             super_class,
+            builtin,
         } => HirExprKind::MethodCall {
+            builtin: *builtin,
             object: Box::new(empty_expr()),
             method: method.clone(),
             args: expr_slots(args.len()),
@@ -880,6 +882,7 @@ mod tests {
                 field: "field".into(),
             },
             10 => HirExprKind::MethodCall {
+                builtin: None,
                 object: Box::new(child),
                 method: "method".into(),
                 args: vec![leaf()],

@@ -19,14 +19,14 @@ impl TypeChecker {
                 } => {
                     let ch_ty = self.check_expr(channel);
                     let elem = self.select_channel_elem(&ch_ty, channel.span());
-                    // `recv_opt` binds `Option<T>`: `None` when the case ran
-                    // because the channel closed.
-                    let elem = if *closed_aware && elem != Type::Void {
-                        B::Option.apply(vec![elem])
-                    } else {
-                        elem
-                    };
                     if binding != "_" {
+                        let elem = elem.into_owned();
+                        // Closed channels bind None in a close-aware receive.
+                        let elem = if *closed_aware && elem != Type::Void {
+                            B::Option.apply(vec![elem])
+                        } else {
+                            elem
+                        };
                         // Include the received binding in the task's Send check,
                         // independently of other bindings at the same source span.
                         if self.local.current_async_context {
@@ -52,18 +52,8 @@ impl TypeChecker {
                     let ch_ty = self.check_expr(channel);
                     let elem = self.select_channel_elem(&ch_ty, channel.span());
                     let v_ty = self.check_expr(value);
-                    // A bounded send can suspend while holding the value,
-                    // so its type participates in the task's Send check.
-                    if self.local.current_async_context && elem != Type::Void {
-                        self.record_async_local(
-                            elem.clone(),
-                            "select send value",
-                            value.span(),
-                            super::async_retention::Key::Value(value.id()),
-                        );
-                    }
-                    if elem != Type::Void
-                        && v_ty != elem
+                    if *elem != Type::Void
+                        && v_ty != *elem
                         && !self.recovery_types_compatible(&elem, &v_ty)
                     {
                         self.push(
@@ -77,6 +67,16 @@ impl TypeChecker {
                                 ),
                             )
                             .with_label(Label::primary(value.span(), "wrong value type")),
+                        );
+                    }
+                    // A bounded send can suspend while holding the value,
+                    // so its type participates in the task's Send check.
+                    if self.local.current_async_context && *elem != Type::Void {
+                        self.record_async_local(
+                            elem.into_owned(),
+                            "select send value",
+                            value.span(),
+                            super::async_retention::Key::Value(value.id()),
                         );
                     }
                 }
@@ -181,42 +181,37 @@ impl TypeChecker {
         }
     }
 
-    /// True when `obj_ty` is a class type — a builtin-sounding method name
-    /// (`close`, `send`, `recv`) on a CLASS receiver must resolve through
-    /// normal class-method lookup: either the user's method, or a proper
-    /// "no method on class" error — never the misleading channel-builtin
-    /// "expected `Channel<T>`" (deferred action checking found via `defer r.close()`).
-    fn class_defines_method(&self, obj_ty: &Type, _method: &str) -> bool {
-        matches!(obj_ty, Type::Named(name) if self.symbols.lookup_class(name).is_some())
-    }
-
     /// Type-check method calls on `Option<T>` and `Result<T,E>`.
-    /// Returns `Some(return_type)` if the call was handled, `None` to fall through.
+    /// Callback parameter and return types depend on the receiver's payloads.
     pub(super) fn check_option_result_method_call(
         &mut self,
         obj_ty: &Type,
         call: &MethodCallExpr,
-    ) -> Option<Type> {
-        use super::builtin_methods::{OptionAction, TransformResult, option_method};
-        let builtin = builtin_types::resolve(obj_ty)?;
-        let (arity, action) = option_method(builtin.id, &call.method)?;
+        spelling: &str,
+        method: AdtMethod,
+    ) -> Type {
+        use super::builtin_methods::{OptionAction, TransformResult, adt_arity, option_action};
+        let builtin = builtin_types::resolve(obj_ty).expect("checked Option or Result");
+        let arity = adt_arity(method);
+        let action = option_action(builtin.id, method);
         let owner = builtin.id.source_name();
-        let inner = builtin.args.first().cloned().unwrap_or(Type::Void);
-        let error = builtin.args.get(1).cloned().unwrap_or(Type::Void);
+        static VOID: Type = Type::Void;
+        let inner = builtin.args.first().unwrap_or(&VOID);
+        let error = builtin.args.get(1).unwrap_or(&VOID);
         if call.args.len() != arity.count {
             self.check_discarded_builtin_args(&call.args);
-            self.check_builtin_arity(arity, owner, &call.method, call.args.len(), call.span);
-            return Some(match action {
+            self.check_builtin_arity(arity, owner, spelling, call.args.len(), call.span);
+            return match action {
                 OptionAction::Bool => Type::Bool,
-                OptionAction::ErrorPayload => error,
+                OptionAction::ErrorPayload => error.clone(),
                 OptionAction::Transform { .. } => obj_ty.clone(),
-                _ => inner,
-            });
+                _ => inner.clone(),
+            };
         }
-        Some(match action {
+        match action {
             OptionAction::Bool => Type::Bool,
-            OptionAction::Payload => inner,
-            OptionAction::ErrorPayload => error,
+            OptionAction::Payload => inner.clone(),
+            OptionAction::ErrorPayload => error.clone(),
             OptionAction::Message | OptionAction::Default => {
                 let got = self.check_expr(&call.args[0].expr);
                 let rule = if matches!(action, OptionAction::Message) {
@@ -227,46 +222,51 @@ impl TypeChecker {
                 self.check_builtin_argument(
                     rule,
                     owner,
-                    &call.method,
-                    &inner,
+                    spelling,
+                    inner,
                     &got,
                     call.args[0].expr.span(),
                 );
-                inner
+                inner.clone()
             }
             OptionAction::Transform {
                 error_input,
                 no_input,
                 result,
             } => {
-                let input = if error_input { &error } else { &inner };
+                let input = if error_input { error } else { inner };
                 let params = if no_input {
                     &[][..]
                 } else {
                     std::slice::from_ref(input)
                 };
-                let f_ty = self.check_fn_arg_with_param_context(&call.args[0].expr, params, false);
+                let mut f_ty =
+                    self.check_fn_arg_with_param_context(&call.args[0].expr, params, false);
                 match f_ty {
-                    Type::Fn(ref parameters, ref ret) | Type::Closure(ref parameters, ref ret)
+                    Type::Fn(ref parameters, ref mut ret)
+                    | Type::Closure(ref parameters, ref mut ret)
                         if parameters.len() == params.len() =>
                     {
                         if !no_input {
                             self.check_builtin_argument(
                                 BuiltinArgument::Closure,
                                 owner,
-                                &call.method,
+                                spelling,
                                 input,
                                 &parameters[0],
                                 call.args[0].expr.span(),
                             );
                         }
+                        let output = std::mem::replace(ret.as_mut(), Type::Void);
                         match result {
-                            TransformResult::Option => B::Option.apply(vec![*ret.clone()]),
-                            TransformResult::ResultOk => B::Result.apply(vec![*ret.clone(), error]),
-                            TransformResult::ResultErr => {
-                                B::Result.apply(vec![inner, *ret.clone()])
+                            TransformResult::Option => B::Option.apply(vec![output]),
+                            TransformResult::ResultOk => {
+                                B::Result.apply(vec![output, error.clone()])
                             }
-                            TransformResult::Direct => *ret.clone(),
+                            TransformResult::ResultErr => {
+                                B::Result.apply(vec![inner.clone(), output])
+                            }
+                            TransformResult::Direct => output,
                         }
                     }
                     _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
@@ -275,23 +275,23 @@ impl TypeChecker {
                         Self::error_type()
                     }
                     _ => {
-                        let signature = match (builtin.id, call.method.as_str()) {
-                            (_, "map") => {
+                        let signature = match (builtin.id, method) {
+                            (_, AdtMethod::Map) => {
                                 format!("fn({}) -> U", self.diagnostic_type_name(input))
                             }
-                            (B::Result, "map_err") => {
+                            (B::Result, AdtMethod::MapErr) => {
                                 format!("fn({}) -> F", self.diagnostic_type_name(input))
                             }
-                            (B::Option, "and_then") => {
+                            (B::Option, AdtMethod::AndThen) => {
                                 format!("fn({}) -> Option<U>", self.diagnostic_type_name(input))
                             }
-                            (B::Option, "or_else") => {
+                            (B::Option, AdtMethod::OrElse) => {
                                 format!("fn() -> Option<{}>", self.diagnostic_type_name(input))
                             }
-                            (B::Result, "and_then") => {
+                            (B::Result, AdtMethod::AndThen) => {
                                 format!("fn({}) -> Result<U, E>", self.diagnostic_type_name(input))
                             }
-                            (B::Result, "or_else") => {
+                            (B::Result, AdtMethod::OrElse) => {
                                 format!("fn({}) -> Result<T, F>", self.diagnostic_type_name(input))
                             }
                             _ => unreachable!(),
@@ -302,7 +302,7 @@ impl TypeChecker {
                                 ErrorCode::E0201,
                                 format!(
                                     "`{owner}::{}` expects a function `{signature}`, found `{}`",
-                                    call.method,
+                                    spelling,
                                     self.diagnostic_type_name(&f_ty)
                                 ),
                             )
@@ -315,7 +315,7 @@ impl TypeChecker {
                     }
                 }
             }
-        })
+        }
     }
 
     /// Type-check a method on the explicitly native-blocking compatibility
@@ -330,23 +330,15 @@ impl TypeChecker {
         lock: &str,
         elem: &Type,
         call: &MethodCallExpr,
+        spelling: &str,
+        signature: Option<ResolvedMethod>,
     ) -> Type {
-        // (expected arg type, return type) per method.
-        let sig: Option<(Option<Type>, Type)> = match (B::from_name(lock), call.method.as_str()) {
-            (Some(B::BlockingCell), "get") | (Some(B::BlockingRwCell), "read") => {
-                Some((None, elem.clone()))
-            }
-            (Some(B::BlockingCell), "set") | (Some(B::BlockingRwCell), "write") => {
-                Some((Some(elem.clone()), Type::Void))
-            }
-            _ => None,
-        };
-        let Some((arg_ty, ret)) = sig else {
+        let Some(sig) = signature else {
             self.check_discarded_builtin_args(&call.args);
             let mut diagnostic = Diagnostic::new(
                 Severity::Error,
                 ErrorCode::E0806,
-                format!("`{lock}<T>` has no method `{}`", call.method),
+                format!("`{lock}<T>` has no method `{}`", spelling),
             )
             .with_label(Label::primary(call.span, "unknown lock method"));
             diagnostic = if matches!(B::from_name(lock), Some(B::Mutex | B::RwLock)) {
@@ -370,54 +362,51 @@ impl TypeChecker {
             self.push(diagnostic);
             return Type::Void;
         };
-        let expected_argc = usize::from(arg_ty.is_some());
+        let expected_argc = sig.arity;
         self.check_builtin_arity(
             BuiltinArity::new(expected_argc, ArityText::ArgumentS),
             lock,
-            &call.method,
+            spelling,
             call.args.len(),
             call.span,
         );
-        if let (Some(expected), Some(arg)) = (arg_ty, call.args.first()) {
+        if sig.arity == 1
+            && let Some(arg) = call.args.first()
+        {
             let got = self.check_expr(&arg.expr);
             self.check_builtin_argument(
                 BuiltinArgument::Cell,
                 lock,
-                &call.method,
-                &expected,
+                spelling,
+                elem,
                 &got,
                 arg.expr.span(),
             );
         }
-        ret
+        sig.return_type(|_| None)
     }
 
     /// Type-check a method on `AtomicI64` / `AtomicBool`.
     /// `compare_exchange(T, T) -> bool`, `load() -> T`, `store(T)`, `add(T)/sub(T) -> T` (i64 only), `swap(T) -> T`.
-    pub(super) fn check_atomic_method_call(&mut self, atomic: &str, call: &MethodCallExpr) -> Type {
+    pub(super) fn check_atomic_method_call(
+        &mut self,
+        atomic: &str,
+        call: &MethodCallExpr,
+        spelling: &str,
+        signature: Option<ResolvedMethod>,
+    ) -> Type {
         let elem = if B::from_name(atomic) == Some(B::AtomicI64) {
             Type::I64
         } else {
             Type::Bool
         };
-        // (arg count, expected arg type, return type)
-        let sig: Option<(usize, Option<Type>, Type)> = match call.method.as_str() {
-            "load" => Some((0, None, elem.clone())),
-            "store" => Some((1, Some(elem.clone()), Type::Void)),
-            "compare_exchange" => Some((2, Some(elem.clone()), Type::Bool)),
-            "swap" => Some((1, Some(elem.clone()), elem.clone())),
-            "add" | "sub" if B::from_name(atomic) == Some(B::AtomicI64) => {
-                Some((1, Some(Type::I64), Type::I64))
-            }
-            _ => None,
-        };
-        let Some((argc, arg_ty, ret)) = sig else {
+        let Some(sig) = signature else {
             self.check_discarded_builtin_args(&call.args);
             self.push(
                 Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0806,
-                    format!("`{atomic}` has no method `{}`", call.method),
+                    format!("`{atomic}` has no method `{}`", spelling),
                 )
                 .with_label(Label::primary(call.span, "unknown atomic method"))
                 .with_help("`AtomicI64`: load/store/add/sub/swap/compare_exchange; `AtomicBool`: load/store/swap/compare_exchange"),
@@ -425,14 +414,14 @@ impl TypeChecker {
             return Type::Void;
         };
         self.check_builtin_arity(
-            BuiltinArity::new(argc, ArityText::ArgumentS),
+            BuiltinArity::new(sig.arity, ArityText::ArgumentS),
             atomic,
-            &call.method,
+            spelling,
             call.args.len(),
             call.span,
         );
         for arg in &call.args {
-            let Some(expected) = arg_ty.as_ref() else {
+            if sig.arity == 0 {
                 self.check_expr(&arg.expr);
                 continue;
             };
@@ -440,366 +429,281 @@ impl TypeChecker {
             self.check_builtin_argument(
                 BuiltinArgument::Cell,
                 atomic,
-                &call.method,
-                expected,
+                spelling,
+                &elem,
                 &got,
                 arg.expr.span(),
             );
         }
-        ret
+        sig.return_type(|_| None)
     }
 
-    pub(super) fn check_concurrency_method_call(
+    pub(super) fn check_task_control_method_call(
         &mut self,
-        obj_ty: &Type,
+        kind: &str,
         call: &MethodCallExpr,
-    ) -> Option<Type> {
-        // Atomic primitives.
-        if let Some(id @ (B::AtomicI64 | B::AtomicBool)) =
-            builtin_types::resolve(obj_ty).map(|resolved| resolved.id)
-        {
-            return Some(self.check_atomic_method_call(id.source_name(), call));
-        }
-        if let Some(kind_id @ (B::CancellationToken | B::TaskScope)) =
-            builtin_types::resolve(obj_ty).map(|resolved| resolved.id)
-        {
-            let kind = kind_id.source_name();
-            for arg in &call.args {
-                if matches!(arg.mode, CallArgMode::Reference { .. }) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E1703,
-                            "unexpected reference argument",
-                        )
-                        .with_label(Label::primary(
-                            arg.span,
-                            format!("`{kind}::{}` takes Task values by value", call.method),
-                        )),
-                    );
-                }
-            }
-            return Some(match call.method.as_str() {
-                "cancel" | "is_cancelled" | "child" | "finish" => {
-                    if call.args.len() != method_arity(kind, &call.method).count {
-                        self.check_discarded_builtin_args(&call.args);
-                        self.check_builtin_arity(
-                            method_arity(kind, &call.method),
-                            kind,
-                            &call.method,
-                            call.args.len(),
-                            call.span,
-                        );
-                    }
-                    match call.method.as_str() {
-                        "cancel" => Type::Void,
-                        "is_cancelled" => Type::Bool,
-                        "child" => Type::Named(kind.to_string()),
-                        "finish" if kind_id == B::TaskScope => B::Task.apply(vec![
-                            B::Result.apply(vec![Type::Void, Type::Named("Cancelled".to_string())]),
-                        ]),
-                        "finish" => {
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    "`CancellationToken` has no `finish` method",
-                                )
-                                .with_label(Label::primary(call.span, "unknown token method")),
-                            );
-                            Type::Void
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                "attach" | "add" => {
-                    let valid_name = (kind_id == B::CancellationToken && call.method == "attach")
-                        || (kind_id == B::TaskScope && call.method == "add");
-                    if !valid_name {
-                        self.check_discarded_builtin_args(&call.args);
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!("`{kind}` has no `{}` method", call.method),
-                            )
-                            .with_label(Label::primary(call.span, "unknown method")),
-                        );
-                        Type::Void
-                    } else if call.args.len() != method_arity(kind, &call.method).count {
-                        self.check_discarded_builtin_args(&call.args);
-                        self.check_builtin_arity(
-                            method_arity(kind, &call.method),
-                            kind,
-                            &call.method,
-                            call.args.len(),
-                            call.span,
-                        );
-                        Type::Void
-                    } else {
-                        let task_ty = self.check_expr(&call.args[0].expr);
-                        if !is_task_handle_type(&task_ty) && Self::contains_error_type(&task_ty) {
-                            Self::error_type()
-                        } else if !self.check_builtin_argument(
-                            BuiltinArgument::Task,
-                            kind,
-                            &call.method,
-                            &Type::Void,
-                            &task_ty,
-                            call.args[0].expr.span(),
-                        ) {
-                            Type::Void
-                        } else {
-                            task_ty
-                        }
-                    }
-                }
-                _ => {
-                    self.check_discarded_builtin_args(&call.args);
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!("unknown `{kind}` method `{}`", call.method),
-                        )
-                        .with_label(Label::primary(call.span, "unknown method")),
-                    );
-                    Type::Void
-                }
-            });
-        }
-        // Scheduler-aware locks route here only to get the lexical-API
-        // migration diagnostic. Native-blocking compatibility is explicitly
-        // named BlockingCell/BlockingRwCell.
-        if let Type::Generic(n, args) = obj_ty
-            && matches!(
-                B::from_name(n.as_str()),
-                Some(B::Mutex | B::RwLock | B::BlockingCell | B::BlockingRwCell)
-            )
-            && args.len() == 1
-        {
-            return Some(self.check_lock_method_call(n, &args[0].clone(), call));
-        }
-        match call.method.as_str() {
-            // `result()`: a cancellation-aware awaitable VIEW of
-            // the same task and the same async frame. It starts nothing, waits
-            // for nothing, and duplicates nothing — only `await` on the
-            // returned `TaskResult<T>` waits, and it maps a cancelled task to
-            // `Err(Cancelled)` instead of panicking.
-            "result" if join_handle_result_type(obj_ty).is_some() => {
-                self.check_builtin_arity(
-                    method_arity("Task", &call.method),
-                    "Task",
-                    &call.method,
-                    call.args.len(),
-                    call.span,
-                );
-                Some(B::TaskResult.apply(vec![join_handle_result_type(obj_ty).unwrap()]))
-            }
-            // Cooperative cancellation.
-            "cancel" | "is_cancelled" if join_handle_result_type(obj_ty).is_some() => {
-                self.check_builtin_arity(
-                    method_arity("Task", &call.method),
-                    "Task",
-                    &call.method,
-                    call.args.len(),
-                    call.span,
-                );
-                Some(if call.method == "cancel" {
-                    Type::Void
-                } else {
-                    Type::Bool
-                })
-            }
-            // `join()` and `try_join()` are REMOVED: every Task
-            // completion wait is expressed through `await`. Keep both names
-            // intercepted for Task handles so users get a migration diagnostic
-            // rather than an unrelated "unknown method" error. Unrelated user
-            // classes may still define methods with either name.
-            "join" | "try_join" if !self.class_defines_method(obj_ty, &call.method) => {
-                self.check_discarded_builtin_args(&call.args);
-                if !is_task_handle_type(obj_ty) {
-                    return None;
-                }
-                let is_try_join = call.method == "try_join";
-                let code = if is_try_join {
-                    ErrorCode::E0813
-                } else {
-                    ErrorCode::E0812
-                };
+        spelling: &str,
+        lookup: MethodLookup<String>,
+    ) -> Type {
+        for arg in &call.args {
+            if matches!(arg.mode, CallArgMode::Reference { .. }) {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
-                        code,
-                        format!(
-                            "`{}::{}` has been removed",
-                            self.diagnostic_type_name(obj_ty),
-                            if is_try_join { "try_join()" } else { "join()" }
-                        ),
+                        ErrorCode::E1703,
+                        "unexpected reference argument",
                     )
                     .with_label(Label::primary(
-                        call.span,
-                        format!("`{}` no longer exists", call.method),
-                    ))
-                    .with_help("use `await task`")
-                    .with_help("make the containing function `async` if necessary")
-                    .with_help("to handle cancellation as a value, use `await task.result()`"),
+                        arg.span,
+                        format!("`{kind}::{}` takes Task values by value", spelling),
+                    )),
                 );
-                let Type::Generic(_, args) = obj_ty else {
-                    unreachable!()
-                };
-                Some(if is_try_join {
+            }
+        }
+        match lookup {
+            MethodLookup::Intrinsic(sig)
+                if matches!(sig.intrinsic, Intrinsic::TokenAttach | Intrinsic::ScopeAdd) =>
+            {
+                if call.args.len() != sig.arity {
+                    self.check_discarded_builtin_args(&call.args);
+                    self.check_builtin_arity(
+                        BuiltinArity::new(sig.arity, ArityText::Method("")),
+                        kind,
+                        spelling,
+                        call.args.len(),
+                        call.span,
+                    );
                     Type::Void
                 } else {
-                    args[0].clone()
-                })
-            }
-            "send" if !self.class_defines_method(obj_ty, "send") => {
-                let channel_type = channel_element_type(obj_ty);
-                if channel_type.is_none() {
-                    self.check_discarded_builtin_args(&call.args);
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0806,
-                            format!(
-                                "cannot call `send` on `{}`",
-                                self.diagnostic_type_name(obj_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(call.span, "expected `Channel<T>`")),
-                    );
-                    return Some(Type::Void);
-                }
-                let element_ty = channel_type.unwrap();
-                // A sent value crosses task/worker boundaries, so the channel
-                // item type must be Send (parallel-map Send checking, spec §10; gated like the
-                // other data-race checks).
-                if self.enforce_send_sync && element_ty != Type::Void && !self.is_send(&element_ty)
-                {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E2403,
-                            format!(
-                                "channel item type `{}` must be `Send`",
-                                self.diagnostic_type_name(&element_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(
-                            call.span,
-                            "this value crosses a task boundary",
-                        ))
-                        .with_help("send Send values (scalars, String, frozen/Sync types) through channels"),
-                    );
-                }
-                self.check_builtin_arity(
-                    method_arity("Channel", &call.method),
-                    "Channel",
-                    &call.method,
-                    call.args.len(),
-                    call.span,
-                );
-                if let Some(arg) = call.args.first() {
-                    let arg_ty = self.check_expr_expecting(&arg.expr, &element_ty);
-                    // Record each suspended value independently: a
-                    // cooperative `send` on a bounded channel is a suspend
-                    // point, so the lowering frame-backs channel + value and
-                    // carries the value into the task.
-                    if self.local.current_async_context && element_ty != Type::Void {
-                        self.record_async_local(
-                            element_ty.clone(),
-                            "channel send value",
-                            arg.expr.span(),
-                            super::async_retention::Key::Value(arg.expr.id()),
-                        );
-                    }
-                    if matches!(arg.mode, CallArgMode::Reference { .. }) {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E1703,
-                                "unexpected reference argument",
-                            )
-                            .with_label(Label::primary(
-                                arg.span,
-                                format!(
-                                    "send expects `{}`, not `& {}`",
-                                    self.diagnostic_type_name(&element_ty),
-                                    self.diagnostic_type_name(&arg_ty)
-                                ),
-                            )),
-                        );
+                    let task_ty = self.check_expr(&call.args[0].expr);
+                    if !is_task_handle_type(&task_ty) && Self::contains_error_type(&task_ty) {
+                        Self::error_type()
+                    } else if !self.check_builtin_argument(
+                        BuiltinArgument::Task,
+                        kind,
+                        spelling,
+                        &Type::Void,
+                        &task_ty,
+                        call.args[0].expr.span(),
+                    ) {
+                        Type::Void
                     } else {
-                        self.check_builtin_argument(
-                            BuiltinArgument::Channel,
-                            "Channel",
-                            &call.method,
-                            &element_ty,
-                            &arg_ty,
-                            arg.expr.span(),
-                        );
-                    }
-                }
-                Some(Type::Void)
-            }
-            method @ ("recv" | "recv_opt") if !self.class_defines_method(obj_ty, method) => {
-                self.check_builtin_arity(
-                    method_arity("Channel", &call.method),
-                    "Channel",
-                    &call.method,
-                    call.args.len(),
-                    call.span,
-                );
-                match channel_element_type(obj_ty) {
-                    // `recv_opt` answers `None` once the channel is closed and
-                    // drained instead of raising.
-                    Some(element_ty) if method == "recv_opt" => {
-                        Some(B::Option.apply(vec![element_ty]))
-                    }
-                    Some(element_ty) => Some(element_ty),
-                    None => {
-                        self.check_discarded_builtin_args(&call.args);
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0806,
-                                format!(
-                                    "cannot call `{method}` on `{}`",
-                                    self.diagnostic_type_name(obj_ty)
-                                ),
-                            )
-                            .with_label(Label::primary(call.span, "expected `Channel<T>`")),
-                        );
-                        Some(Type::Void)
+                        task_ty
                     }
                 }
             }
-            "close" if !self.class_defines_method(obj_ty, "close") => {
-                self.check_builtin_arity(
-                    method_arity("Channel", &call.method),
-                    "Channel",
-                    &call.method,
-                    call.args.len(),
-                    call.span,
-                );
-                if channel_element_type(obj_ty).is_none() {
+            MethodLookup::Intrinsic(sig) => {
+                if call.args.len() != sig.arity {
                     self.check_discarded_builtin_args(&call.args);
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0806,
-                            format!(
-                                "cannot call `close` on `{}`",
-                                self.diagnostic_type_name(obj_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(call.span, "expected `Channel<T>`")),
+                    self.check_builtin_arity(
+                        BuiltinArity::new(sig.arity, ArityText::QualifiedCount),
+                        kind,
+                        spelling,
+                        call.args.len(),
+                        call.span,
                     );
                 }
-                Some(Type::Void)
+                sig.return_type(|_| None)
             }
-            _ => None,
+            MethodLookup::Missing(MethodName::Finish) => {
+                if !call.args.is_empty() {
+                    self.check_discarded_builtin_args(&call.args);
+                    self.check_builtin_arity(
+                        BuiltinArity::new(0, ArityText::QualifiedCount),
+                        kind,
+                        spelling,
+                        call.args.len(),
+                        call.span,
+                    );
+                }
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        "`CancellationToken` has no `finish` method",
+                    )
+                    .with_label(Label::primary(call.span, "unknown token method")),
+                );
+                Type::Void
+            }
+            MethodLookup::Missing(MethodName::Attach | MethodName::Add) => {
+                self.check_discarded_builtin_args(&call.args);
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!("`{kind}` has no `{}` method", spelling),
+                    )
+                    .with_label(Label::primary(call.span, "unknown method")),
+                );
+                Type::Void
+            }
+            _ => {
+                self.check_discarded_builtin_args(&call.args);
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!("unknown `{kind}` method `{}`", spelling),
+                    )
+                    .with_label(Label::primary(call.span, "unknown method")),
+                );
+                Type::Void
+            }
         }
+    }
+    pub(super) fn check_retired_task_wait(
+        &mut self,
+        obj_ty: &Type,
+        call: &MethodCallExpr,
+        spelling: &str,
+        name: MethodName,
+    ) -> Type {
+        self.check_discarded_builtin_args(&call.args);
+        let is_try_join = name == MethodName::TryJoin;
+        let code = if is_try_join {
+            ErrorCode::E0813
+        } else {
+            ErrorCode::E0812
+        };
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                code,
+                format!(
+                    "`{}::{}` has been removed",
+                    self.diagnostic_type_name(obj_ty),
+                    if is_try_join { "try_join()" } else { "join()" }
+                ),
+            )
+            .with_label(Label::primary(
+                call.span,
+                format!("`{}` no longer exists", spelling),
+            ))
+            .with_help("use `await task`")
+            .with_help("make the containing function `async` if necessary")
+            .with_help("to handle cancellation as a value, use `await task.result()`"),
+        );
+        let Type::Generic(_, args) = obj_ty else {
+            unreachable!()
+        };
+        if is_try_join {
+            Type::Void
+        } else {
+            args[0].clone()
+        }
+    }
+
+    pub(super) fn check_invalid_channel_receiver(
+        &mut self,
+        obj_ty: &Type,
+        call: &MethodCallExpr,
+        spelling: &str,
+        attempted: Intrinsic,
+    ) -> Type {
+        if attempted != Intrinsic::ChannelSend {
+            self.check_builtin_arity(
+                BuiltinArity::new(0, ArityText::Plain),
+                "Channel",
+                spelling,
+                call.args.len(),
+                call.span,
+            );
+        }
+        self.check_discarded_builtin_args(&call.args);
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0806,
+                format!(
+                    "cannot call `{}` on `{}`",
+                    spelling,
+                    self.diagnostic_type_name(obj_ty)
+                ),
+            )
+            .with_label(Label::primary(call.span, "expected `Channel<T>`")),
+        );
+        Type::Void
+    }
+
+    pub(super) fn check_channel_send(
+        &mut self,
+        obj_ty: &Type,
+        call: &MethodCallExpr,
+        spelling: &str,
+        arity: usize,
+    ) -> Type {
+        let element_ty = channel_element_type(obj_ty).expect("checked channel receiver");
+        // A sent value crosses task/worker boundaries, so the channel
+        // item type must be Send (parallel-map Send checking, spec §10; gated like the
+        // other data-race checks).
+        if self.enforce_send_sync && *element_ty != Type::Void && !self.is_send(element_ty) {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2403,
+                    format!(
+                        "channel item type `{}` must be `Send`",
+                        self.diagnostic_type_name(element_ty)
+                    ),
+                )
+                .with_label(Label::primary(
+                    call.span,
+                    "this value crosses a task boundary",
+                ))
+                .with_help(
+                    "send Send values (scalars, String, frozen/Sync types) through channels",
+                ),
+            );
+        }
+        self.check_builtin_arity(
+            BuiltinArity::new(arity, ArityText::Plain),
+            "Channel",
+            spelling,
+            call.args.len(),
+            call.span,
+        );
+        if let Some(arg) = call.args.first() {
+            let arg_ty = self.check_expr_expecting(&arg.expr, element_ty);
+            // Record each suspended value independently: a
+            // cooperative `send` on a bounded channel is a suspend
+            // point, so the lowering frame-backs channel + value and
+            // carries the value into the task.
+            if self.local.current_async_context && *element_ty != Type::Void {
+                self.record_async_local(
+                    element_ty.clone(),
+                    "channel send value",
+                    arg.expr.span(),
+                    super::async_retention::Key::Value(arg.expr.id()),
+                );
+            }
+            if matches!(arg.mode, CallArgMode::Reference { .. }) {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E1703,
+                        "unexpected reference argument",
+                    )
+                    .with_label(Label::primary(
+                        arg.span,
+                        format!(
+                            "send expects `{}`, not `& {}`",
+                            self.diagnostic_type_name(element_ty),
+                            self.diagnostic_type_name(&arg_ty)
+                        ),
+                    )),
+                );
+            } else {
+                self.check_builtin_argument(
+                    BuiltinArgument::Channel,
+                    "Channel",
+                    spelling,
+                    element_ty,
+                    &arg_ty,
+                    arg.expr.span(),
+                );
+            }
+        }
+        Type::Void
     }
 }

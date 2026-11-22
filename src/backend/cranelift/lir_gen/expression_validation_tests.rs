@@ -596,8 +596,10 @@ fn cancellation_method(recv: &Type, method: &str, args: &[HirExpr]) -> Option<(I
             | Intrinsic::ScopeFinish
     )
     .then(|| {
-        let ret = resolved.return_type(|i| args.get(i).map(|a: &HirExpr| a.ty.clone()));
-        (resolved.intrinsic, ret)
+        (
+            resolved.intrinsic,
+            resolved.return_type(|i| args.get(i).map(|a: &HirExpr| a.ty.clone())),
+        )
     })
 }
 
@@ -1467,6 +1469,7 @@ fn supported_expr_node<'n>(
             method,
             args,
             super_class,
+            ..
         } => match &object.ty {
             Type::Array(_) | Type::FixedArray(_, _) => {
                 let shape_ok = if let Some(owner) = super_class {
@@ -1480,14 +1483,11 @@ fn supported_expr_node<'n>(
                 } else {
                     let arg_types: Vec<_> = args.iter().map(|arg| arg.ty.clone()).collect();
                     intrinsics::resolve(&object.ty, method, args.len()).is_some_and(|resolution| {
+                        let intrinsic = resolution.intrinsic;
                         let result = resolution.return_type(|index| arg_types.get(index).cloned());
                         ctx.same_repr(&result, &e.ty)
                             && flat_intrinsic_supported(
-                                resolution.intrinsic,
-                                &object.ty,
-                                &arg_types,
-                                &e.ty,
-                                ctx,
+                                intrinsic, &object.ty, &arg_types, &e.ty, ctx,
                             )
                     })
                 };
@@ -1498,9 +1498,18 @@ fn supported_expr_node<'n>(
             // `Type::Generic`; `lir_collection` never matches an enum, so the
             // two sets cannot overlap.
             Type::Generic(..) if ctx.supported_enum_type(&object.ty) => {
-                let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
-                option_result_method(&object.ty, method, &arg_tys)
-                    .is_some_and(|ret| ctx.same_repr(&ret, &e.ty))
+                let arg_tys = match args.as_slice() {
+                    [] => &[][..],
+                    [arg] => std::slice::from_ref(&arg.ty),
+                    _ => return false,
+                };
+                match method.kind().lookup(&object.ty) {
+                    intrinsics::MethodLookup::Adt(id) => {
+                        option_result_method(&object.ty, id, arg_tys)
+                    }
+                    _ => None,
+                }
+                .is_some_and(|ret| ret.matches(&e.ty, ctx))
                     && child_supported(object)
                     && args.iter().all(child_supported)
             }

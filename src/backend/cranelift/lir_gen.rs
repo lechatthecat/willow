@@ -57,7 +57,7 @@ use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::{FunctionId, TypeId};
 #[cfg(test)]
 use crate::semantic::intrinsics;
-use crate::semantic::intrinsics::Intrinsic;
+use crate::semantic::intrinsics::{AdtMethod, Intrinsic};
 #[cfg(test)]
 use crate::semantic::type_checker::types::await_output_type;
 use crate::semantic::type_checker::types::type_name;
@@ -87,6 +87,11 @@ mod expression_validation_tests;
 #[cfg(test)]
 use expression_validation_tests::*;
 mod intrinsic;
+
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static ENUM_EMISSION_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
 mod rvalue;
 mod terminator;
 

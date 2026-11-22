@@ -247,6 +247,14 @@ pub const SEND_ONLY_BUILTINS: &[&str] = &[
 mod integer;
 pub use integer::IntegerLayout;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static HASHED_TYPE_NODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static SERIALIZED_EXPR_NODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static SERIALIZED_TYPE_NODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static REBUILT_TYPE_NODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[path = "type_tree.rs"]
 mod type_tree;
 
@@ -1197,11 +1205,84 @@ pub struct CallExpr {
     pub span: Span,
 }
 
+/// Immutable member token. Its spelling and lexical classification travel together
+/// through AST clones. The serialized syntax keeps the original string format.
+#[derive(Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(from = "String")]
+pub struct MethodSpelling {
+    text: Box<str>,
+    kind: crate::semantic::intrinsics::MethodName,
+}
+
+impl serde::Serialize for MethodSpelling {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.text)
+    }
+}
+
+impl From<String> for MethodSpelling {
+    fn from(text: String) -> Self {
+        Self {
+            kind: crate::semantic::intrinsics::MethodName::classify(&text),
+            text: text.into_boxed_str(),
+        }
+    }
+}
+
+impl From<&str> for MethodSpelling {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
+impl MethodSpelling {
+    /// Construct a compiler-generated call with its known builtin token.
+    pub(crate) fn fixed(kind: crate::semantic::intrinsics::MethodName) -> Self {
+        Self {
+            text: kind.fixed_spelling().expect("fixed builtin member").into(),
+            kind,
+        }
+    }
+
+    pub(crate) fn kind(&self) -> crate::semantic::intrinsics::MethodName {
+        self.kind
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl AsRef<str> for MethodSpelling {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::ops::Deref for MethodSpelling {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Debug for MethodSpelling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.text, f)
+    }
+}
+
+impl std::fmt::Display for MethodSpelling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MethodCallExpr {
     pub id: ExprId,
     pub object: Expr,
-    pub method: String,
+    pub method: MethodSpelling,
     pub args: Vec<CallArg>,
     pub span: Span,
 }

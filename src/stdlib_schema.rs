@@ -862,10 +862,10 @@ pub(crate) fn attach_array_storage(program: &mut crate::parser::ast::Program) {
                         && index.ty.as_ref().is_none_or(|ty| *ty == Type::I64)
                         && matches!(&index.init, Expr::MethodCall(call)
                             if matches!(&call.object, Expr::Var(name, _, _) if name == "self")
-                                && call.method == "__abi_len" && call.args.is_empty())
+                                && call.method.kind() == crate::semantic::intrinsics::MethodName::AbiLen && call.args.is_empty())
                         && matches!(&resize.expr, Expr::MethodCall(call)
                             if matches!(&call.object, Expr::Var(name, _, _) if name == "self")
-                                && call.method == "__abi_resize" && call.args.len() == 1
+                                && call.method.kind() == crate::semantic::intrinsics::MethodName::AbiResize && call.args.len() == 1
                                 && call.args[0].mode == crate::parser::ast::CallArgMode::Value
                                 && matches!(&call.args[0].expr, Expr::Binary(sum)
                                     if sum.op == crate::parser::ast::BinOp::Add
@@ -881,7 +881,7 @@ pub(crate) fn attach_array_storage(program: &mut crate::parser::ast::Program) {
                 && matches!(method.body.stmts.as_slice(), [Stmt::Return(statement)]
                     if matches!(&statement.value, Some(Expr::MethodCall(call))
                         if matches!(&call.object, Expr::Var(name, _, _) if name == "self")
-                            && call.method == "__abi_len" && call.args.is_empty()));
+                            && call.method.kind() == crate::semantic::intrinsics::MethodName::AbiLen && call.args.is_empty()));
             method.array_body_optimization = if append {
                 crate::parser::ast::ArrayBodyOptimization::Append
             } else if length {

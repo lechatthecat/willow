@@ -371,8 +371,8 @@ pub(in crate::backend::cranelift) fn lir_rejection_reason(
                                 receiver_ty,
                                 method,
                                 ..
-                            }
-                            | V::EnumMethod {
+                            } => format!("the method `{method}` on a `{}`", type_name(receiver_ty)),
+                            V::EnumMethod {
                                 receiver_ty,
                                 method,
                                 ..
@@ -780,7 +780,7 @@ pub(super) fn flat_rvalue_supported(
             .find(|(name, _)| name == field)
             .map(|(_, ty)| ty.clone())
     };
-    if value.operands().iter().any(|operand| matches!(operand, crate::ir::lowered::LirOperand::Reference { place, .. } if !flat_reference_place_supported(place, locals, ctx))) { return false; }
+    if value.iter_operands().any(|operand| matches!(operand, crate::ir::lowered::LirOperand::Reference { place, .. } if !flat_reference_place_supported(place, locals, ctx))) { return false; }
     match value {
         V::ReferenceDebug { argument, .. } => matches!(argument, crate::ir::lowered::LirOperand::Reference { place, .. } if flat_reference_place_supported(place, locals, ctx)),
         V::StartTask { callee, args, params, output, .. } => ctx.cooperative_leaves.contains(&ctx.fn_types.scope().resolve(callee))
@@ -829,7 +829,7 @@ pub(super) fn flat_rvalue_supported(
         V::EnumAlloc { class, variant, enum_ty } => ctx.supported_enum_type(enum_ty) && ctx.enum_instance(enum_ty).is_some_and(|(name, definition)| name == *class && definition.variant(variant).is_some()),
         V::EnumPayloadStore { class, variant, index, source, enum_ty, .. } => ctx.supported_enum_type(enum_ty) && ctx.supported_type(source) && ctx.enum_instance(enum_ty).is_some_and(|(name, definition)| name == *class && definition.variant(variant).and_then(|variant| variant.payloads.get(*index)).is_some_and(|slot| ctx.storable(slot, source))),
         V::Range { start, end } => ty(start) == Some(Type::I64) && ty(end) == Some(Type::I64),
-        V::EnumMethod { receiver_ty, method, arg_types, result, .. } => ctx.supported_enum_type(receiver_ty) && ctx.supported_type(result) && arg_types.iter().all(|ty| ctx.supported_type(ty)) && option_result_method(receiver_ty, method, arg_types).is_some_and(|ret| ctx.same_repr(&ret, result)),
+        V::EnumMethod { receiver_ty, method, arg_types, result, .. } => ctx.supported_enum_type(receiver_ty) && ctx.supported_type(result) && arg_types.iter().all(|ty| ctx.supported_type(ty)) && option_result_method(receiver_ty, *method, arg_types).is_some_and(|ret| ret.matches(result, ctx)),
         V::BuiltinCall { callee, params, result, .. } => {
             if callee.is_free_named("$contract_i64") { return matches!(params.as_slice(), [op, lhs, rhs] if *op == Type::I64 && lhs.integer_layout().is_some() && lhs == rhs && lhs == result); }
             if callee.is_free_named("$contract_check") { return params == &[Type::Bool, Type::I64] && *result == Type::Void; }

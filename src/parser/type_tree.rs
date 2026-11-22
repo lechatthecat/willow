@@ -8,10 +8,21 @@ impl<N> Type<N> {
     where
         N: Clone,
     {
-        self.map_tree(Clone::clone, true, None, Type::Generic)
+        self.array_storage_type_with(|_| None)
+    }
+    /// Substitute named leaves while copying a checked fact into its storage shape.
+    /// The replacement is already a receiver type and keeps its own representation.
+    pub(crate) fn array_storage_type_with(
+        &self,
+        replacement: impl FnMut(&N) -> Option<Self>,
+    ) -> Self
+    where
+        N: Clone,
+    {
+        self.map_tree(Clone::clone, true, None, Type::Generic, replacement)
     }
     pub fn map_names<M>(&self, map: impl FnMut(&N) -> M) -> Type<M> {
-        self.map_tree(map, false, None, Type::Generic)
+        self.map_tree(map, false, None, Type::Generic, |_| None)
     }
     /// Rewrite every function-value type in the tree to one internal kind:
     /// `sync == true` gives the shareable kind ([`Type::Fn`]), `false` the
@@ -22,7 +33,7 @@ impl<N> Type<N> {
     where
         N: Clone,
     {
-        self.map_tree(Clone::clone, false, Some(sync), Type::Generic)
+        self.map_tree(Clone::clone, false, Some(sync), Type::Generic, |_| None)
     }
     /// The callable kinds a freshly parsed written type has: task-local
     /// everywhere except inside [`super::SEND_ONLY_BUILTINS`] arguments.
@@ -32,17 +43,23 @@ impl<N> Type<N> {
     where
         N: Clone + AsRef<str>,
     {
-        self.map_tree(Clone::clone, false, Some(false), |name, args| {
-            if super::SEND_ONLY_BUILTINS.contains(&name.as_ref()) {
-                let args = args
-                    .iter()
-                    .map(|arg| arg.with_callable_kind(true))
-                    .collect();
-                Type::Generic(name, args)
-            } else {
-                Type::Generic(name, args)
-            }
-        })
+        self.map_tree(
+            Clone::clone,
+            false,
+            Some(false),
+            |name, args| {
+                if super::SEND_ONLY_BUILTINS.contains(&name.as_ref()) {
+                    let args = args
+                        .iter()
+                        .map(|arg| arg.with_callable_kind(true))
+                        .collect();
+                    Type::Generic(name, args)
+                } else {
+                    Type::Generic(name, args)
+                }
+            },
+            |_| None,
+        )
     }
     /// Whether `self` has exactly the shape of `other` and, at every callable
     /// position, the same kind or the shareable one where `other` is
@@ -108,7 +125,7 @@ impl<N> Type<N> {
     where
         N: Clone,
     {
-        self.map_tree(Clone::clone, false, None, rewrite)
+        self.map_tree(Clone::clone, false, None, rewrite, |_| None)
     }
     fn map_tree<M>(
         &self,
@@ -116,6 +133,7 @@ impl<N> Type<N> {
         erase_array_length: bool,
         callable_kind: Option<bool>,
         mut generic: impl FnMut(M, Vec<Type<M>>) -> Type<M>,
+        mut replacement: impl FnMut(&N) -> Option<Type<M>>,
     ) -> Type<M> {
         enum Work<'a, N> {
             Enter(&'a Type<N>),
@@ -126,11 +144,19 @@ impl<N> Type<N> {
         while let Some(task) = work.pop() {
             match task {
                 Work::Enter(ty) => {
+                    if let Type::Named(name) = ty
+                        && let Some(value) = replacement(name)
+                    {
+                        values.push(value);
+                        continue;
+                    }
                     let children = ty.children();
                     work.push(Work::Build(ty, children.len()));
                     work.extend(children.into_iter().rev().map(Work::Enter));
                 }
                 Work::Build(ty, count) => {
+                    #[cfg(test)]
+                    super::REBUILT_TYPE_NODES.with(|nodes| nodes.set(nodes.get() + 1));
                     let mut children = values.split_off(values.len() - count);
                     let value = match ty {
                         Type::I8 => Type::I8,
@@ -174,77 +200,25 @@ impl<N> Type<N> {
         }
         values.pop().unwrap()
     }
-    pub fn substitute_names(&self, mut replacement: impl FnMut(&N) -> Option<Self>) -> Self
+    pub fn substitute_names(&self, replacement: impl FnMut(&N) -> Option<Self>) -> Self
     where
         N: Clone,
     {
-        enum Work<'a, N> {
-            Enter(&'a Type<N>),
-            Build(&'a Type<N>, usize),
-        }
-        let mut work = vec![Work::Enter(self)];
-        let mut values = Vec::new();
-        while let Some(task) = work.pop() {
-            match task {
-                Work::Enter(ty) => {
-                    if let Type::Named(name) = ty
-                        && let Some(value) = replacement(name)
-                    {
-                        values.push(value);
-                        continue;
-                    }
-                    let children = ty.children();
-                    work.push(Work::Build(ty, children.len()));
-                    work.extend(children.into_iter().rev().map(Work::Enter));
-                }
-                Work::Build(ty, count) => {
-                    let mut children = values.split_off(values.len() - count);
-                    let value = match ty {
-                        Type::I8 => Type::I8,
-                        Type::I16 => Type::I16,
-                        Type::I32 => Type::I32,
-                        Type::U16 => Type::U16,
-                        Type::U32 => Type::U32,
-                        Type::U64 => Type::U64,
-                        Type::Char => Type::Char,
-                        Type::U8 => Type::U8,
-                        Type::I64 => Type::I64,
-                        Type::F64 => Type::F64,
-                        Type::Bool => Type::Bool,
-                        Type::String => Type::String,
-                        Type::Void => Type::Void,
-                        Type::Never => Type::Never,
-                        Type::Named(name) => Type::Named(name.clone()),
-                        Type::Array(_) => Type::Array(Box::new(children.pop().unwrap())),
-                        Type::FixedArray(_, n) => {
-                            Type::FixedArray(Box::new(children.pop().unwrap()), *n)
-                        }
-                        Type::Generic(name, _) => Type::Generic(name.clone(), children),
-                        Type::Fn(..) => {
-                            let result = children.pop().unwrap();
-                            Type::Fn(children, Box::new(result))
-                        }
-                        Type::Closure(..) => {
-                            let result = children.pop().unwrap();
-                            Type::Closure(children, Box::new(result))
-                        }
-                    };
-                    values.push(value);
-                }
-            }
-        }
-        values.pop().unwrap()
+        self.map_tree(Clone::clone, false, None, Type::Generic, replacement)
     }
-    fn children(&self) -> Vec<&Self> {
+    /// Arguments and the optional trailing child, in structural key order.
+    pub(crate) fn child_parts(&self) -> (&[Self], Option<&Self>) {
         match self {
-            Self::Array(element) | Self::FixedArray(element, _) => vec![element],
-            Self::Generic(_, args) => args.iter().collect(),
-            Self::Fn(args, result) | Self::Closure(args, result) => args
-                .iter()
-                .chain(std::iter::once(result.as_ref()))
-                .collect(),
-            _ => Vec::new(),
+            Self::Array(e) | Self::FixedArray(e, _) => (&[], Some(e)),
+            Self::Generic(_, args) => (args, None),
+            Self::Fn(args, ret) | Self::Closure(args, ret) => (args, Some(ret)),
+            _ => (&[], None),
         }
+    }
+
+    fn children(&self) -> Vec<&Self> {
+        let (args, tail) = self.child_parts();
+        args.iter().chain(tail).collect()
     }
     fn take_children(&mut self, pending: &mut Vec<Self>) {
         match self {
@@ -332,6 +306,8 @@ impl<N: Hash> Hash for Type<N> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let mut pending = vec![self];
         while let Some(ty) = pending.pop() {
+            #[cfg(test)]
+            super::HASHED_TYPE_NODES.with(|nodes| nodes.set(nodes.get() + 1));
             std::mem::discriminant(ty).hash(state);
             match ty {
                 Self::Named(name) | Self::Generic(name, _) => name.hash(state),
@@ -376,6 +352,8 @@ impl<N: serde::Serialize> serde::Serialize for Type<N> {
             nodes.push(ty);
             pending.extend(ty.children());
         }
+        #[cfg(test)]
+        super::SERIALIZED_TYPE_NODES.with(|count| count.set(count.get() + nodes.len()));
         // Pointer IDs refer only to this serialization traversal, never persisted addresses.
         let indexes: std::collections::HashMap<*const Type<N>, usize> = nodes
             .iter()

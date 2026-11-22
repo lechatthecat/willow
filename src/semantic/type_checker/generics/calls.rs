@@ -16,7 +16,7 @@ struct GenericCallSite<'a> {
     type_args: &'a [Type],
     call_args: &'a [CallArg],
     span: Span,
-    expected: Option<&'a Type>,
+    context: CallContext<'a>,
 }
 
 struct CheckedGenericArguments {
@@ -100,17 +100,19 @@ impl TypeChecker {
         expr: &Expr,
         expected: &Type,
         parameters: &HashSet<&str>,
+        checked: bool,
     ) -> Type {
         #[cfg(test)]
         GENERIC_ENUM_ARGUMENT_CHECKS.with(|count| count.set(count.get() + 1));
+        let checked = checked && self.expr_types.contains_key(&expr.id());
         if !uses_parameters(expected, parameters) {
-            return self.check_expr_expecting(expr, expected);
+            return self.check_argument_expecting(expr, expected, checked);
         }
         if let (Expr::ArrayLiteral(elements, _, _), Type::FixedArray(element, _)) = (expr, expected)
         {
             let mut actual = crate::semantic::generic_inference::enum_hole();
             for item in elements {
-                let ty = self.check_generic_enum_argument(item, element, parameters);
+                let ty = self.check_generic_enum_argument(item, element, parameters, checked);
                 if crate::semantic::generic_inference::is_enum_hole(&actual) {
                     actual = ty;
                 } else if crate::semantic::generic_inference::has_enum_hole(&actual)
@@ -143,20 +145,15 @@ impl TypeChecker {
                     .then(crate::semantic::generic_inference::enum_hole)
             });
             let ty = match expr {
-                Expr::Ternary(t) => self.check_ternary_expecting(t, &context),
-                Expr::Match(m) => {
-                    let previous = self.local.match_expected.replace(context);
-                    let ty = self.check_match_expr(m);
-                    self.local.match_expected = previous;
-                    ty
-                }
+                Expr::Ternary(t) => self.check_ternary_expecting(t, &context, checked),
+                Expr::Match(m) => self.check_match_expr(m, Some(&context), checked),
                 _ => unreachable!(),
             };
             self.expr_types.insert(expr.id(), ty.clone());
             return ty;
         }
         let Type::Generic(enum_name, expected_args) = expected else {
-            return self.check_expr(expr);
+            return self.check_or_reuse_expr(expr, checked);
         };
         // Only enum constructors produce inference holes. Ordinary values keep
         // their own type, even when their formal parameter is a generic enum.
@@ -180,13 +177,13 @@ impl TypeChecker {
             {
                 (call.method.as_str(), call.args.as_slice())
             }
-            _ => return self.check_expr(expr),
+            _ => return self.check_or_reuse_expr(expr, checked),
         };
         let Some(info) = self.symbols.lookup_enum(enum_name) else {
-            return self.check_expr(expr);
+            return self.check_or_reuse_expr(expr, checked);
         };
         let Some(definition) = info.variants.iter().find(|v| v.name == variant) else {
-            return self.check_expr(expr);
+            return self.check_or_reuse_expr(expr, checked);
         };
         let type_params = info.type_params.clone();
         let payload_templates = definition.payload_types.clone();
@@ -206,14 +203,14 @@ impl TypeChecker {
                 ),
             );
             for arg in args {
-                self.check_expr(&arg.expr);
+                self.check_or_reuse_expr(&arg.expr, checked);
             }
             return Self::error_type();
         }
         let actual: Vec<_> = args
             .iter()
             .zip(&payloads)
-            .map(|(arg, ty)| self.check_generic_enum_argument(&arg.expr, ty, parameters))
+            .map(|(arg, ty)| self.check_generic_enum_argument(&arg.expr, ty, parameters, checked))
             .collect();
         let mut payload_inference =
             crate::semantic::generic_inference::Inference::new(&type_params, &[])
@@ -375,9 +372,9 @@ impl TypeChecker {
     pub(in crate::semantic::type_checker) fn check_generic_call(
         &mut self,
         c: &CallExpr,
-        expected: Option<&Type>,
+        context: CallContext<'_>,
     ) -> Option<Type> {
-        self.check_generic_call_parts(&c.callee, &c.type_args, &c.args, c.span, c.id, expected)
+        self.check_generic_call_parts(&c.callee, &c.type_args, &c.args, c.span, c.id, context)
     }
 
     pub(in crate::semantic::type_checker) fn check_generic_call_parts(
@@ -387,9 +384,17 @@ impl TypeChecker {
         call_args: &[CallArg],
         span: Span,
         id: ExprId,
-        expected: Option<&Type>,
+        context: CallContext<'_>,
     ) -> Option<Type> {
         let template = self.generics.functions.get(callee)?.clone();
+        if context.checked
+            && let Some(expected) = context.expected
+            && self.checked_as(id, expected)
+        {
+            // All type parameters are already bound, including any inferred
+            // from a callback body. The identical result adds no constraints.
+            return Some(expected.clone());
+        }
         #[cfg(test)]
         GENERIC_CALL_CHECKS.with(|count| count.set(count.get() + 1));
         if !template.public && template.span.file_id != span.file_id {
@@ -405,7 +410,7 @@ impl TypeChecker {
                 type_args,
                 call_args,
                 span,
-                expected,
+                context,
             },
         );
         let Some(CheckedGenericArguments {
@@ -575,7 +580,7 @@ impl TypeChecker {
             type_args,
             call_args,
             span,
-            expected,
+            context,
         } = site;
         let explicit: Vec<_> = type_args
             .iter()
@@ -625,7 +630,7 @@ impl TypeChecker {
         // (`let h: Box<Array<i64>> = wrap([])`, contextual generic arguments). It is only a
         // checking context: inference still binds from the checked arguments,
         // so an ordinary value keeps its own type.
-        let hinted_params = match expected {
+        let hinted_params = match context.expected {
             // An async call yields `Task<R>` and has no generic form to match.
             Some(expected) if !fully_explicit && !template.is_async => {
                 let declared = imported
@@ -672,8 +677,9 @@ impl TypeChecker {
                     template.params.get(i).map(|p| &p.mode),
                     Some(ParamMode::Reference { .. })
                 ) && matches!(a.mode, CallArgMode::Reference { .. });
+                let checked = context.checked && self.expr_types.contains_key(&a.expr.id());
                 let place = if is_reference {
-                    self.reference_place_info(&a.expr, a.span)
+                    self.reference_place_info(&a.expr, a.span, checked)
                 } else {
                     None
                 };
@@ -682,13 +688,13 @@ impl TypeChecker {
                         .as_ref()
                         .map_or_else(Self::error_type, |place| place.ty.clone())
                 } else if let Some(Some(expected)) = contextual_params.get(i) {
-                    self.check_expr_expecting(&a.expr, expected)
+                    self.check_argument_expecting(&a.expr, expected, checked)
                 } else if let Some(Some(hint)) = hinted_params.get(i) {
-                    self.check_expr_expecting(&a.expr, hint)
+                    self.check_argument_expecting(&a.expr, hint, checked)
                 } else if let Some(expected) = params.get(i) {
-                    self.check_generic_enum_argument(&a.expr, expected, parameter_names)
+                    self.check_generic_enum_argument(&a.expr, expected, parameter_names, checked)
                 } else {
-                    self.check_expr(&a.expr)
+                    self.check_or_reuse_expr(&a.expr, checked)
                 };
                 reference_places.push(place);
                 Some(result.substitute_names(|n| self.generics.logical_types.get(n).cloned()))

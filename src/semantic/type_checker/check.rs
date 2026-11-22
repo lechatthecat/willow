@@ -451,6 +451,7 @@ impl TypeChecker {
                 program,
                 &self.expr_types,
                 &self.static_call_classes,
+                &self.builtin_calls,
             );
             for diagnostic in result.diagnostics {
                 self.push(diagnostic);
@@ -464,13 +465,25 @@ impl TypeChecker {
     pub(crate) fn resolved_effect_graph(
         program: &Program,
     ) -> crate::semantic::call_graph::CallGraph {
+        Self::resolved_effect_graph_and_builtins(program).0
+    }
+
+    pub(crate) fn resolved_effect_graph_and_builtins(
+        program: &Program,
+    ) -> (
+        crate::semantic::call_graph::CallGraph,
+        crate::semantic::intrinsics::BuiltinCalls,
+    ) {
         let mut checker = Self::new();
         checker.effect_graph_only = Some(Default::default());
         checker.check_program(program);
-        checker
-            .effect_graph_only
-            .take()
-            .expect("graph collection mode")
+        (
+            checker
+                .effect_graph_only
+                .take()
+                .expect("graph collection mode"),
+            checker.builtin_calls,
+        )
     }
 
     /// Reset and index the named callables consumed by the semantic
@@ -1039,9 +1052,9 @@ impl TypeChecker {
     /// Interface receivers resolve to the single synthetic union node connected
     /// to every known implementation by `connect_interface_lock_effects`.
     pub(super) fn method_effect_ids(&self, obj_ty: &Type, method: &str) -> Vec<FunctionId> {
-        if let Type::Array(element) | Type::FixedArray(element, _) = obj_ty
+        if matches!(obj_ty, Type::Array(_) | Type::FixedArray(..))
             && !method.starts_with("__abi_")
-            && let Some(owner) = self.array_class(&Type::Array(element.clone()))
+            && let Some(owner) = self.array_storage_method_class(obj_ty)
         {
             return vec![FunctionId::method(TypeId::from_source_name(owner), method)];
         }
@@ -2244,7 +2257,7 @@ impl TypeChecker {
             }
             DeferBody::Block(block) => self.check_block(block),
         }
-        if let Some((span, operation)) = defer_scheduler_drive_span(&d.body, &self.expr_types) {
+        if let Some((span, operation)) = defer_scheduler_drive_span(&d.body, &self.builtin_calls) {
             self.push(
                 Self::error_at(
                     ErrorCode::E0905,
@@ -2483,11 +2496,7 @@ impl TypeChecker {
         // `scope.add(task)` hands the task to the scope, whose
         // `finish()` joins it; its returned handle is optional.
         let scope_owned = matches!(&s.expr, Expr::MethodCall(call)
-            if call.method == "add"
-                && self
-                    .expr_types
-                    .get(&call.object.id())
-                    .is_some_and(|ty| builtin_types::is(ty, B::TaskScope)));
+            if self.builtin_calls.get(&call.id) == Some(&Intrinsic::ScopeAdd));
         if !self.template_precheck
             && self.error_generation == errors_before
             && !scope_owned
@@ -2512,7 +2521,7 @@ impl TypeChecker {
     pub(super) fn check_static_call(
         &mut self,
         s: &StaticCallExpr,
-        expected: Option<&Type>,
+        context: CallContext<'_>,
     ) -> Type {
         // Constructor syntax supplies a class argument from the expected array
         // when omitted, then uses the declaration's ordinary static dispatch.
@@ -2533,10 +2542,15 @@ impl TypeChecker {
                 return Self::error_type();
             }
             self.check_collection_type_imported(B::Array.source_name(), s.span);
+            if context.checked
+                && (!s.type_args.is_empty() || !matches!(context.expected, Some(Type::Array(_))))
+            {
+                return self.reuse_checked_type(s.id);
+            }
             let inferred;
             let mut checked_argument = None;
             let arguments = if s.type_args.is_empty() {
-                inferred = match expected {
+                inferred = match context.expected {
                     Some(Type::Array(element)) => vec![element.as_ref().clone()],
                     _ => {
                         // Infer from a declared T parameter, then reuse that check
@@ -2609,7 +2623,7 @@ impl TypeChecker {
                 if let Some((id, ty)) = &checked_argument {
                     self.prechecked_array_args.insert(*id, ty.clone());
                 }
-                self.check_call_args_against_param_infos(&params, &s.args);
+                self.check_call_args_against_param_infos(&params, &s.args, context.checked);
                 if let Some((id, _)) = checked_argument {
                     self.prechecked_array_args.remove(&id);
                 }
@@ -2641,7 +2655,7 @@ impl TypeChecker {
                 &s.method,
                 &s.args,
                 (s.span, s.method_span),
-                expected,
+                context,
             );
             if let Some((id, _)) = checked_argument {
                 self.prechecked_array_args.remove(&id);
@@ -2660,10 +2674,22 @@ impl TypeChecker {
                 &s.args,
                 s.span,
                 s.id,
-                expected,
+                context,
             )
         {
             return ty;
+        }
+        // Only a lock constructor can use a result hint in the remaining
+        // static resolvers. All ordinary argument checks already ran.
+        if context.checked {
+            let lock_context = s.method == "new"
+                && s.type_args.is_empty()
+                && matches!(context.expected, Some(Type::Generic(name, args)) if args.len() == 1
+                    && matches!(B::from_name(name), Some(B::Mutex | B::RwLock | B::BlockingCell | B::BlockingRwCell))
+                    && self.resolve_static_call_class_quiet(&s.class).as_deref() == Some(name));
+            if !lock_context {
+                return self.reuse_checked_type(s.id);
+            }
         }
         self.record_static_builtin_lock_effect(s);
         let callee = self.static_method_effect_id(&s.class, &s.method);
@@ -2673,12 +2699,20 @@ impl TypeChecker {
             &s.method,
             &s.args,
             (s.span, s.method_span),
-            expected,
+            context,
         );
         if let Some(callee) = callee {
             self.record_lock_effect_call(callee, s.span);
         }
         result
+    }
+
+    pub(super) fn check_or_reuse_expr(&mut self, expr: &Expr, checked: bool) -> Type {
+        if checked && let Some(ty) = self.expr_types.get(&expr.id()).cloned() {
+            self.reuse_check_failure(super::body::FailedCheck::Value(expr.id()));
+            return ty;
+        }
+        self.check_expr(expr)
     }
 
     pub(super) fn check_expr(&mut self, expr: &Expr) -> Type {
@@ -2783,7 +2817,43 @@ impl TypeChecker {
         }
     }
 
+    /// An exact, successful result needs no new contextual inference.
+    pub(super) fn checked_as(&self, id: ExprId, expected: &Type) -> bool {
+        self.expr_types.get(&id) == Some(expected)
+            && !self
+                .local
+                .failed_checks
+                .contains(&super::body::FailedCheck::Value(id))
+    }
+
+    pub(super) fn record_check_failure(&mut self, part: super::body::FailedCheck, failed: bool) {
+        if failed {
+            self.local.failed_checks.insert(part);
+        } else if !self.local.failed_checks.is_empty() {
+            self.local.failed_checks.remove(&part);
+        }
+    }
+
+    pub(super) fn reuse_check_failure(&mut self, part: super::body::FailedCheck) {
+        if self.local.failed_checks.contains(&part) {
+            // Preserve error recovery in enclosing expressions without emitting
+            // another copy of the diagnostic or walking the child again.
+            self.error_generation += 1;
+        }
+    }
+
+    pub(super) fn reuse_checked_type(&mut self, id: ExprId) -> Type {
+        self.reuse_check_failure(super::body::FailedCheck::Value(id));
+        self.expr_types[&id].clone()
+    }
+
     pub(super) fn record_checked_expr(&mut self, expr: &Expr, ty: Type, generation: usize) -> Type {
+        if self.error_generation != 0 {
+            self.record_check_failure(
+                super::body::FailedCheck::Value(expr.id()),
+                self.error_generation != generation,
+            );
+        }
         let ty = if ty == Type::Void && self.error_generation != generation {
             Self::error_type()
         } else {
@@ -2817,6 +2887,8 @@ impl TypeChecker {
     /// Record resolution at the checked expression, while lexical bindings and
     /// receiver types are still available. Unknown is explicit for panic safety.
     fn record_resolved_call(&mut self, expr: &Expr) {
+        use crate::semantic::intrinsics::BuiltinMethod;
+        let mut inline_callback = false;
         let mut targets = match expr {
             // Constant reads inline their value. Keep a string constant's
             // resolved identity outside AI capture too, so allocation proofs
@@ -2857,18 +2929,22 @@ impl TypeChecker {
                 .expr_types
                 .get(&call.object.id())
                 .map(|ty| {
-                    let targets = self.method_effect_ids(ty, &call.method);
-                    if targets.is_empty()
-                        && let Some(resolved) =
-                            crate::semantic::intrinsics::resolve(ty, &call.method, call.args.len())
+                    let mut targets = if matches!(ty, Type::Array(_) | Type::FixedArray(..))
+                        && let Some(&owner) = self.static_call_classes.get(&call.id)
                     {
-                        return vec![resolved.intrinsic.function_id()];
-                    }
-                    if targets.is_empty()
-                        && let Some(target) =
-                            crate::semantic::intrinsics::adt_method_target(ty, &call.method)
-                    {
-                        return vec![target];
+                        vec![FunctionId::method(owner, &call.method)]
+                    } else {
+                        self.method_effect_ids(ty, &call.method)
+                    };
+                    if targets.is_empty() {
+                        match self.builtin_calls.effect_method(&call.id) {
+                            Some(BuiltinMethod::Intrinsic(id)) => targets.push(id.function_id()),
+                            Some(BuiltinMethod::Adt(method)) => {
+                                targets.extend(method.target());
+                                inline_callback = method.callback();
+                            }
+                            None => {}
+                        }
                     }
                     targets
                 })
@@ -2977,21 +3053,15 @@ impl TypeChecker {
                 })
                 .map(|_| UnsupportedInitialization::RuntimeCallback)
         } else if targets.is_empty() {
-            Some(
-                if let Expr::MethodCall(call) = expr
-                    && self.expr_types.get(&call.object.id()).is_some_and(|ty| {
-                        crate::semantic::intrinsics::adt_callback(ty, &call.method)
-                    })
-                {
-                    UnsupportedInitialization::InlineCallback
-                } else if matches!(expr, Expr::Call(_)) {
-                    UnsupportedInitialization::IndirectCall
-                } else if virtual_call.is_some() {
-                    UnsupportedInitialization::UnresolvedVirtualCall
-                } else {
-                    UnsupportedInitialization::UnresolvedCall
-                },
-            )
+            Some(if inline_callback {
+                UnsupportedInitialization::InlineCallback
+            } else if matches!(expr, Expr::Call(_)) {
+                UnsupportedInitialization::IndirectCall
+            } else if virtual_call.is_some() {
+                UnsupportedInitialization::UnresolvedVirtualCall
+            } else {
+                UnsupportedInitialization::UnresolvedCall
+            })
         } else {
             None
         };
@@ -3075,8 +3145,13 @@ impl TypeChecker {
         }
     }
 
-    pub(super) fn check_new_with_effects(&mut self, n: &NewExpr, class: &str) -> Type {
-        let result = self.check_new(n, class);
+    pub(super) fn check_new_with_effects(
+        &mut self,
+        n: &NewExpr,
+        class: &str,
+        checked: bool,
+    ) -> Type {
+        let result = self.check_new(n, class, checked);
         if self
             .symbols
             .lookup_class(class)
@@ -3120,7 +3195,7 @@ impl TypeChecker {
             };
             self.generics.objects.insert(expr.id(), name.clone());
             if let Expr::New(n) = expr {
-                return self.check_new_with_effects(n, name);
+                return self.check_new_with_effects(n, name, false);
             }
 
             let mut concrete = expr.clone();
@@ -3159,13 +3234,13 @@ impl TypeChecker {
                 let obj_ty = self.check_expr(obj);
                 self.resolve_field(&obj_ty, field_name, *span, true, "read")
             }
-            Expr::MethodCall(m) => self.check_method_call_expecting(m, None),
+            Expr::MethodCall(m) => self.check_method_call_expecting(m, None, false),
             Expr::StaticCall(s) if self.is_static_field_call(s) => {
                 self.resolve_static_field_read(&s.class, &s.method, s.span)
             }
-            Expr::StaticCall(s) => self.check_static_call(s, None),
+            Expr::StaticCall(s) => self.check_static_call(s, CallContext::default()),
             Expr::StaticField(s) => self.resolve_static_field_read(&s.class, &s.field, s.span),
-            Expr::New(n) => self.check_new_with_effects(n, &n.class_name),
+            Expr::New(n) => self.check_new_with_effects(n, &n.class_name, false),
             Expr::ObjectLiteral(o) => self.check_object_literal(o),
             Expr::Await(a) => self.check_await_expr(a),
             Expr::Select(s) => {
@@ -3177,7 +3252,7 @@ impl TypeChecker {
             Expr::Ternary(t) => self.check_ternary_expr(t),
             Expr::Range(r) => self.check_range(r),
             Expr::Lambda(l) => self.check_lambda(l),
-            Expr::Match(m) => self.check_match_expr(m),
+            Expr::Match(m) => self.check_match_expr(m, None, false),
             Expr::TryPropagate(inner, span, _) => self.check_try_propagate(inner, *span),
             Expr::ArrayLiteral(elements, _span, _) => self.check_array_literal(elements),
             Expr::Index(arr, index, span, _) => self.check_index(arr, index, *span),
@@ -3485,7 +3560,7 @@ impl TypeChecker {
             }
         }
 
-        if let Some(ty) = self.check_generic_call(c, None) {
+        if let Some(ty) = self.check_generic_call(c, CallContext::default()) {
             return ty;
         }
         if !c.type_args.is_empty() {
@@ -3526,7 +3601,7 @@ impl TypeChecker {
             if info.foreign {
                 self.check_foreign_call(c.span, info.is_async);
             }
-            self.check_call_args_against_param_infos(&info.param_infos, &c.args);
+            self.check_call_args_against_param_infos(&info.param_infos, &c.args, false);
             self.check_async_call_captures(&info.param_infos, &c.args, info.is_async);
             if let Some(operation) = self.imported_blocking_std_functions.get(&c.callee).copied() {
                 self.record_direct_lock_effect(c.span, operation, LockEffectKind::Block);
@@ -3548,8 +3623,14 @@ impl TypeChecker {
                 .lookup_enum(name)
                 .is_some_and(|info| info.name == name)
         {
-            let ty =
-                self.resolve_static_call(name, &[], &c.callee, &c.args, (c.span, c.span), None);
+            let ty = self.resolve_static_call(
+                name,
+                &[],
+                &c.callee,
+                &c.args,
+                (c.span, c.span),
+                CallContext::default(),
+            );
             self.enum_variant_resolutions.insert(c.id, name.to_string());
             return ty;
         }
@@ -3684,9 +3765,14 @@ impl TypeChecker {
         Type::Void
     }
 
-    fn check_ternary_expr(&mut self, t: &TernaryExpr) -> Type {
+    pub(super) fn check_ternary_condition(&mut self, condition: &Expr, checked: bool) {
+        let part = super::body::FailedCheck::Condition(condition.id());
+        if checked {
+            self.reuse_check_failure(part);
+            return;
+        }
         let errors_before = self.error_generation;
-        let cond_ty = self.check_expr(&t.condition);
+        let cond_ty = self.check_expr(condition);
         if cond_ty != Type::Bool
             && self.error_generation == errors_before
             && !Self::contains_error_type(&cond_ty)
@@ -3701,7 +3787,7 @@ impl TypeChecker {
                     ),
                 )
                 .with_label(Label::primary(
-                    t.condition.span(),
+                    condition.span(),
                     format!(
                         "expected `bool`, found `{}`",
                         self.diagnostic_type_name(&cond_ty)
@@ -3709,6 +3795,13 @@ impl TypeChecker {
                 )),
             );
         }
+        if self.error_generation != 0 {
+            self.record_check_failure(part, self.error_generation != errors_before);
+        }
+    }
+
+    fn check_ternary_expr(&mut self, t: &TernaryExpr) -> Type {
+        self.check_ternary_condition(&t.condition, false);
         let then_ty = self.check_branch_value(&t.then_expr);
         let else_ty = self.check_branch_value(&t.else_expr);
         if let Some(unified_ty) = self.unify_ternary_types(&then_ty, &else_ty) {
@@ -3751,35 +3844,16 @@ impl TypeChecker {
     /// Record direct built-in waits using the receiver's checked type. This is
     /// shared by the transitive helper summary and the direct lock-body scan:
     /// a user class that happens to name a method `send` must stay effect-free.
-    fn record_builtin_lock_effect(&mut self, obj_ty: &Type, call: &MethodCallExpr) {
-        let family = builtin_types::resolve(obj_ty).map(|resolved| resolved.id);
-        let effect = match (family, call.method.as_str()) {
-            (Some(B::Channel), "send" | "recv" | "recv_opt") => Some((
-                match call.method.as_str() {
-                    "send" => "Channel.send",
-                    "recv" => "Channel.recv",
-                    _ => "Channel.recv_opt",
-                },
-                LockEffectKind::Suspend,
-            )),
-            (Some(B::BlockingCell), "get" | "set") => Some((
-                if call.method == "get" {
-                    "BlockingCell.get"
-                } else {
-                    "BlockingCell.set"
-                },
-                LockEffectKind::Block,
-            )),
-            (Some(B::BlockingRwCell), "read" | "write") => Some((
-                if call.method == "read" {
-                    "BlockingRwCell.read"
-                } else {
-                    "BlockingRwCell.write"
-                },
-                LockEffectKind::Block,
-            )),
-            _ => None,
-        };
+    fn record_builtin_lock_effect(&mut self, intrinsic: Option<Intrinsic>, call: &MethodCallExpr) {
+        let effect = intrinsic.and_then(|id| match id {
+            Intrinsic::CellGet => Some(("BlockingCell.get", LockEffectKind::Block)),
+            Intrinsic::CellSet => Some(("BlockingCell.set", LockEffectKind::Block)),
+            Intrinsic::RwCellRead => Some(("BlockingRwCell.read", LockEffectKind::Block)),
+            Intrinsic::RwCellWrite => Some(("BlockingRwCell.write", LockEffectKind::Block)),
+            _ => id
+                .channel_wait_name()
+                .map(|name| (name, LockEffectKind::Suspend)),
+        });
         if let Some((operation, kind)) = effect {
             self.record_direct_lock_effect(call.span, operation, kind);
         }
@@ -3878,6 +3952,7 @@ impl TypeChecker {
         &mut self,
         m: &MethodCallExpr,
         expected_receiver: Option<&Type>,
+        checked: bool,
     ) -> Type {
         // `.` is instance member access; module items use `::`. Using
         // `math.add(..)` on a module is an error that points at `::`.
@@ -3905,7 +3980,7 @@ impl TypeChecker {
             return self.check_super_method_call(m, *super_span);
         }
         let obj_ty = match expected_receiver {
-            Some(expected) => self.check_expr_expecting(&m.object, expected),
+            Some(expected) => self.check_argument_expecting(&m.object, expected, checked),
             // A method can resolve an omitted enum parameter (for example
             // `Result::Ok(1).and_then(f)`). Nested argument expressions still
             // use the ordinary inference boundary.
@@ -3925,7 +4000,7 @@ impl TypeChecker {
     }
 
     /// Member calls on an already-checked, non-error receiver.
-    fn check_receiver_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) -> Type {
+    pub(super) fn check_receiver_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) -> Type {
         if let Type::Named(name) = obj_ty
             && self.generics.parameter_names.contains(name)
         {
@@ -3950,50 +4025,142 @@ impl TypeChecker {
             }
             return Self::error_type();
         }
-        if let Some(current) = crate::semantic::intrinsics::renamed_method(&m.method)
-            && !self.type_has_method(obj_ty, &m.method)
-            && self.type_has_method(obj_ty, current)
+        let spelling = m.method.as_str();
+        let name = m.method.kind();
+        let (name, spelling, lookup) = if let Some((current, renamed)) = name.replacement()
+            && !self.type_declares_method(obj_ty, spelling)
         {
-            return self.check_renamed_method_call(obj_ty, m, current);
+            let replacement = renamed.lookup(obj_ty);
+            if replacement.identity().is_some() || self.type_declares_method(obj_ty, current) {
+                self.report_renamed_method(obj_ty, m, current);
+                (renamed, current, replacement)
+            } else {
+                // Retired spellings have no builtin signature.
+                (name, spelling, MethodLookup::Missing(name))
+            }
+        } else {
+            (name, spelling, name.lookup(obj_ty))
+        };
+        if let Some((id, arity)) = lookup.identity() {
+            self.builtin_calls.record(m.id, id, arity, m.args.len());
         }
-        self.record_builtin_lock_effect(obj_ty, m);
-        if let Some(ret) = self.check_option_result_method_call(obj_ty, m) {
-            return ret;
+        if let MethodLookup::Adt(method) = lookup {
+            return self.check_option_result_method_call(obj_ty, m, spelling, method);
         }
-        if let Some(ret) = self.check_concurrency_method_call(obj_ty, m) {
-            return ret;
+        let intrinsic = match &lookup {
+            MethodLookup::Intrinsic(sig) => Some(sig.intrinsic),
+            _ => None,
+        };
+        self.record_builtin_lock_effect(intrinsic, m);
+        let family = builtin_types::resolve(obj_ty).map(|ty| (ty.id, ty.args));
+        match family {
+            Some((kind @ (B::AtomicI64 | B::AtomicBool), _)) => {
+                return self.check_atomic_method_call(
+                    kind.source_name(),
+                    m,
+                    spelling,
+                    lookup.into_signature(),
+                );
+            }
+            Some((kind @ (B::CancellationToken | B::TaskScope), _)) => {
+                return self.check_task_control_method_call(
+                    kind.source_name(),
+                    m,
+                    spelling,
+                    lookup,
+                );
+            }
+            Some((B::Mutex | B::RwLock | B::BlockingCell | B::BlockingRwCell, [elem])) => {
+                let Type::Generic(lock, _) = obj_ty else {
+                    unreachable!()
+                };
+                return self.check_lock_method_call(
+                    lock,
+                    elem,
+                    m,
+                    spelling,
+                    lookup.into_signature(),
+                );
+            }
+            _ => {}
         }
-        if let Some(ret) = self.check_array_method_call(obj_ty, m) {
-            return ret;
+        match lookup {
+            MethodLookup::Intrinsic(sig)
+                if matches!(
+                    sig.intrinsic,
+                    Intrinsic::TaskResult | Intrinsic::TaskCancel | Intrinsic::TaskIsCancelled
+                ) =>
+            {
+                self.check_builtin_arity(
+                    BuiltinArity::new(sig.arity, ArityText::Plain),
+                    "Task",
+                    spelling,
+                    m.args.len(),
+                    m.span,
+                );
+                return sig.return_type(|_| None);
+            }
+            MethodLookup::Intrinsic(sig) if sig.intrinsic == Intrinsic::ChannelSend => {
+                return self.check_channel_send(obj_ty, m, spelling, sig.arity);
+            }
+            MethodLookup::Intrinsic(sig)
+                if matches!(
+                    sig.intrinsic,
+                    Intrinsic::ChannelRecv | Intrinsic::ChannelRecvOpt | Intrinsic::ChannelClose
+                ) =>
+            {
+                self.check_builtin_arity(
+                    BuiltinArity::new(sig.arity, ArityText::Plain),
+                    "Channel",
+                    spelling,
+                    m.args.len(),
+                    m.span,
+                );
+                return sig.return_type(|_| None);
+            }
+            MethodLookup::Missing(wait)
+                if wait.is_retired_wait() && is_task_handle_type(obj_ty) =>
+            {
+                return self.check_retired_task_wait(obj_ty, m, spelling, wait);
+            }
+            MethodLookup::Missing(name) => {
+                if let Some(attempted) = name.channel()
+                    && !matches!(obj_ty, Type::Named(class) if self.symbols.lookup_class(class).is_some())
+                {
+                    return self.check_invalid_channel_receiver(obj_ty, m, spelling, attempted);
+                }
+            }
+            _ => {}
         }
-        if let Some(ret) = self.check_frozen_array_method_call(obj_ty, m) {
-            return ret;
+        if let Type::Array(elem) | Type::FixedArray(elem, _) = obj_ty {
+            return self.check_array_method_call(obj_ty, elem, m, spelling, lookup);
         }
-        if let Some(ret) = self.check_map_method_call(obj_ty, m) {
-            return ret;
+        match family {
+            Some((B::FrozenArray, [elem])) => {
+                return self.check_frozen_array_method_call(elem, m, spelling, lookup);
+            }
+            Some((B::Map, [key, value])) => {
+                return self.check_map_method_call(obj_ty, (key, value), m, spelling, lookup);
+            }
+            Some((B::FrozenMap, [key, value])) => {
+                return self.check_frozen_map_method_call((key, value), m, spelling, lookup);
+            }
+            _ => {}
         }
-        if let Some(ret) = self.check_frozen_map_method_call(obj_ty, m) {
-            return ret;
-        }
-        self.check_task_method_call(obj_ty, m);
-
-        for callee in self.method_effect_ids(obj_ty, &m.method) {
+        self.check_task_method_call(obj_ty, m, spelling);
+        for callee in self.method_effect_ids(obj_ty, spelling) {
             self.record_lock_effect_call(callee, m.span);
         }
-
-        self.resolve_method(obj_ty, m, true)
+        self.resolve_method(
+            obj_ty,
+            m,
+            spelling,
+            true,
+            Some((name, lookup.into_signature())),
+        )
     }
 
-    /// A call spelled with a retired builtin name (`x.toString()`): report the
-    /// current name, then check the call as if it were written with it, so the
-    /// result type and argument diagnostics are those of the real method. Only
-    /// erroneous programs reach this, so the receiver clone is off the hot path.
-    fn check_renamed_method_call(
-        &mut self,
-        obj_ty: &Type,
-        m: &MethodCallExpr,
-        current: &'static str,
-    ) -> Type {
+    fn report_renamed_method(&mut self, obj_ty: &Type, m: &MethodCallExpr, current: &str) {
         let mut diagnostic = Diagnostic::new(
             Severity::Error,
             ErrorCode::E0201,
@@ -4009,14 +4176,6 @@ impl TypeChecker {
         ));
         self.label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
         self.push(diagnostic);
-        let renamed = MethodCallExpr {
-            id: m.id,
-            object: m.object.clone(),
-            method: current.to_string(),
-            args: m.args.clone(),
-            span: m.span,
-        };
-        self.check_receiver_method_call(obj_ty, &renamed)
     }
 }
 
@@ -4133,7 +4292,7 @@ fn defer_async_call_span(body: &DeferBody, expr_types: &HashMap<ExprId, Type>) -
 
 fn defer_scheduler_drive_span(
     body: &DeferBody,
-    expr_types: &HashMap<ExprId, Type>,
+    builtin_calls: &crate::semantic::intrinsics::BuiltinCalls,
 ) -> Option<(Span, &'static str)> {
     let mut statement = None;
     let mut expression = None;
@@ -4153,18 +4312,11 @@ fn defer_scheduler_drive_span(
             let Expr::MethodCall(call) = expr else {
                 return;
             };
-            let is_channel = expr_types
-                .get(&call.object.id())
-                .is_some_and(|ty| builtin_types::is(ty, B::Channel));
-            if is_channel && matches!(call.method.as_str(), "send" | "recv" | "recv_opt") {
-                expression = Some((
-                    call.span,
-                    match call.method.as_str() {
-                        "send" => "Channel.send",
-                        "recv" => "Channel.recv",
-                        _ => "Channel.recv_opt",
-                    },
-                ));
+            if let Some(name) = builtin_calls
+                .candidate(&call.id)
+                .and_then(|id| id.channel_wait_name())
+            {
+                expression = Some((call.span, name));
             }
         },
     );

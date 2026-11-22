@@ -748,7 +748,12 @@ impl TypeChecker {
 
     /// A match guard is a `bool` condition checked with the arm's pattern
     /// bindings in scope.
-    fn check_match_guard(&mut self, guard: &Expr) {
+    fn check_match_guard(&mut self, guard: &Expr, checked: bool) {
+        let part = super::body::FailedCheck::Condition(guard.id());
+        if checked {
+            self.reuse_check_failure(part);
+            return;
+        }
         let errors_before = self.error_generation;
         let guard_ty = self.check_expr(guard);
         if guard_ty != Type::Bool
@@ -773,6 +778,9 @@ impl TypeChecker {
                 ))
                 .with_help("use an explicit comparison, e.g. `!= 0`"),
             );
+        }
+        if self.error_generation != 0 {
+            self.record_check_failure(part, self.error_generation != errors_before);
         }
     }
 
@@ -833,12 +841,18 @@ impl TypeChecker {
     /// Run an arm's guard steps in order: `if` conditions must be `bool`;
     /// each `let P = e` link checks `e` with the names bound so far, then
     /// binds `P`'s names for the steps after it and the arm body.
-    fn check_match_guards(&mut self, guards: &[Guard]) {
+    fn check_match_guards(&mut self, guards: &[Guard], checked: bool) {
         for guard in guards {
             match guard {
-                Guard::If(condition) => self.check_match_guard(condition),
+                Guard::If(condition) => {
+                    self.check_match_guard(condition, checked);
+                }
                 Guard::Let(step) => {
-                    let ty = self.check_expr(&step.scrutinee);
+                    let ty = if checked {
+                        self.reuse_checked_type(step.scrutinee.id())
+                    } else {
+                        self.check_expr(&step.scrutinee)
+                    };
                     let errors_before = self.error_generation;
                     let bindings = if Self::contains_error_type(&ty) {
                         self.bind_invalid_pattern(&step.pattern);
@@ -853,19 +867,30 @@ impl TypeChecker {
         }
     }
 
-    pub(super) fn check_match_expr(&mut self, m: &MatchExpr) -> Type {
-        // The type this `match` flows into, when it was reached through
-        // `check_expr_expecting`. Taken, not borrowed: a
-        // `match` nested anywhere inside an arm gets its own context or none,
-        // never this one by accident.
-        let expected = self.local.match_expected.take();
-        let partial_enum_context = expected
-            .as_ref()
-            .is_some_and(crate::semantic::generic_inference::has_enum_hole);
+    pub(super) fn check_match_expr(
+        &mut self,
+        m: &MatchExpr,
+        expected: Option<&Type>,
+        checked: bool,
+    ) -> Type {
+        // A successful independent match of the exact contextual type has
+        // already checked its patterns, scopes, values, and coverage.
+        if checked
+            && let Some(expected) = expected
+            && self.checked_as(m.id, expected)
+        {
+            return expected.clone();
+        }
+        let partial_enum_context =
+            expected.is_some_and(crate::semantic::generic_inference::has_enum_hole);
         let errors_before_match = self.error_generation;
-        let scrutinee_ty = self.check_expr(&m.scrutinee);
+        let scrutinee_ty = if checked {
+            self.reuse_checked_type(m.scrutinee.id())
+        } else {
+            self.check_expr(&m.scrutinee)
+        };
         if Self::contains_error_type(&scrutinee_ty) {
-            return self.check_match_arms_without_scrutinee(m, expected.as_ref());
+            return self.check_match_arms_without_scrutinee(m, expected, checked);
         }
 
         if m.arms.is_empty() {
@@ -890,14 +915,15 @@ impl TypeChecker {
             // Check invalid arms too, but their bindings cannot constrain types.
             self.symbols.push_scope();
             self.bind_checked_pattern(&arm.pattern, bindings, invalid_pattern);
-            self.check_match_guards(&arm.guard);
+            self.check_match_guards(&arm.guard, checked);
             let errors_before_body = self.error_generation;
             let arm_ty = self.check_match_body(
                 &arm.body,
-                expected.as_ref().or(result_type
+                expected.or(result_type
                     .as_ref()
                     .filter(|ty| matches!(ty, Type::Array(_)) && !has_array_placeholder(ty))),
                 m.source,
+                checked,
             );
             self.symbols.pop_scope();
             if m.source == MatchSource::LetElse && index == 1 && arm_ty != Type::Never {
@@ -917,13 +943,15 @@ impl TypeChecker {
                 arm,
                 arm_ty,
                 &mut result_type,
-                expected.as_ref(),
+                expected,
                 partial_enum_context,
             );
         }
 
         // Reachability and exhaustiveness need every pattern well typed.
-        let exhaustive = !invalid_patterns && self.check_match_coverage(m, &scrutinee_ty);
+        let exhaustive = !invalid_patterns
+            && ((checked && self.local.exhaustive_matches.contains(&m.id))
+                || self.check_match_coverage(m, &scrutinee_ty));
         self.finish_match_expr(m, exhaustive, result_type, errors_before_match)
     }
 
@@ -933,12 +961,13 @@ impl TypeChecker {
         &mut self,
         m: &MatchExpr,
         expected: Option<&Type>,
+        checked: bool,
     ) -> Type {
         for arm in &m.arms {
             self.symbols.push_scope();
             self.bind_invalid_pattern(&arm.pattern);
-            self.check_match_guards(&arm.guard);
-            self.check_match_body(&arm.body, expected, m.source);
+            self.check_match_guards(&arm.guard, checked);
+            self.check_match_body(&arm.body, expected, m.source, checked);
             self.symbols.pop_scope();
         }
         Self::error_type()
@@ -1404,11 +1433,7 @@ impl TypeChecker {
             "expected an Option scrutinee",
         ));
         if let Some(Expr::MethodCall(call)) = scrutinee
-            && call.method == "recv"
-            && self
-                .expr_types
-                .get(&call.object.id())
-                .is_some_and(|ty| builtin_types::unary_arg(ty, B::Channel).is_some())
+            && self.builtin_calls.candidate(&call.id) == Some(&Intrinsic::ChannelRecv)
         {
             diagnostic = diagnostic
                 .with_help("Channel::recv() returns T; use `recv_opt()` to receive an Option<T>");
@@ -1826,15 +1851,7 @@ impl TypeChecker {
         body: &MatchBody,
         expected: Option<&Type>,
         source: MatchSource,
-    ) -> Type {
-        self.check_match_body_inner(body, expected, source)
-    }
-
-    fn check_match_body_inner(
-        &mut self,
-        body: &MatchBody,
-        expected: Option<&Type>,
-        source: MatchSource,
+        checked: bool,
     ) -> Type {
         match body {
             MatchBody::Expr(expr) => {
@@ -1845,17 +1862,24 @@ impl TypeChecker {
                 // one an `Ok` with no error type. This is what
                 // a ternary in the same position already does.
                 match expected {
-                    Some(expected) => {
-                        let expected = expected.clone();
-                        self.check_expr_expecting(expr, &expected)
-                    }
+                    Some(expected) => self.check_argument_expecting(expr, expected, checked),
+                    None if checked => self.reuse_checked_type(expr.id()),
                     None => self.check_branch_value(expr),
                 }
             }
             MatchBody::Block(block) => {
                 // A tuple-let tail has a binding scope but no new source-level
                 // recovery boundary. Real arm blocks still add lexical depth.
-                self.check_block_scope(block, source != MatchSource::TupleLet);
+                let part = super::body::FailedCheck::ArmBlock(block.id);
+                if checked {
+                    self.reuse_check_failure(part);
+                } else {
+                    let before = self.error_generation;
+                    self.check_block_scope(block, source != MatchSource::TupleLet);
+                    if self.error_generation != 0 {
+                        self.record_check_failure(part, self.error_generation != before);
+                    }
+                }
                 // An arm that always leaves — by `return`, or by `break` /
                 // `continue` of an enclosing loop — diverges:
                 // type it `Never` so it unifies with value arms

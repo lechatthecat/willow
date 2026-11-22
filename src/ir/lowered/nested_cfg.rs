@@ -461,6 +461,7 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
                 object,
                 method,
                 args,
+                builtin: None,
                 ..
             } if self.method_call_supported(object, method, args) => {
                 self.schedule_method_call(expr)
@@ -982,6 +983,7 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
             method,
             args,
             super_class,
+            ..
         } = &expr.kind
         else {
             unreachable!()
@@ -1003,7 +1005,7 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
             value: LirRvalue::PrepareMethod {
                 receiver,
                 receiver_ty: object.ty.clone(),
-                method: method.clone(),
+                method: method.to_string(),
             },
             span: expr.span,
         });
@@ -1043,6 +1045,7 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
             method,
             args,
             super_class,
+            ..
         } = &expr.kind
         else {
             unreachable!()
@@ -1073,7 +1076,7 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
             value: LirRvalue::MethodCall {
                 receiver: LirOperand::Local(receiver),
                 receiver_ty: object.ty.clone(),
-                method: method.clone(),
+                method: method.to_string(),
                 // Filled once all method calls have been lowered.
                 is_async: false,
                 args,

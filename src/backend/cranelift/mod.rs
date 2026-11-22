@@ -199,7 +199,7 @@ pub struct Codegen {
 /// including on errors and unwinding; canonical metadata is never copied.
 pub struct UnitCodegenContext<'a> {
     static_init_order: Option<std::sync::Arc<[crate::compiler_db::ids::StaticId]>>,
-    checked: Option<&'a crate::compiler_db::CheckedUnit>,
+    checked: Option<crate::ir::lower::SemanticFacts<'a>>,
     declarations_open: bool,
     output: &'a mut EmissionState,
     type_scope: TypeScope,
@@ -1872,10 +1872,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn option_repr(&self, ty: &Type) -> Option<option_repr::OptionRepr> {
-        if option_repr::option_inner(ty).is_some_and(|inner| self.is_interface_pair(inner)) {
-            Some(option_repr::OptionRepr::BoxedTaggedEnum)
+        option_repr::option_inner(ty).map(|inner| self.option_payload_repr(inner))
+    }
+
+    fn option_payload_repr(&self, inner: &Type) -> option_repr::OptionRepr {
+        if self.is_interface_pair(inner) {
+            option_repr::OptionRepr::BoxedTaggedEnum
         } else {
-            option_repr::option_repr(ty, self.enum_infos)
+            option_repr::option_payload_repr(inner, self.enum_infos)
         }
     }
 

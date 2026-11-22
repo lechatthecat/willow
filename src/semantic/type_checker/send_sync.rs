@@ -280,6 +280,7 @@ impl TypeChecker {
             body,
             &self.lambda_captures,
             &self.expr_types,
+            &self.builtin_calls,
             &self.local.exhaustive_matches,
             &self.pattern_resolutions,
         );

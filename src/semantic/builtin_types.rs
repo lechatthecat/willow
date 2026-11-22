@@ -187,15 +187,16 @@ pub fn panic_info_fields() -> [(&'static str, Type); 4] {
     ]
 }
 
-pub(crate) fn is_scalar_pair<N: TypeName>(ty: &crate::parser::ast::Type<N>) -> bool {
-    use crate::parser::ast::Type as T;
-    fn scalar<N>(ty: &T<N>) -> bool {
-        ty.scalar_layout().is_some() || matches!(ty, T::F64 | T::Bool | T::Void)
-    }
+pub(crate) fn is_scalar_adt_payload<N>(ty: &Type<N>) -> bool {
+    ty.scalar_layout().is_some() || matches!(ty, Type::F64 | Type::Bool | Type::Void)
+}
+
+pub(crate) fn is_scalar_pair<N: TypeName>(ty: &Type<N>) -> bool {
     if let Some(inner) = unary_arg(ty, BuiltinTypeId::Option) {
-        return scalar(inner);
+        return is_scalar_adt_payload(inner);
     }
-    binary_args(ty, BuiltinTypeId::Result).is_some_and(|(ok, err)| scalar(ok) && scalar(err))
+    binary_args(ty, BuiltinTypeId::Result)
+        .is_some_and(|(ok, err)| is_scalar_adt_payload(ok) && is_scalar_adt_payload(err))
 }
 
 #[cfg(test)]

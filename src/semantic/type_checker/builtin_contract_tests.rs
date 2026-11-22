@@ -121,7 +121,7 @@ fn builtin_contract_diagnostics() {
         (
             "Array<i64>",
             &["push", "pop", "len", "get", "set"],
-            8138042849136865135,
+            14817040709860707179,
         ),
         (
             "i64",

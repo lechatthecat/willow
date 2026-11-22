@@ -17,6 +17,7 @@ pub(crate) enum CheckKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum CheckInput {
     Helper(FunctionId),
+    Method(crate::parser::ast::ExprId),
     Class(String),
     Target,
     SignatureType(String, crate::diagnostics::FileId),

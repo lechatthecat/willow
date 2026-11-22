@@ -248,43 +248,6 @@ fn instance_method(receiver: &Type, method: &str, args: &[HirExpr], callables: &
     )
 }
 
-fn enum_method(receiver: &Type, method: &str) -> bool {
-    use crate::semantic::builtin_types::{self, BuiltinTypeId};
-    builtin_types::resolve(receiver).is_some_and(|resolved| match resolved.id {
-        BuiltinTypeId::Option => matches!(
-            method,
-            "is_some"
-                | "is_none"
-                | "unwrap"
-                | "expect"
-                | "unwrap_or"
-                | "map"
-                | "and_then"
-                | "or_else"
-                | "ok_or"
-                | "ok_or_else"
-        ),
-        BuiltinTypeId::Result => matches!(
-            method,
-            "is_ok"
-                | "is_err"
-                | "unwrap"
-                | "expect"
-                | "unwrap_or"
-                | "unwrap_err"
-                | "expect_err"
-                | "map"
-                | "map_err"
-                | "and_then"
-                | "or_else"
-                | "ok"
-                | "err"
-        ),
-        // Only Option and Result use these enum method lowering rules.
-        _ => false,
-    })
-}
-
 fn argument_types(
     node: &HirExpr,
     names: &HashMap<String, LirLocalId>,
@@ -428,8 +391,7 @@ fn scalar(
         HirExprKind::Var(name) => names.contains_key(name),
         HirExprKind::Lambda { captures, .. } => captures.iter().all(|capture| names.contains_key(&capture.source)),
         HirExprKind::Print { value, .. } => matches!(value.ty, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never),
-        HirExprKind::MethodCall { object, method, args, super_class } => crate::semantic::intrinsics::resolve(&object.ty, method, args.len()).is_some_and(|resolved|
-            !(is_async && resolved.intrinsic.is_suspension_point()) && resolved.return_type(|i| args.get(i).map(|arg| arg.ty.clone())) == node.ty) || enum_method(&object.ty, method) || instance_method(super_class.map(Type::Named).as_ref().unwrap_or(&object.ty), method, args, callables),
+        HirExprKind::MethodCall { object, method, args, super_class, builtin } => match builtin { Some(id) => !(is_async && id.is_suspension_point()), None => instance_method(super_class.map(Type::Named).as_ref().unwrap_or(&object.ty), method, args, callables) },
         HirExprKind::Invoke { callee, args, .. } => matches!(&callee.ty, Type::Fn(params, result) | Type::Closure(params, result) if **result == node.ty && params.len() == args.len() && !args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) && params.iter().zip(args).all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution))),
         HirExprKind::Call { callee, args } => if let Some(local) = names.get(callee.unqualified_name().as_deref().unwrap_or("")) {
             matches!(&locals[local.0 as usize].ty, Type::Fn(params, result) | Type::Closure(params, result) if !args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) && **result == node.ty && params.len() == args.len() && params.iter().zip(args).all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution)))

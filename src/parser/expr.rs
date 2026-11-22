@@ -3,6 +3,7 @@ use super::ast::*;
 use super::import_usage::ReferenceKind;
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::lexer::token::TokenKind;
+use crate::semantic::intrinsics::MethodName;
 
 #[willow_continuations::parser]
 impl Parser {
@@ -524,7 +525,8 @@ impl Parser {
                 let member = self.expect_ident()?;
                 if self.eat(TokenKind::LParen) {
                     let args = self.parse_call_args_after_lparen()?;
-                    if member == "entries" {
+                    let member = MethodSpelling::from(member);
+                    if member.kind() == crate::semantic::intrinsics::MethodName::Entries {
                         self.tuple_arities.insert(2);
                     }
                     lhs = Expr::MethodCall(Box::new(MethodCallExpr {
@@ -1203,13 +1205,13 @@ impl Parser {
                     // alone would silently discard `ch.recv(f())` — both the
                     // arity error and the argument's side effects.
                     Expr::MethodCall(m)
-                        if matches!(m.method.as_str(), "recv" | "recv_opt")
+                        if matches!(m.method.kind(), MethodName::Recv | MethodName::RecvOpt)
                             && m.args.is_empty() =>
                     {
                         SelectCaseKind::Recv {
                             binding,
                             channel: m.object.take(),
-                            closed_aware: m.method == "recv_opt",
+                            closed_aware: m.method.kind() == MethodName::RecvOpt,
                         }
                     }
                     Expr::Await(a) => Self::select_await_case(binding, a.expr.take()),
@@ -1222,13 +1224,13 @@ impl Parser {
                 // `ch.recv() => ...` (discarded value) or `ch.send(x) => ...`
                 match &mut self.parse_expr()? {
                     Expr::MethodCall(m)
-                        if matches!(m.method.as_str(), "recv" | "recv_opt")
+                        if matches!(m.method.kind(), MethodName::Recv | MethodName::RecvOpt)
                             && m.args.is_empty() =>
                     {
                         SelectCaseKind::Recv {
                             binding: "_".to_string(),
                             channel: m.object.take(),
-                            closed_aware: m.method == "recv_opt",
+                            closed_aware: m.method.kind() == MethodName::RecvOpt,
                         }
                     }
                     Expr::Await(a) => Self::select_await_case("_".to_string(), a.expr.take()),
@@ -1236,7 +1238,9 @@ impl Parser {
                     // reference argument would be silently downgraded to a value
                     // one — rejected here with the same code a plain
                     // `ch.send(&v)` / `sleep(&ms)` gets from the checker.
-                    Expr::MethodCall(m) if m.method == "send" && m.args.len() == 1 => {
+                    Expr::MethodCall(m)
+                        if m.method.kind() == MethodName::Send && m.args.len() == 1 =>
+                    {
                         let arg = m.args.remove(0);
                         if let CallArgMode::Reference { ampersand_span } = arg.mode {
                             return Err(self.err_at(
@@ -1342,14 +1346,14 @@ impl Parser {
         if !m.args.is_empty() {
             return None;
         }
-        match m.method.as_str() {
-            "join" => Some(
+        match m.method.kind() {
+            MethodName::Join => Some(
                 self.err(
                     ErrorCode::E0812,
                     "`join()` has been removed: a select task case is now `let v = await t => { ... }`",
                 ),
             ),
-            "try_join" => Some(self.err(
+            MethodName::TryJoin => Some(self.err(
                 ErrorCode::E0813,
                 "`try_join()` has been removed: use `let v = await t` or `let r = await t.result()`",
             )),

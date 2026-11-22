@@ -862,7 +862,7 @@ fn flat_rvalues_reject_forged_runtime_and_enum_metadata() {
             &V::EnumMethod {
                 receiver: O::Int(0),
                 receiver_ty: Type::I64,
-                method: "unwrap".into(),
+                method: AdtMethod::Unwrap,
                 args: vec![],
                 arg_types: vec![],
                 result: Type::I64
@@ -3724,12 +3724,13 @@ fn k10_self_returning_method_matches_receiver_interface() {
     let shape = Type::Named("Shape".to_string().into());
     let call = |ty: Type| HirExpr {
         kind: HirExprKind::MethodCall {
+            builtin: None,
             object: Box::new(HirExpr {
                 kind: HirExprKind::Var("s".to_string()),
                 ty: shape.clone(),
                 span: crate::diagnostics::Span::dummy(),
             }),
-            method: "itself".to_string(),
+            method: "itself".into(),
             args: Vec::new(),
             super_class: None,
         },
@@ -4233,12 +4234,15 @@ fn c06_map_to_string_unrenderable_value_ineligible() {
     let span = crate::diagnostics::Span::dummy();
     let to_string = |value: Type| HirExpr {
         kind: HirExprKind::MethodCall {
+            builtin: Some(crate::semantic::intrinsics::BuiltinMethod::Intrinsic(
+                Intrinsic::MapToString,
+            )),
             object: Box::new(HirExpr {
                 kind: HirExprKind::Var("m".to_string()),
                 ty: map_ty(Type::String, value),
                 span,
             }),
-            method: "to_string".to_string(),
+            method: "to_string".into(),
             args: Vec::new(),
             super_class: None,
         },
@@ -5454,8 +5458,10 @@ fn p10_closure_combinators_eligible() {
     // The list is closed against names the language does not have either,
     // so a future `Option::filter` cannot be emitted before it is written.
     let opt_i64 = Type::Generic("Option".to_string().into(), vec![Type::I64]);
-    let pred = Type::Fn(vec![Type::I64], Box::new(Type::Bool));
-    assert!(option_result_method(&opt_i64, "filter", &[pred]).is_none());
+    assert!(matches!(
+        intrinsics::lookup(&opt_i64, "filter"),
+        intrinsics::MethodLookup::Missing(_)
+    ));
 }
 
 // p11. `unwrap_or`'s argument must have the payload's representation. A
@@ -6545,6 +6551,164 @@ fn f18_lambda_inside_a_class_method_is_lifted() {
     assert_eq!(lambda_eligibility(src, &["apply"]), vec![true]);
 }
 
+#[test]
+fn scalar_destinations_survive_lowering_and_validation_without_reparsing() {
+    use crate::ir::lowered::LirRvalue;
+    use intrinsics::SCALAR_TARGET_PARSES;
+
+    for count in [1, 8, 64] {
+        let source = format!(
+            "fn probe(x: i8, s: String) {{ {} }}",
+            "s.parse_char(); x.to_i32(); x.wrapping_to_u16(); x.checked_to_u32();".repeat(count)
+        );
+        SCALAR_TARGET_PARSES.set(0);
+        let (program, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(SCALAR_TARGET_PARSES.get(), 4 * count);
+        let mut checker = crate::semantic::TypeChecker::new();
+        crate::register_prelude(&mut checker).unwrap();
+        checker.check_program(&program);
+        assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+        let facts = crate::ir::lower::SemanticFacts::from_checker(&checker);
+        let (decls, errors) = Parser::new(
+            Lexer::new("enum Option<T> { Some(T), None }")
+                .tokenize()
+                .unwrap(),
+        )
+        .parse();
+        assert!(errors.is_empty());
+        let tables = TestTables::build(&decls, &["probe"], &[]);
+
+        SCALAR_TARGET_PARSES.set(0);
+        let (hir, diagnostics) = crate::ir::lower::lower_program_with(&program, &facts);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let lir = crate::ir::lowered::lower_program(&hir);
+        let f = &lir.functions[0];
+        let mut seen = [0; 4];
+        let mut forged_locals = f.locals.clone();
+        for inst in f.blocks.iter().flat_map(|b| &b.instrs) {
+            if let LirInst::Compute {
+                local,
+                value: value @ LirRvalue::IntrinsicCall { intrinsic, .. },
+                ..
+            } = inst
+            {
+                let index = match intrinsic {
+                    Intrinsic::ScalarParse => 0,
+                    Intrinsic::IntegerConvert => 1,
+                    Intrinsic::IntegerWrappingConvert => 2,
+                    Intrinsic::IntegerCheckedConvert => 3,
+                    _ => panic!("unexpected scalar intrinsic {intrinsic:?}"),
+                };
+                seen[index] += 1;
+                assert!(value.is_well_typed(&f.locals, *local));
+                // Even a consistent destination slot and result annotation must
+                // disagree with a conversion checked for a different width.
+                let mut forged = value.clone();
+                let LirRvalue::IntrinsicCall { result, .. } = &mut forged else {
+                    unreachable!()
+                };
+                *result = if matches!(index, 0 | 3) {
+                    B::Option.apply(vec![Type::I64])
+                } else {
+                    Type::I64
+                };
+                let slot = local.0 as usize;
+                let original = std::mem::replace(&mut forged_locals[slot].ty, result.clone());
+                assert!(!forged.is_well_typed(&forged_locals, *local));
+                forged_locals[slot].ty = original;
+            }
+        }
+        assert_eq!(seen, [count; 4]);
+        assert!(tables.with_ctx(|ctx| lir_supported_function(f, ctx)));
+        assert_eq!(SCALAR_TARGET_PARSES.get(), 0);
+    }
+}
+
+#[test]
+fn backend_adt_method_validation_borrows_nested_payloads() {
+    use crate::ir::lowered::{LirLocal, LirOperand, LirRvalue};
+    use crate::parser::ast::REBUILT_TYPE_NODES;
+
+    let declarations = "enum Option<T> { Some(T), None } enum Result<T,E> { Ok(T), Err(E) }";
+    let (program, errors) = Parser::new(Lexer::new(declarations).tokenize().unwrap()).parse();
+    assert!(errors.is_empty());
+    let tables = TestTables::build(&program, &[], &[]);
+    for depth in [0, 8, 32, 128] {
+        let payload = (0..depth).fold(Type::I64, |inner, _| Type::Array(Box::new(inner)));
+        REBUILT_TYPE_NODES.set(0);
+        let arg = payload.clone();
+        assert_eq!(REBUILT_TYPE_NODES.get(), depth + 1);
+        let recv = B::Result.apply(vec![arg.clone(), Type::Bool]);
+        let opt = B::Option.apply(vec![arg.clone()]);
+        let callback = |output| Type::Fn(vec![arg.clone()], Box::new(output));
+        let cases = [
+            (
+                AdtMethod::AndThen,
+                &recv,
+                vec![callback(recv.clone())],
+                &recv,
+            ),
+            (AdtMethod::Map, &recv, vec![callback(arg.clone())], &recv),
+            (AdtMethod::Map, &opt, vec![callback(arg.clone())], &opt),
+            (AdtMethod::Unwrap, &opt, vec![], &arg),
+            (AdtMethod::IsOk, &recv, vec![], &Type::Bool),
+        ];
+        for (method, receiver_ty, arg_types, result) in cases {
+            let locals: Vec<_> = [receiver_ty, result]
+                .into_iter()
+                .chain(&arg_types)
+                .enumerate()
+                .map(|(i, ty)| LirLocal {
+                    id: LirLocalId(i as u32),
+                    storage_kind: Default::default(),
+                    name: String::new(),
+                    ty: ty.clone(),
+                    source_span: None,
+                    synthetic: false,
+                    parameter: false,
+                })
+                .collect();
+            let call = LirRvalue::EnumMethod {
+                receiver: LirOperand::Local(LirLocalId(0)),
+                receiver_ty: receiver_ty.clone(),
+                method,
+                args: (2..locals.len())
+                    .map(|i| LirOperand::Local(LirLocalId(i as u32)))
+                    .collect(),
+                arg_types,
+                result: result.clone(),
+            };
+            let LirRvalue::EnumMethod { arg_types, .. } = &call else {
+                unreachable!()
+            };
+            tables.with_ctx(|ctx| {
+                // Eligibility also validates generic declarations and their layout.
+                // Measure that common cost independently of the method contract.
+                REBUILT_TYPE_NODES.set(0);
+                assert!(
+                    ctx.supported_enum_type(receiver_ty)
+                        && ctx.supported_type(result)
+                        && arg_types.iter().all(|ty| ctx.supported_type(ty))
+                );
+                let layout_copies = REBUILT_TYPE_NODES.get();
+                for count in [1, 8, 64] {
+                    REBUILT_TYPE_NODES.set(0);
+                    for _ in 0..count {
+                        assert!(call.is_well_typed(&locals, LirLocalId(1)));
+                        assert!(flat_rvalue_supported(&call, &locals, ctx));
+                    }
+                    assert_eq!(
+                        REBUILT_TYPE_NODES.get(),
+                        count * layout_copies,
+                        "{method:?}, {count} calls, depth {depth}"
+                    );
+                }
+            });
+        }
+    }
+}
+
 // f19. `Option::map` — the first combinator that CALLS its operand. The
 // result is `Option<U>` for the callable's return `U`, which is what
 // decides the new value's representation.
@@ -6553,18 +6717,21 @@ fn f19_option_map_result_type_follows_the_callable() {
     let opt_i64 = Type::Generic("Option".to_string().into(), vec![Type::I64]);
     let to_string = Type::Fn(vec![Type::I64], Box::new(Type::String));
     assert_eq!(
-        option_result_method(&opt_i64, "map", &[to_string]),
-        Some(Type::Generic(
-            "Option".to_string().into(),
-            vec![Type::String]
-        ))
+        option_result_method(&opt_i64, AdtMethod::Map, &[to_string]),
+        Some(EnumMethodResult::Option(&Type::String))
     );
     // a `void`-returning callable would build a `Some` with no payload slot
     let to_void = Type::Fn(vec![Type::I64], Box::new(Type::Void));
-    assert_eq!(option_result_method(&opt_i64, "map", &[to_void]), None);
+    assert_eq!(
+        option_result_method(&opt_i64, AdtMethod::Map, &[to_void]),
+        None
+    );
     // the callable's parameter must be the payload type
     let wrong = Type::Fn(vec![Type::String], Box::new(Type::I64));
-    assert_eq!(option_result_method(&opt_i64, "map", &[wrong]), None);
+    assert_eq!(
+        option_result_method(&opt_i64, AdtMethod::Map, &[wrong]),
+        None
+    );
 }
 
 // f20. `and_then` and `or_else` MERGE one arm's receiver with the other
@@ -6578,24 +6745,27 @@ fn f20_and_then_and_or_else_merge_rules() {
     let opt_str = Type::Generic("Option".to_string().into(), vec![Type::String]);
     let to_opt_str = Type::Fn(vec![Type::I64], Box::new(opt_str.clone()));
     assert_eq!(
-        option_result_method(&opt_i64, "and_then", &[to_opt_str]),
-        Some(opt_str.clone())
+        option_result_method(&opt_i64, AdtMethod::AndThen, &[to_opt_str]),
+        Some(EnumMethodResult::Value(&opt_str))
     );
     // `or_else` takes NO argument and must produce the receiver's payload
     let same = Type::Fn(vec![], Box::new(opt_i64.clone()));
     assert_eq!(
-        option_result_method(&opt_i64, "or_else", &[same]),
-        Some(opt_i64.clone())
+        option_result_method(&opt_i64, AdtMethod::OrElse, &[same]),
+        Some(EnumMethodResult::Value(&opt_i64))
     );
     let other = Type::Fn(vec![], Box::new(opt_str));
-    assert_eq!(option_result_method(&opt_i64, "or_else", &[other]), None);
+    assert_eq!(
+        option_result_method(&opt_i64, AdtMethod::OrElse, &[other]),
+        None
+    );
 
     let res = Type::Generic("Result".to_string().into(), vec![Type::I64, Type::String]);
     let unresolved_err = Type::Generic("Result".to_string().into(), vec![Type::I64, Type::Void]);
     let recover = Type::Fn(vec![Type::String], Box::new(unresolved_err.clone()));
     assert_eq!(
-        option_result_method(&res, "or_else", &[recover]),
-        Some(unresolved_err)
+        option_result_method(&res, AdtMethod::OrElse, &[recover]),
+        Some(EnumMethodResult::Value(&unresolved_err))
     );
     // the OK payload still has to match — that arm passes the receiver on
     let mismatched = Type::Fn(
@@ -6605,7 +6775,10 @@ fn f20_and_then_and_or_else_merge_rules() {
             vec![Type::String, Type::String],
         )),
     );
-    assert_eq!(option_result_method(&res, "or_else", &[mismatched]), None);
+    assert_eq!(
+        option_result_method(&res, AdtMethod::OrElse, &[mismatched]),
+        None
+    );
 }
 
 // f21. `map_err` is a `Result`-only combinator, and it rebuilds the ERROR
@@ -6615,11 +6788,11 @@ fn f21_map_err_is_result_only() {
     let res = Type::Generic("Result".to_string().into(), vec![Type::I64, Type::String]);
     let wrap = Type::Fn(vec![Type::String], Box::new(Type::String));
     assert_eq!(
-        option_result_method(&res, "map_err", std::slice::from_ref(&wrap)),
-        Some(res.clone())
+        option_result_method(&res, AdtMethod::MapErr, std::slice::from_ref(&wrap)),
+        Some(EnumMethodResult::Result(&Type::I64, &Type::String))
     );
     let opt = Type::Generic("Option".to_string().into(), vec![Type::I64]);
-    assert_eq!(option_result_method(&opt, "map_err", &[wrap]), None);
+    assert_eq!(option_result_method(&opt, AdtMethod::MapErr, &[wrap]), None);
 }
 
 // f22. a `void` payload has no slot for a combinator to read or write, so
@@ -6629,7 +6802,7 @@ fn f21_map_err_is_result_only() {
 fn f22_void_payloads_are_excluded_from_combinators() {
     let res_void = Type::Generic("Result".to_string().into(), vec![Type::Void, Type::String]);
     let f = Type::Fn(vec![Type::Void], Box::new(Type::I64));
-    for method in ["map", "and_then"] {
+    for method in [AdtMethod::Map, AdtMethod::AndThen] {
         assert_eq!(
             option_result_method(&res_void, method, std::slice::from_ref(&f)),
             None,
@@ -8346,6 +8519,33 @@ fn builtin_identity_preserves_task_stack_call_boundaries() {
                 task_stack_boundary(&call),
                 boundary || callback,
                 "{name}, callback={callback}"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_enum_emission_borrows_predicate_and_callback_types() {
+    use crate::backend::cranelift::emit_interface::tests::compile_fixture_with;
+
+    for depth in [0, 4, 16] {
+        let payload = (0..depth).fold(String::from("i64"), |inner, _| {
+            format!("FrozenArray<{inner}>")
+        });
+        for count in [1, 8, 32] {
+            let calls = "r.is_ok(); r.is_err(); o.map(identity); o.and_then(some); o.or_else(nothing); \
+                r.map(identity); r.map_err(identity); r.and_then(ok); r.or_else(ok);";
+            let source = format!("fn identity(x: {payload}) -> {payload} {{ return x; }}
+                fn some(x: {payload}) -> Option<{payload}> {{ return Option::Some(x); }}
+                fn nothing() -> Option<{payload}> {{ return Option::None; }}
+                fn ok(x: {payload}) -> Result<{payload},{payload}> {{ return Result::Ok(x); }}
+                fn probe(o: Option<{payload}>, r: Result<{payload},{payload}>) {{ {} }} fn main() {{}}", calls.repeat(count));
+            ENUM_EMISSION_WORK.set((0, 0));
+            compile_fixture_with(&source, &crate::CompilerOptions::debug());
+            assert_eq!(
+                ENUM_EMISSION_WORK.get(),
+                (9 * count, 0),
+                "{count} groups at depth {depth}"
             );
         }
     }

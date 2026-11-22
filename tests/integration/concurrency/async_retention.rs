@@ -62,7 +62,8 @@ fn identity(op: fn(i64) -> i64) -> fn(i64) -> i64 {{ return op; }}
 fn consume(op: fn(i64) -> i64, n: i64) {{ println(op(n)); }}
 async fn number() -> i64 {{ return 1; }}
 async fn main() {{
-    let op: fn(i64) -> i64 = |x| x;
+    let mut base = 1;
+    let op: fn(i64) -> i64 = |x| {{ base = base + x; return base; }};
     let holder = new Holder(op);
     let ops: Array<fn(i64) -> i64> = [op];
     consume({operand}, await number());
@@ -222,7 +223,7 @@ fn async_retention_literal_expression_branches_run() {
     let source = r#"
 async fn choose() -> bool { println(99); return true; }
 async fn main() {
-    let op: fn(i64) -> i64 = |x| x;
+    let mut op: fn(i64) -> i64 = |x| x;
     let a = false && await choose();
     let b = true || await choose();
     let c = true ? false : await choose();
@@ -250,7 +251,7 @@ async fn main() {
         "false ? false : await choose()",
     ] {
         let source = format!(
-            "async fn choose() -> bool {{ return true; }} async fn main() {{ let op: fn(i64) -> i64 = |x| x; let b = {expr}; println(op(1)); }}"
+            "async fn choose() -> bool {{ return true; }} async fn main() {{ let mut op: fn(i64) -> i64 = |x| x; let b = {expr}; println(op(1)); }}"
         );
         let (ok, errors) = compile_with_data_race_check(&source);
         assert!(!ok && errors.contains("E2402"), "{expr}: {errors}");
@@ -269,7 +270,7 @@ fn async_retention_bare_variant_rejections() {
                 format!("match tag {{ {a} => {{}}, {b} => {{ await sleep(0); println(op(1)); }} }}")
             };
             let source = format!(
-                "enum Tag {{ A, B }} async fn work(tag: Tag) {{ let op: fn(i64) -> i64 = |x| x; {body} }} async fn main() {{ await work(Tag::B); }}"
+                "enum Tag {{ A, B }} async fn work(tag: Tag) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }} async fn main() {{ await work(Tag::B); }}"
             );
             let (ok, errors) = compile_with_data_race_check(&source);
             assert!(
@@ -330,7 +331,7 @@ fn async_retention_never_cli_diagnostics() {
             true,
         ),
     ] {
-        let source = format!("async fn main() {{ let op: fn(i64) -> i64 = |x| x; {body} }}");
+        let source = format!("async fn main() {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}");
         let (ok, errors) = compile_with_data_race_check(&source);
         assert_eq!(ok, !bad, "{body}: {errors}");
         assert_eq!(errors.contains("E2402"), bad, "{body}: {errors}");

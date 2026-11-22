@@ -22,14 +22,18 @@
 //! incrementally without changing behavior.
 
 mod expressions;
+mod normalization;
+pub use normalization::NormalizedTypes;
 mod resolution;
 
 #[cfg(test)]
 thread_local! {
+    static MEMBER_LOOKUP_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REQUIRED_TYPE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 use expressions::{lower_expr, lower_expr_cont};
+use normalization::{BoundNames, bound_names};
 use resolution::lower_resolution_partial;
 
 use crate::qualified_name::QualifiedName;
@@ -51,6 +55,7 @@ use super::typed_ast::{
     HirCapture, HirClass, HirDeferBody, HirDeferId, HirExpr, HirExprKind, HirFunction, HirGuard,
     HirMatchArm, HirParam, HirPattern, HirProgram, HirSelectCase, HirSelectCaseKind, HirStmt,
 };
+use crate::semantic::intrinsics::{BuiltinMethod, Intrinsic};
 
 /// Complete semantic input to production lowering. Sparse maps represent
 /// optional per-node facts, never an optional checking phase. The references
@@ -61,8 +66,9 @@ pub struct SemanticFacts<'a> {
     pub enum_variant_resolutions: &'a HashMap<ExprId, String>,
     pub pattern_resolutions: &'a HashMap<PatternId, crate::parser::ast::Pattern>,
     pub arm_leaves: &'a HashMap<crate::parser::ast::BodyId, bool>,
-    pub normalized_types: &'a HashMap<Type, Type>,
+    pub normalized_types: NormalizedTypes<'a>,
     pub static_call_classes: &'a HashMap<ExprId, crate::semantic::ids::TypeId>,
+    pub builtin_calls: &'a crate::semantic::intrinsics::BuiltinCalls,
     pub lambda_captures: &'a HashMap<ExprId, Vec<LambdaCapture>>,
 }
 
@@ -74,13 +80,14 @@ impl<'a> SemanticFacts<'a> {
             enum_variant_resolutions: &checker.enum_variant_resolutions,
             pattern_resolutions: &checker.pattern_resolutions,
             arm_leaves: &checker.arm_leaves,
-            normalized_types: &checker.normalized_types,
+            normalized_types: (&checker.normalized_types).into(),
             static_call_classes: &checker.static_call_classes,
+            builtin_calls: &checker.builtin_calls,
             lambda_captures: &checker.lambda_captures,
         }
     }
 
-    fn lowering(&self) -> PartialCheckerTables<'_> {
+    fn lowering(&self) -> PartialCheckerTables<'a> {
         PartialCheckerTables {
             checked: true,
             mutable_capture_declarations: Default::default(),
@@ -90,8 +97,9 @@ impl<'a> SemanticFacts<'a> {
             enum_variant_resolutions: Some(self.enum_variant_resolutions),
             pattern_resolutions: Some(self.pattern_resolutions),
             arm_leaves: Some(self.arm_leaves),
-            normalized_types: Some(self.normalized_types),
+            normalized_types: self.normalized_types.clone(),
             static_call_classes: Some(self.static_call_classes),
+            builtin_calls: Some(self.builtin_calls),
             lambda_captures: Some(self.lambda_captures),
         }
     }
@@ -183,10 +191,11 @@ pub struct PartialCheckerTables<'a> {
     /// identity is `signal::Level`) are still the words the source used; every
     /// other phase sees the normalized type, so without this the LIR walker
     /// meets a named type nothing has heard of and turns the body down.
-    pub normalized_types: Option<&'a HashMap<Type, Type>>,
+    pub normalized_types: NormalizedTypes<'a>,
     /// Resolved class/module name for every checked static expression, including
     /// unchanged spellings. Absence is an error on the production path.
     pub static_call_classes: Option<&'a HashMap<ExprId, crate::semantic::ids::TypeId>>,
+    pub builtin_calls: Option<&'a crate::semantic::intrinsics::BuiltinCalls>,
     /// What each lambda captures from its enclosing function, keyed by the
     /// lambda's node ID and ordered as the closure environment lays its slots out. Only the
     /// checker knows this: capture is decided by
@@ -214,77 +223,12 @@ impl<'a> PartialCheckerTables<'a> {
     /// spelling inside a type argument is rewritten even when the whole type
     /// was never written that way.
     pub(crate) fn normalize(&self, ty: &Type) -> Type {
-        self.normalize_declared(ty, &[])
+        self.normalize_declared(ty, None)
     }
 
     /// Symbolic declaration parameters must survive until instantiation.
-    fn normalize_declared(&self, ty: &Type, bound: &[String]) -> Type {
-        if let Type::Named(name) = ty
-            && bound.contains(name)
-        {
-            return ty.clone();
-        }
-        if let Type::Named(name) = ty
-            && let Some(spelled) = self.receiver_spelling(name)
-        {
-            return Type::Named(spelled);
-        }
-        let ty = self.normalized_types.and_then(|m| m.get(ty)).unwrap_or(ty);
-        let rebuilt = match ty {
-            Type::Named(name) => self
-                .enums
-                .and_then(|enums| enums.get(&crate::semantic::ids::TypeId::from_source_name(name)))
-                .map(|info| Type::Named(info.name.clone()))
-                .or_else(|| {
-                    self.symbols
-                        .and_then(|symbols| symbols.lookup_class(name))
-                        .map(|info| Type::Named(info.name.clone()))
-                })
-                .or_else(|| {
-                    self.symbols
-                        .and_then(|symbols| symbols.lookup_interface(name))
-                        .map(|info| Type::Named(info.name.clone()))
-                })
-                .unwrap_or_else(|| ty.clone()),
-            Type::Array(elem) | Type::FixedArray(elem, _) => {
-                Type::Array(Box::new(self.normalize_declared(elem, bound)))
-            }
-            Type::Generic(name, args) => Type::Generic(
-                self.symbols
-                    .and_then(|symbols| symbols.lookup_interface(name))
-                    .map(|info| info.name.clone())
-                    .or_else(|| {
-                        self.enums
-                            .and_then(|enums| {
-                                enums.get(&crate::semantic::ids::TypeId::from_source_name(name))
-                            })
-                            .map(|info| info.name.clone())
-                    })
-                    .unwrap_or_else(|| name.clone()),
-                args.iter()
-                    .map(|a| self.normalize_declared(a, bound))
-                    .collect(),
-            ),
-            Type::Fn(params, ret) => Type::Fn(
-                params
-                    .iter()
-                    .map(|p| self.normalize_declared(p, bound))
-                    .collect(),
-                Box::new(self.normalize_declared(ret, bound)),
-            ),
-            Type::Closure(params, ret) => Type::Closure(
-                params
-                    .iter()
-                    .map(|p| self.normalize_declared(p, bound))
-                    .collect(),
-                Box::new(self.normalize_declared(ret, bound)),
-            ),
-            other => other.clone(),
-        };
-        match self.normalized_types.and_then(|m| m.get(&rebuilt)) {
-            Some(normalized) => normalized.clone(),
-            None => rebuilt,
-        }
+    fn normalize_declared(&self, ty: &Type, bound: Option<&BoundNames<'_>>) -> Type {
+        normalization::normalize(self, ty, bound, None)
     }
 
     /// How this scope must spell the type `name` is an alias of, when that
@@ -353,24 +297,8 @@ impl<'a> PartialCheckerTables<'a> {
         if !declared.contains(&info.name) {
             return info.to_semantic();
         }
-        let mut canonical = info.clone();
-        for variant in &mut canonical.variants {
-            for ty in &mut variant.payload_types {
-                *ty = self.normalize_declared(ty, &info.type_params);
-            }
-        }
-        canonical.to_semantic()
-    }
-
-    /// A lambda's full inferred callable type, from the checker's expression
-    /// table — including the parameter types a call site supplied, which the
-    /// AST cannot spell. Either callable form answers: which one it is says
-    /// whether the lambda captures, not what its signature is.
-    fn lambda_fn_type(&self, id: &ExprId) -> Option<&Type> {
-        match self.expr_types.and_then(|m| m.get(id)) {
-            Some(ty @ (Type::Fn(..) | Type::Closure(..))) => Some(ty),
-            _ => None,
-        }
+        let bound = bound_names(&info.type_params);
+        info.to_semantic_with(|ty| self.normalize_declared(ty, Some(&bound)).into())
     }
 
     /// What the lambda at `span` captures, in environment-slot order.
@@ -405,12 +333,6 @@ impl<'a> PartialCheckerTables<'a> {
             .and_then(|m| m.get(id))
             .map(ToString::to_string)
             .unwrap_or_else(|| written.to_string())
-    }
-
-    fn expr_type(&self, id: &ExprId) -> Option<Type> {
-        self.expr_types
-            .and_then(|m| m.get(id))
-            .map(Type::array_storage_type)
     }
 
     /// The checker's enums, re-keyed by the name they are WRITTEN with —
@@ -774,12 +696,8 @@ fn lower_env(program: &Program, tables: &PartialCheckerTables) -> LowerEnv {
             // name a module's own scrutinee carries — is replaced as well. Imported enums are
             // already canonical.
             Item::Enum(e) => {
-                let mut info = enum_info(e);
-                for payload in info.variants.values_mut() {
-                    for ty in payload {
-                        *ty = tables.normalize_declared(ty, &e.type_params);
-                    }
-                }
+                let bound = bound_names(&e.type_params);
+                let info = enum_info(e, |ty| tables.normalize_declared(ty, Some(&bound)));
                 if let Some(identity) = tables.enum_identity(&e.name)
                     && identity != e.name
                 {
@@ -844,7 +762,7 @@ fn prelude_enums() -> &'static HashMap<String, EnumInfo> {
             .items
             .iter()
             .filter_map(|item| match item {
-                Item::Enum(e) => Some((e.name.clone(), enum_info(e))),
+                Item::Enum(e) => Some((e.name.clone(), enum_info(e, Type::clone))),
                 _ => None,
             })
             .collect()
@@ -852,13 +770,18 @@ fn prelude_enums() -> &'static HashMap<String, EnumInfo> {
 }
 
 /// One enum declaration's lowering-side shape.
-fn enum_info(e: &crate::parser::ast::EnumDecl) -> EnumInfo {
+fn enum_info(e: &crate::parser::ast::EnumDecl, payload_type: impl Fn(&Type) -> Type) -> EnumInfo {
     EnumInfo {
         type_params: e.type_params.clone(),
         variants: e
             .variants
             .iter()
-            .map(|v| (v.name.clone(), v.payload.clone()))
+            .map(|v| {
+                (
+                    v.name.clone(),
+                    v.payload.iter().map(&payload_type).collect(),
+                )
+            })
             .collect(),
     }
 }
@@ -923,10 +846,12 @@ impl Classes {
     /// or if the chain revisits a class: the checker rejects an `extends` cycle
     /// (E0426), so lowering never sees one, but this walk must still terminate
     /// on any table it is handed.
-    fn resolve<F: Fn(&ClassInfo) -> Option<Type>>(&self, class: &str, pick: F) -> Option<Type> {
+    fn resolve(&self, class: &str, pick: impl Fn(&ClassInfo) -> Option<&Type>) -> Option<&Type> {
         let mut current = Some(class);
         let mut seen = HashSet::new();
         while let Some(name) = current {
+            #[cfg(test)]
+            MEMBER_LOOKUP_STEPS.set(MEMBER_LOOKUP_STEPS.get() + 1);
             if !seen.insert(name) {
                 return None;
             }
@@ -939,20 +864,23 @@ impl Classes {
         None
     }
 
-    fn field_type(&self, class: &str, field: &str) -> Option<Type> {
-        self.resolve(class, |info| info.fields.get(field).cloned())
+    fn field_type(&self, class: &str, field: &str) -> Option<&Type> {
+        self.resolve(class, |info| info.fields.get(field))
     }
 
     fn method_type(&self, class: &str, method: &str) -> Option<Type> {
-        self.resolve(class, |info| info.methods.get(method).cloned())
+        self.resolve(class, |info| info.methods.get(method))
+            .cloned()
     }
 
     fn static_field_type(&self, class: &str, field: &str) -> Option<Type> {
-        self.resolve(class, |info| info.static_fields.get(field).cloned())
+        self.resolve(class, |info| info.static_fields.get(field))
+            .cloned()
     }
 
     fn static_method_type(&self, class: &str, method: &str) -> Option<Type> {
-        self.resolve(class, |info| info.static_methods.get(method).cloned())
+        self.resolve(class, |info| info.static_methods.get(method))
+            .cloned()
     }
 }
 
@@ -1129,7 +1057,7 @@ struct Binding {
 fn cell_storage(binding: &Binding, span: Span) -> HirExpr {
     HirExpr {
         kind: HirExprKind::Var(binding.hir_name.clone()),
-        ty: Type::Array(Box::new(binding.ty.clone())).into(),
+        ty: Type::Array(Box::new((&binding.ty).into())),
         span,
     }
 }
@@ -1142,20 +1070,21 @@ fn cell_index(span: Span) -> HirExpr {
     }
 }
 
-fn cell_read(binding: &Binding, span: Span) -> HirExpr {
-    HirExpr {
-        kind: HirExprKind::Index {
+fn binding_read(binding: &Binding, ty: crate::semantic::ids::SemanticType, span: Span) -> HirExpr {
+    let kind = if binding.cell {
+        HirExprKind::Index {
             array: Box::new(cell_storage(binding, span)),
             index: Box::new(cell_index(span)),
-        },
-        ty: binding.ty.clone().into(),
-        span,
-    }
+        }
+    } else {
+        HirExprKind::Var(binding.hir_name.clone())
+    };
+    HirExpr { kind, ty, span }
 }
 
 /// Lowering scope: variables (innermost-last) plus the free-function
 /// return types used to type `Call` expressions.
-struct LowerCtx<'a> {
+struct LowerCtx<'a, 'unit> {
     arm_leaves: HashMap<crate::parser::ast::BodyId, bool>,
     scopes: crate::semantic::scopes::Scopes<Binding>,
     /// Scope depth immediately outside the current function/lambda body.
@@ -1173,15 +1102,15 @@ struct LowerCtx<'a> {
     fn_returns: &'a HashMap<String, Type>,
     classes: &'a Classes,
     enums: &'a Enums,
-    tables: &'a PartialCheckerTables<'a>,
+    tables: &'a PartialCheckerTables<'unit>,
 }
 
-impl<'a> LowerCtx<'a> {
+impl<'a, 'unit> LowerCtx<'a, 'unit> {
     fn new(
         fn_returns: &'a HashMap<String, Type>,
         classes: &'a Classes,
         enums: &'a Enums,
-        tables: &'a PartialCheckerTables<'a>,
+        tables: &'a PartialCheckerTables<'unit>,
     ) -> Self {
         Self {
             arm_leaves: HashMap::new(),
@@ -1200,21 +1129,27 @@ impl<'a> LowerCtx<'a> {
 
     /// The checker's type for a written annotation.
     fn normalize(&self, ty: &Type) -> Type {
-        self.receiver_self(self.tables.normalize(ty))
+        normalization::normalize(self.tables, ty, None, self.receiver.as_ref())
+    }
+
+    /// Construct the single normalized HIR result. Structural inference runs only for standalone expressions without a recorded type.
+    fn result_type(
+        &self,
+        checked: Option<Type>,
+        infer: impl FnOnce() -> Type,
+    ) -> crate::semantic::ids::SemanticType {
+        self.normalize(&checked.unwrap_or_else(infer)).into()
     }
 
     /// The checker's type for expression `id`, with `Self` as the receiver.
     fn expr_type(&self, id: &ExprId) -> Option<Type> {
-        self.tables.expr_type(id).map(|ty| self.receiver_self(ty))
-    }
-
-    fn receiver_self(&self, ty: Type) -> Type {
-        match &self.receiver {
+        let ty = self.tables.expr_types?.get(id)?;
+        Some(match &self.receiver {
             Some(receiver) => {
-                ty.substitute_names(|name| (name == "Self").then(|| receiver.clone()))
+                ty.array_storage_type_with(|name| (name == "Self").then(|| receiver.clone()))
             }
-            None => ty,
-        }
+            None => ty.array_storage_type(),
+        })
     }
 
     fn push_scope(&mut self) {
@@ -1338,7 +1273,7 @@ fn lower_block(block: &Block, ctx: &mut LowerCtx) -> Result<Vec<HirStmt>, Diagno
                         .symbols
                         .and_then(|symbols| symbols.lookup_class(&owner.to_string()))
                 })
-                .and_then(|class| class.methods.get(&call.method))
+                .and_then(|class| class.methods.get(call.method.as_str()))
                 .is_some_and(|method| {
                     method.array_body_optimization
                         == crate::parser::ast::ArrayBodyOptimization::Append
@@ -1394,7 +1329,10 @@ fn lower_block(block: &Block, ctx: &mut LowerCtx) -> Result<Vec<HirStmt>, Diagno
                 value: HirExpr {
                     kind: HirExprKind::MethodCall {
                         object: Box::new(receiver.clone()),
-                        method: "__abi_len".into(),
+                        builtin: Some(BuiltinMethod::Intrinsic(Intrinsic::ArrayLen)),
+                        method: crate::parser::ast::MethodSpelling::fixed(
+                            crate::semantic::intrinsics::MethodName::AbiLen,
+                        ),
                         args: vec![],
                         super_class: None,
                     },
@@ -1419,7 +1357,10 @@ fn lower_block(block: &Block, ctx: &mut LowerCtx) -> Result<Vec<HirStmt>, Diagno
             out.push(HirStmt::Expr(HirExpr {
                 kind: HirExprKind::MethodCall {
                     object: Box::new(receiver.clone()),
-                    method: "__abi_resize".into(),
+                    builtin: Some(BuiltinMethod::Intrinsic(Intrinsic::ArrayResize)),
+                    method: crate::parser::ast::MethodSpelling::fixed(
+                        crate::semantic::intrinsics::MethodName::AbiResize,
+                    ),
                     args: vec![length],
                     super_class: None,
                 },
@@ -1680,7 +1621,10 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
                         span: iterable.span,
                         kind: HirExprKind::MethodCall {
                             object: Box::new(iterable),
-                            method: "entries".into(),
+                            builtin: Some(BuiltinMethod::Intrinsic(Intrinsic::MapEntries)),
+                            method: crate::parser::ast::MethodSpelling::fixed(
+                                crate::semantic::intrinsics::MethodName::Entries,
+                            ),
                             args: vec![],
                             super_class: None,
                         },
@@ -1770,53 +1714,9 @@ fn lower_value_args(args: &[CallArg], ctx: &mut LowerCtx) -> Result<Vec<HirExpr>
 
 /// The class name a value's type names, if it is a (possibly generic) class
 /// type — the receiver position for field access and method calls.
-fn class_name_of(ty: &Type) -> Option<&str> {
+fn class_name_of(ty: &crate::semantic::ids::SemanticType) -> Option<String> {
     match ty {
-        Type::Named(name) => Some(name),
-        Type::Generic(name, _) => Some(name),
-        _ => None,
-    }
-}
-
-/// Return types of the compiler-builtin collection/concurrency methods, keyed
-/// by the receiver type (mirrors the checker's method tables).
-fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
-    match receiver {
-        Type::String if method == "len" => Some(Type::I64),
-        Type::Array(elem) => match method {
-            "__abi_len" => Some(Type::I64),
-            "__abi_resize" => Some(Type::Void),
-            "__abi_concat" if **elem == Type::String => Some(Type::String),
-            "__abi_copy" => Some(B::FrozenArray.apply(vec![(**elem).clone()])),
-            _ => None,
-        },
-        Type::Generic(_, args) => match (
-            builtin_types::resolve(receiver)?.id,
-            args.as_slice(),
-            method,
-        ) {
-            (B::Map, [k, v], _) => match method {
-                "insert" => Some(Type::Void),
-                "to_string" => Some(Type::String),
-                "get" => Some(B::Option.apply(vec![v.clone()])),
-                "contains" => Some(Type::Bool),
-                "len" => Some(Type::I64),
-                "freeze" => Some(B::FrozenMap.apply(vec![k.clone(), v.clone()])),
-                _ => None,
-            },
-            (B::FrozenArray, [_], "len") | (B::FrozenMap, [_, _], "len") => Some(Type::I64),
-            (B::FrozenMap, [_, v], "get") => Some(B::Option.apply(vec![v.clone()])),
-            (B::FrozenMap, [_, _], "contains") => Some(Type::Bool),
-            (B::Task | B::JoinHandle, [_], "cancel") => Some(Type::Void),
-            // Cancellation-aware awaitable view of the same frame.
-            (B::Task | B::JoinHandle, [t], "result") => Some(B::TaskResult.apply(vec![t.clone()])),
-            (B::Task | B::JoinHandle, [_], "is_cancelled") => Some(Type::Bool),
-            (B::BlockingCell, [t], "get") => Some(t.clone()),
-            (B::BlockingCell, [_], "set") => Some(Type::Void),
-            (B::BlockingRwCell, [t], "read") => Some(t.clone()),
-            (B::BlockingRwCell, [_], "write") => Some(Type::Void),
-            _ => None,
-        },
+        Type::Named(name) | Type::Generic(name, _) => Some(name.to_string()),
         _ => None,
     }
 }

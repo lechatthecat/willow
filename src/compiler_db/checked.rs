@@ -24,6 +24,7 @@ pub struct CheckedUnit {
     #[serde(with = "super::map_entries")]
     pub normalized_types: HashMap<Type, Type>,
     pub static_call_classes: HashMap<ExprId, crate::semantic::ids::TypeId>,
+    pub builtin_calls: crate::semantic::intrinsics::BuiltinCalls,
     pub lambda_captures: HashMap<ExprId, Vec<LambdaCapture>>,
 }
 
@@ -41,6 +42,7 @@ impl From<TypeChecker> for CheckedUnit {
             arm_leaves: checker.arm_leaves,
             normalized_types: checker.normalized_types,
             static_call_classes: checker.static_call_classes,
+            builtin_calls: checker.builtin_calls,
             lambda_captures: checker.lambda_captures,
         }
     }
@@ -54,8 +56,9 @@ impl CheckedUnit {
             enum_variant_resolutions: &self.enum_variant_resolutions,
             pattern_resolutions: &self.pattern_resolutions,
             arm_leaves: &self.arm_leaves,
-            normalized_types: &self.normalized_types,
+            normalized_types: (&self.normalized_types).into(),
             static_call_classes: &self.static_call_classes,
+            builtin_calls: &self.builtin_calls,
             lambda_captures: &self.lambda_captures,
         }
     }
@@ -79,7 +82,7 @@ impl CheckedDeclarations {
             mutable_capture_declarations: Default::default(),
             symbols: Some(&self.symbols),
             enums: Some(&self.symbols.enums),
-            normalized_types: Some(&self.normalized_types),
+            normalized_types: (&self.normalized_types).into(),
             ..crate::ir::lower::PartialCheckerTables::default()
         }
     }
@@ -97,6 +100,7 @@ impl CheckedDeclarations {
             pattern_resolutions: HashMap::new(),
             arm_leaves: HashMap::new(),
             static_call_classes: HashMap::new(),
+            builtin_calls: Default::default(),
             lambda_captures: HashMap::new(),
         }
     }

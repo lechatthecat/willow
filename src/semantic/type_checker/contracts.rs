@@ -70,12 +70,9 @@ impl TypeChecker {
                             .iter()
                             .all(|arm| matches!(arm.body, MatchBody::Expr(_))),
                         Expr::MethodCall(c) => {
-                            c.method == "len"
-                                && c.args.is_empty()
+                            self.builtin_calls.get(&c.id) == Some(&Intrinsic::FrozenArrayLen)
                                 && self.expr_types.get(&c.object.id()).is_some_and(|ty| {
-                                    builtin_types::resolve(ty)
-                                        .is_some_and(|b| b.id == B::FrozenArray)
-                                        && self.verification_immutable_type(ty, immutable)
+                                    self.verification_immutable_type(ty, immutable)
                                 })
                         }
                         Expr::Call(c) if matches!(c.callee.as_str(), "forall" | "exists") => true,

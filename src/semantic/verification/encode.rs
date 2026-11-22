@@ -72,7 +72,7 @@ struct LoopShape<'a> {
     bounds: Option<(&'a Value, &'a Value)>,
 }
 struct Encoder<'a> {
-    data: &'a DataTypes,
+    data: &'a DataTypes<'a>,
     functions: &'a [&'a FunctionDecl],
     names: &'a HashMap<&'a str, usize>,
     nodes: Vec<(Value, String)>,
@@ -315,9 +315,26 @@ impl Encoder<'_> {
                     &ty,
                 )
             }
-            Expr::MethodCall(c) if c.method == "len" && c.args.is_empty() => {
+            Expr::MethodCall(c) if c.args.is_empty() => {
+                use crate::semantic::intrinsics::{Intrinsic, MethodName};
+                // A declared length has the historical receiver diagnostic, but
+                // only a checked frozen-array intrinsic can emit its SMT selector.
+                let frozen = match self.data.calls {
+                    Some(calls) => match calls.get(&c.id) {
+                        Some(Intrinsic::FrozenArrayLen) => true,
+                        Some(
+                            Intrinsic::StringLen | Intrinsic::MapLen | Intrinsic::FrozenMapLen,
+                        ) => false,
+                        None if c.method.kind() == MethodName::Len => false,
+                        _ => return Err("unsupported expression in i64/bool V1".into()),
+                    },
+                    None if c.method.kind() == MethodName::Len => true,
+                    None => return Err("unsupported expression in i64/bool V1".into()),
+                };
                 let object = self.expr(&c.object, state, gate)?;
-                frozen_element(&object.ty).ok_or("len requires immutable FrozenArray")?;
+                if !frozen || frozen_element(&object.ty).is_none() {
+                    return Err("len requires immutable FrozenArray".into());
+                }
                 self.node(
                     format!("(len_{} {})", type_key(&object.ty), object.text),
                     false,

@@ -39,7 +39,7 @@ impl BuiltinArity {
         }
     }
 
-    fn label(mut self, label: &'static str) -> Self {
+    pub(super) fn label(mut self, label: &'static str) -> Self {
         self.label = label;
         self
     }
@@ -106,83 +106,63 @@ pub(super) enum TransformResult {
     Direct,
 }
 
-/// A match table avoids a scan or allocation per call. Receiver and method
-/// names have a fixed maximum length in the recognized set.
-pub(super) fn option_method(owner: B, method: &str) -> Option<(BuiltinArity, OptionAction)> {
+pub(super) fn option_action(owner: B, method: AdtMethod) -> OptionAction {
     use OptionAction::*;
-    let action = match (owner, method) {
-        (B::Option, "is_some" | "is_none") | (B::Result, "is_ok" | "is_err") => Bool,
-        (B::Option | B::Result, "unwrap") => Payload,
-        (B::Result, "unwrap_err") => ErrorPayload,
-        (B::Option | B::Result, "expect") => Message,
-        (B::Option | B::Result, "unwrap_or") => Default,
-        (B::Option, "map") => Transform {
+    match (owner, method) {
+        (B::Option, AdtMethod::IsSome | AdtMethod::IsNone)
+        | (B::Result, AdtMethod::IsOk | AdtMethod::IsErr) => Bool,
+        (B::Option | B::Result, AdtMethod::Unwrap) => Payload,
+        (B::Result, AdtMethod::UnwrapErr) => ErrorPayload,
+        (B::Option | B::Result, AdtMethod::Expect) => Message,
+        (B::Option | B::Result, AdtMethod::UnwrapOr) => Default,
+        (B::Option, AdtMethod::Map) => Transform {
             error_input: false,
             no_input: false,
             result: TransformResult::Option,
         },
-        (B::Result, "map") => Transform {
+        (B::Result, AdtMethod::Map) => Transform {
             error_input: false,
             no_input: false,
             result: TransformResult::ResultOk,
         },
-        (B::Result, "map_err") => Transform {
+        (B::Result, AdtMethod::MapErr) => Transform {
             error_input: true,
             no_input: false,
             result: TransformResult::ResultErr,
         },
-        (B::Option | B::Result, "and_then") => Transform {
+        (B::Option | B::Result, AdtMethod::AndThen) => Transform {
             error_input: false,
             no_input: false,
             result: TransformResult::Direct,
         },
-        (B::Option, "or_else") => Transform {
+        (B::Option, AdtMethod::OrElse) => Transform {
             error_input: false,
             no_input: true,
             result: TransformResult::Direct,
         },
-        (B::Result, "or_else") => Transform {
+        (B::Result, AdtMethod::OrElse) => Transform {
             error_input: true,
             no_input: false,
             result: TransformResult::Direct,
         },
-        _ => return None,
+        _ => unreachable!("receiver-checked Option/Result method"),
+    }
+}
+
+pub(super) fn adt_arity(method: AdtMethod) -> BuiltinArity {
+    let count = method.arity();
+    let suffix = if method.callback() {
+        " (fn)"
+    } else if method == AdtMethod::Expect {
+        " (message)"
+    } else {
+        ""
     };
-    let (count, suffix) = match action {
-        Bool | Payload | ErrorPayload => (0, ""),
-        Message => (1, " (message)"),
-        Default => (1, ""),
-        Transform { .. } => (1, " (fn)"),
-    };
-    let arity = BuiltinArity::new(count, ArityText::Method(suffix)).label(if count == 0 {
+    BuiltinArity::new(count, ArityText::Method(suffix)).label(if count == 0 {
         "unexpected arguments"
     } else {
         "wrong number of arguments"
-    });
-    Some((arity, action))
-}
-
-pub(super) fn method_arity(owner: &str, method: &str) -> BuiltinArity {
-    use ArityText::*;
-    match (Builtin::from_name(owner), method) {
-        (Some(Builtin::Map), _) => map_method(method).expect("known Map method").0,
-        (Some(Builtin::Channel), "send") => BuiltinArity::new(1, Plain),
-        (Some(Builtin::Channel), "recv" | "recv_opt" | "close")
-        | (Some(Builtin::Task), "result" | "cancel" | "is_cancelled") => {
-            BuiltinArity::new(0, Plain)
-        }
-        (Some(Builtin::CancellationToken | Builtin::TaskScope), "attach" | "add") => {
-            BuiltinArity::new(1, Method(""))
-        }
-        (
-            Some(Builtin::CancellationToken | Builtin::TaskScope),
-            "cancel" | "is_cancelled" | "child" | "finish",
-        ) => BuiltinArity::new(0, QualifiedCount),
-        (None, "to_string") if owner == "primitive" => {
-            BuiltinArity::new(0, Display).label("unexpected arguments")
-        }
-        _ => unreachable!("missing builtin arity: {owner}::{method}"),
-    }
+    })
 }
 
 pub(super) fn constructor_arity(owner: &str, method: &str) -> BuiltinArity {
@@ -228,7 +208,24 @@ impl TypeChecker {
 
 #[willow_continuations::checker]
 impl TypeChecker {
-    /// Used only on paths that already evaluated all arguments without context.
+    /// Missing members normally report the receiver first. The retired waits
+    /// historically report independent argument errors before the receiver.
+    pub(super) fn report_missing_method_with_args(
+        &mut self,
+        diagnostic: Diagnostic,
+        args: &[CallArg],
+        args_first: bool,
+    ) {
+        if args_first {
+            self.check_discarded_builtin_args(args);
+            self.push(diagnostic);
+        } else {
+            self.push(diagnostic);
+            self.check_discarded_builtin_args(args);
+        }
+    }
+
+    /// Check independent argument errors when there is no parameter context.
     pub(super) fn check_discarded_builtin_args(&mut self, args: &[CallArg]) {
         #[cfg(test)]
         BUILTIN_WORK.with(|work| {
@@ -356,35 +353,15 @@ impl TypeChecker {
     }
 }
 
-/// (arity, checks key, checks value). Incorrect arity intentionally checks neither.
-pub(super) fn map_method(method: &str) -> Option<(BuiltinArity, bool, bool)> {
-    use ArityText::Method;
-    Some(match method {
-        "insert" => (
-            BuiltinArity::new(2, Method("")).label("expected `insert(key, value)`"),
-            true,
-            true,
-        ),
-        "get" => (
-            BuiltinArity::new(1, Method("")).label("expected `get(key)`"),
-            true,
-            false,
-        ),
-        "remove" => (
-            BuiltinArity::new(1, Method("")).label("expected `remove(key)`"),
-            true,
-            false,
-        ),
-        "contains" => (
-            BuiltinArity::new(1, Method("")).label("expected `contains(key)`"),
-            true,
-            false,
-        ),
-        "keys" | "values" | "entries" | "len" | "freeze" | "to_string" => (
-            BuiltinArity::new(0, Method("")).label("unexpected arguments"),
-            false,
-            false,
-        ),
-        _ => return None,
-    })
+/// Arity wording for Map methods. Argument roles follow the signature:
+/// argument zero is a key and argument one (insert only) is a value.
+pub(super) fn map_arity(sig: &ResolvedMethod) -> BuiltinArity {
+    let label = match sig.intrinsic {
+        Intrinsic::MapInsert => "expected `insert(key, value)`",
+        Intrinsic::MapGet => "expected `get(key)`",
+        Intrinsic::MapRemove => "expected `remove(key)`",
+        Intrinsic::MapContains => "expected `contains(key)`",
+        _ => "unexpected arguments",
+    };
+    BuiltinArity::new(sig.arity, ArityText::Method("")).label(label)
 }

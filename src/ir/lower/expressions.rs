@@ -51,47 +51,7 @@ pub(super) fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Dia
     {
         return Err(missing_fact(expr.span(), "static target"));
     }
-    let mut lowered = lower_expr_inner(expr, ctx)?;
-    lowered.ty = ctx
-        .normalize(&checked_type.unwrap_or_else(|| lowered.ty.to_source()))
-        .into();
-    match &mut lowered.kind {
-        HirExprKind::StaticCall { class, .. } | HirExprKind::StaticField { class, .. } => {
-            let source = if *class == crate::semantic::ids::TypeId::local("Self") {
-                ctx.current_class
-                    .as_deref()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| class.to_string())
-            } else {
-                class.to_string()
-            };
-            if let Type::Named(name) = &ctx.normalize(&Type::Named(source)) {
-                *class = name.as_str().into();
-            }
-        }
-        ir_variants!(
-            HirExprKind;
-            Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array, Index,
-            Ternary, New, FieldAccess, MethodCall, ObjectLiteral, ReferenceArg, Range, Await,
-            TryPropagate, Lambda, Match, Select
-        ) => {}
-    }
-    // Construction records the identity being allocated, not the source's
-    // import alias. Keep it identical to the canonical result type.
-    if let crate::semantic::ids::SemanticType::Named(identity) = &lowered.ty {
-        match &mut lowered.kind {
-            HirExprKind::New { class, .. } | HirExprKind::ObjectLiteral { class, .. } => {
-                *class = *identity
-            }
-            ir_variants!(
-                HirExprKind;
-                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
-                Index, Ternary, FieldAccess, MethodCall, StaticField, StaticCall, ReferenceArg,
-                Range, Await, TryPropagate, Lambda, Match, Select
-            ) => {}
-        }
-    }
-    Ok(lowered)
+    lower_expr_inner(expr, checked_type, ctx)
 }
 
 #[willow_continuations::function(
@@ -118,40 +78,102 @@ pub(super) fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Dia
     lower_try_propagate_expr,
     lower_value_args
 )]
-fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+fn lower_expr_inner(
+    expr: &Expr,
+    checked_type: Option<Type>,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
     match expr {
-        Expr::Integer(n, span, _) => Ok(lit(HirExprKind::Int(*n as i64), Type::I64, *span)),
-        Expr::Char(c, span, _) => Ok(lit(
-            HirExprKind::Int(i64::from(u32::from(*c))),
-            Type::Char,
+        Expr::Integer(n, span, _) => Ok(lit(
+            HirExprKind::Int(*n as i64),
+            ctx.normalize(checked_type.as_ref().unwrap_or(&Type::I64)),
             *span,
         )),
-        Expr::Float(f, span, _) => Ok(lit(HirExprKind::Float(*f), Type::F64, *span)),
-        Expr::Bool(b, span, _) => Ok(lit(HirExprKind::Bool(*b), Type::Bool, *span)),
-        Expr::String(s, span, _) => Ok(lit(HirExprKind::Str(s.clone()), Type::String, *span)),
-        Expr::Var(name, span, _) => lower_var_expr(expr, name, *span, ctx),
+        Expr::Char(c, span, _) => Ok(lit(
+            HirExprKind::Int(i64::from(u32::from(*c))),
+            ctx.normalize(checked_type.as_ref().unwrap_or(&Type::Char)),
+            *span,
+        )),
+        Expr::Float(f, span, _) => Ok(lit(
+            HirExprKind::Float(*f),
+            ctx.normalize(checked_type.as_ref().unwrap_or(&Type::F64)),
+            *span,
+        )),
+        Expr::Bool(b, span, _) => Ok(lit(
+            HirExprKind::Bool(*b),
+            ctx.normalize(checked_type.as_ref().unwrap_or(&Type::Bool)),
+            *span,
+        )),
+        Expr::String(s, span, _) => Ok(lit(
+            HirExprKind::Str(s.clone()),
+            ctx.normalize(checked_type.as_ref().unwrap_or(&Type::String)),
+            *span,
+        )),
+        Expr::Var(name, span, id) => lower_var_expr(*id, name, *span, checked_type, ctx),
         Expr::Binary(_) | Expr::Unary(_) => lower_operator_tree(expr, ctx),
-        Expr::Call(c) => lower_call_expr(c, ctx),
-        Expr::Print(inner, newline, span, _) => lower_print_expr(inner, *newline, *span, ctx),
+        Expr::Call(c) => lower_call_expr(c, checked_type, ctx),
+        Expr::Print(inner, newline, span, _) => {
+            lower_print_expr(inner, *newline, *span, checked_type, ctx)
+        }
         Expr::ArrayLiteral(elements, span, _) => {
-            lower_array_literal_expr(expr, elements, *span, ctx)
+            lower_array_literal_expr(elements, *span, checked_type, ctx)
         }
-        Expr::Index(array, index, span, _) => lower_index_expr(array, index, *span, ctx),
-        Expr::Ternary(t) => lower_ternary_expr(t, ctx),
-        Expr::New(n) => lower_new_expr(n, ctx),
+        Expr::Index(array, index, span, _) => {
+            lower_index_expr(array, index, *span, checked_type, ctx)
+        }
+        Expr::Ternary(t) => lower_ternary_expr(t, checked_type, ctx),
+        Expr::New(n) => lower_new_expr(n, checked_type, ctx),
         Expr::FieldAccess(object, field, span, _) => {
-            lower_field_access_expr(expr, object, field, *span, ctx)
+            lower_field_access_expr(object, field, *span, checked_type, ctx)
         }
-        Expr::MethodCall(m) => lower_method_call_expr(m, ctx),
-        Expr::ObjectLiteral(o) => lower_object_literal_expr(o, ctx),
-        Expr::StaticField(s) => lower_static_field_expr(s, ctx),
-        Expr::StaticCall(s) => lower_static_call_expr(s, ctx),
-        Expr::Range(r) => lower_range_expr(r, ctx),
-        Expr::Select(select) => lower_select_expr(select, ctx),
-        Expr::Await(a) => lower_await_expr(a, ctx),
-        Expr::TryPropagate(inner, span, _) => lower_try_propagate_expr(inner, *span, ctx),
-        Expr::Lambda(l) => lower_lambda_expr(l, ctx),
-        Expr::Match(m) => lower_match(m, ctx),
+        Expr::MethodCall(m) => lower_method_call_expr(m, checked_type, ctx),
+        Expr::ObjectLiteral(o) => lower_object_literal_expr(o, checked_type, ctx),
+        Expr::StaticField(s) => lower_static_field_expr(s, checked_type, ctx),
+        Expr::StaticCall(s) => lower_static_call_expr(s, checked_type, ctx),
+        Expr::Range(r) => lower_range_expr(r, checked_type, ctx),
+        Expr::Select(select) => lower_select_expr(select, checked_type, ctx),
+        Expr::Await(a) => lower_await_expr(a, checked_type, ctx),
+        Expr::TryPropagate(inner, span, _) => {
+            lower_try_propagate_expr(inner, *span, checked_type, ctx)
+        }
+        Expr::Lambda(l) => lower_lambda_expr(l, checked_type, ctx),
+        Expr::Match(m) => lower_match(m, checked_type, ctx),
+    }
+}
+
+/// The allocated identity follows the normalized type, including import aliases.
+fn allocation_type(
+    name: &str,
+    checked: Option<Type>,
+    ctx: &LowerCtx,
+) -> (
+    crate::semantic::ids::TypeId,
+    crate::semantic::ids::SemanticType,
+) {
+    let ty = ctx.result_type(checked, || Type::Named(name.to_owned()));
+    let class = match &ty {
+        Type::Named(class) => *class,
+        _ => name.into(),
+    };
+    (class, ty)
+}
+
+fn normalized_static_class(
+    class: crate::semantic::ids::TypeId,
+    ctx: &LowerCtx,
+) -> crate::semantic::ids::TypeId {
+    let source = if class == crate::semantic::ids::TypeId::local("Self") {
+        ctx.current_class
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| class.to_string())
+    } else {
+        class.to_string()
+    };
+    if let Type::Named(name) = &ctx.normalize(&Type::Named(source)) {
+        name.as_str().into()
+    } else {
+        class
     }
 }
 
@@ -167,16 +189,15 @@ fn required_expr_type(id: ExprId, span: Span, ctx: &LowerCtx) -> Result<Option<T
 }
 
 /// The literal one use of a module-level `const` stands for.
-fn const_literal(value: &crate::parser::ast::ConstValue, span: Span) -> HirExpr {
+fn const_literal_kind(value: &crate::parser::ast::ConstValue) -> HirExprKind {
     use crate::parser::ast::ConstValue;
-    let kind = match value {
+    match value {
         ConstValue::Integer(n) => HirExprKind::Int(*n as i64),
         ConstValue::Char(c) => HirExprKind::Int(i64::from(u32::from(*c))),
         ConstValue::Float(f) => HirExprKind::Float(*f),
         ConstValue::Bool(b) => HirExprKind::Bool(*b),
         ConstValue::String(s) => HirExprKind::Str(s.clone()),
-    };
-    lit(kind, value.ty(), span)
+    }
 }
 
 /// Each non-trivial arm of [`lower_expr_inner`] lives in its own function so a
@@ -188,67 +209,47 @@ fn const_literal(value: &crate::parser::ast::ConstValue, span: Span) -> HirExpr 
 /// into one frame.
 #[inline(never)]
 fn lower_var_expr(
-    expr: &Expr,
+    id: ExprId,
     name: &str,
     span: Span,
-    ctx: &mut LowerCtx,
+    checked_type: Option<Type>,
+    ctx: &LowerCtx,
 ) -> Result<HirExpr, Diagnostic> {
     if let Some(binding) = ctx.lookup(name) {
-        if binding.cell {
-            return Ok(cell_read(binding, span));
-        }
-        return Ok(HirExpr {
-            kind: HirExprKind::Var(binding.hir_name.to_string()),
-            ty: binding.ty.clone().into(),
-            span,
-        });
+        let ty = ctx.normalize(checked_type.as_ref().unwrap_or(&binding.ty));
+        return Ok(binding_read(binding, ty.into(), span));
     }
-    // A bare fieldless unqualified variant (`None`, `Halt`) parses as a
-    // variable; the checker resolves it against the expected enum and
-    // records both the enum and the expression type.
-    if let Some(enum_name) = ctx.tables.enum_variant_resolution(&expr.id()) {
-        let ty = ctx
-            .expr_type(&expr.id())
-            .unwrap_or_else(|| Type::Named(enum_name.to_string()));
-        return Ok(HirExpr {
-            kind: HirExprKind::StaticField {
-                class: enum_name.to_string().into(),
+
+    let (kind, ty) = if let Some(enum_name) = ctx.tables.enum_variant_resolution(&id) {
+        // A bare fieldless variant parses as a variable.
+        (
+            HirExprKind::StaticField {
+                class: normalized_static_class(enum_name.as_str().into(), ctx),
                 field: name.to_string(),
             },
-            ty: ty.into(),
-            span,
-        });
-    }
-    // A module-level `const`: inline its literal. Locals
-    // were resolved above, so a binding of the same name still shadows it,
-    // exactly as in the checker.
-    if let Some(value) = ctx.tables.constant(name) {
-        return Ok(const_literal(value, span));
-    }
-    // A named top-level function used as a value (`apply(10, double)`,
-    // function value lowering). The checker types the bare identifier as the
-    // function's `fn(...) -> ...`; taking that from the checker rather
-    // than rebuilding it keeps the parameter modes and the return type
-    // exactly what the call site was checked against. A function bound by an
-    // item import is not in `fn_returns`; the back end binds its local name
-    // to the imported symbol, as for a direct call.
-    if (ctx.fn_returns.contains_key(name)
+            checked_type.unwrap_or_else(|| Type::Named(enum_name.to_string())),
+        )
+    } else if let Some(value) = ctx.tables.constant(name) {
+        (
+            const_literal_kind(value),
+            checked_type.unwrap_or_else(|| value.ty()),
+        )
+    } else if (ctx.fn_returns.contains_key(name)
         || ctx
             .tables
             .symbols
             .is_some_and(|symbols| symbols.lookup_func(name).is_some()))
-        && let Some(ty @ (Type::Fn(..) | Type::Closure(..))) = ctx.expr_type(&expr.id())
+        && let Some(ty @ (Type::Fn(..) | Type::Closure(..))) = checked_type
     {
-        return Ok(HirExpr {
-            kind: HirExprKind::FnRef(name.into()),
-            ty: ty.into(),
+        // An imported function value may be known only to the checker.
+        (HirExprKind::FnRef(name.into()), ty)
+    } else {
+        return Err(internal(
             span,
-        });
-    }
-    Err(internal(
-        span,
-        format!("unbound variable `{name}` reached HIR lowering"),
-    ))
+            format!("unbound variable `{name}` reached HIR lowering"),
+        ));
+    };
+    Ok(lit(kind, ctx.normalize(&ty), span))
 }
 
 /// Operator chains have no lexical boundaries. Keep their construction frames
@@ -286,7 +287,7 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
     let mut work = vec![Step::Enter(expr)];
     let mut values: Vec<HirExpr> = Vec::new();
     while let Some(step) = work.pop() {
-        let mut value = match step {
+        let value = match step {
             Step::Enter(Expr::Binary(binary)) => {
                 work.push(Step::Binary(binary));
                 work.push(Step::Enter(&binary.rhs));
@@ -298,7 +299,15 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
                     && let Expr::Integer(n, _, _) = &unary.expr
                 {
                     let ty = required_expr_type(unary.id, unary.span, ctx)?.unwrap_or(Type::I64);
-                    values.push(lit(HirExprKind::Int((-*n) as i64), ty, unary.span));
+                    values.push(lit(
+                        HirExprKind::Int((-*n) as i64),
+                        if work.is_empty() {
+                            ctx.normalize(&ty)
+                        } else {
+                            ty
+                        },
+                        unary.span,
+                    ));
                     continue;
                 }
                 work.push(Step::Unary(unary));
@@ -327,34 +336,32 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     },
-                    ty: ty.into(),
+                    ty: ctx.normalize(&ty).into(),
                     span: binary.span,
                 }
             }
             Step::Unary(unary) => {
                 let operand = values.pop().expect("lowered unary operand");
-                let ty = required_expr_type(unary.id, unary.span, ctx)?
-                    .map(Into::into)
-                    .unwrap_or_else(|| match unary.op {
-                        UnaryOp::Neg => operand.ty.clone(),
+                let ty = required_expr_type(unary.id, unary.span, ctx)?.unwrap_or_else(|| {
+                    match unary.op {
+                        UnaryOp::Neg => operand.ty.to_source(),
                         // `!` is bitwise on `i64` and logical on `bool`.
-                        UnaryOp::Not if operand.ty.integer_layout().is_some() => operand.ty.clone(),
+                        UnaryOp::Not if operand.ty.integer_layout().is_some() => {
+                            operand.ty.to_source()
+                        }
                         UnaryOp::Not => Type::Bool,
-                    });
+                    }
+                });
                 HirExpr {
                     kind: HirExprKind::Unary {
                         op: unary.op.clone(),
                         operand: Box::new(operand),
                     },
-                    ty,
+                    ty: ctx.normalize(&ty).into(),
                     span: unary.span,
                 }
             }
         };
-        // The outer lower_expr normalizes the root once, just as before.
-        if !work.is_empty() {
-            value.ty = ctx.normalize(&value.ty.to_source()).into();
-        }
         values.push(value);
     }
     Ok(values.pop().expect("lowered operator root"))
@@ -385,7 +392,11 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
     lower_try_propagate_expr,
     lower_value_args
 )]
-fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+fn lower_call_expr(
+    c: &CallExpr,
+    checked_type: Option<Type>,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
     if matches!(c.callee.as_str(), "forall" | "exists") {
         if c.args.len() != 3 || !c.type_args.is_empty() {
             return Err(unsupported(c.span, "malformed quantified expression"));
@@ -502,7 +513,7 @@ fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
                     span,
                 }],
             },
-            Type::Bool,
+            ctx.normalize(checked_type.as_ref().unwrap_or(&Type::Bool)),
             span,
         ));
     }
@@ -514,10 +525,10 @@ fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
         return Ok(HirExpr {
             kind: HirExprKind::Invoke {
                 name: c.callee.clone().into(),
-                callee: Box::new(cell_read(binding, c.span)),
+                callee: Box::new(binding_read(binding, (&binding.ty).into(), c.span)),
                 args,
             },
-            ty: (**ret).clone().into(),
+            ty: ctx.normalize(checked_type.as_ref().unwrap_or(ret)).into(),
             span: c.span,
         });
     }
@@ -527,66 +538,53 @@ fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
     if let Some(enum_name) = ctx.tables.enum_variant_resolution(&c.id) {
         // Prefer the checker's recorded type (it carries generic type
         // arguments, e.g. `Result<i64, String>` for `Ok(42)`).
-        let ty = match ctx.expr_type(&c.id) {
+        let ty = match checked_type {
             Some(ty) => ty,
             None => enum_variant_construction_type(ctx.enums, enum_name, &args, c.span)?,
         };
         return Ok(HirExpr {
             kind: HirExprKind::StaticCall {
-                class: enum_name.clone().into(),
+                class: normalized_static_class(enum_name.as_str().into(), ctx),
                 method: c.callee.clone(),
                 args,
             },
-            ty: ty.into(),
+            ty: ctx.normalize(&ty).into(),
             span: c.span,
         });
     }
     // A local fn-typed variable shadows a free function; its call is an
     // indirect call typed by the variable's `fn(..) -> R`, and it is
     // named by the binding's HIR name.
-    let indirect = ctx.lookup(&c.callee).and_then(|b| match &b.ty {
-        Type::Fn(_, ret) | Type::Closure(_, ret) => Some((b.hir_name.clone(), (**ret).clone())),
+    let (callee, ty) = if let Some((name, ret)) = ctx.lookup(&c.callee).and_then(|b| match &b.ty {
+        Type::Fn(_, ret) | Type::Closure(_, ret) => Some((&b.hir_name, ret.as_ref())),
         _ => None,
-    });
-    let callee = match &indirect {
-        Some((name, _)) => name.clone(),
-        None => {
-            // The later operand pass sees all locals at once. Reserve this
-            // free callee's spelling so a subsequent local binding cannot
-            // retroactively turn this call into an indirect local call.
-            if !ctx.binds_seen.contains_key(&c.callee) {
-                ctx.binds_seen.insert(c.callee.clone(), 1);
-            }
-            c.callee.clone()
+    }) {
+        (
+            name.as_str().into(),
+            ctx.normalize(checked_type.as_ref().unwrap_or(ret)),
+        )
+    } else {
+        // Reserve the free name before lowering a later shadowing binding.
+        if !ctx.binds_seen.contains_key(&c.callee) {
+            ctx.binds_seen.insert(c.callee.clone(), 1);
         }
+        // Imported functions may exist only in the checker's tables.
+        let ty = checked_type
+            .as_ref()
+            .or_else(|| ctx.fn_returns.get(&c.callee))
+            .ok_or_else(|| {
+                internal(
+                    c.span,
+                    format!(
+                        "call to unknown function `{}` reached HIR lowering",
+                        c.callee
+                    ),
+                )
+            })?;
+        (c.callee.as_str().into(), ctx.normalize(ty))
     };
-    let ty = indirect
-        .map(|(_, ret)| ret)
-        .or_else(|| ctx.fn_returns.get(&c.callee).cloned())
-        // A function bound by an ITEM import (`import calc::add;`) is a
-        // plain unqualified call in this file, but it is not one of the
-        // program's own items, so `fn_returns` has never heard of it. The checker did resolve
-        // the import and typed
-        // the call, so its type is what makes the call lowerable at
-        // all. The back end binds this same local name to the mangled
-        // symbol of the module THIS unit imported, rebinding it before
-        // each unit's bodies, so the call the type came from is the
-        // call that gets emitted.
-        .or_else(|| ctx.expr_type(&c.id))
-        .ok_or_else(|| {
-            internal(
-                c.span,
-                format!(
-                    "call to unknown function `{}` reached HIR lowering",
-                    c.callee
-                ),
-            )
-        })?;
     Ok(HirExpr {
-        kind: HirExprKind::Call {
-            callee: callee.into(),
-            args,
-        },
+        kind: HirExprKind::Call { callee, args },
         ty: ty.into(),
         span: c.span,
     })
@@ -621,6 +619,7 @@ fn lower_print_expr(
     inner: &Expr,
     newline: bool,
     span: Span,
+    checked_type: Option<Type>,
     ctx: &mut LowerCtx,
 ) -> Result<HirExpr, Diagnostic> {
     let value = lower_expr(inner, ctx)?;
@@ -629,7 +628,7 @@ fn lower_print_expr(
             value: Box::new(value),
             newline,
         },
-        ty: Type::Void,
+        ty: ctx.result_type(checked_type, || Type::Void),
         span,
     })
 }
@@ -660,9 +659,9 @@ fn lower_print_expr(
     lower_value_args
 )]
 fn lower_array_literal_expr(
-    expr: &Expr,
     elements: &[Expr],
     span: Span,
+    checked_type: Option<Type>,
     ctx: &mut LowerCtx,
 ) -> Result<HirExpr, Diagnostic> {
     let mut lowered = Vec::with_capacity(elements.len());
@@ -672,21 +671,18 @@ fn lower_array_literal_expr(
     // The checker owns contextual typing for every literal, not only empty
     // ones. Inferring again from element 0 loses interface storage/boxing.
     // The first-element fallback supports callers lowering unchecked syntax.
-    let ty = match ctx.expr_type(&expr.id()) {
-        Some(recorded @ Type::Array(_)) => recorded.into(),
-        _ => match lowered.first() {
-            Some(first) => Type::Array(Box::new(first.ty.clone())),
-            None => {
-                return Err(unsupported(
-                    span,
-                    "empty array literal with no recorded element type",
-                ));
-            }
-        },
+    let ty = match checked_type {
+        Some(ty) if !lowered.is_empty() || matches!(ty, Type::Array(_)) => ty,
+        _ => {
+            let first = lowered.first().ok_or_else(|| {
+                unsupported(span, "empty array literal with no recorded element type")
+            })?;
+            Type::Array(Box::new(first.ty.to_source()))
+        }
     };
     Ok(HirExpr {
         kind: HirExprKind::Array { elements: lowered },
-        ty,
+        ty: ctx.normalize(&ty).into(),
         span,
     })
 }
@@ -720,6 +716,7 @@ fn lower_index_expr(
     array: &Expr,
     index: &Expr,
     span: Span,
+    checked_type: Option<Type>,
     ctx: &mut LowerCtx,
 ) -> Result<HirExpr, Diagnostic> {
     let array = lower_expr(array, ctx)?;
@@ -729,13 +726,13 @@ fn lower_index_expr(
     // to one `Index` node. `Range<i64>` also spells a
     // read this way but is not a handle at all, so it stays unsupported.
     let element = match &array.ty {
-        Type::Array(element) => (**element).clone(),
+        Type::Array(element) => element.as_ref(),
         ty => match builtin_types::unary_arg(ty, B::FrozenArray) {
-            Some(element) => element.clone(),
+            Some(element) => element,
             None => return Err(unsupported(span, "index of a non-array value")),
         },
     };
-    let ty = element;
+    let ty = ctx.result_type(checked_type, || element.to_source());
     Ok(HirExpr {
         kind: HirExprKind::Index {
             array: Box::new(array),
@@ -771,7 +768,11 @@ fn lower_index_expr(
     lower_try_propagate_expr,
     lower_value_args
 )]
-fn lower_ternary_expr(t: &TernaryExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+fn lower_ternary_expr(
+    t: &TernaryExpr,
+    checked_type: Option<Type>,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
     let condition = lower_expr(&t.condition, ctx)?;
     let then_expr = lower_expr(&t.then_expr, ctx)?;
     let else_expr = lower_expr(&t.else_expr, ctx)?;
@@ -779,15 +780,13 @@ fn lower_ternary_expr(t: &TernaryExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Di
     // the result remains Never. Otherwise the checker's type is
     // authoritative: branches of distinct classes flowing into an interface
     // take that interface.
-    let ty = if then_expr.ty == Type::Never {
-        else_expr.ty.clone()
-    } else {
-        then_expr.ty.clone()
-    };
-    let ty = match ctx.expr_type(&t.id) {
-        Some(checked) if ty != Type::Never => checked.into(),
-        _ => ty,
-    };
+    let ty = ctx.result_type(checked_type, || {
+        if then_expr.ty == Type::Never {
+            else_expr.ty.to_source()
+        } else {
+            then_expr.ty.to_source()
+        }
+    });
     Ok(HirExpr {
         kind: HirExprKind::Ternary {
             condition: Box::new(condition),
@@ -824,14 +823,16 @@ fn lower_ternary_expr(t: &TernaryExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Di
     lower_try_propagate_expr,
     lower_value_args
 )]
-fn lower_new_expr(n: &NewExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+fn lower_new_expr(
+    n: &NewExpr,
+    checked_type: Option<Type>,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
     let args = lower_value_args(&n.args, ctx)?;
+    let (class, ty) = allocation_type(&n.class_name, checked_type, ctx);
     Ok(HirExpr {
-        kind: HirExprKind::New {
-            class: n.class_name.clone().into(),
-            args,
-        },
-        ty: Type::Named(n.class_name.clone().into()),
+        kind: HirExprKind::New { class, args },
+        ty,
         span: n.span,
     })
 }
@@ -862,29 +863,25 @@ fn lower_new_expr(n: &NewExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic
     lower_value_args
 )]
 fn lower_field_access_expr(
-    expr: &Expr,
     object: &Expr,
     field: &str,
     span: Span,
+    checked_type: Option<Type>,
     ctx: &mut LowerCtx,
 ) -> Result<HirExpr, Diagnostic> {
     let object = lower_expr(object, ctx)?;
-    let ty = {
-        match class_name_of(&object.ty.to_source())
-            .and_then(|class| ctx.classes.field_type(class, field))
-        {
-            Some(ty) => ty,
-            None => ctx
-                .expr_type(&expr.id())
-                .ok_or_else(|| unsupported(span, "field not found on receiver"))?,
-        }
-    };
+    let ty = checked_type
+        .as_ref()
+        .or_else(|| {
+            class_name_of(&object.ty).and_then(|class| ctx.classes.field_type(&class, field))
+        })
+        .ok_or_else(|| unsupported(span, "field not found on receiver"))?;
     Ok(HirExpr {
         kind: HirExprKind::FieldAccess {
             object: Box::new(object),
             field: field.to_string(),
         },
-        ty: ty.into(),
+        ty: ctx.normalize(ty).into(),
         span,
     })
 }
@@ -914,7 +911,11 @@ fn lower_field_access_expr(
     lower_try_propagate_expr,
     lower_value_args
 )]
-fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+fn lower_method_call_expr(
+    m: &MethodCallExpr,
+    checked_type: Option<Type>,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
     // `super.method(args)`: the receiver is `self`, and the checker typed the
     // `super` receiver as the base class whose implementation is called.
     if let Expr::Var(name, span, id) = &m.object
@@ -922,7 +923,7 @@ fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirE
         && ctx.lookup("super").is_none()
     {
         let base = ctx.expr_type(id);
-        let (Some(Type::Named(base)), Some(ty)) = (&base, ctx.expr_type(&m.id)) else {
+        let (Some(Type::Named(base)), Some(ty)) = (&base, checked_type) else {
             return Err(unsupported(m.span, "unresolved `super` method call"));
         };
         let Some(binding) = ctx.lookup("self") else {
@@ -930,7 +931,7 @@ fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirE
         };
         let object = HirExpr {
             kind: HirExprKind::Var(binding.hir_name.to_string()),
-            ty: binding.ty.clone().into(),
+            ty: (&binding.ty).into(),
             span: *span,
         };
         // The checker types `super` as the base written in this unit (an item
@@ -945,26 +946,52 @@ fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirE
                 object: Box::new(object),
                 method: m.method.clone(),
                 args,
+                builtin: None,
                 super_class: Some(base.as_str().into()),
             },
-            ty: ty.into(),
+            ty: ctx.normalize(&ty).into(),
             span: m.span,
         });
     }
     let object = lower_expr(&m.object, ctx)?;
-    let ty = if let Some(ty) = builtin_method_type(&object.ty.to_source(), &m.method) {
-        ty
-    } else if let Some(ty) = class_name_of(&object.ty.to_source())
-        .and_then(|class| ctx.classes.method_type(class, &m.method))
-    {
-        ty
-    } else {
-        // Checker authority: interface methods, generic receivers,
-        // Option/Result methods, and anything else it typed.
-        ctx.expr_type(&m.id)
-            .ok_or_else(|| unsupported(m.span, "method not found on receiver"))?
-    };
+    // Partial lowering also serves standalone callers that have no checker facts.
+    let standalone = ctx
+        .tables
+        .builtin_calls
+        .is_none()
+        .then(|| m.method.kind().lookup(&object.ty));
+    let builtin = ctx
+        .tables
+        .builtin_calls
+        .and_then(|calls| calls.checked(&m.id))
+        .or_else(|| {
+            standalone
+                .as_ref()?
+                .identity()
+                .filter(|(_, arity)| *arity == m.args.len())
+                .map(|(id, _)| id)
+        });
+    use crate::semantic::intrinsics::{IntrinsicReturn, MethodLookup};
+    let result = checked_type
+        .map(IntrinsicReturn::Fixed)
+        .or_else(|| match standalone? {
+            MethodLookup::Intrinsic(sig) if sig.arity == m.args.len() => Some(match sig.ret {
+                IntrinsicReturn::Fixed(ty) => IntrinsicReturn::Fixed(ty.to_source()),
+                IntrinsicReturn::SameAsArg(i) => IntrinsicReturn::SameAsArg(i),
+            }),
+            _ => None,
+        })
+        .or_else(|| {
+            class_name_of(&object.ty)
+                .and_then(|class| ctx.classes.method_type(&class, &m.method))
+                .map(IntrinsicReturn::Fixed)
+        })
+        .ok_or_else(|| unsupported(m.span, "method not found on receiver"))?;
     let args = lower_value_args(&m.args, ctx)?;
+    let ty = match result {
+        IntrinsicReturn::Fixed(ty) => ty,
+        IntrinsicReturn::SameAsArg(i) => args[i].ty.to_source(),
+    };
     let owner = ctx
         .tables
         .static_call_classes
@@ -974,7 +1001,7 @@ fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirE
         ctx.tables
             .symbols
             .and_then(|symbols| symbols.lookup_class(&owner.to_string()))
-            .and_then(|class| class.methods.get(&m.method))
+            .and_then(|class| class.methods.get(m.method.as_str()))
             .is_some_and(|method| {
                 method.array_body_optimization == crate::parser::ast::ArrayBodyOptimization::Length
             })
@@ -982,15 +1009,22 @@ fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirE
     Ok(HirExpr {
         kind: HirExprKind::MethodCall {
             object: Box::new(object),
+            builtin: if forward_length {
+                Some(BuiltinMethod::Intrinsic(Intrinsic::ArrayLen))
+            } else {
+                builtin
+            },
             method: if forward_length {
-                "__abi_len".into()
+                crate::parser::ast::MethodSpelling::fixed(
+                    crate::semantic::intrinsics::MethodName::AbiLen,
+                )
             } else {
                 m.method.clone()
             },
             args,
             super_class: if forward_length { None } else { owner },
         },
-        ty: ty.into(),
+        ty: ctx.normalize(&ty).into(),
         span: m.span,
     })
 }
@@ -1022,28 +1056,35 @@ fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirE
 )]
 fn lower_object_literal_expr(
     o: &ObjectLiteralExpr,
+    checked_type: Option<Type>,
     ctx: &mut LowerCtx,
 ) -> Result<HirExpr, Diagnostic> {
     let mut fields = Vec::with_capacity(o.fields.len());
     for f in &o.fields {
         fields.push((f.name.clone(), lower_expr(&f.value, ctx)?));
     }
+    let (class, ty) = allocation_type(&o.class, checked_type, ctx);
     Ok(HirExpr {
-        kind: HirExprKind::ObjectLiteral {
-            class: o.class.clone().into(),
-            fields,
-        },
-        ty: Type::Named(o.class.clone().into()),
+        kind: HirExprKind::ObjectLiteral { class, fields },
+        ty,
         span: o.span,
     })
 }
 
 #[inline(never)]
-fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+fn lower_static_field_expr(
+    s: &StaticFieldExpr,
+    checked_type: Option<Type>,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
     // `config::LIMIT` names a module's `const` before any class,
     // matching the checker's precedence.
     if let Some(value) = ctx.tables.module_constant(&s.class, &s.field) {
-        return Ok(const_literal(value, s.span));
+        return Ok(lit(
+            const_literal_kind(value),
+            ctx.normalize(&checked_type.unwrap_or_else(|| value.ty())),
+            s.span,
+        ));
     }
     // `Enum::Variant` (fieldless) parses like a static property read.
     let resolved = ctx.tables.static_call_class(&s.id, &s.class);
@@ -1052,21 +1093,16 @@ fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<Hi
     } else {
         &resolved
     };
-    let variant_ty = enum_variant_value_type(ctx.enums, class, &s.field, true);
-    let ty = variant_ty
+    let ty = checked_type
+        .or_else(|| enum_variant_value_type(ctx.enums, class, &s.field, true))
         .or_else(|| ctx.classes.static_field_type(class, &s.field))
-        // Checker authority, exactly as the static-CALL arm below uses
-        // it: `Self::prop` inside a class body names a class the
-        // registry has no entry for, and the checker has already
-        // resolved and typed the read.
-        .or_else(|| ctx.expr_type(&s.id))
         .ok_or_else(|| unsupported(s.span, "static property not found"))?;
     Ok(HirExpr {
         kind: HirExprKind::StaticField {
-            class: class.into(),
+            class: normalized_static_class(class.into(), ctx),
             field: s.field.clone(),
         },
-        ty: ty.into(),
+        ty: ctx.normalize(&ty).into(),
         span: s.span,
     })
 }
@@ -1096,14 +1132,22 @@ fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<Hi
     lower_try_propagate_expr,
     lower_value_args
 )]
-fn lower_static_call_expr(s: &StaticCallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+fn lower_static_call_expr(
+    s: &StaticCallExpr,
+    checked_type: Option<Type>,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
     // `config::LIMIT`: an uppercase bare member parses like a fieldless
     // variant; a module's `const` takes precedence, as in the checker.
     //
     if s.is_bare_member()
         && let Some(value) = ctx.tables.module_constant(&s.class, &s.method)
     {
-        return Ok(const_literal(value, s.span));
+        return Ok(lit(
+            const_literal_kind(value),
+            ctx.normalize(&checked_type.unwrap_or_else(|| value.ty())),
+            s.span,
+        ));
     }
     // A bare uppercase member on a class is a property, just like a
     // lowercase StaticField. Keep explicit `Member()` calls distinct.
@@ -1127,6 +1171,7 @@ fn lower_static_call_expr(s: &StaticCallExpr, ctx: &mut LowerCtx) -> Result<HirE
                     field: s.method.clone(),
                     span: s.span,
                 },
+                checked_type,
                 ctx,
             );
         }
@@ -1137,12 +1182,9 @@ fn lower_static_call_expr(s: &StaticCallExpr, ctx: &mut LowerCtx) -> Result<HirE
     } else {
         &s.class
     };
-    let variant_ty = enum_variant_value_type(ctx.enums, class, &s.method, false);
-    let ty = variant_ty
+    let ty = checked_type
+        .or_else(|| enum_variant_value_type(ctx.enums, class, &s.method, false))
         .or_else(|| ctx.classes.static_method_type(class, &s.method))
-        // Checker authority: generic-enum construction, `Self::`,
-        // module-qualified statics, constructors.
-        .or_else(|| ctx.expr_type(&s.id))
         .ok_or_else(|| {
             unsupported(
                 s.span,
@@ -1152,11 +1194,14 @@ fn lower_static_call_expr(s: &StaticCallExpr, ctx: &mut LowerCtx) -> Result<HirE
     let args = lower_value_args(&s.args, ctx)?;
     Ok(HirExpr {
         kind: HirExprKind::StaticCall {
-            class: ctx.tables.static_call_class(&s.id, &s.class).into(),
+            class: normalized_static_class(
+                ctx.tables.static_call_class(&s.id, &s.class).into(),
+                ctx,
+            ),
             method: s.method.clone(),
             args,
         },
-        ty: ty.into(),
+        ty: ctx.normalize(&ty).into(),
         span: s.span,
     })
 }
@@ -1186,7 +1231,11 @@ fn lower_static_call_expr(s: &StaticCallExpr, ctx: &mut LowerCtx) -> Result<HirE
     lower_try_propagate_expr,
     lower_value_args
 )]
-fn lower_range_expr(r: &RangeExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+fn lower_range_expr(
+    r: &RangeExpr,
+    checked_type: Option<Type>,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
     let start = lower_expr(&r.start, ctx)?;
     let end = lower_expr(&r.end, ctx)?;
     Ok(HirExpr {
@@ -1194,7 +1243,7 @@ fn lower_range_expr(r: &RangeExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagno
             start: Box::new(start),
             end: Box::new(end),
         },
-        ty: Type::Generic("Range".to_string().into(), vec![Type::I64]),
+        ty: ctx.result_type(checked_type, || B::Range.apply(vec![Type::I64])),
         span: r.span,
     })
 }
@@ -1224,7 +1273,11 @@ fn lower_range_expr(r: &RangeExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagno
     lower_try_propagate_expr,
     lower_value_args
 )]
-fn lower_select_expr(select: &SelectExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+fn lower_select_expr(
+    select: &SelectExpr,
+    checked_type: Option<Type>,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
     let mut cases = Vec::with_capacity(select.cases.len());
     for case in &select.cases {
         let kind = match &case.kind {
@@ -1236,14 +1289,14 @@ fn lower_select_expr(select: &SelectExpr, ctx: &mut LowerCtx) -> Result<HirExpr,
                 let channel = lower_expr(channel, ctx)?;
                 let elem_ty = builtin_types::unary_arg(&channel.ty, B::Channel)
                     .ok_or_else(|| unsupported(case.span, "select receive channel"))?
-                    .clone();
+                    .to_source();
                 let binding_ty = if *closed_aware {
                     B::Option.apply(vec![elem_ty])
                 } else {
                     elem_ty
                 };
                 ctx.push_scope();
-                let binding = ctx.bind(binding.clone(), (binding_ty).to_source());
+                let binding = ctx.bind(binding.clone(), binding_ty);
                 let mut body = Vec::with_capacity(case.body.stmts.len());
                 for stmt in &case.body.stmts {
                     body.push(lower_stmt(stmt, ctx)?);
@@ -1305,7 +1358,7 @@ fn lower_select_expr(select: &SelectExpr, ctx: &mut LowerCtx) -> Result<HirExpr,
     }
     Ok(HirExpr {
         kind: HirExprKind::Select { cases },
-        ty: Type::Void,
+        ty: ctx.result_type(checked_type, || Type::Void),
         span: select.span,
     })
 }
@@ -1335,17 +1388,25 @@ fn lower_select_expr(select: &SelectExpr, ctx: &mut LowerCtx) -> Result<HirExpr,
     lower_try_propagate_expr,
     lower_value_args
 )]
-fn lower_await_expr(a: &AwaitExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+fn lower_await_expr(
+    a: &AwaitExpr,
+    checked_type: Option<Type>,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
     let inner = lower_expr(&a.expr, ctx)?;
     let resolved = builtin_types::resolve(&inner.ty)
         .filter(|resolved| resolved.args.len() == 1)
         .ok_or_else(|| unsupported(a.span, "await of a non-Task/Future value"))?;
     let ty = match resolved.id {
-        B::Task | B::Future | B::JoinHandle => resolved.args[0].clone(),
-        // `await task.result()` yields `Result<T, Cancelled>`.
-        B::TaskResult => {
-            B::Result.apply(vec![resolved.args[0].clone(), B::Cancelled.apply(vec![])])
+        B::Task | B::Future | B::JoinHandle => {
+            ctx.result_type(checked_type, || resolved.args[0].to_source())
         }
+        B::TaskResult => ctx.result_type(checked_type, || {
+            B::Result.apply(vec![
+                resolved.args[0].to_source(),
+                B::Cancelled.apply(vec![]),
+            ])
+        }),
         _ => return Err(unsupported(a.span, "await of a non-Task/Future value")),
     };
     Ok(HirExpr {
@@ -1385,13 +1446,15 @@ fn lower_await_expr(a: &AwaitExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagno
 fn lower_try_propagate_expr(
     inner: &Expr,
     span: Span,
+    checked_type: Option<Type>,
     ctx: &mut LowerCtx,
 ) -> Result<HirExpr, Diagnostic> {
     let inner = lower_expr(inner, ctx)?;
-    let ty = builtin_types::resolve(&inner.ty)
+    let payload = builtin_types::resolve(&inner.ty)
         .filter(|resolved| matches!(resolved.id, B::Result | B::Option))
-        .and_then(|resolved| resolved.args.first().cloned())
+        .and_then(|resolved| resolved.args.first())
         .ok_or_else(|| unsupported(span, "`?` on a non-Result/Option value"))?;
+    let ty = ctx.result_type(checked_type, || payload.to_source());
     Ok(HirExpr {
         kind: HirExprKind::TryPropagate {
             inner: Box::new(inner),
@@ -1426,25 +1489,18 @@ fn lower_try_propagate_expr(
     lower_try_propagate_expr,
     lower_value_args
 )]
-fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+fn lower_lambda_expr(
+    l: &LambdaExpr,
+    checked_type: Option<Type>,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
     // The checker's inferred full `fn(...) -> ...` type fills in what
     // the AST cannot store: unannotated parameter types and, for
     // block-bodied lambdas, the inferred return type.
-    let inferred = match ctx.tables.lambda_fn_type(&l.id) {
-        Some(Type::Fn(params, ret) | Type::Closure(params, ret)) => {
-            // Inferred types need the same import normalization as explicit
-            // annotations before they become bindings in the lifted body.
-            Some((
-                params
-                    .iter()
-                    .map(|ty| ctx.normalize(ty))
-                    .collect::<Vec<_>>(),
-                ctx.normalize(ret),
-            ))
-        }
+    let inferred = match &checked_type {
+        Some(Type::Fn(params, ret) | Type::Closure(params, ret)) => Some((params, ret.as_ref())),
         _ => None,
     };
-    let is_closure = matches!(ctx.tables.lambda_fn_type(&l.id), Some(Type::Closure(..)));
     // Resolve every capture in the ENCLOSING namespace first: after the
     // scope below, `n` means the lambda's own copy.
     let capture_sources: Vec<(String, String, Type, bool)> = ctx
@@ -1461,7 +1517,7 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
         })
         .collect();
     let mut params = Vec::with_capacity(l.params.len());
-    let mut param_tys = Vec::with_capacity(l.params.len());
+
     ctx.push_scope();
     // A lambda body is lifted into a LirFunction of its own, so its
     // flat namespace is its own too and the shadow suffixes restart
@@ -1489,17 +1545,17 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
         })
         .collect();
     for (i, p) in l.params.iter().enumerate() {
-        let inferred_param = inferred
-            .as_ref()
-            .and_then(|(params, _)| params.get(i).cloned());
-        let Some(ty) = p.ty.as_ref().map(|ty| ctx.normalize(ty)).or(inferred_param) else {
+        let Some(ty) =
+            p.ty.as_ref()
+                .or_else(|| inferred.and_then(|(params, _)| params.get(i)))
+        else {
             ctx.pop_scope();
             ctx.binds_seen = outer_binds;
             ctx.namespace_scope_base = outer_namespace_scope_base;
             return Err(unsupported(p.span, "unannotated lambda parameter"));
         };
+        let ty = ctx.normalize(ty);
         let name = ctx.bind(p.name.clone(), ty.clone());
-        param_tys.push(ty.clone());
         params.push(HirParam {
             name,
             ty: ty.into(),
@@ -1507,7 +1563,10 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
             span: p.span,
         });
     }
-    let inferred_ret = inferred.map(|(_, ret)| ret);
+    let declared_ret = l
+        .return_type
+        .as_ref()
+        .or_else(|| inferred.map(|(_, ret)| ret));
     let (body, ret) = match &l.body {
         crate::parser::ast::LambdaBody::Expr(e) => {
             let value = match lower_expr(e, ctx) {
@@ -1519,12 +1578,9 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
                     return Err(err);
                 }
             };
-            let ret = l
-                .return_type
-                .as_ref()
+            let ret = declared_ret
                 .map(|ty| ctx.normalize(ty))
-                .or(inferred_ret)
-                .unwrap_or_else(|| (value.ty.clone()).to_source());
+                .unwrap_or_else(|| value.ty.to_source());
             let span = value.span;
             // A `void` body has no value to return: `|s| println(s)` is
             // a statement, and returning its non-existent value would
@@ -1541,12 +1597,7 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
             (body, ret)
         }
         crate::parser::ast::LambdaBody::Block(block) => {
-            let Some(ret) = l
-                .return_type
-                .as_ref()
-                .map(|ty| ctx.normalize(ty))
-                .or(inferred_ret)
-            else {
+            let Some(ret) = declared_ret.map(|ty| ctx.normalize(ty)) else {
                 ctx.pop_scope();
                 ctx.binds_seen = outer_binds;
                 ctx.namespace_scope_base = outer_namespace_scope_base;
@@ -1572,11 +1623,12 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
     ctx.namespace_scope_base = outer_namespace_scope_base;
     // The checker's kind (shareable or task-local) only constrains where
     // the value may flow; every function value has the same representation.
-    let ty = if is_closure {
-        Type::Closure(param_tys, Box::new(ret))
-    } else {
-        Type::Fn(param_tys, Box::new(ret))
-    };
+    let ty = ctx.result_type(checked_type, || {
+        Type::Fn(
+            params.iter().map(|p| p.ty.to_source()).collect(),
+            Box::new(ret),
+        )
+    });
     Ok(HirExpr {
         kind: HirExprKind::Lambda {
             id: l.id,
@@ -1584,7 +1636,7 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
             captures,
             body,
         },
-        ty: ty.into(),
+        ty,
         span: l.span,
     })
 }
@@ -1654,6 +1706,7 @@ fn enum_variant_value_type(
 )]
 fn lower_match(
     m: &crate::parser::ast::MatchExpr,
+    checked_type: Option<Type>,
     ctx: &mut LowerCtx,
 ) -> Result<HirExpr, Diagnostic> {
     use crate::parser::ast::{Guard, MatchBody};
@@ -1759,16 +1812,11 @@ fn lower_match(
     // Never. Otherwise the checker's unified type is authoritative: arms of
     // distinct classes flowing into an interface take that interface.
     //
-    let ty = arms
-        .iter()
-        .map(|a| &a.ty)
-        .find(|t| **t != Type::Never)
-        .cloned()
-        .unwrap_or(Type::Never);
-    let ty = match ctx.expr_type(&m.id) {
-        Some(checked) if ty != Type::Never => checked.into(),
-        _ => ty,
-    };
+    let ty = ctx.result_type(checked_type, || {
+        arms.iter()
+            .find(|arm| arm.ty != Type::Never)
+            .map_or(Type::Never, |arm| arm.ty.to_source())
+    });
     Ok(HirExpr {
         kind: HirExprKind::Match {
             scrutinee: Box::new(scrutinee),

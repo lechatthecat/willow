@@ -601,8 +601,9 @@ pub enum HirExprKind {
     },
     /// `object.method(args)`; `ty` is the method's return type.
     MethodCall {
+        builtin: Option<crate::semantic::intrinsics::BuiltinMethod>,
         object: Box<HirExpr>,
-        method: String,
+        method: crate::parser::ast::MethodSpelling,
         args: Vec<HirExpr>,
         /// `Some(base)` for `super.method(args)`: `object` is `self`, and the
         /// call targets the implementation `base` resolves `method` to —

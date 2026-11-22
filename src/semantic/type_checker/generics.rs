@@ -373,7 +373,7 @@ mod template_registry_tests {
                     unreachable!()
                 };
                 let mut checker = TypeChecker::new();
-                checker.register_class(class);
+                checker.register_class(class, None);
                 let template = checker.generics.registry.borrow_mut().intern_class(class);
                 checker.generics.classes.insert("Heap".into(), template);
                 for i in 1..templates {
@@ -923,7 +923,7 @@ mod template_registry_tests {
                     copy.body = default.clone();
                     copy.is_interface_default = true;
                     copy.is_default_injected = false;
-                    let handled = checker.instantiate_foreign_defaults(&class);
+                    let handled = checker.cached_class_defaults(&class);
                     assert!(handled.contains("get"), "{:?}", checker.errors);
                     pending += checker.generics.pending.len();
                 }
@@ -952,7 +952,7 @@ mod template_registry_tests {
             };
             for count in [1, 16, 256] {
                 let mut checker = TypeChecker::new();
-                checker.register_class(class);
+                checker.register_class(class, None);
                 let bindings = (0..count)
                     .map(|index| (format!("T{index}"), Type::Named("Payload".into())))
                     .collect();
@@ -1503,7 +1503,7 @@ impl TypeChecker {
                 continue;
             }
             checker.generics.parameter_names = f.type_params.iter().cloned().collect();
-            checker.local.declared_type_params = f.type_params.clone();
+            checker.local.declared_type_params = f.type_params.iter().cloned().collect();
             checker.precheck_operation(
                 format!("abstract_function:{}:{}", file.0, f.name),
                 f.body.id,
@@ -1536,7 +1536,7 @@ impl TypeChecker {
                 continue;
             }
             checker.generics.parameter_names = c.type_params.iter().cloned().collect();
-            checker.local.declared_type_params = c.type_params.clone();
+            checker.local.declared_type_params = c.type_params.iter().cloned().collect();
             checker.precheck_operation(
                 format!("abstract_class:{}:{}", file.0, c.name),
                 BodyId::fresh(),
@@ -1558,7 +1558,7 @@ impl TypeChecker {
                     );
                         }
                     }
-                    state.register_class(&c);
+                    state.register_class(&c, None);
                     state.check_class(&c);
                     state.generics.pending.clear();
                 },
@@ -1581,7 +1581,7 @@ impl TypeChecker {
             _ => None,
         }) {
             checker.generics.parameter_names = interface.type_params.iter().cloned().collect();
-            checker.local.declared_type_params = interface.type_params.clone();
+            checker.local.declared_type_params = interface.type_params.iter().cloned().collect();
             for method in &interface.methods {
                 if method.default_body.is_some() {
                     let id = interface_default_effect_id(&interface.name, &method.name);
@@ -1727,7 +1727,7 @@ impl TypeChecker {
                 }
             }
             Item::Class(c) => {
-                self.register_class(c);
+                self.register_class(c, None);
                 let receiver = self.cached_class_validation(c);
                 self.check_static_property_initializers(c);
                 self.cached_class_defaults(c);

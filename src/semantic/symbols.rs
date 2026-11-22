@@ -797,6 +797,13 @@ impl SymbolTable {
 
 impl EnumInfo {
     pub fn to_semantic(&self) -> EnumInfo<TypeId> {
+        self.to_semantic_with(|ty| ty.into())
+    }
+
+    pub(crate) fn to_semantic_with(
+        &self,
+        payload_type: impl Fn(&Type) -> Type<TypeId>,
+    ) -> EnumInfo<TypeId> {
         EnumInfo {
             name: TypeId::from_source_name(&self.name),
             public: self.public,
@@ -809,7 +816,7 @@ impl EnumInfo {
                     name: v.name.clone(),
                     tag: v.tag,
                     declaration_span: v.declaration_span,
-                    payload_types: v.payload_types.iter().map(Into::into).collect(),
+                    payload_types: v.payload_types.iter().map(&payload_type).collect(),
                 })
                 .collect(),
         }

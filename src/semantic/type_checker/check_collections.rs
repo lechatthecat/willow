@@ -16,7 +16,7 @@ impl TypeChecker {
     /// `Array<Void>`, an unresolved placeholder that a type annotation resolves
     /// (e.g. `let xs: Array<i64> = [];`).
     pub(super) fn check_array_literal(&mut self, elements: &[Expr]) -> Type {
-        self.check_array_literal_expecting(elements, None)
+        self.check_array_literal_expecting(elements, None, false)
     }
 
     /// Type-check an array literal. When `expected_elem` is given (e.g. from a
@@ -27,6 +27,7 @@ impl TypeChecker {
         &mut self,
         elements: &[Expr],
         expected_elem: Option<&Type>,
+        checked: bool,
     ) -> Type {
         // Both callers return through check_expr/check_expr_expecting, which
         // record the authoritative literal type once for downstream lowering.
@@ -34,7 +35,7 @@ impl TypeChecker {
         ARRAY_ELEMENT_CHECKS.with(|count| count.set(count.get() + elements.len()));
         if let Some(expected) = expected_elem {
             for el in elements {
-                let ty = self.check_expr_expecting(el, expected);
+                let ty = self.check_argument_expecting(el, expected, checked);
                 if !self.types_compatible(expected, &ty) {
                     self.push(
                         self.with_callable_kind_help(
@@ -143,18 +144,22 @@ impl TypeChecker {
         }
     }
 
-    /// Source methods on array storage. Returns `Some(ret)` when `obj_ty` is an
-    /// array (handling the method or reporting an unknown one), `None` otherwise.
+    /// Resolve a source method or a private storage operation on an array.
     pub(super) fn check_array_method_call(
         &mut self,
         obj_ty: &Type,
+        elem: &Type,
         m: &MethodCallExpr,
-    ) -> Option<Type> {
-        let (Type::Array(elem) | Type::FixedArray(elem, _)) = obj_ty else {
-            return None;
-        };
+        spelling: &str,
+        lookup: MethodLookup<String>,
+    ) -> Type {
         if matches!(obj_ty, Type::FixedArray(..))
-            && matches!(m.method.as_str(), "push" | "pop" | "insert" | "remove")
+            && matches!(
+                lookup,
+                MethodLookup::Missing(
+                    MethodName::Push | MethodName::Pop | MethodName::Insert | MethodName::Remove
+                )
+            )
         {
             self.push(
                 Diagnostic::new(
@@ -165,39 +170,40 @@ impl TypeChecker {
                 .with_label(Label::primary(m.span, "resizing a fixed array")),
             );
             self.check_discarded_builtin_args(&m.args);
-            return Some(Self::error_type());
+            return Self::error_type();
         }
-        let template = self
-            .generics
-            .classes
-            .get("$std::collections::Array")
-            .cloned()
-            .or_else(|| {
-                self.generics
-                    .classes
-                    .get(B::Array.source_name())
-                    .filter(|c| c.abi_storage.is_some())
-                    .cloned()
-            });
-        if !m.method.starts_with("__abi_") {
-            let storage = Type::Array(elem.clone());
+        if !spelling.starts_with("__abi_") {
+            let bundled = "$std::collections::Array";
+            let template = self
+                .generics
+                .classes
+                .get(bundled)
+                .map(|class| (bundled, class))
+                .or_else(|| {
+                    let local = B::Array.source_name();
+                    self.generics
+                        .classes
+                        .get(local)
+                        .filter(|class| class.abi_storage.is_some())
+                        .map(|class| (local, class))
+                })
+                .map(|(access, class)| (access, std::rc::Rc::clone(class)));
+            let builtin = match lookup {
+                MethodLookup::Missing(name) => Some((name, None)),
+                _ => None,
+            };
             if template.is_none()
-                && let Some(owner) = self.array_class(&storage).cloned()
+                && let Some(owner) = self.array_storage_method_class(obj_ty).cloned()
             {
-                self.static_call_classes
-                    .insert(m.id, TypeId::from_source_name(&owner));
-                self.record_lock_effect_call(
-                    FunctionId::method(TypeId::from_source_name(&owner), &m.method),
-                    m.span,
-                );
-                return Some(self.resolve_method(&Type::Named(owner), m, false));
+                self.record_array_method_owner(m, spelling, &owner);
+                return self.resolve_method(&Type::Named(owner), m, spelling, false, builtin);
             }
-            if let Some(template) = template {
-                let declared = template
+            if let Some((access, template)) = template {
+                let Some(declared) = template
                     .methods
                     .iter()
-                    .find(|method| method.name == m.method);
-                if declared.is_none() {
+                    .find(|method| method.name == spelling)
+                else {
                     let methods = template
                         .methods
                         .iter()
@@ -210,19 +216,21 @@ impl TypeChecker {
                         ErrorCode::E0201,
                         format!(
                             "no method `{}` on type `{}`",
-                            m.method,
+                            spelling,
                             self.diagnostic_type_name(obj_ty)
                         ),
                     )
                     .with_label(Label::primary(m.span, "unknown method"))
                     .with_help(format!("available methods: {methods}"));
                     self.label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
-                    self.push(diagnostic);
-                    self.check_discarded_builtin_args(&m.args);
-                    return Some(Self::error_type());
-                }
-                if **elem == Type::Void {
-                    let method = declared.expect("checked source declaration");
+                    self.report_missing_method_with_args(
+                        diagnostic,
+                        &m.args,
+                        lookup.is_retired_wait(),
+                    );
+                    return Self::error_type();
+                };
+                if *elem == Type::Void {
                     let depends = |ty: &Type| {
                         super::generics::mentions(ty, |name| {
                             template
@@ -231,74 +239,67 @@ impl TypeChecker {
                                 .any(|parameter| parameter == name)
                         })
                     };
-                    if method.constraint.is_some()
-                        || depends(&method.return_type)
-                        || method.params.iter().any(|parameter| depends(&parameter.ty))
+                    if declared.constraint.is_some()
+                        || depends(&declared.return_type)
+                        || declared
+                            .params
+                            .iter()
+                            .any(|parameter| depends(&parameter.ty))
                     {
+                        if lookup.is_retired_wait() {
+                            self.check_discarded_builtin_args(&m.args);
+                        }
                         self.generic_error(m.span, "array method requires a known element type");
-                        return Some(Self::error_type());
+                        return Self::error_type();
                     }
                     // An empty literal has no element representation yet. Source
                     // signatures independent of that element can still be checked;
                     // executable storage continues to require a concrete type.
                     self.check_call_argument_count(
-                        &m.method,
-                        method.params.len(),
+                        spelling,
+                        declared.params.len(),
                         m.args.len(),
                         m.span,
                     );
                     self.check_value_call_args(
-                        &method
+                        &declared
                             .params
                             .iter()
                             .map(|parameter| parameter.ty.clone())
                             .collect::<Vec<_>>(),
                         &m.args,
                     );
-                    return Some(method.return_type.clone());
+                    return declared.return_type.clone();
                 }
-                if let Some(bound) = template
-                    .methods
-                    .iter()
-                    .find(|method| method.name == m.method)
-                    .and_then(|method| method.constraint.as_ref())
-                    && !bound.alternatives.contains(elem.as_ref())
+                if let Some(bound) = &declared.constraint
+                    && !bound.alternatives.contains(elem)
                 {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "method `{}` is unavailable for `{}`",
-                                m.method,
-                                self.diagnostic_type_name(obj_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(m.span, "method constraint is not satisfied")),
+                    let diagnostic = Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "method `{}` is unavailable for `{}`",
+                            spelling,
+                            self.diagnostic_type_name(obj_ty)
+                        ),
+                    )
+                    .with_label(Label::primary(m.span, "method constraint is not satisfied"));
+                    self.report_missing_method_with_args(
+                        diagnostic,
+                        &m.args,
+                        lookup.is_retired_wait(),
                     );
-                    self.check_discarded_builtin_args(&m.args);
-                    return Some(Self::error_type());
+                    return Self::error_type();
                 }
-                let access = if self
-                    .generics
-                    .classes
-                    .contains_key("$std::collections::Array")
-                {
-                    "$std::collections::Array"
-                } else {
-                    B::Array.source_name()
-                };
                 if let Some(receiver) =
-                    self.instantiate_class(access, &[elem.as_ref().clone()], m.span)
+                    self.instantiate_class(access, std::slice::from_ref(elem), m.span)
                 {
-                    if let Type::Named(owner) = &receiver {
-                        self.static_call_classes
-                            .insert(m.id, TypeId::from_source_name(owner));
+                    if let Type::Named(owner) = &receiver
+                        && !Self::is_error_name(owner)
+                    {
+                        self.record_array_method_owner(m, spelling, owner);
                     }
-                    for callee in self.method_effect_ids(&Type::Array(elem.clone()), &m.method) {
-                        self.record_lock_effect_call(callee, m.span);
-                    }
-                    return Some(self.resolve_method(&receiver, m, false));
+                    return self.resolve_method(&receiver, m, spelling, false, builtin);
                 }
                 self.generic_error(
                     template.span,
@@ -307,105 +308,109 @@ impl TypeChecker {
             } else {
                 self.generic_error(m.span, "bundled Array declaration is unavailable");
             }
-            return Some(Self::error_type());
+            return Self::error_type();
         }
         if !self.array_abi_files.contains(&m.span.file_id) {
             self.generic_error(
                 m.span,
                 "array ABI operations are private to the bundled declaration",
             );
-            return Some(Self::error_type());
+            return Self::error_type();
         }
-        let (params, result) = match m.method.as_str() {
-            "__abi_len" => (vec![], Type::I64),
-            "__abi_resize" => (vec![Type::I64], Type::Void),
-            "__abi_copy" => (
-                vec![],
-                Type::Generic("FrozenArray".into(), vec![elem.as_ref().clone()]),
-            ),
-            "__abi_concat" if **elem == Type::String => (vec![], Type::String),
-            _ => {
-                self.generic_error(m.span, "unknown array storage operation");
-                return Some(Self::error_type());
-            }
+        let MethodLookup::Intrinsic(sig) = lookup else {
+            self.generic_error(m.span, "unknown array storage operation");
+            return Self::error_type();
         };
-        self.check_call_argument_count(&m.method, params.len(), m.args.len(), m.span);
-        self.check_value_call_args(&params, &m.args);
-        Some(result)
+        let params: &[Type] = if sig.intrinsic == Intrinsic::ArrayResize {
+            &[Type::I64]
+        } else {
+            &[]
+        };
+        self.check_call_argument_count(spelling, params.len(), m.args.len(), m.span);
+        self.check_value_call_args(params, &m.args);
+        sig.return_type(|_| None)
+    }
+
+    fn record_array_method_owner(&mut self, call: &MethodCallExpr, spelling: &str, owner: &str) {
+        let owner = TypeId::from_source_name(owner);
+        self.static_call_classes.insert(call.id, owner);
+        self.record_lock_effect_call(FunctionId::method(owner, spelling), call.span);
     }
 
     pub(super) fn check_frozen_array_method_call(
         &mut self,
-        obj_ty: &Type,
+        elem_ty: &Type,
         m: &MethodCallExpr,
-    ) -> Option<Type> {
-        let elem_ty = builtin_types::unary_arg(obj_ty, B::FrozenArray)?;
-        match m.method.as_str() {
-            "len" => Some(Type::I64),
-            "push" | "pop" | "set" => {
+        spelling: &str,
+        lookup: MethodLookup<String>,
+    ) -> Type {
+        if let MethodLookup::Intrinsic(sig) = lookup {
+            return sig.return_type(|_| None);
+        }
+        match lookup {
+            MethodLookup::Missing(MethodName::Push | MethodName::Pop | MethodName::Set) => {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0201,
-                        format!("`FrozenArray` is immutable; `{}` is not allowed", m.method),
+                        format!("`FrozenArray` is immutable; `{}` is not allowed", spelling),
                     )
                     .with_label(Label::primary(m.span, "frozen arrays cannot be mutated"))
                     .with_help(
                         "freeze a copy of a mutable `Array<T>`; read it with `[i]` / `.len()`",
                     ),
                 );
-                Some(Type::Void)
+                Type::Void
             }
-            other => {
+            _ => {
+                if lookup.is_retired_wait() {
+                    self.check_discarded_builtin_args(&m.args);
+                }
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0201,
                         format!(
-                            "no method `{other}` on `FrozenArray<{}>`",
+                            "no method `{spelling}` on `FrozenArray<{}>`",
                             self.diagnostic_type_name(elem_ty)
                         ),
                     )
                     .with_label(Label::primary(m.span, "unknown method"))
                     .with_help("`FrozenArray` supports `.len()` and indexing `fa[i]`"),
                 );
-                Some(Type::Void)
+                Type::Void
             }
         }
     }
 
     /// Builtin methods on `Map<K, V>`: `insert(k, v)`, `get(k) -> Option<V>`,
-    /// `contains(k) -> bool`, `len() -> i64`. Returns `Some(ret)` when `obj_ty`
-    /// is a map, `None` otherwise.
+    /// `contains(k) -> bool`, `len() -> i64`.
     pub(super) fn check_map_method_call(
         &mut self,
         obj_ty: &Type,
+        payloads: (&Type, &Type),
         m: &MethodCallExpr,
-    ) -> Option<Type> {
-        let (key_ty, val_ty) = builtin_types::binary_args(obj_ty, B::Map)?;
-        let key_ty = key_ty.clone();
-        let val_ty = val_ty.clone();
+        spelling: &str,
+        lookup: MethodLookup<String>,
+    ) -> Type {
+        let (key_ty, val_ty) = payloads;
+        let retired_wait = lookup.is_retired_wait();
+        let signature = lookup.into_signature();
+        let intrinsic = signature.as_ref().map(|s| s.intrinsic);
 
-        if key_ty == Type::Void
-            && val_ty == Type::Void
-            && m.method == "insert"
+        if matches!(key_ty, Type::Void)
+            && matches!(val_ty, Type::Void)
+            && intrinsic == Some(Intrinsic::MapInsert)
             && m.args.len() == 2
             && let Expr::Var(name, _, _) = &m.object
-            && let Some(info) = self.symbols.lookup_var(name).cloned()
-            && self
-                .local
-                .inferred_maps
-                .contains_key(&info.declaration_span)
+            && let Some(declaration) = self.symbols.lookup_var(name).map(|v| v.declaration_span)
+            && self.local.inferred_maps.contains_key(&declaration)
         {
             let key = self.check_expr(&m.args[0].expr);
             let value = self.check_expr(&m.args[1].expr);
             if key != Type::Void && value != Type::Void {
                 let ty = B::Map.apply(vec![key, value]);
-                let (uses, async_slot) = self
-                    .local
-                    .inferred_maps
-                    .remove(&info.declaration_span)
-                    .unwrap();
+                let (uses, async_slot) = self.local.inferred_maps.remove(&declaration).unwrap();
                 for id in uses {
                     self.local.pending_map_uses.remove(&id);
                     self.expr_types.insert(id, ty.clone());
@@ -415,13 +420,18 @@ impl TypeChecker {
                 }
                 self.symbols.lookup_var_mut(name).unwrap().ty = ty;
             }
-            return Some(Type::Void);
+            return Type::Void;
         }
 
-        if (key_ty == Type::Void || val_ty == Type::Void)
+        if (matches!(key_ty, Type::Void) || matches!(val_ty, Type::Void))
             && matches!(
-                m.method.as_str(),
-                "get" | "contains" | "freeze" | "to_string"
+                intrinsic,
+                Some(
+                    Intrinsic::MapGet
+                        | Intrinsic::MapContains
+                        | Intrinsic::MapFreeze
+                        | Intrinsic::MapToString
+                )
             )
         {
             self.push(
@@ -435,55 +445,41 @@ impl TypeChecker {
             );
         }
 
-        if let Some((arity, key, value)) = super::builtin_methods::map_method(&m.method)
+        if let Some(sig) = &signature
             && self.check_builtin_arity(
-                arity,
+                super::builtin_methods::map_arity(sig),
                 B::Map.source_name(),
-                &m.method,
+                spelling,
                 m.args.len(),
                 m.span,
             )
         {
-            if key {
-                let got = self.check_expr_expecting(&m.args[0].expr, &key_ty);
+            if let Some(arg) = m.args.first() {
+                let got = self.check_expr_expecting(&arg.expr, key_ty);
                 self.check_builtin_argument(
                     BuiltinArgument::MapKey,
                     B::Map.source_name(),
-                    &m.method,
-                    &key_ty,
+                    spelling,
+                    key_ty,
                     &got,
-                    m.args[0].expr.span(),
+                    arg.expr.span(),
                 );
             }
-            if value {
-                let got = self.check_expr_expecting(&m.args[1].expr, &val_ty);
+            if let Some(arg) = m.args.get(1) {
+                let got = self.check_expr_expecting(&arg.expr, val_ty);
                 self.check_builtin_argument(
                     BuiltinArgument::MapValue,
                     B::Map.source_name(),
-                    &m.method,
-                    &val_ty,
+                    spelling,
+                    val_ty,
                     &got,
-                    m.args[1].expr.span(),
+                    arg.expr.span(),
                 );
             }
         }
 
-        match m.method.as_str() {
-            "insert" => Some(Type::Void),
-            "keys" | "values" | "entries" => {
-                let element = match m.method.as_str() {
-                    "keys" => key_ty,
-                    "values" => val_ty,
-                    _ => Type::Generic("$Tuple2".into(), vec![key_ty, val_ty]),
-                };
-                Some(Type::Array(Box::new(element)))
-            }
-            "get" | "remove" => Some(B::Option.apply(vec![val_ty])),
-            "contains" => Some(Type::Bool),
-            "len" => Some(Type::I64),
-            // `.freeze()` -> an immutable `FrozenMap<K,V>` copy, Sync when K,V are
-            // Sync, so it can be shared across tasks.
-            "to_string" => {
+        match signature {
+            Some(sig) if sig.intrinsic == Intrinsic::MapToString => {
                 if !matches!(
                     val_ty,
                     Type::I8
@@ -505,7 +501,7 @@ impl TypeChecker {
                             ErrorCode::E1402,
                             format!(
                                 "cannot to_string a map with `{}` values",
-                                self.diagnostic_type_name(&val_ty)
+                                self.diagnostic_type_name(val_ty)
                             ),
                         )
                         .with_label(Label::primary(
@@ -514,23 +510,28 @@ impl TypeChecker {
                         )),
                     );
                 }
-                Some(Type::String)
+                Type::String
             }
-            "freeze" => {
-                if key_ty == Type::Void || val_ty == Type::Void {
-                    return Some(Self::error_type());
+            Some(sig)
+                if sig.intrinsic == Intrinsic::MapFreeze
+                    && (matches!(key_ty, Type::Void) || matches!(val_ty, Type::Void)) =>
+            {
+                Self::error_type()
+            }
+            Some(sig) => sig.return_type(|_| None),
+            None => {
+                if retired_wait {
+                    self.check_discarded_builtin_args(&m.args);
                 }
-                Some(B::FrozenMap.apply(vec![key_ty, val_ty]))
-            }
-            other => {
+                let other = spelling;
                 let mut diagnostic = Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0201,
                         format!(
                             "no method `{}` on type `Map<{}, {}>`",
                             other,
-                            self.diagnostic_type_name(&key_ty),
-                            self.diagnostic_type_name(&val_ty)
+                            self.diagnostic_type_name(key_ty),
+                            self.diagnostic_type_name(val_ty)
                         ),
                     )
                     .with_label(Label::primary(m.span, "unknown map method"))
@@ -539,7 +540,7 @@ impl TypeChecker {
                     );
                 self.label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
                 self.push(diagnostic);
-                Some(Type::Void)
+                Type::Void
             }
         }
     }
@@ -549,17 +550,25 @@ impl TypeChecker {
     /// `insert`/`remove` are rejected.
     pub(super) fn check_frozen_map_method_call(
         &mut self,
-        obj_ty: &Type,
+        payloads: (&Type, &Type),
         m: &MethodCallExpr,
-    ) -> Option<Type> {
-        let (key_ty, val_ty) = builtin_types::binary_args(obj_ty, B::FrozenMap)?;
-        let key_ty = key_ty.clone();
-        let val_ty = val_ty.clone();
+        spelling: &str,
+        lookup: MethodLookup<String>,
+    ) -> Type {
+        let (key_ty, val_ty) = payloads;
+        if lookup.is_retired_wait() {
+            self.check_discarded_builtin_args(&m.args);
+        }
         if let Some(arg) = m.args.first() {
-            let k = self.check_expr_expecting(&arg.expr, &key_ty);
-            if matches!(m.method.as_str(), "get" | "contains")
-                && key_ty != Type::Void
-                && !self.types_compatible(&key_ty, &k)
+            let k = self.check_argument_expecting(&arg.expr, key_ty, lookup.is_retired_wait());
+            if matches!(
+                &lookup,
+                MethodLookup::Intrinsic(ResolvedMethod {
+                    intrinsic: Intrinsic::FrozenMapGet | Intrinsic::FrozenMapContains,
+                    ..
+                })
+            ) && !matches!(key_ty, Type::Void)
+                && !self.types_compatible(key_ty, &k)
             {
                 self.push(
                     Diagnostic::new(
@@ -567,7 +576,7 @@ impl TypeChecker {
                         ErrorCode::E0201,
                         format!(
                             "map key type mismatch: expected `{}`, found `{}`",
-                            self.diagnostic_type_name(&key_ty),
+                            self.diagnostic_type_name(key_ty),
                             self.diagnostic_type_name(&k)
                         ),
                     )
@@ -575,37 +584,37 @@ impl TypeChecker {
                 );
             }
         }
-        match m.method.as_str() {
-            "get" => Some(B::Option.apply(vec![val_ty])),
-            "contains" => Some(Type::Bool),
-            "len" => Some(Type::I64),
-            "insert" | "remove" => {
+        if let MethodLookup::Intrinsic(sig) = lookup {
+            return sig.return_type(|_| None);
+        }
+        match lookup {
+            MethodLookup::Missing(MethodName::Insert | MethodName::Remove) => {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0201,
-                        format!("`FrozenMap` is immutable; `{}` is not allowed", m.method),
+                        format!("`FrozenMap` is immutable; `{}` is not allowed", spelling),
                     )
                     .with_label(Label::primary(m.span, "frozen maps cannot be mutated"))
                     .with_help("freeze a copy of a mutable `Map<K, V>`; read it with `.get`/`.contains`/`.len`"),
                 );
-                Some(Type::Void)
+                Type::Void
             }
-            other => {
+            _ => {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0201,
                         format!(
-                            "no method `{other}` on `FrozenMap<{}, {}>`",
-                            self.diagnostic_type_name(&key_ty),
-                            self.diagnostic_type_name(&val_ty)
+                            "no method `{spelling}` on `FrozenMap<{}, {}>`",
+                            self.diagnostic_type_name(key_ty),
+                            self.diagnostic_type_name(val_ty)
                         ),
                     )
                     .with_label(Label::primary(m.span, "unknown method"))
                     .with_help("`FrozenMap` supports `.get(k)`, `.contains(k)`, `.len()`"),
                 );
-                Some(Type::Void)
+                Type::Void
             }
         }
     }

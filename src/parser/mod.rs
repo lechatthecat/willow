@@ -628,6 +628,30 @@ mod tests {
     }
 
     #[test]
+    fn method_spelling_round_trips_original_string_format() {
+        use crate::semantic::intrinsics::MethodName;
+        assert_eq!(
+            std::mem::size_of::<MethodSpelling>(),
+            std::mem::size_of::<String>()
+        );
+        for (name, kind) in [
+            ("freeze", MethodName::Freeze),
+            ("len", MethodName::Len),
+            ("mine", MethodName::Unknown),
+            (
+                "to_i16",
+                MethodName::Convert(crate::semantic::intrinsics::ScalarTarget::I16),
+            ),
+        ] {
+            let raw = serde_json::to_string(name).unwrap();
+            let member: MethodSpelling = serde_json::from_str(&raw).unwrap();
+            assert!(member.kind() == kind);
+            assert_eq!(member.as_str(), name);
+            assert_eq!(serde_json::to_string(&member.clone()).unwrap(), raw);
+        }
+    }
+
+    #[test]
     fn parse_cascade_recovery_token_reads_scale_linearly() {
         let mut samples = Vec::new();
         for count in [16, 64, 256] {
@@ -2983,7 +3007,7 @@ class ProtectedCtor { prot init(self) {} }
         let Stmt::Let(let_stmt) = &function.body.stmts[0] else {
             panic!("expected a let statement");
         };
-        assert!(matches!(&let_stmt.init, Expr::MethodCall(m) if m.method == "lock"));
+        assert!(matches!(&let_stmt.init, Expr::MethodCall(m) if m.method.as_str() == "lock"));
     }
 
     // Perspective 12: `read` and `write` remain ordinary identifiers.
@@ -3108,11 +3132,11 @@ class ProtectedCtor { prot init(self) {} }
         let Stmt::Let(let_stmt) = &function.body.stmts[0] else {
             panic!("expected a let statement");
         };
-        assert!(matches!(&let_stmt.init, Expr::MethodCall(m) if m.method == "read"));
+        assert!(matches!(&let_stmt.init, Expr::MethodCall(m) if m.method.as_str() == "read"));
         let Stmt::Expr(expr_stmt) = &function.body.stmts[1] else {
             panic!("expected an expression statement");
         };
-        assert!(matches!(&expr_stmt.expr, Expr::MethodCall(m) if m.method == "write"));
+        assert!(matches!(&expr_stmt.expr, Expr::MethodCall(m) if m.method.as_str() == "write"));
     }
 
     // Perspective 24: `read` and `write` still work as FIELD names, including

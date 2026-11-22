@@ -222,6 +222,82 @@ fn verified_data_checked_frontend_and_comparison() {
 }
 
 #[test]
+fn verified_length_preserves_user_receiver_diagnostic() {
+    let program = parse(
+        "class C {pub x:i64; pub fn len(self)->i64 {return self.x;}} @pure @verified fn f(c:C)->i64 {return c.len();}",
+    );
+    let mut checker = crate::semantic::TypeChecker::new();
+    checker.check_program(&program);
+    assert!(
+        checker
+            .errors
+            .iter()
+            .any(|error| error.code == ErrorCode::E2631
+                && error.message == "@verified `f`: UNKNOWN: len requires immutable FrozenArray")
+    );
+}
+
+#[test]
+fn checked_length_encoding_uses_receiver_identity() {
+    use crate::parser::iter::{AstEvent, AstWalk};
+    use crate::semantic::intrinsics::Intrinsic;
+    for (source, intrinsic, error) in [
+        (
+            r#"fn text()->String {return "abc";} @pure @verified fn f()->i64 {return text().len();}"#,
+            Some(Intrinsic::StringLen),
+            Some("callee is not @pure"),
+        ),
+        (
+            "class C {pub x:i64; pub fn len(self)->i64 {return self.x;}} @pure @verified fn f(c:C)->i64 {return c.len();}",
+            None,
+            Some("len requires immutable FrozenArray"),
+        ),
+        (
+            "@pure @verified fn f(a:FrozenArray<i64>)->i64 ensures result>=0 {return a.len();}",
+            Some(Intrinsic::FrozenArrayLen),
+            None,
+        ),
+    ] {
+        let program = parse(source);
+        let mut checker = crate::semantic::TypeChecker::new();
+        checker.check_program(&program);
+        let functions: Vec<_> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Function(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        let names: HashMap<_, _> = functions
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.as_str(), i))
+            .collect();
+        let f = functions[names["f"]];
+        let id = AstWalk::new(AstEvent::Block(&f.body))
+            .find_map(|event| match event {
+                AstEvent::Expr(Expr::MethodCall(c)) => Some(c.id),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(checker.builtin_calls.get(&id).copied(), intrinsic);
+        let data = DataTypes {
+            calls: Some(&checker.builtin_calls),
+            ..DataTypes::new(
+                &program,
+                &crate::semantic::field_writes::FieldWrites::from_program(&program),
+            )
+        };
+        let encoded = encode::encode(names["f"], &functions, &names, &data);
+        assert_eq!(encoded.err().as_deref(), error, "{source}");
+        if error.is_none() {
+            assert_eq!(checker.verification.reports[0].status, Status::Proven);
+        }
+    }
+}
+
+#[test]
 fn verified_data_unknown_and_quantifier_scopes() {
     let source = "@pure @verified fn f(a:FrozenArray<i64>)->bool ensures result {return forall(0,a.len(),|i:i64| exists(0,a.len(),|j:i64| i==j));}";
     let options = Options {

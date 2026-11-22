@@ -1,10 +1,26 @@
 use super::*;
 use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 
+/// Recovery can reuse an expression's type even when the expression reported
+/// an error. Match controls and statement arms receive no result-type context.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum FailedCheck {
+    Value(ExprId),
+    Condition(ExprId),
+    ArmBlock(BodyId),
+}
+
+// Keep parameter membership indexed and cache serialization in declaration order.
+#[cfg(not(test))]
+pub(super) type DeclaredTypeParams = indexmap::IndexSet<String>;
+#[cfg(test)]
+pub(super) type DeclaredTypeParams = indexmap::IndexSet<String, crate::counted_hashes::KeyHasher>;
+
 /// Ephemeral callable state. A root body starts empty; nested lambda checking
 /// keeps this same lexical/inference state until independent lambda inputs exist.
 /// Immutable declarations and unit orchestration are deliberately absent.
 pub(super) struct BodyState {
+    pub(super) failed_checks: HashSet<FailedCheck>,
     /// Nesting depth of enclosing loops; `break`/`continue` outside a loop is
     /// E0904. Reset to 0 inside a lambda body (a loop outside the lambda is
     /// not breakable from within it).
@@ -34,7 +50,7 @@ pub(super) struct BodyState {
     /// A bare `T` there names a parameter, not a missing type, so
     /// [`Self::validate_type`] accepts it; every other position sees an empty
     /// list and reports the name as unknown.
-    pub(super) declared_type_params: Vec<String>,
+    pub(super) declared_type_params: DeclaredTypeParams,
     /// Unannotated map constructors and uses awaiting their first insertion.
     pub(super) inferred_maps: HashMap<Span, (Vec<ExprId>, Option<usize>)>,
     /// Every use recorded in `inferred_maps`, for the lambda boundary: a use
@@ -48,10 +64,6 @@ pub(super) struct BodyState {
     pub(super) capture_writes: HashSet<Span>,
     /// Binding identities captured by the lambda currently being checked.
     pub(super) current_capture_declarations: HashSet<Span>,
-    /// The type a `match` in value position flows into, set for the duration of
-    /// that one `match` by [`TypeChecker::check_expr_expecting`] and taken by
-    /// [`TypeChecker::check_match_expr`].
-    pub(super) match_expected: Option<Type>,
     pub(super) current_return_type: Type,
     /// Stack of lambda return types being inferred. When non-empty, `return` stmts
     /// record their type here instead of checking against `current_return_type`.
@@ -91,6 +103,7 @@ pub(super) struct BodyState {
 impl Default for BodyState {
     fn default() -> Self {
         Self {
+            failed_checks: HashSet::new(),
             loop_depth: 0,
             lock_depth: 0,
             lexical_block_depth: 0,
@@ -98,12 +111,11 @@ impl Default for BodyState {
             task_loan_args: HashSet::new(),
             exhaustive_matches: std::collections::HashSet::new(),
             async_local_bindings: HashMap::new(),
-            declared_type_params: Vec::new(),
+            declared_type_params: Default::default(),
             inferred_maps: HashMap::new(),
             pending_map_uses: HashSet::new(),
             capture_writes: HashSet::new(),
             current_capture_declarations: HashSet::new(),
-            match_expected: None,
             current_return_type: Type::Void,
             lambda_return_stack: Vec::new(),
             lambda_holes_deferred: false,
@@ -153,6 +165,7 @@ pub(super) struct BodyOutputs {
     arm_leaves: HashMap<BodyId, bool>,
     normalized_types: HashMap<Type, Type>,
     static_call_classes: HashMap<ExprId, crate::semantic::ids::TypeId>,
+    builtin_calls: crate::semantic::intrinsics::BuiltinCalls,
     lambda_captures: HashMap<ExprId, Vec<LambdaCapture>>,
     lock_edges: HashMap<FunctionId, HashSet<FunctionId>>,
     resolved_calls: HashMap<FunctionId, crate::semantic::call_graph::CallSites>,
@@ -183,6 +196,7 @@ pub(crate) struct TypedBody {
     #[serde(with = "crate::compiler_db::map_entries")]
     normalized_types: HashMap<Type, Type>,
     static_call_classes: HashMap<ExprId, crate::semantic::ids::TypeId>,
+    builtin_calls: crate::semantic::intrinsics::BuiltinCalls,
     lambda_captures: HashMap<ExprId, Vec<LambdaCapture>>,
     #[serde(with = "crate::compiler_db::map_entries")]
     lock_edges: HashMap<FunctionId, HashSet<FunctionId>>,
@@ -226,6 +240,7 @@ impl TypedBody {
             arm_leaves: outputs.arm_leaves,
             normalized_types: outputs.normalized_types,
             static_call_classes: outputs.static_call_classes,
+            builtin_calls: outputs.builtin_calls,
             lambda_captures: outputs.lambda_captures,
             lock_edges: outputs.lock_edges,
             resolved_calls: outputs.resolved_calls,
@@ -278,6 +293,7 @@ impl TypedBody {
         unit.pattern_resolutions.extend(self.pattern_resolutions);
         unit.arm_leaves.extend(self.arm_leaves);
         unit.static_call_classes.extend(self.static_call_classes);
+        unit.builtin_calls.extend(self.builtin_calls);
         unit.lambda_captures.extend(self.lambda_captures);
         for splice in self.lambdas {
             queries.read(splice.body)?.merge_tables(unit, queries)?;
@@ -469,6 +485,7 @@ impl TypeChecker {
         self.arm_leaves.extend(body.arm_leaves);
         self.normalized_types.extend(body.normalized_types);
         self.static_call_classes.extend(body.static_call_classes);
+        self.builtin_calls.extend(body.builtin_calls);
         self.lambda_captures.extend(body.lambda_captures);
         for (caller, targets) in body.lock_edges {
             self.effect_inputs
@@ -539,6 +556,7 @@ impl TypeChecker {
             &mut self.static_call_classes,
             &mut outputs.static_call_classes,
         );
+        swap(&mut self.builtin_calls, &mut outputs.builtin_calls);
         swap(&mut self.lambda_captures, &mut outputs.lambda_captures);
         swap(&mut self.effect_inputs.edges, &mut outputs.lock_edges);
         swap(&mut self.resolved_calls, &mut outputs.resolved_calls);
@@ -840,6 +858,7 @@ mod tests {
             &standalone.normalized_types,
             "normalized_types",
         );
+        assert_eq!(cached.builtin_calls, standalone.builtin_calls);
         assert_map_eq(
             &cached.static_call_classes,
             &standalone.static_call_classes,
@@ -1008,7 +1027,12 @@ mod tests {
         }
         for _ in 0..2 {
             let errors = queries
-                .check_async_borrows(&program, &checker.expr_types, &checker.reference_arg_modes)
+                .check_async_borrows(
+                    &program,
+                    &checker.expr_types,
+                    &checker.reference_arg_modes,
+                    &checker.builtin_calls,
+                )
                 .unwrap();
             assert_eq!(errors.len(), 1, "{errors:?}");
             assert_eq!(errors[0].code, ErrorCode::E1706);

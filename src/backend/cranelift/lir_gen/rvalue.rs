@@ -481,14 +481,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 method,
                 args,
                 arg_types,
-                ..
+                result,
             } => {
                 let receiver = self.emit_lir_operand(function, receiver);
                 let args: Vec<_> = args
                     .iter()
                     .map(|arg| self.emit_lir_operand(function, arg))
                     .collect();
-                self.emit_flat_enum_method(receiver, receiver_ty, method, &args, arg_types, span)
+                self.emit_flat_enum_method(
+                    (receiver, receiver_ty),
+                    *method,
+                    &args,
+                    arg_types,
+                    result,
+                    span,
+                )
             }
             LirRvalue::BuiltinCall {
                 callee,

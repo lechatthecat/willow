@@ -167,6 +167,7 @@ fn report(f: &FunctionDecl, options: &Options) -> Report {
 pub(crate) fn check(
     program: &Program,
     previous: &[Diagnostic],
+    calls: &crate::semantic::intrinsics::BuiltinCalls,
     writes: &crate::semantic::field_writes::FieldWrites,
     options: &Options,
     cache: &mut ProofCache,
@@ -203,7 +204,10 @@ pub(crate) fn check(
         options,
         prior_error,
         cache,
-        &DataTypes::new(program, writes),
+        &DataTypes {
+            calls: Some(calls),
+            ..DataTypes::new(program, writes)
+        },
     );
     for r in &verification.reports {
         if r.status != Status::Proven && r.status != Status::RuntimeChecked {

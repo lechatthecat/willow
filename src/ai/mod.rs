@@ -688,7 +688,7 @@ impl CaptureExpressionContext<'_> {
         if let Some(target) = calls.get(&e.id()) {
             let operation = match e {
                 Expr::Call(c) => Some(c.callee.clone()),
-                Expr::MethodCall(c) => Some(c.method.clone()),
+                Expr::MethodCall(c) => Some(c.method.as_str().to_owned()),
                 Expr::StaticCall(c) => Some(QualifiedName::join(&c.class, &c.method)),
                 _ => None,
             };

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::diagnostics::Span;
 use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
+use crate::semantic::intrinsics::{BuiltinCalls, Intrinsic};
 
 use super::LambdaCapture;
 
@@ -202,6 +203,7 @@ struct Graph<'a> {
     names: Names,
     summarizing: bool,
     types: &'a HashMap<ExprId, Type>,
+    builtin_calls: &'a BuiltinCalls,
     exhaustive_matches: &'a HashSet<ExprId>,
     patterns: &'a HashMap<PatternId, Pattern>,
     nodes: Vec<Node>,
@@ -232,6 +234,7 @@ pub(super) fn analyze(
     body: &Block,
     captures: &HashMap<ExprId, Vec<LambdaCapture>>,
     types: &HashMap<ExprId, Type>,
+    builtin_calls: &BuiltinCalls,
     exhaustive_matches: &HashSet<ExprId>,
     patterns: &HashMap<PatternId, Pattern>,
 ) -> Retention {
@@ -239,6 +242,7 @@ pub(super) fn analyze(
         names: Names::resolve(body, captures, patterns),
         summarizing: false,
         types,
+        builtin_calls,
         exhaustive_matches,
         patterns,
         nodes: terminals(),
@@ -292,7 +296,9 @@ pub(super) fn analyze(
                     graph.names.temporary(operand);
                 }
             }
-            AstEvent::Expr(Expr::MethodCall(c)) if c.method == "send" => {
+            AstEvent::Expr(Expr::MethodCall(c))
+                if builtin_calls.candidate(&c.id) == Some(&Intrinsic::ChannelSend) =>
+            {
                 if let Some(arg) = c.args.first() {
                     graph.names.temporary(&arg.expr);
                 }
@@ -1002,16 +1008,10 @@ impl<'a> Graph<'a> {
                                 }
                             }
                             if let Expr::MethodCall(call) = expr
-                                && matches!(call.method.as_str(), "send" | "recv" | "recv_opt")
-                                && self.types.get(&call.object.id()).is_some_and(|ty| {
-                                    crate::semantic::builtin_types::unary_arg(
-                                        ty,
-                                        crate::semantic::builtin_types::BuiltinTypeId::Channel,
-                                    )
-                                    .is_some()
-                                })
+                                && let Some(id) = self.builtin_calls.candidate(&call.id)
+                                && id.is_suspension_point()
                             {
-                                if call.method == "send"
+                                if *id == Intrinsic::ChannelSend
                                     && let Some(arg) = call.args.first()
                                 {
                                     self.nodes[finish]
@@ -1420,27 +1420,27 @@ mod tests {
             ),
             (
                 "deferred operand scope ended",
-                "if true { let op: fn(i64) -> i64 = |x| x; defer consume(op); } await sleep(0);",
+                "if true { let mut op: fn(i64) -> i64 = |x| x; defer consume(op); } await sleep(0);",
                 false,
             ),
             (
                 "deferred operand live",
-                "let op: fn(i64) -> i64 = |x| x; defer consume(op); await sleep(0);",
+                "let mut op: fn(i64) -> i64 = |x| x; defer consume(op); await sleep(0);",
                 true,
             ),
             (
                 "deferred operand no wait",
-                "let op: fn(i64) -> i64 = |x| x; defer consume(op);",
+                "let mut op: fn(i64) -> i64 = |x| x; defer consume(op);",
                 false,
             ),
             (
                 "channel implicit wait",
-                "let op: fn(i64) -> i64 = |x| x; let ch = Channel<i64>::new(); ch.send(1); println(op(1));",
+                "let mut op: fn(i64) -> i64 = |x| x; let ch = Channel<i64>::new(); ch.send(1); println(op(1));",
                 true,
             ),
             (
                 "channel wait after last use",
-                "let op: fn(i64) -> i64 = |x| x; println(op(1)); let ch = Channel<i64>::new(); ch.send(1);",
+                "let mut op: fn(i64) -> i64 = |x| x; println(op(1)); let ch = Channel<i64>::new(); ch.send(1);",
                 false,
             ),
         ];
@@ -1492,7 +1492,11 @@ mod tests {
                 "let ops: Array<fn(i64) -> i64> = [op]; consume(ops[0], await number());",
                 true,
             ),
-            ("literal closure", "consume(|x| x, await number());", true),
+            (
+                "literal closure",
+                "consume(|x| { base = base + x; return base; }, await number());",
+                true,
+            ),
             (
                 "conditional result",
                 "consume(flag ? identity(op) : op, await number());",
@@ -1535,7 +1539,7 @@ fn evaluate(op: fn(i64) -> i64) -> i64 {{ return op(1); }}
 fn consume(op: fn(i64) -> i64, n: i64) {{ println(op(n)); }}
 fn consume_number(a: i64, b: i64) {{ println(a + b); }}
 async fn number() -> i64 {{ return 1; }}
-async fn check(flag: bool) {{ let op: fn(i64) -> i64 = |x| x; {body} }}
+async fn check(flag: bool) {{ let mut base = 1; let op: fn(i64) -> i64 = |x| {{ base = base + x; return base; }}; {body} }}
 "#
             );
             let program = parse(&source);
@@ -1742,12 +1746,12 @@ async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}
         for n in [16, 32, 64, 128] {
             for deferred in [false, true] {
                 let body = if deferred {
-                    "if true { let op: fn(i64) -> i64 = |x| x; defer op(1); await sleep(0); }"
+                    "if true { let mut op: fn(i64) -> i64 = |x| x; defer op(1); await sleep(0); }"
                         .repeat(n)
                 } else {
                     let arms = "f if await choose() => {},".repeat(n);
                     format!(
-                        "let op: fn(i64) -> i64 = |x| x; match op {{ {arms} g => {{ println(g(1)); }} }}"
+                        "let mut op: fn(i64) -> i64 = |x| x; match op {{ {arms} g => {{ println(g(1)); }} }}"
                     )
                 };
                 let program = parse(&format!(
@@ -1763,6 +1767,7 @@ async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}
                     &f.body,
                     &checker.lambda_captures,
                     &checker.expr_types,
+                    &checker.builtin_calls,
                     &checker.local.exhaustive_matches,
                     &checker.pattern_resolutions,
                 );
@@ -1945,6 +1950,7 @@ async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}
                 &f.body,
                 &checker.lambda_captures,
                 &checker.expr_types,
+                &checker.builtin_calls,
                 &checker.local.exhaustive_matches,
                 &checker.pattern_resolutions,
             );
@@ -2231,6 +2237,7 @@ async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}
                         &f.body,
                         &checker.lambda_captures,
                         &checker.expr_types,
+                        &checker.builtin_calls,
                         &exhaustive,
                         &checker.pattern_resolutions,
                     );
@@ -2274,7 +2281,7 @@ async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}
         ];
         for (expr, bad) in cases {
             let program = parse(&format!(
-                "async fn choose() -> bool {{ return true; }} async fn check(flag: bool) {{ let op: fn(i64) -> i64 = |x| x; let b = {expr}; println(op(1)); }}"
+                "async fn choose() -> bool {{ return true; }} async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; let b = {expr}; println(op(1)); }}"
             ));
             let mut checker = TypeChecker::new();
             checker.set_enforce_send_sync(true);
@@ -2360,7 +2367,7 @@ async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}
             );
             assert_variant_retention(
                 &format!(
-                    "let A: fn(i64) -> i64 = |x| x; match tag {{ {a} => {{ await sleep(0); println(A(1)); }}, {b} => {{}} }}"
+                    "let mut A: fn(i64) -> i64 = |x| x; match tag {{ {a} => {{ await sleep(0); println(A(1)); }}, {b} => {{}} }}"
                 ),
                 true,
                 "variant must not shadow local",
@@ -2472,6 +2479,7 @@ async fn work() {{ let op: fn(i64) -> i64 = |x| x; {body} }}
                 &f.body,
                 &checker.lambda_captures,
                 &checker.expr_types,
+                &checker.builtin_calls,
                 &checker.local.exhaustive_matches,
                 &checker.pattern_resolutions,
             );
@@ -2507,6 +2515,7 @@ async fn work() {{ let op: fn(i64) -> i64 = |x| x; {body} }}
                     &f.body,
                     &HashMap::new(),
                     &HashMap::new(),
+                    &Default::default(),
                     &HashSet::new(),
                     &HashMap::new(),
                 );
@@ -2541,6 +2550,7 @@ async fn work() {{ let op: fn(i64) -> i64 = |x| x; {body} }}
                     &f.body,
                     &HashMap::new(),
                     &HashMap::new(),
+                    &Default::default(),
                     &HashSet::new(),
                     &HashMap::new(),
                 );
@@ -2739,6 +2749,7 @@ async fn work() {{ let op: fn(i64) -> i64 = |x| x; {body} }}
                 &f.body,
                 &checker.lambda_captures,
                 &checker.expr_types,
+                &checker.builtin_calls,
                 &checker.local.exhaustive_matches,
                 &checker.pattern_resolutions,
             );
@@ -2785,6 +2796,7 @@ async fn work() {{ let op: fn(i64) -> i64 = |x| x; {body} }}
                 &f.body,
                 &checker.lambda_captures,
                 &checker.expr_types,
+                &checker.builtin_calls,
                 &checker.local.exhaustive_matches,
                 &checker.pattern_resolutions,
             );
@@ -2916,6 +2928,7 @@ async fn work() {{ let op: fn(i64) -> i64 = |x| x; {body} }}
                 &f.body,
                 &HashMap::new(),
                 &HashMap::new(),
+                &Default::default(),
                 &HashSet::new(),
                 &HashMap::new(),
             );

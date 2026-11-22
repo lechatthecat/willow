@@ -175,12 +175,15 @@ impl LirOperand {
     pub fn locals(&self) -> Vec<LirLocalId> {
         self.iter_locals().collect()
     }
-    pub fn ty(&self, locals: &[LirLocal]) -> Option<Type> {
+    fn plain_type<'a>(&'a self, locals: &'a [LirLocal]) -> Option<&'a Type> {
+        static I64: Type = Type::I64;
+        static F64: Type = Type::F64;
+        static BOOL: Type = Type::Bool;
         match self {
             Self::Local(id) => locals
                 .get(id.0 as usize)
                 .filter(|local| !local.is_gc_owner())
-                .map(|local| local.ty.clone()),
+                .map(|local| &local.ty),
             Self::Integer { value, ty } => {
                 let valid = if *ty == Type::Char {
                     u32::try_from(*value)
@@ -191,12 +194,22 @@ impl LirOperand {
                     ty.integer_layout()
                         .is_some_and(|layout| layout.contains(layout.value(*value)))
                 };
-                valid.then(|| ty.clone())
+                valid.then_some(ty)
             }
+            Self::Int(_) => Some(&I64),
+            Self::Float(_) => Some(&F64),
+            Self::Bool(_) => Some(&BOOL),
+            Self::Reference { .. } => None,
+        }
+    }
+
+    pub fn ty(&self, locals: &[LirLocal]) -> Option<Type> {
+        match self {
+            Self::Reference { place, .. } => place.ty(locals),
             Self::Int(_) => Some(Type::I64),
             Self::Float(_) => Some(Type::F64),
             Self::Bool(_) => Some(Type::Bool),
-            Self::Reference { place, .. } => place.ty(locals),
+            Self::Integer { .. } | Self::Local(_) => self.plain_type(locals).cloned(),
         }
     }
 }
@@ -302,7 +315,7 @@ pub enum LirRvalue {
     EnumMethod {
         receiver: LirOperand,
         receiver_ty: Type,
-        method: String,
+        method: crate::semantic::intrinsics::AdtMethod,
         args: Vec<LirOperand>,
         arg_types: Vec<Type>,
         result: Type,
@@ -373,7 +386,7 @@ pub enum LirRvalue {
     },
     IntrinsicCall {
         intrinsic: crate::semantic::intrinsics::Intrinsic,
-        method: String,
+        method: crate::parser::ast::MethodSpelling,
         receiver: LirOperand,
         receiver_ty: Type,
         args: Vec<LirOperand>,
@@ -470,17 +483,11 @@ impl LirRvalue {
         };
         // Check the operand kind during type lookup. Calls that can pass a
         // reference check its place type directly in their own arms.
-        let plain_ty = |operand: &LirOperand| {
-            if operand.is_plain_value() {
-                operand.ty(locals)
-            } else {
-                None
-            }
-        };
+        let plain_ty = |operand| LirOperand::plain_type(operand, locals);
         if let Self::CaptureArrayOwner { array, index } = self {
             return destination.is_gc_owner()
                 && matches!(plain_ty(array), Some(Type::Array(_)))
-                && plain_ty(index) == Some(Type::I64);
+                && plain_ty(index) == Some(&Type::I64);
         }
         if destination.is_gc_owner() {
             return false;
@@ -489,55 +496,54 @@ impl LirRvalue {
             Self::BeginReferenceCall => destination.ty == Type::Void,
             Self::CaptureArrayOwner { .. } => false,
             Self::ReferenceDebug { argument, .. } => destination.ty == Type::Void && matches!(argument, LirOperand::Reference { .. }) && argument.ty(locals).is_some(),
-            Self::Use(operand) => plain_ty(operand).as_ref() == Some(&destination.ty),
+            Self::Use(operand) => plain_ty(operand) == Some(&destination.ty),
             Self::StartTask { args, params, output, .. } => matches!(&destination.ty, Type::Generic(name, payloads) if builtin_types::resolve_name(name) == Some(Builtin::Task) && payloads == std::slice::from_ref(output)) && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| arg.ty(locals).as_ref() == Some(param)),
-            Self::AwaitFuture { future, result } => destination.ty == *result && matches!(plain_ty(future).as_ref(), Some(Type::Generic(name, payloads)) if builtin_types::resolve_name(name) == Some(Builtin::Future) && payloads == std::slice::from_ref(result)),
-            Self::SelectIdleWait { deadlines } => destination.ty == Type::Void && deadlines.iter().all(|operand| plain_ty(operand) == Some(Type::I64)),
-            Self::Coerce { value, source, target } => plain_ty(value).as_ref() == Some(source) && destination.ty == *target,
-            Self::ArrayAlloc { element, .. } => destination.ty == Type::Array(Box::new(element.clone())),
-            Self::ArrayStore { array, index, value, element } => plain_ty(array) == Some(Type::Array(Box::new(element.clone()))) && plain_ty(index) == Some(Type::I64) && plain_ty(value).is_some() && destination.ty == Type::Void,
-            Self::Index { array, index, element } => plain_ty(index) == Some(Type::I64) && destination.ty == *element && plain_ty(array).is_some_and(|array| match &array { Type::Array(inner) => **inner == *element, Type::Generic(name, args) => crate::semantic::builtin_types::resolve_name(name) == Some(crate::semantic::builtin_types::BuiltinTypeId::FrozenArray) && args == std::slice::from_ref(element), _ => false }),
+            Self::AwaitFuture { future, result } => destination.ty == *result && matches!(plain_ty(future), Some(Type::Generic(name, payloads)) if builtin_types::resolve_name(name) == Some(Builtin::Future) && payloads == std::slice::from_ref(result)),
+            Self::SelectIdleWait { deadlines } => destination.ty == Type::Void && deadlines.iter().all(|operand| plain_ty(operand) == Some(&Type::I64)),
+            Self::Coerce { value, source, target } => plain_ty(value) == Some(source) && destination.ty == *target,
+            Self::ArrayAlloc { element, .. } => matches!(&destination.ty, Type::Array(inner) if inner.as_ref() == element),
+            Self::ArrayStore { array, index, value, element } => matches!(plain_ty(array), Some(Type::Array(inner)) if inner.as_ref() == element) && plain_ty(index) == Some(&Type::I64) && plain_ty(value).is_some() && destination.ty == Type::Void,
+            Self::Index { array, index, element } => plain_ty(index) == Some(&Type::I64) && destination.ty == *element && plain_ty(array).is_some_and(|array| match array { Type::Array(inner) => **inner == *element, Type::Generic(name, args) => crate::semantic::builtin_types::resolve_name(name) == Some(crate::semantic::builtin_types::BuiltinTypeId::FrozenArray) && args == std::slice::from_ref(element), _ => false }),
             Self::ObjectAlloc { class } => destination.ty == Type::Named(*class),
-            Self::FieldLoad { object, object_ty, result, .. } => plain_ty(object).as_ref() == Some(object_ty) && destination.ty == *result,
-            Self::FieldStore { object, object_ty, value, .. } => plain_ty(object).as_ref() == Some(object_ty) && plain_ty(value).is_some() && destination.ty == Type::Void,
+            Self::FieldLoad { object, object_ty, result, .. } => plain_ty(object) == Some(object_ty) && destination.ty == *result,
+            Self::FieldStore { object, object_ty, value, .. } => plain_ty(object) == Some(object_ty) && plain_ty(value).is_some() && destination.ty == Type::Void,
             Self::StaticField { result, .. } => destination.ty == *result,
             Self::StaticStore { value, .. } => plain_ty(value).is_some() && destination.ty == Type::Void,
-            Self::ConstructorCall { object, class, args, arg_types } => plain_ty(object) == Some(Type::Named(*class)) && destination.ty == Type::Void && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| arg.ty(locals).as_ref() == Some(expected)),
-            Self::Range { start, end } => plain_ty(start) == Some(Type::I64) && plain_ty(end) == Some(Type::I64) && matches!(&destination.ty, Type::Generic(name, payloads) if builtin_types::resolve_name(name) == Some(Builtin::Range) && payloads == &[Type::I64]),
-            Self::EnumMethod { receiver, receiver_ty, args, arg_types, result, .. } => plain_ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| plain_ty(arg).as_ref() == Some(expected)),
-            Self::BuiltinCall { args, params, result, .. } => destination.ty == *result && args.len() == params.len() && args.iter().zip(params).all(|(arg, expected)| plain_ty(arg).as_ref() == Some(expected)),
+            Self::ConstructorCall { object, class, args, arg_types } => plain_ty(object) == Some(&Type::Named(*class)) && destination.ty == Type::Void && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| arg.ty(locals).as_ref() == Some(expected)),
+            Self::Range { start, end } => plain_ty(start) == Some(&Type::I64) && plain_ty(end) == Some(&Type::I64) && matches!(&destination.ty, Type::Generic(name, payloads) if builtin_types::resolve_name(name) == Some(Builtin::Range) && payloads == &[Type::I64]),
+            Self::EnumMethod { receiver, receiver_ty, args, arg_types, result, .. } => plain_ty(receiver) == Some(receiver_ty) && destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| plain_ty(arg) == Some(expected)),
+            Self::BuiltinCall { args, params, result, .. } => destination.ty == *result && args.len() == params.len() && args.iter().zip(params).all(|(arg, expected)| plain_ty(arg) == Some(expected)),
             Self::StaticCall { args, arg_types, result, .. } => destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| arg.ty(locals).as_ref() == Some(expected)),
             Self::EnumAlloc { enum_ty, .. } => destination.ty == *enum_ty,
-            Self::EnumPayloadStore { object, value, source, enum_ty, .. } => plain_ty(object).as_ref() == Some(enum_ty) && plain_ty(value).as_ref() == Some(source) && destination.ty == *enum_ty,
-            Self::FormatScalar { value, ty: expected, format } => plain_ty(value).as_ref() == Some(expected) && destination.ty == Type::String && if format.is_some() { *expected == Type::F64 } else { matches!(expected, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String) },
-            Self::Panic { message } => plain_ty(message) == Some(Type::String) && destination.ty == Type::Never,
+            Self::EnumPayloadStore { object, value, source, enum_ty, .. } => plain_ty(object) == Some(enum_ty) && plain_ty(value) == Some(source) && destination.ty == *enum_ty,
+            Self::FormatScalar { value, ty: expected, format } => plain_ty(value) == Some(expected) && destination.ty == Type::String && if format.is_some() { *expected == Type::F64 } else { matches!(expected, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String) },
+            Self::Panic { message } => plain_ty(message) == Some(&Type::String) && destination.ty == Type::Never,
             Self::Recover => destination.ty == Type::Generic(TypeId::local(Builtin::Option.source_name()), vec![Type::Named(TypeId::local("PanicInfo"))]),
-            Self::RebindResultError { value, source, target } | Self::IntoError { value, source, target } => plain_ty(value).as_ref() == Some(source) && destination.ty == *target,
-            Self::PrepareMethod { receiver, receiver_ty, .. } => plain_ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *receiver_ty,
-            Self::MethodCall { receiver, receiver_ty, args, arg_types, result, .. } => plain_ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| arg.ty(locals).as_ref() == Some(expected)),
+            Self::RebindResultError { value, source, target } | Self::IntoError { value, source, target } => plain_ty(value) == Some(source) && destination.ty == *target,
+            Self::PrepareMethod { receiver, receiver_ty, .. } => plain_ty(receiver) == Some(receiver_ty) && destination.ty == *receiver_ty,
+            Self::MethodCall { receiver, receiver_ty, args, arg_types, result, .. } => plain_ty(receiver) == Some(receiver_ty) && destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| arg.ty(locals).as_ref() == Some(expected)),
             Self::IntrinsicCall { intrinsic, method, receiver, receiver_ty, args, arg_types, result } => {
-                plain_ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *result
-                    && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| plain_ty(arg).as_ref() == Some(expected))
-                    && crate::semantic::intrinsics::resolve(receiver_ty, method, args.len()).is_some_and(|resolved|
-                        resolved.intrinsic == *intrinsic && resolved.return_type(|i| arg_types.get(i).cloned()) == *result)
+                plain_ty(receiver) == Some(receiver_ty) && destination.ty == *result
+                    && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| plain_ty(arg) == Some(expected))
+                    && crate::semantic::intrinsics::matches_signature(receiver_ty, method.kind(), *intrinsic, arg_types, result)
             }
             Self::StringLiteral(_) => destination.ty == Type::String,
             Self::FunctionRef { ty, .. } => destination.ty == *ty && matches!(ty, Type::Fn(..) | Type::Closure(..)),
             Self::Closure { captures, ty: result, .. } => destination.ty == *result
                 && matches!(result, Type::Fn(..) | Type::Closure(..)) && captures.iter().all(|capture| plain_ty(capture).is_some()),
             Self::Print { value, ty: expected, .. } => destination.ty == Type::Void
-                && plain_ty(value).as_ref() == Some(expected) && matches!(expected, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String),
+                && plain_ty(value) == Some(expected) && matches!(expected, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String),
             Self::DirectCall { args, params, result, .. } => destination.ty == *result
                 && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| arg.ty(locals).as_ref() == Some(param)),
             Self::IndirectCall { callee, args, params, result, .. } => destination.ty == *result
-                && plain_ty(callee).is_some_and(|callee| matches!(&callee, Type::Fn(expected, output) | Type::Closure(expected, output) if expected == params && **output == *result))
-                && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| plain_ty(arg).as_ref() == Some(param)),
+                && plain_ty(callee).is_some_and(|callee| matches!(callee, Type::Fn(expected, output) | Type::Closure(expected, output) if expected == params && **output == *result))
+                && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| plain_ty(arg) == Some(param)),
             Self::Unary {
                 op,
                 operand,
                 ty: expected,
             } => {
-                plain_ty(operand).as_ref() == Some(expected)
+                plain_ty(operand) == Some(expected)
                     && destination.ty == *expected
                     && match op {
                         UnaryOp::Neg => expected.integer_layout().is_some() || *expected == Type::F64,
@@ -555,13 +561,13 @@ impl LirRvalue {
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
                 );
                 let result = if comparison {
-                    Type::Bool
+                    &Type::Bool
                 } else {
-                    operand_ty.clone()
+                    operand_ty
                 };
-                plain_ty(lhs).as_ref() == Some(operand_ty)
-                    && plain_ty(rhs).as_ref() == Some(operand_ty)
-                    && destination.ty == result
+                plain_ty(lhs) == Some(operand_ty)
+                    && plain_ty(rhs) == Some(operand_ty)
+                    && &destination.ty == result
                     && !matches!(op, BinOp::And | BinOp::Or)
                     && match operand_ty {
                         ty if ty.integer_layout().is_some() => true,
@@ -578,7 +584,7 @@ impl LirRvalue {
                     && parts.len() == part_types.len()
                     && parts.iter().zip(part_types).all(|(part, expected)| {
                         matches!(expected, Type::String | Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64)
-                            && plain_ty(part).as_ref() == Some(expected)
+                            && plain_ty(part) == Some(expected)
                     })
             }
         }
@@ -793,6 +799,177 @@ mod tests {
             source_span: None,
             synthetic: true,
             parameter: false,
+        }
+    }
+
+    fn intrinsic_call(
+        method: &str,
+        intrinsic: crate::semantic::intrinsics::Intrinsic,
+        receiver_ty: Type,
+        arg_types: Vec<Type>,
+        result: Type,
+    ) -> (LirRvalue, Vec<LirLocal>) {
+        let locals = [result.clone(), receiver_ty.clone()]
+            .into_iter()
+            .chain(arg_types.iter().cloned())
+            .enumerate()
+            .map(|(i, ty)| value_local(i as u32, ty))
+            .collect();
+        let args = (0..arg_types.len())
+            .map(|i| LirOperand::Local(LirLocalId(2 + i as u32)))
+            .collect();
+        (
+            LirRvalue::IntrinsicCall {
+                intrinsic,
+                method: method.into(),
+                receiver: LirOperand::Local(LirLocalId(1)),
+                receiver_ty,
+                args,
+                arg_types,
+                result,
+            },
+            locals,
+        )
+    }
+
+    #[test]
+    fn intrinsic_lir_requires_the_id_of_the_typed_member() {
+        use crate::semantic::intrinsics::Intrinsic::*;
+        for (name, id, wrong_id, recv, args, result) in [
+            (
+                "to_upper",
+                StringToUpper,
+                StringToLower,
+                Type::String,
+                vec![],
+                Type::String,
+            ),
+            (
+                "slice",
+                StringSubstring,
+                StringReplace,
+                Type::String,
+                vec![Type::I64, Type::I64],
+                Type::String,
+            ),
+            (
+                "substring",
+                StringSubstring,
+                StringReplace,
+                Type::String,
+                vec![Type::I64, Type::I64],
+                Type::String,
+            ),
+            (
+                "__abi_debug",
+                I64ToString,
+                ScalarToString,
+                Type::I64,
+                vec![],
+                Type::String,
+            ),
+            (
+                "__abi_debug",
+                ScalarToString,
+                I64ToString,
+                Type::Char,
+                vec![],
+                Type::String,
+            ),
+            (
+                "close",
+                ChannelClose,
+                ChannelSend,
+                Builtin::Channel.apply(vec![Type::I64]),
+                vec![],
+                Type::Void,
+            ),
+        ] {
+            let (mut call, locals) = intrinsic_call(name, id, recv, args, result);
+            assert!(call.is_well_typed(&locals, LirLocalId(0)), "{name}");
+            let LirRvalue::IntrinsicCall { intrinsic, .. } = &mut call else {
+                unreachable!()
+            };
+            *intrinsic = wrong_id;
+            assert!(!call.is_well_typed(&locals, LirLocalId(0)), "{name}");
+        }
+    }
+
+    #[test]
+    fn intrinsic_lir_compares_result_types_without_copying_payloads() {
+        use crate::parser::ast::REBUILT_TYPE_NODES;
+        use crate::semantic::intrinsics::Intrinsic::*;
+
+        for depth in [0, 8, 32, 128] {
+            let item = (0..depth).fold(Type::I64, |ty, _| Type::Array(Box::new(ty)));
+            REBUILT_TYPE_NODES.set(0);
+            let key = item.clone();
+            assert_eq!(REBUILT_TYPE_NODES.get(), depth + 1);
+            let map = Builtin::Map.apply(vec![key.clone(), item.clone()]);
+            let task = Builtin::Task.apply(vec![item.clone()]);
+            let wrong = Type::Generic(TypeId::local("Other"), vec![item.clone()]);
+            for (name, id, recv, args, result) in [
+                (
+                    "get",
+                    MapGet,
+                    map.clone(),
+                    vec![key.clone()],
+                    Builtin::Option.apply(vec![item.clone()]),
+                ),
+                (
+                    "freeze",
+                    MapFreeze,
+                    map.clone(),
+                    vec![],
+                    Builtin::FrozenMap.apply(vec![key.clone(), item.clone()]),
+                ),
+                (
+                    "entries",
+                    MapEntries,
+                    map.clone(),
+                    vec![],
+                    Type::Array(Box::new(Type::Generic(
+                        TypeId::local("$Tuple2"),
+                        vec![key.clone(), item.clone()],
+                    ))),
+                ),
+                (
+                    "attach",
+                    TokenAttach,
+                    Builtin::CancellationToken.apply(vec![]),
+                    vec![task.clone()],
+                    task.clone(),
+                ),
+                (
+                    "add",
+                    ScopeAdd,
+                    Builtin::TaskScope.apply(vec![]),
+                    vec![task.clone()],
+                    task.clone(),
+                ),
+                (
+                    "recv",
+                    ChannelRecv,
+                    Builtin::Channel.apply(vec![item.clone()]),
+                    vec![],
+                    item.clone(),
+                ),
+            ] {
+                let (call, locals) = intrinsic_call(name, id, recv.clone(), args.clone(), result);
+                let (invalid, bad_locals) = intrinsic_call(name, id, recv, args, wrong.clone());
+                for count in [1, 8, 64] {
+                    REBUILT_TYPE_NODES.set(0);
+                    for _ in 0..count {
+                        assert!(call.is_well_typed(&locals, LirLocalId(0)), "{name}");
+                        assert!(!invalid.is_well_typed(&bad_locals, LirLocalId(0)), "{name}");
+                    }
+                    assert_eq!(
+                        REBUILT_TYPE_NODES.get(),
+                        0,
+                        "{name}, depth {depth}, calls {count}"
+                    );
+                }
+            }
         }
     }
 

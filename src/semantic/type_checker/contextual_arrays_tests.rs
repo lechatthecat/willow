@@ -452,9 +452,13 @@ fn freeze_inference_receiver_work_is_linear() {
 #[test]
 fn freeze_inference_records_call_targets_and_receiver_types() {
     use crate::parser::iter::{AstEvent, AstWalk};
+    use crate::semantic::intrinsics::{Intrinsic, METHOD_LOOKUPS, MethodName};
+    check_source("");
+    METHOD_LOOKUPS.with(|counter| counter.set(0));
     let source = "import std::collections::Array; import std::collections::Map; class C { pub fn freeze(self) -> FrozenArray<i64> { return [1].freeze(); } } fn f() -> FrozenArray<i64> { return new C().freeze(); } fn g() -> FrozenMap<String, i64> { return Map::new().freeze(); } fn h() -> FrozenArray<i64> { return Array::new().freeze(); }";
     let (program, errors) = Parser::new(Lexer::new(source).tokenize().unwrap()).parse();
     assert!(errors.is_empty());
+    assert_eq!(METHOD_LOOKUPS.with(|counter| counter.get()), 4);
     let mut checker = TypeChecker::new();
     checker.capture_call_sites = true;
     checker.check_program(&program);
@@ -469,6 +473,15 @@ fn freeze_inference_records_call_targets_and_receiver_types() {
             for event in AstWalk::new(AstEvent::Block(&f.body)) {
                 if let AstEvent::Expr(Expr::MethodCall(call)) = event {
                     freezes += 1;
+                    assert!(call.method.kind() == MethodName::Freeze);
+                    match f.name.as_str() {
+                        "f" => assert!(checker.builtin_calls.get(&call.id).is_none()),
+                        "g" => assert_eq!(
+                            checker.builtin_calls.get(&call.id),
+                            Some(&Intrinsic::MapFreeze)
+                        ),
+                        _ => {}
+                    }
                     assert!(checker.analysis_calls[&call.id].is_some());
                     let receiver = &checker.expr_types[&call.object.id()];
                     assert!(!format!("{receiver:?}").contains("Void"));
@@ -476,6 +489,7 @@ fn freeze_inference_records_call_targets_and_receiver_types() {
             }
         }
     }
+    assert_eq!(METHOD_LOOKUPS.with(|counter| counter.get()), 4);
     assert_eq!(freezes, 3);
     let sites = &checker.resolved_calls[&FunctionId::free_from_source_name("f")];
     assert!(

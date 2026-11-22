@@ -1,4 +1,3 @@
-use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
 use cranelift_module::Module;
 
@@ -25,8 +24,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr: cranelift_codegen::ir::Value,
         inner_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let option_ty = Builtin::Option.apply(vec![inner_ty.clone()]);
-        if self.option_repr(&option_ty) == Some(OptionRepr::NullableGcPointer) {
+        if self.option_payload_repr(inner_ty) == OptionRepr::NullableGcPointer {
             return self.builder.ins().icmp_imm_u(IntCC::NotEqual, ptr, 0);
         }
         let tag = self.emit_load_enum_tag(ptr);
@@ -39,8 +37,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr: cranelift_codegen::ir::Value,
         inner_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let option_ty = Builtin::Option.apply(vec![inner_ty.clone()]);
-        let raw = if self.option_repr(&option_ty) == Some(OptionRepr::NullableGcPointer) {
+        let raw = if self.option_payload_repr(inner_ty) == OptionRepr::NullableGcPointer {
             ptr
         } else {
             self.emit_enum_payload_bits(ptr, inner_ty)
@@ -231,12 +228,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         ptr: cranelift_codegen::ir::Value,
         inner_ty: &Type,
-        ret_ty: &Type,
+        output_ty: &Type,
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let output_ty = Builtin::Option.apply(vec![ret_ty.clone()]);
-        let result_var = self.builder.declare_var(self.clif_type(&output_ty));
+        let ret_ty = callback_return_type(f_ty);
+        let result_var = self.builder.declare_var(self.clif_type(output_ty));
         let is_some = self.emit_option_is_some(ptr, inner_ty);
 
         let some_block = self.builder.create_block();
@@ -273,18 +270,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let output_ty = match f_ty {
-            Type::Fn(_, ret) | Type::Closure(_, ret) => (**ret).clone(),
-            _ => unreachable!("combinator callback must be a function"),
-        };
-        let result_var = self.builder.declare_var(self.clif_type(&output_ty));
+        let output_ty = callback_return_type(f_ty);
+        let result_var = self.builder.declare_var(self.clif_type(output_ty));
         let is_some = self.emit_option_is_some(ptr, inner_ty);
-        let output_inner = match f_ty {
-            Type::Fn(_, ret) | Type::Closure(_, ret) => {
-                option_inner(ret).cloned().unwrap_or(Type::Void)
-            }
-            _ => Type::Void,
-        };
+        let output_inner = option_inner(output_ty).expect("checked Option.and_then return type");
 
         let some_block = self.builder.create_block();
         let none_block = self.builder.create_block();
@@ -302,7 +291,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(none_block);
         self.builder.seal_block(none_block);
-        let new_none = self.emit_alloc_option_none(&output_inner);
+        let new_none = self.emit_alloc_option_none(output_inner);
         self.builder.def_var(result_var, new_none);
         self.builder.ins().jump(merge, &[]);
 
@@ -319,8 +308,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let output_ty = Builtin::Option.apply(vec![inner_ty.clone()]);
-        let result_var = self.builder.declare_var(self.clif_type(&output_ty));
+        let output_ty = callback_return_type(f_ty);
+        let result_var = self.builder.declare_var(self.clif_type(output_ty));
         let is_some = self.emit_option_is_some(ptr, inner_ty);
 
         let some_block = self.builder.create_block();
@@ -356,23 +345,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr: cranelift_codegen::ir::Value,
         ok_ty: &Type,
         err_ty: &Type,
-        f_val: cranelift_codegen::ir::Value,
-        f_ty: &Type,
+        (f_val, f_ty): (cranelift_codegen::ir::Value, &Type),
+        output_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ret_ty = &callback_return_type(f_ty);
-        let type_args = match side {
-            ResultSide::Ok => vec![ret_ty.clone(), err_ty.clone()],
-            ResultSide::Err => vec![ok_ty.clone(), ret_ty.clone()],
-        };
-        let output_ty = Builtin::Result.apply(type_args);
-        self.emit_result_arms(ptr, &output_ty, |this, arm| {
+        let ret_ty = callback_return_type(f_ty);
+        self.emit_result_arms(ptr, output_ty, |this, arm| {
             let arm_ty = arm.payload_ty(ok_ty, err_ty);
             let payload = this.emit_result_arm_payload(ptr, arm_ty);
             if arm == side {
                 let result = this.emit_indirect_call(f_val, f_ty, &[payload]);
-                this.emit_alloc_result_variant(&output_ty, arm.tag(), ret_ty, result)
+                this.emit_alloc_result_variant(output_ty, arm.tag(), ret_ty, result)
             } else {
-                this.emit_alloc_result_variant(&output_ty, arm.tag(), arm_ty, payload)
+                this.emit_alloc_result_variant(output_ty, arm.tag(), arm_ty, payload)
             }
         })
     }
@@ -392,16 +376,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let output_ty = callback_return_type(f_ty);
-        self.emit_result_arms(ptr, &output_ty, |this, arm| {
+        self.emit_result_arms(ptr, output_ty, |this, arm| {
             let arm_ty = arm.payload_ty(ok_ty, err_ty);
             if arm == side {
                 let payload = this.emit_result_arm_payload(ptr, arm_ty);
                 this.emit_indirect_call(f_val, f_ty, &[payload])
-            } else if this.builder.func.dfg.value_type(ptr) == this.clif_type(&output_ty) {
+            } else if this.builder.func.dfg.value_type(ptr) == this.clif_type(output_ty) {
                 ptr
             } else {
                 let payload = this.emit_result_arm_payload(ptr, arm_ty);
-                this.emit_alloc_result_variant(&output_ty, arm.tag(), arm_ty, payload)
+                this.emit_alloc_result_variant(output_ty, arm.tag(), arm_ty, payload)
             }
         })
     }
@@ -527,10 +511,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         payload_ty: &Type,
         payload_val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        let option_ty = Builtin::Option.apply(vec![payload_ty.clone()]);
-        if self.option_repr(&option_ty) == Some(OptionRepr::NullableGcPointer) {
+        let repr = self.option_payload_repr(payload_ty);
+        if repr == OptionRepr::NullableGcPointer {
             payload_val
-        } else if super::option_repr::is_scalar_pair(&option_ty) {
+        } else if repr == OptionRepr::TaggedPair {
             let payload = self.coerce_to_i64(payload_val, payload_ty);
             let tag = self.builder.ins().iconst(types::I64, 0);
             self.emit_pair(tag, payload)
@@ -544,12 +528,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         payload_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let option_ty = Builtin::Option.apply(vec![payload_ty.clone()]);
-        if self.option_repr(&option_ty) == Some(OptionRepr::NullableGcPointer) {
+        let repr = self.option_payload_repr(payload_ty);
+        if repr == OptionRepr::NullableGcPointer {
             self.builder
                 .ins()
                 .iconst(reference_type(self.module.target_config()), 0)
-        } else if super::option_repr::is_scalar_pair(&option_ty) {
+        } else if repr == OptionRepr::TaggedPair {
             let tag = self.builder.ins().iconst(types::I64, 1);
             let payload = self.builder.ins().iconst(types::I64, 0);
             self.emit_pair(tag, payload)
@@ -570,9 +554,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 }
 
 /// The return type of a combinator's callback.
-fn callback_return_type(f_ty: &Type) -> Type {
+fn callback_return_type(f_ty: &Type) -> &Type {
     match f_ty {
-        Type::Fn(_, ret) | Type::Closure(_, ret) => (**ret).clone(),
+        Type::Fn(_, ret) | Type::Closure(_, ret) => ret,
         _ => unreachable!("combinator callback must be a function"),
     }
 }

@@ -196,7 +196,7 @@ impl TypeChecker {
         let key = (
             1,
             QualifiedName::join(template.span.file_id.0, &template.name),
-            identity_args.clone(),
+            identity_args,
         );
         if let Some(name) = self.generics.instances.get(&key) {
             return Some(Type::Named(name.clone()));
@@ -220,7 +220,7 @@ impl TypeChecker {
             .zip(args.iter().cloned())
             .collect();
         let template_access = name.to_string();
-        let local_name = symbol(&template.name, &identity_args);
+        let local_name = symbol(&template.name, &key.2);
         self.record_runtime_instance_name(&local_name, &template.name, &args);
         let name = self
             .generics
@@ -334,7 +334,7 @@ impl TypeChecker {
         };
         let generation = self.error_generation;
         if template_access == template.name {
-            self.register_class(&class);
+            self.register_class(&class, None);
         } else {
             // Registration happens in the consumer, while the queued body is
             // checked in the provider. Only the consumer's signature copy may
@@ -374,7 +374,7 @@ impl TypeChecker {
             let Item::Class(signature) = signature else {
                 unreachable!()
             };
-            self.register_class(&signature);
+            self.register_class(&signature, None);
         }
         self.generics.active_class_depth -= 1;
         if self.error_generation != generation {
@@ -442,31 +442,20 @@ impl TypeChecker {
     /// copies handled this way, which `c` must not check itself.
     pub(in crate::semantic::type_checker) fn instantiate_foreign_defaults<'c>(
         &mut self,
-        c: &'c ClassDecl,
+        c: &ClassDecl,
+        copies: &[(&'c str, Span)],
     ) -> HashSet<&'c str> {
-        let copies: Vec<&MethodDecl> = c
-            .methods
-            .iter()
-            .filter(|m| {
-                m.is_interface_default
-                    && !m.is_default_injected
-                    && m.body.span.file_id != c.span.file_id
-            })
-            .collect();
         let mut handled = HashSet::new();
-        if copies.is_empty() {
-            return handled;
-        }
         // A template's copies still name its own parameters; each concrete
         // instance of the class requests its own interface instance.
         if self.generics.abstract_check {
-            handled.extend(copies.iter().map(|m| m.name.as_str()));
+            handled.extend(copies.iter().map(|&(name, _)| name));
             return handled;
         }
-        let copy_names: HashSet<&'c str> = copies.iter().map(|m| m.name.as_str()).collect();
+        let copy_names: HashSet<&'c str> = copies.iter().map(|&(name, _)| name).collect();
         // Each default method name to the first implemented interface that
         // provides it, in the order desugaring chose the copies in.
-        let mut providers: HashMap<&str, (Rc<InterfaceDecl>, &'c [Type], usize)> = HashMap::new();
+        let mut providers: HashMap<&str, (Rc<InterfaceDecl>, &[Type], usize)> = HashMap::new();
         for ty in &c.implements {
             let Type::Generic(name, args) = ty else {
                 continue;
@@ -498,8 +487,8 @@ impl TypeChecker {
             }
         }
         let mut instances: HashMap<*const InterfaceDecl, Rc<InterfaceDecl>> = HashMap::new();
-        for m in copies {
-            let Some((template, args, index)) = providers.get(m.name.as_str()) else {
+        for &(name, origin) in copies {
+            let Some((template, args, index)) = providers.get(name) else {
                 continue;
             };
             // Spans survive class instantiation; body ids are renumbered.
@@ -507,7 +496,7 @@ impl TypeChecker {
             let provides = declared
                 .default_body
                 .as_ref()
-                .is_some_and(|b| b.span == m.body.span);
+                .is_some_and(|b| b.span == origin);
             if !provides {
                 continue;
             }
@@ -527,8 +516,8 @@ impl TypeChecker {
                 .default_copies
                 .entry(c.name.clone())
                 .or_default()
-                .insert(m.name.clone(), (instance, *index));
-            handled.insert(m.name.as_str());
+                .insert(name.to_owned(), (instance, *index));
+            handled.insert(name);
         }
         handled
     }

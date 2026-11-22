@@ -3,6 +3,111 @@ use crate::lexer::Lexer;
 use crate::parser::Parser;
 
 #[test]
+fn normalization_matches_exact_subtrees_before_and_after_rebuilding() {
+    let named = |name: &str| Type::Named(name.to_owned());
+    let generic = |name: &str, args| Type::Generic(name.to_owned(), args);
+    let array = |elem| Type::Array(Box::new(elem));
+    let f = |param, ret| Type::Fn(vec![param], Box::new(ret));
+    let closure = |param, ret| Type::Closure(vec![param], Box::new(ret));
+    let fixed = |n| Type::FixedArray(Box::new(named("Alias")), n);
+    let rows = HashMap::from([
+        (named("Alias"), named("Canonical")),
+        (
+            generic("Exact", vec![named("Alias")]),
+            generic("Mapped", vec![named("Alias")]),
+        ),
+        (
+            generic("Post", vec![named("Canonical")]),
+            named("PostResult"),
+        ),
+        (fixed(7), named("Seven")),
+        (f(Type::I64, Type::String), named("Forward")),
+        (f(Type::String, Type::I64), named("Reverse")),
+        (closure(Type::I64, Type::String), named("Captured")),
+        (generic("Pair", vec![Type::I64, Type::String]), named("Two")),
+        (
+            generic("Input", vec![named("Owner")]),
+            generic("Output", vec![named("Self")]),
+        ),
+        (named("A"), named("B")),
+        (named("B"), named("C")),
+        (named("C"), named("D")),
+    ]);
+    let id = ExprId::fresh();
+    let expr_types = HashMap::from([(id, generic("Input", vec![named("Self")]))]);
+    let tables = PartialCheckerTables {
+        expr_types: Some(&expr_types),
+        normalized_types: (&rows).into(),
+        ..Default::default()
+    };
+    for (input, expected) in [
+        (
+            generic("Exact", vec![named("Alias")]),
+            generic("Mapped", vec![named("Canonical")]),
+        ),
+        (generic("Post", vec![named("Alias")]), named("PostResult")),
+        (fixed(7), named("Seven")),
+        (fixed(8), array(named("Canonical"))),
+        (f(Type::I64, Type::String), named("Forward")),
+        (f(Type::String, Type::I64), named("Reverse")),
+        (closure(Type::I64, Type::String), named("Captured")),
+        (
+            generic("Pair", vec![Type::I64]),
+            generic("Pair", vec![Type::I64]),
+        ),
+        (generic("Pair", vec![Type::I64, Type::String]), named("Two")),
+        (named("A"), named("C")),
+    ] {
+        assert_eq!(tables.normalize(&input), expected, "{input:?}");
+    }
+    assert_eq!(
+        tables.normalize_declared(
+            &array(named("Alias")),
+            Some(&BoundNames::from_iter(["Alias"]))
+        ),
+        array(named("Alias"))
+    );
+    let returns = HashMap::new();
+    let classes = Classes::default();
+    let enums = Enums::default();
+    let mut ctx = LowerCtx::new(&returns, &classes, &enums, &tables);
+    ctx.receiver = Some(named("Owner"));
+    // The concrete receiver selects a rule whose replacement introduces Self again.
+    let fact = ctx.expr_type(&id).unwrap();
+    assert_eq!(
+        ctx.normalize(&fact),
+        generic("Output", vec![named("Owner")])
+    );
+    assert_eq!(
+        ctx.normalize(&Type::FixedArray(Box::new(named("Self")), 4)),
+        array(named("Owner"))
+    );
+}
+
+#[test]
+fn deep_normalization_uses_heap_frames() {
+    std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            let wrap = |ty| Type::Generic("FrozenArray".into(), vec![ty]);
+            let (mut input, mut expected) = (Type::Named("Leaf".into()), Type::String);
+            let rows = HashMap::from([(input.clone(), expected.clone())]);
+            let tables = PartialCheckerTables {
+                normalized_types: (&rows).into(),
+                ..Default::default()
+            };
+            for _ in 0..8192 {
+                input = wrap(input);
+                expected = wrap(expected);
+            }
+            assert!(tables.normalize(&input) == expected);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn construction_identity_uses_normalized_type_alias() {
     use crate::semantic::ids::{SemanticType, TypeId};
     let tokens = Lexer::new(
@@ -17,7 +122,7 @@ fn construction_identity_uses_normalized_type_alias() {
         Type::Named("sales::Amount".into()),
     )]);
     let tables = PartialCheckerTables {
-        normalized_types: Some(&normalized),
+        normalized_types: (&normalized).into(),
         ..Default::default()
     };
     let (hir, diagnostics) = lower_program_with_partial(&program, &tables);
@@ -150,7 +255,8 @@ fn operator_lowering_uses_heap_frames_on_success_and_error() {
                     expr = if depth % 2 == 0 {
                         Expr::Unary(Box::new(UnaryExpr {
                             id: ExprId::fresh(),
-                            op: UnaryOp::Neg,
+                            // Keep every frame in the HIR, including the first literal operand.
+                            op: UnaryOp::Not,
                             expr,
                             span,
                         }))
@@ -231,6 +337,87 @@ fn lower_src(src: &str) -> (HirProgram, Vec<Diagnostic>) {
     let (program, errs) = Parser::new(tokens).parse();
     assert!(errs.is_empty(), "unexpected parse errors: {errs:?}");
     lower_program(&program)
+}
+
+#[test]
+fn branch_result_inference_preserves_diverging_arms() {
+    for (expr, expected) in [
+        (r#"flag ? panic("left") : 2"#, Type::I64),
+        (r#"flag ? 2 : panic("right")"#, Type::I64),
+        (r#"flag ? panic("left") : panic("right")"#, Type::Never),
+        (
+            r#"match flag { true => panic("left"), false => 2 }"#,
+            Type::I64,
+        ),
+        (
+            r#"match flag { true => 2, false => panic("right") }"#,
+            Type::I64,
+        ),
+        (
+            r#"match flag { true => panic("left"), false => panic("right") }"#,
+            Type::Never,
+        ),
+    ] {
+        assert_eq!(
+            return_ty(&format!("fn f(flag: bool) -> i64 {{ return {expr}; }}")),
+            expected,
+            "{expr}"
+        );
+    }
+}
+
+#[test]
+fn recorded_index_result_still_validates_the_receiver() {
+    use crate::parser::iter::{AstEvent, AstWalk};
+
+    let (program, errors) =
+        Parser::new(Lexer::new("fn f(x: i64) { x[0]; }").tokenize().unwrap()).parse();
+    assert!(errors.is_empty());
+    let Item::Function(f) = &program.items[0] else {
+        unreachable!()
+    };
+    let facts: HashMap<_, _> = AstWalk::new(AstEvent::Block(&f.body))
+        .filter_map(|event| match event {
+            AstEvent::Expr(e) => Some((e.id(), Type::I64)),
+            _ => None,
+        })
+        .collect();
+    let tables = PartialCheckerTables {
+        expr_types: Some(&facts),
+        ..Default::default()
+    };
+    let (_, errors) = lower_program_with_partial(&program, &tables);
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].message,
+        "HIR lowering does not yet support index of a non-array value"
+    );
+}
+
+#[test]
+fn standalone_task_registration_preserves_argument_type() {
+    let body = lower_body(
+        "fn f(scope: TaskScope, token: CancellationToken, t: Task<i64>) { let a = scope.add(t); let b = token.attach(t); }",
+    );
+    assert_eq!(body.len(), 2);
+    for (stmt, expected) in body
+        .iter()
+        .zip([Intrinsic::ScopeAdd, Intrinsic::TokenAttach])
+    {
+        let HirStmt::Let { value, ty, .. } = stmt else {
+            panic!("expected a binding")
+        };
+        let HirExprKind::MethodCall { args, builtin, .. } = &value.kind else {
+            panic!("expected a method call")
+        };
+        assert_eq!(*builtin, Some(BuiltinMethod::Intrinsic(expected)));
+        assert_eq!(
+            args[0].ty.to_source(),
+            Type::Generic("Task".into(), vec![Type::I64])
+        );
+        assert_eq!(value.ty, args[0].ty);
+        assert_eq!(ty, &value.ty);
+    }
 }
 
 /// Lower a program expected to be wholly within slice 1; assert no
@@ -820,7 +1007,7 @@ fn map_iteration_lowers_one_snapshot_per_loop() {
         for statement in &hir.functions[0].body {
             if let HirStmt::For { iterable, .. } = statement {
                 assert!(
-                    matches!(&iterable.kind, HirExprKind::MethodCall { method, args, .. } if method == "entries" && args.is_empty())
+                    matches!(&iterable.kind, HirExprKind::MethodCall { method, args, .. } if method.as_str() == "entries" && args.is_empty())
                 );
                 snapshots += 1;
             }
@@ -1179,10 +1366,10 @@ fn source_append_expansion_has_constant_operations_per_call() {
             assert!(matches!(&expansion[0], HirStmt::Let { .. }));
             assert!(matches!(&expansion[1], HirStmt::Let { .. }));
             assert!(
-                matches!(&expansion[2], HirStmt::Let { value: HirExpr { kind: HirExprKind::MethodCall { method, .. }, .. }, .. } if method == "__abi_len")
+                matches!(&expansion[2], HirStmt::Let { value: HirExpr { kind: HirExprKind::MethodCall { method, .. }, .. }, .. } if method.as_str() == "__abi_len")
             );
             assert!(
-                matches!(&expansion[3], HirStmt::Expr(HirExpr { kind: HirExprKind::MethodCall { method, .. }, .. }) if method == "__abi_resize")
+                matches!(&expansion[3], HirStmt::Expr(HirExpr { kind: HirExprKind::MethodCall { method, .. }, .. }) if method.as_str() == "__abi_resize")
             );
             assert!(matches!(&expansion[4], HirStmt::IndexAssign { .. }));
         }
@@ -1398,8 +1585,8 @@ fn class_table_resolve_stops_at_a_base_missing_from_the_table() {
         ("Sized", Some("shapes::Sized"), &[("depth", Type::I64)]),
         ("Block", Some("Sized"), &[]),
     ]);
-    assert_eq!(classes.field_type("Sized", "depth"), Some(Type::I64));
-    assert_eq!(classes.field_type("Block", "depth"), Some(Type::I64));
+    assert_eq!(classes.field_type("Sized", "depth"), Some(&Type::I64));
+    assert_eq!(classes.field_type("Block", "depth"), Some(&Type::I64));
     assert_eq!(classes.field_type("Block", "width"), None);
     assert_eq!(classes.field_type("Sized", "width"), None);
 }
@@ -1409,7 +1596,7 @@ fn class_table_resolve_stops_at_a_base_missing_from_the_table() {
 #[test]
 fn class_table_resolve_terminates_on_a_self_ring() {
     let classes = table(&[("Sized", Some("Sized"), &[("depth", Type::I64)])]);
-    assert_eq!(classes.field_type("Sized", "depth"), Some(Type::I64));
+    assert_eq!(classes.field_type("Sized", "depth"), Some(&Type::I64));
     assert_eq!(classes.field_type("Sized", "width"), None);
     assert_eq!(classes.method_type("Sized", "area"), None);
 }
@@ -1422,8 +1609,8 @@ fn class_table_resolve_terminates_on_a_two_class_ring() {
         ("A", Some("B"), &[("a", Type::I64)]),
         ("B", Some("A"), &[("b", Type::Bool)]),
     ]);
-    assert_eq!(classes.field_type("A", "b"), Some(Type::Bool));
-    assert_eq!(classes.field_type("B", "a"), Some(Type::I64));
+    assert_eq!(classes.field_type("A", "b"), Some(&Type::Bool));
+    assert_eq!(classes.field_type("B", "a"), Some(&Type::I64));
     assert_eq!(classes.field_type("A", "missing"), None);
     assert_eq!(classes.field_type("B", "missing"), None);
 }

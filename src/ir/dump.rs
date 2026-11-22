@@ -304,6 +304,7 @@ fn format_expr(e: &HirExpr) -> String {
             method,
             args,
             super_class,
+            ..
         } => {
             let args = args
                 .iter()

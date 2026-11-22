@@ -521,7 +521,7 @@ fn sentinel_diagnostics_static_call_argument_work() {
             "make",
             &args,
             (Span::dummy(), Span::dummy()),
-            None,
+            super::CallContext::default(),
         );
         assert!(TypeChecker::is_error_type(&result));
         assert!(checker.errors.is_empty());
