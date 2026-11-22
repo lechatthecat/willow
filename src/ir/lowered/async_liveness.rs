@@ -4,12 +4,14 @@
 //! Bindings are identified by [`LirLocalId`], including locals synthesized by
 //! LIR lowering, and spans remain optional diagnostic metadata on `LirLocal`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::ir::typed_ast::{HirExpr, HirExprKind};
 
 use super::liveness::{self, Liveness};
-use super::{LirLocal, LirLocalId, LirSelectOp, SourceBlock, SourceInst, SourceTerminator};
+use super::{
+    LirInst, LirLocal, LirLocalId, LirSelectOp, SourceBlock, SourceInst, SourceTerminator,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FrameSlot {
@@ -30,6 +32,9 @@ impl LirAsyncFrameLayout {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static SCRATCH_CAPACITY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SLOT_PROOF_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SLOT_BLOCK_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BORROW_OPERAND_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -53,9 +58,17 @@ pub(crate) fn analyze_with(
     let mut framed = HashSet::new();
     let mut pinned = HashSet::new();
     for block in blocks {
-        if let SourceTerminator::Suspend { operation, .. } = &block.terminator {
-            framed.extend(liveness.live_out.iter(block.id.0));
-            operation.collect_locals(&mut pinned);
+        match &block.terminator {
+            SourceTerminator::Suspend { operation, .. } => {
+                framed.extend(liveness.live_out.iter(block.id.0));
+                operation.for_each_local(|id| {
+                    pinned.insert(id);
+                });
+            }
+            SourceTerminator::Jump(_)
+            | SourceTerminator::Branch { .. }
+            | SourceTerminator::Return(_)
+            | SourceTerminator::CleanupReturn => {}
         }
         for inst in &block.instrs {
             match inst {
@@ -64,15 +77,11 @@ pub(crate) fn analyze_with(
                     // Its borrower can outlive the last direct read of the
                     // local. Give it an exclusive slot for the entire frame
                     // lifetime; never rematerialize or coalesce that storage.
-                    for operand in value.operands() {
+                    for operand in value.iter_operands() {
                         #[cfg(test)]
                         BORROW_OPERAND_VISITS.with(|visits| visits.set(visits.get() + 1));
-                        if let super::LirOperand::Reference {
-                            place: super::LirPlace::Local(local),
-                            ..
-                        } = operand
-                        {
-                            pinned.insert(*local);
+                        if let Some(local) = operand.borrowed_local() {
+                            pinned.insert(local);
                         }
                     }
                 }
@@ -106,11 +115,18 @@ pub(crate) fn analyze_with(
                         LirSelectOp::Recv { binding, .. } | LirSelectOp::Join { binding, .. } => {
                             pinned.extend(binding.iter().copied());
                         }
-                        _ => {}
+                        LirSelectOp::Send { .. }
+                        | LirSelectOp::Timeout { .. }
+                        | LirSelectOp::Default => {}
                     }
                 }
                 SourceInst::Defer { body, .. } => pinned.extend(body.captures.iter().copied()),
-                _ => {}
+                ir_variants!(
+                    SourceInst;
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Let, Assign,
+                    FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, ReleaseLock,
+                    MatchTest, MatchBind, Expr
+                ) => {}
             }
         }
         if block
@@ -124,7 +140,10 @@ pub(crate) fn analyze_with(
                 | SourceTerminator::Branch { cond: value, .. } => {
                     collect_expr_uses(value, &names, &mut pinned, &no_defs);
                 }
-                _ => {}
+                SourceTerminator::Jump(_)
+                | SourceTerminator::Suspend { .. }
+                | SourceTerminator::Return(_)
+                | SourceTerminator::CleanupReturn => {}
             }
         }
     }
@@ -164,37 +183,18 @@ pub(crate) fn analyze_with(
         }
     }
     let mut slots = Vec::new();
-    let mut occupants: Vec<Vec<&LirLocal>> = Vec::new();
     let mut mapping = HashMap::new();
-    let mut reusable_slots: Vec<usize> = Vec::new();
+    let mut by_type = HashMap::new();
     for local in locals.iter().filter(|local| framed.contains(&local.id)) {
-        // GC values and protocol/defer slots retain exclusive ownership. This
-        // first tier only reuses primitive scalars with identical types.
-        let reusable = !pinned.contains(&local.id) && reusable_scalar(local);
-        let index = reusable
-            .then(|| {
-                reusable_slots.iter().copied().find(|&index| {
-                    occupants[index].iter().all(|other| {
-                        !pinned.contains(&other.id)
-                            && reusable_scalar(other)
-                            && other.ty == local.ty
-                            && disjoint(
-                                &regions[local.id.0 as usize],
-                                &regions[other.id.0 as usize],
-                            )
-                    })
-                })
-            })
-            .flatten()
-            .unwrap_or_else(|| {
-                slots.push(local.id);
-                occupants.push(Vec::new());
-                if reusable {
-                    reusable_slots.push(slots.len() - 1);
-                }
-                slots.len() - 1
-            });
-        occupants[index].push(local);
+        let index = if candidate(local) {
+            let group = by_type
+                .entry(&local.ty)
+                .or_insert_with(ReusableSlots::default);
+            group.assign(&regions[local.id.0 as usize], local.id, &mut slots)
+        } else {
+            slots.push(local.id);
+            slots.len() - 1
+        };
         mapping.insert(local.id, FrameSlot { index });
     }
     LirAsyncFrameLayout {
@@ -234,12 +234,9 @@ pub(crate) fn stable_borrow_rejection(function: &super::LirFunction) -> Option<S
         for instruction in &block.instrs {
             match instruction {
                 super::LirInst::Compute { value, .. } => {
-                    for operand in value.operands() {
-                        if let super::LirOperand::Reference {
-                            place: super::LirPlace::Local(id),
-                            ..
-                        } = operand
-                            && let Some(reason) = check_local(*id)
+                    for operand in value.iter_operands() {
+                        if let Some(id) = operand.borrowed_local()
+                            && let Some(reason) = check_local(id)
                         {
                             return Some(reason);
                         }
@@ -254,7 +251,12 @@ pub(crate) fn stable_borrow_rejection(function: &super::LirFunction) -> Option<S
                         }
                     }
                 }
-                _ => {}
+                ir_variants!(
+                    LirInst;
+                    Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots,
+                    SelectInit, SelectProbe, SelectPick, SelectUnregister, SelectCommit,
+                    ReleaseLock, MatchTest, MatchBind, Unsupported
+                ) => {}
             }
         }
     }
@@ -303,6 +305,19 @@ fn collect_select_locals(operation: &LirSelectOp, out: &mut HashSet<LirLocalId>)
     }
 }
 
+/// Reuse a scratch table while its capacity tracks the last populated set.
+/// Iteration and clearing can both scan buckets. After a wide-to-narrow
+/// transition, charge one sparse scan to the wide set and release the table.
+pub(crate) fn clear_local_scratch(set: &mut HashSet<LirLocalId>) {
+    #[cfg(test)]
+    SCRATCH_CAPACITY.with(|total| total.set(total.get() + set.capacity()));
+    if crate::ir::sparse_scratch_table(set.capacity(), set.len()) {
+        *set = HashSet::new();
+    } else {
+        set.clear();
+    }
+}
+
 pub(crate) fn instruction_use_def(
     inst: &SourceInst,
     names: &HashMap<&str, LirLocalId>,
@@ -316,8 +331,8 @@ pub(crate) fn instruction_use_def(
     }
     match inst {
         SourceInst::Compute { local, value, .. } => {
-            for operand in value.operands() {
-                for id in operand.locals() {
+            for operand in value.iter_operands() {
+                for id in operand.iter_locals() {
                     if !defs.contains(&id) {
                         uses.insert(id);
                     }
@@ -368,7 +383,10 @@ pub(crate) fn instruction_use_def(
                         }
                         defs.insert(*deadline);
                     }
-                    _ => select_uses(operation, uses, defs),
+                    LirSelectOp::Recv { .. }
+                    | LirSelectOp::Send { .. }
+                    | LirSelectOp::Join { .. }
+                    | LirSelectOp::Default => select_uses(operation, uses, defs),
                 }
             }
         }
@@ -400,7 +418,7 @@ pub(crate) fn instruction_use_def(
                 LirSelectOp::Recv { binding, .. } | LirSelectOp::Join { binding, .. } => {
                     defs.extend(binding.iter().copied());
                 }
-                _ => {}
+                LirSelectOp::Send { .. } | LirSelectOp::Timeout { .. } | LirSelectOp::Default => {}
             }
             defs.insert(*success);
         }
@@ -465,7 +483,11 @@ pub(crate) fn terminator_uses(
     match terminator {
         SourceTerminator::Branch { cond, .. } => read!(cond),
         SourceTerminator::Return(Some(value)) => read!(value),
-        SourceTerminator::Suspend { operation, .. } => operation.collect_locals(uses),
+        SourceTerminator::Suspend { operation, .. } => operation.for_each_local(|id| {
+            if !defs.contains(&id) {
+                uses.insert(id);
+            }
+        }),
         SourceTerminator::Jump(_)
         | SourceTerminator::Return(None)
         | SourceTerminator::CleanupReturn => {}
@@ -500,27 +522,255 @@ fn collect_expr_uses(
     uses: &mut HashSet<LirLocalId>,
     defs: &HashSet<LirLocalId>,
 ) {
-    for expr in expr.walk_postorder(false) {
-        if let HirExprKind::Var(name) = &expr.kind
-            && let Some(local) = names.get(name.as_str())
+    let mut read = |name: &str| {
+        if let Some(local) = names.get(name)
             && !defs.contains(local)
         {
             uses.insert(*local);
         }
+    };
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match &expr.kind {
+            HirExprKind::Var(name) => read(name),
+            HirExprKind::Call { callee, .. } => {
+                if let Some(name) = callee.unqualified_name() {
+                    read(&name);
+                }
+            }
+            HirExprKind::Lambda { captures, .. } => {
+                for capture in captures {
+                    read(&capture.source);
+                }
+                // Constructing the closure reads its environment. Its body runs later.
+                continue;
+            }
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, FnRef, Binary, Unary, Invoke, Print, Array,
+                Index, Ternary, New, FieldAccess, MethodCall, ObjectLiteral, StaticField,
+                StaticCall, ReferenceArg, Range, Await, TryPropagate, Match, Select
+            ) => {}
+        }
+        pending.extend(expr.children());
     }
 }
 
-/// Whether two ascending block-id lists share no block.
-fn disjoint(left: &[usize], right: &[usize]) -> bool {
-    let (mut l, mut r) = (0, 0);
-    while l < left.len() && r < right.len() {
-        match left[l].cmp(&right[r]) {
-            std::cmp::Ordering::Less => l += 1,
-            std::cmp::Ordering::Greater => r += 1,
-            std::cmp::Ordering::Equal => return false,
+/// Disjoint half-open runs of same-type slot ordinals occupied by one block.
+#[derive(Default)]
+struct OccupiedSlots {
+    prefix: usize,
+    // Runs above the first hole. A dense prefix needs no tree allocation.
+    runs: BTreeMap<usize, usize>,
+}
+
+impl OccupiedSlots {
+    fn first_free_from(&self, slot: usize) -> usize {
+        if slot <= self.prefix {
+            return self.prefix;
+        }
+        self.runs
+            .range(..=slot)
+            .next_back()
+            .map_or(slot, |(_, &end)| end.max(slot))
+    }
+
+    fn occupy(&mut self, slot: usize) {
+        let end = self.runs.remove(&(slot + 1)).unwrap_or(slot + 1);
+        if slot == self.prefix {
+            self.prefix = end;
+        } else if let Some((_, previous_end)) = self.runs.range_mut(..slot).next_back()
+            && *previous_end == slot
+        {
+            *previous_end = end;
+        } else {
+            self.runs.insert(slot, end);
         }
     }
-    true
+}
+
+/// All ordinals below `end` conflict with at least one of these blocks.
+struct ConflictPrefix {
+    blocks: Vec<usize>,
+    end: usize,
+}
+
+#[derive(Default)]
+struct WitnessNode {
+    children: HashMap<usize, usize>,
+    proof: Option<ConflictPrefix>,
+}
+
+/// Trie of ordered witness sets. At each matched prefix, inspect the smaller
+/// of its outgoing edges and the remaining blocks of the request.
+#[derive(Default)]
+struct ConflictPrefixes {
+    nodes: Vec<WitnessNode>,
+    positions: HashMap<usize, usize>,
+    pending: Vec<(usize, usize)>,
+}
+
+impl ConflictPrefixes {
+    fn insert(&mut self, blocks: Vec<usize>, end: usize) {
+        if self.nodes.is_empty() {
+            self.nodes.push(WitnessNode::default());
+        }
+        let mut node = 0;
+        for &block in &blocks {
+            self.positions.entry(block).or_insert(0);
+            node = if let Some(&child) = self.nodes[node].children.get(&block) {
+                child
+            } else {
+                let child = self.nodes.len();
+                self.nodes[node].children.insert(block, child);
+                self.nodes.push(WitnessNode::default());
+                child
+            };
+        }
+        self.nodes[node].proof = Some(ConflictPrefix { blocks, end });
+    }
+
+    fn best(&mut self, region: &[usize], mut bound: usize) -> Option<&mut ConflictPrefix> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        for (i, block) in region.iter().enumerate() {
+            if let Some(pos) = self.positions.get_mut(block) {
+                *pos = i;
+            }
+        }
+        self.pending.push((0, 0));
+        let mut best = None;
+        while let Some((node, start)) = self.pending.pop() {
+            if let Some(proof) = &self.nodes[node].proof
+                && proof.end > bound
+            {
+                best = Some(node);
+                bound = proof.end;
+            }
+            let children = &self.nodes[node].children;
+            let remaining = &region[start..];
+            #[cfg(test)]
+            SLOT_PROOF_PROBES.set(SLOT_PROOF_PROBES.get() + children.len().min(remaining.len()));
+            if remaining.len() < children.len() {
+                for (offset, b) in remaining.iter().enumerate() {
+                    if let Some(&child) = children.get(b) {
+                        self.pending.push((child, start + offset + 1));
+                    }
+                }
+            } else {
+                for (b, &child) in children {
+                    let pos = self.positions[b];
+                    // An absent label can retain a position from an earlier request.
+                    if pos >= start && region.get(pos) == Some(b) {
+                        self.pending.push((child, pos + 1));
+                    }
+                }
+            }
+        }
+        self.nodes[best?].proof.as_mut()
+    }
+
+    #[cfg(test)]
+    fn proofs(&self) -> impl Iterator<Item = &ConflictPrefix> {
+        self.nodes.iter().filter_map(|n| n.proof.as_ref())
+    }
+}
+
+/// First-fit assigns monotonically occupied slots in creation order.
+#[derive(Default)]
+struct ReusableSlots<'region> {
+    slots: Vec<usize>,
+    by_block: HashMap<usize, OccupiedSlots>,
+    // Remember fragmented searches as well, including interleaved regions.
+    region_prefix: HashMap<&'region [usize], usize>,
+    shared: ConflictPrefixes,
+}
+
+impl<'region> ReusableSlots<'region> {
+    fn assign(
+        &mut self,
+        region: &'region [usize],
+        local: LirLocalId,
+        slots: &mut Vec<LirLocalId>,
+    ) -> usize {
+        let (prefix_block, prefix) = region
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| self.by_block.get(b).map(|o| (i, o.prefix)))
+            .max_by_key(|&(_, end)| end)
+            .unwrap_or((0, 0));
+        let exact = self.region_prefix.get(region).copied().unwrap_or(0);
+        let mut ordinal = prefix.max(exact);
+        let mut shared = if ordinal < self.slots.len() && region.len() > 1 {
+            self.shared.best(region, ordinal)
+        } else {
+            None
+        };
+        if let Some(proof) = shared.as_deref() {
+            ordinal = proof.end;
+        }
+        let start = ordinal;
+        let mut fragmented = false;
+        let mut witnesses = Vec::new();
+        while ordinal < self.slots.len() {
+            let mut next = ordinal;
+            let mut witness = 0;
+            for (i, block) in region.iter().enumerate() {
+                #[cfg(test)]
+                SLOT_BLOCK_PROBES.set(SLOT_BLOCK_PROBES.get() + 1);
+                if let Some(occupied) = self.by_block.get(block) {
+                    let end = occupied.first_free_from(ordinal);
+                    if end > next {
+                        next = end;
+                        witness = i;
+                    }
+                }
+            }
+            if next == ordinal {
+                break;
+            }
+            fragmented |= ordinal != start || next == ordinal + 1;
+            if start == prefix && region.len() > 1 {
+                if witnesses.is_empty() {
+                    witnesses.resize(region.len(), false);
+                    if prefix > 0 {
+                        witnesses[prefix_block] = true;
+                    }
+                }
+                witnesses[witness] = true;
+            }
+            if let Some(proof) = shared.as_deref_mut()
+                && proof.end == ordinal
+                && proof.blocks.contains(&region[witness])
+            {
+                proof.end = next;
+            }
+            ordinal = next;
+        }
+        if ordinal == self.slots.len() {
+            self.slots.push(slots.len());
+            slots.push(local);
+        }
+        if let Some(proof) = shared
+            && ordinal == proof.end
+        {
+            proof.end = ordinal + 1;
+        } else if fragmented && witnesses.contains(&false) {
+            let blocks: Vec<_> = region
+                .iter()
+                .zip(witnesses)
+                .filter_map(|(&b, used)| used.then_some(b))
+                .collect();
+            self.shared.insert(blocks, ordinal + 1);
+        } else if exact > 0 || (fragmented && region.len() > 1) {
+            self.region_prefix.insert(region, ordinal + 1);
+        }
+        for &block in region {
+            self.by_block.entry(block).or_default().occupy(ordinal);
+        }
+        self.slots[ordinal]
+    }
 }
 
 #[cfg(test)]
@@ -541,6 +791,78 @@ mod coalescing_tests {
         let wire = serde_json::to_vec(&frame).unwrap();
         let restored: LirAsyncFrameLayout = serde_json::from_slice(&wire).unwrap();
         assert_eq!(restored, frame);
+    }
+
+    #[test]
+    fn local_call_reads_its_callee_and_arguments_before_definition() {
+        use crate::diagnostics::Span;
+        use crate::semantic::ids::FunctionId;
+        let names = HashMap::from([("f", LirLocalId(0)), ("arg", LirLocalId(1))]);
+        let call = |name, args| HirExpr {
+            kind: HirExprKind::Call {
+                callee: FunctionId::free_from_source_name(name),
+                args,
+            },
+            ty: Type::I64,
+            span: Span::dummy(),
+        };
+        let mut uses = HashSet::new();
+        let f = call("f", vec![]);
+        collect_expr_uses(&f, &names, &mut uses, &HashSet::new());
+        assert_eq!(uses, HashSet::from([LirLocalId(0)]));
+        uses.clear();
+        let arg = HirExpr {
+            kind: HirExprKind::Var("arg".into()),
+            ty: Type::I64,
+            span: Span::dummy(),
+        };
+        collect_expr_uses(
+            &call("f", vec![arg]),
+            &names,
+            &mut uses,
+            &HashSet::from([LirLocalId(0)]),
+        );
+        assert_eq!(uses, HashSet::from([LirLocalId(1)]));
+        uses.clear();
+        collect_expr_uses(
+            &call("module::f", vec![]),
+            &names,
+            &mut uses,
+            &HashSet::new(),
+        );
+        assert!(uses.is_empty());
+    }
+
+    #[test]
+    fn lambda_reads_capture_sources_without_entering_its_body() {
+        use crate::diagnostics::Span;
+        use crate::ir::typed_ast::{HirCapture, HirStmt};
+        use crate::parser::ast::ExprId;
+        let names = HashMap::from([("outer", LirLocalId(0)), ("inner", LirLocalId(1))]);
+        let lambda = HirExpr {
+            kind: HirExprKind::Lambda {
+                id: ExprId::fresh(),
+                params: vec![],
+                captures: vec![HirCapture {
+                    source: "outer".into(),
+                    name: "inner".into(),
+                    ty: Type::I64,
+                }],
+                body: vec![HirStmt::Expr(HirExpr {
+                    kind: HirExprKind::Var("inner".into()),
+                    ty: Type::I64,
+                    span: Span::dummy(),
+                })],
+            },
+            ty: Type::Fn(vec![], Box::new(Type::Void)),
+            span: Span::dummy(),
+        };
+        let mut uses = HashSet::new();
+        collect_expr_uses(&lambda, &names, &mut uses, &HashSet::new());
+        assert_eq!(uses, HashSet::from([LirLocalId(0)]));
+        uses.clear();
+        collect_expr_uses(&lambda, &names, &mut uses, &HashSet::from([LirLocalId(0)]));
+        assert!(uses.is_empty());
     }
 
     #[test]
@@ -600,6 +922,290 @@ mod coalescing_tests {
         assert_eq!(slot("a") == slot("b"), shared, "{source}");
         for slot in layout.locals.values() {
             assert!(slot.index < layout.slots.len());
+        }
+    }
+
+    #[test]
+    fn suspension_reads_only_upward_exposed_values_on_block_entry() {
+        use super::super::{BlockId, LirOperand, LirRvalue, SuspendOp};
+        use crate::diagnostics::Span;
+        let id = LirLocalId(0);
+        let locals = [LirLocal {
+            id,
+            name: "millis".into(),
+            ty: Type::I64,
+            storage_kind: Default::default(),
+            synthetic: false,
+            parameter: false,
+            source_span: None,
+        }];
+        let mut blocks = [
+            SourceBlock {
+                id: BlockId(0),
+                instrs: vec![SourceInst::Compute {
+                    local: id,
+                    value: LirRvalue::Use(LirOperand::Int(1)),
+                    span: Span::dummy(),
+                }],
+                terminator: SourceTerminator::Suspend {
+                    operation: SuspendOp::Sleep { millis: id },
+                    resume: BlockId(1),
+                },
+                recovery: vec![],
+            },
+            SourceBlock {
+                id: BlockId(1),
+                instrs: vec![],
+                terminator: SourceTerminator::Return(None),
+                recovery: vec![],
+            },
+        ];
+        assert!(
+            Liveness::compute(&blocks, &locals)
+                .live_in
+                .iter(0)
+                .next()
+                .is_none()
+        );
+        blocks[0].instrs.insert(
+            0,
+            SourceInst::Expr(HirExpr {
+                kind: HirExprKind::Var("millis".into()),
+                ty: Type::I64,
+                span: Span::dummy(),
+            }),
+        );
+        assert_eq!(
+            Liveness::compute(&blocks, &locals)
+                .live_in
+                .iter(0)
+                .collect::<Vec<_>>(),
+            [id]
+        );
+    }
+
+    #[test]
+    fn first_fit_indexes_disjoint_regions_and_skips_conflicting_prefixes() {
+        for n in [8, 64, 512, 2048] {
+            let mut group = ReusableSlots::default();
+            let mut slots = vec![];
+            SLOT_BLOCK_PROBES.set(0);
+            let regions: Vec<_> = (0..n).map(|i| [i]).collect();
+            for (i, region) in regions.iter().enumerate() {
+                assert_eq!(group.assign(region, LirLocalId(i as u32), &mut slots), 0);
+            }
+            assert_eq!(SLOT_BLOCK_PROBES.get(), n - 1);
+            assert_eq!(slots, [LirLocalId(0)]);
+            // Each local now interferes in block zero. Its first possible
+            // slot advances by one without searching previous occupants.
+            SLOT_BLOCK_PROBES.set(0);
+            for i in 1..=n {
+                assert_eq!(
+                    group.assign(&[0], LirLocalId((n + i) as u32), &mut slots),
+                    i
+                );
+            }
+            assert_eq!(SLOT_BLOCK_PROBES.get(), 0);
+            // A free earlier slot for a different region still wins.
+            assert_eq!(
+                group.assign(&[1, n], LirLocalId((2 * n + 1) as u32), &mut slots),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_mixed_regions_resume_after_their_first_fit() {
+        for n in [8, 64, 512, 2048] {
+            let mut group = ReusableSlots::default();
+            let mut slots = Vec::new();
+            assert_eq!(group.assign(&[0, 2], LirLocalId(0), &mut slots), 0);
+            assert_eq!(group.assign(&[1, 2], LirLocalId(1), &mut slots), 1);
+            SLOT_BLOCK_PROBES.set(0);
+            for i in 2..n + 2 {
+                assert_eq!(group.assign(&[0, 1], LirLocalId(i as u32), &mut slots), i);
+            }
+            // Only the first mixed search inspects slot one (A absent, B present).
+            assert_eq!(SLOT_BLOCK_PROBES.get(), 2);
+            assert_eq!(slots.len(), n + 2);
+            assert_eq!(group.region_prefix.len(), 1);
+        }
+    }
+
+    #[test]
+    fn mixed_regions_skip_shared_conflicts_with_distinct_extra_blocks() {
+        for n in [8, 64, 512, 2048] {
+            let regions: Vec<_> = (0..n).map(|i| [0, 1, 3 + i]).collect();
+            let mut group = ReusableSlots::default();
+            let mut slots = Vec::new();
+            assert_eq!(group.assign(&[0, 2], LirLocalId(0), &mut slots), 0);
+            assert_eq!(group.assign(&[1, 2], LirLocalId(1), &mut slots), 1);
+            SLOT_BLOCK_PROBES.set(0);
+            for (i, region) in regions.iter().enumerate() {
+                assert_eq!(
+                    group.assign(region, LirLocalId(i as u32 + 2), &mut slots),
+                    i + 2
+                );
+            }
+            assert_eq!(SLOT_BLOCK_PROBES.get(), 3);
+            assert_eq!(group.shared.proofs().count(), 1);
+            assert_eq!(slots.len(), n + 2);
+        }
+    }
+
+    #[test]
+    fn alternating_slot_conflicts_share_their_bound_across_wider_regions() {
+        for n in [8, 64, 512, 2048] {
+            // Extra blocks lie between A and B in block traversal order.
+            let b = n + 1;
+            let c = n + 2;
+            let pairs = [[0, c], [b, c]];
+            let regions: Vec<_> = (1..=n).map(|d| [0, d, b]).collect();
+            let mut group = ReusableSlots::default();
+            let mut slots = Vec::new();
+            SLOT_BLOCK_PROBES.set(0);
+            for i in 0..2 * n {
+                assert_eq!(
+                    group.assign(&pairs[i % 2], LirLocalId(i as u32), &mut slots),
+                    i
+                );
+            }
+            for (i, region) in regions.iter().enumerate() {
+                let ordinal = 2 * n + i;
+                assert_eq!(
+                    group.assign(region, LirLocalId(ordinal as u32), &mut slots),
+                    ordinal
+                );
+            }
+            assert_eq!(SLOT_BLOCK_PROBES.get(), 3 * (2 * n - 1));
+            assert_eq!(group.shared.proofs().count(), 1);
+            let proof = group.shared.proofs().next().unwrap();
+            assert_eq!(proof.blocks, [0, b]);
+            assert_eq!(proof.end, 3 * n);
+            // Omitting B makes slot one available even after the prefix grew.
+            assert_eq!(
+                group.assign(&[0], LirLocalId((3 * n) as u32), &mut slots),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn alternating_proofs_with_one_anchor_keep_both_first_fit_bounds() {
+        for n in [8, 64, 512, 2048] {
+            let mut group = ReusableSlots::default();
+            let mut slots = Vec::new();
+            let regions: Vec<_> = (0..2 * n).map(|i| [0, 1 + i % 2, 4 + i]).collect();
+            for i in 0..2 * n {
+                let pair: &[usize] = if i % 2 == 0 { &[0, 3] } else { &[1, 2, 3] };
+                assert_eq!(group.assign(pair, LirLocalId(i as u32), &mut slots), i);
+            }
+            SLOT_BLOCK_PROBES.set(0);
+            SLOT_PROOF_PROBES.set(0);
+            for (i, region) in regions.iter().enumerate() {
+                let expected = 2 * n + i;
+                assert_eq!(
+                    group.assign(region, LirLocalId(expected as u32), &mut slots),
+                    expected
+                );
+            }
+            assert_eq!(group.shared.proofs().count(), 2);
+            assert_eq!(SLOT_BLOCK_PROBES.get(), 18 * n - 9);
+            assert_eq!(SLOT_PROOF_PROBES.get(), 6 * n - 4);
+        }
+    }
+
+    #[test]
+    fn fragmented_block_runs_match_first_fit_for_every_region() {
+        let mut group = ReusableSlots::default();
+        let mut slots = Vec::new();
+        let mut occupants: Vec<usize> = Vec::new();
+        let regions: Vec<Vec<_>> = (0..256)
+            .map(|i| (0..7).filter(|b| (i * 37 % 128) & (1 << b) != 0).collect())
+            .collect();
+        for (i, region) in regions.iter().enumerate() {
+            let mask = region.iter().fold(0, |bits, b| bits | (1 << b));
+            let expected = occupants
+                .iter()
+                .position(|bits| bits & mask == 0)
+                .unwrap_or(occupants.len());
+            if expected == occupants.len() {
+                occupants.push(0);
+            }
+            occupants[expected] |= mask;
+            assert_eq!(
+                group.assign(region, LirLocalId(i as u32), &mut slots),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn closing_a_hole_skips_the_entire_occupied_run() {
+        for n in [8, 64, 512, 2048] {
+            let mut group = ReusableSlots::default();
+            let mut slots = vec![];
+            SLOT_BLOCK_PROBES.set(0);
+            assert_eq!(group.assign(&[0], LirLocalId(0), &mut slots), 0);
+            for i in 1..=n {
+                assert_eq!(group.assign(&[0, 1], LirLocalId(i as u32), &mut slots), i);
+            }
+            for i in 0..n {
+                let local = LirLocalId((n + 1 + i) as u32);
+                let expected = if i == 0 { 0 } else { n + i };
+                assert_eq!(group.assign(&[1], local, &mut slots), expected);
+            }
+            // Filling slot zero merges the entire adjacent run in one operation.
+            assert_eq!(SLOT_BLOCK_PROBES.get(), 1);
+            assert_eq!(slots.len(), 2 * n);
+        }
+    }
+
+    #[test]
+    fn separate_suspension_regions_share_the_first_frame_slot() {
+        use super::super::{BlockId, SuspendOp};
+        use crate::diagnostics::Span;
+        for n in [8, 64, 512] {
+            // One self-resuming region per scalar, with no intervening definition.
+            let locals: Vec<_> = (0..n)
+                .map(|id| LirLocal {
+                    id: LirLocalId(id),
+                    name: format!("v{id}"),
+                    ty: Type::I64,
+                    storage_kind: Default::default(),
+                    parameter: false,
+                    synthetic: true,
+                    source_span: None,
+                })
+                .collect();
+            let blocks: Vec<_> = locals
+                .iter()
+                .map(|local| {
+                    let block = BlockId(local.id.0 as usize);
+                    SourceBlock {
+                        id: block,
+                        instrs: vec![SourceInst::Expr(HirExpr {
+                            kind: HirExprKind::Var(local.name.clone()),
+                            ty: Type::I64,
+                            span: Span::dummy(),
+                        })],
+                        terminator: SourceTerminator::Suspend {
+                            operation: SuspendOp::Yield,
+                            resume: block,
+                        },
+                        recovery: vec![],
+                    }
+                })
+                .collect();
+            SLOT_BLOCK_PROBES.set(0);
+            let frame = analyze(&blocks, &locals);
+            assert_eq!(frame.slots, [LirLocalId(0)]);
+            assert!(
+                locals
+                    .iter()
+                    .all(|local| frame.slot(local.id) == Some(FrameSlot { index: 0 }))
+            );
+            assert_eq!(SLOT_BLOCK_PROBES.get(), n as usize - 1);
         }
     }
 

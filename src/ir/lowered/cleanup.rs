@@ -354,7 +354,12 @@ impl CleanupGraph {
                             .transitions
                             .insert(location, CleanupTransition::Register { site: *id, state });
                     }
-                    _ => {}
+                    ir_variants!(
+                        LirInst;
+                        Compute, Let, Assign, ClearScopeRoots, SelectInit, SelectProbe,
+                        SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest,
+                        MatchBind, Unsupported
+                    ) => {}
                 }
                 if cleanup {
                     graph.after.insert(location, state);

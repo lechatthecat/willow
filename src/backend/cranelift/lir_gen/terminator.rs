@@ -1,6 +1,7 @@
 //! Block, suspension, cleanup and return emission.
 
 use super::*;
+use crate::ir::ir_variants;
 use willow_abi::runtime_symbols::names as rt;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -278,7 +279,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.store_lir_local(function, *success, one);
                 }
             }
-            _ => unreachable!(),
+            ir_variants!(
+                LirInst;
+                Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                ClearScopeRoots, Defer, ReleaseLock, MatchTest, MatchBind, Unsupported
+            ) => unreachable!(),
         }
     }
 

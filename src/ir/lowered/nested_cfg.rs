@@ -493,7 +493,12 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
             {
                 self.schedule_new(expr)
             }
-            _ => Some(false),
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Index,
+                Ternary, New, FieldAccess, MethodCall, ObjectLiteral, StaticField, StaticCall,
+                ReferenceArg, Range, Await, TryPropagate, Lambda, Match, Select
+            ) => Some(false),
         }
     }
 
@@ -696,7 +701,12 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
                     element: place.ty.clone(),
                 }
             }
-            _ => return None,
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, FnRef, Binary, Unary, Call, Invoke, Print, Array, Ternary,
+                New, MethodCall, ObjectLiteral, StaticField, StaticCall, ReferenceArg, Range,
+                Await, TryPropagate, Lambda, Match, Select
+            ) => return None,
         };
         let argument = LirOperand::Reference {
             place: captured,
@@ -722,7 +732,12 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
                 self.pending.push(Work::Eval(index, false, false));
                 self.pending.push(Work::Eval(array, false, false));
             }
-            _ => {}
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
+                Ternary, New, MethodCall, ObjectLiteral, StaticField, StaticCall, ReferenceArg,
+                Range, Await, TryPropagate, Lambda, Match, Select
+            ) => {}
         }
 
         Some(())
@@ -768,7 +783,16 @@ impl<'b, 'e> NestedCfg<'b, 'e> {
                     span: place.span,
                 });
             }
-            _ => unreachable!(),
+            // A reserved place must pair the source form with the matching storage.
+            (
+                ir_variants!(
+                    HirExprKind;
+                    Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
+                    Index, Ternary, New, FieldAccess, MethodCall, ObjectLiteral, StaticField,
+                    StaticCall, ReferenceArg, Range, Await, TryPropagate, Lambda, Match, Select
+                ),
+                _,
+            ) => unreachable!(),
         }
         self.references.insert(std::ptr::from_ref(expr), argument);
         self.values.push(expr.clone());

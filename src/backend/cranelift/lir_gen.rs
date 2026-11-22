@@ -28,6 +28,7 @@ use super::class_view::ClassTables;
 use super::emit_option_result::ResultSide;
 use super::function_index::FunctionMap;
 use super::{FlatReferenceDebug, ModuleSymbols};
+use crate::ir::ir_variants;
 use crate::qualified_name::QualifiedName;
 use crate::semantic::ids::SemanticType as Type;
 use std::borrow::Cow;
@@ -214,6 +215,7 @@ fn lir_sync_poll_blocks(f: &LirFunction) -> Vec<bool> {
                     pending.push((target, 0));
                 }
                 1 => poll[target] = true,
+                // Finished successors have already had all outgoing edges visited.
                 _ => {}
             }
         }
@@ -274,13 +276,28 @@ fn lir_defer_entry_poll(f: &LirFunction, poll: &mut [bool], overflow_checks: boo
                             V::Binary { op, .. } => {
                                 !matches!(op, BinOp::Div | BinOp::Rem | BinOp::Pow)
                             }
-                            _ => false,
+                            ir_variants!(
+                                V;
+                                BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait,
+                                Coerce, ArrayAlloc, CaptureArrayOwner, ArrayStore, Index,
+                                ObjectAlloc, FieldLoad, FieldStore, StaticField, StaticStore,
+                                StaticCall, EnumAlloc, EnumPayloadStore, ConstructorCall, Range,
+                                EnumMethod, BuiltinCall, FormatScalar, Panic, Recover,
+                                ReferenceDebug, RebindResultError, IntoError, PrepareMethod,
+                                MethodCall, StringLiteral, FunctionRef, Closure, Print,
+                                IntrinsicCall, DirectCall, IndirectCall, StringConcat
+                            ) => false,
                         }
                 }
                 LirInst::Let { .. } | LirInst::Assign { .. } | LirInst::ClearScopeRoots { .. } => {
                     true
                 }
-                _ => false,
+                ir_variants!(
+                    LirInst;
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, SelectInit, SelectProbe,
+                    SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
+                    Unsupported
+                ) => false,
             })
     };
     let returns = |id: BlockId| {
@@ -347,7 +364,12 @@ fn lir_call_frame_entries(f: &LirFunction) -> Option<Vec<Vec<(String, Span)>>> {
                     resume: Some(resume),
                     ..
                 } => edges.push((resume.0, stack.clone())),
-                _ => {}
+                ir_variants!(
+                    LirInst;
+                    Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                    ClearScopeRoots, Defer, SelectInit, SelectProbe, SelectPick, SelectUnregister,
+                    SelectCommit, ReleaseLock, MatchTest, MatchBind, Unsupported
+                ) => {}
             }
         }
         if !diverged {
@@ -444,7 +466,12 @@ fn lir_reference_scope_entries(
                     resume: Some(resume),
                     ..
                 } => edges.push((resume.0, scopes.clone())),
-                _ => {}
+                ir_variants!(
+                    LirInst;
+                    Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                    ClearScopeRoots, Defer, SelectInit, SelectProbe, SelectPick, SelectUnregister,
+                    SelectCommit, ReleaseLock, MatchTest, MatchBind, Unsupported
+                ) => {}
             }
         }
         if !diverged {
@@ -480,7 +507,11 @@ fn lir_inst_span(inst: &LirInst) -> Option<Span> {
         | LirInst::MatchTest { span, .. }
         | LirInst::MatchBind { span, .. }
         | LirInst::Unsupported { span, .. } => Some(*span),
-        _ => None,
+        ir_variants!(
+            LirInst;
+            Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, SelectInit,
+            SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock
+        ) => None,
     }
 }
 
@@ -755,6 +786,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Ok("index") => {
                 order = (0..f.blocks.len()).collect();
             }
+            // Use the cleanup graph order unless an explicit test override selects another.
             _ => {}
         }
         for i in order {
@@ -808,7 +840,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // exit dominates this block whatever order emits the two.
             self.reuse.lir_reuse = match reuse_preds[i] {
                 Some(pred) if !poll_blocks[i] => reuse_exits[pred].clone(),
-                _ => None,
+                Some(_) | None => None,
             };
             if let Some(reuse) = &mut self.reuse.lir_reuse {
                 if let Some((target, index, len)) = reuse.branch_bound.take()
@@ -910,6 +942,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             {
                 Some(slot)
             }
+            // Only an array owner in a stack slot can reuse this cached load.
             _ => None,
         };
         if let Some(slot) = reusable {
@@ -1120,6 +1153,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 {
                     Some(Root::Frame(*offset))
                 }
+                // Only rooted stack and frame slots need clearing on scope exit.
                 _ => None,
             })
             .collect();
@@ -1177,18 +1211,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn bind_lir_locals(&mut self, f: &LirFunction, unrooted: &HashSet<LirLocalId>) {
         for block in &f.blocks {
             for inst in &block.instrs {
-                if let LirInst::Compute { value, .. } = inst {
-                    for operand in value.operands() {
-                        if let crate::ir::lowered::LirOperand::Reference {
-                            place: crate::ir::lowered::LirPlace::Local(id),
-                            ..
-                        } = operand
-                        {
-                            self.locals
-                                .address_taken
-                                .insert(f.locals[id.0 as usize].name.clone());
+                match inst {
+                    LirInst::Compute { value, .. } => {
+                        for operand in value.operands() {
+                            if let Some(id) = operand.borrowed_local() {
+                                self.locals
+                                    .address_taken
+                                    .insert(f.locals[id.0 as usize].name.clone());
+                            }
                         }
                     }
+                    // Only Compute can take the address of a local in this body.
+                    // Cleanup bodies bind their own locals when emitted.
+                    ir_variants!(
+                        LirInst;
+                        Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                        ClearScopeRoots, Defer, SelectInit, SelectProbe, SelectPick,
+                        SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
+                        Unsupported
+                    ) => {}
                 }
             }
         }
@@ -1227,6 +1268,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let var = self.builder.declare_var(clif);
             let zero = match clif {
                 types::F64 => self.builder.ins().f64const(0.0),
+                // Other machine types use the ordinary zero initializer.
                 ty => self.emit_zero(ty),
             };
             self.builder.def_var(var, zero);
@@ -1277,7 +1319,14 @@ pub(super) fn task_stack_boundary(value: &crate::ir::lowered::LirRvalue) -> bool
         | R::EnumMethod { arg_types, .. }
         | R::IntrinsicCall { arg_types, .. } => arg_types.as_slice(),
         R::BuiltinCall { params, .. } => params.as_slice(),
-        _ => &[],
+        ir_variants!(
+            R;
+            BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait, Coerce, ArrayAlloc,
+            CaptureArrayOwner, ArrayStore, Index, ObjectAlloc, FieldLoad, FieldStore, StaticField,
+            StaticStore, EnumAlloc, EnumPayloadStore, Range, FormatScalar, Panic, Recover,
+            ReferenceDebug, RebindResultError, IntoError, PrepareMethod, StringLiteral,
+            FunctionRef, Closure, Print, DirectCall, IndirectCall, Unary, Binary, StringConcat
+        ) => &[],
     };
     if params
         .iter()
@@ -1301,7 +1350,14 @@ pub(super) fn task_stack_boundary(value: &crate::ir::lowered::LirRvalue) -> bool
             crate::semantic::builtin_types::resolve(receiver_ty)
                 .is_none_or(|ty| matches!(ty.id, B::Mutex | B::RwLock | B::Range))
         }
-        _ => false,
+        ir_variants!(
+            R;
+            BeginReferenceCall, Use, StartTask, SelectIdleWait, Coerce, ArrayAlloc,
+            CaptureArrayOwner, ArrayStore, Index, ObjectAlloc, FieldLoad, FieldStore, StaticField,
+            StaticStore, EnumAlloc, EnumPayloadStore, Range, BuiltinCall, FormatScalar, Panic,
+            Recover, ReferenceDebug, RebindResultError, PrepareMethod, StringLiteral, FunctionRef,
+            Closure, IntrinsicCall, Unary, Binary, StringConcat
+        ) => false,
     }
 }
 
@@ -1334,7 +1390,12 @@ pub(super) fn cleanup_needs_task_stack(function: &LirFunction) -> bool {
             match instruction {
                 LirInst::Compute { value, .. } if task_stack_boundary(value) => return true,
                 LirInst::Defer { body, .. } => pending.push(&body.function),
-                _ => {}
+                ir_variants!(
+                    LirInst;
+                    Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                    ClearScopeRoots, SelectInit, SelectProbe, SelectPick, SelectUnregister,
+                    SelectCommit, ReleaseLock, MatchTest, MatchBind, Unsupported
+                ) => {}
             }
         }
     }

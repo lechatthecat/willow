@@ -1,8 +1,10 @@
 //! End root ownership at last use. Async source bindings must also release
 //! their frame slots before suspending after their final read.
-use super::async_liveness::{instruction_use_def, terminator_uses};
+use super::async_liveness::{clear_local_scratch, instruction_use_def, terminator_uses};
 use super::liveness::{self, Liveness};
-use super::{BlockId, SourceBlock, SourceFunction, SourceInst, SourceTerminator};
+use super::{
+    BlockId, LirOperand, LirRvalue, SourceBlock, SourceFunction, SourceInst, SourceTerminator,
+};
 use std::collections::{HashMap, HashSet};
 
 /// Insert last-use root clears into `function` and its defer bodies. Returns
@@ -14,14 +16,56 @@ pub(super) fn clear_dead_temporaries(function: &mut SourceFunction) -> Liveness 
     while let Some(function) = functions.pop() {
         for block in &mut function.blocks {
             for instruction in &mut block.instrs {
-                if let SourceInst::Defer { body, .. } = instruction {
-                    clear_function(body.function.as_mut());
-                    functions.push(body.function.as_mut());
+                match instruction {
+                    SourceInst::Defer { body, .. } => {
+                        clear_function(body.function.as_mut());
+                        functions.push(body.function.as_mut());
+                    }
+                    ir_variants!(
+                        SourceInst;
+                        Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                        ClearScopeRoots, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit,
+                        SelectInit, SelectProbe, SelectPick, SelectUnregister, SelectCommit,
+                        ReleaseLock, MatchTest, MatchBind, Expr
+                    ) => {}
                 }
             }
         }
     }
     root
+}
+
+/// Arguments whose referenced slots can still be read by a child task after
+/// the instruction returns. A synchronous call finishes borrowing at the call.
+fn task_arguments(value: &LirRvalue) -> &[LirOperand] {
+    match value {
+        LirRvalue::StartTask { args, .. }
+        | LirRvalue::MethodCall {
+            args,
+            is_async: true,
+            ..
+        }
+        | LirRvalue::StaticCall {
+            args,
+            is_async: true,
+            ..
+        } => args,
+        LirRvalue::MethodCall {
+            is_async: false, ..
+        }
+        | LirRvalue::StaticCall {
+            is_async: false, ..
+        }
+        | ir_variants!(
+            LirRvalue;
+            BeginReferenceCall, Use, AwaitFuture, SelectIdleWait, Coerce, ArrayAlloc,
+            CaptureArrayOwner, ArrayStore, Index, ObjectAlloc, FieldLoad, FieldStore,
+            StaticField, StaticStore, EnumAlloc, EnumPayloadStore, ConstructorCall,
+            Range, EnumMethod, BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
+            RebindResultError, IntoError, PrepareMethod, StringLiteral, FunctionRef,
+            Closure, Print, IntrinsicCall, DirectCall, IndirectCall, Unary, Binary, StringConcat
+        ) => &[],
+    }
 }
 
 fn clear_function(function: &mut SourceFunction) -> Liveness {
@@ -32,59 +76,30 @@ fn clear_function(function: &mut SourceFunction) -> Liveness {
         .collect();
     // Cleanup reads captured slots even when cancellation has no normal CFG
     // exit (for example, an infinite loop while holding a lock).
-    let mut captured: HashSet<_> = function
-        .blocks
-        .iter()
-        .flat_map(|block| &block.instrs)
-        .filter_map(|inst| {
-            if let SourceInst::Defer { body, .. } = inst {
-                Some(&body.captures)
-            } else {
-                None
-            }
-        })
-        .flatten()
-        .copied()
-        .collect();
+    let mut captured = HashSet::new();
     for instruction in function.blocks.iter().flat_map(|block| &block.instrs) {
-        // Address uses outlive the last direct value use. A child task owns
-        // the reference cell, not a copy of the value, so clearing this slot
-        // would change what it reads. Keep task-borrowed locals until lexical
-        // scope exit (E1708 requires borrowed tasks to discharge before then).
-        // Synchronous reference calls finish before their last-use clear and
-        // need no extension. Inspect the task's argument slice without making
-        // an operand vector for every computation.
-        if let SourceInst::Compute {
-            value:
-                super::LirRvalue::StartTask { args, .. }
-                | super::LirRvalue::MethodCall {
-                    args,
-                    is_async: true,
-                    ..
-                }
-                | super::LirRvalue::StaticCall {
-                    args,
-                    is_async: true,
-                    ..
-                },
-            ..
-        } = instruction
-        {
-            for operand in args {
-                if let super::LirOperand::Reference {
-                    place: super::LirPlace::Local(local),
-                    ..
-                } = operand
-                {
-                    captured.insert(*local);
-                }
+        match instruction {
+            SourceInst::Defer { body, .. } => captured.extend(body.captures.iter().copied()),
+            SourceInst::EnterDeferScope {
+                lock: Some(slots), ..
+            } => {
+                captured.extend(slots.all_locals());
             }
-        }
-        if let SourceInst::EnterDeferScope {
-            lock: Some(slots), ..
-        } = instruction
-        {
-            captured.extend(slots.all_locals());
+            SourceInst::Compute { value, .. } => {
+                // Task-borrowed slots retain their value until lexical scope exit.
+                captured.extend(
+                    task_arguments(value)
+                        .iter()
+                        .filter_map(LirOperand::borrowed_local),
+                );
+            }
+            SourceInst::EnterDeferScope { lock: None, .. }
+            | ir_variants!(
+                SourceInst;
+                Let, Assign, LeaveDeferScope, FlushDefers, ClearScopeRoots, FieldAssign,
+                IndexAssign, StaticFieldAssign, SuperInit, SelectInit, SelectProbe, SelectPick,
+                SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind, Expr
+            ) => {}
         }
     }
     let mut clearable = vec![0u64; function.locals.len().div_ceil(64)];
@@ -124,7 +139,7 @@ fn clear_function(function: &mut SourceFunction) -> Liveness {
                 *word |= bits;
             }
         }
-        read.clear();
+        clear_local_scratch(&mut read);
         terminator_uses(&block.terminator, &names, &mut read, &HashSet::new());
         read.iter().for_each(|&id| liveness::insert(&mut live, id));
         // A value used only on one branch dies on the other edge, even when
@@ -143,7 +158,7 @@ fn clear_function(function: &mut SourceFunction) -> Liveness {
                 } => {
                     vec![then_block, else_block]
                 }
-                _ => Vec::new(),
+                SourceTerminator::Return(_) | SourceTerminator::CleanupReturn => Vec::new(),
             };
             for target in targets {
                 let dead: Vec<u64> = live
@@ -168,8 +183,8 @@ fn clear_function(function: &mut SourceFunction) -> Liveness {
         }
         let mut reversed = Vec::with_capacity(block.instrs.len());
         for instruction in std::mem::take(&mut block.instrs).into_iter().rev() {
-            read.clear();
-            written.clear();
+            clear_local_scratch(&mut read);
+            clear_local_scratch(&mut written);
             instruction_use_def(&instruction, &names, &mut read, &mut written);
             let mut clear: Vec<_> = read
                 .union(&written)
@@ -198,6 +213,92 @@ fn clear_function(function: &mut SourceFunction) -> Liveness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_selects_bound_scratch_work_across_narrow_instructions() {
+        use super::super::async_liveness::SCRATCH_CAPACITY;
+        use super::super::{LirLocal, LirLocalId, LirSelectOp, LirStorageKind};
+        use crate::ir::optimize::{
+            devirtualize_function_values, eliminate_dead_values, scalar_replace_objects,
+        };
+        use crate::semantic::ids::SemanticType as Type;
+
+        let tokens = crate::lexer::Lexer::new("fn main() {}").tokenize().unwrap();
+        let (ast, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty());
+        let (hir, errors) = crate::ir::lower::lower_program(&ast);
+        assert!(errors.is_empty());
+        let mut function = super::super::lower_source_program(&hir)
+            .functions
+            .into_iter()
+            .find(|f| f.name.is_free_named("main"))
+            .unwrap();
+        for (width, narrow) in [(32, 128), (256, 128), (256, 1024), (1024, 2048)] {
+            let timer = LirLocalId(width);
+            let chosen = LirLocalId(width + 1);
+            function.locals = (0..=chosen.0)
+                .map(|i| LirLocal {
+                    id: LirLocalId(i),
+                    name: format!("l{i}"),
+                    ty: if i < width { Type::Bool } else { Type::I64 },
+                    storage_kind: LirStorageKind::Value,
+                    synthetic: false,
+                    parameter: i == width,
+                    source_span: None,
+                })
+                .collect();
+            let ready: Vec<_> = (0..width).map(|i| Some(LirLocalId(i))).collect();
+            // Forward passes see the wide definition first. The reverse
+            // lifetime walk sees the wide read before the same narrow run.
+            let mut instrs = vec![SourceInst::SelectProbe {
+                operations: vec![
+                    LirSelectOp::Timeout {
+                        millis: timer,
+                        deadline: timer
+                    };
+                    width as usize
+                ],
+                ready: ready.clone(),
+            }];
+            instrs.extend((0..narrow).map(|_| SourceInst::SelectPick {
+                ready: vec![Some(LirLocalId(0))],
+                chosen,
+            }));
+            instrs.push(SourceInst::SelectPick { ready, chosen });
+            function.blocks = vec![SourceBlock {
+                id: BlockId(0),
+                instrs,
+                terminator: SourceTerminator::Return(None),
+                recovery: vec![],
+            }];
+            // Sum the actual capacities of populated scratch tables as they
+            // are reset. Every pass makes a fixed number of scans per table.
+            let check = |pass, run: &mut dyn FnMut()| {
+                SCRATCH_CAPACITY.set(0);
+                run();
+                let capacity = SCRATCH_CAPACITY.get();
+                assert!(capacity >= narrow, "{pass} did not measure the narrow run");
+                assert!(
+                    capacity <= 96 * (width as usize + narrow),
+                    "{pass}: {capacity}"
+                );
+                println!("{pass}, width={width}, narrow={narrow}, capacity={capacity}");
+            };
+            check("scalar replacement", &mut || {
+                scalar_replace_objects(&mut function.blocks, &function.locals)
+            });
+            check("DCE including scalar replacement", &mut || {
+                eliminate_dead_values(&mut function.blocks, &function.locals)
+            });
+            check("devirtualization", &mut || {
+                devirtualize_function_values(&mut function, &HashMap::new())
+            });
+            check("last use including block liveness", &mut || {
+                clear_function(&mut function);
+            });
+            assert_eq!(function.blocks[0].instrs.len(), narrow + 2);
+        }
+    }
 
     #[test]
     fn async_method_effect_cache_scales_with_inherited_calls() {

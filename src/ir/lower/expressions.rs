@@ -69,7 +69,12 @@ pub(super) fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Dia
                 *class = name.as_str().into();
             }
         }
-        _ => {}
+        ir_variants!(
+            HirExprKind;
+            Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array, Index,
+            Ternary, New, FieldAccess, MethodCall, ObjectLiteral, ReferenceArg, Range, Await,
+            TryPropagate, Lambda, Match, Select
+        ) => {}
     }
     // Construction records the identity being allocated, not the source's
     // import alias. Keep it identical to the canonical result type.
@@ -78,7 +83,12 @@ pub(super) fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Dia
             HirExprKind::New { class, .. } | HirExprKind::ObjectLiteral { class, .. } => {
                 *class = *identity
             }
-            _ => {}
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
+                Index, Ternary, FieldAccess, MethodCall, StaticField, StaticCall, ReferenceArg,
+                Range, Await, TryPropagate, Lambda, Match, Select
+            ) => {}
         }
     }
     Ok(lowered)

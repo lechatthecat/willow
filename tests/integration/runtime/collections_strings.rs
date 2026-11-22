@@ -189,6 +189,253 @@ fn main() {
 }
 
 #[test]
+fn string_concat_snapshots_live_through_repeated_alias_writes_and_gc() {
+    let source = r#"
+class Cell { pub text: String; pub count: i64; }
+fn change(c: Cell, tag:String) -> String {
+    println(c.text);
+    c.text = tag + "!";
+    c.count += 1;
+    gc_collect();
+    return tag;
+}
+fn render(x:&String, i:&i64, c:Cell) -> String {
+    return x + ":" + i.to_string() + change(c,"a") +
+           x + ":" + i.to_string() + change(c,"b") +
+           x + ":" + i.to_string() + change(c,"c");
+}
+fn main() {
+    let c = new Cell("start" + "!", 1);
+    println(render(&c.text, &c.count, c));
+    println(c.text);
+    println(c.count);
+}
+"#;
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress_all,
+    ] {
+        let (out, ok) = run(source);
+        assert!(ok, "{out}");
+        assert_eq!(out, "start!\na!\nb!\nstart!:1aa!:2bb!:3c\nc!\n4\n");
+    }
+}
+
+#[test]
+fn string_concat_reads_before_a_reference_argument_writes() {
+    let source = r#"
+fn change(x: &mut String) -> String { x = "new"; return "!"; }
+fn main() {
+    let mut x = "old";
+    println(x + ":" + change(&x));
+    println(x);
+}
+"#;
+    for run in [compile_and_run, compile_and_run_release] {
+        let (out, ok) = run(source);
+        assert!(ok, "{out}");
+        assert_eq!(out, "old:!\nnew\n");
+    }
+}
+
+#[test]
+fn string_concat_reads_a_borrowed_parameter_before_its_heap_alias_changes() {
+    let source = r#"
+class Cell { pub text: String; }
+fn change(x: &mut String) -> String { x = "new"; return "!"; }
+fn replace(c: Cell) -> String { c.text = "new"; return "!"; }
+fn through_reference(x: &String, c: Cell) -> String {
+    return x + ":" + change(&c.text);
+}
+fn through_object(x: &String, c: Cell) -> String {
+    return x + ":" + replace(c);
+}
+fn main() {
+    let c = new Cell("old");
+    println(through_reference(&c.text, c));
+    c.text = "old";
+    println(through_object(&c.text, c));
+}
+"#;
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "old:!\nold:!\n");
+}
+
+#[test]
+fn string_concat_reads_before_a_conditional_array_alias_writes() {
+    let source = r#"
+import std::collections::Array;
+fn change(input: Array<String>, use_input: bool) -> String {
+    let mut items = ["local"];
+    if use_input { items = input; }
+    items[0] = "new";
+    return "!";
+}
+fn render(x: &String, input: Array<String>, use_input: bool) -> String {
+    return x + ":" + change(input, use_input);
+}
+fn main() {
+    let items = ["old"];
+    println(render(&items[0], items, false));
+    println(items[0]);
+    println(render(&items[0], items, true));
+    println(items[0]);
+}
+"#;
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "old:!\nold\nold:!\nnew\n");
+}
+
+#[test]
+fn string_concat_reads_before_a_returned_array_alias_writes() {
+    let source = r#"
+import std::collections::Array;
+fn choose(input: Array<String>, use_input: bool) -> Array<String> {
+    if use_input { return input; }
+    return ["private"];
+}
+fn change(input: Array<String>, use_input: bool) -> String {
+    let items = choose(input, use_input);
+    items[0] = "new";
+    return "!";
+}
+fn render(x: &String, input: Array<String>, use_input: bool) -> String {
+    return x + ":" + change(input, use_input);
+}
+fn main() {
+    let items = ["old"];
+    println(render(&items[0], items, false));
+    println(items[0]);
+    println(render(&items[0], items, true));
+    println(items[0]);
+}
+"#;
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "old:!\nold\nold:!\nnew\n");
+}
+
+#[test]
+fn string_concat_reads_before_a_forwarded_argument_writes() {
+    let source = r#"
+import std::collections::Array;
+fn grow(items: Array<String>, n: String) { items[0] = n; items.push(n); }
+fn forward(n: String, items: Array<String>) -> String { grow(items, n); return "!"; }
+fn private(x: &String, n: String) -> String {
+    let items = n.split(",");
+    return x + ":" + forward(n, items);
+}
+fn shared(x: &String, items: Array<String>) -> String {
+    return x + ":" + forward("new", items);
+}
+fn main() {
+    let items = ["old"];
+    println(private(&items[0], "new"));
+    println(items[0]);
+    println(shared(&items[0], items));
+    println(items[0]);
+}
+"#;
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "old:!\nold\nold:!\nnew\n");
+}
+
+#[test]
+fn string_concat_reads_before_writes_via_returned_and_rebound_parameters() {
+    let source = r#"
+import std::collections::Array;
+fn id(items: Array<String>, n: String) -> Array<String> {
+    if n.len() == 8 { return items; }
+    return items;
+}
+fn rebind(slot: &mut Array<String>, items: Array<String>) { slot = items; }
+fn change(slot: &mut String) -> String { slot = "new"; return "!"; }
+fn private(x: &String, n: String) -> String {
+    let mut tmp = n;
+    let items = id([n,n], n);
+    change(&items[0]);
+    return x + ":" + change(&tmp);
+}
+fn shared(x: &String, input: Array<String>) -> String {
+    let mut tmp = ["local"];
+    rebind(&tmp, id(input, "12345678"));
+    return x + ":" + change(&tmp[0]);
+}
+fn main() {
+    let items = ["old"];
+    println(private(&items[0], "value"));
+    println(items[0]);
+    println(shared(&items[0], items));
+    println(items[0]);
+}
+"#;
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "old:!\nold\nold:!\nnew\n");
+}
+
+#[test]
+fn string_concat_reads_before_writing_through_an_indexed_inner_array() {
+    let source = r#"
+import std::collections::Array;
+fn change(input: Array<String>, use_input: bool) -> String {
+    let outer = [["local"]];
+    if use_input { outer[0] = input; }
+    let inner = outer[0];
+    println(inner[0]);
+    inner[0] = "new";
+    println(inner[0]);
+    return "!";
+}
+fn render(x: &String, input: Array<String>, use_input: bool) -> String {
+    return x + ":" + change(input, use_input);
+}
+fn main() {
+    let items = ["old"];
+    println(render(&items[0], items, false));
+    println(items[0]);
+    println(render(&items[0], items, true));
+    println(items[0]);
+}
+"#;
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "local\nnew\nold:!\nold\nold\nnew\nold:!\nnew\n");
+}
+
+#[test]
+fn string_concat_reads_before_writing_an_array_loaded_from_a_field() {
+    let source = r#"
+import std::collections::Array;
+class Holder { pub items: Array<String>; }
+fn grow(a: Array<String>) -> String { a[0] = "new"; a.push("tail"); return "!"; }
+fn private(x: &String) -> String {
+    let h = new Holder(["local"]);
+    return x + ":" + grow(h.items);
+}
+fn shared(x: &String, a: Array<String>) -> String {
+    let h = new Holder(a);
+    return x + ":" + grow(h.items);
+}
+fn main() {
+    let a = ["old"];
+    println(private(&a[0]));
+    println(a[0]);
+    println(shared(&a[0], a));
+    println(a[0]);
+    println(a.len());
+}
+"#;
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "old:!\nold\nold:!\nnew\n2\n");
+}
+
+#[test]
 fn test_string_concatenation_rejects_non_string_rhs() {
     assert_compile_error_contains(
         r#"

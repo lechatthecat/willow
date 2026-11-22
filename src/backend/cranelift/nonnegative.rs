@@ -9,6 +9,7 @@
 //! edge pass, and a worklist visiting each copy dependency once. Bounded copy
 //! peeling (eight links) keeps even adversarial copy chains linear.
 
+use crate::ir::ir_variants;
 use crate::ir::lowered::{
     LirFunction, LirInst, LirLocalId, LirOperand as O, LirRvalue as V, Terminator,
 };
@@ -35,7 +36,7 @@ impl Proof {
         match operand {
             O::Int(n) => *n >= 0,
             O::Local(id) => self.locals.get(id.0 as usize).copied().unwrap_or(false),
-            _ => false,
+            O::Integer { .. } | O::Float(_) | O::Bool(_) | O::Reference { .. } => false,
         }
     }
 }
@@ -53,9 +54,15 @@ pub(super) fn analyze(f: &LirFunction) -> Proof {
         || !f.captures.is_empty()
         || f.blocks.iter().any(|b| {
             !b.recovery.is_empty()
-                || b.instrs
-                    .iter()
-                    .any(|i| matches!(i, LirInst::Defer { .. } | LirInst::EnterDeferScope { .. }))
+                || b.instrs.iter().any(|inst| match inst {
+                    LirInst::Defer { .. } | LirInst::EnterDeferScope { .. } => true,
+                    ir_variants!(
+                        LirInst;
+                        Compute, Let, Assign, LeaveDeferScope, FlushDefers,
+                        ClearScopeRoots, SelectInit, SelectProbe, SelectPick, SelectUnregister,
+                        SelectCommit, ReleaseLock, MatchTest, MatchBind, Unsupported
+                    ) => false,
+                })
         })
     {
         return out;
@@ -88,7 +95,12 @@ pub(super) fn analyze(f: &LirFunction) -> Proof {
                     counts[local.0 as usize] += 1;
                     *writes.entry((b, *local)).or_default() += 1;
                 }
-                _ => {
+                ir_variants!(
+                    LirInst;
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer,
+                    SelectInit, SelectProbe, SelectPick, SelectUnregister, SelectCommit,
+                    ReleaseLock, MatchTest, MatchBind, Unsupported
+                ) => {
                     for id in super::transient_roots::inst_locals(inst) {
                         out.work += 1;
                         allowed[id.0 as usize] = false;
@@ -173,7 +185,9 @@ pub(super) fn analyze(f: &LirFunction) -> Proof {
         }
         let bound = match peel(rhs.clone(), p, def.at, &mut out.work) {
             O::Int(n) => n,
-            _ => i64::MAX,
+            O::Local(_) | O::Integer { .. } | O::Float(_) | O::Bool(_) | O::Reference { .. } => {
+                i64::MAX
+            }
         };
         guard[b] = Some((id, bound));
     }
@@ -191,18 +205,43 @@ pub(super) fn analyze(f: &LirFunction) -> Proof {
                         match value {
                             V::Use(O::Local(source)) => copies[source.0 as usize].push(*local),
                             V::Use(O::Int(n)) if *n >= 0 => out.locals[local.0 as usize] = true,
-                            _ => {}
+                            ir_variants!(
+                                V;
+                                BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait,
+                                Coerce, ArrayAlloc, CaptureArrayOwner, ArrayStore, Index,
+                                ObjectAlloc, FieldLoad, FieldStore, StaticField, StaticStore,
+                                StaticCall, EnumAlloc, EnumPayloadStore, ConstructorCall, Range,
+                                EnumMethod, BuiltinCall, FormatScalar, Panic, Recover,
+                                ReferenceDebug, RebindResultError, IntoError, PrepareMethod,
+                                MethodCall, StringLiteral, FunctionRef, Closure, Print,
+                                IntrinsicCall, DirectCall, IndirectCall, Unary, Binary,
+                                StringConcat
+                            ) => {}
                         }
                     }
                     let mut operands = value.operands();
-                    if let V::ReferenceDebug { argument, .. } = value {
-                        operands.push(argument);
-                    }
+                    let captures_plain_operands = match value {
+                        V::Closure { .. } => true,
+                        V::ReferenceDebug { argument, .. } => {
+                            // Diagnostic references are omitted by operands().
+                            operands.push(argument);
+                            false
+                        }
+                        ir_variants!(
+                            V;
+                            BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait,
+                            Coerce, ArrayAlloc, CaptureArrayOwner, ArrayStore, Index,
+                            ObjectAlloc, FieldLoad, FieldStore, StaticField, StaticStore,
+                            StaticCall, EnumAlloc, EnumPayloadStore, ConstructorCall, Range,
+                            EnumMethod, BuiltinCall, FormatScalar, Panic, Recover,
+                            RebindResultError, IntoError, PrepareMethod, MethodCall,
+                            StringLiteral, FunctionRef, Print, IntrinsicCall, DirectCall,
+                            IndirectCall, Unary, Binary, StringConcat
+                        ) => false,
+                    };
                     for operand in operands {
                         out.work += 1;
-                        if matches!(operand, O::Reference { .. })
-                            || matches!(value, V::Closure { .. })
-                        {
+                        if captures_plain_operands || !operand.is_plain_value() {
                             for id in operand.locals() {
                                 allowed[id.0 as usize] = false;
                                 escaped[id.0 as usize] = true;
@@ -257,7 +296,12 @@ pub(super) fn analyze(f: &LirFunction) -> Proof {
                         allowed[id] = false;
                     }
                 }
-                _ => {}
+                ir_variants!(
+                    LirInst;
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer,
+                    SelectInit, SelectProbe, SelectPick, SelectUnregister, SelectCommit,
+                    ReleaseLock, MatchTest, MatchBind, Unsupported
+                ) => {}
             }
         }
     }

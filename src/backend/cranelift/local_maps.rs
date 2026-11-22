@@ -1,6 +1,7 @@
 //! Fail-closed, whole-function confinement proof for scalar maps.
 //! No alias graph is needed: every map source must be a fresh constructor or
 //! local copy, and no handle may leave the function. Unknown uses keep locks.
+use crate::ir::ir_variants;
 use crate::ir::lowered::{LirFunction, LirInst, LirOperand, LirRvalue, Terminator};
 use crate::semantic::builtin_types::{self, BuiltinTypeId};
 use crate::semantic::ids::SemanticType as Type;
@@ -56,9 +57,12 @@ pub(super) fn confined_scalar_maps(f: &LirFunction) -> bool {
     }
     let map_operand = |operand: &LirOperand| match operand {
         LirOperand::Local(id) => maps[id.0 as usize],
-        _ => false,
+        LirOperand::Int(_)
+        | LirOperand::Integer { .. }
+        | LirOperand::Float(_)
+        | LirOperand::Bool(_)
+        | LirOperand::Reference { .. } => false,
     };
-    let plain = |operand: &LirOperand| !matches!(operand, LirOperand::Reference { .. });
     for block in &f.blocks {
         for instruction in &block.instrs {
             #[cfg(test)]
@@ -81,7 +85,17 @@ pub(super) fn confined_scalar_maps(f: &LirFunction) -> bool {
                                     && method == "new"
                                     && args.is_empty()
                             }
-                            _ => false,
+                            ir_variants!(
+                                LirRvalue;
+                                BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait,
+                                Coerce, ArrayAlloc, CaptureArrayOwner, ArrayStore, Index,
+                                ObjectAlloc, FieldLoad, FieldStore, StaticField, StaticStore,
+                                EnumAlloc, EnumPayloadStore, ConstructorCall, Range, EnumMethod,
+                                BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
+                                RebindResultError, IntoError, MethodCall, StringLiteral,
+                                FunctionRef, Closure, Print, IntrinsicCall, DirectCall,
+                                IndirectCall, Unary, Binary, StringConcat
+                            ) => false,
                         };
                     // ReferenceDebug intentionally omits its diagnostic operand
                     // from operands(); reject it explicitly rather than miss it.
@@ -133,15 +147,25 @@ pub(super) fn confined_scalar_maps(f: &LirFunction) -> bool {
                                             | Intrinsic::MapFreeze
                                     )
                             }
-                            _ => false,
+                            ir_variants!(
+                                LirRvalue;
+                                BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait,
+                                Coerce, ArrayAlloc, CaptureArrayOwner, ArrayStore, Index,
+                                ObjectAlloc, FieldLoad, FieldStore, StaticField, StaticStore,
+                                StaticCall, EnumAlloc, EnumPayloadStore, ConstructorCall, Range,
+                                EnumMethod, BuiltinCall, FormatScalar, Panic, Recover,
+                                ReferenceDebug, RebindResultError, IntoError, MethodCall,
+                                StringLiteral, FunctionRef, Closure, Print, DirectCall,
+                                IndirectCall, Unary, Binary, StringConcat
+                            ) => false,
                         };
                     valid_source
                         && valid_use
-                        && operands.into_iter().all(plain)
+                        && operands.into_iter().all(LirOperand::is_plain_value)
                         && !matches!(value, LirRvalue::ReferenceDebug { .. })
                 }
                 LirInst::Let { local, value, .. } | LirInst::Assign { local, value, .. } => {
-                    plain(value) && maps[local.0 as usize] == map_operand(value)
+                    value.is_plain_value() && maps[local.0 as usize] == map_operand(value)
                 }
                 LirInst::ClearScopeRoots { .. }
                 | LirInst::LeaveDeferScope { .. }
@@ -154,7 +178,11 @@ pub(super) fn confined_scalar_maps(f: &LirFunction) -> bool {
                     ..
                 } => !maps[scrutinee.0 as usize] && bindings.iter().all(|id| !maps[id.0 as usize]),
                 // In particular, reject cleanup captures and suspension/locks.
-                _ => false,
+                ir_variants!(
+                    LirInst;
+                    Defer, SelectInit, SelectProbe, SelectPick, SelectUnregister, SelectCommit,
+                    ReleaseLock, Unsupported
+                ) => false,
             };
             if !allowed {
                 return false;
@@ -165,9 +193,9 @@ pub(super) fn confined_scalar_maps(f: &LirFunction) -> bool {
         let allowed = match &block.terminator {
             Terminator::Jump(_) | Terminator::Return(None) => true,
             Terminator::Branch { cond, .. } | Terminator::Return(Some(cond)) => {
-                plain(cond) && !map_operand(cond)
+                cond.is_plain_value() && !map_operand(cond)
             }
-            _ => false,
+            Terminator::Suspend { .. } | Terminator::CleanupReturn => false,
         };
         if !allowed {
             return false;

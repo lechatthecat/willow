@@ -2,6 +2,7 @@
 //!
 //! The live emission-path root count is not a function maximum. Inspect the
 //! complete LIR before binding parameters or emitting the entry snapshot instead.
+use crate::ir::ir_variants;
 use crate::ir::lowered::{LirFunction, LirInst, LirOperand, LirRvalue, Terminator};
 use crate::parser::ast::BinOp;
 use crate::semantic::ids::SemanticType as Type;
@@ -60,9 +61,22 @@ pub(super) fn preserves_stack_helper(function: &LirFunction) -> bool {
                         matches!(intrinsic, Intrinsic::ArrayLen)
                             && matches!(receiver_ty, Type::Array(element) if immediate(element))
                     }
-                    _ => false,
+                    ir_variants!(
+                        LirRvalue;
+                        BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait, Coerce,
+                        CaptureArrayOwner, ObjectAlloc, FieldLoad, FieldStore, StaticField,
+                        StaticStore, StaticCall, EnumAlloc, EnumPayloadStore, ConstructorCall,
+                        Range, EnumMethod, BuiltinCall, FormatScalar, Panic, Recover,
+                        ReferenceDebug, RebindResultError, IntoError, PrepareMethod, MethodCall,
+                        FunctionRef, Closure, DirectCall, IndirectCall, StringConcat
+                    ) => false,
                 },
-                _ => false,
+                ir_variants!(
+                    LirInst;
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, SelectInit, SelectProbe,
+                    SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
+                    Unsupported
+                ) => false,
             })
     })
 }
@@ -87,7 +101,7 @@ pub(super) fn may_push_gc_roots(function: &LirFunction) -> bool {
         return true;
     }
     let operand_is_immediate = |operand: &LirOperand| {
-        !matches!(operand, LirOperand::Reference { .. })
+        operand.is_plain_value()
             && operand
                 .ty(&function.locals)
                 .is_some_and(|ty| immediate(&ty))
@@ -106,7 +120,16 @@ pub(super) fn may_push_gc_roots(function: &LirFunction) -> bool {
                         LirRvalue::StaticCall {
                             arg_types, result, ..
                         } => arg_types.iter().all(immediate) && immediate(result),
-                        _ => false,
+                        ir_variants!(
+                            LirRvalue;
+                            BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait, Coerce,
+                            ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc,
+                            FieldLoad, FieldStore, StaticField, StaticStore, EnumAlloc,
+                            EnumPayloadStore, ConstructorCall, Range, EnumMethod, BuiltinCall,
+                            FormatScalar, Panic, Recover, ReferenceDebug, RebindResultError,
+                            IntoError, PrepareMethod, MethodCall, StringLiteral, FunctionRef,
+                            Closure, IntrinsicCall, IndirectCall, StringConcat
+                        ) => false,
                     };
                     operation_is_safe && value.operands().into_iter().all(&operand_is_immediate)
                 }
@@ -114,7 +137,12 @@ pub(super) fn may_push_gc_roots(function: &LirFunction) -> bool {
                     operand_is_immediate(value)
                 }
                 LirInst::ClearScopeRoots { .. } => true,
-                _ => false,
+                ir_variants!(
+                    LirInst;
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, SelectInit, SelectProbe,
+                    SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
+                    Unsupported
+                ) => false,
             };
             if !safe {
                 return true;
@@ -124,7 +152,7 @@ pub(super) fn may_push_gc_roots(function: &LirFunction) -> bool {
             Terminator::Jump(_) | Terminator::Return(None) => true,
             Terminator::Branch { cond, .. } => operand_is_immediate(cond),
             Terminator::Return(Some(value)) => operand_is_immediate(value),
-            _ => false,
+            Terminator::Suspend { .. } | Terminator::CleanupReturn => false,
         };
         if !safe {
             return true;
@@ -150,11 +178,10 @@ pub(super) fn is_safepoint_free_leaf(function: &LirFunction, overflow_checks: bo
     if function.is_async || function.params.iter().any(|p| p.by_reference) {
         return false;
     }
-    let operand_is_value = |operand: &LirOperand| !matches!(operand, LirOperand::Reference { .. });
     // Stores and returns may implicitly allocate an interface box. Without
     // class metadata, accept only identity conversions.
     let identity = |value: &LirOperand, target: &Type| {
-        operand_is_value(value) && value.ty(&function.locals).as_ref() == Some(target)
+        value.is_plain_value() && value.ty(&function.locals).as_ref() == Some(target)
     };
     for block in &function.blocks {
         if !block.recovery.is_empty() {
@@ -182,21 +209,36 @@ pub(super) fn is_safepoint_free_leaf(function: &LirFunction, overflow_checks: bo
                                         *operand_ty == Type::F64
                                             || matches!(rhs, LirOperand::Int(divisor) if *divisor != 0 && *divisor != -1)
                                     }
+                                    // Other immediate operators have no division or exponentiation guard here.
                                     _ => true,
                                 }
                         }
-                        _ => false,
+                        ir_variants!(
+                            LirRvalue;
+                            BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait, Coerce,
+                            ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc,
+                            FieldStore, StaticField, StaticStore, StaticCall, EnumAlloc,
+                            EnumPayloadStore, ConstructorCall, Range, EnumMethod, BuiltinCall,
+                            FormatScalar, Panic, Recover, ReferenceDebug, RebindResultError,
+                            IntoError, PrepareMethod, MethodCall, StringLiteral, FunctionRef,
+                            Closure, Print, IntrinsicCall, DirectCall, IndirectCall, StringConcat
+                        ) => false,
                     };
                     operation_is_safe
                         && !(overflow_checks && value.has_overflow_check())
-                        && value.operands().into_iter().all(&operand_is_value)
+                        && value.operands().into_iter().all(LirOperand::is_plain_value)
                 }
                 LirInst::Let { value, ty, .. } => identity(value, ty),
                 LirInst::Assign { local, value, .. } => {
                     identity(value, &function.locals[local.0 as usize].ty)
                 }
                 LirInst::ClearScopeRoots { .. } => true,
-                _ => false,
+                ir_variants!(
+                    LirInst;
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, SelectInit, SelectProbe,
+                    SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
+                    Unsupported
+                ) => false,
             };
             if !safe {
                 return false;
@@ -204,9 +246,9 @@ pub(super) fn is_safepoint_free_leaf(function: &LirFunction, overflow_checks: bo
         }
         let safe = match &block.terminator {
             Terminator::Jump(_) | Terminator::Return(None) => true,
-            Terminator::Branch { cond, .. } => operand_is_value(cond),
+            Terminator::Branch { cond, .. } => cond.is_plain_value(),
             Terminator::Return(Some(value)) => identity(value, &function.return_type),
-            _ => false,
+            Terminator::Suspend { .. } | Terminator::CleanupReturn => false,
         };
         if !safe {
             return false;
@@ -225,7 +267,9 @@ fn is_acyclic(function: &LirFunction) -> bool {
             else_block,
             ..
         } => [Some(then_block.0), Some(else_block.0)],
-        _ => [None, None],
+        Terminator::Suspend { .. } | Terminator::Return(_) | Terminator::CleanupReturn => {
+            [None, None]
+        }
     };
     // 0 = unvisited, 1 = on the DFS stack, 2 = finished.
     let mut color = vec![0u8; function.blocks.len()];
@@ -250,6 +294,7 @@ fn is_acyclic(function: &LirFunction) -> bool {
                 pending.push((target, 0));
             }
             Some(1) | None => return false,
+            // Finished successors already have a validated subtree.
             _ => {}
         }
     }

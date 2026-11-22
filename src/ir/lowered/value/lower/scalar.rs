@@ -567,7 +567,10 @@ impl<'e> ScalarLowering<'_, 'e> {
             HirExprKind::Call { .. } => self.finish_call(node),
             HirExprKind::Unary { .. } => self.finish_unary(node),
             HirExprKind::Binary { .. } => self.finish_binary(node),
-            _ => unreachable!("scalar tree was validated"),
+            ir_variants!(
+                HirExprKind;
+                Array, Ternary, ObjectLiteral, ReferenceArg, TryPropagate, Match, Select
+            ) => unreachable!("scalar tree was validated"),
         };
         self.values.insert(std::ptr::from_ref(node), operand);
     }
@@ -608,7 +611,12 @@ impl<'e> ScalarLowering<'_, 'e> {
                     element: place.ty.clone(),
                 }
             }
-            _ => unreachable!("validated reference place"),
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, FnRef, Binary, Unary, Call, Invoke, Print, Array, Ternary,
+                New, MethodCall, ObjectLiteral, StaticField, StaticCall, ReferenceArg, Range,
+                Await, TryPropagate, Lambda, Match, Select
+            ) => unreachable!("validated reference place"),
         };
         let argument = LirOperand::Reference {
             place: captured,
@@ -635,7 +643,12 @@ impl<'e> ScalarLowering<'_, 'e> {
                 self.work.push(Work::Enter(index));
                 self.work.push(Work::Enter(array));
             }
-            _ => unreachable!("validated reference place"),
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, FnRef, Binary, Unary, Call, Invoke, Print, Array, Ternary,
+                New, MethodCall, ObjectLiteral, StaticField, StaticCall, ReferenceArg, Range,
+                Await, TryPropagate, Lambda, Match, Select
+            ) => unreachable!("validated reference place"),
         }
         true
     }
@@ -776,7 +789,12 @@ impl<'e> ScalarLowering<'_, 'e> {
             }
             HirExprKind::New { .. } => self.enter_new(node, targets),
             HirExprKind::ObjectLiteral { .. } => self.enter_object_literal(node),
-            _ => false,
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
+                Index, Ternary, FieldAccess, MethodCall, StaticField, StaticCall, Range, Await,
+                TryPropagate, Lambda, Match, Select
+            ) => false,
         }
     }
 
@@ -801,7 +819,12 @@ impl<'e> ScalarLowering<'_, 'e> {
                 method,
                 args,
             } => Some((FunctionId::method(*class, method), args)),
-            _ => None,
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Invoke, Print, Array, Index,
+                Ternary, FieldAccess, ObjectLiteral, StaticField, ReferenceArg, Range, Await,
+                TryPropagate, Lambda, Match, Select
+            ) => None,
         };
         if let Some((callee, args)) = reference_call {
             let has_refs = args
@@ -1052,7 +1075,16 @@ impl<'e> ScalarLowering<'_, 'e> {
                     span: place.span,
                 });
             }
-            _ => unreachable!("reserved reference place"),
+            // A reserved place must pair the source form with the matching storage.
+            (
+                ir_variants!(
+                    HirExprKind;
+                    Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
+                    Index, Ternary, New, FieldAccess, MethodCall, ObjectLiteral, StaticField,
+                    StaticCall, ReferenceArg, Range, Await, TryPropagate, Lambda, Match, Select
+                ),
+                _,
+            ) => unreachable!("reserved reference place"),
         }
     }
 

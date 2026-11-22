@@ -338,13 +338,7 @@ fn operand(
     instructions: &mut Vec<LirInst>,
 ) -> Option<LirOperand> {
     use crate::ir::typed_ast::HirExprKind as E;
-    let value = match &expression.kind {
-        E::Var(name) => names.get(name).copied().map(LirOperand::Local),
-        E::Int(value) => Some(LirOperand::integer(*value, &expression.ty)),
-        E::Float(value) => Some(LirOperand::Float(*value)),
-        E::Bool(value) => Some(LirOperand::Bool(*value)),
-        _ => None,
-    };
+    let value = LirOperand::from_flat_expr(expression, |name| names.get(name).copied());
     if value.is_none() {
         if let Some(node) = expression
             .walk_postorder(false)
@@ -352,7 +346,12 @@ fn operand(
         {
             let name = match &node.kind {
                 E::Call { callee, .. } => format!("`{callee}`"),
-                _ => "a value operand".into(),
+                ir_variants!(
+                    E;
+                    Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Invoke, Print, Array, Index,
+                    Ternary, New, FieldAccess, MethodCall, ObjectLiteral, StaticField, StaticCall,
+                    ReferenceArg, Range, Await, TryPropagate, Lambda, Match, Select
+                ) => "a value operand".into(),
             };
             instructions.push(LirInst::Unsupported {
                 span: node.span,
@@ -374,7 +373,11 @@ fn operand(
             E::Match { .. } => "match".into(),
             E::Lambda { .. } => "lambda construction".into(),
             E::ReferenceArg { .. } => "reference argument".into(),
-            _ => "expression".into(),
+            ir_variants!(
+                E;
+                Int, Float, Bool, Str, FnRef, Binary, Unary, Invoke, Print, Array, Index, Ternary,
+                ObjectLiteral, Range
+            ) => "expression".into(),
         };
         instructions.push(LirInst::Unsupported {
             span: expression.span,

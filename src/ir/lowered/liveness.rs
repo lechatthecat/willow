@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::async_liveness::{instruction_use_def, terminator_uses};
+use super::async_liveness::{clear_local_scratch, instruction_use_def, terminator_uses};
 use super::{LirLocalId, SourceBlock, SourceTerminator};
 
 #[cfg(test)]
@@ -131,8 +131,8 @@ impl Liveness {
         let mut written = HashSet::new();
         for (index, block) in blocks.iter().enumerate() {
             debug_assert_eq!(block.id.0, index, "LIR block ids are dense indexes");
-            read.clear();
-            written.clear();
+            clear_local_scratch(&mut read);
+            clear_local_scratch(&mut written);
             for inst in &block.instrs {
                 instruction_use_def(inst, names, &mut read, &mut written);
             }

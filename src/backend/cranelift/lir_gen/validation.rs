@@ -1,12 +1,13 @@
 //! Operand-only LIR graph and operation validation.
 
 use super::*;
+use crate::ir::ir_variants;
+use crate::ir::lowered::LirRvalue;
 
 /// Conservative "can evaluating this run a collection?" test, used to decide
 /// whether a live GC temporary has to be rooted across a sub-expression. Only
 /// the forms known to be allocation-free answer `false`; everything else —
-/// including any expression form added later — answers `true`, so a new node
-/// kind cannot silently drop a root.
+/// including calls, allocation and control flow — retains roots.
 #[cfg(test)]
 pub(super) fn may_allocate(e: &HirExpr) -> bool {
     let mut pending = vec![e];
@@ -40,8 +41,12 @@ pub(super) fn may_allocate(e: &HirExpr) -> bool {
                 pending.extend([index.as_ref(), array.as_ref()]);
             }
             HirExprKind::FieldAccess { object, .. } => pending.push(object),
-            // Unknown forms conservatively retain GC roots.
-            _ => return true,
+            // Retain roots for operations outside the allocation-free subset.
+            ir_variants!(
+                HirExprKind;
+                Str, Call, Invoke, Print, Array, New, MethodCall, ObjectLiteral, StaticField,
+                StaticCall, Range, Await, TryPropagate, Match, Select
+            ) => return true,
         }
     }
     false
@@ -319,7 +324,17 @@ pub(in crate::backend::cranelift) fn lir_rejection_reason(
                                 span.line
                             ));
                         }
-                        _ => {}
+                        ir_variants!(
+                            LirRvalue;
+                            BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait,
+                            Coerce, ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc,
+                            FieldLoad, FieldStore, StaticField, StaticStore, StaticCall,
+                            EnumAlloc, EnumPayloadStore, ConstructorCall, Range, EnumMethod,
+                            BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
+                            RebindResultError, IntoError, PrepareMethod, MethodCall,
+                            StringLiteral, FunctionRef, Closure, Print, IntrinsicCall, DirectCall,
+                            IndirectCall, Unary, Binary, StringConcat
+                        ) => {}
                     }
                     if let crate::ir::lowered::LirRvalue::IntrinsicCall {
                         intrinsic,
@@ -381,7 +396,15 @@ pub(in crate::backend::cranelift) fn lir_rejection_reason(
                             V::StartTask { callee, .. } => {
                                 format!("the task constructor `{callee}`")
                             }
-                            _ => "a flat computation".into(),
+                            ir_variants!(
+                                V;
+                                BeginReferenceCall, Use, AwaitFuture, SelectIdleWait, Coerce,
+                                ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, EnumAlloc,
+                                EnumPayloadStore, Range, BuiltinCall, FormatScalar, Panic,
+                                Recover, ReferenceDebug, RebindResultError, IntoError,
+                                StringLiteral, FunctionRef, Closure, Print, IntrinsicCall,
+                                DirectCall, IndirectCall, Unary, Binary, StringConcat
+                            ) => "a flat computation".into(),
                         };
                         return Some(format!(
                             "{operation} at line {} has incompatible operands, metadata or destination",
@@ -401,7 +424,7 @@ pub(in crate::backend::cranelift) fn lir_rejection_reason(
                     }) || !value
                         .ty(&f.locals)
                         .is_some_and(|source| ctx.storable(ty, &source))
-                        || matches!(value, crate::ir::lowered::LirOperand::Reference { .. })
+                        || !value.is_plain_value()
                     {
                         return Some(format!(
                             "`let {name}` has incompatible LIR storage or operand"
@@ -415,7 +438,7 @@ pub(in crate::backend::cranelift) fn lir_rejection_reason(
                             && value
                                 .ty(&f.locals)
                                 .is_some_and(|source| ctx.storable(&slot.ty, &source))
-                    }) || matches!(value, crate::ir::lowered::LirOperand::Reference { .. })
+                    }) || !value.is_plain_value()
                     {
                         return Some(format!(
                             "`{name} = ...` has incompatible LIR storage or operand"
@@ -484,7 +507,13 @@ pub(in crate::backend::cranelift) fn lir_rejection_reason(
                         {
                             return Some("a match binding references an invalid local".into());
                         }
-                        _ => {}
+                        ir_variants!(
+                            LirInst;
+                            Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                            ClearScopeRoots, Defer, SelectInit, SelectProbe, SelectPick,
+                            SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
+                            Unsupported
+                        ) => {}
                     }
                     let mut arm_names = names.clone();
                     if !supported_lir_pattern(pattern, scrutinee_ty, ctx, &mut arm_names) {
@@ -505,9 +534,7 @@ pub(in crate::backend::cranelift) fn lir_rejection_reason(
         }
         match &block.terminator {
             Terminator::Branch { cond, .. } => {
-                if cond.ty(&f.locals) != Some(Type::Bool)
-                    || matches!(cond, crate::ir::lowered::LirOperand::Reference { .. })
-                {
+                if cond.ty(&f.locals) != Some(Type::Bool) || !cond.is_plain_value() {
                     return Some("a branch has an invalid boolean operand".into());
                 }
             }
@@ -518,7 +545,7 @@ pub(in crate::backend::cranelift) fn lir_rejection_reason(
                 if !value
                     .ty(&f.locals)
                     .is_some_and(|ty| ty != Type::Void && ctx.storable(&f.return_type, &ty))
-                    || matches!(value, crate::ir::lowered::LirOperand::Reference { .. })
+                    || !value.is_plain_value()
                 {
                     return Some("a return has an incompatible operand or signature".into());
                 }
@@ -565,7 +592,12 @@ pub(in crate::backend::cranelift) fn lir_async_rejection_reason(f: &LirFunction)
             LirInst::Unsupported { span, reason } => {
                 Some(format!("{reason} at line {}", span.line))
             }
-            _ => None,
+            ir_variants!(
+                LirInst;
+                Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                ClearScopeRoots, Defer, SelectInit, SelectProbe, SelectPick, SelectUnregister,
+                SelectCommit, ReleaseLock, MatchTest, MatchBind
+            ) => None,
         })
 }
 
@@ -590,6 +622,7 @@ pub(super) fn flat_intrinsic_supported(
         ChannelSend => {
             let element = match receiver {
                 Type::Array(element) => &**element,
+                // Generic channel receivers carry the element type in their type argument.
                 _ => match builtin_types::unary_arg(receiver, B::Channel) {
                     Some(element) => element,
                     None => return false,
@@ -613,6 +646,7 @@ pub(super) fn flat_intrinsic_supported(
                         && ctx.same_repr(&types[0], &args[0])
                         && ctx.storable(&types[1], &args[1])
                 }
+                // The remaining map operations take a single key.
                 _ => args.len() == 1 && ctx.same_repr(&types[0], &args[0]),
             }
         }
@@ -621,6 +655,7 @@ pub(super) fn flat_intrinsic_supported(
         }
         CellGet | CellSet | RwCellRead | RwCellWrite => blocking_cell(receiver)
             .is_some_and(|(_, elem)| args.iter().all(|arg| ctx.same_repr(elem, arg))),
+        // The intrinsic signature suffices when no extra representation check applies.
         _ => true,
     }
 }
@@ -811,7 +846,11 @@ pub(super) fn flat_rvalue_supported(
         // compares its object word by reference identity.
         V::Binary { op, operand_ty, .. } if matches!(operand_ty, Type::Named(_) | Type::Generic(..)) => matches!(op, BinOp::Eq | BinOp::Ne) && (ctx.tag_immediate_enum(operand_ty) || (ctx.supported_type(operand_ty) && matches!(operand_ty, Type::Named(name) | Type::Generic(name, _) if ctx.is_class(name) || (ctx.is_interface)(name)))),
         V::Recover => true,
-        _ => true,
+        ir_variants!(
+            V;
+            BeginReferenceCall, Use, StringLiteral, FunctionRef, Closure, Print, IntrinsicCall,
+            DirectCall, Unary, Binary, StringConcat
+        ) => true,
     }
 }
 
@@ -826,6 +865,7 @@ pub(super) fn flat_method_signature(
     }
     let name = match receiver {
         Type::Named(name) | Type::Generic(name, _) => name,
+        // Only named and generic receivers own method signatures.
         _ => return None,
     };
     let (params, ret) = if (ctx.is_interface)(name) {
@@ -852,14 +892,19 @@ pub(super) fn flat_method_signature(
 }
 
 fn flat_argument_modes_match(args: &[crate::ir::lowered::LirOperand], modes: &[ParamMode]) -> bool {
-    args.iter().enumerate().all(|(index, arg)| {
-        matches!(arg, crate::ir::lowered::LirOperand::Reference { .. })
-            == matches!(modes.get(index), Some(ParamMode::Reference { .. }))
-    })
+    args.iter()
+        .enumerate()
+        .all(|(index, arg)| match modes.get(index) {
+            Some(ParamMode::Reference { .. }) => {
+                matches!(arg, crate::ir::lowered::LirOperand::Reference { .. })
+            }
+            Some(ParamMode::Value) | None => arg.is_plain_value(),
+        })
 }
 fn flat_method_modes(receiver: &Type, method: &str, ctx: &LirTypeCtx<'_>) -> Vec<ParamMode> {
     let name = match receiver {
         Type::Named(name) | Type::Generic(name, _) => name,
+        // Only named and generic receivers can supply declared parameter modes.
         _ => return vec![],
     };
     if (ctx.is_interface)(name) {

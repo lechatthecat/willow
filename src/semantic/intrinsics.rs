@@ -258,6 +258,14 @@ impl<N: Clone + From<&'static str>> ResolvedMethod<N> {
     }
 }
 
+/// Storage that a resolved method can mutate, independent of allocation or GC.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntrinsicWrite {
+    None,
+    Receiver,
+    External,
+}
+
 impl Intrinsic {
     /// Every intrinsic, for exhaustiveness tests. A new variant that is not
     /// added here fails `all_variants_are_listed`.
@@ -459,6 +467,84 @@ impl Intrinsic {
             self,
             Intrinsic::ChannelSend | Intrinsic::ChannelRecv | Intrinsic::ChannelRecvOpt
         )
+    }
+
+    /// Writes to existing storage and whether the returned aggregate has private
+    /// outer storage. Snapshot elements can still alias their source elements.
+    pub(crate) fn storage_effect(self) -> (IntrinsicWrite, bool) {
+        use Intrinsic::*;
+        match self {
+            StringSplit
+            | ArrayCopy
+            | MapKeys
+            | MapValues
+            | MapEntries
+            | MapFreeze
+            | MapGet
+            | FrozenMapGet
+            | IntegerCheckedConvert
+            | ScalarParse
+            | I64CheckedAdd
+            | I64CheckedSub
+            | I64CheckedMul
+            | I64CheckedNeg
+            | StringFind => (IntrinsicWrite::None, true),
+            MapRemove => (IntrinsicWrite::Receiver, true),
+            ChannelRecvOpt => (IntrinsicWrite::External, true),
+            TaskCancel | TokenCancel | TokenChild | TokenAttach | ScopeCancel | ScopeChild
+            | ScopeAdd | ScopeFinish | ChannelSend | ChannelRecv | ChannelClose => {
+                (IntrinsicWrite::External, false)
+            }
+            AtomicStore
+            | AtomicSwap
+            | AtomicCompareExchange
+            | AtomicAdd
+            | AtomicSub
+            | CellSet
+            | RwCellWrite
+            | ArrayResize
+            | MapInsert => (IntrinsicWrite::Receiver, false),
+            I64ToString
+            | IntegerConvert
+            | IntegerWrappingConvert
+            | ScalarToString
+            | F64ToString
+            | BoolToString
+            | I64WrappingAdd
+            | I64WrappingSub
+            | I64WrappingMul
+            | I64WrappingNeg
+            | StringToString
+            | StringLen
+            | StringSubstring
+            | StringByteAt
+            | StringContains
+            | StringEndsWith
+            | StringReplace
+            | StringTrimStart
+            | StringTrimEnd
+            | StringToLower
+            | StringToUpper
+            | StringTrim
+            | StringRepeat
+            | StringStartsWith
+            | TaskIsCancelled
+            | TaskResult
+            | TokenIsCancelled
+            | ScopeIsCancelled
+            | AtomicLoad
+            | CellGet
+            | RwCellRead
+            | ArrayLen
+            | StringConcatArray
+            | StringDebug
+            | FrozenArrayLen
+            | MapContains
+            | MapLen
+            | MapToString
+            | FrozenMapContains
+            | FrozenMapLen => (IntrinsicWrite::None, false),
+        }
     }
 
     /// Every runtime symbol the lowering of this intrinsic can call, over all

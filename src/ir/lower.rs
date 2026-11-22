@@ -1913,7 +1913,12 @@ fn contract_expression(mut expression: HirExpr) -> HirExpr {
                 op: UnaryOp::Neg,
                 operand,
             } if operand.ty.integer_layout().is_some() => Some(6),
-            _ => None,
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
+                Index, Ternary, New, FieldAccess, MethodCall, ObjectLiteral, StaticField,
+                StaticCall, ReferenceArg, Range, Await, TryPropagate, Lambda, Match, Select
+            ) => None,
         };
         if let Some(op) = op {
             let int = |n| HirExpr {
@@ -1929,7 +1934,12 @@ fn contract_expression(mut expression: HirExpr) -> HirExpr {
                     zero.ty = operand.ty.clone();
                     (*operand, zero)
                 }
-                _ => unreachable!(),
+                ir_variants!(
+                    HirExprKind;
+                    Int, Float, Bool, Str, Var, FnRef, Call, Invoke, Print, Array, Index, Ternary,
+                    New, FieldAccess, MethodCall, ObjectLiteral, StaticField, StaticCall,
+                    ReferenceArg, Range, Await, TryPropagate, Lambda, Match, Select
+                ) => unreachable!(),
             };
             let layout = lhs
                 .ty

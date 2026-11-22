@@ -26,6 +26,7 @@ use crate::parser::ast::{ExprId, LockMode};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::{FunctionId, SemanticType as Type, TypeId};
 use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type};
+use std::collections::HashMap;
 
 use super::typed_ast::{
     HirCapture, HirDeferBody, HirDeferId, HirExpr, HirExprKind, HirFunction, HirGuard, HirParam,
@@ -36,6 +37,7 @@ pub mod async_liveness;
 pub mod cleanup;
 mod lifetime;
 mod liveness;
+pub(crate) use liveness::normal_successors;
 mod nested_cfg;
 pub mod value;
 pub use value::{LirOperand, LirPlace, LirRvalue};
@@ -378,10 +380,7 @@ impl LirSelectOp {
 }
 
 impl SuspendOp {
-    pub(crate) fn collect_locals(&self, out: &mut std::collections::HashSet<LirLocalId>) {
-        let mut insert = |local| {
-            out.insert(local);
-        };
+    pub(crate) fn for_each_local(&self, mut insert: impl FnMut(LirLocalId)) {
         match self {
             SuspendOp::Sleep { millis } => insert(*millis),
             SuspendOp::Yield | SuspendOp::Preempt => {}
@@ -720,11 +719,7 @@ pub(crate) fn lower_source_program_with(
     value::lower_calls(&mut functions, &mut lambdas, &program.resolution);
     // Calls through a value that can only be one named function become
     // direct calls before leaf inlining selects its call sites.
-    let direct: std::collections::HashSet<_> = functions
-        .iter()
-        .filter(|function| !function.is_async)
-        .map(|function| function.name)
-        .collect();
+    let direct = synchronous_function_indices(&functions);
     for function in functions
         .iter_mut()
         .chain(lambdas.iter_mut().map(|lambda| &mut lambda.function))
@@ -741,7 +736,13 @@ pub(crate) fn lower_source_program_with(
         super::optimize::eliminate_tail_recursion(function);
         super::optimize::inline_scalar_recursion(function, overflow_checks);
         super::optimize::unroll_scalar_loops(function);
-        super::optimize::fuse_string_concats(function);
+    }
+    super::optimize::fuse_program(&mut functions, &mut lambdas, &direct);
+    drop(direct);
+    for function in functions
+        .iter_mut()
+        .chain(lambdas.iter_mut().map(|lambda| &mut lambda.function))
+    {
         let liveness = lifetime::clear_dead_temporaries(function);
         function.async_frame = if function.is_async {
             #[cfg(test)]
@@ -762,6 +763,26 @@ pub(crate) fn lower_source_program_with(
         });
     }
     SourceProgram { functions, lambdas }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(in crate::ir) static DIRECT_INDEX_WORK: std::cell::Cell<(usize,usize)> = const { std::cell::Cell::new((0,0)) };
+}
+
+/// Both devirtualization and effect lookup use the function order established by lowering.
+pub(in crate::ir) fn synchronous_function_indices(
+    functions: &[SourceFunction],
+) -> HashMap<FunctionId, usize> {
+    let index: HashMap<_, _> = functions
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !f.is_async)
+        .map(|(i, f)| (f.name, i))
+        .collect();
+    #[cfg(test)]
+    DIRECT_INDEX_WORK.set((DIRECT_INDEX_WORK.get().0 + 1, index.len()));
+    index
 }
 
 /// Lift every lambda in a statement body, innermost first, into its own block
@@ -868,7 +889,12 @@ pub(crate) fn reference_place_name(place: &HirExpr) -> String {
                 suffixes.push((None, Some(index.as_ref())));
                 current = array;
             }
-            _ => break "<expression>".into(),
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, FnRef, Binary, Unary, Call, Invoke, Print, Array, Ternary,
+                New, MethodCall, ObjectLiteral, StaticField, StaticCall, ReferenceArg, Range,
+                Await, TryPropagate, Lambda, Match, Select
+            ) => break "<expression>".into(),
         }
     };
     for (field, index) in suffixes.into_iter().rev() {
@@ -880,7 +906,12 @@ pub(crate) fn reference_place_name(place: &HirExpr) -> String {
             match &index.kind {
                 HirExprKind::Int(value) => out.push_str(&value.to_string()),
                 HirExprKind::Var(name) => out.push_str(name),
-                _ => out.push_str("<expr>"),
+                ir_variants!(
+                    HirExprKind;
+                    Float, Bool, Str, FnRef, Binary, Unary, Call, Invoke, Print, Array, Index,
+                    Ternary, New, FieldAccess, MethodCall, ObjectLiteral, StaticField, StaticCall,
+                    ReferenceArg, Range, Await, TryPropagate, Lambda, Match, Select
+                ) => out.push_str("<expr>"),
             }
             out.push(']');
         }
@@ -1311,7 +1342,12 @@ fn expr_suspends_here(expr: &HirExpr) -> bool {
             builtin_types::unary_arg(&object.ty, B::Channel).is_some()
                 && matches!(method.as_str(), "send" | "recv" | "recv_opt")
         }
-        _ => false,
+        ir_variants!(
+            HirExprKind;
+            Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array, Index,
+            Ternary, New, FieldAccess, ObjectLiteral, StaticField, StaticCall, ReferenceArg,
+            Range, TryPropagate, Lambda, Match
+        ) => false,
     }
 }
 
@@ -1404,7 +1440,12 @@ fn hoistable_around(node: &HirExpr, target: &HirExpr, seen: &mut bool) -> bool {
                 ..
             } => !ancestors.contains(&std::ptr::from_ref(&**lhs)),
             HirExprKind::Select { .. } | HirExprKind::Lambda { .. } => true,
-            _ => false,
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
+                Index, New, FieldAccess, MethodCall, ObjectLiteral, StaticField, StaticCall,
+                ReferenceArg, Range, Await, TryPropagate
+            ) => false,
         };
         if conditional {
             return false;
@@ -1856,7 +1897,12 @@ impl Builder {
                 value: Box::new(capture(self, "print", value)),
                 newline: *newline,
             },
-            _ => return expr.clone(),
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Array, Index, Ternary, New,
+                FieldAccess, ObjectLiteral, StaticField, StaticCall, ReferenceArg, Range, Await,
+                TryPropagate, Lambda, Match, Select
+            ) => return expr.clone(),
         };
         out
     }
@@ -1923,6 +1969,7 @@ impl Builder {
                             SuspendOp::Sleep { millis }
                         }
                         ("yield", []) if builtin && value.ty == Type::Void => SuspendOp::Yield,
+                        // Other calls produce a task that must be evaluated before parking.
                         _ => {
                             let awaited = self.lower_operand_before_suspend(inner)?;
                             let name = self.synthetic_name("task");
@@ -1986,10 +2033,16 @@ impl Builder {
                             elem_ty,
                         }
                     }
+                    // Only these channel method and arity pairs park a task.
                     _ => return None,
                 }
             }
-            _ => return None,
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
+                Index, Ternary, New, FieldAccess, MethodCall, ObjectLiteral, StaticField,
+                StaticCall, ReferenceArg, Range, TryPropagate, Lambda, Match, Select
+            ) => return None,
         };
         let resume = self.new_block();
         self.terminate(SourceTerminator::Suspend { operation, resume });
@@ -2432,6 +2485,7 @@ impl Builder {
             {
                 Some((destination, value, rest))
             }
+            // Arms without a value-producing tail use ordinary scope lowering.
             _ => None,
         });
         match value_tail {
@@ -2561,28 +2615,23 @@ impl Builder {
     }
 
     fn flat_operand(&mut self, value: &HirExpr) -> LirOperand {
-        match &value.kind {
-            HirExprKind::Int(n) => LirOperand::integer(*n, &value.ty),
-            HirExprKind::Float(value) => LirOperand::Float(*value),
-            HirExprKind::Bool(value) => LirOperand::Bool(*value),
-            HirExprKind::Var(name) if self.local_by_name.contains_key(name) => {
-                LirOperand::Local(self.local_by_name[name])
-            }
-            _ => {
-                let name = self.synthetic_name("operand");
-                let local = self.declare_local(
-                    name,
-                    value.ty.clone(),
-                    None,
-                    LocalOptions {
-                        synthetic: true,
-                        parameter: false,
-                    },
-                );
-                self.lower_value_into(local, value);
-                LirOperand::Local(local)
-            }
+        if let Some(operand) =
+            LirOperand::from_flat_expr(value, |name| self.local_by_name.get(name).copied())
+        {
+            return operand;
         }
+        let name = self.synthetic_name("operand");
+        let local = self.declare_local(
+            name,
+            value.ty.clone(),
+            None,
+            LocalOptions {
+                synthetic: true,
+                parameter: false,
+            },
+        );
+        self.lower_value_into(local, value);
+        LirOperand::Local(local)
     }
 
     fn lower_nested_suspend(&mut self, value: &HirExpr) -> Option<HirExpr> {
@@ -2704,8 +2753,17 @@ impl Builder {
                     source = rhs;
                     current = target_rhs;
                 }
-                _ if can_fall_back => break,
-                _ => return None,
+                ir_variants!(
+                    HirExprKind;
+                    Int, Float, Bool, Str, Var, FnRef, Unary, Call, Invoke, Array, Index, Ternary,
+                    New, FieldAccess, MethodCall, ObjectLiteral, StaticField, StaticCall,
+                    ReferenceArg, Range, Await, TryPropagate, Lambda, Match, Select
+                ) => {
+                    if can_fall_back {
+                        break;
+                    }
+                    return None;
+                }
             }
         }
         Some(out)
@@ -2734,7 +2792,12 @@ impl Builder {
                 }
                 return self.lower_conditional_branches(value, lhs, &constant, rhs);
             }
-            _ => return None,
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
+                Index, New, FieldAccess, MethodCall, ObjectLiteral, StaticField, StaticCall,
+                ReferenceArg, Range, Await, TryPropagate, Lambda, Match, Select
+            ) => return None,
         };
         self.lower_conditional_branches(value, condition, then_expr, else_expr)
     }
@@ -2806,7 +2869,7 @@ impl Builder {
         );
         match self.lower_root_suspend(condition, Some(local)) {
             Some(Some(value)) => value,
-            _ => self
+            Some(None) | None => self
                 .lower_nested_suspend(condition)
                 .unwrap_or_else(|| condition.clone()),
         }
@@ -2869,7 +2932,12 @@ impl Builder {
                     element: place.ty.clone(),
                 }
             }
-            _ => return None,
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, FnRef, Binary, Unary, Call, Invoke, Print, Array, Ternary,
+                New, MethodCall, ObjectLiteral, StaticField, StaticCall, ReferenceArg, Range,
+                Await, TryPropagate, Lambda, Match, Select
+            ) => return None,
         };
         let argument = LirOperand::Reference {
             place: captured.clone(),
@@ -2915,7 +2983,16 @@ impl Builder {
                 });
             }
             (HirExprKind::Var(_), LirPlace::Local(_)) => {}
-            _ => unreachable!(),
+            // A reserved place must pair the source form with the matching storage.
+            (
+                ir_variants!(
+                    HirExprKind;
+                    Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
+                    Index, Ternary, New, FieldAccess, MethodCall, ObjectLiteral, StaticField,
+                    StaticCall, ReferenceArg, Range, Await, TryPropagate, Lambda, Match, Select
+                ),
+                _,
+            ) => unreachable!(),
         }
         Some(argument)
     }
@@ -3295,7 +3372,10 @@ impl Builder {
                 .iter()
                 .filter_map(|operation| match operation {
                     LirSelectOp::Timeout { deadline, .. } => Some(LirOperand::Local(*deadline)),
-                    _ => None,
+                    LirSelectOp::Recv { .. }
+                    | LirSelectOp::Send { .. }
+                    | LirSelectOp::Join { .. }
+                    | LirSelectOp::Default => None,
                 })
                 .collect();
             self.push(SourceInst::Compute {
@@ -3437,7 +3517,10 @@ impl Builder {
             let terminator_calls = match &terminator {
                 SourceTerminator::Branch { cond, .. } => expression_executes_call(cond),
                 SourceTerminator::Return(Some(value)) => expression_executes_call(value),
-                _ => false,
+                SourceTerminator::Jump(_)
+                | SourceTerminator::Suspend { .. }
+                | SourceTerminator::Return(_)
+                | SourceTerminator::CleanupReturn => false,
             };
             if terminator_calls {
                 let resume = self.new_block();
@@ -3521,6 +3604,7 @@ impl Builder {
                     );
                     Some((id, *span))
                 }
+                // Only defer declarations reserve cleanup sites at scope entry.
                 _ => None,
             })
             .collect();
@@ -4284,9 +4368,18 @@ impl Builder {
         // inside the body changes how far the walk goes.
         let bound_expr: HirExpr;
         let element_binding: HirExpr;
-        match (&iterable.kind, &iterable.ty) {
+        let literal_bounds = match &iterable.kind {
+            HirExprKind::Range { start, end } => Some((start, end)),
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
+                Index, Ternary, New, FieldAccess, MethodCall, ObjectLiteral, StaticField,
+                StaticCall, ReferenceArg, Await, TryPropagate, Lambda, Match, Select
+            ) => None,
+        };
+        match (literal_bounds, &iterable.ty) {
             // for x in start..end  →  i = start; while i < end { x = i; .. }
-            (HirExprKind::Range { start, end }, _) => {
+            (Some((start, end)), _) => {
                 let bound_name = format!("__for{n}_end");
                 self.push_synth_let(&i_name, true, (**start).clone());
                 self.push_synth_let(&bound_name, false, (**end).clone());
@@ -4298,12 +4391,13 @@ impl Builder {
                 element_binding = i64_var(&i_name);
             }
             // for x in arr  →  a = arr; i = 0; while i < a.len() { x = a[i]; .. }
-            (_, ty)
+            (None, ty)
                 if matches!(ty, Type::Array(_))
                     || builtin_types::unary_arg(ty, B::FrozenArray).is_some() =>
             {
                 let elem = match ty {
                     Type::Array(elem) => elem.as_ref(),
+                    // The guard above admits FrozenArray as the other representation.
                     _ => builtin_types::unary_arg(ty, B::FrozenArray).unwrap(),
                 };
                 let arr_name = format!("__for{n}_arr");
@@ -4357,7 +4451,7 @@ impl Builder {
             // immutable, so re-reading them per iteration could only cost
             // loads, and hoisting the value itself keeps a call in the iterable
             // position from running twice.
-            (_, Type::Generic(g, args))
+            (None, Type::Generic(g, args))
                 if g.namespace().is_none()
                     && B::from_name(g.name().as_ref()) == Some(B::Range)
                     && args.first() == Some(&Type::I64) =>
@@ -4387,7 +4481,7 @@ impl Builder {
                 };
                 element_binding = i64_var(&i_name);
             }
-            _ => {
+            (None, _) => {
                 // The HIR lowering only produces array/range iterables.
                 unreachable!("for over unsupported iterable reached LIR lowering")
             }
@@ -4948,7 +5042,13 @@ impl Builder {
                 Some(SourceTerminator::Return(None)) if f.return_type != Type::Void => continue,
                 Some(SourceTerminator::Return(value)) => value.take(),
                 None if f.return_type == Type::Void => None,
-                _ => continue,
+                Some(
+                    SourceTerminator::Jump(_)
+                    | SourceTerminator::Branch { .. }
+                    | SourceTerminator::Suspend { .. }
+                    | SourceTerminator::CleanupReturn,
+                )
+                | None => continue,
             };
             if let Some(value) = value {
                 self.blocks[index].0.push(if let Some(local) = result {

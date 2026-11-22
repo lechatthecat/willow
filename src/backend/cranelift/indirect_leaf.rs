@@ -3,6 +3,7 @@
 //! unknown targets still use the ordinary checked indirect call.
 use super::*;
 use crate::diagnostics::Span;
+use crate::ir::ir_variants;
 use crate::ir::lowered::{LirFunction, LirInst, LirLocalId, LirOperand, LirRvalue, Terminator};
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 use cranelift_module::Module;
@@ -99,7 +100,17 @@ impl Leaf {
                                 op,
                                 BinOp::Div | BinOp::Rem | BinOp::Pow | BinOp::And | BinOp::Or
                             ) => {}
-                        _ => return None,
+                        ir_variants!(
+                            LirRvalue;
+                            BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait, Coerce,
+                            ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc,
+                            FieldLoad, FieldStore, StaticField, StaticStore, StaticCall,
+                            EnumAlloc, EnumPayloadStore, ConstructorCall, Range, EnumMethod,
+                            BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
+                            RebindResultError, IntoError, PrepareMethod, MethodCall,
+                            StringLiteral, FunctionRef, Closure, Print, IntrinsicCall, DirectCall,
+                            IndirectCall, Binary, StringConcat
+                        ) => return None,
                     }
                     operations.push((*local, value.clone()));
                 }
@@ -107,7 +118,12 @@ impl Leaf {
                     operations.push((*local, LirRvalue::Use(value.clone())))
                 }
                 LirInst::ClearScopeRoots { .. } => {}
-                _ => return None,
+                ir_variants!(
+                    LirInst;
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, SelectInit, SelectProbe,
+                    SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
+                    Unsupported
+                ) => return None,
             }
         }
         let param_locals = function
@@ -145,7 +161,7 @@ impl FuncGen<'_, '_> {
             LirOperand::Int(n) => self.builder.ins().iconst(types::I64, *n),
             LirOperand::Float(n) => self.builder.ins().f64const(*n),
             LirOperand::Bool(b) => self.builder.ins().iconst(types::I8, i64::from(*b)),
-            _ => unreachable!("scalar leaf operand"),
+            LirOperand::Reference { .. } => unreachable!("scalar leaf operand"),
         }
     }
 
@@ -285,7 +301,16 @@ impl FuncGen<'_, '_> {
                     let r = self.scalar_leaf_operand(rhs, &locals);
                     self.emit_lir_binop(op, l, r, operand_ty)
                 }
-                _ => unreachable!("validated scalar leaf operation"),
+                ir_variants!(
+                    LirRvalue;
+                    BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait, Coerce,
+                    ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc, FieldLoad,
+                    FieldStore, StaticField, StaticStore, StaticCall, EnumAlloc, EnumPayloadStore,
+                    ConstructorCall, Range, EnumMethod, BuiltinCall, FormatScalar, Panic, Recover,
+                    ReferenceDebug, RebindResultError, IntoError, PrepareMethod, MethodCall,
+                    StringLiteral, FunctionRef, Closure, Print, IntrinsicCall, DirectCall,
+                    IndirectCall, StringConcat
+                ) => unreachable!("validated scalar leaf operation"),
             };
             locals[id.0 as usize] = Some(value);
         }

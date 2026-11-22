@@ -12,7 +12,8 @@
 //! width lookup, and O(blocks + locals + largest block) auxiliary space.
 
 use super::transient_roots::{inst_locals, terminator_locals};
-use crate::ir::lowered::{LirFunction, LirInst, LirLocalId, LirOperand};
+use crate::ir::ir_variants;
+use crate::ir::lowered::{LirFunction, LirInst, LirLocalId};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
@@ -59,7 +60,7 @@ pub(super) fn groups(f: &LirFunction, widths: &[Option<u32>]) -> Vec<Vec<LirLoca
                 LirInst::Compute { local, value, .. } => {
                     for operand in value.operands() {
                         for id in operand.locals() {
-                            if matches!(operand, LirOperand::Reference { .. }) {
+                            if !operand.is_plain_value() {
                                 states[id.0 as usize] = Lifetime::Rejected;
                             } else {
                                 touch(&mut states, id, block_index, at);
@@ -70,7 +71,7 @@ pub(super) fn groups(f: &LirFunction, widths: &[Option<u32>]) -> Vec<Vec<LirLoca
                 }
                 LirInst::Let { local, value, .. } => {
                     for id in value.locals() {
-                        if matches!(value, LirOperand::Reference { .. }) {
+                        if !value.is_plain_value() {
                             states[id.0 as usize] = Lifetime::Rejected;
                         } else {
                             touch(&mut states, id, block_index, at);
@@ -84,7 +85,12 @@ pub(super) fn groups(f: &LirFunction, widths: &[Option<u32>]) -> Vec<Vec<LirLoca
                     }
                     None
                 }
-                _ => {
+                ir_variants!(
+                    LirInst;
+                    Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, SelectInit,
+                    SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
+                    MatchTest, MatchBind, Unsupported
+                ) => {
                     // Includes mutable assignments, match bindings, select,
                     // locks and defer captures. Keep their original storage.
                     for id in inst_locals(inst) {
@@ -150,7 +156,7 @@ mod tests {
     use super::*;
     use crate::diagnostics::Span;
     use crate::ir::lowered::{
-        BlockId, LirBlock, LirLocal, LirPlace, LirRvalue, LirStorageKind, Terminator,
+        BlockId, LirBlock, LirLocal, LirOperand, LirPlace, LirRvalue, LirStorageKind, Terminator,
     };
     use crate::semantic::ids::SemanticType as Type;
 

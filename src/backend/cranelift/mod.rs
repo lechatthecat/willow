@@ -1,3 +1,4 @@
+use crate::ir::ir_variants;
 use crate::qualified_name::QualifiedName;
 use anyhow::Result;
 use cranelift_codegen::ir::{
@@ -3616,7 +3617,7 @@ mod tests {
 pub(super) fn lir_address_taken_locals(
     function: &crate::ir::lowered::LirFunction,
 ) -> HashSet<String> {
-    use crate::ir::lowered::{LirInst, LirOperand, LirPlace};
+    use crate::ir::lowered::LirInst;
     let mut names = HashSet::new();
     let mut pending = vec![function];
     while let Some(function) = pending.pop() {
@@ -3625,17 +3626,18 @@ pub(super) fn lir_address_taken_locals(
                 match instruction {
                     LirInst::Compute { value, .. } => {
                         for operand in value.operands() {
-                            if let LirOperand::Reference {
-                                place: LirPlace::Local(local),
-                                ..
-                            } = operand
-                            {
+                            if let Some(local) = operand.borrowed_local() {
                                 names.insert(function.locals[local.0 as usize].name.clone());
                             }
                         }
                     }
                     LirInst::Defer { body, .. } => pending.push(&body.function),
-                    _ => {}
+                    ir_variants!(
+                        LirInst;
+                        Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                        ClearScopeRoots, SelectInit, SelectProbe, SelectPick, SelectUnregister,
+                        SelectCommit, ReleaseLock, MatchTest, MatchBind, Unsupported
+                    ) => {}
                 }
             }
         }

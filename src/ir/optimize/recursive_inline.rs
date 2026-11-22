@@ -8,7 +8,6 @@ use crate::ir::lowered::{
 };
 use crate::ir::typed_ast::{HirExpr, HirExprKind};
 use crate::parser::ast::BinOp;
-use crate::semantic::ids::SemanticType as Type;
 
 /// With `overflow_checks` (debug builds), checked integer arithmetic is a
 /// fault whose call stack must keep every recursive frame.
@@ -17,38 +16,22 @@ pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_ch
     const MAX_DEPTH: u32 = 3;
     const MAX_INSTRUCTIONS: usize = 256;
     const MAX_BLOCKS: usize = 64;
-    let scalar = |ty: &Type| {
-        matches!(
-            ty,
-            Type::I8
-                | Type::I16
-                | Type::I32
-                | Type::U16
-                | Type::U32
-                | Type::U64
-                | Type::Char
-                | Type::U8
-                | Type::I64
-                | Type::F64
-                | Type::Bool
-        )
-    };
     if function.is_async
         || !function.captures.is_empty()
-        || !scalar(&function.return_type)
+        || !super::inline_scalar_type(&function.return_type)
         || function.params.iter().any(|p| p.by_reference)
         || function.locals.len() > 32
         || function
             .locals
             .iter()
-            .any(|l| l.is_gc_owner() || !scalar(&l.ty))
+            .any(|l| l.is_gc_owner() || !super::inline_scalar_type(&l.ty))
         || function.blocks.is_empty()
         || function.blocks.len() > 6
     {
         return;
     }
     let leaf = |e: &HirExpr| {
-        scalar(&e.ty)
+        super::inline_scalar_type(&e.ty)
             && matches!(
                 e.kind,
                 HirExprKind::Var(_)
@@ -70,11 +53,7 @@ pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_ch
             instructions += 1;
             match inst {
                 SourceInst::Compute { value, .. } => {
-                    if value
-                        .operands()
-                        .iter()
-                        .any(|op| matches!(op, LirOperand::Reference { .. }))
-                    {
+                    if value.operands().iter().any(|op| !op.is_plain_value()) {
                         return;
                     }
                     if overflow_checks && value.has_overflow_check() {
@@ -89,11 +68,27 @@ pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_ch
                         {
                             calls += 1
                         }
-                        _ => return,
+                        ir_variants!(
+                            LirRvalue;
+                            BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait, Coerce,
+                            ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc,
+                            FieldLoad, FieldStore, StaticField, StaticStore, StaticCall,
+                            EnumAlloc, EnumPayloadStore, ConstructorCall, Range, EnumMethod,
+                            BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
+                            RebindResultError, IntoError, PrepareMethod, MethodCall,
+                            StringLiteral, FunctionRef, Closure, Print, IntrinsicCall, DirectCall,
+                            IndirectCall, Binary, StringConcat
+                        ) => return,
                     }
                 }
                 SourceInst::ClearScopeRoots { .. } => {} // all locals proved scalar
-                _ => return,
+                ir_variants!(
+                    SourceInst;
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, Let, Assign,
+                    FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
+                    SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
+                    MatchTest, MatchBind, Expr
+                ) => return,
             }
         }
         match &block.terminator {
@@ -106,7 +101,10 @@ pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_ch
                 edges[block.id.0].extend([then_block.0, else_block.0]);
             }
             SourceTerminator::Return(Some(value)) if leaf(value) => returns += 1,
-            _ => return,
+            SourceTerminator::Branch { .. }
+            | SourceTerminator::Suspend { .. }
+            | SourceTerminator::Return(_)
+            | SourceTerminator::CleanupReturn => return,
         }
         for &target in &edges[block.id.0] {
             incoming[target] += 1;
@@ -189,7 +187,11 @@ pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_ch
             }
             let remap_operand = |operand: &LirOperand| match operand {
                 LirOperand::Local(id) => LirOperand::Local(remap_id(*id)),
-                _ => operand.clone(),
+                LirOperand::Int(_)
+                | LirOperand::Integer { .. }
+                | LirOperand::Float(_)
+                | LirOperand::Bool(_)
+                | LirOperand::Reference { .. } => operand.clone(),
             };
             let remap_expr = |expr: &HirExpr| {
                 let mut copy = expr.clone();
@@ -263,7 +265,17 @@ pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_ch
                             params: params.clone(),
                             result: result.clone(),
                         },
-                        _ => unreachable!("candidate operations validated"),
+                        ir_variants!(
+                            LirRvalue;
+                            BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait, Coerce,
+                            ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc,
+                            FieldLoad, FieldStore, StaticField, StaticStore, StaticCall,
+                            EnumAlloc, EnumPayloadStore, ConstructorCall, Range, EnumMethod,
+                            BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
+                            RebindResultError, IntoError, PrepareMethod, MethodCall,
+                            StringLiteral, FunctionRef, Closure, Print, IntrinsicCall,
+                            IndirectCall, StringConcat
+                        ) => unreachable!("candidate operations validated"),
                     };
                     instrs.push(SourceInst::Compute {
                         local: remap_id(*local),
@@ -283,15 +295,9 @@ pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_ch
                         else_block: remap_block(*else_block),
                     },
                     SourceTerminator::Return(Some(value)) => {
-                        let operand = match &value.kind {
-                            HirExprKind::Var(name) => {
-                                LirOperand::Local(remap_id(names[name.as_str()]))
-                            }
-                            HirExprKind::Int(n) => LirOperand::integer(*n, &value.ty),
-                            HirExprKind::Float(n) => LirOperand::Float(*n),
-                            HirExprKind::Bool(b) => LirOperand::Bool(*b),
-                            _ => unreachable!(),
-                        };
+                        let operand =
+                            LirOperand::from_flat_expr(value, |name| Some(remap_id(names[name])))
+                                .unwrap_or_else(|| unreachable!());
                         instrs.push(SourceInst::Compute {
                             local: destination,
                             value: LirRvalue::Use(operand),
@@ -299,7 +305,11 @@ pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_ch
                         });
                         SourceTerminator::Jump(continuation)
                     }
-                    _ => unreachable!("candidate terminators validated"),
+                    SourceTerminator::Suspend { .. }
+                    | SourceTerminator::Return(_)
+                    | SourceTerminator::CleanupReturn => {
+                        unreachable!("candidate terminators validated")
+                    }
                 };
                 function.blocks.push(SourceBlock {
                     id: remap_block(source.id),

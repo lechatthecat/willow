@@ -55,12 +55,17 @@ pub enum LirPlace {
 }
 
 impl LirPlace {
-    pub fn locals(&self) -> Vec<LirLocalId> {
+    fn base_and_index(&self) -> (LirLocalId, Option<LirLocalId>) {
         match self {
-            Self::Local(local) => vec![*local],
-            Self::Field { object, .. } => vec![*object],
-            Self::ArrayElement { owner, index, .. } => vec![*owner, *index],
+            Self::Local(local) => (*local, None),
+            Self::Field { object, .. } => (*object, None),
+            Self::ArrayElement { owner, index, .. } => (*owner, Some(*index)),
         }
+    }
+
+    pub fn locals(&self) -> Vec<LirLocalId> {
+        let (base, index) = self.base_and_index();
+        std::iter::once(base).chain(index).collect()
     }
     pub fn ty(&self, locals: &[LirLocal]) -> Option<Type> {
         match self {
@@ -93,10 +98,56 @@ impl LirPlace {
 }
 
 impl LirOperand {
+    /// True for direct values that do not capture a storage location.
+    pub(crate) fn is_plain_value(&self) -> bool {
+        match self {
+            Self::Local(_)
+            | Self::Int(_)
+            | Self::Integer { .. }
+            | Self::Float(_)
+            | Self::Bool(_) => true,
+            Self::Reference { .. } => false,
+        }
+    }
+
+    /// The local whose own slot supplies the borrowed storage, if any.
+    pub(crate) fn borrowed_local(&self) -> Option<LirLocalId> {
+        match self {
+            Self::Reference { place, .. } => match place {
+                LirPlace::Local(local) => Some(*local),
+                LirPlace::Field { .. } | LirPlace::ArrayElement { .. } => None,
+            },
+            Self::Local(_)
+            | Self::Int(_)
+            | Self::Integer { .. }
+            | Self::Float(_)
+            | Self::Bool(_) => None,
+        }
+    }
+
+    /// Read an immediate or resolve a local without lowering an expression tree.
+    pub(in crate::ir) fn from_flat_expr(
+        expr: &HirExpr,
+        local: impl FnOnce(&str) -> Option<LirLocalId>,
+    ) -> Option<Self> {
+        match &expr.kind {
+            HirExprKind::Var(name) => local(name).map(Self::Local),
+            HirExprKind::Int(value) => Some(Self::integer(*value, &expr.ty)),
+            HirExprKind::Float(value) => Some(Self::Float(*value)),
+            HirExprKind::Bool(value) => Some(Self::Bool(*value)),
+            ir_variants!(
+                HirExprKind;
+                Str, FnRef, Binary, Unary, Call, Invoke, Print, Array, Index, Ternary, New,
+                FieldAccess, MethodCall, ObjectLiteral, StaticField, StaticCall, ReferenceArg,
+                Range, Await, TryPropagate, Lambda, Match, Select
+            ) => None,
+        }
+    }
+
     pub(crate) fn integer_value(&self) -> Option<i64> {
         match self {
             Self::Int(n) | Self::Integer { value: n, .. } => Some(*n),
-            _ => None,
+            Self::Local(_) | Self::Float(_) | Self::Bool(_) | Self::Reference { .. } => None,
         }
     }
     pub(crate) fn integer(value: i64, ty: &Type) -> Self {
@@ -109,12 +160,20 @@ impl LirOperand {
             }
         }
     }
+    pub(crate) fn iter_locals(&self) -> impl Iterator<Item = LirLocalId> {
+        let (first, second) = match self {
+            Self::Local(local) => (Some(*local), None),
+            Self::Reference { place, .. } => {
+                let (base, index) = place.base_and_index();
+                (Some(base), index)
+            }
+            Self::Int(_) | Self::Integer { .. } | Self::Float(_) | Self::Bool(_) => (None, None),
+        };
+        first.into_iter().chain(second)
+    }
+
     pub fn locals(&self) -> Vec<LirLocalId> {
-        match self {
-            Self::Local(local) => vec![*local],
-            Self::Reference { place, .. } => place.locals(),
-            _ => Vec::new(),
-        }
+        self.iter_locals().collect()
     }
     pub fn ty(&self, locals: &[LirLocal]) -> Option<Type> {
         match self {
@@ -392,7 +451,16 @@ impl LirRvalue {
                 ..
             } => is_overflow_checked_binary(op, rhs, operand_ty),
             Self::Unary { op, operand, ty } => is_overflow_checked_unary(op, operand, ty),
-            _ => false,
+            ir_variants!(
+                Self;
+                BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait, Coerce,
+                ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc, FieldLoad,
+                FieldStore, StaticField, StaticStore, StaticCall, EnumAlloc, EnumPayloadStore,
+                ConstructorCall, Range, EnumMethod, BuiltinCall, FormatScalar, Panic, Recover,
+                ReferenceDebug, RebindResultError, IntoError, PrepareMethod, MethodCall,
+                StringLiteral, FunctionRef, Closure, Print, IntrinsicCall, DirectCall,
+                IndirectCall, StringConcat
+            ) => false,
         }
     }
 
@@ -400,84 +468,76 @@ impl LirRvalue {
         let Some(destination) = locals.get(destination.0 as usize) else {
             return false;
         };
+        // Check the operand kind during type lookup. Calls that can pass a
+        // reference check its place type directly in their own arms.
+        let plain_ty = |operand: &LirOperand| {
+            if operand.is_plain_value() {
+                operand.ty(locals)
+            } else {
+                None
+            }
+        };
         if let Self::CaptureArrayOwner { array, index } = self {
             return destination.is_gc_owner()
-                && matches!(array.ty(locals), Some(Type::Array(_)))
-                && index.ty(locals) == Some(Type::I64);
+                && matches!(plain_ty(array), Some(Type::Array(_)))
+                && plain_ty(index) == Some(Type::I64);
         }
         if destination.is_gc_owner() {
             return false;
         }
-        if self
-            .operands()
-            .iter()
-            .any(|operand| matches!(operand, LirOperand::Reference { .. }))
-            && !matches!(
-                self,
-                Self::DirectCall { .. }
-                    | Self::MethodCall { .. }
-                    | Self::StaticCall { .. }
-                    | Self::ConstructorCall { .. }
-                    | Self::StartTask { .. }
-                    | Self::ReferenceDebug { .. }
-            )
-        {
-            return false;
-        }
-        let ty = |operand: &LirOperand| operand.ty(locals);
         match self {
             Self::BeginReferenceCall => destination.ty == Type::Void,
             Self::CaptureArrayOwner { .. } => false,
-            Self::ReferenceDebug { argument, .. } => destination.ty == Type::Void && matches!(argument, LirOperand::Reference { .. }) && ty(argument).is_some(),
-            Self::Use(operand) => ty(operand).as_ref() == Some(&destination.ty),
-            Self::StartTask { args, params, output, .. } => matches!(&destination.ty, Type::Generic(name, payloads) if builtin_types::resolve_name(name) == Some(Builtin::Task) && payloads == std::slice::from_ref(output)) && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| ty(arg).as_ref() == Some(param)),
-            Self::AwaitFuture { future, result } => destination.ty == *result && matches!(ty(future).as_ref(), Some(Type::Generic(name, payloads)) if builtin_types::resolve_name(name) == Some(Builtin::Future) && payloads == std::slice::from_ref(result)),
-            Self::SelectIdleWait { deadlines } => destination.ty == Type::Void && deadlines.iter().all(|operand| ty(operand) == Some(Type::I64)),
-            Self::Coerce { value, source, target } => ty(value).as_ref() == Some(source) && destination.ty == *target,
+            Self::ReferenceDebug { argument, .. } => destination.ty == Type::Void && matches!(argument, LirOperand::Reference { .. }) && argument.ty(locals).is_some(),
+            Self::Use(operand) => plain_ty(operand).as_ref() == Some(&destination.ty),
+            Self::StartTask { args, params, output, .. } => matches!(&destination.ty, Type::Generic(name, payloads) if builtin_types::resolve_name(name) == Some(Builtin::Task) && payloads == std::slice::from_ref(output)) && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| arg.ty(locals).as_ref() == Some(param)),
+            Self::AwaitFuture { future, result } => destination.ty == *result && matches!(plain_ty(future).as_ref(), Some(Type::Generic(name, payloads)) if builtin_types::resolve_name(name) == Some(Builtin::Future) && payloads == std::slice::from_ref(result)),
+            Self::SelectIdleWait { deadlines } => destination.ty == Type::Void && deadlines.iter().all(|operand| plain_ty(operand) == Some(Type::I64)),
+            Self::Coerce { value, source, target } => plain_ty(value).as_ref() == Some(source) && destination.ty == *target,
             Self::ArrayAlloc { element, .. } => destination.ty == Type::Array(Box::new(element.clone())),
-            Self::ArrayStore { array, index, value, element } => ty(array) == Some(Type::Array(Box::new(element.clone()))) && ty(index) == Some(Type::I64) && ty(value).is_some() && destination.ty == Type::Void,
-            Self::Index { array, index, element } => ty(index) == Some(Type::I64) && destination.ty == *element && ty(array).is_some_and(|array| match &array { Type::Array(inner) => **inner == *element, Type::Generic(name, args) => crate::semantic::builtin_types::resolve_name(name) == Some(crate::semantic::builtin_types::BuiltinTypeId::FrozenArray) && args == std::slice::from_ref(element), _ => false }),
+            Self::ArrayStore { array, index, value, element } => plain_ty(array) == Some(Type::Array(Box::new(element.clone()))) && plain_ty(index) == Some(Type::I64) && plain_ty(value).is_some() && destination.ty == Type::Void,
+            Self::Index { array, index, element } => plain_ty(index) == Some(Type::I64) && destination.ty == *element && plain_ty(array).is_some_and(|array| match &array { Type::Array(inner) => **inner == *element, Type::Generic(name, args) => crate::semantic::builtin_types::resolve_name(name) == Some(crate::semantic::builtin_types::BuiltinTypeId::FrozenArray) && args == std::slice::from_ref(element), _ => false }),
             Self::ObjectAlloc { class } => destination.ty == Type::Named(*class),
-            Self::FieldLoad { object, object_ty, result, .. } => ty(object).as_ref() == Some(object_ty) && destination.ty == *result,
-            Self::FieldStore { object, object_ty, value, .. } => ty(object).as_ref() == Some(object_ty) && ty(value).is_some() && destination.ty == Type::Void,
+            Self::FieldLoad { object, object_ty, result, .. } => plain_ty(object).as_ref() == Some(object_ty) && destination.ty == *result,
+            Self::FieldStore { object, object_ty, value, .. } => plain_ty(object).as_ref() == Some(object_ty) && plain_ty(value).is_some() && destination.ty == Type::Void,
             Self::StaticField { result, .. } => destination.ty == *result,
-            Self::StaticStore { value, .. } => ty(value).is_some() && destination.ty == Type::Void,
-            Self::ConstructorCall { object, class, args, arg_types } => ty(object) == Some(Type::Named(*class)) && destination.ty == Type::Void && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| ty(arg).as_ref() == Some(expected)),
-            Self::Range { start, end } => ty(start) == Some(Type::I64) && ty(end) == Some(Type::I64) && matches!(&destination.ty, Type::Generic(name, payloads) if builtin_types::resolve_name(name) == Some(Builtin::Range) && payloads == &[Type::I64]),
-            Self::EnumMethod { receiver, receiver_ty, args, arg_types, result, .. } => ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| ty(arg).as_ref() == Some(expected)),
-            Self::BuiltinCall { args, params, result, .. } => destination.ty == *result && args.len() == params.len() && args.iter().zip(params).all(|(arg, expected)| ty(arg).as_ref() == Some(expected)),
-            Self::StaticCall { args, arg_types, result, .. } => destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| ty(arg).as_ref() == Some(expected)),
+            Self::StaticStore { value, .. } => plain_ty(value).is_some() && destination.ty == Type::Void,
+            Self::ConstructorCall { object, class, args, arg_types } => plain_ty(object) == Some(Type::Named(*class)) && destination.ty == Type::Void && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| arg.ty(locals).as_ref() == Some(expected)),
+            Self::Range { start, end } => plain_ty(start) == Some(Type::I64) && plain_ty(end) == Some(Type::I64) && matches!(&destination.ty, Type::Generic(name, payloads) if builtin_types::resolve_name(name) == Some(Builtin::Range) && payloads == &[Type::I64]),
+            Self::EnumMethod { receiver, receiver_ty, args, arg_types, result, .. } => plain_ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| plain_ty(arg).as_ref() == Some(expected)),
+            Self::BuiltinCall { args, params, result, .. } => destination.ty == *result && args.len() == params.len() && args.iter().zip(params).all(|(arg, expected)| plain_ty(arg).as_ref() == Some(expected)),
+            Self::StaticCall { args, arg_types, result, .. } => destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| arg.ty(locals).as_ref() == Some(expected)),
             Self::EnumAlloc { enum_ty, .. } => destination.ty == *enum_ty,
-            Self::EnumPayloadStore { object, value, source, enum_ty, .. } => ty(object).as_ref() == Some(enum_ty) && ty(value).as_ref() == Some(source) && destination.ty == *enum_ty,
-            Self::FormatScalar { value, ty: expected, format } => ty(value).as_ref() == Some(expected) && destination.ty == Type::String && if format.is_some() { *expected == Type::F64 } else { matches!(expected, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String) },
-            Self::Panic { message } => ty(message) == Some(Type::String) && destination.ty == Type::Never,
+            Self::EnumPayloadStore { object, value, source, enum_ty, .. } => plain_ty(object).as_ref() == Some(enum_ty) && plain_ty(value).as_ref() == Some(source) && destination.ty == *enum_ty,
+            Self::FormatScalar { value, ty: expected, format } => plain_ty(value).as_ref() == Some(expected) && destination.ty == Type::String && if format.is_some() { *expected == Type::F64 } else { matches!(expected, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String) },
+            Self::Panic { message } => plain_ty(message) == Some(Type::String) && destination.ty == Type::Never,
             Self::Recover => destination.ty == Type::Generic(TypeId::local(Builtin::Option.source_name()), vec![Type::Named(TypeId::local("PanicInfo"))]),
-            Self::RebindResultError { value, source, target } | Self::IntoError { value, source, target } => ty(value).as_ref() == Some(source) && destination.ty == *target,
-            Self::PrepareMethod { receiver, receiver_ty, .. } => ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *receiver_ty,
-            Self::MethodCall { receiver, receiver_ty, args, arg_types, result, .. } => ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| ty(arg).as_ref() == Some(expected)),
+            Self::RebindResultError { value, source, target } | Self::IntoError { value, source, target } => plain_ty(value).as_ref() == Some(source) && destination.ty == *target,
+            Self::PrepareMethod { receiver, receiver_ty, .. } => plain_ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *receiver_ty,
+            Self::MethodCall { receiver, receiver_ty, args, arg_types, result, .. } => plain_ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *result && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| arg.ty(locals).as_ref() == Some(expected)),
             Self::IntrinsicCall { intrinsic, method, receiver, receiver_ty, args, arg_types, result } => {
-                ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *result
-                    && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| ty(arg).as_ref() == Some(expected))
+                plain_ty(receiver).as_ref() == Some(receiver_ty) && destination.ty == *result
+                    && args.len() == arg_types.len() && args.iter().zip(arg_types).all(|(arg, expected)| plain_ty(arg).as_ref() == Some(expected))
                     && crate::semantic::intrinsics::resolve(receiver_ty, method, args.len()).is_some_and(|resolved|
                         resolved.intrinsic == *intrinsic && resolved.return_type(|i| arg_types.get(i).cloned()) == *result)
             }
             Self::StringLiteral(_) => destination.ty == Type::String,
             Self::FunctionRef { ty, .. } => destination.ty == *ty && matches!(ty, Type::Fn(..) | Type::Closure(..)),
             Self::Closure { captures, ty: result, .. } => destination.ty == *result
-                && matches!(result, Type::Fn(..) | Type::Closure(..)) && captures.iter().all(|capture| ty(capture).is_some()),
+                && matches!(result, Type::Fn(..) | Type::Closure(..)) && captures.iter().all(|capture| plain_ty(capture).is_some()),
             Self::Print { value, ty: expected, .. } => destination.ty == Type::Void
-                && ty(value).as_ref() == Some(expected) && matches!(expected, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String),
+                && plain_ty(value).as_ref() == Some(expected) && matches!(expected, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String),
             Self::DirectCall { args, params, result, .. } => destination.ty == *result
-                && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| ty(arg).as_ref() == Some(param)),
+                && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| arg.ty(locals).as_ref() == Some(param)),
             Self::IndirectCall { callee, args, params, result, .. } => destination.ty == *result
-                && ty(callee).is_some_and(|callee| matches!(&callee, Type::Fn(expected, output) | Type::Closure(expected, output) if expected == params && **output == *result))
-                && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| ty(arg).as_ref() == Some(param)),
+                && plain_ty(callee).is_some_and(|callee| matches!(&callee, Type::Fn(expected, output) | Type::Closure(expected, output) if expected == params && **output == *result))
+                && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| plain_ty(arg).as_ref() == Some(param)),
             Self::Unary {
                 op,
                 operand,
                 ty: expected,
             } => {
-                ty(operand).as_ref() == Some(expected)
+                plain_ty(operand).as_ref() == Some(expected)
                     && destination.ty == *expected
                     && match op {
                         UnaryOp::Neg => expected.integer_layout().is_some() || *expected == Type::F64,
@@ -499,8 +559,8 @@ impl LirRvalue {
                 } else {
                     operand_ty.clone()
                 };
-                ty(lhs).as_ref() == Some(operand_ty)
-                    && ty(rhs).as_ref() == Some(operand_ty)
+                plain_ty(lhs).as_ref() == Some(operand_ty)
+                    && plain_ty(rhs).as_ref() == Some(operand_ty)
                     && destination.ty == result
                     && !matches!(op, BinOp::And | BinOp::Or)
                     && match operand_ty {
@@ -518,68 +578,69 @@ impl LirRvalue {
                     && parts.len() == part_types.len()
                     && parts.iter().zip(part_types).all(|(part, expected)| {
                         matches!(expected, Type::String | Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64)
-                            && ty(part).as_ref() == Some(expected)
+                            && plain_ty(part).as_ref() == Some(expected)
                     })
             }
         }
     }
 
-    pub fn operands(&self) -> Vec<&LirOperand> {
-        match self {
-            Self::BeginReferenceCall => vec![],
-            Self::CaptureArrayOwner { array, index } => vec![array, index],
-            Self::ReferenceDebug { .. } => vec![],
-            Self::StartTask { args, .. } => args.iter().collect(),
-            Self::AwaitFuture { future, .. } => vec![future],
-            Self::SelectIdleWait { deadlines } => deadlines.iter().collect(),
-            Self::Use(operand) => vec![operand],
-            Self::Coerce { value, .. }
-            | Self::StaticStore { value, .. }
-            | Self::FormatScalar { value, .. } => vec![value],
-            Self::ArrayAlloc { .. }
+    /// Fixed operands precede any variable-length argument or capture list.
+    pub(crate) fn iter_operands(&self) -> impl Iterator<Item = &LirOperand> {
+        let (first, second, tail): (_, _, &[LirOperand]) = match self {
+            Self::BeginReferenceCall
+            | Self::ReferenceDebug { .. }
+            | Self::ArrayAlloc { .. }
             | Self::ObjectAlloc { .. }
             | Self::StaticField { .. }
-            | Self::Recover => vec![],
+            | Self::Recover
+            | Self::EnumAlloc { .. }
+            | Self::StringLiteral(_)
+            | Self::FunctionRef { .. } => (None, None, &[]),
+            Self::AwaitFuture { future: value, .. }
+            | Self::Use(value)
+            | Self::Coerce { value, .. }
+            | Self::StaticStore { value, .. }
+            | Self::FormatScalar { value, .. }
+            | Self::FieldLoad { object: value, .. }
+            | Self::Panic { message: value }
+            | Self::RebindResultError { value, .. }
+            | Self::IntoError { value, .. }
+            | Self::PrepareMethod {
+                receiver: value, ..
+            }
+            | Self::Print { value, .. }
+            | Self::Unary { operand: value, .. } => (Some(value), None, &[]),
+            Self::CaptureArrayOwner { array, index } | Self::Index { array, index, .. } => {
+                (Some(array), Some(index), &[])
+            }
+            Self::FieldStore { object, value, .. }
+            | Self::EnumPayloadStore { object, value, .. } => (Some(object), Some(value), &[]),
+            Self::Range { start, end } => (Some(start), Some(end), &[]),
+            Self::Binary { lhs, rhs, .. } => (Some(lhs), Some(rhs), &[]),
             Self::ArrayStore {
                 array,
                 index,
                 value,
                 ..
-            } => vec![array, index, value],
-            Self::Index { array, index, .. } => vec![array, index],
-            Self::FieldLoad { object, .. } => vec![object],
-            Self::FieldStore { object, value, .. } => vec![object, value],
-            Self::ConstructorCall { object, args, .. } => {
-                std::iter::once(object).chain(args).collect()
-            }
-            Self::Range { start, end } => vec![start, end],
-            Self::EnumMethod { receiver, args, .. } => {
-                std::iter::once(receiver).chain(args).collect()
-            }
-            Self::BuiltinCall { args, .. } => args.iter().collect(),
-            Self::StaticCall { args, .. } => args.iter().collect(),
-            Self::EnumAlloc { .. } => vec![],
-            Self::EnumPayloadStore { object, value, .. } => vec![object, value],
-            Self::Panic { message } => vec![message],
-            Self::RebindResultError { value, .. } | Self::IntoError { value, .. } => vec![value],
-            Self::PrepareMethod { receiver, .. } => vec![receiver],
-            Self::MethodCall { receiver, args, .. } => {
-                std::iter::once(receiver).chain(args).collect()
-            }
-            Self::IntrinsicCall { receiver, args, .. } => {
-                std::iter::once(receiver).chain(args).collect()
-            }
-            Self::StringLiteral(_) | Self::FunctionRef { .. } => vec![],
-            Self::Closure { captures, .. } => captures.iter().collect(),
-            Self::Print { value, .. } => vec![value],
-            Self::DirectCall { args, .. } => args.iter().collect(),
-            Self::IndirectCall { callee, args, .. } => {
-                std::iter::once(callee).chain(args).collect()
-            }
-            Self::Unary { operand, .. } => vec![operand],
-            Self::Binary { lhs, rhs, .. } => vec![lhs, rhs],
-            Self::StringConcat { parts, .. } => parts.iter().collect(),
-        }
+            } => (Some(array), Some(index), std::slice::from_ref(value)),
+            Self::StartTask { args, .. }
+            | Self::BuiltinCall { args, .. }
+            | Self::StaticCall { args, .. }
+            | Self::DirectCall { args, .. } => (None, None, args),
+            Self::SelectIdleWait { deadlines } => (None, None, deadlines),
+            Self::Closure { captures, .. } => (None, None, captures),
+            Self::StringConcat { parts, .. } => (None, None, parts),
+            Self::ConstructorCall { object, args, .. } => (Some(object), None, args),
+            Self::EnumMethod { receiver, args, .. }
+            | Self::MethodCall { receiver, args, .. }
+            | Self::IntrinsicCall { receiver, args, .. } => (Some(receiver), None, args),
+            Self::IndirectCall { callee, args, .. } => (Some(callee), None, args),
+        };
+        first.into_iter().chain(second).chain(tail)
+    }
+
+    pub fn operands(&self) -> Vec<&LirOperand> {
+        self.iter_operands().collect()
     }
 }
 
@@ -732,6 +793,126 @@ mod tests {
             source_span: None,
             synthetic: true,
             parameter: false,
+        }
+    }
+
+    #[test]
+    fn operand_iteration_preserves_fixed_operands_arguments_and_place_locals() {
+        let local = |n| LirOperand::Local(LirLocalId(n));
+        let args = vec![
+            LirOperand::Int(9),
+            LirOperand::Reference {
+                place: LirPlace::ArrayElement {
+                    owner: LirLocalId(1),
+                    index: LirLocalId(2),
+                    element: Type::I64,
+                },
+                span: Span::dummy(),
+                display: "array[index]".into(),
+            },
+            local(1),
+        ];
+        let call = LirRvalue::IndirectCall {
+            callee: local(0),
+            name: FunctionId::free_from_source_name("callee"),
+            params: vec![Type::I64; args.len()],
+            args,
+            result: Type::Void,
+        };
+        let store = LirRvalue::ArrayStore {
+            array: local(2),
+            index: local(1),
+            value: local(0),
+            element: Type::I64,
+        };
+        for (value, expected) in [
+            (call, vec![0, 1, 2, 1]),
+            (store, vec![2, 1, 0]),
+            (LirRvalue::BeginReferenceCall, vec![]),
+        ] {
+            let ids = value.iter_operands().flat_map(LirOperand::iter_locals);
+            assert!(ids.eq(expected.into_iter().map(LirLocalId)));
+        }
+    }
+
+    #[test]
+    fn reference_operand_is_rejected_for_use_and_accepted_for_direct_call() {
+        let local = LirLocalId(0);
+        let locals = [value_local(local.0, Type::I64)];
+        let reference = LirOperand::Reference {
+            place: LirPlace::Local(local),
+            span: Span::dummy(),
+            display: "v0".into(),
+        };
+        assert!(LirRvalue::Use(LirOperand::Local(local)).is_well_typed(&locals, local));
+        assert!(!LirRvalue::Use(reference.clone()).is_well_typed(&locals, local));
+        let call = LirRvalue::DirectCall {
+            callee: FunctionId::free_from_source_name("read"),
+            args: vec![reference],
+            params: vec![Type::I64],
+            result: Type::I64,
+        };
+        assert!(call.is_well_typed(&locals, local));
+    }
+
+    fn reference_to(id: u32) -> LirOperand {
+        LirOperand::Reference {
+            place: LirPlace::Local(LirLocalId(id)),
+            span: Span::dummy(),
+            display: format!("v{id}"),
+        }
+    }
+
+    #[test]
+    fn capture_array_owner_requires_plain_array_and_index() {
+        let locals = [
+            value_local(0, Type::Array(Box::new(Type::I64))),
+            value_local(1, Type::I64),
+            LirLocal {
+                storage_kind: super::super::LirStorageKind::GcOwner,
+                ..value_local(2, Type::Void)
+            },
+        ];
+        let capture = |array, index| {
+            LirRvalue::CaptureArrayOwner { array, index }.is_well_typed(&locals, LirLocalId(2))
+        };
+        let array = LirOperand::Local(LirLocalId(0));
+        let index = LirOperand::Local(LirLocalId(1));
+        assert!(capture(array.clone(), index.clone()));
+        assert!(!capture(reference_to(0), index));
+        assert!(!capture(array, reference_to(1)));
+    }
+
+    #[test]
+    fn constructor_and_method_require_plain_receivers_and_allow_reference_arguments() {
+        let class = TypeId::local("Cell");
+        let locals = [
+            value_local(0, Type::Named(class)),
+            value_local(1, Type::I64),
+            value_local(2, Type::Void),
+        ];
+        for (receiver, valid) in [
+            (LirOperand::Local(LirLocalId(0)), true),
+            (reference_to(0), false),
+        ] {
+            let constructor = LirRvalue::ConstructorCall {
+                object: receiver.clone(),
+                class,
+                args: vec![reference_to(1)],
+                arg_types: vec![Type::I64],
+            };
+            let method = LirRvalue::MethodCall {
+                receiver,
+                receiver_ty: Type::Named(class),
+                method: "read".into(),
+                is_async: false,
+                args: vec![reference_to(1)],
+                arg_types: vec![Type::I64],
+                result: Type::Void,
+                super_class: None,
+            };
+            assert_eq!(constructor.is_well_typed(&locals, LirLocalId(2)), valid);
+            assert_eq!(method.is_well_typed(&locals, LirLocalId(2)), valid);
         }
     }
 

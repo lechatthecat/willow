@@ -4,6 +4,7 @@
 //! driver can call them; child-module access reaches private FuncGen/Codegen
 //! state.
 
+use crate::ir::ir_variants;
 use crate::ir::lowered::{LirDeferId, LirFunction, LirInst, LirLocalId};
 use crate::qualified_name::QualifiedName;
 use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
@@ -199,7 +200,12 @@ impl UnitCodegenContext<'_> {
                         super::lir_gen::task_stack_boundary(value)
                             && !matches!(value, crate::ir::lowered::LirRvalue::Print { .. })
                     }
-                    _ => false,
+                    ir_variants!(
+                        LirInst;
+                        Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                        ClearScopeRoots, SelectInit, SelectProbe, SelectPick, SelectUnregister,
+                        SelectCommit, ReleaseLock, MatchTest, MatchBind, Unsupported
+                    ) => false,
                 });
         let selected: Vec<_> = if frame_all {
             lir.locals
@@ -315,7 +321,12 @@ impl UnitCodegenContext<'_> {
             .flat_map(|block| &block.instrs)
             .filter_map(|inst| match inst {
                 LirInst::Defer { id, span, .. } => Some((*id, *span)),
-                _ => None,
+                ir_variants!(
+                    LirInst;
+                    Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                    ClearScopeRoots, SelectInit, SelectProbe, SelectPick, SelectUnregister,
+                    SelectCommit, ReleaseLock, MatchTest, MatchBind, Unsupported
+                ) => None,
             })
             .collect();
         defer_sites.sort_unstable_by_key(|(id, _)| *id);

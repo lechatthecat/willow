@@ -10,11 +10,11 @@ mod recursive_inline;
 mod string_concat;
 pub(crate) use devirtualize::devirtualize_function_values;
 pub(crate) use recursive_inline::inline_scalar_recursion;
-pub(crate) use string_concat::fuse_string_concats;
+pub(crate) use string_concat::fuse_program;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use super::lowered::{SourceBlock, SourceInst, SourceTerminator};
+use super::lowered::{LirLocalId, SourceBlock, SourceInst, SourceTerminator};
 use super::typed_ast::{HirExpr, HirExprKind};
 use crate::parser::ast::{BinOp, UnaryOp};
 use crate::semantic::ids::SemanticType as Type;
@@ -73,6 +73,7 @@ fn binary(op: &BinOp, lhs: Constant, rhs: Constant) -> Option<Constant> {
             Le => Bool(a <= b),
             Gt => Bool(a > b),
             Ge => Bool(a >= b),
+            // Integer folding requires a supported operation and valid shift or exponent.
             _ => return None,
         },
         (Bool(a), Bool(b)) => match op {
@@ -80,8 +81,10 @@ fn binary(op: &BinOp, lhs: Constant, rhs: Constant) -> Option<Constant> {
             Or => Bool(a || b),
             Eq => Bool(a == b),
             Ne => Bool(a != b),
+            // Boolean constants fold only logical operations and equality.
             _ => return None,
         },
+        // Mixed constant kinds have no folding rule.
         _ => return None,
     })
 }
@@ -107,6 +110,7 @@ pub(crate) fn fold_expr(expr: &mut HirExpr) {
                         .integer_layout()
                         .map_or(!n, |layout| layout.value(layout.wrap(!n))),
                 )),
+                // Other operand and operator pairs have no unary constant result.
                 _ => None,
             },
             HirExprKind::Binary { op, lhs, rhs } => match (get(lhs), get(rhs)) {
@@ -121,18 +125,24 @@ pub(crate) fn fold_expr(expr: &mut HirExpr) {
                         binary(op, a, b)
                     }
                 }
+                // Both children must contribute a constant.
                 _ => None,
             },
             // Preserve conditional subtrees, calls, allocation, and reads.
             // No algebraic identities such as effectful_call() * 0 => 0.
-            _ => None,
+            ir_variants!(
+                HirExprKind;
+                Int, Float, Str, Var, FnRef, Call, Invoke, Print, Array, Index, Ternary, New,
+                FieldAccess, MethodCall, ObjectLiteral, StaticField, StaticCall, ReferenceArg,
+                Range, Await, TryPropagate, Lambda, Match, Select
+            ) => None,
         };
         let value = value.filter(|value| match value {
             Constant::Int(n) => node
                 .ty
                 .integer_layout()
                 .is_none_or(|layout| layout.contains(*n)),
-            _ => true,
+            Constant::Bool(_) => true,
         });
         if let Some(value) = value {
             constants.insert(std::ptr::from_ref(node), value);
@@ -146,6 +156,23 @@ pub(crate) fn fold_expr(expr: &mut HirExpr) {
             true
         }
     });
+}
+
+#[cfg(test)]
+thread_local! {
+    static FACT_RESET_CAPACITY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn clear_constant_facts(facts: &mut HashMap<String, Constant>) {
+    #[cfg(test)]
+    FACT_RESET_CAPACITY.set(FACT_RESET_CAPACITY.get() + facts.capacity());
+    // Keep a dense table for the next group of bindings. Release it once
+    // it becomes sparse so narrow invalidations cannot keep scanning it.
+    if crate::ir::sparse_scratch_table(facts.capacity(), facts.len()) {
+        *facts = HashMap::new();
+    } else {
+        facts.clear();
+    }
 }
 
 /// Facts never cross block boundaries or an operation that may mutate locals.
@@ -184,7 +211,7 @@ fn propagate_scalar(expr: &mut HirExpr, facts: &mut HashMap<String, Constant>) {
             true
         });
     } else {
-        facts.clear();
+        clear_constant_facts(facts);
     }
     fold_expr(expr);
 }
@@ -203,7 +230,7 @@ pub(crate) fn fold_blocks(blocks: &mut [SourceBlock]) {
                         // Reference parameters can alias. An assignment may
                         // change another named local through the same address.
                         if assigns {
-                            facts.clear();
+                            clear_constant_facts(&mut facts);
                         }
                         facts.remove(name);
                         let constant = match value.kind {
@@ -211,14 +238,26 @@ pub(crate) fn fold_blocks(blocks: &mut [SourceBlock]) {
                                 Some(Constant::Int(value.ty.integer_layout().unwrap().value(n)))
                             }
                             HirExprKind::Bool(value) => Some(Constant::Bool(value)),
-                            _ => None,
+                            ir_variants!(
+                                HirExprKind;
+                                Int, Float, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print,
+                                Array, Index, Ternary, New, FieldAccess, MethodCall,
+                                ObjectLiteral, StaticField, StaticCall, ReferenceArg, Range,
+                                Await, TryPropagate, Lambda, Match, Select
+                            ) => None,
                         };
                         if let Some(constant) = constant {
                             facts.insert(name.clone(), constant);
                         }
                     }
                     SourceInst::Expr(value) => propagate_scalar(value, &mut facts),
-                    _ => facts.clear(),
+                    ir_variants!(
+                        SourceInst;
+                        Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots,
+                        Defer, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
+                        SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
+                        MatchTest, MatchBind
+                    ) => clear_constant_facts(&mut facts),
                 }
                 match inst {
                     SourceInst::Compute { .. } => {}
@@ -289,7 +328,9 @@ pub(crate) fn eliminate_dead_values(
         block.instrs.retain(|inst| !matches!(inst, SourceInst::Expr(HirExpr { kind: HirExprKind::Var(name), ty, .. }) if synthetic.get(name.as_str()).is_some_and(|declared| *declared == ty)));
     }
     scalar_replace_objects(blocks, locals);
-    use super::lowered::async_liveness::{instruction_use_def, terminator_uses};
+    use super::lowered::async_liveness::{
+        clear_local_scratch, instruction_use_def, terminator_uses,
+    };
     use super::lowered::{LirLocalId, LirOperand, LirRvalue};
     use std::collections::HashSet;
     let names = locals
@@ -299,26 +340,37 @@ pub(crate) fn eliminate_dead_values(
     // Debug builds check integer `+ - * **` and negation for overflow, so a dead one still
     // reports its fault. Release keeps a
     // dead wrapping op only until Cranelift's own dead-code elimination.
-    let pure = |value: &LirRvalue| match value {
-        _ if value.has_overflow_check() => false,
-        LirRvalue::Use(_) | LirRvalue::Unary { .. } => true,
-        LirRvalue::FunctionRef { .. } => true,
-        LirRvalue::Binary {
-            operand_ty: Type::String,
-            ..
-        } => false,
-        LirRvalue::Binary {
-            op,
-            rhs,
-            operand_ty,
-            ..
-        } => match op {
-            BinOp::Div | BinOp::Rem => *operand_ty == Type::F64,
-            BinOp::Pow => matches!(rhs, LirOperand::Int(exponent) if *exponent >= 0),
-            _ => true,
-        },
-        // New operations remain effectful until their contract is proven.
-        _ => false,
+    let pure = |value: &LirRvalue| {
+        !value.has_overflow_check()
+            && match value {
+                LirRvalue::Use(_) | LirRvalue::Unary { .. } => true,
+                LirRvalue::FunctionRef { .. } => true,
+                LirRvalue::Binary {
+                    operand_ty: Type::String,
+                    ..
+                } => false,
+                LirRvalue::Binary {
+                    op,
+                    rhs,
+                    operand_ty,
+                    ..
+                } => match op {
+                    BinOp::Div | BinOp::Rem => *operand_ty == Type::F64,
+                    BinOp::Pow => matches!(rhs, LirOperand::Int(exponent) if *exponent >= 0),
+                    // All remaining binary operators passed the overflow and string checks above.
+                    _ => true,
+                },
+                // Keep operations that can allocate, mutate state, call user code, or fault.
+                ir_variants!(
+                    LirRvalue;
+                    BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait, Coerce, ArrayAlloc,
+                    CaptureArrayOwner, ArrayStore, Index, ObjectAlloc, FieldLoad, FieldStore, StaticField,
+                    StaticStore, StaticCall, EnumAlloc, EnumPayloadStore, ConstructorCall, Range,
+                    EnumMethod, BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
+                    RebindResultError, IntoError, PrepareMethod, MethodCall, StringLiteral, Closure,
+                    Print, IntrinsicCall, DirectCall, IndirectCall, StringConcat
+                ) => false,
+            }
     };
     let mut definitions = HashMap::<LirLocalId, usize>::new();
     let mut dependencies = HashMap::new();
@@ -326,7 +378,8 @@ pub(crate) fn eliminate_dead_values(
     let mut defs = HashSet::new();
     for block in blocks.iter() {
         for inst in &block.instrs {
-            defs.clear();
+            clear_local_scratch(&mut defs);
+            clear_local_scratch(&mut ignored);
             instruction_use_def(inst, &names, &mut ignored, &mut defs);
             for &local in &defs {
                 *definitions.entry(local).or_default() += 1;
@@ -342,7 +395,11 @@ pub(crate) fn eliminate_dead_values(
                         .into_iter()
                         .filter_map(|operand| match operand {
                             LirOperand::Local(id) => Some(*id),
-                            _ => None,
+                            LirOperand::Int(_)
+                            | LirOperand::Integer { .. }
+                            | LirOperand::Float(_)
+                            | LirOperand::Bool(_)
+                            | LirOperand::Reference { .. } => None,
                         })
                         .collect::<Vec<_>>(),
                 );
@@ -362,7 +419,7 @@ pub(crate) fn eliminate_dead_values(
             {
                 continue;
             }
-            defs.clear();
+            clear_local_scratch(&mut defs);
             instruction_use_def(inst, &names, &mut live, &mut defs);
         }
         terminator_uses(&block.terminator, &names, &mut live, &HashSet::new());
@@ -436,7 +493,9 @@ pub(crate) fn eliminate_tail_recursion(function: &mut super::lowered::SourceFunc
                 SourceTerminator::Jump(_) => true,
                 SourceTerminator::Branch { cond, .. } => leaf(cond),
                 SourceTerminator::Return(Some(e)) => leaf(e),
-                _ => false,
+                SourceTerminator::Suspend { .. }
+                | SourceTerminator::Return(_)
+                | SourceTerminator::CleanupReturn => false,
             }
         {
             return;
@@ -451,11 +510,17 @@ pub(crate) fn eliminate_tail_recursion(function: &mut super::lowered::SourceFunc
                 }
                 SourceInst::Let { value, .. } | SourceInst::Assign { value, .. } => leaf(value),
                 SourceInst::ClearScopeRoots { .. } => true,
-                _ => false,
+                ir_variants!(
+                    SourceInst;
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, FieldAssign,
+                    IndexAssign, StaticFieldAssign, SuperInit, SelectInit, SelectProbe,
+                    SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
+                    Expr
+                ) => false,
             };
             if !safe
                 || matches!(inst, SourceInst::Compute { value, .. }
-                if value.operands().iter().any(|op| matches!(op, LirOperand::Reference { .. })))
+                if value.operands().iter().any(|op| !op.is_plain_value()))
             {
                 return;
             }
@@ -505,7 +570,13 @@ pub(crate) fn eliminate_tail_recursion(function: &mut super::lowered::SourceFunc
                     sites.push((block.id, index, args.clone(), *span));
                     break;
                 }
-                _ => break,
+                ir_variants!(
+                    SourceInst;
+                    Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, Let, Assign,
+                    FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
+                    SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
+                    MatchTest, MatchBind, Expr
+                ) => break,
             }
         }
     }
@@ -568,7 +639,9 @@ pub(crate) fn eliminate_tail_recursion(function: &mut super::lowered::SourceFunc
                 remap(then_block);
                 remap(else_block);
             }
-            _ => {}
+            SourceTerminator::Suspend { .. }
+            | SourceTerminator::Return(_)
+            | SourceTerminator::CleanupReturn => {}
         }
     }
     let mut body = std::mem::replace(
@@ -636,11 +709,25 @@ pub(crate) fn unroll_scalar_loops(function: &mut super::lowered::SourceFunction)
                     && !matches!(op, BinOp::Pow | BinOp::Rem | BinOp::And | BinOp::Or)
                     && (!matches!(op, BinOp::Div) || *operand_ty == Type::F64)
             }
-            _ => false,
+            ir_variants!(
+                LirRvalue;
+                BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait, Coerce, ArrayAlloc,
+                CaptureArrayOwner, ArrayStore, Index, ObjectAlloc, FieldLoad, FieldStore,
+                StaticField, StaticStore, StaticCall, EnumAlloc, EnumPayloadStore,
+                ConstructorCall, Range, EnumMethod, BuiltinCall, FormatScalar, Panic, Recover,
+                ReferenceDebug, RebindResultError, IntoError, PrepareMethod, MethodCall,
+                StringLiteral, FunctionRef, Closure, Print, IntrinsicCall, DirectCall,
+                IndirectCall, StringConcat
+            ) => false,
         },
         SourceInst::Let { value, ty, .. } => scalar(ty) && leaf(value),
         SourceInst::Assign { value, .. } => leaf(value),
-        _ => false,
+        ir_variants!(
+            SourceInst;
+            EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer, FieldAssign,
+            IndexAssign, StaticFieldAssign, SuperInit, SelectInit, SelectProbe, SelectPick,
+            SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind, Expr
+        ) => false,
     };
     let original_len = function.blocks.len();
     let mut predecessors = vec![0usize; original_len];
@@ -661,7 +748,7 @@ pub(crate) fn unroll_scalar_loops(function: &mut super::lowered::SourceFunction)
                 edge(*else_block);
             }
             SourceTerminator::Suspend { resume, .. } => edge(*resume),
-            _ => {}
+            SourceTerminator::Return(_) | SourceTerminator::CleanupReturn => {}
         }
         for target in &block.recovery {
             edge(*target);
@@ -736,6 +823,23 @@ pub(crate) fn unroll_scalar_loops(function: &mut super::lowered::SourceFunction)
     }
 }
 
+fn inline_scalar_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Char
+            | Type::U8
+            | Type::I64
+            | Type::F64
+            | Type::Bool
+    )
+}
+
 /// Inline only bounded, single-block scalar leaves. No allocation, calls,
 /// faults, loops, references, or cleanup can cross this transformation.
 /// Keeping the expansion budget small also bounds work between safepoints.
@@ -758,50 +862,16 @@ pub(crate) fn inline_scalar_leaves(
         operations: Vec<(LirLocalId, LirRvalue, Type, crate::diagnostics::Span)>,
         result: LirOperand,
     }
-    fn operand(expr: &HirExpr, names: &HashMap<&str, LirLocalId>) -> Option<LirOperand> {
-        Some(match &expr.kind {
-            HirExprKind::Int(value) => LirOperand::integer(*value, &expr.ty),
-            HirExprKind::Float(value) => LirOperand::Float(*value),
-            HirExprKind::Bool(value) => LirOperand::Bool(*value),
-            HirExprKind::Var(name) => LirOperand::Local(*names.get(name.as_str())?),
-            _ => return None,
-        })
-    }
     fn candidate(function: &super::lowered::SourceFunction, overflow_checks: bool) -> Option<Leaf> {
         if function.is_async
             || function.blocks.len() != 1
             || !function.captures.is_empty()
             || function.params.iter().any(|param| param.by_reference)
-            || !matches!(
-                function.return_type,
-                Type::I8
-                    | Type::I16
-                    | Type::I32
-                    | Type::U16
-                    | Type::U32
-                    | Type::U64
-                    | Type::Char
-                    | Type::U8
-                    | Type::I64
-                    | Type::F64
-                    | Type::Bool
-            )
-            || function.locals.iter().any(|local| {
-                !matches!(
-                    local.ty,
-                    Type::I8
-                        | Type::I16
-                        | Type::I32
-                        | Type::U16
-                        | Type::U32
-                        | Type::U64
-                        | Type::Char
-                        | Type::U8
-                        | Type::I64
-                        | Type::F64
-                        | Type::Bool
-                )
-            })
+            || !inline_scalar_type(&function.return_type)
+            || function
+                .locals
+                .iter()
+                .any(|local| !inline_scalar_type(&local.ty))
         {
             return None;
         }
@@ -825,7 +895,17 @@ pub(crate) fn inline_scalar_leaves(
                         LirRvalue::Use(_) | LirRvalue::Unary { .. } => {}
                         LirRvalue::Binary { op, .. }
                             if !matches!(op, BinOp::Div | BinOp::Rem | BinOp::Pow) => {}
-                        _ => return None,
+                        ir_variants!(
+                            LirRvalue;
+                            BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait, Coerce,
+                            ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc,
+                            FieldLoad, FieldStore, StaticField, StaticStore, StaticCall,
+                            EnumAlloc, EnumPayloadStore, ConstructorCall, Range, EnumMethod,
+                            BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
+                            RebindResultError, IntoError, PrepareMethod, MethodCall,
+                            StringLiteral, FunctionRef, Closure, Print, IntrinsicCall, DirectCall,
+                            IndirectCall, Binary, StringConcat
+                        ) => return None,
                     }
                     operations.push((
                         *local,
@@ -835,7 +915,13 @@ pub(crate) fn inline_scalar_leaves(
                     ));
                 }
                 SourceInst::ClearScopeRoots { .. } => {} // all locals proved scalar
-                _ => return None,
+                ir_variants!(
+                    SourceInst;
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, Let, Assign,
+                    FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
+                    SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
+                    MatchTest, MatchBind, Expr
+                ) => return None,
             }
         }
         let SourceTerminator::Return(Some(result)) = &block.terminator else {
@@ -848,13 +934,17 @@ pub(crate) fn inline_scalar_leaves(
                 .map(|param| names.get(param.name.as_str()).copied())
                 .collect::<Option<_>>()?,
             operations,
-            result: operand(result, &names)?,
+            result: LirOperand::from_flat_expr(result, |name| names.get(name).copied())?,
         })
     }
     fn remap(operand: &LirOperand, locals: &HashMap<LirLocalId, LirOperand>) -> LirOperand {
         match operand {
             LirOperand::Local(id) => locals[id].clone(),
-            _ => operand.clone(),
+            LirOperand::Int(_)
+            | LirOperand::Integer { .. }
+            | LirOperand::Float(_)
+            | LirOperand::Bool(_)
+            | LirOperand::Reference { .. } => operand.clone(),
         }
     }
     let leaves: HashMap<FunctionId, Leaf> = functions
@@ -905,7 +995,17 @@ pub(crate) fn inline_scalar_leaves(
                                 rhs: remap(rhs, &mapping),
                                 operand_ty: operand_ty.clone(),
                             },
-                            _ => unreachable!("leaf operations validated"),
+                            ir_variants!(
+                                LirRvalue;
+                                BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait,
+                                Coerce, ArrayAlloc, CaptureArrayOwner, ArrayStore, Index,
+                                ObjectAlloc, FieldLoad, FieldStore, StaticField, StaticStore,
+                                StaticCall, EnumAlloc, EnumPayloadStore, ConstructorCall, Range,
+                                EnumMethod, BuiltinCall, FormatScalar, Panic, Recover,
+                                ReferenceDebug, RebindResultError, IntoError, PrepareMethod,
+                                MethodCall, StringLiteral, FunctionRef, Closure, Print,
+                                IntrinsicCall, DirectCall, IndirectCall, StringConcat
+                            ) => unreachable!("leaf operations validated"),
                         };
                         let id = LirLocalId(function.locals.len() as u32);
                         let mut name = format!("__lir_inline_{}", id.0);
@@ -943,6 +1043,40 @@ pub(crate) fn inline_scalar_leaves(
     }
 }
 
+fn object_alias_target(
+    inst: &SourceInst,
+    aliases: &HashSet<LirLocalId>,
+    names: &HashMap<&str, LirLocalId>,
+) -> Option<LirLocalId> {
+    use super::lowered::{LirOperand as O, LirRvalue as V};
+    match inst {
+        SourceInst::Compute {
+            local,
+            value: V::Use(O::Local(source)),
+            ..
+        } if aliases.contains(source) => Some(*local),
+        SourceInst::Let {
+            name,
+            value:
+                HirExpr {
+                    kind: HirExprKind::Var(source),
+                    ..
+                },
+            ..
+        } => names
+            .get(source.as_str())
+            .filter(|source| aliases.contains(source))
+            .and_then(|_| names.get(name.as_str()).copied()),
+        ir_variants!(
+            SourceInst;
+            Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer,
+            Let, Assign, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
+            SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest,
+            MatchBind, Expr
+        ) => None,
+    }
+}
+
 /// Eliminate one nonescaping scalar aggregate in a pure single-block body.
 /// No call, allocation, fault, or GC observation may cross the replacement.
 /// Stored operands must remain stable: replacing a store with a later read of
@@ -951,7 +1085,9 @@ pub(crate) fn scalar_replace_objects(
     blocks: &mut [SourceBlock],
     locals: &[super::lowered::LirLocal],
 ) {
-    use super::lowered::async_liveness::{instruction_use_def, terminator_uses};
+    use super::lowered::async_liveness::{
+        clear_local_scratch, instruction_use_def, terminator_uses,
+    };
     use super::lowered::{LirLocalId, LirOperand as O, LirRvalue as V};
     use std::collections::HashSet;
     let [block] = blocks else {
@@ -986,8 +1122,8 @@ pub(crate) fn scalar_replace_objects(
     let mut defs = HashSet::new();
     let mut candidate = None;
     for (index, inst) in block.instrs.iter().enumerate() {
-        uses.clear();
-        defs.clear();
+        clear_local_scratch(&mut uses);
+        clear_local_scratch(&mut defs);
         instruction_use_def(inst, &names, &mut uses, &mut defs);
         for &id in &defs {
             last_def.insert(id, index);
@@ -1018,27 +1154,7 @@ pub(crate) fn scalar_replace_objects(
         if index == allocated_at {
             continue;
         }
-        let alias_source = match inst {
-            SourceInst::Compute {
-                local,
-                value: V::Use(O::Local(source)),
-                ..
-            } if aliases.contains(source) => Some((*local, *source)),
-            SourceInst::Let {
-                name,
-                value:
-                    HirExpr {
-                        kind: HirExprKind::Var(source),
-                        ..
-                    },
-                ..
-            } => names
-                .get(source.as_str())
-                .filter(|source| aliases.contains(source))
-                .and_then(|source| names.get(name.as_str()).map(|target| (*target, *source))),
-            _ => None,
-        };
-        if let Some((target, _)) = alias_source {
+        if let Some(target) = object_alias_target(inst, &aliases, &names) {
             if index < allocated_at {
                 return;
             }
@@ -1105,17 +1221,31 @@ pub(crate) fn scalar_replace_objects(
                 V::Binary { op, operand_ty, .. }
                     if scalar(operand_ty)
                         && !matches!(op, BinOp::Div | BinOp::Rem | BinOp::Pow) => {}
-                _ => return,
+                ir_variants!(
+                    V;
+                    BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait, Coerce,
+                    ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc, FieldLoad,
+                    FieldStore, StaticField, StaticStore, StaticCall, EnumAlloc, EnumPayloadStore,
+                    ConstructorCall, Range, EnumMethod, BuiltinCall, FormatScalar, Panic, Recover,
+                    ReferenceDebug, RebindResultError, IntoError, PrepareMethod, MethodCall,
+                    StringLiteral, FunctionRef, Closure, Print, IntrinsicCall, DirectCall,
+                    IndirectCall, Unary, Binary, StringConcat
+                ) => return,
             },
             SourceInst::Let { value, .. }
             | SourceInst::Assign { value, .. }
             | SourceInst::Expr(value)
                 if atom(value) => {}
             SourceInst::ClearScopeRoots { .. } => continue,
-            _ => return,
+            ir_variants!(
+                SourceInst;
+                EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, Let, Assign, FieldAssign,
+                IndexAssign, StaticFieldAssign, SuperInit, SelectInit, SelectProbe, SelectPick,
+                SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind, Expr
+            ) => return,
         }
-        uses.clear();
-        defs.clear();
+        clear_local_scratch(&mut uses);
+        clear_local_scratch(&mut defs);
         instruction_use_def(inst, &names, &mut uses, &mut defs);
         if !uses.is_disjoint(&aliases) || !defs.is_disjoint(&aliases) {
             return;
@@ -1127,14 +1257,14 @@ pub(crate) fn scalar_replace_objects(
         if remove.contains(&index) || matches!(inst, SourceInst::ClearScopeRoots { .. }) {
             continue;
         }
-        uses.clear();
-        defs.clear();
+        clear_local_scratch(&mut uses);
+        clear_local_scratch(&mut defs);
         instruction_use_def(inst, &names, &mut uses, &mut defs);
         if !uses.is_disjoint(&discard_defs) {
             return;
         }
     }
-    uses.clear();
+    clear_local_scratch(&mut uses);
     terminator_uses(&block.terminator, &names, &mut uses, &HashSet::new());
     if !uses.is_disjoint(&aliases) || !uses.is_disjoint(&discard_defs) {
         return;
@@ -1726,6 +1856,8 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
 
     #[test]
     fn preserves_arithmetic_faults_and_overflow_and_folds_successful_operations() {
+        use crate::ir::lowered::{LirOperand, LirRvalue};
+
         // Overflow is left to the backend, which checks or wraps per build
         // mode.
         for (op, a, b) in [
@@ -1743,6 +1875,8 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
             (BinOp::Shl, 1, -1),
             (BinOp::Shr, -1, 64),
             (BinOp::Shr, 1, i64::MIN),
+            // The exact intermediate 2^63 is outside i64. The emitted shift sets the sign bit.
+            (BinOp::Shl, 1, 63),
         ] {
             let mut expr = bin(op, int(a), int(b));
             let original = expr.clone();
@@ -1760,7 +1894,6 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
             (BinOp::BitAnd, -6, 255, 250),
             (BinOp::BitOr, 12, 10, 14),
             (BinOp::BitXor, 12, 10, 6),
-            (BinOp::Shl, 1, 63, i64::MIN),
             (BinOp::Shl, 3, 0, 3),
             (BinOp::Shr, -16, 2, -4),
             (BinOp::Shr, i64::MIN, 63, -1),
@@ -1769,6 +1902,20 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
             fold_expr(&mut expr);
             assert_eq!(expr, int(expected));
         }
+
+        let program = lowered("fn sign_bit() -> i64 { return 1 << 63; }");
+        assert_eq!(
+            count_computes(&program, "sign_bit", |value| matches!(
+                value,
+                LirRvalue::Binary {
+                    op: BinOp::Shl,
+                    lhs: LirOperand::Int(1),
+                    rhs: LirOperand::Int(63),
+                    operand_ty: Type::I64,
+                }
+            )),
+            1
+        );
     }
 
     #[test]
@@ -1830,6 +1977,172 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
             panic!()
         };
         value.clone()
+    }
+
+    #[test]
+    fn wide_constant_facts_have_linear_invalidation_cost() {
+        let binding = |id: u32, value| SourceInst::Let {
+            local: LirLocalId(id),
+            name: format!("v{id}"),
+            mutable: true,
+            ty: Type::I64,
+            value: int(value),
+            span: Span::dummy(),
+        };
+        let call = HirExpr {
+            kind: HirExprKind::Call {
+                callee: "effect".into(),
+                args: vec![],
+            },
+            ty: Type::I64,
+            span: Span::dummy(),
+        };
+        for (width, narrow) in [(32, 128), (256, 128), (256, 1024), (1024, 2048)] {
+            for barrier in [
+                None,
+                Some(SourceInst::Expr(call.clone())),
+                Some(SourceInst::ClearScopeRoots { locals: vec![] }),
+            ] {
+                let mut instrs: Vec<_> = (0..width).map(|id| binding(id, 42)).collect();
+                let mut last = String::from("v0");
+                for i in 0..narrow {
+                    if let Some(inst) = &barrier {
+                        instrs.push(inst.clone());
+                        instrs.push(binding(width + i, i64::from(i)));
+                        last = format!("v{}", width + i);
+                    } else {
+                        instrs.push(assign("v0", int(i64::from(i))));
+                    }
+                }
+                FACT_RESET_CAPACITY.set(0);
+                let result = optimize_return(instrs, bin(BinOp::Add, var("v1"), var(&last)));
+                assert_eq!(
+                    result,
+                    bin(BinOp::Add, var("v1"), int(i64::from(narrow - 1)))
+                );
+                let capacity = FACT_RESET_CAPACITY.get();
+                assert!(capacity >= width as usize);
+                assert!(
+                    capacity <= 8 * (width + narrow) as usize,
+                    "capacity={capacity}"
+                );
+                println!("fact resets width={width} narrow={narrow} capacity={capacity}");
+            }
+        }
+    }
+
+    #[test]
+    fn shuffled_callable_bindings_are_marked_and_removed_in_linear_work() {
+        use super::super::lowered::{BlockId, LirLocal, LirOperand, LirRvalue, LirStorageKind};
+        use crate::semantic::ids::FunctionId;
+        let target = FunctionId::free("identity");
+        let callable = Type::Fn(vec![Type::I64], Box::new(Type::I64));
+        let mut function = lowered("fn main() {}").functions.remove(0);
+        for width in [8u32, 64, 512, 2048] {
+            let result = LirLocalId(width + 1);
+            function.locals = (0..=result.0)
+                .map(|i| LirLocal {
+                    id: LirLocalId(i),
+                    name: format!("f{i}"),
+                    ty: if i == result.0 {
+                        Type::I64
+                    } else {
+                        callable.clone()
+                    },
+                    storage_kind: LirStorageKind::Value,
+                    synthetic: i == 0 || i == result.0,
+                    parameter: false,
+                    source_span: None,
+                })
+                .collect();
+            let mut definitions = vec![SourceInst::Compute {
+                local: LirLocalId(0),
+                value: LirRvalue::FunctionRef {
+                    function: target,
+                    ty: callable.clone(),
+                },
+                span: Span::dummy(),
+            }];
+            for i in 1..=width {
+                definitions.push(SourceInst::Let {
+                    local: LirLocalId(i),
+                    name: format!("f{i}"),
+                    mutable: false,
+                    ty: callable.clone(),
+                    span: Span::dummy(),
+                    value: HirExpr {
+                        kind: if i % 2 == 0 {
+                            HirExprKind::Var("f0".into())
+                        } else {
+                            HirExprKind::FnRef(target)
+                        },
+                        ty: callable.clone(),
+                        span: Span::dummy(),
+                    },
+                });
+            }
+            let mut order: Vec<_> = (1..=width).collect();
+            let mut seed = 37u32;
+            for i in (1..order.len()).rev() {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                order.swap(i, seed as usize % (i + 1));
+            }
+            let calls = order
+                .iter()
+                .map(|&i| SourceInst::Compute {
+                    local: result,
+                    span: Span::dummy(),
+                    value: LirRvalue::IndirectCall {
+                        callee: LirOperand::Local(LirLocalId(i)),
+                        name: FunctionId::free(format!("f{i}")),
+                        args: vec![LirOperand::Int(i64::from(i))],
+                        params: vec![Type::I64],
+                        result: Type::I64,
+                    },
+                })
+                .collect();
+            function.return_type = callable.clone();
+            function.blocks = vec![
+                SourceBlock {
+                    id: BlockId(0),
+                    instrs: definitions,
+                    terminator: SourceTerminator::Jump(BlockId(1)),
+                    recovery: vec![],
+                },
+                SourceBlock {
+                    id: BlockId(1),
+                    instrs: calls,
+                    terminator: SourceTerminator::Return(Some(HirExpr {
+                        kind: HirExprKind::Var("f1".into()),
+                        ty: callable.clone(),
+                        span: Span::dummy(),
+                    })),
+                    recovery: vec![],
+                },
+            ];
+            devirtualize::REMOVAL_VISITS.set((0, 0));
+            devirtualize_function_values(&mut function, &HashMap::from([(target, 0)]));
+            // f1 is returned. Every other binding, including the shared f0,
+            // dies. The block of calls never enters the removal pass.
+            assert_eq!(
+                devirtualize::REMOVAL_VISITS.get(),
+                (width as usize, width as usize + 1)
+            );
+            assert!(matches!(
+                &function.blocks[0].instrs[..],
+                [SourceInst::Let {
+                    local: LirLocalId(1),
+                    ..
+                }]
+            ));
+            assert_eq!(function.blocks[1].instrs.len(), order.len());
+            for (inst, i) in function.blocks[1].instrs.iter().zip(order) {
+                assert!(
+                    matches!(inst, SourceInst::Compute { value: LirRvalue::DirectCall { callee, args, .. }, .. }
+                    if *callee == target && args == &[LirOperand::Int(i64::from(i))])
+                );
+            }
+        }
     }
 
     #[test]

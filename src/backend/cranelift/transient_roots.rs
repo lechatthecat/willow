@@ -39,6 +39,7 @@
 //! Cost: one pass over instructions and operands plus one prefix count per
 //! block, so O(instructions + operands) per function.
 
+use crate::ir::ir_variants;
 use crate::ir::lowered::{LirFunction, LirInst, LirLocalId, LirOperand, LirRvalue, Terminator};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::SemanticType as Type;
@@ -236,7 +237,15 @@ fn called_value(value: &LirRvalue) -> Option<LirLocalId> {
             args,
             ..
         } if !args.iter().any(|arg| arg.locals().contains(callee)) => Some(*callee),
-        _ => None,
+        ir_variants!(
+            LirRvalue;
+            BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait, Coerce, ArrayAlloc,
+            CaptureArrayOwner, ArrayStore, Index, ObjectAlloc, FieldLoad, FieldStore, StaticField,
+            StaticStore, StaticCall, EnumAlloc, EnumPayloadStore, ConstructorCall, Range,
+            EnumMethod, BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
+            RebindResultError, IntoError, PrepareMethod, MethodCall, StringLiteral, FunctionRef,
+            Closure, Print, IntrinsicCall, DirectCall, IndirectCall, Unary, Binary, StringConcat
+        ) => None,
     }
 }
 
@@ -279,27 +288,40 @@ fn inspected_array(value: &LirRvalue) -> Option<LirLocalId> {
             element,
             ..
         } if scalar(element) => Some(*array),
-        _ => None,
+        ir_variants!(
+            LirRvalue;
+            BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait, Coerce, ArrayAlloc,
+            CaptureArrayOwner, ArrayStore, Index, ObjectAlloc, FieldLoad, FieldStore, StaticField,
+            StaticStore, StaticCall, EnumAlloc, EnumPayloadStore, ConstructorCall, Range,
+            EnumMethod, BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
+            RebindResultError, IntoError, PrepareMethod, MethodCall, StringLiteral, FunctionRef,
+            Closure, Print, IntrinsicCall, DirectCall, IndirectCall, Unary, Binary, StringConcat
+        ) => None,
     }
 }
 
 /// Whether every continuing path of `inst` is free of GC points. A copy
 /// into an interface-typed local boxes, so only scalar and array copies count.
 pub(super) fn gc_free(f: &LirFunction, inst: &LirInst) -> bool {
-    let plain = |operand: &LirOperand| !matches!(operand, LirOperand::Reference { .. });
     let copyable = |ty: &Type| scalar(ty) || is_array(ty);
     match inst {
         LirInst::Compute { value, .. } => match value {
-            LirRvalue::Use(operand) => plain(operand),
+            LirRvalue::Use(operand) => operand.is_plain_value(),
             LirRvalue::Binary { operand_ty, .. } => scalar(operand_ty),
+            // All other rvalues delegate to the exhaustive inline array-access classification.
             value => inspected_array(value).is_some(),
         },
-        LirInst::Let { ty, value, .. } => plain(value) && copyable(ty),
+        LirInst::Let { ty, value, .. } => value.is_plain_value() && copyable(ty),
         LirInst::Assign { local, value, .. } => {
-            plain(value) && copyable(&f.locals[local.0 as usize].ty)
+            value.is_plain_value() && copyable(&f.locals[local.0 as usize].ty)
         }
         LirInst::ClearScopeRoots { .. } => true,
-        _ => false,
+        ir_variants!(
+            LirInst;
+            EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, SelectInit, SelectProbe,
+            SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
+            Unsupported
+        ) => false,
     }
 }
 
@@ -373,7 +395,9 @@ pub(super) fn terminator_locals(terminator: &Terminator) -> Vec<LirLocalId> {
         Terminator::Branch { cond, .. } | Terminator::Return(Some(cond)) => cond.locals(),
         Terminator::Suspend { operation, .. } => {
             let mut out = HashSet::new();
-            operation.collect_locals(&mut out);
+            operation.for_each_local(|id| {
+                out.insert(id);
+            });
             out.into_iter().collect()
         }
         Terminator::Jump(_) | Terminator::Return(None) | Terminator::CleanupReturn => Vec::new(),

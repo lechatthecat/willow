@@ -23,6 +23,11 @@ use super::super::lowered::{LirLocalId, LirOperand, LirRvalue, SourceFunction, S
 use super::super::typed_ast::HirExprKind;
 use crate::semantic::ids::FunctionId;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static REMOVAL_VISITS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 #[derive(Clone, Copy)]
 enum Def {
     Function(FunctionId),
@@ -30,14 +35,23 @@ enum Def {
     Opaque,
 }
 
+/// Losing the last use of a resolved binding makes its definition removable.
+fn remove_use(local: LirLocalId, use_counts: &mut [u32], dead: &mut Vec<LirLocalId>) {
+    let remaining = &mut use_counts[local.0 as usize];
+    *remaining -= 1;
+    if *remaining == 0 {
+        dead.push(local);
+    }
+}
+
 /// Rewrite calls through locals that always hold one synchronous named
 /// function's value into direct calls. `direct` lists the functions a direct
 /// call may name (an `async` target would need its task protocol instead).
 pub(crate) fn devirtualize_function_values(
     function: &mut SourceFunction,
-    direct: &HashSet<FunctionId>,
+    direct: &HashMap<FunctionId, usize>,
 ) {
-    use super::super::lowered::async_liveness::instruction_use_def;
+    use super::super::lowered::async_liveness::{clear_local_scratch, instruction_use_def};
     let names: HashMap<_, _> = function
         .locals
         .iter()
@@ -49,14 +63,14 @@ pub(crate) fn devirtualize_function_values(
     // Instructions and terminators reading each local, and where each
     // function-or-copy binding is defined.
     let mut use_counts = vec![0u32; function.locals.len()];
-    let mut def_sites = vec![None; function.locals.len()];
+    let mut def_blocks = vec![None; function.locals.len()];
     let mut uses = HashSet::new();
     let mut defs = HashSet::new();
     let mut any_call = false;
     for (block_index, block) in function.blocks.iter().enumerate() {
-        for (inst_index, inst) in block.instrs.iter().enumerate() {
-            defs.clear();
-            uses.clear();
+        for inst in &block.instrs {
+            clear_local_scratch(&mut defs);
+            clear_local_scratch(&mut uses);
             instruction_use_def(inst, &names, &mut uses, &mut defs);
             for local in &defs {
                 definitions[local.0 as usize] += 1;
@@ -69,16 +83,29 @@ pub(crate) fn devirtualize_function_values(
                     any_call |= matches!(value, LirRvalue::IndirectCall { .. });
                     // A reference argument may write its place.
                     for operand in value.operands() {
-                        if let LirOperand::Reference { place, .. } = operand {
-                            for id in place.locals() {
-                                definitions[id.0 as usize] += 2;
+                        match operand {
+                            LirOperand::Reference { place, .. } => {
+                                for id in place.locals() {
+                                    definitions[id.0 as usize] += 2;
+                                }
                             }
+                            ir_variants!(LirOperand; Local, Int, Integer, Float, Bool) => {}
                         }
                     }
                     let def = match value {
                         LirRvalue::FunctionRef { function, .. } => Def::Function(*function),
                         LirRvalue::Use(LirOperand::Local(source)) => Def::Copy(*source),
-                        _ => Def::Opaque,
+                        ir_variants!(
+                            LirRvalue;
+                            BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait,
+                            Coerce, ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc,
+                            FieldLoad, FieldStore, StaticField, StaticStore, StaticCall,
+                            EnumAlloc, EnumPayloadStore, ConstructorCall, Range, EnumMethod,
+                            BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
+                            RebindResultError, IntoError, PrepareMethod, MethodCall,
+                            StringLiteral, Closure, Print, IntrinsicCall, DirectCall,
+                            IndirectCall, Unary, Binary, StringConcat
+                        ) => Def::Opaque,
                     };
                     // Only a compiler temporary is defined solely here; a
                     // source variable is bound by `Let`.
@@ -98,16 +125,28 @@ pub(crate) fn devirtualize_function_values(
                         HirExprKind::Var(name) => names
                             .get(name.as_str())
                             .map_or(Def::Opaque, |source| Def::Copy(*source)),
-                        _ => Def::Opaque,
+                        ir_variants!(
+                            HirExprKind;
+                            Int, Float, Bool, Str, Binary, Unary, Call, Invoke, Print, Array,
+                            Index, Ternary, New, FieldAccess, MethodCall, ObjectLiteral,
+                            StaticField, StaticCall, ReferenceArg, Range, Await, TryPropagate,
+                            Lambda, Match, Select
+                        ) => Def::Opaque,
                     };
                     (*local, def)
                 }
-                _ => continue,
+                ir_variants!(
+                    SourceInst;
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer, Let,
+                    Assign, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
+                    SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
+                    MatchTest, MatchBind, Expr
+                ) => continue,
             };
             sources[local.0 as usize] = def;
-            def_sites[local.0 as usize] = Some((block_index, inst_index));
+            def_blocks[local.0 as usize] = Some(block_index);
         }
-        uses.clear();
+        clear_local_scratch(&mut uses);
         terminator_uses(&block.terminator, &names, &mut uses, &HashSet::new());
         for local in &uses {
             use_counts[local.0 as usize] += 1;
@@ -139,7 +178,7 @@ pub(crate) fn devirtualize_function_values(
                 break None;
             }
             match sources[current.0 as usize] {
-                Def::Function(target) => break direct.contains(&target).then_some(target),
+                Def::Function(target) => break direct.contains_key(&target).then_some(target),
                 Def::Copy(source) => current = source,
                 Def::Opaque => break None,
             }
@@ -168,8 +207,7 @@ pub(crate) fn devirtualize_function_values(
             let Some(target) = resolve(*callee) else {
                 continue;
             };
-            use_counts[callee.0 as usize] -= 1;
-            dead.push(*callee);
+            remove_use(*callee, &mut use_counts, &mut dead);
             *value = LirRvalue::DirectCall {
                 callee: target,
                 args: std::mem::take(args),
@@ -181,37 +219,43 @@ pub(crate) fn devirtualize_function_values(
     // Remove bindings the rewrite left unread. Each resolved local has
     // exactly one definition, a function reference or a copy; removing a
     // copy may leave its source unread in turn.
+    if dead.is_empty() {
+        return;
+    }
     let mut removed = vec![false; function.locals.len()];
-    let mut sites: Vec<Vec<usize>> = vec![Vec::new(); function.blocks.len()];
+    let mut changed_blocks = vec![false; function.blocks.len()];
     while let Some(local) = dead.pop() {
         let id = local.0 as usize;
-        if removed[id] || use_counts[id] != 0 || resolve(local).is_none() {
-            continue;
-        }
-        let Some((block, inst)) = def_sites[id] else {
-            continue;
-        };
+        // Only resolved locals enter this list, when their last use disappears.
+        // Each has exactly one defining instruction, identified by its local.
+        let block = def_blocks[id].expect("resolved callable has a definition");
         removed[id] = true;
-        sites[block].push(inst);
+        changed_blocks[block] = true;
+        #[cfg(test)]
+        REMOVAL_VISITS.with(|visits| visits.update(|(marks, scans)| (marks + 1, scans)));
         if let Def::Copy(source) = sources[id] {
-            use_counts[source.0 as usize] -= 1;
-            dead.push(source);
+            remove_use(source, &mut use_counts, &mut dead);
         }
     }
-    for (block, mut drop) in function.blocks.iter_mut().zip(sites) {
-        if drop.is_empty() {
-            continue;
+    for (block, changed) in function.blocks.iter_mut().zip(changed_blocks) {
+        if changed {
+            block.instrs.retain(|inst| {
+                #[cfg(test)]
+                REMOVAL_VISITS.with(|visits| visits.update(|(marks, scans)| (marks, scans + 1)));
+                match inst {
+                    SourceInst::Compute { local, .. } | SourceInst::Let { local, .. } => {
+                        !removed[local.0 as usize]
+                    }
+                    // Only Compute and immutable Let populate the definition table.
+                    ir_variants!(
+                        SourceInst;
+                        Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots,
+                        Defer, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
+                        SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
+                        MatchTest, MatchBind, Expr
+                    ) => true,
+                }
+            });
         }
-        drop.sort_unstable();
-        let mut next = drop.into_iter().peekable();
-        let mut index = 0;
-        block.instrs.retain(|_| {
-            let keep = next.peek() != Some(&index);
-            if !keep {
-                next.next();
-            }
-            index += 1;
-            keep
-        });
     }
 }

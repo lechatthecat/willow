@@ -120,6 +120,7 @@ fn static_call(
                 )
         }
         (None, "new", []) if matches!(class_name.as_str(), "CancelToken" | "CancelSource") => true,
+        // Only these builtin constructor and argument shapes have flat lowering.
         _ => false,
     }
 }
@@ -134,6 +135,7 @@ fn enum_payloads(
     let args = match ty {
         Type::Generic(name, args) if name == class => args.as_slice(),
         Type::Named(name) if name == class => &[],
+        // Only an instance of this enum supplies substitutions for its payload.
         _ => return None,
     };
     if info.type_params.len() != args.len() {
@@ -199,7 +201,7 @@ fn builtin_call(callee: &FunctionId, args: &[HirExpr], result: &Type) -> bool {
             && match args {
                 [] => true,
                 [arg] => arg.ty == Type::String,
-                _ => format_segments(args).is_some(),
+                [_, _, ..] => format_segments(args).is_some(),
             };
     }
     if name == "format" {
@@ -278,6 +280,7 @@ fn enum_method(receiver: &Type, method: &str) -> bool {
                 | "ok"
                 | "err"
         ),
+        // Only Option and Result use these enum method lowering rules.
         _ => false,
     })
 }
@@ -291,12 +294,14 @@ fn argument_types(
     match &node.kind {
         HirExprKind::Invoke { callee, .. } => match &callee.ty {
             Type::Fn(params, _) | Type::Closure(params, _) => Some(params.clone()),
+            // Only callable types supply parameter types.
             _ => None,
         },
         HirExprKind::Call { callee, .. } => {
             if let Some(local) = names.get(callee.unqualified_name().as_deref().unwrap_or("")) {
                 match &locals[local.0 as usize].ty {
                     Type::Fn(params, _) | Type::Closure(params, _) => Some(params.clone()),
+                    // A local shadows the declaration even when it has no callable signature.
                     _ => None,
                 }
             } else {
@@ -352,7 +357,12 @@ fn argument_types(
             }
             None
         }
-        _ => None,
+        ir_variants!(
+            HirExprKind;
+            Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Print, Array, Index, Ternary,
+            FieldAccess, ObjectLiteral, StaticField, ReferenceArg, Range, Await, TryPropagate,
+            Lambda, Match, Select
+        ) => None,
     }
 }
 
@@ -430,7 +440,7 @@ fn scalar(
             && (matches!(lhs.ty, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String)
                 || (matches!(op, BinOp::Eq | BinOp::Ne) && identity_operand_type(lhs, rhs, &callables.resolution).is_some())
                 || (matches!(op, BinOp::Eq | BinOp::Ne) && matches!(&lhs.ty, Type::Named(name) | Type::Generic(name, _) if callables.resolution.enums.get(name).is_some_and(|info| info.variants.iter().all(|variant| variant.payloads.is_empty()))))),
-        _ => false,
+        HirExprKind::Ternary { .. } | HirExprKind::TryPropagate { .. } | HirExprKind::Match { .. } | HirExprKind::Select { .. } => false,
     })
 }
 
@@ -660,13 +670,8 @@ fn operand(
     snapshot: bool,
 ) -> LirOperand {
     lower(expr, emitted, locals, names, callables, is_async);
-    let value = match &expr.kind {
-        HirExprKind::Var(name) => LirOperand::Local(names[name]),
-        HirExprKind::Int(value) => LirOperand::integer(*value, &expr.ty),
-        HirExprKind::Float(value) => LirOperand::Float(*value),
-        HirExprKind::Bool(value) => LirOperand::Bool(*value),
-        _ => unreachable!("validated expression became a flat operand"),
-    };
+    let value = LirOperand::from_flat_expr(expr, |name| Some(names[name]))
+        .unwrap_or_else(|| unreachable!("validated expression became a flat operand"));
     if snapshot && expr.ty != Type::Never && matches!(value, LirOperand::Local(_)) {
         LirOperand::Local(emit(
             LirRvalue::Use(value),
@@ -703,7 +708,12 @@ fn lower_store(
         SourceInst::StaticFieldAssign { value, .. } => {
             scalar(value, names, locals, callables, is_async)
         }
-        _ => false,
+        ir_variants!(
+            SourceInst;
+            Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer, Let,
+            Assign, SuperInit, SelectInit, SelectProbe, SelectPick, SelectUnregister,
+            SelectCommit, ReleaseLock, MatchTest, MatchBind, Expr
+        ) => false,
     };
     if !valid {
         return false;
@@ -782,7 +792,12 @@ fn lower_store(
                 value.span,
             )
         }
-        _ => unreachable!(),
+        ir_variants!(
+            SourceInst;
+            Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer, Let,
+            Assign, SuperInit, SelectInit, SelectProbe, SelectPick, SelectUnregister,
+            SelectCommit, ReleaseLock, MatchTest, MatchBind, Expr
+        ) => unreachable!(),
     };
     emit(value, Type::Void, span, emitted, locals, names);
     true
@@ -822,7 +837,13 @@ fn lower_blocks_with(
                 SourceInst::Assign { value, .. } | SourceInst::Expr(value) => {
                     lower(value, &mut emitted, locals, &mut names, callables, is_async)
                 }
-                _ => {}
+                ir_variants!(
+                    SourceInst;
+                    Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots,
+                    Defer, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
+                    SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
+                    MatchTest, MatchBind
+                ) => {}
             }
             // Keep lexical scope markers even after a raise: backend cleanup
             // construction consumes them on exceptional paths as well.
@@ -858,7 +879,10 @@ fn lower_blocks_with(
                     block.terminator = SourceTerminator::Return(None);
                 }
             }
-            _ => {}
+            SourceTerminator::Jump(_)
+            | SourceTerminator::Suspend { .. }
+            | SourceTerminator::Return(_)
+            | SourceTerminator::CleanupReturn => {}
         }
         block.instrs = emitted;
     }
@@ -1145,6 +1169,7 @@ mod tests {
                     value: LirRvalue::BuiltinCall { .. },
                     ..
                 } => Some("call"),
+                // This assertion projects constructor effects in evaluation order.
                 _ => None,
             })
             .collect();
@@ -1197,6 +1222,7 @@ mod tests {
                         .collect();
                     assert_eq!(parts, segments, "segments keep source order");
                 }
+                // Only formatting and its inputs contribute events to this assertion.
                 _ => {}
             }
         }
@@ -1226,6 +1252,7 @@ mod tests {
                 LirRvalue::ArrayAlloc { .. } => Some("alloc"),
                 LirRvalue::ArrayStore { .. } => Some("store"),
                 LirRvalue::BuiltinCall { .. } => Some("call"),
+                // This assertion projects array construction effects in evaluation order.
                 _ => None,
             })
             .collect();

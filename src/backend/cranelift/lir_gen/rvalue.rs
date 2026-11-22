@@ -1,6 +1,8 @@
 //! Operand and rvalue emission.
 
 use super::*;
+use crate::ir::ir_variants;
+use crate::ir::lowered::LirOperand;
 use willow_abi::runtime_symbols::names as rt;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -372,7 +374,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         Some(VarStorage::Stack { ty, .. })
                             if is_gc_managed(ty, self.enum_infos)
                     ),
-                    _ => false,
+                    crate::ir::lowered::LirOperand::Int(_)
+                    | crate::ir::lowered::LirOperand::Integer { .. }
+                    | crate::ir::lowered::LirOperand::Float(_)
+                    | crate::ir::lowered::LirOperand::Bool(_)
+                    | crate::ir::lowered::LirOperand::Reference { .. } => false,
                 };
                 let receiver = self.emit_lir_operand(function, receiver);
                 let (args, roots) = self.emit_flat_call_operands(function, args);
@@ -438,7 +444,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 args,
                 arg_types,
             } => self.emit_flat_constructor_call(function, object, class, args, arg_types, span),
-            _ => unreachable!("rvalue dispatched by responsibility"),
+            ir_variants!(
+                LirRvalue;
+                BeginReferenceCall, Use, AwaitFuture, SelectIdleWait, Coerce, ArrayAlloc,
+                CaptureArrayOwner, ArrayStore, Index, ObjectAlloc, FieldLoad, FieldStore,
+                StaticField, StaticStore, EnumAlloc, EnumPayloadStore, Range, EnumMethod,
+                BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug, RebindResultError,
+                IntoError, StringLiteral, FunctionRef, Closure, Print, IntrinsicCall, DirectCall,
+                IndirectCall, Unary, Binary, StringConcat
+            ) => unreachable!("rvalue dispatched by responsibility"),
         }
     }
 
@@ -586,7 +600,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_void_runtime_call(name, &[value]);
                 self.builder.ins().iconst(types::I8, 0)
             }
-            _ => unreachable!("rvalue dispatched by responsibility"),
+            ir_variants!(
+                LirRvalue;
+                BeginReferenceCall, Use, StartTask, Coerce, ArrayAlloc, CaptureArrayOwner,
+                ArrayStore, Index, ObjectAlloc, FieldLoad, FieldStore, StaticField, StaticStore,
+                StaticCall, EnumAlloc, EnumPayloadStore, ConstructorCall, Range, FormatScalar,
+                ReferenceDebug, RebindResultError, IntoError, PrepareMethod, MethodCall,
+                StringLiteral, FunctionRef, Closure, DirectCall, IndirectCall, Unary, Binary,
+                StringConcat
+            ) => unreachable!("rvalue dispatched by responsibility"),
         }
     }
 
@@ -706,7 +728,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_post_willow_call_panic_check(panic_depth);
                 converted
             }
-            _ => unreachable!("rvalue dispatched by responsibility"),
+            ir_variants!(
+                LirRvalue;
+                BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait, StaticCall,
+                ConstructorCall, EnumMethod, BuiltinCall, FormatScalar, Panic, Recover,
+                ReferenceDebug, PrepareMethod, MethodCall, StringLiteral, FunctionRef, Closure,
+                Print, IntrinsicCall, DirectCall, IndirectCall, Unary, Binary, StringConcat
+            ) => unreachable!("rvalue dispatched by responsibility"),
         }
     }
 
@@ -812,7 +840,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_post_willow_call_panic_check(panic_depth);
                 result
             }
-            _ => unreachable!("rvalue dispatched by responsibility"),
+            ir_variants!(
+                LirRvalue;
+                BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait, Coerce,
+                ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc, FieldLoad,
+                FieldStore, StaticField, StaticStore, StaticCall, EnumAlloc, EnumPayloadStore,
+                ConstructorCall, Range, EnumMethod, BuiltinCall, FormatScalar, Panic, Recover,
+                ReferenceDebug, RebindResultError, IntoError, PrepareMethod, MethodCall,
+                StringLiteral, Print, IntrinsicCall, IndirectCall, Unary, Binary, StringConcat
+            ) => unreachable!("rvalue dispatched by responsibility"),
         }
     }
 
@@ -870,7 +906,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let unsigned_rem = if nonnegative_lhs && matches!(op, BinOp::Rem) {
                     match rhs {
                         crate::ir::lowered::LirOperand::Int(n) if *n > 0 => Some(*n as u64),
-                        _ => None,
+                        ir_variants!(
+                            LirOperand;
+                            Local, Int, Integer, Float, Bool, Reference
+                        ) => None,
                     }
                 } else {
                     None
@@ -995,7 +1034,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let value = self.emit_lir_operand(function, value);
                 self.emit_flat_format_scalar(value, ty, *format)
             }
-            _ => unreachable!("rvalue dispatched by responsibility"),
+            ir_variants!(
+                LirRvalue;
+                BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait, Coerce,
+                ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc, FieldLoad,
+                FieldStore, StaticField, StaticStore, StaticCall, EnumAlloc, EnumPayloadStore,
+                ConstructorCall, Range, EnumMethod, BuiltinCall, Panic, Recover, ReferenceDebug,
+                RebindResultError, IntoError, PrepareMethod, MethodCall, StringLiteral,
+                FunctionRef, Closure, Print, IntrinsicCall, DirectCall, IndirectCall
+            ) => unreachable!("rvalue dispatched by responsibility"),
         }
     }
 
@@ -1053,7 +1100,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // panic-depth protocol around the call.
                 self.emit_promoted_fn_call(signature, word, &values, (params, result), &name, span)
             }
-            _ => unreachable!("rvalue dispatched by responsibility"),
+            ir_variants!(
+                LirRvalue;
+                BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait, Coerce,
+                ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc, FieldLoad,
+                FieldStore, StaticField, StaticStore, StaticCall, EnumAlloc, EnumPayloadStore,
+                ConstructorCall, Range, EnumMethod, BuiltinCall, FormatScalar, Panic, Recover,
+                ReferenceDebug, RebindResultError, IntoError, PrepareMethod, MethodCall,
+                StringLiteral, FunctionRef, Closure, Print, IntrinsicCall, DirectCall, Unary,
+                Binary, StringConcat
+            ) => unreachable!("rvalue dispatched by responsibility"),
         }
     }
 
