@@ -220,7 +220,7 @@ fn main() {
 fn verified_immutable_data_fail_closed_build_gate() {
     for (source, code) in [
         (
-            "@pure @verified fn f(a:Array<i64>)->i64{return a[0];}",
+            "import std::collections::Array; @pure @verified fn f(a:Array<i64>)->i64{return a[0];}",
             "E2631",
         ),
         (

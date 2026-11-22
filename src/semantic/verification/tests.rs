@@ -255,6 +255,29 @@ fn verification_missing_solver_and_prior_error_fail_closed() {
     assert_eq!(v.reports[0].status, Status::Unknown);
 }
 #[test]
+fn verification_failed_dependency_preserves_each_diagnostic() {
+    let v = verify_source(
+        "@pure @verified fn leaf()->i64 requires false {return 0;}
+         @pure fn helper()->i64 {return leaf();}
+         @pure @verified fn caller()->i64 {return helper();}",
+    );
+    let [leaf, caller] = v.reports.as_slice() else {
+        panic!("unexpected reports: {:?}", v.reports)
+    };
+    assert_eq!(leaf.status, Status::VacuousPrecondition);
+    assert_eq!(leaf.failure_kind.unwrap().code(), ErrorCode::E2630);
+    assert!(leaf.unknown_reasons.is_empty());
+    assert_eq!(caller.status, Status::Unknown);
+    assert_eq!(caller.failure_kind.unwrap().code(), ErrorCode::E2631);
+    assert_eq!(
+        caller.unknown_reasons,
+        [
+            "dependency `helper` is unverified: dependency `leaf` is unverified: failed requires satisfiability"
+        ]
+    );
+}
+
+#[test]
 fn verification_shared_helper_scaling() {
     for n in [8, 16, 32] {
         let mut source = String::from("@pure fn g(x:i64)->i64 {return x;}");
@@ -369,16 +392,37 @@ fn verification_artifact_write_failure_is_explicit() {
     let path =
         std::env::temp_dir().join(format!("willow-verification-file-{}", std::process::id()));
     std::fs::write(&path, "not a directory").unwrap();
-    let v = verify(
-        &parse("@pure @verified fn f()->i64 {return 1;}"),
-        &Options {
-            artifacts: Some(path.clone()),
-            ..options()
-        },
-        false,
+    let expected = std::fs::create_dir_all(path.join("child"))
+        .unwrap_err()
+        .to_string();
+    let program = parse("@pure @verified fn f()->i64 {return 1;}");
+    let options = Options {
+        artifacts: Some(path.clone()),
+        ..options()
+    };
+    let (diagnostics, verification) = check(
+        &program,
+        &[],
+        &Default::default(),
+        &crate::semantic::field_writes::FieldWrites::from_program(&program),
+        &options,
+        &mut ProofCache::default(),
     );
-    assert!(v.artifact_error.is_some());
+    let direct = verify(&program, &options, false);
     std::fs::remove_file(path).unwrap();
+    assert_eq!(
+        verification.artifact_error.as_deref(),
+        Some(expected.as_str())
+    );
+    assert_eq!(direct.artifact_error, verification.artifact_error);
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("expected one artifact diagnostic, got {diagnostics:?}")
+    };
+    assert_eq!(diagnostic.code, ErrorCode::E2632);
+    assert_eq!(
+        diagnostic.message,
+        format!("UNKNOWN: cannot save verification artifacts: {expected}")
+    );
 }
 
 #[test]

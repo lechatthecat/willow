@@ -170,7 +170,7 @@ fn verified_data_proof_perspectives() {
             );
         }
         if expected == Unknown {
-            assert_eq!(r.diagnostic_code, ErrorCode::E2631, "{name}");
+            assert_eq!(r.failure_kind.unwrap().code(), ErrorCode::E2631, "{name}");
         }
     }
 }
@@ -290,7 +290,11 @@ fn checked_length_encoding_uses_receiver_identity() {
             )
         };
         let encoded = encode::encode(names["f"], &functions, &names, &data);
-        assert_eq!(encoded.err().as_deref(), error, "{source}");
+        assert_eq!(
+            encoded.err().as_ref().map(|e| e.message.as_ref()),
+            error,
+            "{source}"
+        );
         if error.is_none() {
             assert_eq!(checker.verification.reports[0].status, Status::Proven);
         }
@@ -313,7 +317,7 @@ fn verified_data_unknown_and_quantifier_scopes() {
         false,
     );
     assert_eq!(v.reports[0].status, Status::Unknown);
-    assert_eq!(v.reports[0].diagnostic_code, ErrorCode::E2632);
+    assert_eq!(v.reports[0].failure_kind.unwrap().code(), ErrorCode::E2632);
     for source in [
         "@pure @verified fn f()->bool ensures result {return forall(0,3,|i:i64| forall(0,3,|j:i64| i==j));}",
         "@pure @verified fn f()->bool ensures result {return forall(0,3,|i:i64| exists(0,1,|j:i64| i==j));}",
@@ -364,7 +368,7 @@ fn verified_data_scaling_counts() {
         );
         let mut predicate = "true".to_owned();
         for index in 0..size {
-            predicate = format!("forall(0,2,|i{index}:i64| {predicate})");
+            predicate = format!("forall(0,2,|idx{index}:i64| {predicate})");
         }
         let p = parse(&format!(
             "@pure @verified fn f()->bool {{return {predicate};}}"

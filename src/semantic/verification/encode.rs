@@ -1,6 +1,7 @@
 use super::*;
 use crate::parser::iter::{AstEvent, AstWalk};
 use crate::qualified_name::QualifiedName;
+use error::FailureKind::Unsupported;
 
 #[derive(Clone, Debug)]
 pub(super) struct Value {
@@ -93,7 +94,7 @@ struct Encoder<'a> {
     inferred_loop_annotations: Vec<InferredLoopAnnotations>,
 }
 impl Encoder<'_> {
-    fn typed_node(&mut self, expr: String, ty: &Type) -> Result<Value, String> {
+    fn typed_node(&mut self, expr: String, ty: &Type) -> VerificationResult<Value> {
         self.data.check(ty)?;
         let mut value = self.node(expr, *ty == Type::Bool)?;
         value.ty = ty.clone();
@@ -101,26 +102,26 @@ impl Encoder<'_> {
         Ok(value)
     }
 
-    fn node(&mut self, expr: String, boolean: bool) -> Result<Value, String> {
+    fn node(&mut self, expr: String, boolean: bool) -> VerificationResult<Value> {
         if self.nodes.len() + self.scoped_nodes >= 100_000 {
-            return Err("VC node budget exceeded".into());
+            return Err(Unsupported.error("VC node budget exceeded"));
         }
         let value = Value::literal(format!("v{}", self.nodes.len()), boolean);
         self.nodes.push((value.clone(), expr));
         Ok(value)
     }
-    fn and(&mut self, a: &Value, b: &Value) -> Result<Value, String> {
+    fn and(&mut self, a: &Value, b: &Value) -> VerificationResult<Value> {
         self.node(format!("(and {} {})", a.text, b.text), true)
     }
-    fn guard(&mut self, gate: &Value, condition: String) -> Result<(), String> {
+    fn guard(&mut self, gate: &Value, condition: String) -> VerificationResult<()> {
         let v = self.node(format!("(=> {} {condition})", gate.text), true)?;
         self.safety.push(v.text);
         Ok(())
     }
-    fn expr(&mut self, expr: &Expr, state: &State, gate: &Value) -> Result<Value, String> {
+    fn expr(&mut self, expr: &Expr, state: &State, gate: &Value) -> VerificationResult<Value> {
         self.depth += 1;
         if self.depth > 256 {
-            return Err("expression depth budget exceeded".into());
+            return Err(Unsupported.error("expression depth budget exceeded"));
         }
         let expected = self.expected.take();
         let result = self.expr_inner(expr, state, gate, expected.as_ref());
@@ -133,7 +134,7 @@ impl Encoder<'_> {
         state: &State,
         gate: &Value,
         expected: Option<&Type>,
-    ) -> Result<Value, String> {
+    ) -> VerificationResult<Value> {
         let previous = self.expected.take();
         self.expected = expected.cloned();
         let result = self.expr(expr, state, gate);
@@ -146,7 +147,7 @@ impl Encoder<'_> {
         state: &State,
         gate: &Value,
         expected: Option<&Type>,
-    ) -> Result<Value, String> {
+    ) -> VerificationResult<Value> {
         let context = expected.filter(|ty| ty.integer_layout().is_some());
         let is_integer_literal = |expr: &Expr| {
             matches!(expr, Expr::Integer(..))
@@ -184,7 +185,7 @@ impl Encoder<'_> {
             BinOp::Ge => (">=", true),
             BinOp::And => ("and", true),
             BinOp::Or => ("or", true),
-            _ => return Err("unsupported binary operation".into()),
+            _ => return Err(Unsupported.error("unsupported binary operation")),
         };
         let valid = match b.op {
             BinOp::Eq | BinOp::Ne => {
@@ -210,7 +211,7 @@ impl Encoder<'_> {
             _ => l.ty.integer_layout().is_some() && l.ty == r.ty,
         };
         if !valid {
-            return Err("invalid operand types".into());
+            return Err(Unsupported.error("invalid operand types"));
         }
         if matches!(b.op, BinOp::Div | BinOp::Rem) {
             let layout = l.ty.integer_layout().unwrap();
@@ -240,7 +241,7 @@ impl Encoder<'_> {
         state: &State,
         gate: &Value,
         expected: Option<&Type>,
-    ) -> Result<Value, String> {
+    ) -> VerificationResult<Value> {
         match expr {
             Expr::Integer(n, ..) => {
                 let mut value = Value::literal(integer(*n), false);
@@ -275,17 +276,17 @@ impl Encoder<'_> {
                         ty: Type::Char,
                     }),
                     Some(ConstValue::Bool(b)) => Ok(Value::literal(b.to_string(), true)),
-                    _ => Err(format!("unknown scalar binding `{n}`")),
+                    _ => Err(Unsupported.error(format!("unknown scalar binding `{n}`"))),
                 }
             }
             Expr::Index(array, index, ..) => {
                 let array = self.expr(array, state, gate)?;
                 let index = self.expr(index, state, gate)?;
                 let element = frozen_element(&array.ty)
-                    .ok_or("index requires immutable FrozenArray")?
+                    .ok_or_else(|| Unsupported.error("index requires immutable FrozenArray"))?
                     .clone();
                 if index.ty != Type::I64 {
-                    return Err("array index must be i64".into());
+                    return Err(Unsupported.error("array index must be i64"));
                 }
                 let key = type_key(&array.ty);
                 self.guard(
@@ -302,12 +303,12 @@ impl Encoder<'_> {
             }
             Expr::FieldAccess(object, field, ..) => {
                 let object = self.expr(object, state, gate)?;
-                let fields = self
-                    .data
-                    .fields
-                    .get(&object.ty)
-                    .ok_or("field access requires an immutable record")?;
-                let (index, ty) = fields.get(field).ok_or("unknown record field")?;
+                let fields = self.data.fields.get(&object.ty).ok_or_else(|| {
+                    Unsupported.error("field access requires an immutable record")
+                })?;
+                let (index, ty) = fields
+                    .get(field)
+                    .ok_or_else(|| Unsupported.error("unknown record field"))?;
                 let index = *index;
                 let ty = ty.clone();
                 self.typed_node(
@@ -326,14 +327,14 @@ impl Encoder<'_> {
                             Intrinsic::StringLen | Intrinsic::MapLen | Intrinsic::FrozenMapLen,
                         ) => false,
                         None if c.method.kind() == MethodName::Len => false,
-                        _ => return Err("unsupported expression in i64/bool V1".into()),
+                        _ => return Err(Unsupported.error("unsupported expression in i64/bool V1")),
                     },
                     None if c.method.kind() == MethodName::Len => true,
-                    None => return Err("unsupported expression in i64/bool V1".into()),
+                    None => return Err(Unsupported.error("unsupported expression in i64/bool V1")),
                 };
                 let object = self.expr(&c.object, state, gate)?;
                 if !frozen || frozen_element(&object.ty).is_none() {
-                    return Err("len requires immutable FrozenArray".into());
+                    return Err(Unsupported.error("len requires immutable FrozenArray"));
                 }
                 self.node(
                     format!("(len_{} {})", type_key(&object.ty), object.text),
@@ -353,47 +354,47 @@ impl Encoder<'_> {
                         Ok(r)
                     }
                     UnaryOp::Not if v.boolean => self.node(format!("(not {})", v.text), true),
-                    _ => Err("unsupported unary operation".into()),
+                    _ => Err(Unsupported.error("unsupported unary operation")),
                 }
             }
             Expr::Binary(b) => self.binary_expr(b, state, gate, expected),
             Expr::Ternary(t) => {
                 let c = self.expr(&t.condition, state, gate)?;
                 if !c.boolean {
-                    return Err("non-boolean condition".into());
+                    return Err(Unsupported.error("non-boolean condition"));
                 }
                 let yes = self.and(gate, &c)?;
                 let no = self.node(format!("(and {} (not {}))", gate.text, c.text), true)?;
                 let a = self.expr_expecting(&t.then_expr, state, &yes, expected)?;
                 let b = self.expr_expecting(&t.else_expr, state, &no, Some(&a.ty))?;
                 if a.ty != b.ty {
-                    return Err("branch type mismatch".into());
+                    return Err(Unsupported.error("branch type mismatch"));
                 }
                 self.typed_node(format!("(ite {} {} {})", c.text, a.text, b.text), &a.ty)
             }
             Expr::Call(c) => {
                 if !c.type_args.is_empty() || state.env.contains_key(&c.callee) {
-                    return Err("generic or indirect call".into());
+                    return Err(Unsupported.error("generic or indirect call"));
                 }
                 let &id = self
                     .names
                     .get(c.callee.as_str())
-                    .ok_or("callee body unavailable")?;
+                    .ok_or_else(|| Unsupported.error("callee body unavailable"))?;
                 let f = self.functions[id];
                 if !has(f, EffectContractKind::Pure) {
-                    return Err("callee is not @pure".into());
+                    return Err(Unsupported.error("callee is not @pure"));
                 }
                 if c.args.len() != f.params.len() {
-                    return Err("call arity mismatch".into());
+                    return Err(Unsupported.error("call arity mismatch"));
                 }
                 let mut args = Vec::new();
                 for (a, p) in c.args.iter().zip(&f.params) {
                     if a.mode != CallArgMode::Value {
-                        return Err("reference argument".into());
+                        return Err(Unsupported.error("reference argument"));
                     }
                     let v = self.expr_expecting(a, state, gate, Some(&p.ty))?;
                     if v.ty != p.ty {
-                        return Err("argument type mismatch".into());
+                        return Err(Unsupported.error("argument type mismatch"));
                     }
                     args.push(v.text);
                 }
@@ -433,23 +434,28 @@ impl Encoder<'_> {
                 self.assumptions.push(assumption.text);
                 Ok(result)
             }
-            _ => Err("unsupported expression in i64/bool V1".into()),
+            _ => Err(Unsupported.error("unsupported expression in i64/bool V1")),
         }
     }
-    fn quantifier(&mut self, c: &CallExpr, state: &State, gate: &Value) -> Result<Value, String> {
+    fn quantifier(
+        &mut self,
+        c: &CallExpr,
+        state: &State,
+        gate: &Value,
+    ) -> VerificationResult<Value> {
         if c.args.len() != 3
             || !c.type_args.is_empty()
             || c.args.iter().any(|a| a.mode != CallArgMode::Value)
         {
-            return Err("quantifier requires bounds and a predicate".into());
+            return Err(Unsupported.error("quantifier requires bounds and a predicate"));
         }
         let low = self.expr(&c.args[0], state, gate)?;
         let high = self.expr(&c.args[1], state, gate)?;
         if low.ty != Type::I64 || high.ty != Type::I64 {
-            return Err("quantifier bounds must be i64".into());
+            return Err(Unsupported.error("quantifier bounds must be i64"));
         }
         let Expr::Lambda(lambda) = &c.args[2].expr else {
-            return Err("quantifier requires a lambda binder".into());
+            return Err(Unsupported.error("quantifier requires a lambda binder"));
         };
         if lambda.params.len() != 1
             || lambda.params[0]
@@ -457,10 +463,10 @@ impl Encoder<'_> {
                 .as_ref()
                 .is_some_and(|t| *t != Type::I64)
         {
-            return Err("quantifier binder must be i64".into());
+            return Err(Unsupported.error("quantifier binder must be i64"));
         }
         let LambdaBody::Expr(predicate) = &lambda.body else {
-            return Err("quantifier predicate must be an expression".into());
+            return Err(Unsupported.error("quantifier predicate must be an expression"));
         };
         let first = self.nodes.len();
         let safe_first = self.safety.len();
@@ -478,7 +484,7 @@ impl Encoder<'_> {
         );
         let value = self.expr(predicate, &bound, &Value::literal(&range, true))?;
         if value.ty != Type::Bool || self.assumptions.len() != assumption_first {
-            return Err("unsupported quantified predicate".into());
+            return Err(Unsupported.error("unsupported quantified predicate"));
         }
         let safety = self.safety.split_off(safe_first);
         let nodes = self.nodes.split_off(first);
@@ -502,7 +508,7 @@ impl Encoder<'_> {
         state: &State,
         gate: &Value,
         expected: Option<&Type>,
-    ) -> Result<Value, String> {
+    ) -> VerificationResult<Value> {
         let value = self.expr(&m.scrutinee, state, gate)?;
         let mut remaining = gate.clone();
         let mut result: Option<Value> = None;
@@ -515,7 +521,7 @@ impl Encoder<'_> {
                     Guard::If(guard) => {
                         let test = self.expr(guard, &branch, &selected)?;
                         if !test.boolean {
-                            return Err("non-boolean match guard".into());
+                            return Err(Unsupported.error("non-boolean match guard"));
                         }
                         test
                     }
@@ -527,12 +533,12 @@ impl Encoder<'_> {
                 selected = self.and(&selected, &test)?;
             }
             let MatchBody::Expr(expression) = &arm.body else {
-                return Err("proof match requires expression arms".into());
+                return Err(Unsupported.error("proof match requires expression arms"));
             };
             let branch_value = self.expr_expecting(expression, &branch, &selected, expected)?;
             result = Some(if let Some(previous) = result {
                 if previous.ty != branch_value.ty {
-                    return Err("match result type mismatch".into());
+                    return Err(Unsupported.error("match result type mismatch"));
                 }
                 self.typed_node(
                     format!(
@@ -558,7 +564,7 @@ impl Encoder<'_> {
             )?;
         }
         self.guard(gate, format!("(not {})", remaining.text))?;
-        result.ok_or_else(|| "empty match".into())
+        result.ok_or_else(|| Unsupported.error("empty match"))
     }
 
     /// The condition under which `value` matches `pattern`, binding the
@@ -572,7 +578,7 @@ impl Encoder<'_> {
         pattern: &Pattern,
         value: &Value,
         branch: &mut State,
-    ) -> Result<Value, String> {
+    ) -> VerificationResult<Value> {
         let variant_index = |this: &Self, name: &str| {
             this.data
                 .variants
@@ -634,27 +640,28 @@ impl Encoder<'_> {
                 }];
                 ("", class_name, &binding_field)
             }
-            _ => return Err("unsupported match pattern".into()),
+            _ => return Err(Unsupported.error("unsupported match pattern")),
         };
         if !enum_name.is_empty() && value.ty != Type::Named(enum_name.to_owned()) {
-            return Err("unsupported enum pattern type".into());
+            return Err(Unsupported.error("unsupported enum pattern type"));
         }
-        let i = variant_index(self, variant).ok_or("unknown enum variant")?;
+        let i = variant_index(self, variant)
+            .ok_or_else(|| Unsupported.error("unknown enum variant"))?;
         let field_types: Vec<Type> = self
             .data
             .constructors
             .get(&value.ty)
-            .ok_or("unsupported enum")?[i]
+            .ok_or_else(|| Unsupported.error("unsupported enum"))?[i]
             .fields
             .iter()
             .map(|(_, ty)| ty.clone())
             .collect();
         if fields.len() != field_types.len() {
-            return Err(if fields.is_empty() {
-                "enum payload required".into()
+            return Err(Unsupported.error(if fields.is_empty() {
+                "enum payload required"
             } else {
-                "enum pattern arity mismatch".into()
-            });
+                "enum pattern arity mismatch"
+            }));
         }
         let mut condition = self.node(
             format!("((_ is {}) {})", constructor(&value.ty, i), value.text),
@@ -674,9 +681,9 @@ impl Encoder<'_> {
         Ok(condition)
     }
 
-    fn block(&mut self, block: &Block, state: &mut State, depth: usize) -> Result<(), String> {
+    fn block(&mut self, block: &Block, state: &mut State, depth: usize) -> VerificationResult<()> {
         if depth > 256 {
-            return Err("block depth budget exceeded".into());
+            return Err(Unsupported.error("block depth budget exceeded"));
         }
         let mut locals = std::collections::BTreeMap::new();
         for stmt in &block.stmts {
@@ -687,7 +694,7 @@ impl Encoder<'_> {
                     if let Some(t) = &s.ty
                         && v.ty != *t
                     {
-                        return Err("local type mismatch".into());
+                        return Err(Unsupported.error("local type mismatch"));
                     }
                     locals
                         .entry(s.name.clone())
@@ -695,11 +702,15 @@ impl Encoder<'_> {
                     state.env.insert(s.name.clone(), v);
                 }
                 Stmt::Assign(s) => {
-                    let old = state.env.get(&s.name).ok_or("unknown assignment")?.clone();
+                    let old = state
+                        .env
+                        .get(&s.name)
+                        .ok_or_else(|| Unsupported.error("unknown assignment"))?
+                        .clone();
                     let v =
                         self.expr_expecting(&s.value, state, &state.alive.clone(), Some(&old.ty))?;
                     if old.ty != v.ty {
-                        return Err("assignment type mismatch".into());
+                        return Err(Unsupported.error("assignment type mismatch"));
                     }
                     let merged = self.typed_node(
                         format!("(ite {} {} {})", state.alive.text, v.text, old.text),
@@ -710,7 +721,7 @@ impl Encoder<'_> {
                 Stmt::If(s) => {
                     let c = self.expr(&s.cond, state, &state.alive.clone())?;
                     if !c.boolean {
-                        return Err("non-boolean condition".into());
+                        return Err(Unsupported.error("non-boolean condition"));
                     }
                     let incoming = state.alive.clone();
                     state.alive = self.and(&incoming, &c)?;
@@ -742,8 +753,11 @@ impl Encoder<'_> {
                 )?,
                 Stmt::For(s) => self.for_loop(s, state, depth + 1)?,
                 Stmt::Break(_) | Stmt::Continue(_) => {
-                    let (broken, continued) =
-                        self.jumps.last().cloned().ok_or("jump outside loop")?;
+                    let (broken, continued) = self
+                        .jumps
+                        .last()
+                        .cloned()
+                        .ok_or_else(|| Unsupported.error("jump outside loop"))?;
                     let is_break = matches!(stmt, Stmt::Break(_));
                     let old = if is_break { &broken } else { &continued };
                     let merged =
@@ -757,13 +771,15 @@ impl Encoder<'_> {
                 }
                 Stmt::Return(s) => {
                     let v = self.expr_expecting(
-                        s.value.as_ref().ok_or("void return outside V1")?,
+                        s.value
+                            .as_ref()
+                            .ok_or_else(|| Unsupported.error("void return outside V1"))?,
                         state,
                         &state.alive.clone(),
                         Some(&state.result.ty),
                     )?;
                     if v.ty != state.result.ty {
-                        return Err("return type mismatch".into());
+                        return Err(Unsupported.error("return type mismatch"));
                     }
                     state.result = self.typed_node(
                         format!(
@@ -783,7 +799,7 @@ impl Encoder<'_> {
                 }
                 _ => {
                     return Err(
-                        "unsupported statement: verification rejects for, break, continue, defer and heap operations".into(),
+                        Unsupported.error("unsupported statement: verification rejects for, break, continue, defer and heap operations"),
                     );
                 }
             }
@@ -803,7 +819,7 @@ impl Encoder<'_> {
         state: &State,
         gate: &Value,
         index: Option<&str>,
-    ) -> Result<Value, String> {
+    ) -> VerificationResult<Value> {
         if let Some(index) = index {
             let mut annotated = state.clone();
             annotated
@@ -821,7 +837,7 @@ impl Encoder<'_> {
         gate: &Value,
         index: Option<&str>,
         automatic: Option<(&str, &Value, &Value)>,
-    ) -> Result<Value, String> {
+    ) -> VerificationResult<Value> {
         let mut result = gate.clone();
         if let Some((counter, start, upper)) = automatic {
             let counter = &state.env[counter].text;
@@ -837,7 +853,7 @@ impl Encoder<'_> {
         for expr in invariants {
             let value = self.loop_annotation(expr, state, &result, index)?;
             if !value.boolean {
-                return Err("loop invariant must have type bool".into());
+                return Err(Unsupported.error("loop invariant must have type bool"));
             }
             result = self.and(&result, &value)?;
         }
@@ -849,7 +865,7 @@ impl Encoder<'_> {
         shape: LoopShape<'_>,
         state: &mut State,
         depth: usize,
-    ) -> Result<(), String> {
+    ) -> VerificationResult<()> {
         let LoopShape {
             cond,
             invariants,
@@ -861,11 +877,13 @@ impl Encoder<'_> {
             bounds: automatic_bounds,
         } = shape;
         if !self.verified {
-            return Err("a helper containing loops must itself be @verified".into());
+            return Err(Unsupported.error("a helper containing loops must itself be @verified"));
         }
         let variant = variant
             .filter(|_| automatic_bounds.is_some() || !invariants.is_empty())
-            .ok_or("while verification requires both invariant and variant")?;
+            .ok_or_else(|| {
+                Unsupported.error("while verification requires both invariant and variant")
+            })?;
         let incoming = state.alive.clone();
         let annotation_index = element.and(step);
         let automatic =
@@ -924,13 +942,13 @@ impl Encoder<'_> {
         )?;
         let condition = self.expr(cond, &head, &head.alive.clone())?;
         if !condition.boolean {
-            return Err("non-boolean loop condition".into());
+            return Err(Unsupported.error("non-boolean loop condition"));
         }
         let mut body = head.clone();
         body.alive = self.and(&head.alive, &condition)?;
         let rank = self.loop_annotation(variant, &head, &body.alive.clone(), annotation_index)?;
         if rank.ty != Type::I64 {
-            return Err("loop variant must have type i64".into());
+            return Err(Unsupported.error("loop variant must have type i64"));
         }
         self.guard(&body.alive, format!("(<= 0 {})", rank.text))?;
         if let Some((binding, array)) = element {
@@ -972,7 +990,7 @@ impl Encoder<'_> {
         self.guard(&body.alive, preserved.text)?;
         let next = self.loop_annotation(variant, &body, &body.alive.clone(), annotation_index)?;
         if next.ty != Type::I64 {
-            return Err("loop variant must have type i64".into());
+            return Err(Unsupported.error("loop variant must have type i64"));
         }
         self.guard(&body.alive, format!("(< {} {})", next.text, rank.text))?;
 
@@ -998,7 +1016,7 @@ impl Encoder<'_> {
         Ok(())
     }
 
-    fn for_loop(&mut self, s: &ForStmt, state: &mut State, depth: usize) -> Result<(), String> {
+    fn for_loop(&mut self, s: &ForStmt, state: &mut State, depth: usize) -> VerificationResult<()> {
         let array;
         let (start, end, counter, element) = if let Expr::Range(range) = &s.iterable {
             let start = self.expr(&range.start, state, &state.alive.clone())?;
@@ -1006,14 +1024,15 @@ impl Encoder<'_> {
             (start, end, s.name.clone(), None)
         } else {
             array = self.expr(&s.iterable, state, &state.alive.clone())?;
-            frozen_element(&array.ty).ok_or("for requires range or immutable FrozenArray")?;
+            frozen_element(&array.ty)
+                .ok_or_else(|| Unsupported.error("for requires range or immutable FrozenArray"))?;
             // An element does not exist at the empty/exhausted loop head.
             // Head invariants/ranks use outer bindings, not the element binder.
             for expression in s.invariants.iter().chain(s.variant.iter()) {
                 if AstWalk::new(AstEvent::Expr(expression))
                     .any(|e| matches!(e,AstEvent::Expr(Expr::Var(name,..)) if *name == s.name))
                 {
-                    return Err("array loop annotations cannot reference the element binder at an exhausted head".into());
+                    return Err(Unsupported.error("array loop annotations cannot reference the element binder at an exhausted head"));
                 }
             }
             let end = self.node(
@@ -1028,7 +1047,7 @@ impl Encoder<'_> {
             )
         };
         if start.ty != Type::I64 || end.ty != Type::I64 {
-            return Err("non-integer for range".into());
+            return Err(Unsupported.error("non-integer for range"));
         }
         // Bounds are snapshots, not expressions re-evaluated at an arbitrary
         // head. max(start, end) also admits the initial head of reversed ranges.
@@ -1104,12 +1123,12 @@ impl Encoder<'_> {
         Ok(())
     }
 
-    fn clauses(&mut self, clauses: &[Expr], state: &State) -> Result<Value, String> {
+    fn clauses(&mut self, clauses: &[Expr], state: &State) -> VerificationResult<Value> {
         let mut gate = Value::literal("true", true);
         for expr in clauses {
             let value = self.expr(expr, state, &gate)?;
             if !value.boolean {
-                return Err("non-boolean contract".into());
+                return Err(Unsupported.error("non-boolean contract"));
             }
             gate = self.and(&gate, &value)?;
         }
@@ -1226,10 +1245,10 @@ pub(super) fn encode(
     functions: &[&FunctionDecl],
     names: &HashMap<&str, usize>,
     data: &DataTypes,
-) -> Result<Summary, String> {
+) -> VerificationResult<Summary> {
     let f = functions[id];
     if !f.type_params.is_empty() || f.is_async || f.rust_bridge.is_some() {
-        return Err("generic, async or external function outside V1".into());
+        return Err(Unsupported.error("generic, async or external function outside V1"));
     }
     data.check(&f.return_type)?;
     let ret = sort(&f.return_type)?;
@@ -1237,7 +1256,7 @@ pub(super) fn encode(
     let mut env = im::HashMap::new();
     for (i, p) in f.params.iter().enumerate() {
         if p.mode != ParamMode::Value {
-            return Err("reference parameter outside V1".into());
+            return Err(Unsupported.error("reference parameter outside V1"));
         }
         data.check(&p.ty)?;
         let ty = sort(&p.ty)?;
@@ -1329,7 +1348,7 @@ pub(super) fn encode(
     for clause in &f.ensures {
         let value = e.expr(clause, &post_state, &post)?;
         if !value.boolean {
-            return Err("non-boolean contract".into());
+            return Err(Unsupported.error("non-boolean contract"));
         }
         post = e.and(&post, &value)?;
     }
@@ -1421,9 +1440,9 @@ fn index_loop_writes(
     block: &Block,
     index: &mut HashMap<BodyId, BTreeSet<String>>,
     depth: usize,
-) -> Result<BTreeSet<String>, String> {
+) -> VerificationResult<BTreeSet<String>> {
     if depth > 256 {
-        return Err("block depth budget exceeded".into());
+        return Err(Unsupported.error("block depth budget exceeded"));
     }
     let mut writes = BTreeSet::new();
     let mut locals = BTreeSet::new();
@@ -1489,16 +1508,16 @@ pub(super) fn contract_predicates(
     functions: &[&FunctionDecl],
     names: &HashMap<&str, usize>,
     data: &DataTypes,
-) -> Result<String, String> {
+) -> VerificationResult<String> {
     let f = functions[id];
     if !f.type_params.is_empty() || f.is_async || f.rust_bridge.is_some() {
-        return Err("unsupported contract signature".into());
+        return Err(Unsupported.error("unsupported contract signature"));
     }
     let mut params = Vec::new();
     let mut env = im::HashMap::new();
     for (i, p) in f.params.iter().enumerate() {
         if p.mode != ParamMode::Value {
-            return Err("reference contract parameter".into());
+            return Err(Unsupported.error("reference contract parameter"));
         }
         data.check(&p.ty)?;
         let ty = sort(&p.ty)?;
@@ -1572,7 +1591,7 @@ pub(super) fn contract_predicates(
         &safety,
     );
     if !e.dependencies.is_empty() {
-        return Err("contract calls require additional comparison summaries".into());
+        return Err(Unsupported.error("contract calls require additional comparison summaries"));
     }
     Ok(out)
 }

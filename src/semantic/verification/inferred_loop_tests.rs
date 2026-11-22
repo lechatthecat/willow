@@ -139,7 +139,7 @@ fn inferred_loop_constant_obligations_and_scaling() {
         for count in [8, 16, 32] {
             let mut source = String::from("@pure @verified fn f()->i64 {");
             for i in 0..count {
-                source += &format!("for i{i} in 0..9223372036854775807 {{");
+                source += &format!("for idx{i} in 0..9223372036854775807 {{");
                 if !nested {
                     source += "}";
                 }

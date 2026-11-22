@@ -12,6 +12,7 @@ thread_local! {
 pub mod comparison;
 mod data;
 mod encode;
+mod error;
 pub use cache::ProofCache;
 use data::*;
 mod solver;
@@ -20,10 +21,12 @@ mod tests;
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
 use encode::*;
+use error::{FailureKind, FunctionFailure, VerificationError, VerificationResult};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use solver::Answer;
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const PRELUDE: &str = "(define-fun wabs ((x Int)) Int (ite (< x 0) (- x) x))\n(define-fun wdiv ((x Int) (y Int)) Int (ite (= (< x 0) (< y 0)) (div (wabs x) (wabs y)) (- (div (wabs x) (wabs y)))))\n(define-fun wrem ((x Int) (y Int)) Int (- x (* y (wdiv x y))))\n";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -58,7 +61,7 @@ pub struct InferredLoopAnnotations {
 #[derive(Debug, Serialize)]
 pub struct Report {
     #[serde(skip)]
-    diagnostic_code: ErrorCode,
+    failure_kind: Option<FailureKind>,
     pub purity: serde_json::Value,
     pub contract: serde_json::Value,
     pub specification_provenance: serde_json::Value,
@@ -124,6 +127,34 @@ pub struct Verification {
     pub smt: String,
     pub artifact_error: Option<String>,
 }
+impl Verification {
+    fn with_artifacts(
+        mut self,
+        options: &Options,
+        on_error: impl FnOnce(&VerificationError),
+    ) -> Self {
+        if let Some(dir) = &options.artifacts
+            && let Err(cause) = self.write_artifacts(dir)
+        {
+            let error = FailureKind::Infrastructure.error(cause.to_string());
+            on_error(&error);
+            self.artifact_error = Some(error.message.into_owned());
+        }
+        self
+    }
+
+    fn write_artifacts(&self, dir: &Path) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(&self.reports)?;
+        let mut hash = Sha256::new();
+        hash.update(self.smt.as_bytes());
+        hash.update(json.as_bytes());
+        let dir = dir.join(format!("{:x}", crate::hex::Hex(&hash.finalize())));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("verification.smt2"), &self.smt)?;
+        std::fs::write(dir.join("verification.json"), json)
+    }
+}
+
 fn digest(text: &str) -> String {
     format!(
         "sha256:{}",
@@ -135,7 +166,7 @@ fn digest(text: &str) -> String {
 }
 fn report(f: &FunctionDecl, options: &Options) -> Report {
     Report {
-        diagnostic_code: ErrorCode::E2631,
+        failure_kind: None,
         purity: serde_json::Value::Null,
         contract: serde_json::Value::Null,
         specification_provenance: serde_json::Value::Null,
@@ -185,7 +216,7 @@ pub(crate) fn check(
             .filter(|a| a.kind == EffectContractKind::Verified)
         {
             diagnostics.push(diagnostic(
-                ErrorCode::E2631,
+                FailureKind::Unsupported.code(),
                 a.span,
                 "UNKNOWN: @verified V1 requires a top-level scalar function",
             ));
@@ -210,7 +241,7 @@ pub(crate) fn check(
         },
     );
     for r in &verification.reports {
-        if r.status != Status::Proven && r.status != Status::RuntimeChecked {
+        if let Some(failure) = r.failure_kind {
             let detail = r.unknown_reasons.first().cloned().unwrap_or_else(|| {
                 r.obligations
                     .last()
@@ -228,7 +259,7 @@ pub(crate) fn check(
                     .unwrap_or_default()
             });
             diagnostics.push(diagnostic(
-                r.diagnostic_code,
+                failure.code(),
                 r.location,
                 &format!("@verified `{}`: {:?}: {detail}", r.function, r.status)
                     .replace("Counterexample", "COUNTEREXAMPLE")
@@ -237,9 +268,9 @@ pub(crate) fn check(
             ));
         }
     }
-    if let Some(error) = &verification.artifact_error {
+    let verification = verification.with_artifacts(options, |error| {
         diagnostics.push(diagnostic(
-            ErrorCode::E2632,
+            error.kind.code(),
             program
                 .items
                 .iter()
@@ -251,9 +282,12 @@ pub(crate) fn check(
                     }
                 })
                 .unwrap(),
-            &format!("UNKNOWN: cannot save verification artifacts: {error}"),
+            &format!(
+                "UNKNOWN: cannot save verification artifacts: {}",
+                error.message
+            ),
         ));
-    }
+    });
     (diagnostics, verification)
 }
 fn diagnostic(code: ErrorCode, span: Span, message: &str) -> Diagnostic {
@@ -280,6 +314,7 @@ pub fn verify_cached(
         cache,
         &DataTypes::new(program, &writes),
     )
+    .with_artifacts(options, |_| {})
 }
 #[allow(clippy::too_many_lines, reason = "split pending")]
 fn verify_with_data(
@@ -347,12 +382,18 @@ fn verify_with_data(
     }
     let mut reports = Vec::new();
     let mut semantic_digests = vec![String::new(); functions.len()];
-    let mut valid = vec![false; functions.len()];
-    let mut failures: Vec<Option<String>> = vec![None; functions.len()];
+    #[derive(Clone, Copy)]
+    enum FunctionState {
+        Pending,
+        Valid,
+        Failed(usize),
+    }
+    let mut states = vec![FunctionState::Pending; functions.len()];
+    let mut failures = Vec::new();
     let mut engine = if !valid_budget(options) {
-        Err("invalid verification timeout/resource budget".into())
+        Err(FailureKind::Infrastructure.error("invalid verification timeout/resource budget"))
     } else if roots.is_empty() || prior_error {
-        Err("type or purity checking failed".into())
+        Err(FailureKind::Unsupported.error("type or purity checking failed"))
     } else {
         #[cfg(test)]
         SOLVER_STARTS.with(|n| n.set(n.get() + 1));
@@ -382,25 +423,7 @@ fn verify_with_data(
             .iter()
             .map(|i| functions[*i].name.clone())
             .collect();
-        let result: Result<(), String> = (|| {
-            if prior_error {
-                return Err("type or purity checking failed".into());
-            }
-            if verified && !has(f, EffectContractKind::Pure) {
-                return Err("@verified requires @pure".into());
-            }
-            if cyclic.contains(&id) {
-                return Err("recursive call graph outside V1".into());
-            }
-            for &dep in &edges[id] {
-                if !valid[dep] {
-                    return Err(format!(
-                        "dependency `{}` is unverified: {}",
-                        functions[dep].name,
-                        failures[dep].as_deref().unwrap_or("recursive dependency")
-                    ));
-                }
-            }
+        let mut verify_function = || -> VerificationResult<()> {
             let summary = encode(id, &functions, &names, data)?;
             r.vc_nodes = summary.nodes;
             r.dependency_digests = edges[id]
@@ -409,9 +432,8 @@ fn verify_with_data(
                 .collect();
             semantic_digests[id] =
                 digest(&(summary.definitions.clone() + &r.dependency_digests.join("\n")));
-            r.diagnostic_code = ErrorCode::E2632;
             if summary.dependencies != edges[id] {
-                return Err("unresolved call dependency".into());
+                return Err(FailureKind::Infrastructure.error("unresolved call dependency"));
             }
             let s = engine.as_mut().map_err(|e| e.clone())?;
             s.exchange(&summary.definitions)?;
@@ -423,6 +445,7 @@ fn verify_with_data(
             let cache_key = cache::identity(&summary, &r.dependency_digests, f, options);
             r.inferred_loop_annotations = summary.inferred_loop_annotations;
             let cached = cache.get(&cache_key);
+            let cache_hit = cached.is_some();
             let mut args = Vec::new();
             let mut domain = vec!["true".to_string()];
             for (i, p) in f.params.iter().enumerate() {
@@ -441,9 +464,11 @@ fn verify_with_data(
             if let Some(obligations) = cached {
                 // Probe the live solver before reuse: missing, poisoned or exhausted
                 // sessions cannot be turned into a successful old result.
-                if s.query("false", &[])?.0 != "unsat" {
+                if s.query("false", &[])?.0 != Answer::Unsat {
                     cache.remove(&cache_key);
-                    return Err("solver unavailable for cached proof".into());
+                    return Err(
+                        FailureKind::Infrastructure.error("solver unavailable for cached proof")
+                    );
                 }
                 r.obligations = obligations;
             } else {
@@ -451,12 +476,12 @@ fn verify_with_data(
                     (
                         "requires safety",
                         format!("(and {domain} (not {}))", call("pre_safe")),
-                        "unsat",
+                        Answer::Unsat,
                     ),
                     (
                         "requires satisfiability",
                         format!("(and {domain} {})", call("pre")),
-                        "sat",
+                        Answer::Sat,
                     ),
                     (
                         "body safety and termination",
@@ -466,7 +491,7 @@ fn verify_with_data(
                             call("assume"),
                             call("safe")
                         ),
-                        "unsat",
+                        Answer::Unsat,
                     ),
                     (
                         "ensures safety",
@@ -476,7 +501,7 @@ fn verify_with_data(
                             call("assume"),
                             call("post_safe")
                         ),
-                        "unsat",
+                        Answer::Unsat,
                     ),
                     (
                         "ensures truth",
@@ -486,32 +511,33 @@ fn verify_with_data(
                             call("assume"),
                             call("post")
                         ),
-                        "unsat",
+                        Answer::Unsat,
                     ),
                 ] {
-                    let (answer, model) =
-                        s.query(&formula, if want == "unsat" { &model_symbols } else { &[] })?;
+                    let (answer, model) = s.query(
+                        &formula,
+                        if want == Answer::Unsat {
+                            &model_symbols
+                        } else {
+                            &[]
+                        },
+                    )?;
                     r.obligations.push(Obligation {
                         kind: kind.into(),
-                        solver_result: answer.clone(),
-                        expected_solver_result: want.into(),
+                        solver_result: answer.as_str().into(),
+                        expected_solver_result: want.as_str().into(),
                         counterexample_candidate: if answer != want { model } else { None },
                     });
                     if answer != want {
-                        r.status = if answer == "unknown" {
-                            Status::Unknown
-                        } else if want == "sat" {
-                            Status::VacuousPrecondition
-                        } else {
-                            Status::Counterexample
-                        };
-                        if answer != "unknown" {
-                            r.diagnostic_code = ErrorCode::E2630;
-                        }
-                        return Err(if answer == "unknown" {
-                            "solver returned UNKNOWN (timeout or incomplete theory)".into()
-                        } else {
-                            format!("failed {kind}")
+                        return Err(match answer {
+                            Answer::Unknown => FailureKind::Infrastructure
+                                .error("solver returned UNKNOWN (timeout or incomplete theory)"),
+                            Answer::Unsat => {
+                                FailureKind::VacuousPrecondition.error(format!("failed {kind}"))
+                            }
+                            Answer::Sat => {
+                                FailureKind::Counterexample.error(format!("failed {kind}"))
+                            }
                         });
                     }
                 }
@@ -529,17 +555,55 @@ fn verify_with_data(
                 sort(&f.return_type)?
             ))?;
             r.status = Status::Proven;
-            cache.insert(cache_key, r.obligations.clone());
+            if !cache_hit {
+                cache.insert(cache_key, r.obligations.clone());
+            }
             Ok(())
-        })();
+        };
+        let result = if prior_error {
+            Err(FailureKind::Unsupported
+                .error("type or purity checking failed")
+                .into())
+        } else if verified && !has(f, EffectContractKind::Pure) {
+            Err(FailureKind::Unsupported
+                .error("@verified requires @pure")
+                .into())
+        } else if cyclic.contains(&id) {
+            Err(FailureKind::Unsupported
+                .error("recursive call graph outside V1")
+                .into())
+        } else if let Some(failure) = edges[id].iter().find_map(|&dep| {
+            let name = functions[dep].name.as_str();
+            match states[dep] {
+                FunctionState::Valid => None,
+                FunctionState::Failed(cause) => Some(FunctionFailure::Dependency { name, cause }),
+                FunctionState::Pending => Some(
+                    FailureKind::Unsupported
+                        .error(format!(
+                            "dependency `{name}` is unverified: recursive dependency"
+                        ))
+                        .into(),
+                ),
+            }
+        }) {
+            Err(failure)
+        } else {
+            verify_function().map_err(FunctionFailure::Direct)
+        };
         match result {
-            Ok(()) => valid[id] = true,
+            Ok(()) => states[id] = FunctionState::Valid,
             Err(error) => {
                 cache.invalidate();
-                failures[id] = Some(error.clone());
-                if r.status == Status::Unknown {
-                    r.unknown_reasons.push(error);
+                if verified {
+                    let kind = error.kind();
+                    r.failure_kind = Some(kind);
+                    r.status = kind.status();
+                    if r.status == Status::Unknown {
+                        r.unknown_reasons.push(error.message(&failures));
+                    }
                 }
+                states[id] = FunctionState::Failed(failures.len());
+                failures.push(error);
             }
         }
         if verified {
@@ -568,26 +632,11 @@ fn verify_with_data(
         .as_ref()
         .map(|s| s.transcript.clone())
         .unwrap_or_default();
-    let mut result = Verification {
+    Verification {
         reports,
         smt,
         artifact_error: None,
-    };
-    if let Some(dir) = &options.artifacts {
-        let save = (|| -> Result<(), Box<dyn std::error::Error>> {
-            let json = serde_json::to_string_pretty(&result.reports)?;
-            let key = digest(&(result.smt.clone() + &json));
-            let dir = dir.join(&key[7..]);
-            std::fs::create_dir_all(&dir)?;
-            std::fs::write(dir.join("verification.smt2"), &result.smt)?;
-            std::fs::write(dir.join("verification.json"), json)?;
-            Ok(())
-        })();
-        if let Err(error) = save {
-            result.artifact_error = Some(error.to_string());
-        }
     }
-    result
 }
 
 fn contract_text(expr: &Expr) -> String {

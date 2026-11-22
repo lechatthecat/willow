@@ -1,14 +1,41 @@
+use super::error::{FailureKind::Infrastructure, VerificationResult};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "4.15.4";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Answer {
+    Sat,
+    Unsat,
+    Unknown,
+}
+
+impl Answer {
+    fn parse(response: &str) -> VerificationResult<Self> {
+        match response.trim() {
+            "sat" => Ok(Self::Sat),
+            "unsat" => Ok(Self::Unsat),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(Infrastructure.error(format!("malformed solver status: {other}"))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sat => "sat",
+            Self::Unsat => "unsat",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 pub(super) struct Solver {
     child: Child,
     input: SyncSender<String>,
-    written: Receiver<Result<(), String>>,
-    output: Receiver<Result<String, String>>,
+    written: Receiver<VerificationResult<()>>,
+    output: Receiver<VerificationResult<String>>,
     pub transcript: String,
     deadline: Instant,
     timeout: Duration,
@@ -21,20 +48,26 @@ impl Drop for Solver {
     }
 }
 impl Solver {
-    pub fn new(path: &std::path::Path, timeout_ms: u64) -> Result<Self, String> {
+    pub fn new(path: &std::path::Path, timeout_ms: u64) -> VerificationResult<Self> {
         let mut command = Command::new(path);
         command.args(["-in", "-smt2"]);
         Self::from_command(command, timeout_ms)
     }
-    fn from_command(mut command: Command, timeout_ms: u64) -> Result<Self, String> {
+    fn from_command(mut command: Command, timeout_ms: u64) -> VerificationResult<Self> {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("cannot start pinned Z3 {VERSION}: {e}"))?;
-        let mut input = child.stdin.take().ok_or("solver stdin unavailable")?;
-        let output = child.stdout.take().ok_or("solver stdout unavailable")?;
+            .map_err(|e| Infrastructure.error(format!("cannot start pinned Z3 {VERSION}: {e}")))?;
+        let mut input = child
+            .stdin
+            .take()
+            .ok_or_else(|| Infrastructure.error("solver stdin unavailable"))?;
+        let output = child
+            .stdout
+            .take()
+            .ok_or_else(|| Infrastructure.error("solver stdout unavailable"))?;
         let (commands, requests) = sync_channel::<String>(1);
         let (sent, written) = sync_channel(1);
         std::thread::spawn(move || {
@@ -42,7 +75,7 @@ impl Solver {
                 let result = input
                     .write_all(command.as_bytes())
                     .and_then(|_| input.flush())
-                    .map_err(|e| format!("solver input error: {e}"));
+                    .map_err(|e| Infrastructure.error(format!("solver input error: {e}")));
                 let failed = result.is_err();
                 if sent.send(result).is_err() || failed {
                     break;
@@ -65,7 +98,9 @@ impl Solver {
                         }
                     }
                     _ => {
-                        let _ = tx.send(Err("invalid or oversized solver output".into()));
+                        let _ = tx.send(Err(
+                            Infrastructure.error("invalid or oversized solver output")
+                        ));
                         break;
                     }
                 }
@@ -83,17 +118,17 @@ impl Solver {
         };
         let version = s.exchange("(get-info :version)\n")?;
         if version.trim() != format!("(:version \"{VERSION}\")") {
-            return Err(format!(
+            return Err(Infrastructure.error(format!(
                 "requires Z3 {VERSION}; received {}",
                 version.trim()
-            ));
+            )));
         }
         s.exchange(&format!("(set-option :print-success false)\n(set-option :produce-models true)\n(set-option :memory_max_size 512)\n(set-option :smt.random_seed 0)\n(set-option :sat.random_seed 0)\n(set-option :timeout {timeout_ms})\n"))?;
         Ok(s)
     }
-    pub fn exchange(&mut self, command: &str) -> Result<String, String> {
+    pub fn exchange(&mut self, command: &str) -> VerificationResult<String> {
         if self.poisoned {
-            return Err("solver session is invalid after an earlier error".into());
+            return Err(Infrastructure.error("solver session is invalid after an earlier error"));
         }
         let result = self.exchange_inner(command);
         if result.is_err() {
@@ -101,12 +136,12 @@ impl Solver {
         }
         result
     }
-    fn exchange_inner(&mut self, command: &str) -> Result<String, String> {
+    fn exchange_inner(&mut self, command: &str) -> VerificationResult<String> {
         if Instant::now() >= self.deadline {
-            return Err("verification budget timeout".into());
+            return Err(Infrastructure.error("verification budget timeout"));
         }
         if self.transcript.len().saturating_add(command.len()) > 64 * 1024 * 1024 {
-            return Err("SMT byte budget exceeded".into());
+            return Err(Infrastructure.error("SMT byte budget exceeded"));
         }
         self.transcript.push_str(command);
         let deadline = self
@@ -114,27 +149,27 @@ impl Solver {
             .min(Instant::now() + self.timeout + Duration::from_secs(1));
         self.input
             .try_send(format!("{command}(echo \"willow-end\")\n"))
-            .map_err(|_| "solver input unavailable".to_string())?;
+            .map_err(|_| Infrastructure.error("solver input unavailable"))?;
         self.written
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| "solver input timeout".to_string())??;
+            .map_err(|_| Infrastructure.error("solver input timeout"))??;
         let mut text = String::new();
         loop {
             let duration = deadline.saturating_duration_since(Instant::now());
             let line = self
                 .output
                 .recv_timeout(duration)
-                .map_err(|_| "solver timeout or unexpected EOF".to_string())??;
+                .map_err(|_| Infrastructure.error("solver timeout or unexpected EOF"))??;
             if line.trim() == "willow-end" {
                 break;
             }
             text.push_str(&line);
             if text.len() > 1_048_576 {
-                return Err("oversized solver response".into());
+                return Err(Infrastructure.error("oversized solver response"));
             }
         }
         if text.contains("(error") {
-            return Err(format!("solver rejected VC: {}", text.trim()));
+            return Err(Infrastructure.error(format!("solver rejected VC: {}", text.trim())));
         }
         Ok(text)
     }
@@ -142,14 +177,10 @@ impl Solver {
         &mut self,
         formula: &str,
         inputs: &[String],
-    ) -> Result<(String, Option<String>), String> {
+    ) -> VerificationResult<(Answer, Option<String>)> {
         let answer = self.exchange(&format!("(push 1)\n(assert {formula})\n(check-sat)\n"))?;
-        let answer = answer.trim().to_string();
-        if !matches!(answer.as_str(), "sat" | "unsat" | "unknown") {
-            self.poisoned = true;
-            return Err(format!("malformed solver status: {answer}"));
-        }
-        let model = if answer == "sat" && !inputs.is_empty() {
+        let answer = Answer::parse(&answer).inspect_err(|_| self.poisoned = true)?;
+        let model = if answer == Answer::Sat && !inputs.is_empty() {
             Some(
                 self.exchange(&format!("(get-value ({}))\n", inputs.join(" ")))?
                     .trim()
@@ -166,7 +197,7 @@ impl Solver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fake(body: &str, timeout: u64) -> Result<Solver, String> {
+    fn fake(body: &str, timeout: u64) -> VerificationResult<Solver> {
         let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
         command.args(["-u", "-c", body]);
         Solver::from_command(command, timeout)
@@ -177,18 +208,27 @@ mod tests {
         assert!(fake("pass", 10).is_err());
         let script = "import sys\nfor line in sys.stdin:\n if 'get-info' in line: print('(:version \"4.15.4\")')\n elif 'check-sat' in line: print('banana')\n elif 'echo' in line: print('willow-end')\n";
         let mut s = fake(script, 100).unwrap();
-        assert!(s.query("true", &[]).unwrap_err().contains("malformed"));
+        let err = s.query("true", &[]).unwrap_err();
+        assert_eq!(err.kind.code(), crate::diagnostics::ErrorCode::E2632);
+        assert_eq!(err.message, "malformed solver status: banana");
+        assert!(s.poisoned);
     }
     #[test]
     fn verification_solver_timeout_is_bounded_and_poisoned() {
         let script = "import sys,time\nfor line in sys.stdin:\n if 'get-info' in line: print('(:version \"4.15.4\")')\n elif 'check-sat' in line: time.sleep(30)\n elif 'echo' in line: print('willow-end')\n";
         let mut s = fake(script, 1).unwrap();
         let start = Instant::now();
-        assert!(s.query("true", &[]).unwrap_err().contains("timeout"));
+        assert!(
+            s.query("true", &[])
+                .unwrap_err()
+                .message
+                .contains("timeout")
+        );
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(
             s.exchange("(check-sat)\n")
                 .unwrap_err()
+                .message
                 .contains("earlier error")
         );
     }

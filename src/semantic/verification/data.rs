@@ -2,6 +2,7 @@
 use super::encode::integer_bounds;
 use super::*;
 use crate::semantic::field_writes::FieldWrites;
+use error::FailureKind::Unsupported;
 use std::collections::BTreeMap;
 
 #[derive(Clone)]
@@ -17,7 +18,7 @@ pub(super) struct DataTypes<'a> {
     pub digest: String,
     pub fields: HashMap<Type, HashMap<String, (usize, Type)>>,
     pub variants: HashMap<Type, HashMap<String, usize>>,
-    pub errors: HashMap<Type, String>,
+    pub errors: HashMap<Type, VerificationError>,
     pub visits: usize,
 }
 pub(super) fn type_key(ty: &Type) -> String {
@@ -33,7 +34,7 @@ pub(super) fn frozen_element(ty: &Type) -> Option<&Type> {
         None
     }
 }
-pub(super) fn sort(ty: &Type) -> Result<String, String> {
+pub(super) fn sort(ty: &Type) -> VerificationResult<String> {
     match ty {
         Type::I8
         | Type::I16
@@ -47,7 +48,7 @@ pub(super) fn sort(ty: &Type) -> Result<String, String> {
         Type::Bool => Ok("Bool".into()),
         Type::Named(_) => Ok(format!("D{}", type_key(ty))),
         _ if frozen_element(ty).is_some() => Ok(format!("D{}", type_key(ty))),
-        _ => Err("mutable or unsupported verification type".into()),
+        _ => Err(Unsupported.error("mutable or unsupported verification type")),
     }
 }
 pub(super) fn domain(ty: &Type, value: &str) -> String {
@@ -118,7 +119,7 @@ impl DataTypes<'_> {
         declarations: &HashMap<&str, &Item>,
         writes: &FieldWrites,
         depth: usize,
-    ) -> Result<(), String> {
+    ) -> VerificationResult<()> {
         if matches!(
             ty,
             Type::I8
@@ -141,11 +142,13 @@ impl DataTypes<'_> {
             return Ok(());
         }
         self.visits += 1;
-        self.errors
-            .insert(ty.clone(), "recursive or unsupported data type".into());
-        let result: Result<(), String> = (|| {
+        self.errors.insert(
+            ty.clone(),
+            Unsupported.error("recursive or unsupported data type"),
+        );
+        let result: VerificationResult<()> = (|| {
             if depth > 128 {
-                return Err("data type depth budget exceeded".into());
+                return Err(Unsupported.error("data type depth budget exceeded"));
             }
             let name = sort(ty)?;
             let key = type_key(ty);
@@ -163,7 +166,7 @@ impl DataTypes<'_> {
                 self.constructors.insert(ty.clone(), Vec::new());
             } else {
                 let Type::Named(n) = ty else {
-                    return Err("unsupported data type".into());
+                    return Err(Unsupported.error("unsupported data type"));
                 };
                 let ctors = match declarations.get(n.as_str()) {
                     Some(Item::Class(c))
@@ -176,7 +179,7 @@ impl DataTypes<'_> {
                             .iter()
                             .any(|f| !f.is_static && writes.is_reassigned(&f.name, f.span))
                         {
-                            return Err("record contains reassigned fields".into());
+                            return Err(Unsupported.error("record contains reassigned fields"));
                         }
                         vec![Constructor {
                             name: c.name.clone(),
@@ -201,10 +204,14 @@ impl DataTypes<'_> {
                                 .collect(),
                         })
                         .collect(),
-                    _ => return Err("mutable, open or unavailable data declaration".into()),
+                    _ => {
+                        return Err(
+                            Unsupported.error("mutable, open or unavailable data declaration")
+                        );
+                    }
                 };
                 if ctors.is_empty() {
-                    return Err("empty data type".into());
+                    return Err(Unsupported.error("empty data type"));
                 }
                 for c in &ctors {
                     for (_, t) in &c.fields {
@@ -267,7 +274,7 @@ impl DataTypes<'_> {
         }
         result
     }
-    pub fn check(&self, ty: &Type) -> Result<(), String> {
+    pub fn check(&self, ty: &Type) -> VerificationResult<()> {
         if matches!(
             ty,
             Type::I8
@@ -288,7 +295,7 @@ impl DataTypes<'_> {
                 .errors
                 .get(ty)
                 .cloned()
-                .unwrap_or_else(|| "unsupported verification type".into()))
+                .unwrap_or_else(|| Unsupported.error("unsupported verification type")))
         }
     }
 }

@@ -377,7 +377,7 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
     // Conservatively require unchanged data declarations and immutable type domains.
     let data_changed = a.data_digest != b.data_digest || data_a.definitions != data_b.definitions;
     let mut engine = if !valid_budget(options) {
-        Err("invalid verification timeout/resource budget".into())
+        Err(FailureKind::Infrastructure.error("invalid verification timeout/resource budget"))
     } else {
         solver::Solver::new(&options.solver, options.timeout_ms)
     }
@@ -434,7 +434,7 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
                 status = "NOT_PRESERVED";
                 reasons.push("purity guarantee lost".into());
             } else if a.errors.is_empty() && b.errors.is_empty() && a.purity_losses.is_empty() {
-                let result = (|| -> Result<bool, String> {
+                let result = (|| -> VerificationResult<bool> {
                     let i = names_a[key];
                     let j = names_b[key];
                     let s = engine.as_mut().map_err(|e| e.clone())?;
@@ -493,12 +493,15 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
                     ] {
                         comparison_queries += 1;
                         let (answer, candidate) = s.query(&formula, &args)?;
-                        obligations.push(json!({"kind":kind,"result":answer,"expected_solver_result":"unsat","counterexample_candidate":candidate}));
-                        if answer == "unknown" {
-                            return Err("solver returned UNKNOWN".into());
-                        }
-                        if answer != "unsat" {
-                            preserved = false;
+                        obligations.push(json!({"kind":kind,"result":answer.as_str(),"expected_solver_result":Answer::Unsat.as_str(),"counterexample_candidate":candidate}));
+                        match answer {
+                            Answer::Unknown => {
+                                return Err(
+                                    FailureKind::Infrastructure.error("solver returned UNKNOWN")
+                                );
+                            }
+                            Answer::Sat => preserved = false,
+                            Answer::Unsat => {}
                         }
                     }
                     Ok(preserved)
@@ -506,7 +509,7 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
                 match result {
                     Ok(true) => status = "PROVEN",
                     Ok(false) => status = "NOT_PRESERVED",
-                    Err(e) => reasons.push(e),
+                    Err(e) => reasons.push(e.message.into_owned()),
                 }
             }
         } else {
