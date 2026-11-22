@@ -1156,6 +1156,66 @@ class ProtectedCtor { prot init(self) {} }
     }
 
     #[test]
+    fn method_parameter_list_delimiters_and_diagnostics() {
+        for (prefix, suffix) in [("class C { fn f(", " {} }"), ("interface I { fn f(", "; }")] {
+            for list in [
+                "",
+                "self",
+                "self,",
+                "self, x: i64, y: bool",
+                "x: i64,",
+                "x: i64, y: bool",
+            ] {
+                parse_ok(&format!("{prefix}{list}){suffix}"));
+            }
+            for (tail, token, code, message) in [
+                (
+                    "self, x: i64,)",
+                    ")",
+                    ErrorCode::E0102,
+                    "expected identifier",
+                ),
+                ("self,,", ",", ErrorCode::E0102, "expected identifier"),
+                ("self,", "", ErrorCode::E0102, "expected identifier"),
+                (
+                    "self x",
+                    "x",
+                    ErrorCode::E0104,
+                    "expected `)` to close parenthesis",
+                ),
+                (
+                    "x: i64,",
+                    "",
+                    ErrorCode::E0104,
+                    "expected `)` to close parenthesis",
+                ),
+                (
+                    "x)",
+                    ")",
+                    ErrorCode::E0102,
+                    "expected `:` after parameter name",
+                ),
+            ] {
+                let source = format!("{prefix}{tail}");
+                let errors = parse_errors(&source);
+                let [error] = errors.as_slice() else {
+                    panic!("{source}: {errors:?}")
+                };
+                assert_eq!(
+                    (error.code, error.message.as_str()),
+                    (code, message),
+                    "{source}"
+                );
+                let start = source.rfind(token).unwrap();
+                let label =
+                    Label::primary(Span::new(start, start + token.len(), 1, start + 1), message);
+                assert_eq!(error.labels, [label], "{source}");
+                assert!(error.helps.is_empty(), "{source}");
+            }
+        }
+    }
+
+    #[test]
     fn parses_immutable_reference_method_parameter_after_self() {
         let source = "class Box { fn get(self, value: & String?) {} }";
         let program = parse_ok(source);

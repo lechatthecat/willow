@@ -145,7 +145,7 @@ impl TypeChecker {
                     .then(crate::semantic::generic_inference::enum_hole)
             });
             let ty = match expr {
-                Expr::Ternary(t) => self.check_ternary_expecting(t, &context, checked),
+                Expr::Ternary(t) => self.check_ternary_expr(t, Some(&context), checked),
                 Expr::Match(m) => self.check_match_expr(m, Some(&context), checked),
                 _ => unreachable!(),
             };

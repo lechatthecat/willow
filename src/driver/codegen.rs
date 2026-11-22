@@ -781,12 +781,16 @@ fn emit_symbol_conflict(
 
     emitter.emit(&diagnostic, sources)
 }
-/// Lower a source file to typed HIR and render it as text (the `--emit-hir`
-/// build flag). Runs the normal front-end (lex → parse → import → desugar →
-/// type-check) so the HIR reflects the checked, desugared program; lowering
-/// covers the constructs implemented so far and lists the rest as
-/// trailing comments rather than failing.
-pub fn emit_hir_text(src: &str) -> Result<String> {
+
+// Keep the session guards alive through lowering and rendering as well as checking.
+fn with_ir_frontend(
+    src: &str,
+    render: impl FnOnce(
+        &Frontend,
+        &parser::ast::Program,
+        &ir::lower::SemanticFacts<'_>,
+    ) -> Result<String>,
+) -> Result<String> {
     let symbols = semantic::ids::SymbolInterner::new();
     let _symbols = symbols.enter();
     let _query_stats = query_stats::Session::enter();
@@ -802,31 +806,43 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
     let options = CompilerOptions::debug().resolve_environment();
     let frontend = run_frontend(&source, &root, &map, &options)?;
 
-    let body = frontend
+    let artifacts = frontend
         .module_graph
         .artifacts
         .as_ref()
-        .expect("spooled frontend")
-        .hydrate(&frontend.program, diagnostics::FileId::ENTRY)?;
-    let checked = frontend.db.checked_unit(
-        module::UnitId::ENTRY,
-        frontend.module_graph.artifacts.as_ref().unwrap(),
-    )?;
-    let tables = checked.tables();
+        .expect("spooled frontend");
+    let body = artifacts.hydrate(&frontend.program, diagnostics::FileId::ENTRY)?;
+    let checked = frontend.db.checked_unit(module::UnitId::ENTRY, artifacts)?;
+    render(&frontend, &body, &checked.tables())
+}
+
+/// Lower a source file to typed HIR and render it as text (the `--emit-hir`
+/// build flag). Runs the normal front-end (lex → parse → import → desugar →
+/// type-check) so the HIR reflects the checked, desugared program; lowering
+/// covers the constructs implemented so far and lists the rest as
+/// trailing comments rather than failing.
+pub fn emit_hir_text(src: &str) -> Result<String> {
+    with_ir_frontend(src, render_hir)
+}
+
+fn render_hir(
+    frontend: &Frontend,
+    body: &parser::ast::Program,
+    tables: &ir::lower::SemanticFacts<'_>,
+) -> Result<String> {
     let bodies = frontend.db.bodies();
-    let (mut hir, mut lowering_diagnostics) =
-        ir::lower::lower_program_except(&body, &tables, &|m| {
-            bodies.foreign_default(module::UnitId::ENTRY, m).is_some()
-        });
+    let (mut hir, mut lowering_diagnostics) = ir::lower::lower_program_except(body, tables, &|m| {
+        bodies.foreign_default(module::UnitId::ENTRY, m).is_some()
+    });
     // Defaults copied from imported interfaces are lowered in the scope of the
     // module that declares each interface, then shown with the
     // receiving class's own methods.
     let mut foreign = ForeignBatches::new();
-    ForeignDefaults::collect(bodies, module::UnitId::ENTRY, &body).defer(
+    ForeignDefaults::collect(bodies, module::UnitId::ENTRY, body).defer(
         bodies,
         None,
-        &body,
-        &tables,
+        body,
+        tables,
         &|class| class.name.clone(),
         &mut foreign,
     );
@@ -891,48 +907,30 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
 /// `--emit-lir` build flag). Runs the normal front-end, lowers to typed HIR,
 /// then makes control flow explicit as blocks.
 pub fn emit_lir_text(src: &str) -> Result<String> {
-    let symbols = semantic::ids::SymbolInterner::new();
-    let _symbols = symbols.enter();
-    let _query_stats = query_stats::Session::enter();
-    let _node_ids = parser::ast::NodeIdSession::enter();
-    let src_path = PathBuf::from(src);
-    let source = std::fs::read_to_string(&src_path)
-        .with_context(|| format!("cannot read {}", src_path.display()))?;
-    let root = src_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    let map = diagnostics::SourceMap::new(src, &source);
-    let options = CompilerOptions::debug().resolve_environment();
-    let frontend = run_frontend(&source, &root, &map, &options)?;
+    with_ir_frontend(src, render_lir)
+}
 
-    let body = frontend
-        .module_graph
-        .artifacts
-        .as_ref()
-        .expect("spooled frontend")
-        .hydrate(&frontend.program, diagnostics::FileId::ENTRY)?;
-    let checked = frontend.db.checked_unit(
-        module::UnitId::ENTRY,
-        frontend.module_graph.artifacts.as_ref().unwrap(),
-    )?;
-    let tables = checked.tables();
+fn render_lir(
+    frontend: &Frontend,
+    body: &parser::ast::Program,
+    tables: &ir::lower::SemanticFacts<'_>,
+) -> Result<String> {
     // The source dump historically retains import spellings. Its fresh db
     // session is separate from native emission, which uses the declared tree.
     let gaps =
         frontend
             .db
             .lir
-            .lower_unit(module::UnitId::ENTRY, &body, frontend.db.bodies(), &tables)?;
+            .lower_unit(module::UnitId::ENTRY, body, frontend.db.bodies(), tables)?;
     let mut lir = frontend.db.lir.unit_program(module::UnitId::ENTRY)?;
     // Defaults copied from imported interfaces are lowered in the scope of the
     // module that declares each interface.
     let mut foreign = ForeignBatches::new();
-    ForeignDefaults::collect(frontend.db.bodies(), module::UnitId::ENTRY, &body).defer(
+    ForeignDefaults::collect(frontend.db.bodies(), module::UnitId::ENTRY, body).defer(
         frontend.db.bodies(),
         None,
-        &body,
-        &tables,
+        body,
+        tables,
         &|class| class.name.clone(),
         &mut foreign,
     );

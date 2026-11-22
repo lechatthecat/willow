@@ -778,16 +778,7 @@ impl UnitCodegenContext<'_> {
         }
         builder.ins().return_(&[frame]);
         builder.finalize(self.output.module.target_config());
-        self.output
-            .module
-            .define_function(ctor_fid, &mut ctx)
-            .map_err(|e| {
-                if *crate::diagnostic_settings::VERIFY_DEBUG {
-                    eprintln!("[verify] {e:?}");
-                }
-                e
-            })?;
-        self.output.module.clear_context(&mut ctx);
+        self.define_with_diagnostics(ctor_fid, &mut ctx)?;
 
         // Poll fn = the state machine; params are bound from their frame slots
         // and locals are frame-backed via `offsets`.
@@ -994,16 +985,7 @@ impl UnitCodegenContext<'_> {
         }
         builder.finalize(self.output.module.target_config());
         super::block_layout::sink_cold_regions(&mut ctx.func);
-        self.output
-            .module
-            .define_function(func_id, &mut ctx)
-            .map_err(|e| {
-                if *crate::diagnostic_settings::VERIFY_DEBUG {
-                    eprintln!("[verify] {e:?}");
-                }
-                e
-            })?;
-        self.output.module.clear_context(&mut ctx);
+        self.define_with_diagnostics(func_id, &mut ctx)?;
         Ok(())
     }
 
@@ -1334,16 +1316,7 @@ impl UnitCodegenContext<'_> {
 
         builder.finalize(self.output.module.target_config());
         super::block_layout::sink_cold_regions(&mut ctx.func);
-        self.output
-            .module
-            .define_function(func_id, &mut ctx)
-            .map_err(|e| {
-                if *crate::diagnostic_settings::VERIFY_DEBUG {
-                    eprintln!("[verify] {e:?}");
-                }
-                e
-            })?;
-        self.output.module.clear_context(&mut ctx);
+        self.define_with_diagnostics(func_id, &mut ctx)?;
         Ok((defer_sites, lock_sites))
     }
 
@@ -1475,16 +1448,7 @@ impl UnitCodegenContext<'_> {
         }
         builder.seal_all_blocks();
         builder.finalize(self.output.module.target_config());
-        self.output
-            .module
-            .define_function(cancel_fid, &mut ctx)
-            .map_err(|e| {
-                if *crate::diagnostic_settings::VERIFY_DEBUG {
-                    eprintln!("[verify] {e:?}");
-                }
-                e
-            })?;
-        self.output.module.clear_context(&mut ctx);
+        self.define_with_diagnostics(cancel_fid, &mut ctx)?;
         Ok(())
     }
 }

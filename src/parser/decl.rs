@@ -552,14 +552,48 @@ impl Parser {
         })
     }
 
+    async fn parse_method_params(
+        &mut self,
+        is_static: bool,
+    ) -> Result<(bool, Vec<Param>), Diagnostic> {
+        self.expect(TokenKind::LParen)?;
+        let has_self = self.check(TokenKind::SelfKw);
+        if has_self && is_static {
+            let span = self.current_span();
+            return Err(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0831,
+                "static methods cannot take `self`",
+            )
+            .with_label(Label::primary(span, "`self` in a static method"))
+            .with_help("remove `self`, or make this an instance method by dropping `static`"));
+        }
+        let mut params = Vec::new();
+        let mut more = if has_self {
+            self.advance();
+            self.eat(TokenKind::Comma) && !self.check(TokenKind::RParen)
+        } else {
+            !self.check(TokenKind::RParen) && !self.at_eof()
+        };
+        while more {
+            params.push(self.parse_param_cont().await?);
+            // After an explicit receiver and a named parameter, a comma
+            // requires another parameter, even at ')' or EOF.
+            more = self.eat(TokenKind::Comma)
+                && (has_self || (!self.check(TokenKind::RParen) && !self.at_eof()));
+        }
+        self.expect(TokenKind::RParen)?;
+        Ok((has_self, params))
+    }
+
     pub(super) fn parse_interface_method(&mut self) -> Result<InterfaceMethodDecl, Diagnostic> {
         let scope = self.default_import_usage.scope();
-        let result = self.parse_interface_method_inner();
+        let result = self.parse_interface_method_inner().await;
         self.default_import_usage.restore(scope);
         result
     }
 
-    fn parse_interface_method_inner(&mut self) -> Result<InterfaceMethodDecl, Diagnostic> {
+    async fn parse_interface_method_inner(&mut self) -> Result<InterfaceMethodDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::Fn)?;
         let name_span = self.current_span();
@@ -573,33 +607,10 @@ impl Parser {
             .with_label(Label::primary(name_span, "`fn init` is not a method"))
             .with_help("choose a different method name; constructors are class-only `init(self, ...)` declarations"));
         }
-        self.expect(TokenKind::LParen)?;
-
-        let mut has_self = false;
-        let mut params = Vec::new();
-        if self.check(TokenKind::SelfKw) {
-            has_self = true;
-            self.advance();
-            if self.eat(TokenKind::Comma) && !self.check(TokenKind::RParen) {
-                loop {
-                    params.push(self.parse_param()?);
-                    if !self.eat(TokenKind::Comma) {
-                        break;
-                    }
-                }
-            }
-        } else {
-            while !self.check(TokenKind::RParen) && !self.at_eof() {
-                params.push(self.parse_param()?);
-                if !self.eat(TokenKind::Comma) {
-                    break;
-                }
-            }
-        }
-        self.expect(TokenKind::RParen)?;
+        let (has_self, params) = self.parse_method_params(false).await?;
 
         let return_type = if self.eat(TokenKind::Arrow) {
-            self.parse_type()?
+            self.parse_type_cont().await?
         } else {
             Type::Void
         };
@@ -625,7 +636,7 @@ impl Parser {
             for param in &params {
                 self.default_import_usage.bind(&param.name);
             }
-            let body = self.parse_block()?;
+            let body = self.parse_block_cont().await?;
             let end = self.previous_span();
             (Some(body), end)
         } else {
@@ -714,44 +725,9 @@ impl Parser {
                 "write `init(self, ...)` for a constructor, or choose a different method name",
             ));
         }
-        self.expect(TokenKind::LParen)?;
-
-        let mut params = Vec::new();
-
-        if self.check(TokenKind::SelfKw) {
-            // A static method has no receiver; an explicit `self` is always wrong
-            // (static member support §9.2). Instance methods take `self` implicitly, but an
-            // explicit `self` is still accepted during migration.
-            if modifiers.contains(Modifiers::STATIC) {
-                let span = self.current_span();
-                return Err(Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0831,
-                    "static methods cannot take `self`",
-                )
-                .with_label(Label::primary(span, "`self` in a static method"))
-                .with_help("remove `self`, or make this an instance method by dropping `static`"));
-            }
-            self.advance();
-            if self.eat(TokenKind::Comma) && !self.check(TokenKind::RParen) {
-                // parse remaining params after self
-                loop {
-                    params.push(self.parse_param()?);
-                    if !self.eat(TokenKind::Comma) {
-                        break;
-                    }
-                }
-            }
-        } else {
-            while !self.check(TokenKind::RParen) && !self.at_eof() {
-                params.push(self.parse_param()?);
-                if !self.eat(TokenKind::Comma) {
-                    break;
-                }
-            }
-        }
-
-        self.expect(TokenKind::RParen)?;
+        let (_, mut params) = self
+            .parse_method_params(modifiers.contains(Modifiers::STATIC))
+            .await?;
         let return_type = if self.eat(TokenKind::Arrow) {
             self.parse_type()?
         } else {

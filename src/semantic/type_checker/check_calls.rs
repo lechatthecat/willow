@@ -429,7 +429,7 @@ impl TypeChecker {
         // `ok ? Ok(10) : Err("bad")` resolves its unqualified variants against
         // the expected enum exactly like a direct `return` does.
         if let Expr::Ternary(t) = expr {
-            return self.check_ternary_expecting(t, expected, checked);
+            return self.check_ternary_expr(t, Some(expected), checked);
         }
         // A `match` in value position is the same story one arm wider: the
         // expected type reaches every arm VALUE.
@@ -574,63 +574,6 @@ impl TypeChecker {
             && self.symbols.lookup_interface(name).is_none()
             && self.symbols.lookup_enum(name).is_none()
             && self.symbols.lookup_module(name).is_none()
-    }
-
-    /// Check a ternary whose result flows into an expected type: the condition
-    /// stays `bool`, and BOTH branches are checked expecting `expected`, so
-    /// contextual forms (unqualified enum variants, contextually-typed lambdas,
-    /// nested ternaries) resolve inside the branches.
-    pub(super) fn check_ternary_expecting(
-        &mut self,
-        t: &TernaryExpr,
-        expected: &Type,
-        checked: bool,
-    ) -> Type {
-        self.check_ternary_condition(&t.condition, checked);
-        let then_ty = self.check_argument_expecting(&t.then_expr, expected, checked);
-        let else_ty = self.check_argument_expecting(&t.else_expr, expected, checked);
-        let unified = if crate::semantic::generic_inference::has_enum_hole(expected) {
-            match (&then_ty, &else_ty) {
-                (Type::Never, _) => Some(else_ty.clone()),
-                (_, Type::Never) => Some(then_ty.clone()),
-                _ => crate::semantic::generic_inference::merge_enum_holes(&then_ty, &else_ty),
-            }
-        } else {
-            self.unify_ternary_types(&then_ty, &else_ty)
-                .or_else(|| self.unify_to_expected(Some(expected), &then_ty, &else_ty))
-        };
-        if let Some(unified_ty) = unified {
-            self.validate_type(&unified_ty, t.span);
-            unified_ty
-        } else {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0902,
-                    format!(
-                        "ternary branches have incompatible types: `{}` and `{}`",
-                        self.diagnostic_type_name(&then_ty),
-                        self.diagnostic_type_name(&else_ty)
-                    ),
-                )
-                .with_label(Label::primary(
-                    t.else_expr.span(),
-                    format!(
-                        "expected `{}`, found `{}`",
-                        self.diagnostic_type_name(&then_ty),
-                        self.diagnostic_type_name(&else_ty)
-                    ),
-                ))
-                .with_label(Label::secondary(
-                    t.then_expr.span(),
-                    format!(
-                        "this branch has type `{}`",
-                        self.diagnostic_type_name(&then_ty)
-                    ),
-                )),
-            );
-            Type::Void
-        }
     }
 
     /// If `expected` is an enum type with a variant `name`, return the enum's
@@ -1408,6 +1351,58 @@ mod ternary_expecting_tests {
             .into_iter()
             .map(|d| format!("{:?} {}", d.code, d.message))
             .collect()
+    }
+
+    #[test]
+    fn ternary_diagnostics_preserve_branch_labels_and_contextual_help() {
+        use crate::diagnostics::{ErrorCode, Label, Span};
+
+        for annotation in ["", ": i64"] {
+            let source = format!("fn main() {{ let x{annotation} = 3 ? 41 : false; }}");
+            let errors = check_with_prelude(&source);
+            let span = |text: &str| {
+                let at = source.find(text).unwrap();
+                Span::new(at, at + text.len(), 1, at + 1)
+            };
+            let condition = &errors[0];
+            assert_eq!(condition.code, ErrorCode::E0901);
+            assert_eq!(
+                condition.message,
+                "if-expression condition must be `bool`, found `i64`"
+            );
+            assert_eq!(
+                condition.labels,
+                [Label::primary(span("3"), "expected `bool`, found `i64`")]
+            );
+            assert!(condition.helps.is_empty());
+
+            let branches = &errors[1];
+            assert_eq!(branches.code, ErrorCode::E0902);
+            assert_eq!(
+                branches.message,
+                "ternary branches have incompatible types: `i64` and `bool`"
+            );
+            assert_eq!(
+                branches.labels,
+                [
+                    Label::primary(span("false"), "expected `i64`, found `bool`"),
+                    Label::secondary(span("41"), "this branch has type `i64`"),
+                ]
+            );
+            if annotation.is_empty() {
+                assert_eq!(errors.len(), 2);
+                assert_eq!(
+                    branches.helps,
+                    [
+                        "every value must have one type; annotate the destination (`let value: T = ...;`) with a type all values convert to"
+                    ]
+                );
+            } else {
+                assert_eq!(errors.len(), 3);
+                assert_eq!(errors[2].code, ErrorCode::E0201);
+                assert!(branches.helps.is_empty());
+            }
+        }
     }
 
     // 1

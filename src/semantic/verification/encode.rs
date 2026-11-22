@@ -93,7 +93,36 @@ struct Encoder<'a> {
     fragments: Vec<String>,
     inferred_loop_annotations: Vec<InferredLoopAnnotations>,
 }
-impl Encoder<'_> {
+impl<'a> Encoder<'a> {
+    fn new(
+        function_id: usize,
+        functions: &'a [&'a FunctionDecl],
+        names: &'a HashMap<&'a str, usize>,
+        data: &'a DataTypes<'a>,
+    ) -> Self {
+        Self {
+            data,
+            functions,
+            names,
+            nodes: Vec::new(),
+            safety: Vec::new(),
+            assumptions: Vec::new(),
+            dependencies: BTreeSet::new(),
+            depth: 0,
+            expected: None,
+            function_id,
+            havoc: Vec::new(),
+            loop_symbols: std::collections::BTreeMap::new(),
+            loop_writes: HashMap::new(),
+            verified: has(functions[function_id], EffectContractKind::Verified),
+            jumps: Vec::new(),
+            next_quantifier: 0,
+            scoped_nodes: 0,
+            fragments: Vec::new(),
+            inferred_loop_annotations: Vec::new(),
+        }
+    }
+
     fn typed_node(&mut self, expr: String, ty: &Type) -> VerificationResult<Value> {
         self.data.check(ty)?;
         let mut value = self.node(expr, *ty == Type::Bool)?;
@@ -1281,27 +1310,7 @@ pub(super) fn encode(
         returned: Value::literal("false", true),
     };
     let initial = state.clone();
-    let mut e = Encoder {
-        data,
-        functions,
-        names,
-        nodes: Vec::new(),
-        safety: Vec::new(),
-        assumptions: Vec::new(),
-        dependencies: BTreeSet::new(),
-        depth: 0,
-        expected: None,
-        function_id: id,
-        havoc: Vec::new(),
-        loop_symbols: std::collections::BTreeMap::new(),
-        loop_writes: HashMap::new(),
-        verified: has(f, EffectContractKind::Verified),
-        jumps: Vec::new(),
-        next_quantifier: 0,
-        scoped_nodes: 0,
-        fragments: Vec::new(),
-        inferred_loop_annotations: Vec::new(),
-    };
+    let mut e = Encoder::new(id, functions, names, data);
     let pre = e.clauses(&f.requires, &state)?;
     let pre_safe = e.safety();
     let mut definitions = e.definition(&format!("f{id}_pre"), &params.join(" "), "Bool", &pre.text);
@@ -1367,27 +1376,7 @@ pub(super) fn encode(
         &post_safe,
     );
     // Separate contract predicate, with an arbitrary return, for callers.
-    let mut c = Encoder {
-        data,
-        functions,
-        names,
-        nodes: Vec::new(),
-        safety: Vec::new(),
-        assumptions: Vec::new(),
-        dependencies: BTreeSet::new(),
-        depth: 0,
-        expected: None,
-        function_id: id,
-        havoc: Vec::new(),
-        loop_symbols: std::collections::BTreeMap::new(),
-        loop_writes: HashMap::new(),
-        verified: has(f, EffectContractKind::Verified),
-        jumps: Vec::new(),
-        next_quantifier: 0,
-        scoped_nodes: 0,
-        fragments: Vec::new(),
-        inferred_loop_annotations: Vec::new(),
-    };
+    let mut c = Encoder::new(id, functions, names, data);
     let mut cs = initial;
     cs.env.insert(
         "result".into(),
@@ -1543,27 +1532,7 @@ pub(super) fn contract_predicates(
         },
         returned: Value::literal("true", true),
     };
-    let mut e = Encoder {
-        data,
-        functions,
-        names,
-        nodes: Vec::new(),
-        safety: Vec::new(),
-        assumptions: Vec::new(),
-        dependencies: BTreeSet::new(),
-        depth: 0,
-        expected: None,
-        function_id: id,
-        havoc: Vec::new(),
-        loop_symbols: std::collections::BTreeMap::new(),
-        loop_writes: HashMap::new(),
-        verified: has(f, EffectContractKind::Verified),
-        jumps: Vec::new(),
-        next_quantifier: 0,
-        scoped_nodes: 0,
-        fragments: Vec::new(),
-        inferred_loop_annotations: Vec::new(),
-    };
+    let mut e = Encoder::new(id, functions, names, data);
     let pre = e.clauses(&f.requires, &state)?;
     let safety = e.safety();
     let mut out = e.definition(&format!("c{id}_pre"), &params.join(" "), "Bool", &pre.text);

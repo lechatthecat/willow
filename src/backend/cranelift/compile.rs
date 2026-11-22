@@ -487,6 +487,23 @@ impl BodyPlanner {
 }
 
 impl UnitCodegenContext<'_> {
+    pub(super) fn define_with_diagnostics(
+        &mut self,
+        id: FuncId,
+        ctx: &mut cranelift_codegen::Context,
+    ) -> Result<()> {
+        self.output
+            .module
+            .define_function(id, ctx)
+            .inspect_err(|e| {
+                if *crate::diagnostic_settings::VERIFY_DEBUG {
+                    eprintln!("[verify] {e:?}");
+                }
+            })?;
+        self.output.module.clear_context(ctx);
+        Ok(())
+    }
+
     pub fn module_body_plan<'a>(&self, unit: &'a DeclaredModule) -> Vec<UnitBody<'a>> {
         BodyPlanner(self.body_queries.is_some()).module_body_plan(unit)
     }
@@ -2143,16 +2160,7 @@ impl UnitCodegenContext<'_> {
 
         builder.finalize(self.output.module.target_config());
         super::block_layout::sink_cold_regions(&mut ctx.func);
-        self.output
-            .module
-            .define_function(func_id, &mut ctx)
-            .map_err(|e| {
-                if *crate::diagnostic_settings::VERIFY_DEBUG {
-                    eprintln!("[verify] {e:?}");
-                }
-                e
-            })?;
-        self.output.module.clear_context(&mut ctx);
+        self.define_with_diagnostics(func_id, &mut ctx)?;
         Ok(())
     }
 
@@ -2435,16 +2443,7 @@ impl UnitCodegenContext<'_> {
         }
         fg.builder.ins().return_(&[]);
         builder.finalize(self.output.module.target_config());
-        self.output
-            .module
-            .define_function(func_id, &mut ctx)
-            .map_err(|e| {
-                if *crate::diagnostic_settings::VERIFY_DEBUG {
-                    eprintln!("[verify] {e:?}");
-                }
-                e
-            })?;
-        self.output.module.clear_context(&mut ctx);
+        self.define_with_diagnostics(func_id, &mut ctx)?;
         Ok(())
     }
 
@@ -3008,16 +3007,7 @@ impl UnitCodegenContext<'_> {
 
         builder.finalize(self.output.module.target_config());
         super::block_layout::sink_cold_regions(&mut ctx.func);
-        self.output
-            .module
-            .define_function(func_id, &mut ctx)
-            .map_err(|e| {
-                if *crate::diagnostic_settings::VERIFY_DEBUG {
-                    eprintln!("[verify] {e:?}");
-                }
-                e
-            })?;
-        self.output.module.clear_context(&mut ctx);
+        self.define_with_diagnostics(func_id, &mut ctx)?;
         Ok(())
     }
 }

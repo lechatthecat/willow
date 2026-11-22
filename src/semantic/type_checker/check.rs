@@ -3249,7 +3249,7 @@ impl TypeChecker {
                 Type::Void
             }
             Expr::Print(arg, newline, _, _) => self.check_print_expr(arg, newline),
-            Expr::Ternary(t) => self.check_ternary_expr(t),
+            Expr::Ternary(t) => self.check_ternary_expr(t, None, false),
             Expr::Range(r) => self.check_range(r),
             Expr::Lambda(l) => self.check_lambda(l),
             Expr::Match(m) => self.check_match_expr(m, None, false),
@@ -3765,7 +3765,7 @@ impl TypeChecker {
         Type::Void
     }
 
-    pub(super) fn check_ternary_condition(&mut self, condition: &Expr, checked: bool) {
+    fn check_ternary_condition(&mut self, condition: &Expr, checked: bool) {
         let part = super::body::FailedCheck::Condition(condition.id());
         if checked {
             self.reuse_check_failure(part);
@@ -3800,43 +3800,68 @@ impl TypeChecker {
         }
     }
 
-    fn check_ternary_expr(&mut self, t: &TernaryExpr) -> Type {
-        self.check_ternary_condition(&t.condition, false);
-        let then_ty = self.check_branch_value(&t.then_expr);
-        let else_ty = self.check_branch_value(&t.else_expr);
-        if let Some(unified_ty) = self.unify_ternary_types(&then_ty, &else_ty) {
-            self.resolve_generic_values([&t.then_expr, &t.else_expr], &unified_ty);
+    pub(super) fn check_ternary_expr(
+        &mut self,
+        t: &TernaryExpr,
+        expected: Option<&Type>,
+        checked: bool,
+    ) -> Type {
+        self.check_ternary_condition(&t.condition, checked);
+        let (then_ty, else_ty) = match expected {
+            Some(ty) => (
+                self.check_argument_expecting(&t.then_expr, ty, checked),
+                self.check_argument_expecting(&t.else_expr, ty, checked),
+            ),
+            None => (
+                self.check_branch_value(&t.then_expr),
+                self.check_branch_value(&t.else_expr),
+            ),
+        };
+        let unified = if expected.is_some_and(crate::semantic::generic_inference::has_enum_hole) {
+            match (&then_ty, &else_ty) {
+                (Type::Never, _) => Some(else_ty.clone()),
+                (_, Type::Never) => Some(then_ty.clone()),
+                _ => crate::semantic::generic_inference::merge_enum_holes(&then_ty, &else_ty),
+            }
+        } else {
+            self.unify_ternary_types(&then_ty, &else_ty)
+                .or_else(|| self.unify_to_expected(expected, &then_ty, &else_ty))
+        };
+        if let Some(unified_ty) = unified {
+            if expected.is_none() {
+                self.resolve_generic_values([&t.then_expr, &t.else_expr], &unified_ty);
+            }
             self.validate_type(&unified_ty, t.span);
             unified_ty
         } else {
-            let help = self.common_supertype_help(&then_ty, &else_ty);
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0902,
-                    format!(
-                        "ternary branches have incompatible types: `{}` and `{}`",
-                        self.diagnostic_type_name(&then_ty),
-                        self.diagnostic_type_name(&else_ty)
-                    ),
-                )
-                .with_label(Label::primary(
-                    t.else_expr.span(),
-                    format!(
-                        "expected `{}`, found `{}`",
-                        self.diagnostic_type_name(&then_ty),
-                        self.diagnostic_type_name(&else_ty)
-                    ),
-                ))
-                .with_label(Label::secondary(
-                    t.then_expr.span(),
-                    format!(
-                        "this branch has type `{}`",
-                        self.diagnostic_type_name(&then_ty)
-                    ),
-                ))
-                .with_help(help),
-            );
+            let mut diagnostic = Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0902,
+                format!(
+                    "ternary branches have incompatible types: `{}` and `{}`",
+                    self.diagnostic_type_name(&then_ty),
+                    self.diagnostic_type_name(&else_ty)
+                ),
+            )
+            .with_label(Label::primary(
+                t.else_expr.span(),
+                format!(
+                    "expected `{}`, found `{}`",
+                    self.diagnostic_type_name(&then_ty),
+                    self.diagnostic_type_name(&else_ty)
+                ),
+            ))
+            .with_label(Label::secondary(
+                t.then_expr.span(),
+                format!(
+                    "this branch has type `{}`",
+                    self.diagnostic_type_name(&then_ty)
+                ),
+            ));
+            if expected.is_none() {
+                diagnostic = diagnostic.with_help(self.common_supertype_help(&then_ty, &else_ty));
+            }
+            self.push(diagnostic);
             Type::Void
         }
     }
