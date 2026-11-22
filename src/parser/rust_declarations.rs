@@ -37,7 +37,7 @@ impl Parser {
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
             let span = self.current_span();
             if self.check(TokenKind::Class) {
-                let record = self.parse_class(true, false)?;
+                let record = self.parse_class(Modifiers::PUBLIC)?;
                 self.validate_rust_record_identifier(&record.name, "record")?;
                 if !record.type_params.is_empty()
                     || record.base_class.is_some()
@@ -47,7 +47,7 @@ impl Parser {
                     || record
                         .fields
                         .iter()
-                        .any(|f| !f.public || f.is_static || f.initializer.is_some())
+                        .any(|f| !f.public() || f.is_static() || f.initializer.is_some())
                 {
                     return Err(self.err(
                         ErrorCode::E0102,
@@ -222,8 +222,7 @@ impl Parser {
                     return_type_span: None,
                     type_params: Vec::new(),
                     name: close_name,
-                    public: true,
-                    is_async: false,
+                    modifiers: Modifiers::PUBLIC,
                     params: vec![Param {
                         name: "handle".into(),
                         ty: Type::Named(name),
@@ -243,7 +242,8 @@ impl Parser {
                 }));
                 continue;
             }
-            let is_async = self.eat(TokenKind::Async);
+            let modifiers = self.parse_async_modifier(Modifiers::PUBLIC);
+            let is_async = modifiers.contains(Modifiers::ASYNC);
             if is_async && nonblocking.is_some() {
                 return Err(self.err(
                     ErrorCode::E0102,
@@ -313,8 +313,7 @@ impl Parser {
                 type_params: Vec::new(),
                 rust_bridge: Some(Box::new(symbol)),
                 name,
-                public: true,
-                is_async,
+                modifiers,
                 params,
                 return_type,
                 body: Block {

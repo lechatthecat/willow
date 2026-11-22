@@ -1247,7 +1247,7 @@ pub(super) fn encode(
     data: &DataTypes,
 ) -> VerificationResult<Summary> {
     let f = functions[id];
-    if !f.type_params.is_empty() || f.is_async || f.rust_bridge.is_some() {
+    if !f.type_params.is_empty() || f.is_async() || f.rust_bridge.is_some() {
         return Err(Unsupported.error("generic, async or external function outside V1"));
     }
     data.check(&f.return_type)?;
@@ -1510,7 +1510,7 @@ pub(super) fn contract_predicates(
     data: &DataTypes,
 ) -> VerificationResult<String> {
     let f = functions[id];
-    if !f.type_params.is_empty() || f.is_async || f.rust_bridge.is_some() {
+    if !f.type_params.is_empty() || f.is_async() || f.rust_bridge.is_some() {
         return Err(Unsupported.error("unsupported contract signature"));
     }
     let mut params = Vec::new();

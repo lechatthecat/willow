@@ -1,4 +1,5 @@
 use super::*;
+use crate::parser::ast::Modifiers;
 
 /// One unit's imports in the shape the back end wants them, from the module
 /// resolver's own classification (the original change, the original change).
@@ -417,12 +418,7 @@ impl ForeignBatch {
                         array_body_optimization: crate::parser::ast::ArrayBodyOptimization::None,
                         constraint: None,
                         name: method.name.clone(),
-                        public: true,
-                        protected: false,
-                        is_async: false,
-                        is_open: false,
-                        is_override: false,
-                        is_static: false,
+                        modifiers: Modifiers::PUBLIC,
                         params: method.params.clone(),
                         return_type: method.return_type.clone(),
                         body: body.clone(),

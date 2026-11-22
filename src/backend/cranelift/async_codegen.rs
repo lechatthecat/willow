@@ -6,6 +6,7 @@
 
 use crate::ir::ir_variants;
 use crate::ir::lowered::{LirDeferId, LirFunction, LirInst, LirLocalId};
+use crate::parser::ast::Modifiers;
 use crate::qualified_name::QualifiedName;
 use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use anyhow::Result;
@@ -503,8 +504,7 @@ impl UnitCodegenContext<'_> {
                     .unwrap_or(class_name),
                 &m.name,
             ),
-            public: m.public,
-            is_async: true,
+            modifiers: Modifiers::ASYNC | (m.modifiers & Modifiers::PUBLIC),
             params: m.params.clone(),
             return_type: m.return_type.clone(),
             body: Block {
@@ -520,7 +520,7 @@ impl UnitCodegenContext<'_> {
             mangled,
             &poll_decl,
             lir,
-            Some((class_name, m.is_static)),
+            Some((class_name, m.is_static())),
             &QualifiedName::join(class_name, &m.name),
         )
     }

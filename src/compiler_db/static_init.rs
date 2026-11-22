@@ -113,12 +113,12 @@ impl StaticInitQueries {
                 methods: class
                     .methods
                     .iter()
-                    .filter(|method| !method.is_static)
+                    .filter(|method| !method.is_static())
                     .map(|method| FunctionId::method(owner, &method.name))
                     .collect(),
             });
             for (field_index, field) in class.fields.iter().enumerate() {
-                if !field.is_static || field.initializer.is_none() {
+                if !field.is_static() || field.initializer.is_none() {
                     continue;
                 }
                 let callable = initializer_id(&class.name, &field.name);

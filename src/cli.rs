@@ -312,7 +312,13 @@ impl FetchCommand {
                     "no project.toml found",
                 )
             })?;
-            willow_compiler::package::fetch_packages(&root, self.locked, self.offline)
+            willow_compiler::package::fetch_with_options(
+                &root,
+                willow_compiler::package::FetchOptions {
+                    locked: self.locked,
+                    offline: self.offline,
+                },
+            )
         })();
         let graph = result?;
         if self.format == OutputFormat::Human {

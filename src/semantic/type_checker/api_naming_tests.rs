@@ -313,16 +313,16 @@ fn bundled_public_names(source: &str) -> Vec<(String, bool)> {
     let mut names = Vec::new();
     for item in &program.items {
         match item {
-            Item::Function(f) if f.public => names.push((f.name.clone(), false)),
+            Item::Function(f) if f.public() => names.push((f.name.clone(), false)),
             Item::Function(_) => {}
             Item::Class(c) => {
-                if c.public {
+                if c.public() {
                     names.push((c.name.clone(), true));
                 }
                 names.extend(
                     c.methods
                         .iter()
-                        .filter(|m| m.public)
+                        .filter(|m| m.public())
                         .map(|m| (m.name.clone(), false)),
                 );
             }

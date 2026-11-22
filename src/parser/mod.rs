@@ -6,6 +6,7 @@ mod flat_syntax;
 mod generic_closer_tests;
 pub(crate) mod import_usage;
 pub mod iter;
+mod modifiers;
 pub(crate) mod ownership;
 mod pattern;
 mod rust_declarations;
@@ -794,8 +795,8 @@ mod tests {
             panic!("expected a class");
         };
         let ctor = &class.constructors[0];
-        assert!(ctor.public);
-        assert!(!ctor.protected);
+        assert!(ctor.public());
+        assert!(!ctor.protected());
         assert_eq!(ctor.params.len(), 1);
         assert_eq!(ctor.params[0].name, "name");
     }
@@ -815,7 +816,7 @@ class ProtectedCtor { prot init(self) {} }
             .map(|item| match item {
                 Item::Class(class) => {
                     let ctor = &class.constructors[0];
-                    (class.name.as_str(), ctor.public, ctor.protected)
+                    (class.name.as_str(), ctor.public(), ctor.protected())
                 }
                 _ => panic!("expected classes only"),
             })
@@ -1164,7 +1165,7 @@ class ProtectedCtor { prot init(self) {} }
         };
         let method = &class.methods[0];
 
-        assert!(!method.is_static);
+        assert!(!method.is_static());
         assert_eq!(method.params.len(), 1);
         assert_eq!(method.params[0].name, "value");
         assert_eq!(

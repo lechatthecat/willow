@@ -417,7 +417,7 @@ fn lower_program_except_partial(
                         Err(d) => diagnostics.push(d),
                     }
                 }
-                for field in c.fields.iter().filter(|field| field.is_static) {
+                for field in c.fields.iter().filter(|field| field.is_static()) {
                     if let Some(init) = &field.initializer {
                         let mut ctx = LowerCtx::new(&fn_returns, &classes, &enums, tables);
                         ctx.current_class = Some(c.name.clone());
@@ -653,7 +653,7 @@ fn lower_env(program: &Program, tables: &PartialCheckerTables) -> LowerEnv {
             Item::Function(f) => {
                 fn_returns.insert(
                     f.name.clone(),
-                    call_site_type(&tables.normalize(&f.return_type), f.is_async),
+                    call_site_type(&tables.normalize(&f.return_type), f.is_async()),
                 );
             }
             Item::Class(c) => {
@@ -668,7 +668,7 @@ fn lower_env(program: &Program, tables: &PartialCheckerTables) -> LowerEnv {
                     ..ClassInfo::default()
                 };
                 for f in &c.fields {
-                    if f.is_static {
+                    if f.is_static() {
                         info.static_fields
                             .insert(f.name.clone(), tables.normalize(&f.ty));
                     } else {
@@ -676,8 +676,8 @@ fn lower_env(program: &Program, tables: &PartialCheckerTables) -> LowerEnv {
                     }
                 }
                 for m in &c.methods {
-                    let call_ty = call_site_type(&tables.normalize(&m.return_type), m.is_async);
-                    if m.is_static {
+                    let call_ty = call_site_type(&tables.normalize(&m.return_type), m.is_async());
+                    if m.is_static() {
                         info.static_methods.insert(m.name.clone(), call_ty);
                     } else {
                         info.methods.insert(m.name.clone(), call_ty);
@@ -928,7 +928,7 @@ fn lower_function(
         requires,
         ensures,
         name: f.name.clone().into(),
-        is_async: f.is_async,
+        is_async: f.is_async(),
         params,
         return_type: return_type.into(),
         body,
@@ -954,7 +954,7 @@ fn lower_method(
     // Explicit and implicit `self` spellings normalize to the same receiver.
     // A foreign default's receiver is already the class identity: this
     // unit's tables would read its local spelling as another class.
-    if !m.is_static {
+    if !m.is_static() {
         let self_ty = self_ty
             .cloned()
             .unwrap_or_else(|| ctx.normalize(&Type::Named(class_name.to_string())));
@@ -985,7 +985,7 @@ fn lower_method(
         requires: Vec::new(),
         ensures: Vec::new(),
         name: m.name.clone().into(),
-        is_async: m.is_async,
+        is_async: m.is_async(),
         params,
         return_type: return_type.into(),
         body,

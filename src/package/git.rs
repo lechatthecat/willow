@@ -204,6 +204,12 @@ impl Iterator for GitCandidates {
 }
 impl ExactSizeIterator for GitCandidates {}
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct CacheAccess {
+    pub offline: bool,
+    pub read_only: bool,
+}
+
 pub struct GitSource<B: GitBackend = SystemGit> {
     url: CanonicalGitUrl,
     repository: PathBuf,
@@ -236,14 +242,14 @@ impl<B: GitBackend> GitSource<B> {
             packages: RefCell::new(HashMap::new()),
         })
     }
-    pub(crate) fn cached_mode(
+    pub(super) fn cached_mode(
         url: CanonicalGitUrl,
         backend: B,
-        offline: bool,
+        access: CacheAccess,
         pinned: bool,
         expected: Option<String>,
-        read_only: bool,
     ) -> Result<Self, PackageError> {
+        let CacheAccess { offline, read_only } = access;
         let mut cache = super::cache::SourceCache::new(url.as_str(), offline, expected)?;
         cache.read_only = read_only;
         let repository = cache.repository();

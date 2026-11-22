@@ -170,14 +170,14 @@ impl DataTypes<'_> {
                 };
                 let ctors = match declarations.get(n.as_str()) {
                     Some(Item::Class(c))
-                        if !c.is_open
+                        if !c.is_open()
                             && c.base_class.is_none()
                             && c.type_params.is_empty()
                             && c.abi_storage.is_none() =>
                     {
                         if c.fields
                             .iter()
-                            .any(|f| !f.is_static && writes.is_reassigned(&f.name, f.span))
+                            .any(|f| !f.is_static() && writes.is_reassigned(&f.name, f.span))
                         {
                             return Err(Unsupported.error("record contains reassigned fields"));
                         }
@@ -186,7 +186,7 @@ impl DataTypes<'_> {
                             fields: c
                                 .fields
                                 .iter()
-                                .filter(|f| !f.is_static)
+                                .filter(|f| !f.is_static())
                                 .map(|f| (f.name.clone(), f.ty.clone()))
                                 .collect(),
                         }]

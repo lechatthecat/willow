@@ -1125,7 +1125,7 @@ impl UnitCodegenContext<'_> {
         let own: Vec<(String, Type)> = c
             .fields
             .iter()
-            .filter(|f| !f.is_static)
+            .filter(|f| !f.is_static())
             // Under the identity the tables answer to, not this unit's
             // spelling of it: the layout is build-wide and every later unit
             // reads it with its own aliases installed.
@@ -1151,7 +1151,7 @@ impl UnitCodegenContext<'_> {
         let methods = c
             .methods
             .iter()
-            .filter(|method| !method.is_static && (method.is_open || method.is_override))
+            .filter(|method| !method.is_static() && (method.is_open() || method.is_override()))
             .map(|method| method.name.clone())
             .collect();
         self.layout_queries
@@ -2308,7 +2308,7 @@ fn lookup_static_storage_in(
 }
 
 fn function_call_return_type(f: &FunctionDecl) -> Type {
-    if f.is_async {
+    if f.is_async() {
         Type::Generic(
             "Task".to_string().into(),
             vec![f.return_type.clone().into()],
@@ -2319,7 +2319,7 @@ fn function_call_return_type(f: &FunctionDecl) -> Type {
 }
 
 fn method_call_return_type(m: &MethodDecl) -> Type {
-    if m.is_async {
+    if m.is_async() {
         Type::Generic(
             "Task".to_string().into(),
             vec![m.return_type.clone().into()],
@@ -3558,8 +3558,7 @@ mod tests {
             return_type_span: None,
             type_params: Vec::new(),
             name: "work".to_string(),
-            public: false,
-            is_async: true,
+            modifiers: Modifiers::ASYNC,
             params: Vec::new(),
             return_type: crate::parser::ast::Type::I64,
             body: Block {

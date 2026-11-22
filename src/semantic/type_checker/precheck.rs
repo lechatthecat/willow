@@ -74,8 +74,7 @@ fn class_registration_syntax(class: &ClassDecl, isolation: &ClassIsolation) -> V
         abi_storage,
         type_params,
         name,
-        public,
-        is_open,
+        modifiers: _,
         base_class,
         implements,
         source_implements_len,
@@ -88,8 +87,8 @@ fn class_registration_syntax(class: &ClassDecl, isolation: &ClassIsolation) -> V
         "abi_storage": abi_storage,
         "type_params": type_params,
         "name": name,
-        "public": public,
-        "is_open": is_open,
+        "public": class.public(),
+        "is_open": class.is_open(),
         "base_class": base_class,
         "implements": implements,
         "source_implements_len": source_implements_len,
@@ -107,20 +106,17 @@ fn class_registration_syntax(class: &ClassDecl, isolation: &ClassIsolation) -> V
                 let FieldDecl {
                     name,
                     ty,
-                    public,
-                    protected,
-                    is_static,
-                    is_mut,
+                    modifiers: _,
                     span,
                     initializer: _,
                 } = f;
                 json!({
                     "name": name,
                     "ty": ty,
-                    "public": public,
-                    "protected": protected,
-                    "is_static": is_static,
-                    "is_mut": is_mut,
+                    "public": f.public(),
+                    "protected": f.protected(),
+                    "is_static": f.is_static(),
+                    "is_mut": f.is_mut(),
                     "initializer": null,
                     "span": span,
                 })
@@ -132,15 +128,14 @@ fn class_registration_syntax(class: &ClassDecl, isolation: &ClassIsolation) -> V
             .iter()
             .map(|c| {
                 let ConstructorDecl {
-                    public,
-                    protected,
+                    modifiers: _,
                     params,
                     body,
                     span,
                 } = c;
                 json!({
-                    "public": public,
-                    "protected": protected,
+                    "public": c.public(),
+                    "protected": c.protected(),
                     "params": params,
                     "body": empty_block(body),
                     "span": span,
@@ -157,12 +152,7 @@ fn class_registration_syntax(class: &ClassDecl, isolation: &ClassIsolation) -> V
                     array_body_optimization,
                     constraint,
                     name,
-                    public,
-                    protected,
-                    is_async,
-                    is_open,
-                    is_override,
-                    is_static,
+                    modifiers: _,
                     params,
                     return_type,
                     body,
@@ -174,12 +164,12 @@ fn class_registration_syntax(class: &ClassDecl, isolation: &ClassIsolation) -> V
                     "array_body_optimization": array_body_optimization,
                     "constraint": constraint,
                     "name": name,
-                    "public": public,
-                    "protected": protected,
-                    "is_async": is_async,
-                    "is_open": is_open,
-                    "is_override": is_override,
-                    "is_static": is_static,
+                    "public": m.public(),
+                    "protected": m.protected(),
+                    "is_async": m.is_async(),
+                    "is_open": m.is_open(),
+                    "is_override": m.is_override(),
+                    "is_static": m.is_static(),
                     "params": params,
                     "return_type": return_type,
                     "body": empty_block(body),
@@ -203,17 +193,17 @@ fn class_header_syntax(class: &ClassDecl, constructors: &[Rc<SuperInitPlacement>
         .iter()
         .map(|m| {
             let signature =
-                (class.base_class.is_some() && m.is_override && !m.is_static).then(|| {
+                (class.base_class.is_some() && m.is_override() && !m.is_static()).then(|| {
                     let params: Vec<_> = m.params.iter().map(|p| (&p.ty, p.type_span)).collect();
-                    (params, &m.return_type, m.is_async)
+                    (params, &m.return_type, m.is_async())
                 });
-            (&m.name, m.is_static, m.is_override, signature, m.span)
+            (&m.name, m.is_static(), m.is_override(), signature, m.span)
         })
         .collect();
     let fields: Vec<_> = class
         .fields
         .iter()
-        .map(|f| (f.is_static.then_some(&f.name), &f.ty, f.span))
+        .map(|f| (f.is_static().then_some(&f.name), &f.ty, f.span))
         .collect();
     let constructors: Vec<_> = constructors
         .iter()
@@ -1408,7 +1398,9 @@ mod tests {
                     let Item::Class(child) = &mut edited.items[1] else {
                         unreachable!()
                     };
-                    child.methods[0].is_static = true;
+                    child.methods[0]
+                        .modifiers
+                        .insert(crate::parser::ast::Modifiers::STATIC);
                 }
                 let mut correspondence = Correspondence::default();
                 correspondence.reconcile(&program, &mut edited).unwrap();

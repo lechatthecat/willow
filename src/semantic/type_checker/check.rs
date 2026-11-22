@@ -535,7 +535,7 @@ impl TypeChecker {
                     register_root(function.body.id, EffectRootLocation::Function(item_index));
                     self.effect_index.callables.insert(
                         FunctionId::free_from_source_name(function.name.as_str()),
-                        function.is_async,
+                        function.is_async(),
                     );
                 }
                 Item::Class(class) => {
@@ -563,7 +563,7 @@ impl TypeChecker {
                         );
                         self.effect_index.callables.insert(
                             FunctionId::method(owner, method.name.as_str()),
-                            method.is_async,
+                            method.is_async(),
                         );
                     }
                     for (member, constructor) in class.constructors.iter().enumerate() {
@@ -2558,7 +2558,7 @@ impl TypeChecker {
                         // must not recursively check their value twice.
                         let template = &self.generics.classes["$std::collections::Array"];
                         let argument = template.methods.iter()
-                            .find(|method| method.name == s.method && method.is_static)
+                            .find(|method| method.name == s.method && method.is_static())
                             .and_then(|method| method.params.iter().zip(&s.args).find_map(|(param, arg)| {
                                 (matches!(&param.ty, Type::Named(name) if template.type_params.contains(name))
                                     && param.mode == ParamMode::Value && arg.mode == CallArgMode::Value)
@@ -2593,7 +2593,7 @@ impl TypeChecker {
                     self.generic_error(s.span, "constructor is not declared by Array");
                     return Self::error_type();
                 };
-                if !method.public || !method.is_static || method.constraint.is_some() {
+                if !method.public() || !method.is_static() || method.constraint.is_some() {
                     self.generic_error(
                         s.span,
                         "constructor is not available without a known element type",
@@ -2627,12 +2627,12 @@ impl TypeChecker {
                 if let Some((id, _)) = checked_argument {
                     self.prechecked_array_args.remove(&id);
                 }
-                self.check_async_call_captures(&params, &s.args, method.is_async);
+                self.check_async_call_captures(&params, &s.args, method.is_async());
                 self.record_method_use(&s.method, "method", s.span, method.span, &s.args);
                 let result =
                     crate::semantic::generic_inference::substitute(&method.return_type, &bindings);
                 let result = self.normalize_type(&result, s.span);
-                return if method.is_async {
+                return if method.is_async() {
                     B::Task.apply(vec![result])
                 } else {
                     result

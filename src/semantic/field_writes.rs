@@ -243,7 +243,7 @@ impl<'a> Resolver<'a> {
             .map(|c| {
                 c.fields
                     .iter()
-                    .filter(|f| !f.is_static)
+                    .filter(|f| !f.is_static())
                     .map(|f| (f.name.as_str(), f.span))
                     .collect()
             })

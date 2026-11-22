@@ -567,14 +567,14 @@ pub(crate) fn collect(
         match item {
             Item::Function(function) => bodies.push((
                 FunctionId::free(&function.name),
-                function.is_async,
+                function.is_async(),
                 &function.body,
                 function.params.as_slice(),
                 function.type_params.iter().map(String::as_str).collect(),
             )),
             Item::Class(class) => {
                 for field in &class.fields {
-                    if field.is_static && !field.is_mut && field.initializer.as_ref().is_some_and(|expr| matches!(expr, Expr::StaticCall(call) if matches!(Builtin::from_name(call.class.as_str()), Some(Builtin::Mutex | Builtin::RwLock)) && call.method == "new")) {
+                    if field.is_static() && !field.is_mut() && field.initializer.as_ref().is_some_and(|expr| matches!(expr, Expr::StaticCall(call) if matches!(Builtin::from_name(call.class.as_str()), Some(Builtin::Mutex | Builtin::RwLock)) && call.method == "new")) {
                         analysis.globals.insert((class.name.clone(), field.name.clone()), Identity {
                             class: Some(Class::Global(field.span)), same: Some(field.span),
                         });
@@ -583,7 +583,7 @@ pub(crate) fn collect(
                 for method in &class.methods {
                     bodies.push((
                         FunctionId::method(TypeId::local(&class.name), &method.name),
-                        method.is_async,
+                        method.is_async(),
                         &method.body,
                         method.params.as_slice(),
                         class.type_params.iter().map(String::as_str).collect(),

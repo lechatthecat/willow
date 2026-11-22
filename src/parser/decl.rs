@@ -1,5 +1,5 @@
-use super::Parser;
 use super::ast::*;
+use super::{Parser, modifiers::MemberHead};
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 use crate::lexer::token::TokenKind;
 
@@ -228,26 +228,12 @@ impl Parser {
         Ok(contracts)
     }
 
-    // `open` is contextual: at declaration modifier positions only. A field
-    // named `open` is followed by `:`, so leave it for ordinary name parsing.
-    fn eat_open_modifier(&mut self) -> bool {
-        if matches!(self.peek_kind(), TokenKind::Ident(name) if name == "open")
-            && !matches!(self.peek_kind_at(1), TokenKind::Colon)
-        {
-            self.advance();
-            true
-        } else {
-            false
-        }
-    }
-
     /// `Ok(None)`: the item was consumed but rejected, with its diagnostic
     /// already recorded in `recovered_errors` (see [`Self::parse_const`]).
     pub(super) fn parse_item(&mut self) -> Result<Option<Item>, Diagnostic> {
         let contracts = self.parse_effect_contracts()?;
-        let public = self.eat(TokenKind::Pub);
-        let is_open = self.eat_open_modifier();
-        let is_async = self.eat(TokenKind::Async);
+        let modifiers = self.parse_item_modifiers();
+        let public = modifiers.contains(Modifiers::PUBLIC);
         if !contracts.is_empty() && !self.check(TokenKind::Fn) {
             return Err(self.err(
                 ErrorCode::E0105,
@@ -256,31 +242,38 @@ impl Parser {
         }
         match self.peek_kind() {
             TokenKind::Fn => {
-                let mut function = self.parse_fn(public, is_async)?;
+                let mut function =
+                    self.parse_fn(modifiers & (Modifiers::PUBLIC | Modifiers::ASYNC))?;
                 function.effect_contracts = contracts;
                 Ok(Some(Item::Function(function)))
             }
-            TokenKind::Class => Ok(Some(Item::Class(self.parse_class(public, is_open)?))),
+            TokenKind::Class => Ok(Some(Item::Class(
+                self.parse_class(modifiers & (Modifiers::PUBLIC | Modifiers::OPEN))?,
+            ))),
             TokenKind::Enum => Ok(Some(Item::Enum(self.parse_enum_decl(public)?))),
-            TokenKind::Const if is_open => Err(self.err(
+            TokenKind::Const if modifiers.contains(Modifiers::OPEN) => Err(self.err(
                 ErrorCode::E0105,
                 "`open` cannot be used on a `const` declaration",
             )),
-            TokenKind::Const if is_async => Err(self.err(
+            TokenKind::Const if modifiers.contains(Modifiers::ASYNC) => Err(self.err(
                 ErrorCode::E0105,
                 "`async` cannot be used on a `const` declaration",
             )),
-            TokenKind::Const => Ok(self.parse_const(public)?.map(Item::Function)),
-            TokenKind::Interface if is_open => Err(self.err(
+            TokenKind::Const => Ok(self
+                .parse_const(modifiers & Modifiers::PUBLIC)?
+                .map(Item::Function)),
+            TokenKind::Interface if modifiers.contains(Modifiers::OPEN) => Err(self.err(
                 ErrorCode::E0105,
                 "`open` cannot be used on an interface declaration",
             )),
-            TokenKind::Interface if is_async => Err(self.err(
+            TokenKind::Interface if modifiers.contains(Modifiers::ASYNC) => Err(self.err(
                 ErrorCode::E0105,
                 "`async` cannot be used on an interface declaration",
             )),
             TokenKind::Interface => Ok(Some(Item::Interface(self.parse_interface(public)?))),
-            _ if is_async => Err(self.err(ErrorCode::E0105, "`async` can only be used on `fn`")),
+            _ if modifiers.contains(Modifiers::ASYNC) => {
+                Err(self.err(ErrorCode::E0105, "`async` can only be used on `fn`"))
+            }
             _ => Err(self.err(
                 ErrorCode::E0105,
                 "expected `fn`, `class`, `enum`, `interface`, or `const`",
@@ -363,11 +356,7 @@ impl Parser {
         })
     }
 
-    pub(super) fn parse_class(
-        &mut self,
-        public: bool,
-        is_open: bool,
-    ) -> Result<ClassDecl, Diagnostic> {
+    pub(super) fn parse_class(&mut self, modifiers: Modifiers) -> Result<ClassDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::Class)?;
         let name = self.expect_ident()?;
@@ -416,78 +405,16 @@ impl Parser {
 
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
             let contracts = self.parse_effect_contracts()?;
-            let member_public = self.eat(TokenKind::Pub);
-            let member_prot = if !member_public {
-                self.eat(TokenKind::Prot)
-            } else {
-                false
-            };
-            // `init(...)` constructor — `init` is a contextual keyword: an
-            // identifier `init` immediately followed by `(` at member position. It carries
-            // visibility but no other modifiers.
-            let is_init = self.is_constructor_init_ahead();
-            if is_init {
-                if !contracts.is_empty() {
-                    return Err(self.err(ErrorCode::E0105, "effect contracts require a method"));
+            match self.parse_member_head(&contracts)? {
+                MemberHead::Method(modifiers) => {
+                    let mut method = self.parse_method(modifiers)?;
+                    method.effect_contracts = contracts;
+                    methods.push(method);
                 }
-                constructors.push(self.parse_constructor(member_public, member_prot)?);
-                continue;
-            }
-            // `static` marks a class-level member. It sits after
-            // visibility and before `open`/`override`/`async` for methods, and
-            // before `mut` for a mutable static property.
-            let member_static_span = if self.check(TokenKind::Static) {
-                let span = self.current_span();
-                self.advance();
-                Some(span)
-            } else {
-                None
-            };
-            if let Some(static_span) = member_static_span
-                && self.is_constructor_init_ahead()
-            {
-                let init_span = self.current_span();
-                return Err(Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0850,
-                        "`static` is not allowed on constructor `init`",
-                    )
-                    .with_label(Label::primary(static_span, "`static` constructor modifier"))
-                    .with_label(Label::secondary(
-                        init_span,
-                        "`init` is always an instance constructor",
-                    ))
-                    .with_help(
-                        "write `init(self, ...)` without `static`, or use a differently named `static fn` factory",
-                    ));
-            }
-            let member_static = member_static_span.is_some();
-            let member_open = self.eat_open_modifier();
-            let member_override = self.eat(TokenKind::Override);
-            let member_async = self.eat(TokenKind::Async);
-
-            if self.check(TokenKind::Fn) {
-                let mut method = self.parse_method(
-                    member_public,
-                    member_prot,
-                    member_async,
-                    member_open,
-                    member_override,
-                    member_static,
-                )?;
-                method.effect_contracts = contracts;
-                methods.push(method);
-            } else {
-                if !contracts.is_empty() {
-                    return Err(self.err(ErrorCode::E0105, "effect contracts require a method"));
+                MemberHead::Constructor(modifiers) => {
+                    constructors.push(self.parse_constructor(modifiers)?)
                 }
-                if member_open || member_override || member_async {
-                    return Err(self.err(
-                        ErrorCode::E0105,
-                        "`open`, `override`, and `async` can only be used on methods",
-                    ));
-                }
-                fields.push(self.parse_field(member_public, member_prot, member_static)?);
+                MemberHead::Field(modifiers) => fields.push(self.parse_field(modifiers)?),
             }
         }
 
@@ -499,8 +426,7 @@ impl Parser {
             abi_storage: None,
             type_params,
             name,
-            public,
-            is_open,
+            modifiers,
             base_class,
             source_implements_len: implements.len(),
             implements,
@@ -737,21 +663,8 @@ impl Parser {
         }
     }
 
-    pub(super) fn parse_field(
-        &mut self,
-        public: bool,
-        protected: bool,
-        is_static: bool,
-    ) -> Result<FieldDecl, Diagnostic> {
-        // `static mut name: T = expr` — `mut` is only meaningful on a static
-        // property (instance fields take their mutability from the binding).
-        let is_mut = self.eat(TokenKind::Mut);
-        if is_mut && !is_static {
-            return Err(self.err(
-                ErrorCode::E0105,
-                "`mut` on a class field is only allowed on a `static` property",
-            ));
-        }
+    pub(super) fn parse_field(&mut self, modifiers: Modifiers) -> Result<FieldDecl, Diagnostic> {
+        let is_static = modifiers.contains(Modifiers::STATIC);
         let span = self.current_span();
         let name = self.expect_ident()?;
         self.expect(TokenKind::Colon)?;
@@ -779,24 +692,13 @@ impl Parser {
         Ok(FieldDecl {
             name,
             ty,
-            public,
-            protected,
-            is_static,
-            is_mut,
+            modifiers,
             initializer,
             span,
         })
     }
 
-    pub(super) fn parse_method(
-        &mut self,
-        public: bool,
-        protected: bool,
-        is_async: bool,
-        is_open: bool,
-        is_override: bool,
-        is_static: bool,
-    ) -> Result<MethodDecl, Diagnostic> {
+    pub(super) fn parse_method(&mut self, modifiers: Modifiers) -> Result<MethodDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::Fn)?;
         let name_span = self.current_span();
@@ -820,7 +722,7 @@ impl Parser {
             // A static method has no receiver; an explicit `self` is always wrong
             // (static member support §9.2). Instance methods take `self` implicitly, but an
             // explicit `self` is still accepted during migration.
-            if is_static {
+            if modifiers.contains(Modifiers::STATIC) {
                 let span = self.current_span();
                 return Err(Diagnostic::new(
                     Severity::Error,
@@ -873,7 +775,7 @@ impl Parser {
         let body = self.parse_block()?;
         let span = start.to(body.span);
         let mut return_type = return_type;
-        if is_async {
+        if modifiers.contains(Modifiers::ASYNC) {
             sync_callable_signature(&mut params, &mut return_type);
         }
 
@@ -882,12 +784,7 @@ impl Parser {
             array_body_optimization: crate::parser::ast::ArrayBodyOptimization::None,
             constraint,
             name,
-            public,
-            protected,
-            is_async,
-            is_open,
-            is_override,
-            is_static,
+            modifiers,
             params,
             return_type,
             body,
@@ -902,8 +799,7 @@ impl Parser {
     /// `params`, matching method lowering and `new Class(args...)` arity.
     pub(super) fn parse_constructor(
         &mut self,
-        public: bool,
-        protected: bool,
+        modifiers: Modifiers,
     ) -> Result<ConstructorDecl, Diagnostic> {
         let start = self.current_span();
         self.expect_ident()?; // `init`
@@ -948,27 +844,14 @@ impl Parser {
         let body = self.parse_block()?;
         let span = start.to(body.span);
         Ok(ConstructorDecl {
-            public,
-            protected,
+            modifiers,
             params,
             body,
             span,
         })
     }
 
-    pub(super) fn is_constructor_init_ahead(&self) -> bool {
-        matches!(self.peek_kind(), TokenKind::Ident(n) if n == "init")
-            && matches!(
-                self.tokens.get(self.pos + 1).map(|t| &t.kind),
-                Some(TokenKind::LParen)
-            )
-    }
-
-    pub(super) fn parse_fn(
-        &mut self,
-        public: bool,
-        is_async: bool,
-    ) -> Result<FunctionDecl, Diagnostic> {
+    pub(super) fn parse_fn(&mut self, modifiers: Modifiers) -> Result<FunctionDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::Fn)?;
         let name = self.expect_ident()?;
@@ -1015,7 +898,7 @@ impl Parser {
         let body = self.parse_block()?;
         let span = start.to(body.span);
         let mut return_type = return_type;
-        if is_async {
+        if modifiers.contains(Modifiers::ASYNC) {
             sync_callable_signature(&mut params, &mut return_type);
         }
         Ok(FunctionDecl {
@@ -1024,8 +907,7 @@ impl Parser {
             effect_contracts: Vec::new(),
             type_params,
             name,
-            public,
-            is_async,
+            modifiers,
             params,
             return_type,
             return_type_span,
@@ -1044,7 +926,10 @@ impl Parser {
     /// supported constant yields `Ok(None)` with its diagnostic recorded in
     /// `recovered_errors`: the whole declaration, `;` included, is consumed, so
     /// item recovery must not run and skip the following item.
-    pub(super) fn parse_const(&mut self, public: bool) -> Result<Option<FunctionDecl>, Diagnostic> {
+    pub(super) fn parse_const(
+        &mut self,
+        modifiers: Modifiers,
+    ) -> Result<Option<FunctionDecl>, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::Const)?;
         let name = self.expect_ident()?;
@@ -1079,8 +964,7 @@ impl Parser {
             effect_contracts: Vec::new(),
             type_params: Vec::new(),
             name,
-            public,
-            is_async: false,
+            modifiers,
             params: Vec::new(),
             return_type,
             return_type_span: Some(Box::new(type_span)),
@@ -1478,8 +1362,9 @@ mod const_diagnostic_tests {
                 &[ErrorCode::E0110],
                 &["B"],
             ),
+            ("const A: i32 = 1; const B: i64 = 2;", &[], &["A", "B"]),
             (
-                "const A: i32 = 1; const B: i64 = 2;",
+                "const A: i32 = 2147483648; const B: i64 = 2;",
                 &[ErrorCode::E0110],
                 &["B"],
             ),
@@ -1489,7 +1374,7 @@ mod const_diagnostic_tests {
                 &["main"],
             ),
             (
-                "const A: f64 = 1; const B: Array<i64> = [1]; const C: i32 = 1; const D: bool = 1;",
+                "const A: f64 = 1; const B: Array<i64> = [1]; const C: i32 = 2147483648; const D: bool = 1;",
                 &[
                     ErrorCode::E0110,
                     ErrorCode::E0109,

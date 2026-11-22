@@ -1,6 +1,10 @@
 use crate::diagnostics::Span;
 use crate::qualified_name::QualifiedName;
 
+mod modifiers;
+pub use modifiers::Modifiers;
+use modifiers::declaration;
+
 /// Syntax identity, independent of source coordinates. Cloning a checked node
 /// preserves its identity; newly constructed syntax always receives a fresh ID,
 /// so a rebuilt or synthesized node never inherits another node's checker entry
@@ -437,34 +441,30 @@ impl TypePath {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ClassDecl {
-    /// Compiler-assigned storage for a bundled ABI declaration; never parsed from user source.
-    #[serde(default)]
-    pub abi_storage: Option<Type>,
-    #[serde(default)]
-    pub type_params: Vec<String>,
-    pub name: String,
-    pub public: bool,
-    pub is_open: bool,
-    pub base_class: Option<TypePath>,
-    /// Interfaces this class declares conformance to via `implements I, J`.
-    /// Each entry is a `Type` so generic interfaces (`implements From<E>`) carry
-    /// their type arguments. Consumed by the conformance checker.
-    #[allow(
-        dead_code,
-        reason = "Retain interface metadata for type checking and serialization"
-    )]
-    pub implements: Vec<Type>,
-    /// Original source prefix; desugaring appends inherited contracts. Only
-    /// the source entries require import visibility at this declaration site.
-    pub source_implements_len: usize,
-    pub fields: Vec<FieldDecl>,
-    pub methods: Vec<MethodDecl>,
-    /// `init(self, ...)` constructors. MVP allows at most one.
-    /// Empty when the class relies on the implicit memberwise constructor.
-    pub constructors: Vec<ConstructorDecl>,
-    pub span: Span,
+declaration! {
+    pub struct ClassDecl {
+        /// Compiler-assigned storage for a bundled ABI declaration; never parsed from user source.
+        #[serde(default)]
+        pub abi_storage: Option<Type>,
+        #[serde(default)]
+        pub type_params: Vec<String>,
+        pub name: String,
+        modifiers { public => PUBLIC, is_open => OPEN }
+        pub base_class: Option<TypePath>,
+        /// Interfaces this class declares conformance to via `implements I, J`.
+        /// Each entry is a `Type` so generic interfaces (`implements From<E>`) carry
+        /// their type arguments. Consumed by the conformance checker.
+        pub implements: Vec<Type>,
+        /// Original source prefix; desugaring appends inherited contracts. Only
+        /// the source entries require import visibility at this declaration site.
+        pub source_implements_len: usize,
+        pub fields: Vec<FieldDecl>,
+        pub methods: Vec<MethodDecl>,
+        /// `init(self, ...)` constructors. MVP allows at most one.
+        /// Empty when the class relies on the implicit memberwise constructor.
+        pub constructors: Vec<ConstructorDecl>,
+        pub span: Span,
+    }
 }
 
 impl ClassDecl {
@@ -485,33 +485,32 @@ impl ClassDecl {
     }
 }
 
-/// An `init(self, params...) { ... }` constructor declaration. No
-/// return type; `self` is bound in the body and omitted from `params`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ConstructorDecl {
-    pub public: bool,
-    pub protected: bool,
-    pub params: Vec<Param>,
-    pub body: Block,
-    pub span: Span,
+declaration! {
+    /// An `init(self, params...) { ... }` constructor declaration. No
+    /// return type; `self` is bound in the body and omitted from `params`.
+    pub struct ConstructorDecl {
+        modifiers { public => PUBLIC, protected => PROTECTED }
+        pub params: Vec<Param>,
+        pub body: Block,
+        pub span: Span,
+    }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FieldDecl {
-    pub name: String,
-    pub ty: Type,
-    pub public: bool,
-    pub protected: bool,
-    /// `static` class-level property. Static properties live in
-    /// global storage and are not part of instance layout.
-    pub is_static: bool,
-    /// `static mut` — a mutable static property. Only meaningful with
-    /// `is_static`; instance fields use their binding's mutability.
-    pub is_mut: bool,
-    /// Required initializer for static properties (MVP); `None` for instance
-    /// fields, which are initialized through constructors.
-    pub initializer: Option<Expr>,
-    pub span: Span,
+declaration! {
+    pub struct FieldDecl {
+        pub name: String,
+        pub ty: Type,
+        modifiers {
+            public => PUBLIC,
+            protected => PROTECTED,
+            is_static => STATIC,
+            is_mut => MUT,
+        }
+        /// Required initializer for static properties (MVP); `None` for instance
+        /// fields, which are initialized through constructors.
+        pub initializer: Option<Expr>,
+        pub span: Span,
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -529,73 +528,74 @@ pub enum ArrayBodyOptimization {
     Append,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct MethodDecl {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub effect_contracts: Vec<EffectContract>,
-    #[serde(default)]
-    pub array_body_optimization: ArrayBodyOptimization,
-    /// A finite, declaration-checked domain for this method.
-    pub constraint: Option<Box<MethodConstraint>>,
-    pub name: String,
-    pub public: bool,
-    pub protected: bool,
-    pub is_async: bool,
-    pub is_open: bool,
-    pub is_override: bool,
-    /// `static fn`: class-level method with no receiver. A static
-    /// method is called as `Type::method(...)` and has no `self` in its body.
-    pub is_static: bool,
-    pub params: Vec<Param>,
-    pub return_type: Type,
-    pub body: Block,
-    pub span: Span,
-    /// True for a default-interface-method body injected into this class by the
-    /// desugar. The body is the canonical interface default, so
-    /// for a NON-generic interface it is type-checked once at the interface level
-    /// and skipped here to avoid duplicate diagnostics; generic-interface
-    /// injections are left `false` so they are checked with substituted type args.
-    pub is_default_injected: bool,
-    /// True for ANY method synthesized by default-interface-method injection,
-    /// including the generic and cross-module ones that `is_default_injected`
-    /// leaves `false` because their bodies still need checking here.
-    ///
-    /// Default injection consults local and imported ancestor shapes so only the
-    /// highest class that needs a default receives a copy; subclasses inherit it
-    /// normally.
-    pub is_interface_default: bool,
+declaration! {
+    pub struct MethodDecl {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub effect_contracts: Vec<EffectContract>,
+        #[serde(default)]
+        pub array_body_optimization: ArrayBodyOptimization,
+        /// A finite, declaration-checked domain for this method.
+        pub constraint: Option<Box<MethodConstraint>>,
+        pub name: String,
+        modifiers {
+            public => PUBLIC,
+            protected => PROTECTED,
+            is_async => ASYNC,
+            is_open => OPEN,
+            is_override => OVERRIDE,
+            is_static => STATIC,
+        }
+        pub params: Vec<Param>,
+        pub return_type: Type,
+        pub body: Block,
+        pub span: Span,
+        /// True for a default-interface-method body injected into this class by the
+        /// desugar. The body is the canonical interface default, so
+        /// for a NON-generic interface it is type-checked once at the interface level
+        /// and skipped here to avoid duplicate diagnostics; generic-interface
+        /// injections are left `false` so they are checked with substituted type args.
+        pub is_default_injected: bool,
+        /// True for ANY method synthesized by default-interface-method injection,
+        /// including the generic and cross-module ones that `is_default_injected`
+        /// leaves `false` because their bodies still need checking here.
+        ///
+        /// Default injection consults local and imported ancestor shapes so only the
+        /// highest class that needs a default receives a copy; subclasses inherit it
+        /// normally.
+        pub is_interface_default: bool,
+    }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FunctionDecl {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub requires: Vec<Expr>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ensures: Vec<Expr>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub effect_contracts: Vec<EffectContract>,
-    #[serde(default)]
-    pub type_params: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rust_bridge: Option<Box<crate::rust_bridge_ir::RustBridgeSymbol>>,
-    pub name: String,
-    pub public: bool,
-    pub is_async: bool,
-    pub params: Vec<Param>,
-    pub return_type: Type,
-    /// Source range of the explicit return annotation, absent for synthetic functions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub return_type_span: Option<Box<Span>>,
-    pub body: Block,
-    pub span: Span,
-    /// `Some` for a module-level `const NAME: T = literal;`.
-    /// The parser represents a constant as a zero-parameter function whose
-    /// body returns the literal, so declaration registration, visibility,
-    /// item imports and incremental tracking treat it like any other item;
-    /// the checker resolves the bare name as a VALUE of type `T`, and
-    /// lowering inlines this literal at each use instead of calling.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub constant: Option<ConstValue>,
+declaration! {
+    pub struct FunctionDecl {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub requires: Vec<Expr>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub ensures: Vec<Expr>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub effect_contracts: Vec<EffectContract>,
+        #[serde(default)]
+        pub type_params: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub rust_bridge: Option<Box<crate::rust_bridge_ir::RustBridgeSymbol>>,
+        pub name: String,
+        modifiers { public => PUBLIC, is_async => ASYNC }
+        pub params: Vec<Param>,
+        pub return_type: Type,
+        /// Source range of the explicit return annotation, absent for synthetic functions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub return_type_span: Option<Box<Span>>,
+        pub body: Block,
+        pub span: Span,
+        /// `Some` for a module-level `const NAME: T = literal;`.
+        /// The parser represents a constant as a zero-parameter function whose
+        /// body returns the literal, so declaration registration, visibility,
+        /// item imports and incremental tracking treat it like any other item;
+        /// the checker resolves the bare name as a VALUE of type `T`, and
+        /// lowering inlines this literal at each use instead of calling.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub constant: Option<ConstValue>,
+    }
 }
 
 /// The compile-time value of a module-level `const`.

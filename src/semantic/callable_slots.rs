@@ -534,7 +534,7 @@ pub(crate) fn for_each_body<'a>(
             Item::Function(function) => f(
                 BodyRef::Block(&function.body),
                 StoreContext {
-                    is_async: function.is_async,
+                    is_async: function.is_async(),
                     ..StoreContext::default()
                 },
                 &function.params,
@@ -547,7 +547,7 @@ pub(crate) fn for_each_body<'a>(
                 };
                 for method in &class.methods {
                     let context = StoreContext {
-                        is_async: method.is_async,
+                        is_async: method.is_async(),
                         ..class_context
                     };
                     f(
@@ -572,7 +572,7 @@ pub(crate) fn for_each_body<'a>(
                 for field in &class.fields {
                     if let Some(expr) = &field.initializer {
                         let context = StoreContext {
-                            field: (!field.is_static).then_some(field.span),
+                            field: (!field.is_static()).then_some(field.span),
                             ..class_context
                         };
                         f(BodyRef::Initializer(expr), context, &[], &class.type_params);
@@ -751,7 +751,7 @@ impl<'a> Index<'a> {
             .map(|(_, c)| {
                 c.fields
                     .iter()
-                    .filter(|f| !f.is_static)
+                    .filter(|f| !f.is_static())
                     .map(|f| (f.name.as_str(), f.span))
                     .collect()
             })
@@ -785,7 +785,7 @@ impl<'a> Index<'a> {
         let promised = index.promised();
         for (id, &class_promised) in promised.iter().enumerate() {
             let (class, _) = index.classes[id];
-            for field in class.fields.iter().filter(|f| !f.is_static) {
+            for field in class.fields.iter().filter(|f| !f.is_static()) {
                 if is_callable(&field.ty) {
                     let node = index.slot(SlotKey::Decl(field.span), class_promised);
                     index
@@ -994,7 +994,7 @@ impl<'a> Index<'a> {
                         .0
                         .fields
                         .iter()
-                        .filter(|f| !f.is_static)
+                        .filter(|f| !f.is_static())
                         .map(|f| f.span)
                 })
                 .collect();
@@ -1198,7 +1198,7 @@ impl Decisions {
                             set_top_kind(ty, shareable(SlotKey::Decl(span)))
                         }
                     };
-                    for field in class.fields.iter_mut().filter(|f| !f.is_static) {
+                    for field in class.fields.iter_mut().filter(|f| !f.is_static()) {
                         field.ty = kind(&field.ty, field.span);
                     }
                     for constructor in &mut class.constructors {

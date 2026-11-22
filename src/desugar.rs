@@ -1,5 +1,6 @@
 //! AST-to-AST desugaring passes that run after module resolution.
 
+use crate::parser::ast::Modifiers;
 use crate::qualified_name::QualifiedName;
 use crate::{diagnostics, module, parser};
 
@@ -1228,12 +1229,7 @@ fn inject_default_interface_methods(
                         array_body_optimization: crate::parser::ast::ArrayBodyOptimization::None,
                         constraint: None,
                         name: dm.name.clone(),
-                        public: true, // interface methods are public by contract
-                        protected: false,
-                        is_async: false,
-                        is_open: false,
-                        is_override: false,
-                        is_static: false,
+                        modifiers: Modifiers::PUBLIC,
                         params,
 
                         return_type: subst_iface_type(&dm.return_type, &subst),

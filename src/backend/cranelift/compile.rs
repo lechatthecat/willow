@@ -1475,8 +1475,7 @@ impl UnitCodegenContext<'_> {
             return_type_span: None,
             type_params: Vec::new(),
             name: name.to_string(),
-            public: false,
-            is_async: false,
+            modifiers: Default::default(),
             params,
             return_type: return_type.to_source(),
             body,
@@ -1724,7 +1723,7 @@ impl UnitCodegenContext<'_> {
         self.func_ids.insert(lookup_name, id);
         // Task constructors are global declarations. Unit aliases resolve to
         // these canonical identities, including calls within another module.
-        if f.is_async && symbol_name != USER_MAIN_SYMBOL {
+        if f.is_async() && symbol_name != USER_MAIN_SYMBOL {
             self.cooperative_leaves
                 .insert(self.func_ids.scope().lookup_id(lookup_name));
         }
@@ -1963,7 +1962,7 @@ impl UnitCodegenContext<'_> {
             &crate::semantic::ids::SemanticType::from(&f.return_type)
         );
         if let Some(reason) = super::lir_gen::lir_rejection_reason(&lir_fn, &ctx).or_else(|| {
-            f.is_async
+            f.is_async()
                 .then(|| super::lir_gen::lir_async_rejection_reason(&lir_fn))
                 .flatten()
         }) {
@@ -1972,7 +1971,7 @@ impl UnitCodegenContext<'_> {
 
         // Async functions still use the cooperative constructor/poll ABI, with
         // the same mandatory lowered body.
-        if f.is_async {
+        if f.is_async() {
             if *crate::diagnostic_settings::LIR_LOG {
                 eprintln!("[lir] compiling async `{name}` from lowered IR");
             }
@@ -2169,7 +2168,7 @@ impl UnitCodegenContext<'_> {
             let mangled = self.class_method_symbol(&c.name, &m.name);
             let id = FunctionId::method(TypeId::from_source_name(&c.name), &m.name);
             self.func_ids.scope().declare(&mangled, id);
-            if m.is_async {
+            if m.is_async() {
                 self.async_methods
                     .insert(self.func_ids.scope().lookup_id(&mangled));
             }
@@ -2223,7 +2222,7 @@ impl UnitCodegenContext<'_> {
         owner: InitUnitId,
     ) -> Result<()> {
         for field in &c.fields {
-            if !field.is_static {
+            if !field.is_static() {
                 continue;
             }
             let Some(init) = &field.initializer else {
@@ -2278,8 +2277,7 @@ impl UnitCodegenContext<'_> {
                 return_type_span: None,
                 type_params: Vec::new(),
                 name: initializer_name.clone(),
-                public: false,
-                is_async: false,
+                modifiers: Default::default(),
                 params: Vec::new(),
                 return_type: field.ty.clone(),
                 body: Block {
@@ -2307,7 +2305,7 @@ impl UnitCodegenContext<'_> {
                 .or_default()
                 .items
                 .push(StaticInitItem {
-                    is_mut: field.is_mut,
+                    is_mut: field.is_mut(),
                     class_key: class_key.to_string(),
                     field: field.name.clone(),
                     id: self
@@ -2868,13 +2866,13 @@ impl UnitCodegenContext<'_> {
             &crate::semantic::ids::SemanticType::from(&m.return_type)
         );
         if let Some(reason) = super::lir_gen::lir_rejection_reason(&lir_fn, &ctx).or_else(|| {
-            m.is_async
+            m.is_async()
                 .then(|| super::lir_gen::lir_async_rejection_reason(&lir_fn))
                 .flatten()
         }) {
             anyhow::bail!("method `{lir_name}` has invalid lowered IR: {reason}");
         }
-        if m.is_async {
+        if m.is_async() {
             if *crate::diagnostic_settings::LIR_LOG {
                 let display = crate::diagnostics::diagnostic::source_names(
                     lir_name.to_string(),
@@ -2930,7 +2928,7 @@ impl UnitCodegenContext<'_> {
         }
         if panic_return_block.is_some()
             && !unrooted
-            && (!m.is_static || super::root_effect::may_push_gc_roots(&lir_fn))
+            && (!m.is_static() || super::root_effect::may_push_gc_roots(&lir_fn))
         {
             fg.cleanup.panic_function_root_depth =
                 Some(fg.emit_value_runtime_call(rt::willow_root_depth, &[]));
@@ -2946,10 +2944,10 @@ impl UnitCodegenContext<'_> {
         // The receiver is a GC-managed class object; it must be stored in a
         // stack slot and rooted so that allocations inside the method body
         // cannot cause the receiver to be collected.
-        if !m.is_static && unrooted {
+        if !m.is_static() && unrooted {
             let self_val = fg.builder.block_params(entry_block)[0];
             fg.bind_unrooted_param("self", &Type::Named(class_name.to_owned().into()), self_val);
-        } else if !m.is_static {
+        } else if !m.is_static() {
             let self_val = fg.builder.block_params(entry_block)[0];
             let self_slot = fg.builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,

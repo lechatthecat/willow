@@ -921,15 +921,15 @@ impl TypeChecker {
 
         for (decl_index, field) in class.fields.iter().enumerate() {
             let ty = self.normalize_decl_type(&field.ty, field.span, module_prefix);
-            if field.is_static {
+            if field.is_static() {
                 // Static properties live in global storage, not instance layout.
                 static_props.insert(
                     field.name.clone(),
                     StaticPropInfo {
                         ty,
-                        is_mut: field.is_mut,
-                        public: field.public,
-                        protected: field.protected,
+                        is_mut: field.is_mut(),
+                        public: field.public(),
+                        protected: field.protected(),
                         decl_index,
                         declaration_span: field.span,
                     },
@@ -940,8 +940,8 @@ impl TypeChecker {
                     field.name.clone(),
                     FieldInfo {
                         ty,
-                        public: field.public,
-                        protected: field.protected,
+                        public: field.public(),
+                        protected: field.protected(),
                         declaration_span: field.span,
                         reassigned: self.field_reassigned(field),
                     },
@@ -964,8 +964,8 @@ impl TypeChecker {
                         .all(|p| !matches!(p.mode, ParamMode::Reference { .. })),
                 param_infos: self.normalize_decl_param_infos(&ctor.params, module_prefix),
                 params,
-                public: ctor.public,
-                protected: ctor.protected,
+                public: ctor.public(),
+                protected: ctor.protected(),
                 declaration_span: ctor.span,
             }
         });
@@ -989,17 +989,17 @@ impl TypeChecker {
                     param_infos: self.normalize_decl_param_infos(&method.params, module_prefix),
                     params,
 
-                    is_static: method.is_static,
-                    is_async: method.is_async,
+                    is_static: method.is_static(),
+                    is_async: method.is_async(),
                     return_type: self.normalize_decl_type(
                         &method.return_type,
                         method.span,
                         module_prefix,
                     ),
-                    public: method.public,
-                    protected: method.protected,
-                    is_open: method.is_open,
-                    is_override: method.is_override,
+                    public: method.public(),
+                    protected: method.protected(),
+                    is_open: method.is_open(),
+                    is_override: method.is_override(),
                     declaration_span: method.span,
                 },
             );
@@ -1008,8 +1008,8 @@ impl TypeChecker {
 
         ClassInfo {
             name: registered_name.to_string(),
-            public: class.public,
-            is_open: class.is_open,
+            public: class.public(),
+            is_open: class.is_open(),
             base_class: class
                 .base_class
                 .as_ref()
@@ -2367,14 +2367,14 @@ fn imported_class_info_from_decl(
 
     for (decl_index, field) in class.fields.iter().enumerate() {
         let ty = qualify(&field.ty);
-        if field.is_static {
+        if field.is_static() {
             static_props.insert(
                 field.name.clone(),
                 StaticPropInfo {
                     ty,
-                    is_mut: field.is_mut,
-                    public: field.public,
-                    protected: field.protected,
+                    is_mut: field.is_mut(),
+                    public: field.public(),
+                    protected: field.protected(),
                     decl_index,
                     declaration_span: field.span,
                 },
@@ -2385,8 +2385,8 @@ fn imported_class_info_from_decl(
                 field.name.clone(),
                 FieldInfo {
                     ty,
-                    public: field.public,
-                    protected: field.protected,
+                    public: field.public(),
+                    protected: field.protected(),
                     declaration_span: field.span,
                     reassigned: reassigned(field),
                 },
@@ -2403,8 +2403,8 @@ fn imported_class_info_from_decl(
                     .all(|p| !matches!(p.mode, ParamMode::Reference { .. })),
             param_infos: qualify_params(&ctor.params),
             params,
-            public: ctor.public,
-            protected: ctor.protected,
+            public: ctor.public(),
+            protected: ctor.protected(),
             declaration_span: ctor.span,
         }
     });
@@ -2423,13 +2423,13 @@ fn imported_class_info_from_decl(
                 param_infos: qualify_params(&method.params),
                 params,
 
-                is_static: method.is_static,
-                is_async: method.is_async,
+                is_static: method.is_static(),
+                is_async: method.is_async(),
                 return_type: qualify(&method.return_type),
-                public: method.public,
-                protected: method.protected,
-                is_open: method.is_open,
-                is_override: method.is_override,
+                public: method.public(),
+                protected: method.protected(),
+                is_open: method.is_open(),
+                is_override: method.is_override(),
                 declaration_span: method.span,
             },
         );
@@ -2437,8 +2437,8 @@ fn imported_class_info_from_decl(
 
     ClassInfo {
         name: registered_name.to_string(),
-        public: class.public,
-        is_open: class.is_open,
+        public: class.public(),
+        is_open: class.is_open(),
         base_class: class.base_class.as_ref().map(|base| {
             // Both spellings of a base go through `qualify`. A bare one for the
             // same reason a field type does: `extends Parcel` under

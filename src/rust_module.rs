@@ -507,6 +507,8 @@ impl Deriver<'_> {
             target,
             definitions: vec![],
         });
+        let mut modifiers = Modifiers::PUBLIC;
+        modifiers.set(Modifiers::ASYNC, symbol.is_async);
         Ok(FunctionDecl {
             requires: vec![],
             ensures: vec![],
@@ -514,8 +516,7 @@ impl Deriver<'_> {
             type_params: vec![],
             rust_bridge: Some(Box::new(symbol)),
             name,
-            public: true,
-            is_async: f.sig.asyncness.is_some(),
+            modifiers,
             params,
             return_type: output.willow(),
             return_type_span: match &f.sig.output {
@@ -1090,8 +1091,7 @@ impl RecordInterfaces {
             effect_contracts: vec![],
             type_params: vec![],
             name: format!("{name}_close"),
-            public: true,
-            is_async: false,
+            modifiers: Modifiers::PUBLIC,
             params: vec![Param {
                 name: "handle".into(),
                 ty: Type::Named(name),
@@ -1144,10 +1144,7 @@ impl RecordInterfaces {
             fields.push(FieldDecl {
                 name: n.clone(),
                 ty: ty.willow(),
-                public: true,
-                protected: false,
-                is_static: false,
-                is_mut: false,
+                modifiers: Modifiers::PUBLIC,
                 initializer: None,
                 span: d.span(f.span()),
             });
@@ -1197,8 +1194,7 @@ impl RecordInterfaces {
             abi_storage: None,
             type_params: vec![],
             name,
-            public: true,
-            is_open: false,
+            modifiers: Modifiers::PUBLIC,
             base_class: None,
             implements: vec![],
             source_implements_len: 0,

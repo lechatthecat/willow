@@ -3,7 +3,7 @@
 use super::{
     PackageError, PackageGraph, PackageId, PackageIdentity, PackageSourceIdentity, PathSource,
     ResolutionRequirement, ResolutionStats, ResolvedDependency, ResolvedPackage,
-    git::{GitSource, SystemGit},
+    git::{CacheAccess, GitSource, SystemGit},
     source::canonical_root,
 };
 use crate::project::{DependencySource, GitSelector};
@@ -22,6 +22,12 @@ thread_local! {
 pub(super) struct GitPin {
     pub identity: PackageIdentity,
     pub selectors: HashSet<String>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct SolvePolicy {
+    pub cache: CacheAccess,
+    pub repair_pins: bool,
 }
 
 type Key = PackageSourceIdentity;
@@ -57,9 +63,7 @@ struct Solver {
     git: HashMap<String, GitSource>,
     pins: HashMap<String, GitPin>,
     checksums: HashMap<String, String>,
-    offline: bool,
-    read_only: bool,
-    repair_pins: bool,
+    policy: SolvePolicy,
     tasks: Vec<Task>,
     cursor: usize,
     edges: Vec<PackageId>,
@@ -76,8 +80,7 @@ pub fn resolve_packages(root: &Path) -> Result<PackageGraph, PackageError> {
         PathSource::open(root, false)?,
         HashMap::new(),
         HashMap::new(),
-        false,
-        false,
+        SolvePolicy::default(),
     )
 }
 /// Explicit update entry point. CLI presentation is owned by the package CLI.
@@ -88,28 +91,17 @@ pub(super) fn resolve_source(
     root: PathSource,
     pins: HashMap<String, GitPin>,
     checksums: HashMap<String, String>,
-    offline: bool,
-    repair_pins: bool,
+    policy: SolvePolicy,
 ) -> Result<PackageGraph, PackageError> {
-    resolve_prepared(
-        root,
-        pins,
-        checksums,
-        offline,
-        false,
-        HashMap::new(),
-        repair_pins,
-    )
+    resolve_prepared(root, pins, checksums, HashMap::new(), policy)
 }
 
 pub(super) fn resolve_prepared(
     root: PathSource,
     pins: HashMap<String, GitPin>,
     checksums: HashMap<String, String>,
-    offline: bool,
-    read_only: bool,
     git: HashMap<String, GitSource>,
-    repair_pins: bool,
+    policy: SolvePolicy,
 ) -> Result<PackageGraph, PackageError> {
     let mut solver = Solver {
         graph: PackageGraph {
@@ -127,9 +119,7 @@ pub(super) fn resolve_prepared(
         git,
         pins,
         checksums,
-        offline,
-        read_only,
-        repair_pins,
+        policy,
         tasks: Vec::new(),
         cursor: 0,
         edges: Vec::new(),
@@ -239,10 +229,9 @@ impl Solver {
         let source = GitSource::cached_mode(
             url.clone(),
             SystemGit,
-            self.offline,
+            self.policy.cache,
             pinned,
             self.checksums.get(url.as_str()).cloned(),
-            self.read_only,
         )?;
         self.git.insert(url.as_str().into(), source);
         Ok(())
@@ -399,7 +388,7 @@ impl Solver {
                 } else if let Some(pin) =
                     self.pins.get(url.as_str()).map(|pin| pin.identity.clone())
                 {
-                    if self.repair_pins {
+                    if self.policy.repair_pins {
                         // Only a conflict involving this source activates its
                         // fresh alternatives. Keep the prefix and cached analyses.
                         self.decisions.push(Decision {

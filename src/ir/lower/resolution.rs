@@ -114,11 +114,11 @@ fn lower_source_declarations(
             Item::Function(f) => {
                 out.functions.insert(
                     FunctionId::free_from_source_name(&f.name),
-                    signature(&f.params, &f.return_type, true, f.is_async, None),
+                    signature(&f.params, &f.return_type, true, f.is_async(), None),
                 );
             }
             Item::Class(c) => {
-                if c.public && c.is_open {
+                if c.public() && c.is_open() {
                     out.open_dispatch_types.insert(canonical(&c.name));
                 }
                 let mut info = HirClassInfo {
@@ -135,7 +135,7 @@ fn lower_source_declarations(
                 };
                 for field in &c.fields {
                     let ty = tables.normalize(&field.ty).into();
-                    if field.is_static {
+                    if field.is_static() {
                         info.static_fields.insert(field.name.clone(), ty);
                     } else {
                         info.fields.push((field.name.clone(), ty));
@@ -151,8 +151,8 @@ fn lower_source_declarations(
                         signature(
                             &method.params,
                             &method.return_type,
-                            method.is_static,
-                            method.is_async,
+                            method.is_static(),
+                            method.is_async(),
                             None,
                         ),
                     );

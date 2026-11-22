@@ -78,7 +78,7 @@ pub(super) fn relations(program: &Program, checked: &SymbolTable) -> Relations {
                     methods: c
                         .methods
                         .iter()
-                        .map(|m| (m.name.clone(), m.span, m.is_static))
+                        .map(|m| (m.name.clone(), m.span, m.is_static()))
                         .collect(),
                     contracts,
                 });

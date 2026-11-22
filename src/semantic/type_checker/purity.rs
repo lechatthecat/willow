@@ -860,7 +860,7 @@ impl TypeChecker {
                         self.purity_body(
                             &f.body,
                             &f.params,
-                            f.is_async,
+                            f.is_async(),
                             f.rust_bridge.is_some(),
                             &mut immutable,
                         ),
@@ -873,7 +873,13 @@ impl TypeChecker {
                         let id = FunctionId::method(TypeId::local(&c.name), &m.name);
                         nodes.insert(
                             id,
-                            self.purity_body(&m.body, &m.params, m.is_async, false, &mut immutable),
+                            self.purity_body(
+                                &m.body,
+                                &m.params,
+                                m.is_async(),
+                                false,
+                                &mut immutable,
+                            ),
                         );
                         spans.insert(id, m.span);
                         order.push(id);

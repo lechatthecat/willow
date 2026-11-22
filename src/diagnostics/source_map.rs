@@ -365,7 +365,7 @@ impl DebugFunction {
     ) -> DebugFunction {
         DebugFunction {
             name: function.name.clone(),
-            is_async: function.is_async,
+            is_async: function.is_async(),
             line: function.span.line,
             col: function.span.col,
             params: function.params.iter().map(DebugParam::from_param).collect(),
@@ -382,7 +382,7 @@ impl DebugFunction {
     ) -> DebugFunction {
         DebugFunction {
             name: QualifiedName::join(class_name, &method.name),
-            is_async: method.is_async,
+            is_async: method.is_async(),
             line: method.span.line,
             col: method.span.col,
             params: method.params.iter().map(DebugParam::from_param).collect(),

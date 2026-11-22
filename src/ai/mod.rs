@@ -483,7 +483,7 @@ fn capture_body_roots<'a>(
                 f.span,
                 f.body.id,
                 AstEvent::Block(&f.body),
-                f.is_async,
+                f.is_async(),
             )),
             Item::Class(c) => {
                 for field in &c.fields {
@@ -509,7 +509,7 @@ fn capture_body_roots<'a>(
                         m.span,
                         m.body.id,
                         AstEvent::Block(&m.body),
-                        m.is_async,
+                        m.is_async(),
                     ));
                 }
                 for init in &c.constructors {
@@ -1732,7 +1732,7 @@ fn dispatch_classes(
                 let methods = class
                     .methods
                     .iter()
-                    .filter(|m| !m.is_static)
+                    .filter(|m| !m.is_static())
                     .filter_map(|m| {
                         nodes
                             .get(&(

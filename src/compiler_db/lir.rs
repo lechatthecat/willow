@@ -189,7 +189,7 @@ impl LirQueries {
                                 names.insert(FunctionId::method(owner, &m.name), m.body.id);
                                 methods.push((m.body.id, AstEvent::Block(&m.body)));
                             }
-                            for field in c.fields.iter().filter(|field| field.is_static) {
+                            for field in c.fields.iter().filter(|field| field.is_static()) {
                                 if let Some(expr) = &field.initializer {
                                     let static_id = index
                                         .static_id(expr.id())

@@ -1,5 +1,6 @@
 //! Class and interface specialization and deferred method requests.
 use super::*;
+use crate::parser::ast::Modifiers;
 
 struct ClassInstantiation<'a> {
     template: &'a ClassDecl,
@@ -119,7 +120,7 @@ impl TypeChecker {
         if let Type::Named(name) = expected {
             let template = &self.generics.classes[&n.class_name];
             if !self.signature_metadata
-                && !template.public
+                && !template.public()
                 && template.span.file_id != n.span.file_id
             {
                 self.generic_error(
@@ -148,7 +149,7 @@ impl TypeChecker {
         {
             self.generics.registry.borrow_mut().class_requests += 1;
         }
-        if !self.signature_metadata && !template.public && template.span.file_id != span.file_id {
+        if !self.signature_metadata && !template.public() && template.span.file_id != span.file_id {
             self.generic_error(span, format!("generic class `{name}` is private"));
             return Some(Self::error_type());
         }
@@ -405,8 +406,7 @@ impl TypeChecker {
                 abi_storage: class.abi_storage.clone(),
                 type_params: Vec::new(),
                 name: class.name.clone(),
-                public: class.public,
-                is_open: class.is_open,
+                modifiers: class.modifiers,
                 base_class: None,
                 implements: Vec::new(),
                 source_implements_len: 0,
@@ -663,8 +663,7 @@ impl TypeChecker {
                 abi_storage: None,
                 type_params: Vec::new(),
                 name: class.name.clone(),
-                public: class.public,
-                is_open: false,
+                modifiers: class.modifiers & Modifiers::PUBLIC,
                 base_class: None,
                 implements: Vec::new(),
                 source_implements_len: 0,

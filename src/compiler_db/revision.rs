@@ -109,7 +109,10 @@ impl AnalysisRevision {
         let map = diagnostics::SourceMap::new(path.to_str().context("non UTF-8 path")?, &source);
         let inputs = inputs::CompilerInputs::native(session.opts, root.to_path_buf());
         let mut inputs = if verification {
-            inputs.resolve_project_analysis(session.project_root.as_deref(), false)?
+            inputs.resolve_project_analysis(
+                session.project_root.as_deref(),
+                crate::package::LockPublication::Preserve,
+            )?
         } else {
             inputs.resolve_project(session.project_root.as_deref())?
         };

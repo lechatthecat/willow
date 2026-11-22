@@ -17,6 +17,14 @@ use codegen::run_backend;
 pub use codegen::{emit_hir_text, emit_lir_text};
 pub(crate) use frontend::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnalysisMode {
+    Query,
+    Edit,
+    Overview,
+    Verification,
+}
+
 /// A single compilation request. Owns the shared context (paths, options,
 /// source text, source map) and drives the explicit phases: front-end
 /// (lex → parse → import resolution → desugar → type/concurrency checks) and
@@ -70,7 +78,7 @@ impl<'a> CompilerSession<'a> {
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
     ) -> Result<ai::Snapshot> {
-        self.analysis_with_policy(emitter, false, false, false, false)
+        self.analysis_with_policy(emitter, AnalysisMode::Query)
     }
 
     /// Edit preflight covers all project sources and must not rewrite project inputs.
@@ -78,7 +86,7 @@ impl<'a> CompilerSession<'a> {
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
     ) -> Result<ai::Snapshot> {
-        self.analysis_with_policy(emitter, false, true, false, false)
+        self.analysis_with_policy(emitter, AnalysisMode::Edit)
     }
     /// Analyze all project sources without importing additional roots into the entry scope
     /// or publishing lock/edit metadata.
@@ -86,7 +94,7 @@ impl<'a> CompilerSession<'a> {
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
     ) -> Result<ai::Snapshot> {
-        self.analysis_with_policy(emitter, false, true, true, false)
+        self.analysis_with_policy(emitter, AnalysisMode::Overview)
     }
 
     /// Capture semantic evidence even when the final checker reports errors.
@@ -95,16 +103,13 @@ impl<'a> CompilerSession<'a> {
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
     ) -> Result<ai::Snapshot> {
-        self.analysis_with_policy(emitter, false, true, false, true)
+        self.analysis_with_policy(emitter, AnalysisMode::Verification)
     }
 
     fn analysis_with_policy(
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
-        publish_lock: bool,
-        discover: bool,
-        overview_aliases: bool,
-        verification: bool,
+        mode: AnalysisMode,
     ) -> Result<ai::Snapshot> {
         let _symbols = self.symbols.enter();
         let _query_stats = query_stats::Session::enter();
@@ -112,39 +117,31 @@ impl<'a> CompilerSession<'a> {
         let path = std::fs::canonicalize(self.src)?;
         let source = compiler_db::captured::FileInput::read(path.clone())?.source;
         let root = path.parent().context("source has no parent")?;
-        let mut edit_context = if publish_lock {
-            None
-        } else {
-            Some(ai::edit::AnalysisInputs::capture(
-                &path,
-                self.project_root.as_deref(),
-                &self.opts,
-            )?)
-        };
+        let mut context =
+            ai::edit::AnalysisInputs::capture(&path, self.project_root.as_deref(), &self.opts)?;
         let map = diagnostics::SourceMap::new(path.to_str().context("non UTF-8 path")?, &source);
         let mut inputs = compiler_db::inputs::CompilerInputs::native(self.opts, root.to_path_buf())
-            .resolve_project_analysis(self.project_root.as_deref(), publish_lock)?;
-        if let Some(context) = &edit_context {
-            context.verify_files()?;
-        }
-        if discover && let Some(project) = &self.project_root {
+            .resolve_project_analysis(
+                self.project_root.as_deref(),
+                package::LockPublication::Preserve,
+            )?;
+        context.verify_files()?;
+        if mode != AnalysisMode::Query
+            && let Some(project) = &self.project_root
+        {
             let (project, source_root) = discovery_roots(&inputs, project, root);
             inputs.check_modules = if let Some(modules) = compiler_db::captured::overlay_modules() {
                 modules
-            } else if overview_aliases {
+            } else if mode == AnalysisMode::Overview {
                 package::discover_sources_for_overview(&project, &source_root)?
             } else {
                 package::discover_sources(&project, &source_root)?
             };
         }
-        if let Some(context) = &mut edit_context {
-            context.check_modules.clone_from(&inputs.check_modules);
-        }
+        context.check_modules.clone_from(&inputs.check_modules);
         inputs.capture_analysis = true;
-        inputs.verification = verification;
-        let frontend = if let Some(context) = &mut edit_context
-            && !verification
-        {
+        inputs.verification = mode == AnalysisMode::Verification;
+        let frontend = if !inputs.verification {
             let mut recording = ai::verify::RecordingDiagnostics {
                 downstream: emitter,
                 captured: ai::verify::Diagnostics::default(),
@@ -156,10 +153,8 @@ impl<'a> CompilerSession<'a> {
             run_frontend_with_inputs(&source, root, &map, inputs, emitter)?
         };
         let mut snapshot = ai::snapshot(&frontend, &path, &source, self.project_root.as_deref())?;
-        if let Some(context) = &edit_context {
-            context.verify_files()?;
-        }
-        snapshot.edit_context = edit_context;
+        context.verify_files()?;
+        snapshot.edit_context = Some(context);
         Ok(snapshot)
     }
 

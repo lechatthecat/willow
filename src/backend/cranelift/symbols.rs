@@ -209,12 +209,7 @@ pub(crate) fn constructor_to_method(ctor: &ConstructorDecl) -> MethodDecl {
         array_body_optimization: crate::parser::ast::ArrayBodyOptimization::None,
         constraint: None,
         name: "init".to_string(),
-        public: ctor.public,
-        protected: ctor.protected,
-        is_async: false,
-        is_open: false,
-        is_override: false,
-        is_static: false,
+        modifiers: ctor.modifiers,
         params: ctor.params.clone(),
 
         return_type: Type::Void,

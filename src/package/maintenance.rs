@@ -204,10 +204,9 @@ pub fn outdated_packages(root: &Path, offline: bool) -> Result<OutdatedReport> {
                         let remote = GitSource::cached_mode(
                             url.clone(),
                             SystemGit,
-                            false,
+                            super::git::CacheAccess::default(),
                             false,
                             None,
-                            false,
                         )?;
                         let versions = remote.versions()?;
                         sources.insert(url.as_str().to_owned(), (remote, versions));

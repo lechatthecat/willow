@@ -143,12 +143,12 @@ pub(super) fn details_of<'a>(
                             .iter()
                             .map(|c| c.kind.name().to_owned())
                             .collect(),
-                        public_api: f.public,
-                        is_public: f.public,
+                        public_api: f.public(),
+                        is_public: f.public(),
                         parameter_modes: modes(&f.params),
                         constant_value: f.constant.clone(),
                         type_params: f.type_params.clone(),
-                        is_async: f.is_async,
+                        is_async: f.is_async(),
                         is_const: f.constant.is_some(),
                         ..Default::default()
                     },
@@ -158,9 +158,9 @@ pub(super) fn details_of<'a>(
                 result.insert(
                     c.span,
                     DeclarationDetails {
-                        public_api: c.public,
-                        is_public: c.public,
-                        is_open: c.is_open,
+                        public_api: c.public(),
+                        is_public: c.public(),
+                        is_open: c.is_open(),
                         type_params: c.type_params.clone(),
                         extends: c
                             .base_class
@@ -181,11 +181,11 @@ pub(super) fn details_of<'a>(
                     result.insert(
                         f.span,
                         DeclarationDetails {
-                            public_api: c.public && (f.public || f.protected),
-                            is_public: f.public,
-                            is_protected: f.protected,
-                            is_static: f.is_static,
-                            is_mut: f.is_mut,
+                            public_api: c.public() && (f.public() || f.protected()),
+                            is_public: f.public(),
+                            is_protected: f.protected(),
+                            is_static: f.is_static(),
+                            is_mut: f.is_mut(),
                             owner_type_params: owner_params.clone(),
                             ..Default::default()
                         },
@@ -195,9 +195,10 @@ pub(super) fn details_of<'a>(
                     result.insert(
                         constructor.span,
                         DeclarationDetails {
-                            public_api: c.public && (constructor.public || constructor.protected),
-                            is_public: constructor.public,
-                            is_protected: constructor.protected,
+                            public_api: c.public()
+                                && (constructor.public() || constructor.protected()),
+                            is_public: constructor.public(),
+                            is_protected: constructor.protected(),
                             parameters: constructor.params.iter().map(|p| p.ty.clone()).collect(),
                             parameter_modes: modes(&constructor.params),
                             owner_type_params: owner_params.clone(),
@@ -215,12 +216,12 @@ pub(super) fn details_of<'a>(
                                     .iter()
                                     .map(|c| c.kind.name().to_owned())
                                     .collect(),
-                                public_api: c.public && (m.public || m.protected),
-                                is_public: m.public,
-                                is_protected: m.protected,
-                                is_static: m.is_static,
-                                is_open: m.is_open,
-                                is_override: m.is_override,
+                                public_api: c.public() && (m.public() || m.protected()),
+                                is_public: m.public(),
+                                is_protected: m.protected(),
+                                is_static: m.is_static(),
+                                is_open: m.is_open(),
+                                is_override: m.is_override(),
                                 parameter_modes: modes(&m.params),
                                 constraint_parameter: m
                                     .constraint
@@ -231,7 +232,7 @@ pub(super) fn details_of<'a>(
                                     .as_ref()
                                     .map(|c| c.alternatives.clone())
                                     .unwrap_or_default(),
-                                is_async: m.is_async,
+                                is_async: m.is_async(),
                                 owner_type_params: owner_params.clone(),
                                 ..Default::default()
                             },
@@ -442,7 +443,7 @@ pub(super) fn declarations_of<'a>(
             && let Some(info) = checked.lookup_class(&c.name)
         {
             for field in &c.fields {
-                let ty = if field.is_static {
+                let ty = if field.is_static() {
                     info.static_props.get(&field.name).map(|f| &f.ty)
                 } else {
                     info.fields.get(&field.name).map(|f| &f.ty)
@@ -510,7 +511,11 @@ pub(super) fn declarations_of<'a>(
                 for f in &c.fields {
                     declare(
                         &f.name,
-                        if f.is_static { "static-field" } else { "field" },
+                        if f.is_static() {
+                            "static-field"
+                        } else {
+                            "field"
+                        },
                         f.span,
                         Some(f.ty.clone()),
                     );

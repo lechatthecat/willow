@@ -411,8 +411,12 @@ fn rust_dependencies_alone_do_not_make_a_project_package_mode() {
     let fixture = Fixture::new();
     let app = fixture.package("app", false, "[rust-dependencies]\nregex = '1.12'");
     assert!(
-        super::lock::resolve_project_packages(&app, false, false)
-            .unwrap()
-            .is_none()
+        super::resolve_project_analysis(
+            &app,
+            super::FetchOptions::default(),
+            super::LockPublication::Publish
+        )
+        .unwrap()
+        .is_none()
     );
 }

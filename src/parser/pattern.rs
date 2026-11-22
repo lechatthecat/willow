@@ -277,7 +277,7 @@ mod tests {
                 let span = error.primary_span().unwrap();
                 assert_eq!(span.start, source.find(literal).unwrap());
                 assert_eq!(span.end - span.start, literal.len());
-                assert!(program.items.iter().any(|item| matches!(item, crate::parser::ast::Item::Function(f) if f.name == "main" && f.is_async)));
+                assert!(program.items.iter().any(|item| matches!(item, crate::parser::ast::Item::Function(f) if f.name == "main" && f.is_async())));
             }
         }
     }
@@ -368,7 +368,7 @@ mod tests {
                         error.primary_span().unwrap().start,
                         source.find(&format!("{literal})")).unwrap()
                     );
-                    assert!(program.items.iter().any(|item| matches!(item, crate::parser::ast::Item::Function(f) if f.name == "main" && f.is_async)));
+                    assert!(program.items.iter().any(|item| matches!(item, crate::parser::ast::Item::Function(f) if f.name == "main" && f.is_async())));
                 }
             }
             // `bool` and integer literals are ordinary nested patterns.
@@ -403,7 +403,7 @@ mod tests {
                 );
                 let (program, errors) =
                     Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
-                assert!(program.items.iter().any(|item| matches!(item, crate::parser::ast::Item::Function(f) if f.name == "main" && f.is_async)), "{outer}/{inner}: following async modifier was lost");
+                assert!(program.items.iter().any(|item| matches!(item, crate::parser::ast::Item::Function(f) if f.name == "main" && f.is_async())), "{outer}/{inner}: following async modifier was lost");
                 assert!(errors.is_empty(), "{source}: {errors:?}");
                 let pattern = first_arm_pattern(&program);
                 assert!(pattern.is_nested(), "{outer}/{inner}");

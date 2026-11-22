@@ -395,18 +395,18 @@ impl ConcurrencyAnalyzer {
     }
 
     fn check_function(&mut self, function: &FunctionDecl, calls: &BuiltinCalls) {
-        if function.is_async {
+        if function.is_async() {
             self.report.async_functions += 1;
             self.check_async_reference_params("async function", function.span, &function.params);
         }
         let previous_async_context = self.current_async_context;
-        self.current_async_context = function.is_async;
+        self.current_async_context = function.is_async();
         self.check_block(&function.body, calls);
         self.current_async_context = previous_async_context;
     }
 
     fn check_method(&mut self, class_name: &str, method: &MethodDecl, calls: &BuiltinCalls) {
-        if method.is_async {
+        if method.is_async() {
             self.report.async_functions += 1;
             self.check_async_reference_params("async method", method.span, &method.params);
         }
@@ -414,7 +414,7 @@ impl ConcurrencyAnalyzer {
         let previous_class = self
             .current_class
             .replace(TypeId::from_source_name(class_name));
-        self.current_async_context = method.is_async;
+        self.current_async_context = method.is_async();
         self.check_block(&method.body, calls);
         self.current_async_context = previous_async_context;
         self.current_class = previous_class;

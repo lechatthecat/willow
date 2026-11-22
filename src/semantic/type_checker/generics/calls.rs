@@ -397,7 +397,7 @@ impl TypeChecker {
         }
         #[cfg(test)]
         GENERIC_CALL_CHECKS.with(|count| count.set(count.get() + 1));
-        if !template.public && template.span.file_id != span.file_id {
+        if !template.public() && template.span.file_id != span.file_id {
             self.generic_error(span, format!("generic function `{}` is private", callee));
             return Some(Self::error_type());
         }
@@ -479,7 +479,7 @@ impl TypeChecker {
             }
         }
         self.check_mut_reference_aliases(&param_infos, call_args);
-        self.check_async_call_captures(&param_infos, call_args, template.is_async);
+        self.check_async_call_captures(&param_infos, call_args, template.is_async());
         let result = imported
             .as_ref()
             .map_or(&template.return_type, |info| &info.return_type)
@@ -500,7 +500,7 @@ impl TypeChecker {
                     false,
                 );
             }
-            return Some(if template.is_async {
+            return Some(if template.is_async() {
                 Type::Generic("Task".into(), vec![result])
             } else {
                 result
@@ -562,7 +562,7 @@ impl TypeChecker {
         });
         let target = path.map_or(name.clone(), |path| QualifiedName::join(path, &name));
         self.generics.calls.insert(id, target);
-        Some(if template.is_async {
+        Some(if template.is_async() {
             Type::Generic("Task".into(), vec![result])
         } else {
             result
@@ -632,7 +632,7 @@ impl TypeChecker {
         // so an ordinary value keeps its own type.
         let hinted_params = match context.expected {
             // An async call yields `Task<R>` and has no generic form to match.
-            Some(expected) if !fully_explicit && !template.is_async => {
+            Some(expected) if !fully_explicit && !template.is_async() => {
                 let declared = imported
                     .as_ref()
                     .map_or(&template.return_type, |info| &info.return_type);

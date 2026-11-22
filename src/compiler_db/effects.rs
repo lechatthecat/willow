@@ -1420,7 +1420,7 @@ impl<'a> UnitInventory<'a> {
                         continue;
                     }
                     inventory.pending.push((id, f.body.id, &f.body));
-                    if !f.is_async {
+                    if !f.is_async() {
                         inventory.helpers.insert(id, f.span);
                     }
                 }
@@ -1437,7 +1437,7 @@ impl<'a> UnitInventory<'a> {
                             inventory.reused.insert(m.body.id);
                         }
                         inventory.pending.push((id, m.body.id, &m.body));
-                        if !m.is_async {
+                        if !m.is_async() {
                             inventory.helpers.insert(id, m.span);
                         }
                     }

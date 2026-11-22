@@ -1,7 +1,9 @@
 //! Root-owned lock policy. Path sources remain live; Git sources use exact commits.
 #[cfg(test)]
 use super::resolve_path_packages;
-use super::{PackageGraph, PackageSourceIdentity, PathSource};
+use super::{
+    PackageGraph, PackageSourceIdentity, PathSource, git::CacheAccess, solve::SolvePolicy,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -88,14 +90,17 @@ pub(crate) fn candidate_rust_lock(
     let mut source = PathSource::open(root, false)?;
     source.replace_manifest(project)?;
     let (pins, checksums) = command_pins(root, None, false)?;
-    let graph = super::solve::resolve_prepared(
+    let graph = super::solve::resolve_source(
         source,
         pins,
         checksums,
-        offline,
-        false,
-        Default::default(),
-        false,
+        SolvePolicy {
+            cache: CacheAccess {
+                offline,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )?;
     super::PackageImports::new(&graph)?;
     let mut lock = Lock::from_graph(&graph)?;
@@ -325,50 +330,67 @@ impl Lock {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct FetchOptions {
+    pub locked: bool,
+    pub offline: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockPublication {
+    Publish,
+    Preserve,
+}
+
 /// Validate all live path manifests once. The resulting graph is reused by the
 /// compiler, so lock validation does not cause a second dependency traversal.
 /// Only the selected root lock is read. A matching lock is never rewritten.
 pub fn resolve_locked_path_packages(root: &Path, locked: bool) -> Result<PackageGraph> {
-    let transaction = crate::workspace_transaction::WorkspaceFileTransaction::open(root)?;
-    transaction.ensure_no_ai_edit()?;
-    resolve_source(PathSource::open(root, false)?, locked, false, true)
+    fetch_with_options(
+        root,
+        FetchOptions {
+            locked,
+            ..Default::default()
+        },
+    )
+}
+
+/// Preserve the public library calling convention for existing clients.
+pub fn fetch_packages(root: &Path, locked: bool, offline: bool) -> Result<PackageGraph> {
+    fetch_with_options(root, FetchOptions { locked, offline })
 }
 
 /// Resolve and cache dependencies without invoking the compiler or runtime builder.
-pub fn fetch_packages(root: &Path, locked: bool, offline: bool) -> Result<PackageGraph> {
+pub fn fetch_with_options(root: &Path, options: FetchOptions) -> Result<PackageGraph> {
     let transaction = crate::workspace_transaction::WorkspaceFileTransaction::open(root)?;
     transaction.ensure_no_ai_edit()?;
-    resolve_source(PathSource::open(root, false)?, locked, offline, true)
-}
-
-#[cfg(test)]
-pub(crate) fn resolve_project_packages(
-    root: &Path,
-    locked: bool,
-    offline: bool,
-) -> Result<Option<PackageGraph>> {
-    resolve_project_analysis(root, locked, offline, true)
+    resolve_source(
+        PathSource::open(root, false)?,
+        options,
+        LockPublication::Publish,
+    )
 }
 
 pub(crate) fn resolve_project_analysis(
     root: &Path,
-    locked: bool,
-    offline: bool,
-    publish_lock: bool,
+    options: FetchOptions,
+    publication: LockPublication,
 ) -> Result<Option<PackageGraph>> {
-    let transaction = if publish_lock {
-        Some(crate::workspace_transaction::WorkspaceFileTransaction::open(root)?)
-    } else {
-        crate::workspace_transaction::WorkspaceFileTransaction::existing(root)?
+    let _transaction = match publication {
+        LockPublication::Publish => {
+            let transaction = crate::workspace_transaction::WorkspaceFileTransaction::open(root)?;
+            transaction.ensure_no_ai_edit()?;
+            Some(transaction)
+        }
+        LockPublication::Preserve => {
+            crate::workspace_transaction::WorkspaceFileTransaction::existing(root)?
+        }
     };
-    if publish_lock && let Some(transaction) = &transaction {
-        transaction.ensure_no_ai_edit()?;
-    }
     let source = PathSource::open(root, false)?;
     let package_mode = source.manifest.willow.is_some()
         || !source.manifest.dependencies.is_empty()
         || source.manifest.native.is_some();
-    let graph = resolve_source(source, locked, offline, publish_lock)?;
+    let graph = resolve_source(source, options, publication)?;
     Ok(package_mode.then_some(graph))
 }
 
@@ -383,10 +405,10 @@ pub(super) fn update(root: &Path) -> Result<PackageGraph> {
 
 fn resolve_source(
     source: PathSource,
-    locked: bool,
-    offline: bool,
-    publish_lock: bool,
+    options: FetchOptions,
+    publication: LockPublication,
 ) -> Result<PackageGraph> {
+    let FetchOptions { locked, offline } = options;
     let native = source
         .manifest
         .native
@@ -431,7 +453,14 @@ fn resolve_source(
             }
         }
     }
-    let mut graph = match super::solve::resolve_source(source, pins, checksums, offline, !locked) {
+    let policy = SolvePolicy {
+        cache: CacheAccess {
+            offline,
+            ..Default::default()
+        },
+        repair_pins: !locked,
+    };
+    let mut graph = match super::solve::resolve_source(source, pins, checksums, policy) {
         Ok(graph) => graph,
         Err(
             error @ (super::PackageError::CacheMissingOffline(_)
@@ -473,7 +502,7 @@ fn resolve_source(
                     .into(),
             );
         }
-        if publish_lock {
+        if publication == LockPublication::Publish {
             let text = expected.canonical_text()?;
             atomic_write(&path, text.as_bytes(), || Ok(()))?;
         }

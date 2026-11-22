@@ -259,7 +259,7 @@ impl TestTables {
                     t.fn_types
                         .insert(&f.name, sig(&f.params, &f.return_type, false));
                     t.param_modes.insert(&f.name, modes(&f.params, false));
-                    if f.is_async {
+                    if f.is_async() {
                         t.cooperative_leaves
                             .insert(FunctionId::free_from_source_name(&f.name));
                     }
@@ -302,7 +302,7 @@ impl TestTables {
                     );
                 }
                 Item::Class(c) => {
-                    for field in c.fields.iter().filter(|f| f.is_static) {
+                    for field in c.fields.iter().filter(|f| f.is_static()) {
                         t.static_fields.insert(
                             (c.name.clone(), field.name.clone()),
                             field.ty.clone().into(),
@@ -312,7 +312,7 @@ impl TestTables {
                         c.name.clone(),
                         c.fields
                             .iter()
-                            .filter(|f| !f.is_static)
+                            .filter(|f| !f.is_static())
                             .map(|f| (f.name.clone(), f.ty.clone().into()))
                             .collect::<Vec<_>>()
                             .into(),

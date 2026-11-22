@@ -210,8 +210,8 @@ fn keyword_open_preserves_modifiers_and_recovery() {
     let ast::Item::Class(class) = program.items.last().unwrap() else {
         panic!("missing class")
     };
-    assert!(class.is_open);
+    assert!(class.is_open());
     assert_eq!(class.fields[0].name, "open");
     assert_eq!(class.methods[0].name, "open");
-    assert!(class.methods[0].is_open);
+    assert!(class.methods[0].is_open());
 }

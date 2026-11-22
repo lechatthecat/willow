@@ -92,7 +92,7 @@ impl ClassHierarchy {
                 class.base_class.as_ref().map(|base| base.name()),
             );
             for method in &class.methods {
-                if method.is_static {
+                if method.is_static() {
                     continue;
                 }
                 hierarchy.add_method(&class.name, &method.name);

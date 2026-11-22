@@ -383,7 +383,7 @@ impl TypeChecker {
         // flags is decided with the unit's effect facts.
         // The cached summary does not depend on the base chain, which is
         // consulted below through the build-wide write summary.
-        let fields: Vec<_> = c.fields.iter().filter(|field| !field.is_static).collect();
+        let fields: Vec<_> = c.fields.iter().filter(|field| !field.is_static()).collect();
         let compute = || {
             super::constructor_flow::analyze(
                 &ctor.body,
@@ -436,7 +436,7 @@ impl TypeChecker {
                 .iter()
                 .filter(|ctor| pending.contains(&ctor.body.id))
             {
-                let fields: Vec<_> = c.fields.iter().filter(|field| !field.is_static).collect();
+                let fields: Vec<_> = c.fields.iter().filter(|field| !field.is_static()).collect();
                 let flow = super::constructor_flow::analyze(
                     &ctor.body,
                     fields.iter().map(|field| field.name.as_str()),
@@ -1158,10 +1158,10 @@ impl TypeChecker {
     /// `self`. The build-wide dependency plan orders reads and rejects cycles.
     pub(super) fn check_static_property_initializers(&mut self, c: &ClassDecl) {
         for field in &c.fields {
-            if !field.is_static {
+            if !field.is_static() {
                 continue;
             }
-            if field.is_mut {
+            if field.is_mut() {
                 self.push(
                     Diagnostic::new(
                         Severity::Warning,
@@ -1605,7 +1605,7 @@ impl TypeChecker {
     pub(super) fn check_class_inheritance(&mut self, c: &ClassDecl) {
         let Some(base_name) = c.base_class.as_ref().map(type_path_name) else {
             for method in &c.methods {
-                if method.is_override {
+                if method.is_override() {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -1686,7 +1686,7 @@ impl TypeChecker {
         // Static members are non-virtual: a subclass may not redefine (hide) a
         // static member inherited from a base class (static member support §16.3 → E0839).
         for method in &c.methods {
-            if method.is_static
+            if method.is_static()
                 && let Some((owner, _)) = self.lookup_method_in_hierarchy(&base_name, &method.name)
             {
                 self.push(
@@ -1707,7 +1707,7 @@ impl TypeChecker {
             }
         }
         for field in &c.fields {
-            if field.is_static
+            if field.is_static()
                 && let Some((owner, _)) =
                     self.lookup_static_prop_in_hierarchy(&base_name, &field.name)
             {
@@ -1734,11 +1734,11 @@ impl TypeChecker {
             // inherited/overridable like instance methods, so skip override
             // validation for them. Instance methods (implicit or explicit `self`)
             // are still validated.
-            if method.is_static {
+            if method.is_static() {
                 continue;
             }
             let inherited = self.lookup_method_in_ancestors(&base_name, &method.name);
-            match (method.is_override, inherited) {
+            match (method.is_override(), inherited) {
                 (false, Some((owner, _))) => {
                     self.push(
                         Diagnostic::new(
@@ -1795,7 +1795,7 @@ impl TypeChecker {
                         method_params.push(self.normalize_type(&param.ty, param.type_span));
                     }
                     let method_return_type = self.normalize_type(&method.return_type, method.span);
-                    let actual_call_return_type = if method.is_async {
+                    let actual_call_return_type = if method.is_async() {
                         Type::Generic("Task".to_string(), vec![method_return_type.clone()])
                     } else {
                         method_return_type.clone()
@@ -1850,7 +1850,7 @@ impl TypeChecker {
         for (param, ty) in m.params.iter().zip(param_types.iter()) {
             self.validate_type(ty, param.type_span);
         }
-        if m.is_async && is_task_handle_type(&return_type) {
+        if m.is_async() && is_task_handle_type(&return_type) {
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -1881,8 +1881,8 @@ impl TypeChecker {
                 ));
         let previous_async_context = self.local.current_async_context;
         let previous_static_method = self.local.in_static_method;
-        self.local.current_async_context = m.is_async;
-        self.local.in_static_method = m.is_static;
+        self.local.current_async_context = m.is_async();
+        self.local.in_static_method = m.is_static();
         self.local.current_return_type = return_type.clone();
         self.symbols.push_scope();
         let async_locals_before = self.local.async_local_types.len();
@@ -1890,7 +1890,7 @@ impl TypeChecker {
         // Instance methods bind `self` to the enclosing class — implicitly, whether
         // or not the (legacy) explicit `self` parameter was written (static member support
         // §9.1). Static methods get no `self`; references to it there are E0831.
-        if !m.is_static {
+        if !m.is_static() {
             self.define_var(
                 "self".to_string(),
                 VarInfo {
@@ -1925,9 +1925,10 @@ impl TypeChecker {
             },
         );
         let locals = self.local.async_local_types.split_off(async_locals_before);
-        if m.is_async {
-            let mut task_params = Vec::with_capacity(param_types.len() + usize::from(!m.is_static));
-            if !m.is_static {
+        if m.is_async() {
+            let mut task_params =
+                Vec::with_capacity(param_types.len() + usize::from(!m.is_static()));
+            if !m.is_static() {
                 task_params.push((receiver_ty, m.span));
             }
             task_params.extend(
@@ -1975,7 +1976,7 @@ impl TypeChecker {
         // An async fn already returns `Task<ReturnType>`, so its declared return
         // type must be the awaited value, not a task handle — otherwise the call
         // would be a confusing nested `Task<Task<T>>` (async task unification, case A → E0809).
-        if f.is_async && is_task_handle_type(&return_type) {
+        if f.is_async() && is_task_handle_type(&return_type) {
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -2000,7 +2001,7 @@ impl TypeChecker {
             .local
             .current_effect_callable
             .replace(FunctionId::free(f.name.as_str()));
-        self.local.current_async_context = f.is_async;
+        self.local.current_async_context = f.is_async();
         self.local.current_return_type = return_type.clone();
         self.symbols.push_scope();
         let async_locals_before = self.local.async_local_types.len();
@@ -2027,7 +2028,7 @@ impl TypeChecker {
         };
         self.check_all_paths_return(&f.body, &return_type, f.span, site);
         let locals = self.local.async_local_types.split_off(async_locals_before);
-        if f.is_async {
+        if f.is_async() {
             self.check_async_task_send(
                 f.span,
                 &f.body,

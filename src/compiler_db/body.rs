@@ -1292,7 +1292,7 @@ impl BodyQueries {
                             let Some(id) = field
                                 .initializer
                                 .as_ref()
-                                .filter(|_| field.is_static)
+                                .filter(|_| field.is_static())
                                 .and_then(|expr| self.initializer(expr.id()))
                             else {
                                 return Ok(field);
@@ -1581,7 +1581,9 @@ mod tests {
             panic!()
         };
         mid.methods[0].name = "m".into();
-        mid.methods[0].is_override = true;
+        mid.methods[0]
+            .modifiers
+            .insert(crate::parser::ast::Modifiers::OVERRIDE);
         let ids: HashSet<_> = previous.index.entries().map(|(id, _)| id).collect();
         let artifacts = UnitArtifacts::new().unwrap();
         let next = Rc::new(BodyQueries::new(

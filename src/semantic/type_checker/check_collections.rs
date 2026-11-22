@@ -207,7 +207,7 @@ impl TypeChecker {
                     let methods = template
                         .methods
                         .iter()
-                        .filter(|method| method.public && !method.is_static)
+                        .filter(|method| method.public() && !method.is_static())
                         .map(|method| method.name.as_str())
                         .collect::<Vec<_>>()
                         .join(", ");

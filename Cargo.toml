@@ -29,6 +29,7 @@ name = "compiler_bench"
 harness = false
 
 [dependencies]
+bitflags = "2"
 cc = "1.7.0"
 cranelift-codegen = "0.136.2"
 cranelift-frontend = "0.136.2"

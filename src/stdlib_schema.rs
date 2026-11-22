@@ -325,7 +325,7 @@ pub fn type_item(module_name: &str, item_name: &str) -> Option<(usize, &'static 
                     .items
                     .into_iter()
                     .filter_map(|item| match item {
-                        crate::parser::ast::Item::Class(class) if class.public => {
+                        crate::parser::ast::Item::Class(class) if class.public() => {
                             Some((class.name, class.type_params.len()))
                         }
                         _ => None,
@@ -850,8 +850,8 @@ pub(crate) fn attach_array_storage(program: &mut crate::parser::ast::Program) {
             class.type_params[0].clone(),
         ))));
         for method in &mut class.methods {
-            let append = !method.is_static
-                && !method.is_async
+            let append = !method.is_static()
+                && !method.is_async()
                 && method.constraint.is_none()
                 && method.return_type == Type::Void
                 && method.params.len() == 1
@@ -874,8 +874,8 @@ pub(crate) fn attach_array_storage(program: &mut crate::parser::ast::Program) {
                         && matches!(&store.array, Expr::Var(name, _, _) if name == "self")
                         && matches!(&store.index, Expr::Var(name, _, _) if name == &index.name)
                         && matches!(&store.value, Expr::Var(name, _, _) if name == &method.params[0].name));
-            let length = !method.is_static
-                && !method.is_async
+            let length = !method.is_static()
+                && !method.is_async()
                 && method.params.is_empty()
                 && method.return_type == Type::I64
                 && matches!(method.body.stmts.as_slice(), [Stmt::Return(statement)]

@@ -291,8 +291,7 @@ fn operator_lowering_uses_heap_frames_on_success_and_error() {
                         return_type_span: None,
                         type_params: Vec::new(),
                         name: "main".into(),
-                        public: false,
-                        is_async: false,
+                        modifiers: Default::default(),
                         params: vec![],
                         return_type: Type::Void,
                         body: Block {

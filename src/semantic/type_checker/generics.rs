@@ -1034,8 +1034,7 @@ pub(super) fn class_signature(class: &ClassDecl) -> ClassDecl {
         abi_storage: class.abi_storage.clone(),
         type_params: class.type_params.clone(),
         name: class.name.clone(),
-        public: class.public,
-        is_open: class.is_open,
+        modifiers: class.modifiers,
         base_class: class.base_class.clone(),
         implements: class.implements.clone(),
         source_implements_len: class.source_implements_len,
@@ -1046,10 +1045,7 @@ pub(super) fn class_signature(class: &ClassDecl) -> ClassDecl {
             .map(|f| FieldDecl {
                 name: f.name.clone(),
                 ty: f.ty.clone(),
-                public: f.public,
-                protected: f.protected,
-                is_static: f.is_static,
-                is_mut: f.is_mut,
+                modifiers: f.modifiers,
                 initializer: None,
                 span: f.span,
             })
@@ -1062,12 +1058,7 @@ pub(super) fn class_signature(class: &ClassDecl) -> ClassDecl {
                 array_body_optimization: m.array_body_optimization,
                 constraint: m.constraint.clone(),
                 name: m.name.clone(),
-                public: m.public,
-                protected: m.protected,
-                is_async: m.is_async,
-                is_open: m.is_open,
-                is_override: m.is_override,
-                is_static: m.is_static,
+                modifiers: m.modifiers,
                 params: m.params.clone(),
                 return_type: m.return_type.clone(),
                 body: empty(&m.body),
@@ -1080,8 +1071,7 @@ pub(super) fn class_signature(class: &ClassDecl) -> ClassDecl {
             .constructors
             .iter()
             .map(|c| ConstructorDecl {
-                public: c.public,
-                protected: c.protected,
+                modifiers: c.modifiers,
                 params: c.params.clone(),
                 body: empty(&c.body),
                 span: c.span,
@@ -1407,7 +1397,7 @@ impl TypeChecker {
                 template.name.clone(),
                 method.to_owned(),
             ))
-            .is_some_and(|declaration| !declaration.is_static)
+            .is_some_and(|declaration| !declaration.is_static())
     }
 
     /// Restore source types and nominal aliases only in type slots of diagnostics.
@@ -1705,8 +1695,8 @@ impl TypeChecker {
                         params,
                         param_infos,
                         return_type,
-                        public: f.public,
-                        is_async: f.is_async,
+                        public: f.public(),
+                        is_async: f.is_async(),
                         declaration_span: f.span,
                         module_path: None,
                         constant: None,
@@ -1732,7 +1722,7 @@ impl TypeChecker {
                 self.check_static_property_initializers(c);
                 self.cached_class_defaults(c);
                 for method in &c.methods {
-                    if !method.is_static && (method.is_open || method.is_override) {
+                    if !method.is_static() && (method.is_open() || method.is_override()) {
                         self.request_class_method(&c.name, &method.name);
                     }
                 }

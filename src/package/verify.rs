@@ -132,9 +132,13 @@ fn verify(path: &Path, report: &mut Verification) -> Result<(), VerificationErro
     report.modules = modules.len();
     report.checks.insert("source_layout", true);
     // Fresh resolution deliberately neither reads nor writes project.lock.
-    let graph =
-        super::solve::resolve_source(source, Default::default(), Default::default(), false, false)
-            .map_err(package_error)?;
+    let graph = super::solve::resolve_source(
+        source,
+        Default::default(),
+        Default::default(),
+        super::solve::SolvePolicy::default(),
+    )
+    .map_err(package_error)?;
     report.dependencies = graph.packages.len() - 1;
     super::PackageImports::new(&graph)
         .map_err(|error| failure(error.machine_error()["kind"].as_str().unwrap(), &error))?;

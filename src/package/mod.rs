@@ -9,8 +9,8 @@ pub use git::{GitBackend, GitSource, SystemGit};
 pub use solve::{resolve_packages, update_packages};
 mod imports;
 pub(crate) mod lock;
-pub(crate) use lock::resolve_project_analysis;
-pub use lock::{fetch_packages, resolve_locked_path_packages};
+pub use lock::{FetchOptions, fetch_packages, fetch_with_options, resolve_locked_path_packages};
+pub(crate) use lock::{LockPublication, resolve_project_analysis};
 mod resolver;
 mod source;
 

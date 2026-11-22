@@ -143,12 +143,12 @@ fn generic_functions_accept_parameters_and_recover_malformed_lists() {
                     function.type_params,
                     parameters.split(", ").collect::<Vec<_>>()
                 );
-                assert_eq!(function.public, modifiers.contains("pub"));
-                assert_eq!(function.is_async, modifiers.contains("async"));
+                assert_eq!(function.public(), modifiers.contains("pub"));
+                assert_eq!(function.is_async(), modifiers.contains("async"));
             }
             assert!(
                 program.items.iter().any(
-                    |item| matches!(item, Item::Function(f) if f.name == "main" && f.is_async)
+                    |item| matches!(item, Item::Function(f) if f.name == "main" && f.is_async())
                 )
             );
         }
@@ -170,7 +170,7 @@ fn call_result_help_and_nested_recovery() {
             assert!(diagnostics[0].helps[0].contains("`choose`"));
             assert!(!diagnostics[0].helps[0].contains("pick"));
             assert!(program.items.iter().any(
-                |item| matches!(item, Item::Function(f) if f.name == "following" && f.public)
+                |item| matches!(item, Item::Function(f) if f.name == "following" && f.public())
             ));
         }
     }
@@ -240,8 +240,8 @@ fn generic_classes_accept_parameters_and_recover_malformed_lists() {
                         vec!["T"]
                     }
                 );
-                assert_eq!(class.public, modifiers.contains("pub"));
-                assert_eq!(class.is_open, modifiers.contains("open"));
+                assert_eq!(class.public(), modifiers.contains("pub"));
+                assert_eq!(class.is_open(), modifiers.contains("open"));
                 assert_eq!(class.base_class.is_some(), header.contains("extends"));
                 assert_eq!(
                     class.implements.len(),
@@ -249,7 +249,7 @@ fn generic_classes_accept_parameters_and_recover_malformed_lists() {
                 );
             }
             assert!(
-                matches!(program.items.last(), Some(Item::Function(f)) if f.name == "following" && f.public)
+                matches!(program.items.last(), Some(Item::Function(f)) if f.name == "following" && f.public())
             );
         }
     }
@@ -329,12 +329,12 @@ fn following_item_boundaries() {
             assert_eq!(actual.items.len(), expected.items.len() + offset);
             match (&actual.items[offset], &expected.items[0]) {
                 (Item::Class(class), Item::Class(expected)) => {
-                    assert_eq!(class.is_open, expected.is_open);
-                    assert_eq!(class.public, expected.public);
+                    assert_eq!(class.is_open(), expected.is_open());
+                    assert_eq!(class.public(), expected.public());
                 }
                 (Item::Function(function), Item::Function(expected)) => {
-                    assert_eq!(function.is_async, expected.is_async);
-                    assert_eq!(function.public, expected.public);
+                    assert_eq!(function.is_async(), expected.is_async());
+                    assert_eq!(function.public(), expected.public());
                 }
                 _ => {}
             }

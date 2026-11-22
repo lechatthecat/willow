@@ -345,10 +345,18 @@ fn c21_mismatched_literal_is_rejected() {
     );
 }
 
-// 22. Only i64, f64, bool and String are supported types.
+// 22. Integer constants must fit their width. Composite constants are rejected.
 #[test]
 fn c22_unsupported_type_is_rejected() {
-    assert_compile_error_contains("const A: i32 = 1;\nfn main() { println(A); }\n", &["E0110"]);
+    assert_output("const A: i32 = 1;\nfn main() { println(A); }\n", "1\n");
+    assert_compile_error_contains(
+        "const A: i32 = 2147483648;\nfn main() {}",
+        &["E0110", "constant out of range"],
+    );
+    assert_compile_error_contains(
+        "const A: Array<i64> = 1;\nfn main() {}",
+        &["E0110", "unsupported constant type"],
+    );
 }
 
 // 23. `const` is module-level only.

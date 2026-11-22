@@ -1,5 +1,8 @@
 //! Package mutations are planned against an in-memory manifest before publication.
-use super::{GitSource, PackageGraph, PackageSource, PathSource, SystemGit};
+use super::{
+    GitSource, PackageGraph, PackageSource, PathSource, SystemGit, git::CacheAccess,
+    solve::SolvePolicy,
+};
 use crate::project::{CanonicalGitUrl, DependencySource, GitSelector, ProjectManifest};
 use anyhow::{Context, Result, ensure};
 use std::{collections::HashMap, io::Write, path::Path};
@@ -64,7 +67,16 @@ fn git_metadata<'a>(
     if !sources.contains_key(url.as_str()) {
         sources.insert(
             url.as_str().into(),
-            GitSource::cached_mode(url.clone(), SystemGit, false, false, None, dry_run)?,
+            GitSource::cached_mode(
+                url.clone(),
+                SystemGit,
+                CacheAccess {
+                    read_only: dry_run,
+                    ..Default::default()
+                },
+                false,
+                None,
+            )?,
         );
     }
     Ok(&sources[url.as_str()])
@@ -150,15 +162,21 @@ pub fn mutate_packages_report(
     let manifest: ProjectManifest = toml::from_str(&after)?;
     manifest.validate()?;
     source.replace_manifest(manifest)?;
-    let graph =
-        super::solve::resolve_prepared(source, pins, checksums, false, dry_run, sources, false)
-            .with_context(|| {
-                if dry_run {
-                    "cannot resolve dry-run plan; fetch missing Git sources first"
-                } else {
-                    "cannot resolve package plan"
-                }
-            })?;
+    let policy = SolvePolicy {
+        cache: CacheAccess {
+            read_only: dry_run,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let graph = super::solve::resolve_prepared(source, pins, checksums, sources, policy)
+        .with_context(|| {
+            if dry_run {
+                "cannot resolve dry-run plan; fetch missing Git sources first"
+            } else {
+                "cannot resolve package plan"
+            }
+        })?;
     super::PackageImports::new(&graph)?;
     let lock_after = super::lock::command_lock(&graph, dry_run)?;
     let (previous, previous_direct) = super::lock::previous_identities(
@@ -452,15 +470,7 @@ pub fn inspect_packages(root: &Path) -> Result<PackageGraph> {
 
 pub(super) fn inspect_source(source: PathSource) -> Result<PackageGraph> {
     let (pins, checksums) = super::lock::command_pins(&source.root, None, false)?;
-    let graph = super::solve::resolve_prepared(
-        source,
-        pins,
-        checksums,
-        false,
-        false,
-        HashMap::new(),
-        false,
-    )?;
+    let graph = super::solve::resolve_source(source, pins, checksums, SolvePolicy::default())?;
     super::PackageImports::new(&graph)?;
     Ok(graph)
 }

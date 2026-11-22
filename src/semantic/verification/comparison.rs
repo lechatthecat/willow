@@ -45,7 +45,7 @@ pub(super) fn canonical(v: impl Serialize) -> Json {
 }
 pub(super) fn signature(f: &FunctionDecl) -> Json {
     canonical(
-        json!({"name":f.name,"params":f.params,"return":f.return_type,"type_params":f.type_params,"async":f.is_async,"public":f.public,"bridge":f.rust_bridge}),
+        json!({"name":f.name,"params":f.params,"return":f.return_type,"type_params":f.type_params,"async":f.is_async(),"public":f.public(),"bridge":f.rust_bridge}),
     )
 }
 #[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]

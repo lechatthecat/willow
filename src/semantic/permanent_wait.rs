@@ -517,7 +517,7 @@ pub(crate) fn check(
     let index = functions
         .iter()
         .enumerate()
-        .map(|(i, f)| (f.name.as_str(), (i, f.is_async)))
+        .map(|(i, f)| (f.name.as_str(), (i, f.is_async())))
         .collect();
     let summaries: Vec<_> = functions
         .iter()

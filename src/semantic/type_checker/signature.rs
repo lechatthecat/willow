@@ -83,7 +83,7 @@ impl TypeChecker {
                         .contains(&class.declaration_span.file_id)
                 });
                 crate::compiler_db::syntax::semantic(&json!([
-                    template.map(|t| (&t.type_params, &t.abi_storage, t.public, t.span.file_id)),
+                    template.map(|t| (&t.type_params, &t.abi_storage, t.public(), t.span.file_id)),
                     self.local.declared_type_params.contains(name),
                     self.signature_metadata,
                     module.is_some_and(|module| self.signature_only_modules.contains(module)),
@@ -132,8 +132,8 @@ impl TypeChecker {
                 f.name,
                 f.params,
                 f.return_type,
-                f.public,
-                f.is_async,
+                f.public(),
+                f.is_async(),
                 f.constant,
                 f.rust_bridge
             ]);
@@ -151,8 +151,8 @@ impl TypeChecker {
             f.name,
             f.params,
             f.return_type,
-            f.public,
-            f.is_async,
+            f.public(),
+            f.is_async(),
             f.constant,
             f.rust_bridge,
         ]));
@@ -204,8 +204,8 @@ impl TypeChecker {
             param_infos,
             params,
             return_type,
-            public: f.public,
-            is_async: f.is_async,
+            public: f.public(),
+            is_async: f.is_async(),
             declaration_span: f.span,
             module_path: None,
             constant: f.constant.clone(),
